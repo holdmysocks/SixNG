@@ -1,16 +1,31 @@
 #!/bin/sh
-# Build SixNG.app (GUI + CLI) for macOS: scripts/macos-app.sh [out-dir, default dist]
+# Build SixNG.app (GUI + CLI) for macOS:
+#   scripts/macos-app.sh [--universal] [out-dir, default dist]
+# --universal builds Apple Silicon and Intel and joins them with lipo; it needs
+# both targets (rustup target add aarch64-apple-darwin x86_64-apple-darwin).
 # Needs Rust and CMake (brew install cmake). Ad-hoc signed; not notarised.
 set -eu
 cd "$(dirname "$0")/.."
+universal=0
+if [ "${1:-}" = "--universal" ]; then universal=1; shift; fi
 out="${1:-dist}"
 target="${CARGO_TARGET_DIR:-target}"
-cargo build --release
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
 app="$out/SixNG.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$target/release/sixng-gui" "$target/release/sixng" "$app/Contents/MacOS/"
+if [ $universal = 1 ]; then
+  for t in aarch64-apple-darwin x86_64-apple-darwin; do
+    MACOSX_DEPLOYMENT_TARGET=11.0 cargo build --release --target $t
+  done
+  for b in sixng-gui sixng; do
+    lipo -create -output "$app/Contents/MacOS/$b" \
+      "$target/aarch64-apple-darwin/release/$b" "$target/x86_64-apple-darwin/release/$b"
+  done
+else
+  cargo build --release
+  cp "$target/release/sixng-gui" "$target/release/sixng" "$app/Contents/MacOS/"
+fi
 
 # icon from the 512 px logo
 iconset=$(mktemp -d)/sixng.iconset

@@ -73,7 +73,9 @@ This produces `target\release\sixng.exe` (CLI) and
 `cargo build --release` works once CMake is installed (`brew install cmake`).
 It produces `target/release/sixng` and `target/release/sixng-gui`; the GUI
 renders through Metal. `scripts/macos-app.sh` builds `dist/SixNG.app` (GUI and CLI, ad-hoc
-signed, not notarised). The app keeps its settings and default work folder
+signed, not notarised); `scripts/macos-app.sh --universal` makes it run on
+both Apple Silicon and Intel Macs (needs `rustup target add
+aarch64-apple-darwin x86_64-apple-darwin`). The app keeps its settings and default work folder
 in `~/Library/Application Support/SixNG`, never inside the bundle; plain
 binaries keep them next to the exe like on Windows.
 
