@@ -400,7 +400,7 @@ impl ModelView {
                 for (c, w) in p {
                     let (r, resp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
                     ui.painter().rect_filled(r, 2.0, srgb32(*c));
-                    ui.painter().rect_stroke(r, 2.0, egui::Stroke::new(1.0, egui::Color32::from_gray(90)), egui::StrokeKind::Inside);
+                    ui.painter().rect_stroke(r, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)), egui::StrokeKind::Inside);
                     let col = srgb32(*c);
                     if resp.on_hover_text(format!("#{:02x}{:02x}{:02x} · {:.1} %", col.r(), col.g(), col.b(), w * 100.0)).clicked() {
                         self.look.paint = *c;

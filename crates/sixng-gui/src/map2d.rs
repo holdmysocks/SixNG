@@ -507,7 +507,7 @@ impl Map2D {
                 let yaw = { let [x, y, z, w] = q; (2.0 * (w * z + x * y)).atan2(1.0 - 2.0 * (y * y + z * z)) };
                 let c = mapbake::corners(p, yaw, [bb[0][0], bb[0][1]], [bb[1][0], bb[1][1]], 1.0);
                 let pts: Vec<Pos2> = c.iter().map(|v| self.w2s(rect, v[0], v[1])).collect();
-                painter.add(egui::Shape::convex_polygon(pts, Color32::from_rgba_unmultiplied(160, 90, 230, 50), Stroke::new(1.2, Color32::from_rgb(190, 120, 255))));
+                painter.add(egui::Shape::convex_polygon(pts, Color32::from_rgba_unmultiplied(160, 90, 230, 50), Stroke::new(1.2_f32, Color32::from_rgb(190, 120, 255))));
             }
         }
         // roads
@@ -554,12 +554,12 @@ impl Map2D {
                         k += 1;
                     }
                     let col = [Color32::from_rgb(60, 220, 90), Color32::from_rgb(240, 200, 40), Color32::from_rgb(230, 60, 50)][k % 3];
-                    painter.circle(p, 6.0, col, Stroke::new(1.5, Color32::BLACK));
+                    painter.circle(p, 6.0, col, Stroke::new(1.5_f32, Color32::BLACK));
                     if self.mpp < 1.5 {
                         painter.text(p + Vec2::new(8.0, -8.0), egui::Align2::LEFT_BOTTOM, format!("phase {}/{}", k + 1, j.phases.len()), egui::FontId::proportional(10.0), Color32::WHITE);
                     }
                 } else {
-                    painter.circle_stroke(p, 4.0, Stroke::new(1.5, Color32::from_rgb(230, 230, 230)));
+                    painter.circle_stroke(p, 4.0, Stroke::new(1.5_f32, Color32::from_rgb(230, 230, 230)));
                 }
                 for (q, stop, yld) in &j.entrances {
                     if !stop && !yld {
@@ -567,9 +567,9 @@ impl Map2D {
                     }
                     let e = self.w2s(rect, q[0], q[1]);
                     if *stop {
-                        painter.add(egui::Shape::convex_polygon((0..8).map(|k| e + Vec2::angled(k as f32 * std::f32::consts::TAU / 8.0 + 0.39) * 5.0).collect(), Color32::from_rgb(210, 30, 30), Stroke::new(1.0, Color32::WHITE)));
+                        painter.add(egui::Shape::convex_polygon((0..8).map(|k| e + Vec2::angled(k as f32 * std::f32::consts::TAU / 8.0 + 0.39) * 5.0).collect(), Color32::from_rgb(210, 30, 30), Stroke::new(1.0_f32, Color32::WHITE)));
                     } else {
-                        painter.add(egui::Shape::convex_polygon(vec![e + Vec2::new(0.0, 5.0), e + Vec2::new(-5.0, -4.0), e + Vec2::new(5.0, -4.0)], Color32::WHITE, Stroke::new(1.5, Color32::from_rgb(210, 30, 30))));
+                        painter.add(egui::Shape::convex_polygon(vec![e + Vec2::new(0.0, 5.0), e + Vec2::new(-5.0, -4.0), e + Vec2::new(5.0, -4.0)], Color32::WHITE, Stroke::new(1.5_f32, Color32::from_rgb(210, 30, 30))));
                     }
                 }
             }
@@ -603,12 +603,12 @@ impl Map2D {
         if let Some(s) = self.selected {
             if let Some(e) = d.ents.get(s as usize) {
                 let pts: Vec<Pos2> = d.ent_corners(e).iter().map(|v| self.w2s(rect, v[0], v[1])).collect();
-                painter.add(egui::Shape::closed_line(pts, Stroke::new(2.5, Color32::from_rgb(0, 255, 255))));
+                painter.add(egui::Shape::closed_line(pts, Stroke::new(2.5_f32, Color32::from_rgb(0, 255, 255))));
             }
         }
         for &i in self.results.iter().take(500) {
             if let Some(e) = d.ents.get(i as usize) {
-                painter.circle_stroke(self.w2s(rect, e.pos[0], e.pos[1]), 5.0, Stroke::new(1.5, Color32::from_rgb(255, 0, 255)));
+                painter.circle_stroke(self.w2s(rect, e.pos[0], e.pos[1]), 5.0, Stroke::new(1.5_f32, Color32::from_rgb(255, 0, 255)));
             }
         }
         // hover: footprints of what is under the cursor
@@ -634,7 +634,7 @@ impl Map2D {
             if let (Some(i), true) = (hover_ent, self.show_footprints) {
                 let e = &d.ents[i as usize];
                 let pts: Vec<Pos2> = d.ent_corners(e).iter().map(|v| self.w2s(rect, v[0], v[1])).collect();
-                painter.add(egui::Shape::closed_line(pts, Stroke::new(1.5, Color32::YELLOW)));
+                painter.add(egui::Shape::closed_line(pts, Stroke::new(1.5_f32, Color32::YELLOW)));
             }
             let z = d.height(x, y);
             self.hover_info = format!(
@@ -683,7 +683,7 @@ impl Map2D {
         }
         if !self.measure.is_empty() {
             let pts: Vec<Pos2> = self.measure.iter().map(|v| self.w2s(rect, v[0], v[1])).collect();
-            painter.add(egui::Shape::line(pts.clone(), Stroke::new(2.0, Color32::from_rgb(255, 80, 200))));
+            painter.add(egui::Shape::line(pts.clone(), Stroke::new(2.0_f32, Color32::from_rgb(255, 80, 200))));
             let mut total = 0.0;
             for k in 1..self.measure.len() {
                 let (a, b) = (self.measure[k - 1], self.measure[k]);
@@ -696,13 +696,13 @@ impl Map2D {
         }
         if let Some(b) = self.box_sel {
             let r = Rect::from_two_pos(self.w2s(rect, b[0], b[1]), self.w2s(rect, b[2], b[3]));
-            painter.rect(r, 0.0, Color32::from_rgba_unmultiplied(0, 200, 255, 30), Stroke::new(2.0, Color32::from_rgb(0, 200, 255)), egui::StrokeKind::Middle);
+            painter.rect(r, 0.0, Color32::from_rgba_unmultiplied(0, 200, 255, 30), Stroke::new(2.0_f32, Color32::from_rgb(0, 200, 255)), egui::StrokeKind::Middle);
             painter.text(r.left_top() + Vec2::new(4.0, 4.0), egui::Align2::LEFT_TOP, format!("--bbox={:.0},{:.0},{:.0},{:.0}  ({:.0} × {:.0} m)", b[0], b[1], b[2], b[3], b[2] - b[0], b[3] - b[1]), egui::FontId::proportional(12.0), Color32::WHITE);
         }
         // scale bar + readout
         let bar_m = nice_len(self.mpp * 120.0);
         let bl = rect.left_bottom() + Vec2::new(12.0, -28.0);
-        painter.line_segment([bl, bl + Vec2::new(bar_m / self.mpp, 0.0)], Stroke::new(3.0, Color32::WHITE));
+        painter.line_segment([bl, bl + Vec2::new(bar_m / self.mpp, 0.0)], Stroke::new(3.0_f32, Color32::WHITE));
         painter.text(bl + Vec2::new(0.0, -4.0), egui::Align2::LEFT_BOTTOM, if bar_m >= 1000.0 { format!("{} km", bar_m / 1000.0) } else { format!("{bar_m} m") }, egui::FontId::proportional(12.0), Color32::WHITE);
         painter.text(rect.left_bottom() + Vec2::new(12.0, -8.0), egui::Align2::LEFT_BOTTOM, &self.hover_info, egui::FontId::monospace(11.0), Color32::from_white_alpha(220));
         // north arrow

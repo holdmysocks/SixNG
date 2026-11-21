@@ -1169,7 +1169,7 @@ impl Map3D {
             let pts: Vec<Option<Pos2>> = (0..8).map(|k| Renderer3D::project(&self.cam, rect.size(), corner(k)).map(|p| p + rect.min.to_vec2())).collect();
             for (a, b) in [(0, 1), (1, 3), (3, 2), (2, 0), (4, 5), (5, 7), (7, 6), (6, 4), (0, 4), (1, 5), (2, 6), (3, 7)] {
                 if let (Some(pa), Some(pb)) = (pts[a], pts[b]) {
-                    ui.painter().line_segment([pa, pb], Stroke::new(1.5, Color32::from_rgb(255, 220, 40)));
+                    ui.painter().line_segment([pa, pb], Stroke::new(1.5_f32, Color32::from_rgb(255, 220, 40)));
                 }
             }
         }
@@ -1506,16 +1506,16 @@ impl Map3D {
                     data.road_grid.query(eye[0] - range, eye[1] - range, eye[0] + range, eye[1] + range, |i| {
                         let rd = &data.roads[i as usize];
                         let c = map2d::ramp((rd.speed / 35.0).clamp(0.0, 1.0));
-                        p.line_segment([to_px(rd.a[0], rd.a[1]), to_px(rd.b[0], rd.b[1])], Stroke::new(1.0, c));
+                        p.line_segment([to_px(rd.a[0], rd.a[1]), to_px(rd.b[0], rd.b[1])], Stroke::new(1.0_f32, c));
                     });
                     // HD radius and view wedge
-                    p.circle_stroke(r.center(), self.detail.radii[0] / range * size.x * 0.5, Stroke::new(1.0, Color32::from_white_alpha(60)));
+                    p.circle_stroke(r.center(), self.detail.radii[0] / range * size.x * 0.5, Stroke::new(1.0_f32, Color32::from_white_alpha(60)));
                     let yaw = fwd[1].atan2(fwd[0]);
                     let half = self.cam.fov * 0.5 * 1.3;
                     let len = 60.0;
                     let a = r.center() + egui::vec2((yaw - half).cos(), -(yaw - half).sin()) * len;
                     let b = r.center() + egui::vec2((yaw + half).cos(), -(yaw + half).sin()) * len;
-                    p.add(egui::Shape::convex_polygon(vec![r.center(), a, b], Color32::from_rgba_unmultiplied(255, 220, 60, 50), Stroke::new(1.0, Color32::from_rgb(255, 220, 60))));
+                    p.add(egui::Shape::convex_polygon(vec![r.center(), a, b], Color32::from_rgba_unmultiplied(255, 220, 60, 50), Stroke::new(1.0_f32, Color32::from_rgb(255, 220, 60))));
                     p.text(r.left_bottom() + egui::vec2(4.0, -4.0), egui::Align2::LEFT_BOTTOM, format!("±{range:.0} m · click to move"), egui::FontId::proportional(10.0), Color32::from_white_alpha(160));
                     if resp.clicked() {
                         if let Some(q) = resp.interact_pointer_pos() {
