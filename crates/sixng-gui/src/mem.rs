@@ -1,8 +1,8 @@
 //! System and process memory figures, used to size the 3D map's caches.
 //!
 //! Budgets scale with the installed RAM so the streamer behaves on a 16 GB
-//! laptop as well as a 64 GB workstation. On non-Windows targets the
-//! figures fall back to a conservative 16 GB machine.
+//! laptop as well as a 64 GB workstation. On targets other than Windows and
+//! macOS the figures fall back to a conservative 16 GB machine.
 
 #[derive(Clone, Copy, Debug)]
 pub struct MemInfo {
@@ -34,7 +34,27 @@ pub fn query() -> MemInfo {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub fn query() -> MemInfo {
+    fn sysctl<T: Copy + Default>(name: &std::ffi::CStr) -> Option<T> {
+        let mut v = T::default();
+        let mut len = std::mem::size_of::<T>();
+        let r = unsafe { libc::sysctlbyname(name.as_ptr(), &mut v as *mut T as *mut _, &mut len, std::ptr::null_mut(), 0) };
+        (r == 0 && len == std::mem::size_of::<T>()).then_some(v)
+    }
+    let total = sysctl::<u64>(c"hw.memsize").unwrap_or(16 << 30);
+    // percentage of RAM the kernel considers available (free + reclaimable)
+    let avail = sysctl::<u32>(c"kern.memorystatus_level").map_or(8 << 30, |pct| total / 100 * pct.min(100) as u64);
+    // physical footprint: what Activity Monitor shows as "Memory"
+    let process = unsafe {
+        let mut ri: libc::rusage_info_v2 = std::mem::zeroed();
+        let ok = libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V2, &mut ri as *mut _ as *mut _) == 0;
+        if ok { ri.ri_phys_footprint } else { 0 }
+    };
+    MemInfo { total, avail, process }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn query() -> MemInfo {
     MemInfo { total: 16 << 30, avail: 8 << 30, process: 0 }
 }
@@ -95,5 +115,17 @@ impl Budget {
         self.textures = self.textures.min(cap / 3);
         self.models = self.models.min((cap_gb.max(1.0) * 600.0) as usize);
         self
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    #[test]
+    fn macos_figures_are_real() {
+        let m = super::query();
+        assert!(m.total >= 4 << 30 && m.total % (1 << 20) == 0, "total {}", m.total);
+        assert!(m.avail > 0 && m.avail <= m.total, "avail {}", m.avail);
+        assert!(m.process > 1 << 20 && m.process < m.total, "process {}", m.process);
+        eprintln!("total {} GB, avail {} GB, process {} MB", m.total >> 30, m.avail >> 30, m.process >> 20);
     }
 }

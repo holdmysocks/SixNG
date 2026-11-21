@@ -3318,6 +3318,7 @@ dependencies = [
  "flate2",
  "glam",
  "image",
+ "libc",
  "rayon",
  "regex",
  "rfd",
