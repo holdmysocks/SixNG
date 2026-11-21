@@ -88,16 +88,24 @@ struct AppSettings {
     setup_done: bool,
 }
 
+/// The exe's folder for portable installs; None inside a macOS .app bundle,
+/// which must not be written to (settings and work go to the user folder).
+fn portable_dir() -> Option<PathBuf> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    (!dir.ends_with("Contents/MacOS")).then_some(dir)
+}
+
 /// `sixng-settings.json` next to the exe (portable installs), else in the
 /// per-user settings folder (`sixng_core::user_settings_dir`).
 fn settings_path() -> Option<PathBuf> {
-    let local = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("sixng-settings.json")));
+    let local = portable_dir().map(|d| d.join("sixng-settings.json"));
     if let Some(l) = &local {
         if l.exists() {
             return local;
         }
     }
-    sixng_core::user_settings_dir().map(|d| d.join("settings.json")).filter(|p| p.exists()).or(local)
+    let user = sixng_core::user_settings_dir().map(|d| d.join("settings.json"));
+    user.clone().filter(|p| p.exists()).or(local).or(user)
 }
 
 fn load_settings() -> AppSettings {
@@ -118,7 +126,8 @@ fn save_settings(s: &AppSettings) -> std::io::Result<()> {
     }
 }
 
-/// Work folder: $SIXNG_WORK, else the saved setting, else `work` next to the exe.
+/// Work folder: $SIXNG_WORK, else the saved setting, else `work` next to the
+/// exe (in the user settings folder for a macOS .app).
 fn default_work() -> String {
     if let Ok(w) = std::env::var("SIXNG_WORK") {
         return w;
@@ -126,7 +135,7 @@ fn default_work() -> String {
     if let Some(w) = load_settings().work {
         return w;
     }
-    std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("work").display().to_string())).unwrap_or_else(|| "work".into())
+    portable_dir().or_else(sixng_core::user_settings_dir).map(|d| d.join("work").display().to_string()).unwrap_or_else(|| "work".into())
 }
 
 /// Game folder: $SIXNG_GAME, else the saved setting, else empty (the app
