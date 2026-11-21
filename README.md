@@ -527,7 +527,9 @@ and hash. Pick one to see a decoded mip (the largest one that is not in
 an undecodable BCPack chunk, at most 2048 px, by default; any mip from the list),
 as RGBA, RGB or a single channel, zoomed to fit or 0–8×. **Export PNG**
 saves the shown mip to `<work>/out/textures/<hash>_m<mip>.png`, and
-**Show in Explorer** opens it. Textures have no names, only their 64-bit
+**Show in Explorer** opens it. To browse, scroll the mouse wheel over the
+preview (one texture per notch, at fit zoom; zoomed in, the wheel pans) or
+press ↑ / ↓ (Page Up / Page Down: 10 at a time). Textures have no names, only their 64-bit
 hash, the same `hash64` that `model.json` lists for each material slot:
 in the Model viewer, open a material and click **view** on a slot to jump
 here. From the command line: `--texture <hash>` (or `--tab textures`)

@@ -39,8 +39,12 @@ pub struct TextureView {
     zoom: f32,
     tex: Option<(u64, u32, usize, egui::TextureHandle)>,
     decoded: Option<Decoded>,
-    pending: Arc<Mutex<Option<Result<Decoded, String>>>>,
+    /// (decode generation, result): results of superseded decodes are dropped
+    pending: Arc<Mutex<Option<(u64, Result<Decoded, String>)>>>,
+    decode_gen: u64,
     decoding: bool,
+    /// scroll-wheel travel not yet turned into a texture step
+    wheel: f32,
     error: Option<String>,
     status: Option<String>,
     formats: Vec<u32>,
@@ -70,7 +74,9 @@ impl TextureView {
             tex: None,
             decoded: None,
             pending: Arc::new(Mutex::new(None)),
+            decode_gen: 0,
             decoding: false,
+            wheel: 0.0,
             error: None,
             status: None,
             formats: Vec::new(),
@@ -161,10 +167,24 @@ impl TextureView {
         self.decode();
     }
 
+    /// Select the texture `d` rows below (above when negative) the current one.
+    fn step(&mut self, d: i64) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let i = self.sel.and_then(|s| self.rows.iter().position(|&r| r == s)).map_or(0, |i| (i as i64 + d).clamp(0, self.rows.len() as i64 - 1) as usize);
+        if Some(self.rows[i]) != self.sel {
+            self.select(self.rows[i]);
+            self.scroll_to_sel = true;
+        }
+    }
+
     fn decode(&mut self) {
         let (Some(set), Some(r)) = (self.set, self.sel) else { return };
         let (si, ti, mip) = (r.0, r.1, self.mip);
         let slot = self.pending.clone();
+        self.decode_gen += 1;
+        let gen = self.decode_gen;
         self.decoding = true;
         std::thread::spawn(move || {
             let st = &set.stores[si];
@@ -172,7 +192,7 @@ impl TextureView {
             let res = st.data_ex(t).map_err(|e| format!("{e:#}")).and_then(|(data, undecoded)| {
                 ttpf::decode_rgba(t, &data, mip).map(|(rgba, w, h)| Decoded { hash: t.hash, mip, rgba, w, h, undecoded }).map_err(|e| format!("{e:#}"))
             });
-            *slot.lock().unwrap() = Some(res);
+            *slot.lock().unwrap() = Some((gen, res));
         });
     }
 
@@ -207,7 +227,8 @@ impl TextureView {
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         self.ensure_loading();
-        if let Some(res) = self.pending.lock().unwrap().take() {
+        let done = self.pending.lock().unwrap().take().filter(|(g, _)| *g == self.decode_gen);
+        if let Some((_, res)) = done {
             self.decoding = false;
             match res {
                 Ok(d) => {
@@ -274,6 +295,15 @@ impl TextureView {
             ui.label(format!("{} textures", self.rows.len()));
         });
         ui.separator();
+        // Up/Down (and Page Up/Down for 10) step through the list while no text field has focus.
+        if ui.ctx().memory(|m| m.focused().is_none()) {
+            let d = ui.input(|i| {
+                i.key_pressed(egui::Key::ArrowDown) as i64 - i.key_pressed(egui::Key::ArrowUp) as i64 + 10 * (i.key_pressed(egui::Key::PageDown) as i64 - i.key_pressed(egui::Key::PageUp) as i64)
+            });
+            if d != 0 {
+                self.step(d);
+            }
+        }
         egui::SidePanel::left("tv_list").resizable(true).default_width(330.0).width_range(240.0..=560.0).show_inside(ui, |ui| {
             let h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
             let mut sa = egui::ScrollArea::vertical().auto_shrink([false; 2]);
@@ -298,6 +328,19 @@ impl TextureView {
                 self.select(r);
             }
         });
+        // Over the preview at fit zoom the wheel steps through the list (one
+        // texture per notch, also past textures that cannot decode); zoomed in, it pans.
+        if self.zoom <= 0.0 && ui.rect_contains_pointer(ui.available_rect_before_wrap()) {
+            self.wheel += ui.input(|i| i.raw_scroll_delta.y);
+            let notch = 40.0;
+            if self.wheel.abs() >= notch {
+                let d = -(self.wheel / notch).trunc();
+                self.wheel -= -d * notch;
+                self.step(d as i64);
+            }
+        } else {
+            self.wheel = 0.0;
+        }
         // preview
         let Some(r) = self.sel else {
             ui.centered_and_justified(|ui| ui.label("Pick a texture on the left, or use \"view\" on a material slot in the Model viewer."));
