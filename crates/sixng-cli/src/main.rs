@@ -487,21 +487,21 @@ fn main() {
 }
 
 /// The game folder: --game / SIXNG_GAME, else the one saved by sixng-gui
-/// (`sixng-settings.json` next to the exe, else %APPDATA%\SixNG\settings.json).
+/// (`sixng-settings.json` next to the exe, else the per-user settings folder).
 /// There is no built-in default.
 fn game_root(cli: &Cli) -> Result<PathBuf> {
     if let Some(g) = &cli.game {
         return Ok(g.clone());
     }
     let local = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("sixng-settings.json")));
-    let roaming = std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("SixNG").join("settings.json"));
+    let roaming = sixng_core::user_settings_dir().map(|d| d.join("settings.json"));
     let saved = [local, roaming]
         .into_iter()
         .flatten()
         .filter_map(|p| std::fs::read(p).ok())
         .filter_map(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .find_map(|v| v["game"].as_str().filter(|s| !s.is_empty()).map(PathBuf::from));
-    saved.ok_or_else(|| anyhow!(r"no game folder set: pass --game <folder with the GTA VI install>, set the SIXNG_GAME environment variable, or pick the folder once in sixng-gui (it is saved to sixng-settings.json next to the exe, or %APPDATA%\SixNG\settings.json)"))
+    saved.ok_or_else(|| anyhow!(r"no game folder set: pass --game <folder with the GTA VI install>, set the SIXNG_GAME environment variable, or pick the folder once in sixng-gui (it is saved to sixng-settings.json next to the exe, or settings.json in %APPDATA%\SixNG, ~/Library/Application Support/SixNG or ~/.config/SixNG)"))
 }
 
 fn run(cli: &Cli, out: &Out) -> Result<()> {

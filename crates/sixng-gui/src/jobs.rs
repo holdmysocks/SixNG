@@ -534,7 +534,7 @@ impl Jobs {
         if let Some(d) = &j.out_dir {
             if ui.button("📂 Open output folder").clicked() {
                 let p = if d.is_absolute() { d.clone() } else { std::env::current_dir().unwrap_or_default().join(d) };
-                let _ = Command::new("explorer").arg(p).spawn();
+                crate::open_path(&p);
             }
         }
         if let Some(r) = &j.result {

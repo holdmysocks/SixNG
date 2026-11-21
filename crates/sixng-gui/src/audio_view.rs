@@ -374,7 +374,7 @@ impl AudioView {
                 if let Some(f) = &self.last_export {
                     if ui.small_button("Show folder").clicked() {
                         let dir = f.parent().unwrap_or(f).to_path_buf();
-                        let _ = std::process::Command::new(if cfg!(windows) { "explorer" } else { "xdg-open" }).arg(dir).spawn();
+                        crate::open_path(&dir);
                     }
                 }
             });

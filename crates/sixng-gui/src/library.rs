@@ -395,8 +395,8 @@ impl Library {
                         ui.label(egui::RichText::new(&pname).monospace());
                         match export_dir(Path::new(out_root), pid) {
                             Some(dir) => {
-                                if ui.small_button("Show in Explorer").clicked() {
-                                    let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+                                if ui.small_button(format!("Show in {}", crate::FILE_MANAGER)).clicked() {
+                                    crate::open_path(&dir);
                                 }
                                 if ui.small_button("Copy path").clicked() {
                                     ui.ctx().copy_text(dir.display().to_string());
@@ -420,8 +420,8 @@ impl Library {
             Some(dir) => {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(dir.display().to_string()).monospace());
-                    if ui.small_button("Show in Explorer").clicked() {
-                        let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+                    if ui.small_button(format!("Show in {}", crate::FILE_MANAGER)).clicked() {
+                        crate::open_path(&dir);
                     }
                     if ui.small_button("Copy path").clicked() {
                         ui.ctx().copy_text(dir.display().to_string());
@@ -436,10 +436,10 @@ impl Library {
                             ui.label(egui::RichText::new(&n).monospace());
                             ui.label(crate::human(std::fs::metadata(&f).map(|m| m.len()).unwrap_or(0)));
                             if ui.small_button("Open").clicked() {
-                                let _ = std::process::Command::new("explorer").arg(&f).spawn();
+                                crate::open_path(&f);
                             }
                             if ui.small_button("Show").clicked() {
-                                let _ = std::process::Command::new("explorer").arg(format!("/select,{}", f.display())).spawn();
+                                crate::reveal(&f);
                             }
                             ui.end_row();
                         }

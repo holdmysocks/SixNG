@@ -88,7 +88,8 @@ struct AppSettings {
     setup_done: bool,
 }
 
-/// `sixng-settings.json` next to the exe (portable installs), else in %APPDATA%\SixNG.
+/// `sixng-settings.json` next to the exe (portable installs), else in the
+/// per-user settings folder (`sixng_core::user_settings_dir`).
 fn settings_path() -> Option<PathBuf> {
     let local = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("sixng-settings.json")));
     if let Some(l) = &local {
@@ -96,7 +97,7 @@ fn settings_path() -> Option<PathBuf> {
             return local;
         }
     }
-    std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("SixNG").join("settings.json")).filter(|p| p.exists()).or(local)
+    sixng_core::user_settings_dir().map(|d| d.join("settings.json")).filter(|p| p.exists()).or(local)
 }
 
 fn load_settings() -> AppSettings {
@@ -109,9 +110,8 @@ fn save_settings(s: &AppSettings) -> std::io::Result<()> {
     match std::fs::write(&p, &data) {
         Ok(()) => Ok(()),
         Err(_) => {
-            // exe folder not writable: use %APPDATA%\SixNG
-            let a = std::env::var_os("APPDATA").ok_or_else(|| std::io::Error::other("APPDATA not set"))?;
-            let p = PathBuf::from(a).join("SixNG").join("settings.json");
+            // exe folder not writable: use the per-user settings folder
+            let p = sixng_core::user_settings_dir().ok_or_else(|| std::io::Error::other("no per-user settings folder"))?.join("settings.json");
             std::fs::create_dir_all(p.parent().unwrap())?;
             std::fs::write(p, data)
         }
@@ -1259,6 +1259,26 @@ impl App {
             *json = format!("texture decode error: {e}\n\n{json}");
         }
     }
+}
+
+/// Name of the platform file manager, for button labels.
+pub const FILE_MANAGER: &str = if cfg!(windows) { "Explorer" } else if cfg!(target_os = "macos") { "Finder" } else { "file manager" };
+
+/// Open a file or folder with the platform's default handler.
+pub fn open_path(p: &std::path::Path) {
+    let cmd = if cfg!(windows) { "explorer" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let _ = std::process::Command::new(cmd).arg(p).spawn();
+}
+
+/// Show a file selected in the file manager (Linux: open its folder).
+pub fn reveal(p: &std::path::Path) {
+    let _ = if cfg!(windows) {
+        std::process::Command::new("explorer").arg(format!("/select,{}", p.display())).spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg("-R").arg(p).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(p.parent().unwrap_or(p)).spawn()
+    };
 }
 
 /// The SixNG banner (logo) as a texture, loaded once.

@@ -339,8 +339,8 @@ impl TextureView {
                 self.export_png();
             }
             if let Some(p) = &self.last_export {
-                if ui.button("Show in Explorer").clicked() {
-                    let _ = std::process::Command::new("explorer").arg(format!("/select,{}", p.display())).spawn();
+                if ui.button(format!("Show in {}", crate::FILE_MANAGER)).clicked() {
+                    crate::reveal(p);
                 }
             }
         });
