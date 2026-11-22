@@ -6,10 +6,10 @@ license.workspace = true
 
 [dependencies]
 # live GPU object counts for the map stream log (checks that evicted models are freed)
-wgpu = { version = "24", default-features = false, features = ["counters"] }
+wgpu = { version = "30", default-features = false, features = ["counters"] }
 sixng-core = { path = "../sixng-core" }
 anyhow.workspace = true
-eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "x11", "wayland"] }
+eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "x11", "wayland"] }
 winit = "0.30"
 glam = { version = "0.29", features = ["bytemuck"] }
 image.workspace = true

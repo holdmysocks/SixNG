@@ -48,7 +48,11 @@ struct Colour {
 fn hex(s: &str) -> Option<[f32; 3]> {
     let s = s.trim_start_matches('#');
     let v = u32::from_str_radix(s, 16).ok()?;
-    Some([((v >> 16) & 255) as f32 / 255.0, ((v >> 8) & 255) as f32 / 255.0, (v & 255) as f32 / 255.0])
+    Some([
+        ((v >> 16) & 255) as f32 / 255.0,
+        ((v >> 8) & 255) as f32 / 255.0,
+        (v & 255) as f32 / 255.0,
+    ])
 }
 
 /// One spawn configuration: body colour (sRGB, read as if stored linear) and
@@ -84,15 +88,25 @@ pub struct VehicleDb {
 
 impl VehicleDb {
     pub fn new() -> Self {
-        VehicleDb { state: Arc::new(Mutex::new(State::Idle)) }
+        VehicleDb {
+            state: Arc::new(Mutex::new(State::Idle)),
+        }
     }
 
     pub fn path(work: &str) -> PathBuf {
-        Path::new(work).join("out").join("vehicles").join("vehicles.json")
+        Path::new(work)
+            .join("out")
+            .join("vehicles")
+            .join("vehicles.json")
     }
 
     /// The table, starting the load (or build) on first call.
-    pub fn get(&self, game: &str, work: &str, ctx: &egui::Context) -> Option<Arc<HashMap<String, Vehicle>>> {
+    pub fn get(
+        &self,
+        game: &str,
+        work: &str,
+        ctx: &egui::Context,
+    ) -> Option<Arc<HashMap<String, Vehicle>>> {
         let mut st = self.state.lock().unwrap();
         match &*st {
             State::Ready(m) => return Some(m.clone()),
@@ -100,8 +114,17 @@ impl VehicleDb {
             State::Idle => {}
         }
         let path = Self::path(work);
-        *st = State::Loading(if path.exists() { "reading vehicle data …".into() } else { "building vehicle data (sixng vehicles, a few seconds) …".into() });
-        let (slot, game, work, ctx) = (self.state.clone(), game.to_string(), work.to_string(), ctx.clone());
+        *st = State::Loading(if path.exists() {
+            "reading vehicle data …".into()
+        } else {
+            "building vehicle data (sixng vehicles, a few seconds) …".into()
+        });
+        let (slot, game, work, ctx) = (
+            self.state.clone(),
+            game.to_string(),
+            work.to_string(),
+            ctx.clone(),
+        );
         std::thread::spawn(move || {
             let r = load(&game, &work, &path);
             *slot.lock().unwrap() = match r {
@@ -134,7 +157,11 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
         let configs = v
             .configurations
             .into_iter()
-            .map(|c| Config { colour: c.colour.and_then(|c| hex(&c.srgb_if_linear)), rim: c.rim, tyre: c.tyre })
+            .map(|c| Config {
+                colour: c.colour.and_then(|c| hex(&c.srgb_if_linear)),
+                rim: c.rim,
+                tyre: c.tyre,
+            })
             .collect();
         let palettes = v
             .palettes
@@ -149,19 +176,43 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
                     }
                 }
                 n.sort_by(|a, b| b.1.cmp(&a.1));
-                n.iter().filter_map(|(h, k)| hex(h).map(|c| (c, *k as f32 / p.len() as f32))).collect()
+                n.iter()
+                    .filter_map(|(h, k)| hex(h).map(|c| (c, *k as f32 / p.len() as f32)))
+                    .collect()
             })
             .collect();
-        let (ws, wr) = v.model_info.map(|i| (i.wheel_scale, i.wheel_scale_rear)).unwrap_or((None, None));
-        m.insert(name.to_ascii_lowercase(), Vehicle { wheel_scale: ws, wheel_scale_rear: wr, configs, palettes });
+        let (ws, wr) = v
+            .model_info
+            .map(|i| (i.wheel_scale, i.wheel_scale_rear))
+            .unwrap_or((None, None));
+        m.insert(
+            name.to_ascii_lowercase(),
+            Vehicle {
+                wheel_scale: ws,
+                wheel_scale_rear: wr,
+                configs,
+                palettes,
+            },
+        );
     }
     Ok(m)
 }
 
 /// Model name of a loaded source string (`packs.rpf@… phoenix_hi` -> `phoenix`).
 pub fn model_key(source: &str) -> String {
-    let n = source.split_whitespace().last().unwrap_or("").to_ascii_lowercase();
-    let n = n.rsplit(|c| c == '/' || c == char::from(92u8)).next().unwrap_or(&n).split('.').next().unwrap_or("").to_string();
+    let n = source
+        .split_whitespace()
+        .last()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let n = n
+        .rsplit(|c| c == '/' || c == char::from(92u8))
+        .next()
+        .unwrap_or(&n)
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_string();
     for s in ["_hi", "_mid", "_lo"] {
         if let Some(b) = n.strip_suffix(s) {
             return b.to_string();

@@ -117,25 +117,45 @@ pub struct Cells {
 /// coverage fallback (unlinked LOD, or LOD whose children all lack a model),
 /// the nearest distance it fills in at (it draws as a fallback from there to
 /// `lo`).
-fn static_range(data: &MapData, cs: &[u32], cl: &[u32], d: &Detail, i: usize) -> Option<(f32, f32, Option<f32>)> {
+fn static_range(
+    data: &MapData,
+    cs: &[u32],
+    cl: &[u32],
+    d: &Detail,
+    i: usize,
+) -> Option<(f32, f32, Option<f32>)> {
     let n = data.ents.len();
     let k = d.radii[0] / 330.0;
     let rn: Vec<f32> = d.radii.iter().map(|r| r / k).collect();
-    let drawable = |e: &crate::mapbake::EntRec| !data.name(e.model).is_empty() && e.rflags & RF_HIDE == 0;
+    let drawable =
+        |e: &crate::mapbake::EntRec| !data.name(e.model).is_empty() && e.rflags & RF_HIDE == 0;
     let rad_of = |e: &crate::mapbake::EntRec| -> f32 {
         if e.rflags & RF_BBOX_UNKNOWN != 0 && e.lod > 0 {
             1.0e4
         } else {
-            0.5 * ((e.hi[0] - e.lo[0]).powi(2) + (e.hi[1] - e.lo[1]).powi(2) + (e.hi[2] - e.lo[2]).powi(2)).sqrt()
+            0.5 * ((e.hi[0] - e.lo[0]).powi(2)
+                + (e.hi[1] - e.lo[1]).powi(2)
+                + (e.hi[2] - e.lo[2]).powi(2))
+            .sqrt()
         }
     };
     let band = |e: &crate::mapbake::EntRec, rad: f32| -> (f32, f32) {
         let l = e.lod.min(5) as usize;
         let lo = if l == 0 { 0.0 } else { rn[l - 1] * 0.92 };
-        let hi = if l == 0 && d.hd_fallback && rad >= 10.0 { rn[1].min(rn[0] * 1.75) } else { rn[l] };
+        let hi = if l == 0 && d.hd_fallback && rad >= 10.0 {
+            rn[1].min(rn[0] * 1.75)
+        } else {
+            rn[l]
+        };
         (lo, hi)
     };
-    let outer = |e: &crate::mapbake::EntRec, rad: f32| -> f32 { if e.lod_dist > 0.0 { e.lod_dist.min(rn[5]) } else { band(e, rad).1 } };
+    let outer = |e: &crate::mapbake::EntRec, rad: f32| -> f32 {
+        if e.lod_dist > 0.0 {
+            e.lod_dist.min(rn[5])
+        } else {
+            band(e, rad).1
+        }
+    };
     let e = &data.ents[i];
     if !drawable(e) {
         return None;
@@ -157,8 +177,16 @@ fn static_range(data: &MapData, cs: &[u32], cl: &[u32], d: &Detail, i: usize) ->
                 lim = lim.max(outer(p, rad_of(p)));
             }
         }
-        let lo = if has_children && e.child_lod_dist > 0.0 { e.child_lod_dist } else { 0.0 };
-        if lo > 0.0 && !cl[cs[i] as usize..cs[i + 1] as usize].iter().any(|&c| drawable(&data.ents[c as usize])) {
+        let lo = if has_children && e.child_lod_dist > 0.0 {
+            e.child_lod_dist
+        } else {
+            0.0
+        };
+        if lo > 0.0
+            && !cl[cs[i] as usize..cs[i + 1] as usize]
+                .iter()
+                .any(|&c| drawable(&data.ents[c as usize]))
+        {
             fb = Some(0.0);
         }
         (lo, lim)
@@ -196,7 +224,10 @@ fn static_range(data: &MapData, cs: &[u32], cl: &[u32], d: &Detail, i: usize) ->
 const TAG_FORMAT: &str = "v7_";
 
 fn tag_of(d: &Detail) -> String {
-    format!("{TAG_FORMAT}{:.0}_{:.4}_{:.2}_{:.2}_{}", d.radii[0], d.min_size, d.prop_density, d.veg_density, d.hd_fallback as u8)
+    format!(
+        "{TAG_FORMAT}{:.0}_{:.4}_{:.2}_{:.2}_{}",
+        d.radii[0], d.min_size, d.prop_density, d.veg_density, d.hd_fallback as u8
+    )
 }
 
 fn build_index(data: &MapData, cs: &[u32], cl: &[u32], d: &Detail, tag: String) -> Index {
@@ -206,7 +237,9 @@ fn build_index(data: &MapData, cs: &[u32], cl: &[u32], d: &Detail, tag: String) 
     let near_n = NEAR * 0.85 * 330.0;
     let mut by_cell: HashMap<CellKey, (Vec<u32>, f32, f32)> = HashMap::new();
     for i in 0..data.ents.len() {
-        let Some((lo, hi, fb)) = static_range(data, cs, cl, d, i) else { continue };
+        let Some((lo, hi, fb)) = static_range(data, cs, cl, d, i) else {
+            continue;
+        };
         let lo = fb.unwrap_or(lo);
         if hi <= near_n {
             continue;
@@ -231,14 +264,36 @@ fn build_index(data: &MapData, cs: &[u32], cl: &[u32], d: &Detail, tag: String) 
                 let e = &data.ents[i as usize];
                 let (lo, hi, fb) = static_range(data, cs, cl, d, i as usize).unwrap();
                 let (s, c) = e.yaw.sin_cos();
-                let lc = [(e.lo[0] + e.hi[0]) * 0.5, (e.lo[1] + e.hi[1]) * 0.5, (e.lo[2] + e.hi[2]) * 0.5];
-                let ctr = [e.pos[0] + lc[0] * c - lc[1] * s, e.pos[1] + lc[0] * s + lc[1] * c, e.pos[2] + lc[2]];
+                let lc = [
+                    (e.lo[0] + e.hi[0]) * 0.5,
+                    (e.lo[1] + e.hi[1]) * 0.5,
+                    (e.lo[2] + e.hi[2]) * 0.5,
+                ];
+                let ctr = [
+                    e.pos[0] + lc[0] * c - lc[1] * s,
+                    e.pos[1] + lc[0] * s + lc[1] * c,
+                    e.pos[2] + lc[2],
+                ];
                 // about two pixels (1/500 of the distance) where the cell first draws it
                 let grid = (fb.unwrap_or(lo) * k).max(NEAR * 0.85 * d.radii[0]) * 0.002;
-                CellEnt { model: data.name(e.model).to_string(), pos: e.pos, yaw: e.yaw, ctr, lo, hi, grid, fb }
+                CellEnt {
+                    model: data.name(e.model).to_string(),
+                    pos: e.pos,
+                    yaw: e.yaw,
+                    ctr,
+                    lo,
+                    hi,
+                    grid,
+                    fb,
+                }
             })
             .collect();
-        cells.push(Info { key, ents: Arc::new(ents), lo, hi });
+        cells.push(Info {
+            key,
+            ents: Arc::new(ents),
+            lo,
+            hi,
+        });
     }
     let n: usize = cells.iter().map(|c| c.ents.len()).sum();
     let mut per = [(0usize, 0usize); 6];
@@ -247,8 +302,18 @@ fn build_index(data: &MapData, cs: &[u32], cl: &[u32], d: &Detail, tag: String) 
         per[c.key.level as usize].1 += c.ents.len();
     }
     eprintln!("[map3d] cell index per level (cells, placements): {per:?}");
-    eprintln!("[map3d] cell index: {} cells, {} placements in {:.0} ms (lod scale {:.2})", cells.len(), n, t0.elapsed().as_secs_f32() * 1000.0, k);
-    Index { tag, cells, ent_cell }
+    eprintln!(
+        "[map3d] cell index: {} cells, {} placements in {:.0} ms (lod scale {:.2})",
+        cells.len(),
+        n,
+        t0.elapsed().as_secs_f32() * 1000.0,
+        k
+    );
+    Index {
+        tag,
+        cells,
+        ent_cell,
+    }
 }
 
 impl Cells {
@@ -263,7 +328,16 @@ impl Cells {
             drawn: HashSet::new(),
             handover: HashMap::new(),
             done_handover: HashSet::new(),
-            shared: Arc::new(Shared { queue: Mutex::new(Vec::new()), cv: Condvar::new(), stop: AtomicBool::new(false), taken: Mutex::new(HashSet::new()), present: Mutex::new(None), built: AtomicU64::new(0), read: AtomicU64::new(0), build_us: AtomicU64::new(0) }),
+            shared: Arc::new(Shared {
+                queue: Mutex::new(Vec::new()),
+                cv: Condvar::new(),
+                stop: AtomicBool::new(false),
+                taken: Mutex::new(HashSet::new()),
+                present: Mutex::new(None),
+                built: AtomicU64::new(0),
+                read: AtomicU64::new(0),
+                build_us: AtomicU64::new(0),
+            }),
             rx: None,
             started: false,
             bytes: 0,
@@ -278,7 +352,14 @@ impl Cells {
     }
 
     /// Start the cell workers (three at low priority) and their upload thread.
-    pub fn start(&mut self, device: wgpu::Device, queue: wgpu::Queue, up: crate::render3d::Uploader, game: &str, work: &str) {
+    pub fn start(
+        &mut self,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        up: crate::render3d::Uploader,
+        game: &str,
+        work: &str,
+    ) {
         if self.started {
             return;
         }
@@ -290,7 +371,9 @@ impl Cells {
             let sh = self.shared.clone();
             std::thread::spawn(move || {
                 fn walk(p: &Path, files: &mut HashSet<PathBuf>) -> u64 {
-                    let Ok(rd) = std::fs::read_dir(p) else { return 0 };
+                    let Ok(rd) = std::fs::read_dir(p) else {
+                        return 0;
+                    };
                     let mut n = 0;
                     for e in rd.filter_map(|e| e.ok()) {
                         let p = e.path();
@@ -348,7 +431,15 @@ impl Cells {
                 mem::lower_thread_priority();
                 let ws = Workspace::new(&game, &work);
                 let cache = Path::new(&work).join(crate::GUI_CACHE);
-                let opts = glb::LoadOpts { max_tex: 64, skip_keys: None, no_textures: false, hide_placeholders: true, small_cache: true, base_only: true, bc: true };
+                let opts = glb::LoadOpts {
+                    max_tex: 64,
+                    skip_keys: None,
+                    no_textures: false,
+                    hide_placeholders: true,
+                    small_cache: true,
+                    base_only: true,
+                    bc: true,
+                };
                 // recently loaded models (cells next to each other share many)
                 let mut models: HashMap<String, Option<Arc<glb::Model>>> = HashMap::new();
                 let mut model_bytes = 0usize;
@@ -360,7 +451,14 @@ impl Cells {
                                 return;
                             }
                             if !q.is_empty() {
-                                let (bi, _) = q.iter().enumerate().fold((0, f32::MAX), |a, (i, j)| if j.prio < a.1 { (i, j.prio) } else { a });
+                                let (bi, _) =
+                                    q.iter().enumerate().fold((0, f32::MAX), |a, (i, j)| {
+                                        if j.prio < a.1 {
+                                            (i, j.prio)
+                                        } else {
+                                            a
+                                        }
+                                    });
                                 let j = q.swap_remove(bi);
                                 sh.taken.lock().unwrap().insert(j.cell);
                                 break j;
@@ -383,17 +481,30 @@ impl Cells {
                                 models
                                     .entry(format!("{id}|{lod}"))
                                     .or_insert_with(|| {
-                                        let m = map3d::load_model(&ws, &cache, id, lod, &opts, &idx, &offs, &arcs).ok()?;
-                                        model_bytes += m.meshes.iter().map(|me| me.verts.len() * 72 + me.indices.len() * 4).sum::<usize>() + m.images.iter().map(|i| i.bytes()).sum::<usize>();
+                                        let m = map3d::load_model(
+                                            &ws, &cache, id, lod, &opts, &idx, &offs, &arcs,
+                                        )
+                                        .ok()?;
+                                        model_bytes += m
+                                            .meshes
+                                            .iter()
+                                            .map(|me| me.verts.len() * 72 + me.indices.len() * 4)
+                                            .sum::<usize>()
+                                            + m.images.iter().map(|i| i.bytes()).sum::<usize>();
                                         Some(Arc::new(m))
                                     })
                                     .clone()
                             });
-                            sh.build_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                            sh.build_us
+                                .fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
                             sh.built.fetch_add(1, Ordering::Relaxed);
                             if cells::CELL_BYTES.load(Ordering::Relaxed) < cells::CELL_CAP {
                                 if cells::write(&job.path, &c).is_ok() {
-                                    sh.present.lock().unwrap().get_or_insert_with(HashSet::new).insert(job.path.clone());
+                                    sh.present
+                                        .lock()
+                                        .unwrap()
+                                        .get_or_insert_with(HashSet::new)
+                                        .insert(job.path.clone());
                                 }
                             }
                             Some(c)
@@ -408,7 +519,12 @@ impl Cells {
     }
 
     /// Make sure the index matches the detail setting (built on a thread).
-    fn ensure_index(&mut self, data: &Arc<MapData>, cs: &Arc<(Vec<u32>, Vec<u32>)>, d: &Detail) -> bool {
+    fn ensure_index(
+        &mut self,
+        data: &Arc<MapData>,
+        cs: &Arc<(Vec<u32>, Vec<u32>)>,
+        d: &Detail,
+    ) -> bool {
         let tag = tag_of(d);
         if let Some((t, rx)) = &self.building {
             if let Ok(ix) = rx.try_recv() {
@@ -456,7 +572,16 @@ impl Cells {
     /// While the camera `moving`, HD cells not on disk yet are not built
     /// (they are the heavy ones: building them would slow the streaming of
     /// the models the camera is flying into).
-    pub fn update(&mut self, data: &Arc<MapData>, cs: &Arc<(Vec<u32>, Vec<u32>)>, d: &Detail, work: &str, eye: [f32; 3], moving: bool, seen: &dyn Fn([f32; 4]) -> bool) {
+    pub fn update(
+        &mut self,
+        data: &Arc<MapData>,
+        cs: &Arc<(Vec<u32>, Vec<u32>)>,
+        d: &Detail,
+        work: &str,
+        eye: [f32; 3],
+        moving: bool,
+        seen: &dyn Fn([f32; 4]) -> bool,
+    ) {
         if !self.on || !self.ensure_index(data, cs, d) {
             self.state.clear();
             self.drawn.clear();
@@ -472,7 +597,8 @@ impl Cells {
         for c in self.done_handover.drain() {
             self.handover.remove(&c);
         }
-        self.handover.retain(|_, t| t.elapsed().as_secs_f32() < HANDOVER_S);
+        self.handover
+            .retain(|_, t| t.elapsed().as_secs_f32() < HANDOVER_S);
         let prev = std::mem::take(&mut self.drawn);
         self.state.clear();
         self.state.resize(ix.cells.len(), USE_NONE);
@@ -514,14 +640,22 @@ impl Cells {
                     }
                     if matches!(self.slots.get(&ci), Some(Slot::Loading)) && !taken.contains(&ci) {
                         let lvl = c.key.level as f32;
-                        let prio = (dmin + 1.0) / (1.0 + 0.5 * lvl) * if seen(r) { 1.0 } else { 3.0 };
+                        let prio =
+                            (dmin + 1.0) / (1.0 + 0.5 * lvl) * if seen(r) { 1.0 } else { 3.0 };
                         let path = dir.join(c.key.file_name());
                         let on_disk = present.as_ref().is_some_and(|p| p.contains(&path));
                         if c.key.level == 0 && moving && !on_disk {
                             self.slots.remove(&ci);
                             continue;
                         }
-                        jobs.push(Job { cell: ci, gen: self.gen, key: c.key, ents: c.ents.clone(), path, prio });
+                        jobs.push(Job {
+                            cell: ci,
+                            gen: self.gen,
+                            key: c.key,
+                            ents: c.ents.clone(),
+                            path,
+                            prio,
+                        });
                     }
                 }
             } else if ready && was {
@@ -537,7 +671,11 @@ impl Cells {
         {
             let mut q = self.shared.queue.lock().unwrap();
             q.clear();
-            jobs.sort_by(|a, b| a.prio.partial_cmp(&b.prio).unwrap_or(std::cmp::Ordering::Equal));
+            jobs.sort_by(|a, b| {
+                a.prio
+                    .partial_cmp(&b.prio)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             jobs.truncate(512);
             q.extend(jobs);
         }
@@ -547,7 +685,10 @@ impl Cells {
 
     /// What a visibility pass needs (shareable between its threads).
     pub fn view(&self) -> CellView<'_> {
-        CellView { ent_cell: self.index.as_ref().map_or(&[][..], |ix| &ix.ent_cell[..]), state: &self.state }
+        CellView {
+            ent_cell: self.index.as_ref().map_or(&[][..], |ix| &ix.ent_cell[..]),
+            state: &self.state,
+        }
     }
 
     /// After the pass: `pending` = per handover cell, placements in range
@@ -570,7 +711,9 @@ impl Cells {
         let mut any = false;
         let t0 = Instant::now();
         while t0.elapsed().as_millis() < 3 {
-            let Ok((gen, cell, g)) = rx.try_recv() else { break };
+            let Ok((gen, cell, g)) = rx.try_recv() else {
+                break;
+            };
             if gen != self.gen {
                 continue;
             }
@@ -578,7 +721,13 @@ impl Cells {
             match g {
                 Some(g) => {
                     self.bytes += g.bytes;
-                    self.slots.insert(cell, Slot::Ready { gpu: Arc::new(g), used: Instant::now() });
+                    self.slots.insert(
+                        cell,
+                        Slot::Ready {
+                            gpu: Arc::new(g),
+                            used: Instant::now(),
+                        },
+                    );
                 }
                 None => {
                     self.slots.insert(cell, Slot::Failed);
@@ -601,7 +750,11 @@ impl Cells {
             .slots
             .iter()
             .filter_map(|(&c, s)| match s {
-                Slot::Ready { gpu, used } if !self.drawn.contains(&c) && !self.handover.contains_key(&c) => Some((*used, c, gpu.bytes)),
+                Slot::Ready { gpu, used }
+                    if !self.drawn.contains(&c) && !self.handover.contains_key(&c) =>
+                {
+                    Some((*used, c, gpu.bytes))
+                }
                 _ => None,
             })
             .collect();
@@ -616,11 +769,18 @@ impl Cells {
     }
 
     /// Cells and their batches in range this frame. `eye` Y-up world.
-    pub fn draw_list(&mut self, eye: Vec3, k: f32, in_view: &dyn Fn(Vec3, Vec3) -> bool) -> Vec<(Arc<CellGpu>, Vec<u16>)> {
+    pub fn draw_list(
+        &mut self,
+        eye: Vec3,
+        k: f32,
+        in_view: &dyn Fn(Vec3, Vec3) -> bool,
+    ) -> Vec<(Arc<CellGpu>, Vec<u16>)> {
         let mut out = Vec::new();
         let mut nb = 0;
         for &c in self.drawn.iter().chain(self.handover.keys()) {
-            let Some(Slot::Ready { gpu, .. }) = self.slots.get(&c) else { continue };
+            let Some(Slot::Ready { gpu, .. }) = self.slots.get(&c) else {
+                continue;
+            };
             let gact: Vec<bool> = gpu
                 .groups
                 .iter()
@@ -634,7 +794,13 @@ impl Cells {
                     near < g.hi * k && far >= g.lo * k && in_view(lo, hi)
                 })
                 .collect();
-            let act: Vec<u16> = gpu.batches.iter().enumerate().filter(|(_, b)| gact.get(b.group as usize).copied().unwrap_or(false)).map(|(i, _)| i as u16).collect();
+            let act: Vec<u16> = gpu
+                .batches
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| gact.get(b.group as usize).copied().unwrap_or(false))
+                .map(|(i, _)| i as u16)
+                .collect();
             if !act.is_empty() {
                 nb += act.len();
                 out.push((gpu.clone(), act));

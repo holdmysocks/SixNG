@@ -32,7 +32,14 @@ pub struct BakeJob {
 
 impl Default for BakeJob {
     fn default() -> Self {
-        BakeJob { child: None, started: Instant::now(), log_start: 0, last_line: String::new(), finished: None, result: None }
+        BakeJob {
+            child: None,
+            started: Instant::now(),
+            log_start: 0,
+            last_line: String::new(),
+            finished: None,
+            result: None,
+        }
     }
 }
 
@@ -48,7 +55,12 @@ impl BakeJob {
     /// (missing required, missing optional) inputs, as World-data step names.
     pub fn missing_inputs(work: &str) -> (Vec<&'static str>, Vec<&'static str>) {
         let w = Path::new(work);
-        let full = w.join("placements_full").join("placements").join("levels").join("index.jsonl").exists();
+        let full = w
+            .join("placements_full")
+            .join("placements")
+            .join("levels")
+            .join("index.jsonl")
+            .exists();
         let mut req = Vec::new();
         let mut opt = Vec::new();
         for (rel, step, required) in INPUTS {
@@ -56,7 +68,11 @@ impl BakeJob {
                 continue;
             }
             if !w.join("out").join(rel).exists() {
-                if *required { req.push(*step) } else { opt.push(*step) }
+                if *required {
+                    req.push(*step)
+                } else {
+                    opt.push(*step)
+                }
             }
         }
         (req, opt)
@@ -67,7 +83,9 @@ impl BakeJob {
             return Ok(());
         }
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        self.log_start = std::fs::metadata(log_path(work)).map(|m| m.len()).unwrap_or(0);
+        self.log_start = std::fs::metadata(log_path(work))
+            .map(|m| m.len())
+            .unwrap_or(0);
         let child = Command::new(exe)
             .arg("--bake-map")
             .env("SIXNG_GAME", game)
@@ -111,7 +129,11 @@ impl BakeJob {
                     self.result = Some(if ok {
                         format!("Map baked in {}m {:02}s.", secs / 60, secs % 60)
                     } else {
-                        format!("Bake failed: {} (see {})", self.last_line, log_path(work).display())
+                        format!(
+                            "Bake failed: {} (see {})",
+                            self.last_line,
+                            log_path(work).display()
+                        )
                     });
                     self.finished = Some(ok);
                 }

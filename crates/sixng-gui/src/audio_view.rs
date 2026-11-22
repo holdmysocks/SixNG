@@ -57,7 +57,12 @@ pub struct AudioView {
 fn fmt_secs(s: f64) -> String {
     let s = s.max(0.0);
     if s >= 3600.0 {
-        format!("{}:{:02}:{:02}", (s / 3600.0) as u64, (s / 60.0) as u64 % 60, s as u64 % 60)
+        format!(
+            "{}:{:02}:{:02}",
+            (s / 3600.0) as u64,
+            (s / 60.0) as u64 % 60,
+            s as u64 % 60
+        )
     } else {
         format!("{}:{:04.1}", (s / 60.0) as u64, s % 60.0)
     }
@@ -100,7 +105,11 @@ impl AudioView {
 
     /// Ready for a scripted screenshot.
     pub fn idle(&self) -> bool {
-        self.load_started && !self.scanning && self.decoding.is_none() && self.pending_play.is_none() && (self.ix.is_some() || self.error.is_some())
+        self.load_started
+            && !self.scanning
+            && self.decoding.is_none()
+            && self.pending_play.is_none()
+            && (self.ix.is_some() || self.error.is_some())
     }
 
     fn out_dir(&self) -> PathBuf {
@@ -129,7 +138,9 @@ impl AudioView {
             self.scanning = true;
             let id = a.id.clone();
             std::thread::spawn(move || {
-                let r = audio::load_index(&work, &id).map(Arc::new).map_err(|e| e.to_string());
+                let r = audio::load_index(&work, &id)
+                    .map(Arc::new)
+                    .map_err(|e| e.to_string());
                 *slot.lock().unwrap() = Some(r);
             });
             return;
@@ -137,7 +148,8 @@ impl AudioView {
         self.scanning = true;
         let prog = self.scan_progress.clone();
         std::thread::spawn(move || {
-            let p: sixng_core::export::Progress = Arc::new(move |_s: &str, d: u64, t: u64| *prog.lock().unwrap() = (d, t));
+            let p: sixng_core::export::Progress =
+                Arc::new(move |_s: &str, d: u64, t: u64| *prog.lock().unwrap() = (d, t));
             let r = audio::scan(&a.path, &a.id, p).and_then(|ix| {
                 audio::save_index(&work, &ix)?;
                 Ok(ix)
@@ -177,15 +189,27 @@ impl AudioView {
     fn refilter(&mut self) {
         self.dirty = false;
         let Some(ix) = &self.ix else { return };
-        let q = self.search.trim().to_ascii_lowercase().trim_start_matches("0x").to_string();
+        let q = self
+            .search
+            .trim()
+            .to_ascii_lowercase()
+            .trim_start_matches("0x")
+            .to_string();
         let min = self.min_seconds as f64;
         self.rows = ix
             .banks
             .iter()
             .enumerate()
             .filter(|(_, b)| {
-                let playable = b.streams.iter().any(|s| s.layout != "none" && s.seconds() >= min);
-                let hit = q.is_empty() || format!("{:x}", b.off).contains(&q) || b.streams.iter().any(|s| format!("{:08x}", s.id).contains(&q));
+                let playable = b
+                    .streams
+                    .iter()
+                    .any(|s| s.layout != "none" && s.seconds() >= min);
+                let hit = q.is_empty()
+                    || format!("{:x}", b.off).contains(&q)
+                    || b.streams
+                        .iter()
+                        .any(|s| format!("{:08x}", s.id).contains(&q));
                 playable && hit
             })
             .map(|(i, _)| i)
@@ -195,7 +219,9 @@ impl AudioView {
     fn play(&mut self, b: &Bank, s: &Stream) {
         self.stop();
         self.error = None;
-        let Some(a) = self.archive.clone() else { return };
+        let Some(a) = self.archive.clone() else {
+            return;
+        };
         let key = (b.off, s.id);
         self.decoding = Some(key);
         let (b, s) = (b.clone(), s.clone());
@@ -216,12 +242,18 @@ impl AudioView {
 
     fn play_pcm(&mut self, d: Decoded) {
         let r = (|| -> Result<Player, String> {
-            let (stream, handle) = rodio::OutputStream::try_default().map_err(|e| format!("no audio output: {e}"))?;
+            let (stream, handle) =
+                rodio::OutputStream::try_default().map_err(|e| format!("no audio output: {e}"))?;
             let sink = rodio::Sink::try_new(&handle).map_err(|e| e.to_string())?;
             let len = d.pcm.len() as f64 / d.ch.max(1) as f64 / 48000.0;
             sink.set_volume(self.out_volume());
             sink.append(rodio::buffer::SamplesBuffer::new(d.ch as u16, 48000, d.pcm));
-            Ok(Player { _stream: stream, sink, key: d.key, len })
+            Ok(Player {
+                _stream: stream,
+                sink,
+                key: d.key,
+                len,
+            })
         })();
         match r {
             Ok(p) => self.player = Some(p),
@@ -230,7 +262,11 @@ impl AudioView {
     }
 
     fn out_volume(&self) -> f32 {
-        if self.muted { 0.0 } else { self.volume }
+        if self.muted {
+            0.0
+        } else {
+            self.volume
+        }
     }
 
     /// Speaker button (mute / unmute) and a volume slider.
@@ -244,11 +280,17 @@ impl AudioView {
         };
         let mut changed = false;
         let tip = if self.muted { "Unmute" } else { "Mute" };
-        if ui.button(egui::RichText::new(icon).size(16.0)).on_hover_text(tip).clicked() {
+        if ui
+            .button(egui::RichText::new(icon).size(16.0))
+            .on_hover_text(tip)
+            .clicked()
+        {
             self.muted = !self.muted;
             changed = true;
         }
-        let r = ui.add(egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false)).on_hover_text(format!("Volume {:.0}%", self.volume * 100.0));
+        let r = ui
+            .add(egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false))
+            .on_hover_text(format!("Volume {:.0}%", self.volume * 100.0));
         if r.changed() {
             self.muted = false;
             changed = true;
@@ -267,7 +309,9 @@ impl AudioView {
     }
 
     fn export(&mut self, b: &Bank, s: Option<&Stream>, fmt: &str) {
-        let Some(a) = self.archive.clone() else { return };
+        let Some(a) = self.archive.clone() else {
+            return;
+        };
         let dir = self.out_dir();
         let r = (|| -> anyhow::Result<Vec<String>> {
             let bytes = audio::read_bank(&a.path, b)?;
@@ -278,7 +322,11 @@ impl AudioView {
                 return Ok(vec![p.display().to_string()]);
             }
             let mut files = Vec::new();
-            for st in b.streams.iter().filter(|st| s.map_or(st.exportable(), |x| x.id == st.id)) {
+            for st in b
+                .streams
+                .iter()
+                .filter(|st| s.map_or(st.exportable(), |x| x.id == st.id))
+            {
                 files.extend(audio::export_stream(&bytes, b, st, &dir, fmt)?);
             }
             Ok(files)
@@ -317,7 +365,11 @@ impl AudioView {
                     return;
                 }
                 ui.label("Scanning audio.rpf for audio banks (reads the whole archive once, a few minutes)…");
-                ui.add(egui::ProgressBar::new(f).show_percentage().desired_width(420.0));
+                ui.add(
+                    egui::ProgressBar::new(f)
+                        .show_percentage()
+                        .desired_width(420.0),
+                );
             } else if self.archive.is_some() {
                 ui.label("audio.rpf has not been scanned yet. The scan reads the archive once and saves an index to <work>/index.");
                 if ui.button("Scan audio.rpf").clicked() {
@@ -340,17 +392,45 @@ impl AudioView {
         }
         ui.horizontal(|ui| {
             ui.label("Find:");
-            if ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("bank offset or stream id (hex)").desired_width(220.0)).changed() {
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.search)
+                        .hint_text("bank offset or stream id (hex)")
+                        .desired_width(220.0),
+                )
+                .changed()
+            {
                 self.dirty = true;
             }
             ui.label("Min length:");
-            if ui.add(egui::Slider::new(&mut self.min_seconds, 0.0..=120.0).suffix(" s").logarithmic(true).max_decimals(1)).changed() {
+            if ui
+                .add(
+                    egui::Slider::new(&mut self.min_seconds, 0.0..=120.0)
+                        .suffix(" s")
+                        .logarithmic(true)
+                        .max_decimals(1),
+                )
+                .changed()
+            {
                 self.dirty = true;
             }
             self.volume_ui(ui);
-            let n: usize = ix.banks.iter().map(|b| b.streams.iter().filter(|s| s.layout != "none").count()).sum();
-            ui.weak(format!("{} of {} banks, {} streams", self.rows.len(), ix.banks.len(), n));
-            if ui.small_button("Rescan").on_hover_text("Scan audio.rpf again").clicked() {
+            let n: usize = ix
+                .banks
+                .iter()
+                .map(|b| b.streams.iter().filter(|s| s.layout != "none").count())
+                .sum();
+            ui.weak(format!(
+                "{} of {} banks, {} streams",
+                self.rows.len(),
+                ix.banks.len(),
+                n
+            ));
+            if ui
+                .small_button("Rescan")
+                .on_hover_text("Scan audio.rpf again")
+                .clicked()
+            {
                 self.ix = None;
                 self.start_load(true);
             }
@@ -362,7 +442,11 @@ impl AudioView {
                     p.sink.stop();
                 }
                 ui.label(format!("{:x} / {:08x}", p.key.0, p.key.1));
-                ui.add(egui::ProgressBar::new((pos / p.len.max(0.001)) as f32).text(format!("{} / {}", fmt_secs(pos), fmt_secs(p.len))).desired_width(360.0));
+                ui.add(
+                    egui::ProgressBar::new((pos / p.len.max(0.001)) as f32)
+                        .text(format!("{} / {}", fmt_secs(pos), fmt_secs(p.len)))
+                        .desired_width(360.0),
+                );
             });
             if p.sink.empty() {
                 self.player = None;

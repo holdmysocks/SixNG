@@ -13,8 +13,22 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-pub const MODES: [&str; 8] = ["shaded", "albedo", "normals", "UV checker", "texture slot", "BCPack gaps", "vertex colour", "lighting only"];
-pub const RMA_ORDERS: [&str; 4] = ["R rough / G metal / B AO", "ORM (R AO / G rough / B metal)", "R metal / G rough / B AO", "ignore packed"];
+pub const MODES: [&str; 8] = [
+    "shaded",
+    "albedo",
+    "normals",
+    "UV checker",
+    "texture slot",
+    "BCPack gaps",
+    "vertex colour",
+    "lighting only",
+];
+pub const RMA_ORDERS: [&str; 4] = [
+    "R rough / G metal / B AO",
+    "ORM (R AO / G rough / B metal)",
+    "R metal / G rough / B AO",
+    "ignore packed",
+];
 pub const FINISHES: [&str; 4] = ["metallic", "matte", "chrome", "gloss"];
 pub const SLOTS: [&str; 4] = ["base colour", "normal", "packed RMA", "emissive"];
 
@@ -155,7 +169,9 @@ impl ModelView {
     pub fn new(game: &str, work: &str) -> Self {
         ModelView {
             query: String::new(),
-            status: "Type an entry id (levels.rpf@219c8b010), a name regex (^phoenix) or open a .glb.".into(),
+            status:
+                "Type an entry id (levels.rpf@219c8b010), a name regex (^phoenix) or open a .glb."
+                    .into(),
             pending: Arc::new(Mutex::new(None)),
             loading: false,
             loaded: None,
@@ -219,7 +235,9 @@ impl ModelView {
         let work = PathBuf::from(&self.work);
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let r = index_for(&ws, "packs", &idx).and_then(|(a, ix)| sixng_core::groom::catalog_cached(&work, &a, &ix.entries)).map_err(|e| format!("{e:#}"));
+            let r = index_for(&ws, "packs", &idx)
+                .and_then(|(a, ix)| sixng_core::groom::catalog_cached(&work, &a, &ix.entries))
+                .map_err(|e| format!("{e:#}"));
             *slot.lock().unwrap() = Some(r);
             ctx.request_repaint();
         });
@@ -261,7 +279,11 @@ impl ModelView {
         let idx = self.indexes.clone();
         let slot = self.hair.pending.clone();
         let dir = self.cache_dir().join("grooms");
-        let (sel, hw, rgb) = (self.hair.selected.clone(), self.hair.width_mm / 1000.0, self.hair.colour);
+        let (sel, hw, rgb) = (
+            self.hair.selected.clone(),
+            self.hair.width_mm / 1000.0,
+            self.hair.colour,
+        );
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<Vec<glb::Model>> {
@@ -273,7 +295,10 @@ impl ModelView {
                     // linear colour from the sRGB picker value
                     let lin = rgb.map(|c| c.powf(2.2));
                     let p = dir.join(format!("{off:x}.glb"));
-                    std::fs::write(&p, g.ribbon_glb(&format!("groom_{off:x}"), hw, lin, serde_json::json!({})))?;
+                    std::fs::write(
+                        &p,
+                        g.ribbon_glb(&format!("groom_{off:x}"), hw, lin, serde_json::json!({})),
+                    )?;
                     out.push(glb::load(&p, &dir)?);
                 }
                 Ok(out)
@@ -362,7 +387,13 @@ impl ModelView {
         if !self.hair.settled() {
             return false;
         }
-        let Some(l) = self.loaded.as_ref().filter(|l| l.info["wheel_mounts"].is_array()) else { return true };
+        let Some(l) = self
+            .loaded
+            .as_ref()
+            .filter(|l| l.info["wheel_mounts"].is_array())
+        else {
+            return true;
+        };
         let veh = match &*self.vehicles.state.lock().unwrap() {
             crate::vehicle_db::State::Idle | crate::vehicle_db::State::Loading(_) => false,
             crate::vehicle_db::State::Failed(_) => true,
@@ -371,7 +402,9 @@ impl ModelView {
                 !db.contains_key(&key) || self.veh_applied == key
             }
         };
-        let wheels = !self.wheels_on || (!self.wheel_loading && self.wheel_key == format!("{}|{}", self.wheel_rim, self.wheel_tyre));
+        let wheels = !self.wheels_on
+            || (!self.wheel_loading
+                && self.wheel_key == format!("{}|{}", self.wheel_rim, self.wheel_tyre));
         veh && wheels
     }
 
@@ -409,7 +442,16 @@ impl ModelView {
             return None;
         }
         let root = (!id.contains("#outfit:")).then(|| id.to_string());
-        Some(root.into_iter().chain(l.parts.iter().filter(|o| l.selected.contains(&o.off)).map(|o| o.id.clone())).collect())
+        Some(
+            root.into_iter()
+                .chain(
+                    l.parts
+                        .iter()
+                        .filter(|o| l.selected.contains(&o.off))
+                        .map(|o| o.id.clone()),
+                )
+                .collect(),
+        )
     }
 
     /// Parts panel for animals and characters: one choice (or none) per
@@ -420,49 +462,84 @@ impl ModelView {
         if l.parts.is_empty() {
             return None;
         }
-        let mut groups: std::collections::BTreeMap<&str, Vec<&crate::assemble::PartOpt>> = Default::default();
+        let mut groups: std::collections::BTreeMap<&str, Vec<&crate::assemble::PartOpt>> =
+            Default::default();
         for o in &l.parts {
             groups.entry(o.group.as_str()).or_default().push(o);
         }
         let mut sel = l.selected.clone();
         let mut changed = false;
-        ui.heading(format!("Parts ({} shown of {})", l.selected.len(), l.parts.len()));
-        ui.label(egui::RichText::new("One choice per group. Accessories and alternate sets start off.").weak());
-        egui::Grid::new("parts_grid").num_columns(2).striped(true).show(ui, |ui| {
-            for (g, opts) in &groups {
-                let cur = opts.iter().find(|o| l.selected.contains(&o.off));
-                ui.label(*g);
-                let text = cur.map(|o| o.label.clone()).unwrap_or_else(|| "none".into());
-                egui::ComboBox::from_id_salt(("part", *g)).selected_text(text).width(240.0).show_ui(ui, |ui| {
-                    let mut set = |keep: Option<u64>| {
-                        sel.retain(|x| !opts.iter().any(|o| o.off == *x));
-                        sel.extend(keep);
-                        changed = true;
-                    };
-                    if ui.selectable_label(cur.is_none(), "none").clicked() && cur.is_some() {
-                        set(None);
-                    }
-                    for o in opts {
-                        let mut label = o.label.clone();
-                        if o.default && o.label != "default" {
-                            label += "  (default)";
-                        }
-                        let on = cur.map(|c| c.off) == Some(o.off);
-                        if ui.selectable_label(on, label).on_hover_text(&o.name).clicked() && !on {
-                            set(Some(o.off));
-                        }
-                    }
-                });
-                ui.end_row();
-            }
-        });
+        ui.heading(format!(
+            "Parts ({} shown of {})",
+            l.selected.len(),
+            l.parts.len()
+        ));
+        ui.label(
+            egui::RichText::new("One choice per group. Accessories and alternate sets start off.")
+                .weak(),
+        );
+        egui::Grid::new("parts_grid")
+            .num_columns(2)
+            .striped(true)
+            .show(ui, |ui| {
+                for (g, opts) in &groups {
+                    let cur = opts.iter().find(|o| l.selected.contains(&o.off));
+                    ui.label(*g);
+                    let text = cur
+                        .map(|o| o.label.clone())
+                        .unwrap_or_else(|| "none".into());
+                    egui::ComboBox::from_id_salt(("part", *g))
+                        .selected_text(text)
+                        .width(240.0)
+                        .show_ui(ui, |ui| {
+                            let mut set = |keep: Option<u64>| {
+                                sel.retain(|x| !opts.iter().any(|o| o.off == *x));
+                                sel.extend(keep);
+                                changed = true;
+                            };
+                            if ui.selectable_label(cur.is_none(), "none").clicked() && cur.is_some()
+                            {
+                                set(None);
+                            }
+                            for o in opts {
+                                let mut label = o.label.clone();
+                                if o.default && o.label != "default" {
+                                    label += "  (default)";
+                                }
+                                let on = cur.map(|c| c.off) == Some(o.off);
+                                if ui
+                                    .selectable_label(on, label)
+                                    .on_hover_text(&o.name)
+                                    .clicked()
+                                    && !on
+                                {
+                                    set(Some(o.off));
+                                }
+                            }
+                        });
+                    ui.end_row();
+                }
+            });
         // named sets that span several groups (`08 collarharness`: body + harness)
-        let mut sets: Vec<&str> = l.parts.iter().filter(|o| o.label != "default" && o.label.contains(' ') && l.parts.iter().filter(|p| p.label == o.label).count() > 1).map(|o| o.label.as_str()).collect();
+        let mut sets: Vec<&str> = l
+            .parts
+            .iter()
+            .filter(|o| {
+                o.label != "default"
+                    && o.label.contains(' ')
+                    && l.parts.iter().filter(|p| p.label == o.label).count() > 1
+            })
+            .map(|o| o.label.as_str())
+            .collect();
         sets.sort();
         sets.dedup();
         ui.horizontal_wrapped(|ui| {
             for s in &sets {
-                if ui.button(format!("set {s}")).on_hover_text("Switch every group that has this set to it").clicked() {
+                if ui
+                    .button(format!("set {s}"))
+                    .on_hover_text("Switch every group that has this set to it")
+                    .clicked()
+                {
                     for opts in groups.values() {
                         if let Some(o) = opts.iter().find(|o| o.label == *s) {
                             sel.retain(|x| !opts.iter().any(|p| p.off == *x));
@@ -472,18 +549,38 @@ impl ModelView {
                     changed = true;
                 }
             }
-            if ui.button("Defaults").on_hover_text("Back to the default parts").clicked() {
-                sel = l.parts.iter().filter(|o| o.default).map(|o| o.off).collect();
+            if ui
+                .button("Defaults")
+                .on_hover_text("Back to the default parts")
+                .clicked()
+            {
+                sel = l
+                    .parts
+                    .iter()
+                    .filter(|o| o.default)
+                    .map(|o| o.off)
+                    .collect();
                 changed = true;
             }
         });
         ui.separator();
-        changed.then(|| format!("{}#parts={}", l.base, sel.iter().map(|o| format!("{o:x}")).collect::<Vec<_>>().join(",")))
+        changed.then(|| {
+            format!(
+                "{}#parts={}",
+                l.base,
+                sel.iter()
+                    .map(|o| format!("{o:x}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
     }
 
     pub fn open_lod(&mut self, lod: usize, ctx: &egui::Context) {
         let Some(l) = &self.loaded else { return };
-        let Some(p) = l.lods.get(lod).cloned() else { return };
+        let Some(p) = l.lods.get(lod).cloned() else {
+            return;
+        };
         let root = l.out_root.clone();
         let lods = l.lods.clone();
         let source = l.source.clone();
@@ -493,18 +590,37 @@ impl ModelView {
         let slot = self.pending.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let r = glb::load(&p, &root).map(|model| Loaded { model, lods, lod, out_root: root, source, info, parts, selected, base }).map_err(|e| format!("{e:#}"));
+            let r = glb::load(&p, &root)
+                .map(|model| Loaded {
+                    model,
+                    lods,
+                    lod,
+                    out_root: root,
+                    source,
+                    info,
+                    parts,
+                    selected,
+                    base,
+                })
+                .map_err(|e| format!("{e:#}"));
             *slot.lock().unwrap() = Some(r);
             ctx.request_repaint();
         });
     }
 
     fn poll(&mut self, rs: &egui_wgpu::RenderState) {
-        let Some(r) = self.pending.lock().unwrap().take() else { return };
+        let Some(r) = self.pending.lock().unwrap().take() else {
+            return;
+        };
         self.loading = false;
         match r {
             Ok(l) => {
-                let keep_cam = std::mem::take(&mut self.keep_cam_once) || self.loaded.as_ref().map(|o| o.source == l.source).unwrap_or(false);
+                let keep_cam = std::mem::take(&mut self.keep_cam_once)
+                    || self
+                        .loaded
+                        .as_ref()
+                        .map(|o| o.source == l.source)
+                        .unwrap_or(false);
                 let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
                 let mut g = ren.upload(rs, &l.model, &[]);
                 ren.ensure_edges(rs, &mut g, &l.model);
@@ -526,7 +642,12 @@ impl ModelView {
                     l.model.joints.len(),
                     l.model.images.len()
                 );
-                let missing = l.model.materials.iter().filter(|m| m.gap == "no colour texture").count();
+                let missing = l
+                    .model
+                    .materials
+                    .iter()
+                    .filter(|m| m.gap == "no colour texture")
+                    .count();
                 if missing > 0 {
                     self.status += &format!(
                         " · {missing} of {} materials have no colour texture (not decodable or not in the game files; shown plain white, not guessed)",
@@ -576,11 +697,20 @@ impl ModelView {
         }
         ui.heading(format!("Vehicle: {key}"));
         let ws = |x: Option<f32>| x.map(|x| format!("{x:.4}")).unwrap_or_else(|| "?".into());
-        ui.label(format!("wheelScale {} / rear {}", ws(v.wheel_scale), ws(v.wheel_scale_rear)));
+        ui.label(format!(
+            "wheelScale {} / rear {}",
+            ws(v.wheel_scale),
+            ws(v.wheel_scale_rear)
+        ));
         if !v.configs.is_empty() {
             let label = |i: usize| {
                 let c = &v.configs[i];
-                format!("{} · {} · {}", i + 1, c.rim.as_deref().unwrap_or("no rim"), c.tyre.as_deref().unwrap_or("no tyre"))
+                format!(
+                    "{} · {} · {}",
+                    i + 1,
+                    c.rim.as_deref().unwrap_or("no rim"),
+                    c.tyre.as_deref().unwrap_or("no tyre")
+                )
             };
             let mut pick = None;
             egui::ComboBox::from_label(format!("config ({})", v.configs.len()))
@@ -590,10 +720,16 @@ impl ModelView {
                     for i in 0..v.configs.len() {
                         ui.horizontal(|ui| {
                             if let Some(c) = v.configs[i].colour {
-                                let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                                let (r, _) = ui.allocate_exact_size(
+                                    egui::vec2(12.0, 12.0),
+                                    egui::Sense::hover(),
+                                );
                                 ui.painter().rect_filled(r, 2.0, srgb32(c));
                             }
-                            if ui.selectable_label(self.veh_cfg == Some(i), label(i)).clicked() {
+                            if ui
+                                .selectable_label(self.veh_cfg == Some(i), label(i))
+                                .clicked()
+                            {
                                 pick = Some(i);
                             }
                         });
@@ -609,11 +745,26 @@ impl ModelView {
                 ui.set_max_width(300.0);
                 ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
                 for (c, w) in p {
-                    let (r, resp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+                    let (r, resp) =
+                        ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
                     ui.painter().rect_filled(r, 2.0, srgb32(*c));
-                    ui.painter().rect_stroke(r, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)), egui::StrokeKind::Inside);
+                    ui.painter().rect_stroke(
+                        r,
+                        2.0,
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)),
+                        egui::StrokeKind::Inside,
+                    );
                     let col = srgb32(*c);
-                    if resp.on_hover_text(format!("#{:02x}{:02x}{:02x} · {:.1} %", col.r(), col.g(), col.b(), w * 100.0)).clicked() {
+                    if resp
+                        .on_hover_text(format!(
+                            "#{:02x}{:02x}{:02x} · {:.1} %",
+                            col.r(),
+                            col.g(),
+                            col.b(),
+                            w * 100.0
+                        ))
+                        .clicked()
+                    {
                         self.look.paint = *c;
                         self.veh_cfg = None;
                     }
@@ -621,7 +772,14 @@ impl ModelView {
             });
         }
         if v.palettes.len() > 4 {
-            ui.label(egui::RichText::new(format!("{} more palettes in vehicles.json", v.palettes.len() - 4)).weak().small());
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} more palettes in vehicles.json",
+                    v.palettes.len() - 4
+                ))
+                .weak()
+                .small(),
+            );
         }
         ui.label(egui::RichText::new("Colours read as linear, shown in sRGB (unverified).").weak().small()).on_hover_text("Spawn configurations each set a body colour, rim and tyre; the first is applied when a car opens. Stored colours are all dark, so they are taken as linear values; not checked in game.");
         ui.separator();
@@ -660,7 +818,10 @@ impl ModelView {
                 a.iter()
                     .filter_map(|m| {
                         let p: [f32; 3] = serde_json::from_value(m["pivot"].clone()).ok()?;
-                        Some((m["bone"].as_str()?.to_string(), Vec3::new(p[0], p[2], -p[1])))
+                        Some((
+                            m["bone"].as_str()?.to_string(),
+                            Vec3::new(p[0], p[2], -p[1]),
+                        ))
                     })
                     .collect()
             })
@@ -702,14 +863,21 @@ impl ModelView {
             self.wheel_key = key;
             self.wheels.clear();
             self.wheel_loading = true;
-            let qs = [format!("^{}$", self.wheel_rim), format!("^{}$", self.wheel_tyre)];
+            let qs = [
+                format!("^{}$", self.wheel_rim),
+                format!("^{}$", self.wheel_tyre),
+            ];
             let ws = Workspace::new(&self.game, &self.work);
             let cache = self.cache_dir();
             let slot = self.wheel_pending.clone();
             let idx = self.indexes.clone();
             let ctx = ctx.clone();
             std::thread::spawn(move || {
-                let r: Result<Vec<Loaded>, String> = qs.iter().filter(|q| q.len() > 3).map(|q| load_query(&ws, &cache, q, 0, &idx).map_err(|e| format!("{e:#}"))).collect();
+                let r: Result<Vec<Loaded>, String> = qs
+                    .iter()
+                    .filter(|q| q.len() > 3)
+                    .map(|q| load_query(&ws, &cache, q, 0, &idx).map_err(|e| format!("{e:#}")))
+                    .collect();
                 *slot.lock().unwrap() = Some(r);
                 ctx.request_repaint();
             });
@@ -717,12 +885,29 @@ impl ModelView {
         let inst: Vec<render3d::Instance> = mounts
             .iter()
             .map(|(bone, p)| {
-                let right = bone.strip_prefix("wheel_").map(|s| s.starts_with('r')).unwrap_or(false);
-                let mirror = if right { Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0)) } else { Mat4::IDENTITY };
+                let right = bone
+                    .strip_prefix("wheel_")
+                    .map(|s| s.starts_with('r'))
+                    .unwrap_or(false);
+                let mirror = if right {
+                    Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0))
+                } else {
+                    Mat4::IDENTITY
+                };
                 let spin = Mat4::from_quat(Quat::from_rotation_x(self.wheel_spin));
-                let rear = bone.strip_prefix("wheel_").map(|s| s.chars().nth(1) == Some('r')).unwrap_or(false);
-                let sc = if rear { self.wheel_scale_rear } else { self.wheel_scale };
-                render3d::Instance::new(Mat4::from_translation(*p) * spin * mirror * Mat4::from_scale(Vec3::splat(sc)), false)
+                let rear = bone
+                    .strip_prefix("wheel_")
+                    .map(|s| s.chars().nth(1) == Some('r'))
+                    .unwrap_or(false);
+                let sc = if rear {
+                    self.wheel_scale_rear
+                } else {
+                    self.wheel_scale
+                };
+                render3d::Instance::new(
+                    Mat4::from_translation(*p) * spin * mirror * Mat4::from_scale(Vec3::splat(sc)),
+                    false,
+                )
             })
             .collect();
         if let Some(ren) = &self.renderer {
@@ -734,10 +919,19 @@ impl ModelView {
 
     /// Joint matrices (global * inverse bind) with wheel / door animation.
     fn joint_mats(&self) -> (Vec<Mat4>, Vec<Mat4>) {
-        let Some(l) = &self.loaded else { return (vec![], vec![]) };
+        let Some(l) = &self.loaded else {
+            return (vec![], vec![]);
+        };
         let js = &l.model.joints;
         let mut global: Vec<Option<Mat4>> = vec![None; js.len()];
-        fn g(i: usize, js: &[glb::Joint], global: &mut Vec<Option<Mat4>>, spin: f32, door: f32, depth: usize) -> Mat4 {
+        fn g(
+            i: usize,
+            js: &[glb::Joint],
+            global: &mut Vec<Option<Mat4>>,
+            spin: f32,
+            door: f32,
+            depth: usize,
+        ) -> Mat4 {
             if let Some(m) = global[i] {
                 return m;
             }
@@ -747,7 +941,12 @@ impl ModelView {
             if spin != 0.0 && n.starts_with("wheel_") && !n.contains("dummy") {
                 local = local * Mat4::from_quat(Quat::from_rotation_x(spin));
             }
-            if door != 0.0 && matches!(n.as_str(), "door_dside_f" | "door_dside_r" | "door_pside_f" | "door_pside_r") {
+            if door != 0.0
+                && matches!(
+                    n.as_str(),
+                    "door_dside_f" | "door_dside_r" | "door_pside_f" | "door_pside_r"
+                )
+            {
                 // hinge axis is vertical (glTF +Y); driver side is -X
                 let side = if n.contains("dside") { -1.0 } else { 1.0 };
                 local = local * Mat4::from_quat(Quat::from_rotation_y(side * door));
@@ -759,28 +958,52 @@ impl ModelView {
             global[i] = Some(m);
             m
         }
-        let gl: Vec<Mat4> = (0..js.len()).map(|i| g(i, js, &mut global, self.wheel_spin, self.door_open, 0)).collect();
-        let skin: Vec<Mat4> = gl.iter().zip(js).map(|(m, j)| *m * Mat4::from_cols_array(&j.ibm)).collect();
+        let gl: Vec<Mat4> = (0..js.len())
+            .map(|i| g(i, js, &mut global, self.wheel_spin, self.door_open, 0))
+            .collect();
+        let skin: Vec<Mat4> = gl
+            .iter()
+            .zip(js)
+            .map(|(m, j)| *m * Mat4::from_cols_array(&j.ibm))
+            .collect();
         (gl, skin)
     }
 
     fn lines(&self, globals: &[Mat4]) -> (Vec<LineV>, Vec<LineV>) {
         let mut under = Vec::new();
         let mut top = Vec::new();
-        let Some(l) = &self.loaded else { return (under, top) };
+        let Some(l) = &self.loaded else {
+            return (under, top);
+        };
         if self.show_skeleton {
             for (i, j) in l.model.joints.iter().enumerate() {
                 let p = globals[i].w_axis.truncate();
                 if let Some(pa) = j.parent {
                     let q = globals[pa].w_axis.truncate();
                     let a = if pa == 0 { 70 } else { 255 };
-                    top.push(LineV { pos: q.into(), col: [255, 220, 40, a] });
-                    top.push(LineV { pos: p.into(), col: [255, 120, 40, a] });
+                    top.push(LineV {
+                        pos: q.into(),
+                        col: [255, 220, 40, a],
+                    });
+                    top.push(LineV {
+                        pos: p.into(),
+                        col: [255, 120, 40, a],
+                    });
                 }
                 let s = (self.cam.dist * 0.01).max(0.01);
-                for (ax, c) in [(globals[i].x_axis, [255, 60, 60, 255]), (globals[i].y_axis, [60, 255, 60, 255]), (globals[i].z_axis, [80, 120, 255, 255])] {
-                    top.push(LineV { pos: p.into(), col: c });
-                    top.push(LineV { pos: (p + ax.truncate().normalize_or_zero() * s).into(), col: c });
+                for (ax, c) in [
+                    (globals[i].x_axis, [255, 60, 60, 255]),
+                    (globals[i].y_axis, [60, 255, 60, 255]),
+                    (globals[i].z_axis, [80, 120, 255, 255]),
+                ] {
+                    top.push(LineV {
+                        pos: p.into(),
+                        col: c,
+                    });
+                    top.push(LineV {
+                        pos: (p + ax.truncate().normalize_or_zero() * s).into(),
+                        col: c,
+                    });
                 }
             }
         }
@@ -792,8 +1015,14 @@ impl ModelView {
                 for v in m.verts.iter().step_by(step) {
                     let p = Vec3::from(v.pos);
                     let n = Vec3::from(v.nrm);
-                    under.push(LineV { pos: p.into(), col: [80, 160, 255, 255] });
-                    under.push(LineV { pos: (p + n * len).into(), col: [80, 255, 160, 255] });
+                    under.push(LineV {
+                        pos: p.into(),
+                        col: [80, 160, 255, 255],
+                    });
+                    under.push(LineV {
+                        pos: (p + n * len).into(),
+                        col: [80, 255, 160, 255],
+                    });
                 }
                 budget = budget.saturating_sub(m.verts.len() / step);
             }
@@ -806,27 +1035,51 @@ impl ModelView {
         let n = ((ext * 0.75) / step).ceil() as i32;
         let c = (lo + hi) * 0.5;
         for k in -n..=n {
-            let col = if k == 0 { [255, 255, 255, 90] } else { [255, 255, 255, 35] };
+            let col = if k == 0 {
+                [255, 255, 255, 90]
+            } else {
+                [255, 255, 255, 35]
+            };
             let x = c.x + k as f32 * step;
             let z = c.z + k as f32 * step;
-            under.push(LineV { pos: [x, lo.y, c.z - n as f32 * step], col });
-            under.push(LineV { pos: [x, lo.y, c.z + n as f32 * step], col });
-            under.push(LineV { pos: [c.x - n as f32 * step, lo.y, z], col });
-            under.push(LineV { pos: [c.x + n as f32 * step, lo.y, z], col });
+            under.push(LineV {
+                pos: [x, lo.y, c.z - n as f32 * step],
+                col,
+            });
+            under.push(LineV {
+                pos: [x, lo.y, c.z + n as f32 * step],
+                col,
+            });
+            under.push(LineV {
+                pos: [c.x - n as f32 * step, lo.y, z],
+                col,
+            });
+            under.push(LineV {
+                pos: [c.x + n as f32 * step, lo.y, z],
+                col,
+            });
         }
         (under, top)
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, render_state: Option<&egui_wgpu::RenderState>) {
         let ctx = ui.ctx().clone();
-        let Some(rs) = frame.wgpu_render_state() else {
+        let Some(rs) = render_state else {
             ui.label("The model viewer needs the wgpu renderer.");
             return;
         };
         self.poll(rs);
         // ↑/↓ step through the picker list (when no text field has focus)
-        if self.show_picker && !ctx.wants_keyboard_input() && !self.loading {
-            let d = ui.input(|i| if i.key_pressed(egui::Key::ArrowDown) { 1 } else if i.key_pressed(egui::Key::ArrowUp) { -1 } else { 0 });
+        if self.show_picker && !ctx.egui_wants_keyboard_input() && !self.loading {
+            let d = ui.input(|i| {
+                if i.key_pressed(egui::Key::ArrowDown) {
+                    1
+                } else if i.key_pressed(egui::Key::ArrowUp) {
+                    -1
+                } else {
+                    0
+                }
+            });
             if d != 0 {
                 if let Some(id) = self.picker.step(d) {
                     self.open(&id, 0, &ctx);
@@ -835,14 +1088,23 @@ impl ModelView {
         }
         // toolbar
         ui.horizontal(|ui| {
-            ui.toggle_value(&mut self.show_picker, "☰ Models").on_hover_text("Show / hide the model list");
+            ui.toggle_value(&mut self.show_picker, "☰ Models")
+                .on_hover_text("Show / hide the model list");
             if self.show_picker {
-                if ui.add_enabled(!self.loading, egui::Button::new("◀")).on_hover_text("previous in list (↑)").clicked() {
+                if ui
+                    .add_enabled(!self.loading, egui::Button::new("◀"))
+                    .on_hover_text("previous in list (↑)")
+                    .clicked()
+                {
                     if let Some(id) = self.picker.step(-1) {
                         self.open(&id, 0, &ctx);
                     }
                 }
-                if ui.add_enabled(!self.loading, egui::Button::new("▶")).on_hover_text("next in list (↓)").clicked() {
+                if ui
+                    .add_enabled(!self.loading, egui::Button::new("▶"))
+                    .on_hover_text("next in list (↓)")
+                    .clicked()
+                {
                     if let Some(id) = self.picker.step(1) {
                         self.open(&id, 0, &ctx);
                     }
@@ -850,13 +1112,24 @@ impl ModelView {
             }
             ui.separator();
             ui.label("Model:");
-            let r = ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("levels.rpf@219c8b010 · ^phoenix · path.glb").desired_width(320.0));
-            if (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) || ui.add_enabled(!self.loading, egui::Button::new("Open")).clicked() {
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.query)
+                    .hint_text("levels.rpf@219c8b010 · ^phoenix · path.glb")
+                    .desired_width(320.0),
+            );
+            if (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                || ui
+                    .add_enabled(!self.loading, egui::Button::new("Open"))
+                    .clicked()
+            {
                 let q = self.query.clone();
                 self.open(&q, 0, &ctx);
             }
             if ui.button("Open .glb…").clicked() {
-                if let Some(p) = rfd::FileDialog::new().add_filter("glb", &["glb"]).pick_file() {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("glb", &["glb"])
+                    .pick_file()
+                {
                     self.open(&p.display().to_string(), 0, &ctx);
                 }
             }
@@ -871,7 +1144,11 @@ impl ModelView {
                     let primary = primary_lod(&l.info);
                     for k in 0..l.lods.len() {
                         let level = lod_level(&l.lods[k]).unwrap_or(primary);
-                        if ui.selectable_label(l.lod == k, format!("{level}")).clicked() && l.lod != k {
+                        if ui
+                            .selectable_label(l.lod == k, format!("{level}"))
+                            .clicked()
+                            && l.lod != k
+                        {
                             want = Some(k);
                         }
                     }
@@ -882,8 +1159,15 @@ impl ModelView {
             }
             ui.separator();
             if ui.button("📷 Screenshot").clicked() {
-                let name = self.loaded.as_ref().map(|l| sanitize(&l.source)).unwrap_or_else(|| "empty".into());
-                let p = Path::new(&self.work).join("screenshots").join(format!("{name}_{}.png", MODES[self.look.mode as usize].replace(' ', "_")));
+                let name = self
+                    .loaded
+                    .as_ref()
+                    .map(|l| sanitize(&l.source))
+                    .unwrap_or_else(|| "empty".into());
+                let p = Path::new(&self.work).join("screenshots").join(format!(
+                    "{name}_{}.png",
+                    MODES[self.look.mode as usize].replace(' ', "_")
+                ));
                 self.auto.screenshot = Some(p);
                 self.auto.frames = 0;
             }
@@ -897,20 +1181,31 @@ impl ModelView {
         if self.show_picker {
             let ws = Workspace::new(&self.game, &self.work);
             let idx = self.indexes.clone();
-            let current = if self.query.contains('@') { Some(self.query.trim().to_string()) } else { None };
+            let current = if self.query.contains('@') {
+                Some(self.query.trim().to_string())
+            } else {
+                None
+            };
             let mut want = None;
-            egui::SidePanel::left("model_picker").resizable(true).default_width(300.0).width_range(220.0..=560.0).show_inside(ui, |ui| {
-                want = self.picker.ui(ui, ws, idx, current.as_deref());
-            });
+            egui::Panel::left("model_picker")
+                .resizable(true)
+                .default_size(300.0)
+                .size_range(220.0..=560.0)
+                .show(ui, |ui| {
+                    want = self.picker.ui(ui, ws, idx, current.as_deref());
+                });
             if let Some(id) = want {
                 if !self.loading {
                     self.open(&id, 0, &ctx);
                 }
             }
         }
-        egui::SidePanel::right("model_side").resizable(true).default_width(330.0).show_inside(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| self.side_ui(ui, rs));
-        });
+        egui::Panel::right("model_side")
+            .resizable(true)
+            .default_size(330.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| self.side_ui(ui, rs));
+            });
 
         // viewport
         let avail = ui.available_size();
@@ -945,18 +1240,36 @@ impl ModelView {
         models.extend(self.hair.gpu.iter());
         ren.decal_bias = self.decal_bias;
         let tid = ren.render(rs, px, &self.cam, &self.look, &models, &under, &top);
-        ui.painter().image(tid, rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+        ui.painter().image(
+            tid,
+            rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
         // joint labels
         if self.show_skeleton && self.joint_labels {
             if let Some(l) = &self.loaded {
                 for (i, j) in l.model.joints.iter().enumerate() {
                     let n = j.name.to_lowercase();
-                    let important = n.starts_with("wheel") || n.starts_with("door") || n.starts_with("bonnet") || n.starts_with("boot") || n == "chassis" || l.model.joints.len() < 40;
+                    let important = n.starts_with("wheel")
+                        || n.starts_with("door")
+                        || n.starts_with("bonnet")
+                        || n.starts_with("boot")
+                        || n == "chassis"
+                        || l.model.joints.len() < 40;
                     if !important {
                         continue;
                     }
-                    if let Some(p) = Renderer3D::project(&self.cam, rect.size(), globals[i].w_axis.truncate()) {
-                        ui.painter().text(rect.min + p.to_vec2(), egui::Align2::LEFT_BOTTOM, &j.name, egui::FontId::proportional(11.0), egui::Color32::from_rgb(255, 230, 120));
+                    if let Some(p) =
+                        Renderer3D::project(&self.cam, rect.size(), globals[i].w_axis.truncate())
+                    {
+                        ui.painter().text(
+                            rect.min + p.to_vec2(),
+                            egui::Align2::LEFT_BOTTOM,
+                            &j.name,
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::from_rgb(255, 230, 120),
+                        );
                     }
                 }
             }
@@ -964,21 +1277,60 @@ impl ModelView {
         // legend for the gap view
         if self.look.mode == 5 {
             let p = rect.left_bottom() + egui::vec2(10.0, -70.0);
-            for (k, (c, t)) in [(egui::Color32::from_rgb(60, 200, 90), "ok (full mip chain)"), (egui::Color32::from_rgb(240, 190, 40), "lowmip (top mips in BCPack)"), (egui::Color32::from_rgb(230, 50, 50), "flat (no decodable mip)")].iter().enumerate() {
+            for (k, (c, t)) in [
+                (egui::Color32::from_rgb(60, 200, 90), "ok (full mip chain)"),
+                (
+                    egui::Color32::from_rgb(240, 190, 40),
+                    "lowmip (top mips in BCPack)",
+                ),
+                (
+                    egui::Color32::from_rgb(230, 50, 50),
+                    "flat (no decodable mip)",
+                ),
+            ]
+            .iter()
+            .enumerate()
+            {
                 let y = p.y + k as f32 * 18.0;
-                ui.painter().rect_filled(egui::Rect::from_min_size(egui::pos2(p.x, y), egui::vec2(12.0, 12.0)), 2.0, *c);
-                ui.painter().text(egui::pos2(p.x + 18.0, y), egui::Align2::LEFT_TOP, *t, egui::FontId::proportional(12.0), egui::Color32::WHITE);
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_size(egui::pos2(p.x, y), egui::vec2(12.0, 12.0)),
+                    2.0,
+                    *c,
+                );
+                ui.painter().text(
+                    egui::pos2(p.x + 18.0, y),
+                    egui::Align2::LEFT_TOP,
+                    *t,
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::WHITE,
+                );
             }
         }
-        ui.painter().text(rect.right_bottom() + egui::vec2(-8.0, -6.0), egui::Align2::RIGHT_BOTTOM, if self.cam.fly { "fly: WASD/QE, Shift fast, drag look" } else { "orbit: drag · pan: right drag · zoom: wheel · double-click: frame" }, egui::FontId::proportional(11.0), egui::Color32::from_white_alpha(160));
+        ui.painter().text(
+            rect.right_bottom() + egui::vec2(-8.0, -6.0),
+            egui::Align2::RIGHT_BOTTOM,
+            if self.cam.fly {
+                "fly: WASD/QE, Shift fast, drag look"
+            } else {
+                "orbit: drag · pan: right drag · zoom: wheel · double-click: frame"
+            },
+            egui::FontId::proportional(11.0),
+            egui::Color32::from_white_alpha(160),
+        );
 
         // screenshots (UI button and --screenshot automation)
-        if self.gpu.is_some() || self.loaded.is_none() && !self.loading && self.auto.screenshot.is_some() && self.auto.frames > 30 {
+        if self.gpu.is_some()
+            || self.loaded.is_none()
+                && !self.loading
+                && self.auto.screenshot.is_some()
+                && self.auto.frames > 30
+        {
             self.frames_since_load += 1;
         }
         if let Some(path) = self.auto.screenshot.clone() {
             self.auto.frames += 1;
-            let ready = (self.gpu.is_some() && self.frames_since_load >= 3 && settled) || (!self.loading && self.auto.frames > 600);
+            let ready = (self.gpu.is_some() && self.frames_since_load >= 3 && settled)
+                || (!self.loading && self.auto.frames > 600);
             if ready {
                 if let Some((w, h, px)) = ren.read_back(rs) {
                     match render3d::save_png(&path, w, h, &px) {
@@ -988,7 +1340,10 @@ impl ModelView {
                 }
                 self.auto.screenshot = None;
                 // full window (UI included) next to it
-                let ui_path = path.with_file_name(format!("{}_ui.png", path.file_stem().unwrap_or_default().to_string_lossy()));
+                let ui_path = path.with_file_name(format!(
+                    "{}_ui.png",
+                    path.file_stem().unwrap_or_default().to_string_lossy()
+                ));
                 self.auto.ui_shot = Some(ui_path);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             }
@@ -1030,10 +1385,18 @@ impl ModelView {
                     step = Some((i + 1) % n);
                 }
             });
-            ui.label(if src == "linked" { "faces the game links to this head" } else { "automatic: faces of the same sex, body type and ethnicity" });
+            ui.label(if src == "linked" {
+                "faces the game links to this head"
+            } else {
+                "automatic: faces of the same sex, body type and ethnicity"
+            });
             if let Some(k) = step {
                 HEAD_SKIN.store(k, std::sync::atomic::Ordering::Relaxed);
-                let lod = self.loaded.as_ref().and_then(|l| lod_level(&l.lods[l.lod])).unwrap_or(0);
+                let lod = self
+                    .loaded
+                    .as_ref()
+                    .and_then(|l| lod_level(&l.lods[l.lod]))
+                    .unwrap_or(0);
                 let q = self.query.clone();
                 self.keep_cam_once = true;
                 self.open(&q, lod, ui.ctx());
@@ -1041,23 +1404,29 @@ impl ModelView {
             ui.separator();
         }
         ui.heading("View");
-        egui::ComboBox::from_label("mode").selected_text(MODES[self.look.mode as usize]).show_ui(ui, |ui| {
-            for (k, m) in MODES.iter().enumerate() {
-                ui.selectable_value(&mut self.look.mode, k as u32, *m);
-            }
-        });
-        if self.look.mode == 4 {
-            egui::ComboBox::from_label("slot").selected_text(SLOTS[self.look.slot as usize]).show_ui(ui, |ui| {
-                for (k, m) in SLOTS.iter().enumerate() {
-                    ui.selectable_value(&mut self.look.slot, k as u32, *m);
+        egui::ComboBox::from_label("mode")
+            .selected_text(MODES[self.look.mode as usize])
+            .show_ui(ui, |ui| {
+                for (k, m) in MODES.iter().enumerate() {
+                    ui.selectable_value(&mut self.look.mode, k as u32, *m);
                 }
             });
+        if self.look.mode == 4 {
+            egui::ComboBox::from_label("slot")
+                .selected_text(SLOTS[self.look.slot as usize])
+                .show_ui(ui, |ui| {
+                    for (k, m) in SLOTS.iter().enumerate() {
+                        ui.selectable_value(&mut self.look.slot, k as u32, *m);
+                    }
+                });
         }
-        egui::ComboBox::from_label("packed RMA order").selected_text(RMA_ORDERS[self.look.rma_order as usize]).show_ui(ui, |ui| {
-            for (k, m) in RMA_ORDERS.iter().enumerate() {
-                ui.selectable_value(&mut self.look.rma_order, k as u32, *m);
-            }
-        });
+        egui::ComboBox::from_label("packed RMA order")
+            .selected_text(RMA_ORDERS[self.look.rma_order as usize])
+            .show_ui(ui, |ui| {
+                for (k, m) in RMA_ORDERS.iter().enumerate() {
+                    ui.selectable_value(&mut self.look.rma_order, k as u32, *m);
+                }
+            });
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.look.wire, "wireframe");
             ui.checkbox(&mut self.look.tint, "tint").on_hover_text("Multiply the model's tint palette colour into the base colour (the game's per-model colour variation; GLB COLOR_0)");
@@ -1071,10 +1440,17 @@ impl ModelView {
         });
         ui.separator();
         ui.heading("Light");
-        if ui.add(egui::Slider::new(&mut self.tod, 0.0..=24.0).text("time of day (h)")).changed() {
+        if ui
+            .add(egui::Slider::new(&mut self.tod, 0.0..=24.0).text("time of day (h)"))
+            .changed()
+        {
             self.look.set_time_of_day(self.tod);
         }
-        ui.add(egui::Slider::new(&mut self.look.exposure, 0.2..=4.0).logarithmic(true).text("exposure"));
+        ui.add(
+            egui::Slider::new(&mut self.look.exposure, 0.2..=4.0)
+                .logarithmic(true)
+                .text("exposure"),
+        );
         ui.add(egui::Slider::new(&mut self.look.ambient, 0.0..=2.0).text("sky / ambient"));
         ui.add(egui::Slider::new(&mut self.look.emissive, 0.0..=12.0).text("emissive"));
         ui.add(egui::Slider::new(&mut self.look.wet, 0.0..=1.0).text("wet"));
@@ -1090,11 +1466,13 @@ impl ModelView {
             ui.color_edit_button_rgb(&mut self.look.pearl);
         });
         ui.add(egui::Slider::new(&mut self.look.pearl_amount, 0.0..=1.0).text("pearl amount"));
-        egui::ComboBox::from_label("finish").selected_text(FINISHES[self.look.finish as usize]).show_ui(ui, |ui| {
-            for (k, m) in FINISHES.iter().enumerate() {
-                ui.selectable_value(&mut self.look.finish, k as u32, *m);
-            }
-        });
+        egui::ComboBox::from_label("finish")
+            .selected_text(FINISHES[self.look.finish as usize])
+            .show_ui(ui, |ui| {
+                for (k, m) in FINISHES.iter().enumerate() {
+                    ui.selectable_value(&mut self.look.finish, k as u32, *m);
+                }
+            });
         if let Some(l) = &self.loaded {
             if !l.model.joints.is_empty() {
                 ui.separator();
@@ -1105,16 +1483,26 @@ impl ModelView {
                     ui.checkbox(&mut self.wheels_on, "fit shared wheels at the wheel mounts");
                     ui.horizontal(|ui| {
                         ui.label("rim");
-                        ui.add(egui::TextEdit::singleline(&mut self.wheel_rim).desired_width(140.0));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.wheel_rim).desired_width(140.0),
+                        );
                     });
                     ui.horizontal(|ui| {
                         ui.label("tyre");
-                        ui.add(egui::TextEdit::singleline(&mut self.wheel_tyre).desired_width(140.0));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.wheel_tyre).desired_width(140.0),
+                        );
                     });
                     ui.checkbox(&mut self.wheel_auto, "size from the car's wheelScale").on_hover_text(format!("scale = {WHEEL_FACTOR:.3} x wheelScale (front / rear). The factor is fitted by eye on phoenix; the game's exact rule is not decoded."));
                     ui.add_enabled_ui(!self.wheel_auto, |ui| {
-                        ui.add(egui::Slider::new(&mut self.wheel_scale, 0.2..=0.8).text("front wheel scale"));
-                        ui.add(egui::Slider::new(&mut self.wheel_scale_rear, 0.2..=0.8).text("rear wheel scale"));
+                        ui.add(
+                            egui::Slider::new(&mut self.wheel_scale, 0.2..=0.8)
+                                .text("front wheel scale"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.wheel_scale_rear, 0.2..=0.8)
+                                .text("rear wheel scale"),
+                        );
                     });
                 }
             }
@@ -1141,15 +1529,32 @@ impl ModelView {
                 "no colour texture" => egui::Color32::from_rgb(170, 170, 170),
                 _ => egui::Color32::from_rgb(90, 200, 110),
             };
-            let visible = self.gpu.as_ref().map(|g| g.meshes.iter().filter(|me| me.material == k).all(|me| me.visible)).unwrap_or(true);
+            let visible = self
+                .gpu
+                .as_ref()
+                .map(|g| {
+                    g.meshes
+                        .iter()
+                        .filter(|me| me.material == k)
+                        .all(|me| me.visible)
+                })
+                .unwrap_or(true);
             ui.horizontal(|ui| {
                 let mut v = visible;
                 if ui.checkbox(&mut v, "").changed() {
                     toggle = Some((k, v));
                 }
                 if m.class == "car_paint" {
-                    let mut sec = self.gpu.as_ref().map(|g| Renderer3D::is_secondary(g, k)).unwrap_or(false);
-                    if ui.checkbox(&mut sec, "2nd").on_hover_text("use the secondary paint colour").changed() {
+                    let mut sec = self
+                        .gpu
+                        .as_ref()
+                        .map(|g| Renderer3D::is_secondary(g, k))
+                        .unwrap_or(false);
+                    if ui
+                        .checkbox(&mut sec, "2nd")
+                        .on_hover_text("use the secondary paint colour")
+                        .changed()
+                    {
                         second = Some((k, sec));
                     }
                 }
@@ -1159,18 +1564,66 @@ impl ModelView {
                     Some(n) => format!("{} {n}", m.name.split('_').next().unwrap_or("")),
                     None => m.name.clone(),
                 };
-                if ui.selectable_label(sel, egui::RichText::new(format!("{} · {} · {}{}", shown, m.class, m.alpha_mode, if m.gap == "no colour texture" { " · no colour texture (shown white)" } else { "" })).color(col)).clicked() {
+                if ui
+                    .selectable_label(
+                        sel,
+                        egui::RichText::new(format!(
+                            "{} · {} · {}{}",
+                            shown,
+                            m.class,
+                            m.alpha_mode,
+                            if m.gap == "no colour texture" {
+                                " · no colour texture (shown white)"
+                            } else {
+                                ""
+                            }
+                        ))
+                        .color(col),
+                    )
+                    .clicked()
+                {
                     self.material_sel = if sel { None } else { Some(k) };
                 }
             });
             if self.material_sel == Some(k) {
                 ui.indent(k, |ui| {
-                    ui.label(format!("shader {} ({}) · gaps: {}", sixng_core::names::shader(&m.shader_hash).unwrap_or_else(|| "name unknown".into()), m.shader_hash, m.gap));
+                    ui.label(format!(
+                        "shader {} ({}) · gaps: {}",
+                        sixng_core::names::shader(&m.shader_hash)
+                            .unwrap_or_else(|| "name unknown".into()),
+                        m.shader_hash,
+                        m.gap
+                    ));
                     for s in &m.slots {
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(format!("{} {} {}x{} {} — {}{}", s.role, sixng_core::names::param(&s.param_hash).unwrap_or_else(|| s.param_hash.clone()), s.size[0], s.size[1], s.format, s.status, if s.mip > 0 { format!(" (mip {})", s.mip) } else { String::new() })).small()).on_hover_text(format!("parameter hash {}", s.param_hash));
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} {} {}x{} {} — {}{}",
+                                    s.role,
+                                    sixng_core::names::param(&s.param_hash)
+                                        .unwrap_or_else(|| s.param_hash.clone()),
+                                    s.size[0],
+                                    s.size[1],
+                                    s.format,
+                                    s.status,
+                                    if s.mip > 0 {
+                                        format!(" (mip {})", s.mip)
+                                    } else {
+                                        String::new()
+                                    }
+                                ))
+                                .small(),
+                            )
+                            .on_hover_text(format!("parameter hash {}", s.param_hash));
                             if let Ok(h) = u64::from_str_radix(&s.hash, 16) {
-                                if ui.small_button("view").on_hover_text(format!("open texture {} in the Textures tab", s.hash)).clicked() {
+                                if ui
+                                    .small_button("view")
+                                    .on_hover_text(format!(
+                                        "open texture {} in the Textures tab",
+                                        s.hash
+                                    ))
+                                    .clicked()
+                                {
                                     view_tex = Some(h);
                                 }
                             }
@@ -1206,18 +1659,42 @@ impl ModelView {
         if !l.model.joints.is_empty() {
             ui.collapsing(format!("Joints ({})", l.model.joints.len()), |ui| {
                 for j in &l.model.joints {
-                    ui.label(egui::RichText::new(format!("{}  ← {}", j.name, j.parent.map(|p| l.model.joints[p].name.as_str()).unwrap_or("-"))).small());
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}  ← {}",
+                            j.name,
+                            j.parent
+                                .map(|p| l.model.joints[p].name.as_str())
+                                .unwrap_or("-")
+                        ))
+                        .small(),
+                    );
                 }
             });
         }
         ui.collapsing("model.json", |ui| {
-            ui.add(egui::Label::new(egui::RichText::new(serde_json::to_string_pretty(&l.info).unwrap_or_default()).monospace().small()).extend());
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(serde_json::to_string_pretty(&l.info).unwrap_or_default())
+                        .monospace()
+                        .small(),
+                )
+                .extend(),
+            );
         });
     }
 }
 
 fn sanitize(s: &str) -> String {
-    s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect()
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Export root of a GLB under `<root>/models/<archive>/<name>/model.glb`.
@@ -1234,22 +1711,36 @@ pub(crate) fn out_root_of(p: &Path) -> PathBuf {
 
 /// Physical LOD of the primary model (model.glb): the lowest populated slot.
 fn primary_lod(info: &serde_json::Value) -> usize {
-    info["meshes"].as_array().into_iter().flatten().filter_map(|m| m["lod"].as_u64()).min().unwrap_or(0) as usize
+    info["meshes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m["lod"].as_u64())
+        .min()
+        .unwrap_or(0) as usize
 }
 
 /// Physical LOD number of the loaded file at `index`.
 fn shown_lod(lods: &[PathBuf], index: usize, info: &serde_json::Value) -> usize {
-    lods.get(index).and_then(|p| lod_level(p)).unwrap_or_else(|| primary_lod(info))
+    lods.get(index)
+        .and_then(|p| lod_level(p))
+        .unwrap_or_else(|| primary_lod(info))
 }
 
 fn lod_level(path: &Path) -> Option<usize> {
-    path.file_stem()?.to_str()?.strip_prefix("model_lod")?.parse().ok()
+    path.file_stem()?
+        .to_str()?
+        .strip_prefix("model_lod")?
+        .parse()
+        .ok()
 }
 
 /// Choose by physical slot, falling back to the preceding populated LOD.
 /// model.glb is the primary fallback, even when its physical slot is not zero.
 pub(crate) fn lod_index(lods: &[PathBuf], lod: usize) -> usize {
-    lods.iter().rposition(|p| lod_level(p).unwrap_or(0) <= lod).unwrap_or(0)
+    lods.iter()
+        .rposition(|p| lod_level(p).unwrap_or(0) <= lod)
+        .unwrap_or(0)
 }
 
 pub(crate) fn lods_in(dir: &Path) -> Vec<PathBuf> {
@@ -1266,7 +1757,11 @@ pub(crate) fn lods_in(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
-pub fn index_for(ws: &Workspace, archive: &str, cache: &Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>) -> anyhow::Result<(sixng_core::game::ArchiveInfo, Arc<ArchiveIndex>)> {
+pub fn index_for(
+    ws: &Workspace,
+    archive: &str,
+    cache: &Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>,
+) -> anyhow::Result<(sixng_core::game::ArchiveInfo, Arc<ArchiveIndex>)> {
     let a = ws.resolve(archive)?;
     if let Some(ix) = cache.lock().unwrap().get(&a.id) {
         return Ok((a, ix.clone()));
@@ -1276,7 +1771,13 @@ pub fn index_for(ws: &Workspace, archive: &str, cache: &Arc<Mutex<HashMap<String
     Ok((a, ix))
 }
 
-pub(crate) fn load_query(ws: &Workspace, cache: &Path, q: &str, lod: usize, idx: &Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>) -> anyhow::Result<Loaded> {
+pub(crate) fn load_query(
+    ws: &Workspace,
+    cache: &Path,
+    q: &str,
+    lod: usize,
+    idx: &Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>,
+) -> anyhow::Result<Loaded> {
     let (q, sel) = split_parts(q);
     let mut l = load_query_sel(ws, cache, q, sel, lod, idx)?;
     l.base = q.to_string();
@@ -1286,7 +1787,14 @@ pub(crate) fn load_query(ws: &Workspace, cache: &Path, q: &str, lod: usize, idx:
 /// `"<query>#parts=<hex>,<hex>"` → the query and the chosen part offsets.
 fn split_parts(q: &str) -> (&str, Option<Vec<u64>>) {
     match q.trim().split_once("#parts=") {
-        Some((b, l)) => (b.trim(), Some(l.split(',').filter_map(|x| u64::from_str_radix(x.trim(), 16).ok()).collect())),
+        Some((b, l)) => (
+            b.trim(),
+            Some(
+                l.split(',')
+                    .filter_map(|x| u64::from_str_radix(x.trim(), 16).ok())
+                    .collect(),
+            ),
+        ),
         None => (q.trim(), None),
     }
 }
@@ -1294,7 +1802,13 @@ fn split_parts(q: &str) -> (&str, Option<Vec<u64>>) {
 /// Export and merge a set of parts; returns the model (None if none loaded),
 /// the first part's LOD files, the loaded names and the errors. A model
 /// passed in (an animal root) has its placeholder geometry replaced.
-fn load_parts(a: &sixng_core::game::ArchiveInfo, parts: &[&sixng_core::scan::Entry], cache: &Path, lod: usize, mut model: Option<glb::Model>) -> (Option<glb::Model>, Vec<PathBuf>, Vec<String>, Vec<String>) {
+fn load_parts(
+    a: &sixng_core::game::ArchiveInfo,
+    parts: &[&sixng_core::scan::Entry],
+    cache: &Path,
+    lod: usize,
+    mut model: Option<glb::Model>,
+) -> (Option<glb::Model>, Vec<PathBuf>, Vec<String>, Vec<String>) {
     let mut first = Vec::new();
     let mut names = Vec::new();
     let mut errs = Vec::new();
@@ -1325,16 +1839,34 @@ fn load_parts(a: &sixng_core::game::ArchiveInfo, parts: &[&sixng_core::scan::Ent
 }
 
 /// The chosen parts: the selection when given, else the defaults.
-fn pick<'a>(ix: &'a ArchiveIndex, opts: &[crate::assemble::PartOpt], sel: &Option<Vec<u64>>) -> (Vec<u64>, Vec<&'a sixng_core::scan::Entry>) {
+fn pick<'a>(
+    ix: &'a ArchiveIndex,
+    opts: &[crate::assemble::PartOpt],
+    sel: &Option<Vec<u64>>,
+) -> (Vec<u64>, Vec<&'a sixng_core::scan::Entry>) {
     let chosen: Vec<u64> = match sel {
-        Some(s) => opts.iter().filter(|o| s.contains(&o.off)).map(|o| o.off).collect(),
+        Some(s) => opts
+            .iter()
+            .filter(|o| s.contains(&o.off))
+            .map(|o| o.off)
+            .collect(),
         None => opts.iter().filter(|o| o.default).map(|o| o.off).collect(),
     };
-    let parts = chosen.iter().filter_map(|off| ix.entries.iter().find(|e| e.off == *off)).collect();
+    let parts = chosen
+        .iter()
+        .filter_map(|off| ix.entries.iter().find(|e| e.off == *off))
+        .collect();
     (chosen, parts)
 }
 
-fn load_query_sel(ws: &Workspace, cache: &Path, q: &str, sel: Option<Vec<u64>>, lod: usize, idx: &Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>) -> anyhow::Result<Loaded> {
+fn load_query_sel(
+    ws: &Workspace,
+    cache: &Path,
+    q: &str,
+    sel: Option<Vec<u64>>,
+    lod: usize,
+    idx: &Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>,
+) -> anyhow::Result<Loaded> {
     if q.to_lowercase().ends_with(".glb") {
         let p = PathBuf::from(q);
         let dir = p.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -1344,9 +1876,25 @@ fn load_query_sel(ws: &Workspace, cache: &Path, q: &str, sel: Option<Vec<u64>>, 
         }
         let lod = lods.iter().position(|x| x == &p).unwrap_or(0);
         let root = out_root_of(&p);
-        let info = std::fs::read(dir.join("model.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let info = std::fs::read(dir.join("model.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
         let model = glb::load(&p, &root)?;
-        return Ok(Loaded { model, lods, lod, out_root: root, source: dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(), info, parts: Vec::new(), selected: Vec::new(), base: String::new() });
+        return Ok(Loaded {
+            model,
+            lods,
+            lod,
+            out_root: root,
+            source: dir
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            info,
+            parts: Vec::new(),
+            selected: Vec::new(),
+            base: String::new(),
+        });
     }
     // character outfit: "<archive>#outfit:<prefix>"
     if let Some((archive, prefix)) = q.split_once("#outfit:") {
@@ -1360,16 +1908,31 @@ fn load_query_sel(ws: &Workspace, cache: &Path, q: &str, sel: Option<Vec<u64>>, 
             return Err(anyhow::anyhow!("no parts of {prefix} selected"));
         }
         let (model, first, names, errs) = load_parts(&a, &parts, cache, lod, None);
-        let model = model.ok_or_else(|| anyhow::anyhow!("no part of {prefix} loaded: {}", errs.join("; ")))?;
+        let model = model
+            .ok_or_else(|| anyhow::anyhow!("no part of {prefix} loaded: {}", errs.join("; ")))?;
         let info = serde_json::json!({ "assembled_from": names, "ids": parts.iter().map(|e| e.id.clone()).collect::<Vec<_>>(), "errors": errs });
-        return Ok(Loaded { model, lods: first.into_iter().take(1).collect(), lod: 0, out_root: cache.to_path_buf(), source: format!("{} (outfit, {} parts)", prefix, names.len()), info, parts: opts, selected, base: String::new() });
+        return Ok(Loaded {
+            model,
+            lods: first.into_iter().take(1).collect(),
+            lod: 0,
+            out_root: cache.to_path_buf(),
+            source: format!("{} (outfit, {} parts)", prefix, names.len()),
+            info,
+            parts: opts,
+            selected,
+            base: String::new(),
+        });
     }
-    let (q, member) = q.split_once('#').map_or((q, None), |(id, member)| (id, Some(member)));
+    let (q, member) = q
+        .split_once('#')
+        .map_or((q, None), |(id, member)| (id, Some(member)));
     // entry: "<archive>@<hex>" or a name regex (in levels unless "archive:regex")
     let (archive, rest) = match q.split_once('@') {
         Some((a, o)) => (a.to_string(), Some(o.to_string())),
         None => match q.split_once(':') {
-            Some((a, r)) if !a.is_empty() && !a.contains('^') => (a.to_string(), None).clone_with(r),
+            Some((a, r)) if !a.is_empty() && !a.contains('^') => {
+                (a.to_string(), None).clone_with(r)
+            }
             _ => ("levels".to_string(), None).clone_with(q),
         },
     };
@@ -1377,12 +1940,16 @@ fn load_query_sel(ws: &Workspace, cache: &Path, q: &str, sel: Option<Vec<u64>>, 
     let e = match rest {
         Some(o) if !o.starts_with('~') => {
             let id = format!("{o}{}", member.map_or(String::new(), |m| format!("#{m}")));
-            export::ModelResolver::new(&ix.entries).resolve(&ix.entries, &id)?.0
+            export::ModelResolver::new(&ix.entries)
+                .resolve(&ix.entries, &id)?
+                .0
         }
         Some(re) => find_name(&ix, re.trim_start_matches('~'))?,
         None => unreachable!(),
     };
-    let selected = member.map(|name| export::member_entry(e, name)).transpose()?;
+    let selected = member
+        .map(|name| export::member_entry(e, name))
+        .transpose()?;
     let e = selected.as_ref().unwrap_or(e);
     let (model, lods, info) = export_load(&a, e, cache, lod)?;
     let level = lod;
@@ -1398,33 +1965,92 @@ fn load_query_sel(ws: &Workspace, cache: &Path, q: &str, sel: Option<Vec<u64>>, 
         if let Some(o) = info.as_object_mut() {
             o.insert("assembled_from".into(), serde_json::json!(names));
         }
-        let source = if names.is_empty() { format!("{} {}", e.id, name) } else { format!("{} {} (+{} parts)", e.id, name, names.len()) };
-        let lods = if opts.is_empty() { lods } else { lods.into_iter().skip(lod).take(1).collect() };
+        let source = if names.is_empty() {
+            format!("{} {}", e.id, name)
+        } else {
+            format!("{} {} (+{} parts)", e.id, name, names.len())
+        };
+        let lods = if opts.is_empty() {
+            lods
+        } else {
+            lods.into_iter().skip(lod).take(1).collect()
+        };
         let lod = if opts.is_empty() { lod } else { 0 };
-        return Ok(Loaded { model, lods, lod, out_root: cache.to_path_buf(), source, info, parts: opts, selected, base: String::new() });
+        return Ok(Loaded {
+            model,
+            lods,
+            lod,
+            out_root: cache.to_path_buf(),
+            source,
+            info,
+            parts: opts,
+            selected,
+            base: String::new(),
+        });
     }
-    Ok(Loaded { model, lods, lod, out_root: cache.to_path_buf(), source: format!("{} {}", e.id, name).trim().to_string(), info, parts: Vec::new(), selected: Vec::new(), base: String::new() })
+    Ok(Loaded {
+        model,
+        lods,
+        lod,
+        out_root: cache.to_path_buf(),
+        source: format!("{} {}", e.id, name).trim().to_string(),
+        info,
+        parts: Vec::new(),
+        selected: Vec::new(),
+        base: String::new(),
+    })
 }
 
 /// Export one entry into the viewer cache and load the GLB of a LOD level.
-fn export_load(a: &sixng_core::game::ArchiveInfo, e: &sixng_core::scan::Entry, cache: &Path, lod: usize) -> anyhow::Result<(glb::Model, Vec<PathBuf>, serde_json::Value)> {
+fn export_load(
+    a: &sixng_core::game::ArchiveInfo,
+    e: &sixng_core::scan::Entry,
+    cache: &Path,
+    lod: usize,
+) -> anyhow::Result<(glb::Model, Vec<PathBuf>, serde_json::Value)> {
     // Heads are exported again each time (small), so the chosen face variant applies.
     let head = sixng_core::headskin::is_head(e.name.as_deref().unwrap_or(""));
-    let dir = cache.join("models").join(sixng_core::game::index_stem(&a.id)).join(export::export_base_name(e));
+    let dir = cache
+        .join("models")
+        .join(sixng_core::game::index_stem(&a.id))
+        .join(export::export_base_name(e));
     // Cached exports from before tint palettes were applied: export again.
-    let stale_tint = std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| j.contains("\"tintpalettetex\"") && !j.contains("\"tint_applied\""));
-    let opts = ExportOptions { out: cache.to_path_buf(), png: true, dds: false, raw: false, force: head || stale_tint, skip_embedded_textures: false, body_shape: Vec::new(), head_skin: HEAD_SKIN.load(std::sync::atomic::Ordering::Relaxed) };
+    let stale_tint = std::fs::read_to_string(dir.join("model.json"))
+        .is_ok_and(|j| j.contains("\"tintpalettetex\"") && !j.contains("\"tint_applied\""));
+    let opts = ExportOptions {
+        out: cache.to_path_buf(),
+        png: true,
+        dds: false,
+        raw: false,
+        force: head || stale_tint,
+        skip_embedded_textures: false,
+        body_shape: Vec::new(),
+        head_skin: HEAD_SKIN.load(std::sync::atomic::Ordering::Relaxed),
+    };
     let item = export::export_entry(a, e, &opts)?;
     let lods = lods_in(&dir);
     if lods.is_empty() {
-        return Err(anyhow::anyhow!("{} exported no model.glb (status {}, files {:?}{})", e.id, item.status, item.files, item.error.map(|x| format!(", {x}")).unwrap_or_default()));
+        return Err(anyhow::anyhow!(
+            "{} exported no model.glb (status {}, files {:?}{})",
+            e.id,
+            item.status,
+            item.files,
+            item.error.map(|x| format!(", {x}")).unwrap_or_default()
+        ));
     }
     let lod = lod_index(&lods, lod);
-    let info: serde_json::Value = std::fs::read(dir.join("model.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let info: serde_json::Value = std::fs::read(dir.join("model.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
     if let Some(h) = info.get("head_skin") {
         let n = h["count"].as_u64().unwrap_or(0) as usize;
         if n > 0 {
-            *HEAD_SKIN_SEEN.lock().unwrap() = Some((h["index"].as_u64().unwrap_or(0) as usize, n, h["source"].as_str().unwrap_or("").to_string()));
+            *HEAD_SKIN_SEEN.lock().unwrap() = Some((
+                h["index"].as_u64().unwrap_or(0) as usize,
+                n,
+                h["source"].as_str().unwrap_or("").to_string(),
+            ));
         }
     }
     let mut model = glb::load(&lods[lod], cache)?;
@@ -1442,7 +2068,9 @@ impl CloneWith for (String, Option<String>) {
 }
 
 fn find_name<'a>(ix: &'a ArchiveIndex, re: &str) -> anyhow::Result<&'a sixng_core::scan::Entry> {
-    let r = regex::RegexBuilder::new(re).case_insensitive(true).build()?;
+    let r = regex::RegexBuilder::new(re)
+        .case_insensitive(true)
+        .build()?;
     // prefer fragments, then drawables
     let mut best: Option<&sixng_core::scan::Entry> = None;
     for e in &ix.entries {
@@ -1459,30 +2087,56 @@ fn find_name<'a>(ix: &'a ArchiveIndex, re: &str) -> anyhow::Result<&'a sixng_cor
             best = Some(e);
         }
     }
-    best.filter(|e| matches!(e.rtype.as_deref(), Some("ft") | Some("dr") | Some("dd"))).ok_or_else(|| anyhow::anyhow!("no drawable/fragment named like {re}"))
+    best.filter(|e| matches!(e.rtype.as_deref(), Some("ft") | Some("dr") | Some("dd")))
+        .ok_or_else(|| anyhow::anyhow!("no drawable/fragment named like {re}"))
 }
 
 /// Same rule as sixng_core::export::sanitize (kept local: it is private there).
 pub(crate) fn export_sanitize(s: &str) -> String {
-    s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' { c } else { '_' }).collect()
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Entry ids of the parts an animal root or a character outfit is put
 /// together from (None for ordinary models).
-pub(crate) fn assembly_ids(ws: &Workspace, idx: &Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>, id: &str) -> Option<Vec<String>> {
+pub(crate) fn assembly_ids(
+    ws: &Workspace,
+    idx: &Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>,
+    id: &str,
+) -> Option<Vec<String>> {
     if let Some((archive, prefix)) = id.split_once("#outfit:") {
         let (_, ix) = index_for(ws, archive, idx).ok()?;
-        return Some(crate::assemble::outfit_parts(&ix, prefix).iter().map(|e| e.id.clone()).collect());
+        return Some(
+            crate::assemble::outfit_parts(&ix, prefix)
+                .iter()
+                .map(|e| e.id.clone())
+                .collect(),
+        );
     }
     let (archive, _) = id.split_once('@')?;
     let (_, ix) = index_for(ws, archive, idx).ok()?;
-    let (e, member) = export::ModelResolver::new(&ix.entries).resolve(&ix.entries, id).ok()?;
-    if member.is_some() { return None; }
+    let (e, member) = export::ModelResolver::new(&ix.entries)
+        .resolve(&ix.entries, id)
+        .ok()?;
+    if member.is_some() {
+        return None;
+    }
     let name = e.name.as_deref()?;
     if e.rtype.as_deref() == Some("ft") && crate::assemble::is_animal(name) {
         let parts = crate::assemble::animal_parts(&ix, name);
         if !parts.is_empty() {
-            return Some(std::iter::once(e.id.clone()).chain(parts.iter().map(|p| p.id.clone())).collect());
+            return Some(
+                std::iter::once(e.id.clone())
+                    .chain(parts.iter().map(|p| p.id.clone()))
+                    .collect(),
+            );
         }
     }
     None
@@ -1490,7 +2144,11 @@ pub(crate) fn assembly_ids(ws: &Workspace, idx: &Arc<Mutex<HashMap<String, Arc<A
 
 /// sRGB [0,1] triple as an egui colour.
 fn srgb32(c: [f32; 3]) -> egui::Color32 {
-    egui::Color32::from_rgb((c[0] * 255.0).round() as u8, (c[1] * 255.0).round() as u8, (c[2] * 255.0).round() as u8)
+    egui::Color32::from_rgb(
+        (c[0] * 255.0).round() as u8,
+        (c[1] * 255.0).round() as u8,
+        (c[2] * 255.0).round() as u8,
+    )
 }
 
 #[cfg(test)]
@@ -1499,7 +2157,10 @@ mod tests {
 
     #[test]
     fn lod_discovery_keeps_physical_numbers_across_holes() {
-        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let dir = std::env::temp_dir().join(format!("sixng-lod-discovery-test-{stamp}"));
         std::fs::create_dir_all(&dir).unwrap();
         // Slots 2 and 3 export as model.glb and model_lod3.glb.
@@ -1508,8 +2169,18 @@ mod tests {
         }
         let lods = lods_in(&dir);
         std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(lods, [dir.join("model.glb"), dir.join("model_lod3.glb"), dir.join("model_lod5.glb")]);
-        assert_eq!(lods.iter().map(|p| lod_level(p)).collect::<Vec<_>>(), [None, Some(3), Some(5)]);
+        assert_eq!(
+            lods,
+            [
+                dir.join("model.glb"),
+                dir.join("model_lod3.glb"),
+                dir.join("model_lod5.glb")
+            ]
+        );
+        assert_eq!(
+            lods.iter().map(|p| lod_level(p)).collect::<Vec<_>>(),
+            [None, Some(3), Some(5)]
+        );
         for (level, index) in [(0, 0), (2, 0), (3, 1), (4, 1), (5, 2), (7, 2)] {
             assert_eq!(lod_index(&lods, level), index);
         }

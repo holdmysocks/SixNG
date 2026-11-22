@@ -35,6 +35,7 @@ pub struct Library {
     filter_key: (Option<Cat>, String, bool, usize),
     pub thumbs: Thumbs,
     tile: f32,
+    can_render_thumbnails: bool,
     /// part ids of put-together models (animals, characters), by item id
     parts: std::collections::HashMap<String, Option<Vec<String>>>,
 }
@@ -77,21 +78,45 @@ fn archive_of(id: &str) -> &str {
 
 /// Export folder of a model under an output root, if it was exported.
 pub fn export_dir(out: &Path, id: &str) -> Option<PathBuf> {
-    let (id, member) = id.split_once('#').map_or((id, None), |(id, member)| (id, Some(member)));
+    let (id, member) = id
+        .split_once('#')
+        .map_or((id, None), |(id, member)| (id, Some(member)));
     let (a, off) = id.split_once('@')?;
     let d = out.join("models").join(sixng_core::game::index_stem(a));
     if let Some(member) = member {
         let off = u64::from_str_radix(off.trim_start_matches("0x"), 16).ok()?;
-        let path = d.join(format!("{}_{off:x}_member", crate::model_view::export_sanitize(member)));
+        let path = d.join(format!(
+            "{}_{off:x}_member",
+            crate::model_view::export_sanitize(member)
+        ));
         return path.is_dir().then_some(path);
     }
     let suffix = format!("_{}", off.to_ascii_lowercase());
-    std::fs::read_dir(&d).ok()?.flatten().map(|e| e.path()).find(|p| p.is_dir() && p.file_name().map_or(false, |f| f.to_string_lossy().ends_with(&suffix)))
+    std::fs::read_dir(&d)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .map_or(false, |f| f.to_string_lossy().ends_with(&suffix))
+        })
 }
 
 impl Library {
     pub fn new(game: &str, work: &str, thumb_budget_mb: u64) -> Self {
-        Library { view: View::Home, back: Vec::new(), search: String::new(), hide_variants: true, filtered: Vec::new(), filter_key: (None, String::new(), true, 0), thumbs: Thumbs::new(game, work, thumb_budget_mb), tile: 150.0, parts: Default::default() }
+        Library {
+            view: View::Home,
+            back: Vec::new(),
+            search: String::new(),
+            hide_variants: true,
+            filtered: Vec::new(),
+            filter_key: (None, String::new(), true, 0),
+            thumbs: Thumbs::new(game, work, thumb_budget_mb),
+            tile: 150.0,
+            can_render_thumbnails: false,
+            parts: Default::default(),
+        }
     }
 
     pub fn show_item(&mut self, id: &str) {
@@ -109,18 +134,38 @@ impl Library {
         self.thumbs.queued() == 0
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame, mv: &mut ModelView, out_root: &str) -> Option<Action> {
+    fn thumbnail(&mut self, ctx: &egui::Context, id: &str) -> Option<egui::TextureHandle> {
+        if self.can_render_thumbnails {
+            self.thumbs.get(ctx, id)
+        } else {
+            self.thumbs.get_cached(ctx, id)
+        }
+    }
+
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        render_state: Option<&eframe::egui_wgpu::RenderState>,
+        mv: &mut ModelView,
+        out_root: &str,
+    ) -> Option<Action> {
         let ctx = ui.ctx().clone();
         let ws = sixng_core::export::Workspace::new(&mv.game, &mv.work);
         mv.picker.ensure_loaded(ws, mv.indexes.clone(), &ctx);
-        self.thumbs.pump(&ctx, frame.wgpu_render_state(), &mv.indexes);
-        if self.thumbs.queued() > 0 {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        self.can_render_thumbnails = render_state.is_some();
+        if self.can_render_thumbnails {
+            self.thumbs.pump(&ctx, render_state, &mv.indexes);
+            if self.thumbs.queued() > 0 {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
         }
         let mut act = None;
         // header: back, breadcrumb, search
         ui.horizontal(|ui| {
-            if ui.add_enabled(!self.back.is_empty(), egui::Button::new("◀ Back")).clicked() {
+            if ui
+                .add_enabled(!self.back.is_empty(), egui::Button::new("◀ Back"))
+                .clicked()
+            {
                 if let Some(v) = self.back.pop() {
                     self.view = v;
                 }
@@ -138,15 +183,29 @@ impl Library {
                 View::Home => {}
             }
             ui.separator();
-            let r = ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search all models (Ctrl+K)").desired_width(260.0));
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.search)
+                    .hint_text("Search all models (Ctrl+K)")
+                    .desired_width(260.0),
+            );
             if r.changed() && !self.search.is_empty() && self.view == View::Home {
                 self.go(View::Category(Cat::All));
             }
-            if self.thumbs.queued() > 0 {
+            if self.can_render_thumbnails && self.thumbs.queued() > 0 {
                 ui.spinner();
-                ui.label(egui::RichText::new(format!("rendering thumbnails ({} queued)", self.thumbs.queued())).small());
+                ui.label(
+                    egui::RichText::new(format!(
+                        "rendering thumbnails ({} queued)",
+                        self.thumbs.queued()
+                    ))
+                    .small(),
+                );
             } else if self.thumbs.over_budget() {
                 ui.label(egui::RichText::new("thumbnail budget full (Settings)").small());
+            } else if !self.can_render_thumbnails {
+                ui.label(
+                    egui::RichText::new("3D thumbnails are unavailable on this renderer").small(),
+                );
             }
         });
         ui.separator();
@@ -172,18 +231,40 @@ impl Library {
         act
     }
 
-    fn card(&mut self, ui: &mut egui::Ui, title: &str, sub: &str, thumb: Option<egui::TextureHandle>) -> bool {
+    fn card(
+        &mut self,
+        ui: &mut egui::Ui,
+        title: &str,
+        sub: &str,
+        thumb: Option<egui::TextureHandle>,
+    ) -> bool {
         let size = egui::vec2(200.0, 170.0);
         let (rect, r) = ui.allocate_exact_size(size, egui::Sense::click());
         let vis = ui.style().interact(&r);
         let p = ui.painter();
-        p.rect_filled(rect, 8.0, if r.hovered() { ui.visuals().widgets.hovered.bg_fill } else { ui.visuals().faint_bg_color });
-        let img = egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 8.0), egui::vec2(size.x - 16.0, 110.0));
+        p.rect_filled(
+            rect,
+            8.0,
+            if r.hovered() {
+                ui.visuals().widgets.hovered.bg_fill
+            } else {
+                ui.visuals().faint_bg_color
+            },
+        );
+        let img = egui::Rect::from_min_size(
+            rect.min + egui::vec2(8.0, 8.0),
+            egui::vec2(size.x - 16.0, 110.0),
+        );
         if let Some(t) = thumb {
             let s = t.size_vec2();
             let k = (img.width() / s.x).min(img.height() / s.y);
             let r2 = egui::Rect::from_center_size(img.center(), s * k);
-            p.image(t.id(), r2, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+            p.image(
+                t.id(),
+                r2,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
         } else {
             p.rect_filled(img, 6.0, ui.visuals().extreme_bg_color);
             let glyph = match title {
@@ -193,15 +274,39 @@ impl Library {
                 _ => "",
             };
             if !glyph.is_empty() {
-                p.text(img.center(), egui::Align2::CENTER_CENTER, glyph, egui::FontId::proportional(48.0), ui.visuals().weak_text_color());
+                p.text(
+                    img.center(),
+                    egui::Align2::CENTER_CENTER,
+                    glyph,
+                    egui::FontId::proportional(48.0),
+                    ui.visuals().weak_text_color(),
+                );
             }
         }
-        p.text(rect.min + egui::vec2(10.0, 126.0), egui::Align2::LEFT_TOP, title, egui::FontId::proportional(16.0), vis.text_color());
-        p.text(rect.min + egui::vec2(10.0, 148.0), egui::Align2::LEFT_TOP, sub, egui::FontId::proportional(12.0), ui.visuals().weak_text_color());
+        p.text(
+            rect.min + egui::vec2(10.0, 126.0),
+            egui::Align2::LEFT_TOP,
+            title,
+            egui::FontId::proportional(16.0),
+            vis.text_color(),
+        );
+        p.text(
+            rect.min + egui::vec2(10.0, 148.0),
+            egui::Align2::LEFT_TOP,
+            sub,
+            egui::FontId::proportional(12.0),
+            ui.visuals().weak_text_color(),
+        );
         r.clicked()
     }
 
-    fn home(&mut self, ui: &mut egui::Ui, items: &Arc<Vec<Item>>, mv: &mut ModelView, act: &mut Option<Action>) {
+    fn home(
+        &mut self,
+        ui: &mut egui::Ui,
+        items: &Arc<Vec<Item>>,
+        mv: &mut ModelView,
+        act: &mut Option<Action>,
+    ) {
         let ctx = ui.ctx().clone();
         egui::ScrollArea::vertical().show(ui, |ui| {
             let logo = crate::banner(&ctx);
@@ -215,8 +320,11 @@ impl Library {
                         continue;
                     }
                     // first non-variant item of the category as the cover
-                    let cover = items.iter().find(|it| it.cat == c && !it.variant).map(|it| it.id.clone());
-                    let thumb = cover.and_then(|id| self.thumbs.get(&ctx, &id));
+                    let cover = items
+                        .iter()
+                        .find(|it| it.cat == c && !it.variant)
+                        .map(|it| it.id.clone());
+                    let thumb = cover.and_then(|id| self.thumbnail(&ctx, &id));
                     if self.card(ui, label, &format!("{} models", mv.picker.count(c)), thumb) {
                         self.go(View::Category(c));
                     }
@@ -230,11 +338,22 @@ impl Library {
                 if self.card(ui, "Audio", "sound banks: play and export", None) {
                     *act = Some(Action::ShowAudio);
                 }
-                if self.card(ui, "Unnamed", &format!("{} models without a recovered name", mv.picker.count(Cat::Unnamed)), None) {
+                if self.card(
+                    ui,
+                    "Unnamed",
+                    &format!(
+                        "{} models without a recovered name",
+                        mv.picker.count(Cat::Unnamed)
+                    ),
+                    None,
+                ) {
                     self.go(View::Category(Cat::Unnamed));
                 }
             });
-            for (title, ids) in [("Recently opened", mv.picker.recents().to_vec()), ("Favourites", mv.picker.favourites().to_vec())] {
+            for (title, ids) in [
+                ("Recently opened", mv.picker.recents().to_vec()),
+                ("Favourites", mv.picker.favourites().to_vec()),
+            ] {
                 if ids.is_empty() {
                     continue;
                 }
@@ -242,8 +361,12 @@ impl Library {
                 ui.heading(title);
                 ui.horizontal_wrapped(|ui| {
                     for id in ids.iter().take(12) {
-                        let name = items.iter().find(|it| &it.id == id).map(|it| it.name.clone()).unwrap_or_else(|| id.clone());
-                        let t = self.thumbs.get(&ctx, id);
+                        let name = items
+                            .iter()
+                            .find(|it| &it.id == id)
+                            .map(|it| it.name.clone())
+                            .unwrap_or_else(|| id.clone());
+                        let t = self.thumbnail(&ctx, id);
                         if self.card(ui, &display_name(&name), &name, t) {
                             self.go(View::Item(id.clone()));
                         }
@@ -254,17 +377,31 @@ impl Library {
     }
 
     fn refilter(&mut self, items: &[Item], c: Cat) {
-        let key = (Some(c), self.search.clone(), self.hide_variants, items.len());
+        let key = (
+            Some(c),
+            self.search.clone(),
+            self.hide_variants,
+            items.len(),
+        );
         if key == self.filter_key {
             return;
         }
-        let terms: Vec<String> = self.search.to_ascii_lowercase().split_whitespace().map(String::from).collect();
+        let terms: Vec<String> = self
+            .search
+            .to_ascii_lowercase()
+            .split_whitespace()
+            .map(String::from)
+            .collect();
         self.filtered = items
             .iter()
             .enumerate()
             .filter(|(_, it)| c == Cat::All || it.cat == c)
             .filter(|(_, it)| !self.hide_variants || !it.variant)
-            .filter(|(_, it)| terms.iter().all(|t| it.lname.contains(t.as_str()) || it.id.contains(t.as_str())))
+            .filter(|(_, it)| {
+                terms
+                    .iter()
+                    .all(|t| it.lname.contains(t.as_str()) || it.id.contains(t.as_str()))
+            })
             .map(|(i, _)| i as u32)
             .collect();
         self.filter_key = key;
@@ -283,58 +420,129 @@ impl Library {
             ui.label(egui::RichText::new("Names come from the model names; the game's display names are not decoded yet.").small().weak());
         }
         let tile = self.tile;
-        let cols = ((ui.available_width() + 8.0) / (tile + 8.0)).floor().max(1.0) as usize;
+        let cols = ((ui.available_width() + 8.0) / (tile + 8.0))
+            .floor()
+            .max(1.0) as usize;
         let rows = self.filtered.len().div_ceil(cols);
         let row_h = tile + 40.0;
         let mut open = None;
-        egui::ScrollArea::vertical().auto_shrink([false; 2]).show_rows(ui, row_h, rows, |ui, range| {
-            for r in range {
-                ui.horizontal(|ui| {
-                    for k in 0..cols {
-                        let Some(&i) = self.filtered.get(r * cols + k) else { break };
-                        let it = &items[i as usize];
-                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(tile, row_h - 8.0), egui::Sense::click());
-                        let p = ui.painter();
-                        p.rect_filled(rect, 6.0, if resp.hovered() { ui.visuals().widgets.hovered.bg_fill } else { ui.visuals().faint_bg_color });
-                        let img = egui::Rect::from_min_size(rect.min + egui::vec2(4.0, 4.0), egui::vec2(tile - 8.0, tile - 8.0));
-                        match self.thumbs.get(&ctx, &it.id) {
-                            Some(t) => {
-                                p.image(t.id(), img, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show_rows(ui, row_h, rows, |ui, range| {
+                for r in range {
+                    ui.horizontal(|ui| {
+                        for k in 0..cols {
+                            let Some(&i) = self.filtered.get(r * cols + k) else {
+                                break;
+                            };
+                            let it = &items[i as usize];
+                            let (rect, resp) = ui.allocate_exact_size(
+                                egui::vec2(tile, row_h - 8.0),
+                                egui::Sense::click(),
+                            );
+                            let p = ui.painter();
+                            p.rect_filled(
+                                rect,
+                                6.0,
+                                if resp.hovered() {
+                                    ui.visuals().widgets.hovered.bg_fill
+                                } else {
+                                    ui.visuals().faint_bg_color
+                                },
+                            );
+                            let img = egui::Rect::from_min_size(
+                                rect.min + egui::vec2(4.0, 4.0),
+                                egui::vec2(tile - 8.0, tile - 8.0),
+                            );
+                            match self.thumbnail(&ctx, &it.id) {
+                                Some(t) => {
+                                    p.image(
+                                        t.id(),
+                                        img,
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(0.0, 0.0),
+                                            egui::pos2(1.0, 1.0),
+                                        ),
+                                        egui::Color32::WHITE,
+                                    );
+                                }
+                                None => {
+                                    p.rect_filled(img, 4.0, ui.visuals().extreme_bg_color);
+                                    let msg = if self.thumbs.is_pending(&it.id) {
+                                        "…"
+                                    } else {
+                                        "no preview"
+                                    };
+                                    p.text(
+                                        img.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        msg,
+                                        egui::FontId::proportional(12.0),
+                                        ui.visuals().weak_text_color(),
+                                    );
+                                }
                             }
-                            None => {
-                                p.rect_filled(img, 4.0, ui.visuals().extreme_bg_color);
-                                let msg = if self.thumbs.is_pending(&it.id) { "…" } else { "no preview" };
-                                p.text(img.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(12.0), ui.visuals().weak_text_color());
+                            let fav = if mv.picker.is_favourite(&it.id) {
+                                "★ "
+                            } else {
+                                ""
+                            };
+                            p.text(
+                                egui::pos2(rect.min.x + 6.0, img.max.y + 4.0),
+                                egui::Align2::LEFT_TOP,
+                                format!("{fav}{}", display_name(&it.name)),
+                                egui::FontId::proportional(13.0),
+                                ui.visuals().text_color(),
+                            );
+                            p.text(
+                                egui::pos2(rect.min.x + 6.0, img.max.y + 20.0),
+                                egui::Align2::LEFT_TOP,
+                                &it.name,
+                                egui::FontId::proportional(10.0),
+                                ui.visuals().weak_text_color(),
+                            );
+                            if resp
+                                .on_hover_text(format!("{}\n{}", it.name, it.id))
+                                .clicked()
+                            {
+                                open = Some(it.id.clone());
                             }
                         }
-                        let fav = if mv.picker.is_favourite(&it.id) { "★ " } else { "" };
-                        p.text(egui::pos2(rect.min.x + 6.0, img.max.y + 4.0), egui::Align2::LEFT_TOP, format!("{fav}{}", display_name(&it.name)), egui::FontId::proportional(13.0), ui.visuals().text_color());
-                        p.text(egui::pos2(rect.min.x + 6.0, img.max.y + 20.0), egui::Align2::LEFT_TOP, &it.name, egui::FontId::proportional(10.0), ui.visuals().weak_text_color());
-                        if resp.on_hover_text(format!("{}\n{}", it.name, it.id)).clicked() {
-                            open = Some(it.id.clone());
-                        }
-                    }
-                });
-            }
-        });
+                    });
+                }
+            });
         if let Some(id) = open {
             self.go(View::Item(id));
         }
     }
 
-    fn item(&mut self, ui: &mut egui::Ui, items: &Arc<Vec<Item>>, id: &str, mv: &mut ModelView, out_root: &str, act: &mut Option<Action>) {
+    fn item(
+        &mut self,
+        ui: &mut egui::Ui,
+        items: &Arc<Vec<Item>>,
+        id: &str,
+        mv: &mut ModelView,
+        out_root: &str,
+        act: &mut Option<Action>,
+    ) {
         let ctx = ui.ctx().clone();
         let it = items.iter().find(|it| it.id == id);
         let name = it.map(|i| i.name.clone()).unwrap_or_else(|| id.to_string());
         let parts = self
             .parts
             .entry(id.to_string())
-            .or_insert_with(|| crate::model_view::assembly_ids(&sixng_core::export::Workspace::new(&mv.game, &mv.work), &mv.indexes, id))
+            .or_insert_with(|| {
+                crate::model_view::assembly_ids(
+                    &sixng_core::export::Workspace::new(&mv.game, &mv.work),
+                    &mv.indexes,
+                    id,
+                )
+            })
             .clone();
         // follow the parts chosen in the viewer, when it shows this model
         let parts = mv.selected_parts(id).or(parts);
         ui.horizontal_top(|ui| {
-            let t = self.thumbs.get(&ctx, id);
+            let t = self.thumbnail(&ctx, id);
             let (rect, _) = ui.allocate_exact_size(egui::vec2(320.0, 320.0), egui::Sense::hover());
             match t {
                 Some(t) => {
@@ -394,29 +602,44 @@ impl Library {
         ui.heading("Files");
         if let Some(p) = &parts {
             ui.label(format!("Put together from {} parts:", p.len()));
-            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                egui::Grid::new("item_parts").num_columns(3).striped(true).show(ui, |ui| {
-                    for pid in p {
-                        let pname = items.iter().find(|i| &i.id == pid).map(|i| i.name.clone()).unwrap_or_else(|| pid.clone());
-                        ui.label(egui::RichText::new(&pname).monospace());
-                        match export_dir(Path::new(out_root), pid) {
-                            Some(dir) => {
-                                if ui.small_button(format!("Show in {}", crate::FILE_MANAGER)).clicked() {
-                                    crate::open_path(&dir);
+            egui::ScrollArea::vertical()
+                .max_height(320.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("item_parts")
+                        .num_columns(3)
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for pid in p {
+                                let pname = items
+                                    .iter()
+                                    .find(|i| &i.id == pid)
+                                    .map(|i| i.name.clone())
+                                    .unwrap_or_else(|| pid.clone());
+                                ui.label(egui::RichText::new(&pname).monospace());
+                                match export_dir(Path::new(out_root), pid) {
+                                    Some(dir) => {
+                                        if ui
+                                            .small_button(format!(
+                                                "Show in {}",
+                                                crate::FILE_MANAGER
+                                            ))
+                                            .clicked()
+                                        {
+                                            crate::open_path(&dir);
+                                        }
+                                        if ui.small_button("Copy path").clicked() {
+                                            ui.ctx().copy_text(dir.display().to_string());
+                                        }
+                                    }
+                                    None => {
+                                        ui.weak("not exported yet");
+                                        ui.label("");
+                                    }
                                 }
-                                if ui.small_button("Copy path").clicked() {
-                                    ui.ctx().copy_text(dir.display().to_string());
-                                }
+                                ui.end_row();
                             }
-                            None => {
-                                ui.weak("not exported yet");
-                                ui.label("");
-                            }
-                        }
-                        ui.end_row();
-                    }
+                        });
                 });
-            });
             return;
         }
         match export_dir(Path::new(out_root), id) {
@@ -426,31 +649,51 @@ impl Library {
             Some(dir) => {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(dir.display().to_string()).monospace());
-                    if ui.small_button(format!("Show in {}", crate::FILE_MANAGER)).clicked() {
+                    if ui
+                        .small_button(format!("Show in {}", crate::FILE_MANAGER))
+                        .clicked()
+                    {
                         crate::open_path(&dir);
                     }
                     if ui.small_button("Copy path").clicked() {
                         ui.ctx().copy_text(dir.display().to_string());
                     }
                 });
-                let mut files: Vec<PathBuf> = std::fs::read_dir(&dir).map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect()).unwrap_or_default();
+                let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+                    .map(|rd| {
+                        rd.flatten()
+                            .map(|e| e.path())
+                            .filter(|p| p.is_file())
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 files.sort();
-                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                    egui::Grid::new("item_files").num_columns(4).striped(true).show(ui, |ui| {
-                        for f in files {
-                            let n = f.file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
-                            ui.label(egui::RichText::new(&n).monospace());
-                            ui.label(crate::human(std::fs::metadata(&f).map(|m| m.len()).unwrap_or(0)));
-                            if ui.small_button("Open").clicked() {
-                                crate::open_path(&f);
-                            }
-                            if ui.small_button("Show").clicked() {
-                                crate::reveal(&f);
-                            }
-                            ui.end_row();
-                        }
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("item_files")
+                            .num_columns(4)
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for f in files {
+                                    let n = f
+                                        .file_name()
+                                        .map(|x| x.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    ui.label(egui::RichText::new(&n).monospace());
+                                    ui.label(crate::human(
+                                        std::fs::metadata(&f).map(|m| m.len()).unwrap_or(0),
+                                    ));
+                                    if ui.small_button("Open").clicked() {
+                                        crate::open_path(&f);
+                                    }
+                                    if ui.small_button("Show").clicked() {
+                                        crate::reveal(&f);
+                                    }
+                                    ui.end_row();
+                                }
+                            });
                     });
-                });
                 ui.label(egui::RichText::new("Textures referenced by the model are in the output's textures/ folder (see model.json).").small().weak());
             }
         }

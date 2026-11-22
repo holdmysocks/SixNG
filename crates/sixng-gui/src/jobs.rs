@@ -111,7 +111,10 @@ pub struct Jobs {
 }
 
 fn cli_path() -> PathBuf {
-    let dir = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf())).unwrap_or_default();
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_default();
     dir.join(if cfg!(windows) { "sixng.exe" } else { "sixng" })
 }
 
@@ -148,7 +151,11 @@ fn parse_command(name: &str, help: &str) -> CmdSpec {
     let mut usage = String::new();
     let mut section = "";
     for l in help.lines() {
-        if about.is_empty() && !l.trim().is_empty() && section.is_empty() && !l.starts_with("Usage:") {
+        if about.is_empty()
+            && !l.trim().is_empty()
+            && section.is_empty()
+            && !l.starts_with("Usage:")
+        {
             about = l.trim().to_string();
             continue;
         }
@@ -173,29 +180,71 @@ fn parse_command(name: &str, help: &str) -> CmdSpec {
             Some(p) => (t[..p].trim(), t[p..].trim()),
             None => (t, ""),
         };
-        let default = desc.find("[default: ").map(|p| desc[p + 10..].split(']').next().unwrap_or("").to_string());
-        let desc_clean = desc.split(" [default:").next().unwrap_or(desc).split(" [env:").next().unwrap_or(desc).to_string();
+        let default = desc
+            .find("[default: ")
+            .map(|p| desc[p + 10..].split(']').next().unwrap_or("").to_string());
+        let desc_clean = desc
+            .split(" [default:")
+            .next()
+            .unwrap_or(desc)
+            .split(" [env:")
+            .next()
+            .unwrap_or(desc)
+            .to_string();
         if section == "args" {
             let multiple = head.ends_with("...");
             let req = head.starts_with('<');
-            let n = head.trim_end_matches("...").trim_matches(|c| c == '[' || c == ']' || c == '<' || c == '>').to_string();
-            fields.push(Field { name: n.to_ascii_lowercase(), value: Some(n), desc: desc_clean, default, positional: true, required: req, multiple });
+            let n = head
+                .trim_end_matches("...")
+                .trim_matches(|c| c == '[' || c == ']' || c == '<' || c == '>')
+                .to_string();
+            fields.push(Field {
+                name: n.to_ascii_lowercase(),
+                value: Some(n),
+                desc: desc_clean,
+                default,
+                positional: true,
+                required: req,
+                multiple,
+            });
         } else if section == "opts" {
             // "-o, --out <OUT>" or "--force" or "--id <ID>..."
             let long = head.split(", ").last().unwrap_or(head);
-            let Some(rest) = long.strip_prefix("--") else { continue };
+            let Some(rest) = long.strip_prefix("--") else {
+                continue;
+            };
             let (n, v) = match rest.split_once(' ') {
-                Some((n, v)) => (n.to_string(), Some(v.trim_matches(|c| c == '<' || c == '>' || c == '.').to_string())),
+                Some((n, v)) => (
+                    n.to_string(),
+                    Some(
+                        v.trim_matches(|c| c == '<' || c == '>' || c == '.')
+                            .to_string(),
+                    ),
+                ),
                 None => (rest.to_string(), None),
             };
             if GLOBAL.contains(&n.as_str()) {
                 continue;
             }
-            let required = usage.contains(&format!("--{n} <")) && !usage.contains(&format!("[--{n}"));
-            fields.push(Field { name: n, value: v, desc: desc_clean, default, positional: false, required, multiple: head.ends_with("...") });
+            let required =
+                usage.contains(&format!("--{n} <")) && !usage.contains(&format!("[--{n}"));
+            fields.push(Field {
+                name: n,
+                value: v,
+                desc: desc_clean,
+                default,
+                positional: false,
+                required,
+                multiple: head.ends_with("..."),
+            });
         }
     }
-    CmdSpec { name: name.to_string(), about, usage, fields }
+    CmdSpec {
+        name: name.to_string(),
+        about,
+        usage,
+        fields,
+    }
 }
 
 fn load_catalog(cli: &Path) -> Result<Vec<CmdSpec>, String> {
@@ -207,7 +256,9 @@ fn load_catalog(cli: &Path) -> Result<Vec<CmdSpec>, String> {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
-        let o = cmd.output().map_err(|e| format!("cannot run {}: {e}", cli.display()))?;
+        let o = cmd
+            .output()
+            .map_err(|e| format!("cannot run {}: {e}", cli.display()))?;
         Ok(String::from_utf8_lossy(&o.stdout).to_string())
     };
     let top = run(&["--help"])?;
@@ -215,8 +266,13 @@ fn load_catalog(cli: &Path) -> Result<Vec<CmdSpec>, String> {
     let names: Vec<String> = parse_commands(&top).into_iter().map(|(n, _)| n).collect();
     let helps: Vec<Result<String, String>> = std::thread::scope(|s| {
         let run = &run;
-        let hs: Vec<_> = names.iter().map(|n| s.spawn(move || run(&[n.as_str(), "--help"]))).collect();
-        hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("help call crashed".into()))).collect()
+        let hs: Vec<_> = names
+            .iter()
+            .map(|n| s.spawn(move || run(&[n.as_str(), "--help"])))
+            .collect();
+        hs.into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| Err("help call crashed".into())))
+            .collect()
     });
     let mut v = Vec::new();
     for (n, h) in names.iter().zip(helps) {
@@ -252,7 +308,20 @@ fn split_values(s: &str) -> Vec<String> {
 
 impl Jobs {
     pub fn new(game: &str, work: &str) -> Self {
-        Jobs { game: game.into(), work: work.into(), cli: cli_path(), jobs: Vec::new(), next_id: 1, catalog: None, catalog_pending: None, sel_cmd: None, form: Vec::new(), form_flags: Vec::new(), sel_job: None, finished: Vec::new() }
+        Jobs {
+            game: game.into(),
+            work: work.into(),
+            cli: cli_path(),
+            jobs: Vec::new(),
+            next_id: 1,
+            catalog: None,
+            catalog_pending: None,
+            sel_cmd: None,
+            form: Vec::new(),
+            form_flags: Vec::new(),
+            sel_job: None,
+            finished: Vec::new(),
+        }
     }
 
     pub fn set_folders(&mut self, game: &str, work: &str) {
@@ -268,8 +337,23 @@ impl Jobs {
     pub fn enqueue(&mut self, label: &str, args: Vec<String>) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
-        let out_dir = args.iter().position(|a| a == "--out" || a == "-o").and_then(|i| args.get(i + 1)).map(PathBuf::from);
-        self.jobs.push(Job { id, label: label.into(), args, state: State::Queued, child: None, io: Arc::new(Mutex::new(Io::default())), started: None, seconds: 0.0, result: None, out_dir });
+        let out_dir = args
+            .iter()
+            .position(|a| a == "--out" || a == "-o")
+            .and_then(|i| args.get(i + 1))
+            .map(PathBuf::from);
+        self.jobs.push(Job {
+            id,
+            label: label.into(),
+            args,
+            state: State::Queued,
+            child: None,
+            io: Arc::new(Mutex::new(Io::default())),
+            started: None,
+            seconds: 0.0,
+            result: None,
+            out_dir,
+        });
         id
     }
 
@@ -282,7 +366,10 @@ impl Jobs {
     }
 
     pub fn active_count(&self) -> usize {
-        self.jobs.iter().filter(|j| matches!(j.state, State::Running | State::Queued)).count()
+        self.jobs
+            .iter()
+            .filter(|j| matches!(j.state, State::Running | State::Queued))
+            .count()
     }
 
     /// Jobs that ended since the last call: (id, ok).
@@ -307,7 +394,12 @@ impl Jobs {
         let (game, work, cli) = (self.game.clone(), self.work.clone(), self.cli.clone());
         let j = &mut self.jobs[idx];
         let mut cmd = Command::new(&cli);
-        cmd.args(&j.args).env("SIXNG_GAME", &game).env("SIXNG_WORK", &work).stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
+        cmd.args(&j.args)
+            .env("SIXNG_GAME", &game)
+            .env("SIXNG_WORK", &work)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -353,7 +445,10 @@ impl Jobs {
                 j.started = Some(Instant::now());
             }
             Err(e) => {
-                j.io.lock().unwrap().log.push_back(format!("could not start {}: {e}", cli.display()));
+                j.io.lock()
+                    .unwrap()
+                    .log
+                    .push_back(format!("could not start {}: {e}", cli.display()));
                 j.state = State::Failed;
                 self.finished.push((j.id, false));
             }
@@ -375,7 +470,10 @@ impl Jobs {
                 // give the reader threads a moment to drain the pipes
                 std::thread::sleep(std::time::Duration::from_millis(30));
                 let out = j.io.lock().unwrap().stdout.clone();
-                let last = out.lines().rev().find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok());
+                let last = out
+                    .lines()
+                    .rev()
+                    .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok());
                 let ok = st.success() && last.as_ref().map_or(true, |v| v["ok"] != false);
                 j.result = last;
                 j.state = if ok { State::Done } else { State::Failed };
@@ -391,7 +489,8 @@ impl Jobs {
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         if self.running() {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(250));
         }
         if !self.cli_found() {
             ui.colored_label(egui::Color32::from_rgb(230, 150, 90), format!("The command-line tool was not found at {}. Jobs need sixng.exe next to sixng-gui.exe.", self.cli.display()));
@@ -431,22 +530,43 @@ impl Jobs {
                 return;
             }
         };
-        egui::SidePanel::left("jobs_cmds").resizable(true).default_width(250.0).show_inside(ui, |ui| {
-            ui.heading("Commands");
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for (i, c) in cat.iter().enumerate() {
-                    let r = ui.selectable_label(self.sel_cmd == Some(i), egui::RichText::new(&c.name).strong()).on_hover_text(&c.about);
-                    ui.label(egui::RichText::new(&c.about).small().weak());
-                    if r.clicked() {
-                        self.sel_cmd = Some(i);
-                        self.form = c.fields.iter().map(|f| if f.value.is_some() { f.default.clone().unwrap_or_default() } else { String::new() }).collect();
-                        self.form_flags = vec![false; c.fields.len()];
+        egui::Panel::left("jobs_cmds")
+            .resizable(true)
+            .default_size(250.0)
+            .show(ui, |ui| {
+                ui.heading("Commands");
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (i, c) in cat.iter().enumerate() {
+                        let r = ui
+                            .selectable_label(
+                                self.sel_cmd == Some(i),
+                                egui::RichText::new(&c.name).strong(),
+                            )
+                            .on_hover_text(&c.about);
+                        ui.label(egui::RichText::new(&c.about).small().weak());
+                        if r.clicked() {
+                            self.sel_cmd = Some(i);
+                            self.form = c
+                                .fields
+                                .iter()
+                                .map(|f| {
+                                    if f.value.is_some() {
+                                        f.default.clone().unwrap_or_default()
+                                    } else {
+                                        String::new()
+                                    }
+                                })
+                                .collect();
+                            self.form_flags = vec![false; c.fields.len()];
+                        }
                     }
-                }
+                });
             });
-        });
-        egui::SidePanel::right("jobs_queue").resizable(true).default_width(420.0).show_inside(ui, |ui| self.queue_ui(ui));
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::Panel::right("jobs_queue")
+            .resizable(true)
+            .default_size(420.0)
+            .show(ui, |ui| self.queue_ui(ui));
+        egui::CentralPanel::default().show(ui, |ui| {
             let Some(ci) = self.sel_cmd else {
                 ui.label("Pick a command on the left to fill in its options and queue it. Jobs run one at a time in the background; you can keep using the app.");
                 return;
@@ -534,62 +654,108 @@ impl Jobs {
         ui.horizontal(|ui| {
             ui.heading("Queue");
             if ui.small_button("Clear finished").clicked() {
-                self.jobs.retain(|j| matches!(j.state, State::Running | State::Queued));
+                self.jobs
+                    .retain(|j| matches!(j.state, State::Running | State::Queued));
             }
         });
         let mut cancel = None;
-        egui::ScrollArea::vertical().id_salt("jobq").max_height(ui.available_height() * 0.45).show(ui, |ui| {
-            for j in self.jobs.iter().rev() {
-                let (stage, pct, done, total) = j.progress();
-                let col = match j.state {
-                    State::Done => egui::Color32::from_rgb(120, 200, 120),
-                    State::Failed => egui::Color32::from_rgb(230, 120, 90),
-                    State::Cancelled => egui::Color32::GRAY,
-                    _ => ui.visuals().text_color(),
-                };
-                ui.horizontal(|ui| {
-                    if ui.selectable_label(self.sel_job == Some(j.id), egui::RichText::new(format!("#{} {}", j.id, j.label)).color(col)).clicked() {
-                        self.sel_job = Some(j.id);
+        egui::ScrollArea::vertical()
+            .id_salt("jobq")
+            .max_height(ui.available_height() * 0.45)
+            .show(ui, |ui| {
+                for j in self.jobs.iter().rev() {
+                    let (stage, pct, done, total) = j.progress();
+                    let col = match j.state {
+                        State::Done => egui::Color32::from_rgb(120, 200, 120),
+                        State::Failed => egui::Color32::from_rgb(230, 120, 90),
+                        State::Cancelled => egui::Color32::GRAY,
+                        _ => ui.visuals().text_color(),
+                    };
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(
+                                self.sel_job == Some(j.id),
+                                egui::RichText::new(format!("#{} {}", j.id, j.label)).color(col),
+                            )
+                            .clicked()
+                        {
+                            self.sel_job = Some(j.id);
+                        }
+                        ui.label(
+                            egui::RichText::new(format!("{:?} · {:.0}s", j.state, j.seconds))
+                                .small(),
+                        );
+                        if matches!(j.state, State::Running | State::Queued)
+                            && ui.small_button("Cancel").clicked()
+                        {
+                            cancel = Some(j.id);
+                        }
+                    });
+                    if j.state == State::Running {
+                        let frac = if total > 0 { pct / 100.0 } else { 0.0 };
+                        ui.add(
+                            egui::ProgressBar::new(frac)
+                                .text(if total > 0 {
+                                    format!("{stage} {done}/{total} ({pct:.1} %)")
+                                } else {
+                                    "starting …".into()
+                                })
+                                .animate(true),
+                        );
                     }
-                    ui.label(egui::RichText::new(format!("{:?} · {:.0}s", j.state, j.seconds)).small());
-                    if matches!(j.state, State::Running | State::Queued) && ui.small_button("Cancel").clicked() {
-                        cancel = Some(j.id);
-                    }
-                });
-                if j.state == State::Running {
-                    let frac = if total > 0 { pct / 100.0 } else { 0.0 };
-                    ui.add(egui::ProgressBar::new(frac).text(if total > 0 { format!("{stage} {done}/{total} ({pct:.1} %)") } else { "starting …".into() }).animate(true));
                 }
-            }
-        });
+            });
         if let Some(id) = cancel {
             self.cancel(id);
         }
         ui.separator();
-        let Some(j) = self.sel_job.and_then(|id| self.jobs.iter().find(|j| j.id == id)) else {
+        let Some(j) = self
+            .sel_job
+            .and_then(|id| self.jobs.iter().find(|j| j.id == id))
+        else {
             ui.label("Select a job to see its log and result.");
             return;
         };
-        ui.label(egui::RichText::new(format!("sixng {}", j.args.join(" "))).monospace().small());
+        ui.label(
+            egui::RichText::new(format!("sixng {}", j.args.join(" ")))
+                .monospace()
+                .small(),
+        );
         if let Some(d) = &j.out_dir {
             if ui.button("📂 Open output folder").clicked() {
-                let p = if d.is_absolute() { d.clone() } else { std::env::current_dir().unwrap_or_default().join(d) };
+                let p = if d.is_absolute() {
+                    d.clone()
+                } else {
+                    std::env::current_dir().unwrap_or_default().join(d)
+                };
                 crate::open_path(&p);
             }
         }
         if let Some(r) = &j.result {
             ui.collapsing("Result", |ui| {
-                egui::ScrollArea::vertical().id_salt("jobres").max_height(200.0).show(ui, |ui| {
-                    ui.label(egui::RichText::new(serde_json::to_string_pretty(r).unwrap_or_default()).monospace().small());
-                });
+                egui::ScrollArea::vertical()
+                    .id_salt("jobres")
+                    .max_height(200.0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                serde_json::to_string_pretty(r).unwrap_or_default(),
+                            )
+                            .monospace()
+                            .small(),
+                        );
+                    });
             });
         }
         ui.label("Log");
-        egui::ScrollArea::vertical().id_salt("joblog").stick_to_bottom(true).show(ui, |ui| {
-            for l in j.log_lines() {
-                ui.label(egui::RichText::new(l).monospace().small());
-            }
-        });
+        egui::ScrollArea::vertical()
+            .id_salt("joblog")
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for l in j.log_lines() {
+                    ui.label(egui::RichText::new(l).monospace().small());
+                }
+            });
     }
 }
 
@@ -609,12 +775,30 @@ mod tests {
     #[test]
     fn parses_help() {
         let top = "x\n\nUsage: sixng [OPTIONS] <COMMAND>\n\nCommands:\n  info     Show archives\n  index    Build indexes\n  help     Print this\n\nOptions:\n";
-        assert_eq!(parse_commands(top).iter().map(|x| x.0.as_str()).collect::<Vec<_>>(), vec!["info", "index"]);
+        assert_eq!(
+            parse_commands(top)
+                .iter()
+                .map(|x| x.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["info", "index"]
+        );
         let h = "Decode things\n\nUsage: sixng.exe placements [OPTIONS] --out <OUT> [ARCHIVE]\n\nArguments:\n  [ARCHIVE]  Archive (default levels) [default: levels]\n\nOptions:\n      --game <GAME>  root\n      --id <ID>...  ids\n  -o, --out <OUT>  Output directory\n      --batches  Also batches\n";
         let c = parse_command("placements", h);
         assert_eq!(c.about, "Decode things");
-        let n: Vec<_> = c.fields.iter().map(|f| (f.name.as_str(), f.required, f.positional)).collect();
-        assert_eq!(n, vec![("archive", false, true), ("id", false, false), ("out", true, false), ("batches", false, false)]);
+        let n: Vec<_> = c
+            .fields
+            .iter()
+            .map(|f| (f.name.as_str(), f.required, f.positional))
+            .collect();
+        assert_eq!(
+            n,
+            vec![
+                ("archive", false, true),
+                ("id", false, false),
+                ("out", true, false),
+                ("batches", false, false)
+            ]
+        );
         assert_eq!(c.fields[0].default.as_deref(), Some("levels"));
         assert_eq!(split_values("a \"b c\" d"), vec!["a", "b c", "d"]);
     }
