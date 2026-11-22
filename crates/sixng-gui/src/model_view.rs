@@ -235,7 +235,9 @@ impl ModelView {
         let work = PathBuf::from(&self.work);
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let r = index_for(&ws, "packs", &idx).and_then(|(a, ix)| sixng_core::groom::catalog_cached(&work, &a, &ix.entries)).map_err(|e| format!("{e:#}"));
+            let r = index_for(&ws, "packs", &idx)
+                .and_then(|(a, ix)| sixng_core::groom::catalog_cached(&work, &a, &ix.entries))
+                .map_err(|e| format!("{e:#}"));
             *slot.lock().unwrap() = Some(r);
             ctx.request_repaint();
         });
@@ -277,7 +279,11 @@ impl ModelView {
         let idx = self.indexes.clone();
         let slot = self.hair.pending.clone();
         let dir = self.cache_dir().join("grooms");
-        let (sel, hw, rgb) = (self.hair.selected.clone(), self.hair.width_mm / 1000.0, self.hair.colour);
+        let (sel, hw, rgb) = (
+            self.hair.selected.clone(),
+            self.hair.width_mm / 1000.0,
+            self.hair.colour,
+        );
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<Vec<glb::Model>> {
@@ -289,7 +295,10 @@ impl ModelView {
                     // linear colour from the sRGB picker value
                     let lin = rgb.map(|c| c.powf(2.2));
                     let p = dir.join(format!("{off:x}.glb"));
-                    std::fs::write(&p, g.ribbon_glb(&format!("groom_{off:x}"), hw, lin, serde_json::json!({})))?;
+                    std::fs::write(
+                        &p,
+                        g.ribbon_glb(&format!("groom_{off:x}"), hw, lin, serde_json::json!({})),
+                    )?;
                     out.push(glb::load(&p, &dir)?);
                 }
                 Ok(out)

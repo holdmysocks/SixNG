@@ -1504,7 +1504,10 @@ impl App {
         let m = &mut self.model;
         if let Some(v) = c.get("hair") {
             // grooms to show: hex offsets in packs.rpf
-            m.hair.selected = v.split(',').filter_map(|h| u64::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok()).collect();
+            m.hair.selected = v
+                .split(',')
+                .filter_map(|h| u64::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok())
+                .collect();
             if let Some(w) = c.f("hair-width") {
                 m.hair.width_mm = w;
             }
