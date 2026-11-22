@@ -551,7 +551,7 @@ impl App {
             });
             // texture gaps
             egui::CollapsingHeader::new("Texture gaps (BCPack)").default_open(true).show(ui, |ui| {
-                ui.weak("BCPack is the Xbox hardware texture codec. Every BCPack format but BC6H decodes; BC6H textures have no decoder yet and export as a flat colour or at a lower mip.");
+                ui.weak("BCPack is the Xbox hardware texture codec. All six BCPack formats decode; preset tables are fitted, so a few blocks can be off. A chunk that fails to decode falls back to a lower mip or a flat colour.");
                 match &*self.status.gaps.lock().unwrap() {
                     None => {
                         ui.spinner();
