@@ -681,7 +681,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                         Ok(x) => x,
                         Err(e) => return vec![json!({"hash": format!("{:016x}", t.hash), "slices": t.slices(), "error": e.to_string()})],
                     };
-                    // Data entirely in BCPack chunks other than BC1, BC3 and BC7 (no decoder yet): the PNG
+                    // Data entirely in BC6H BCPack chunks (no decoder yet): the PNG
                     // would be blank, so --all writes nothing for it.
                     if *all && skipped >= t.size as u64 {
                         return vec![json!({"hash": format!("{:016x}", t.hash), "w": t.width, "h": t.height, "format": sixng_core::texture::dxgi_name(t.dxgi_format), "error": "all data in BCPack chunks (not decodable yet)", "bcpack_only": true})];
@@ -707,7 +707,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     let bcpack = res.iter().filter(|r| r["bcpack_only"] == true).count();
                     let failed = res.len() - ok - bcpack;
                     let idx = dir.join("index.json");
-                    let note = "One PNG per texture (<hash>_m<mip>.png). partial = some of the data is in BCPack chunks other than BC1, BC3 and BC7, so part of the image is blank or noise; bcpack_only = nothing decodable yet, no PNG written. Names are not recovered (64-bit hashes).";
+                    let note = "One PNG per texture (<hash>_m<mip>.png). partial = some of the data is in BC6H BCPack chunks, so part of the image is blank or noise; bcpack_only = nothing decodable yet, no PNG written. Names are not recovered (64-bit hashes).";
                     std::fs::write(&idx, serde_json::to_vec_pretty(&json!({"note": note, "store": a.id, "textures": st.textures.len(), "written": ok, "complete": ok - partial, "partial": partial, "bcpack_only": bcpack, "failed": failed, "results": res}))?)?;
                     out.print(&json!({"ok": true, "store": a.id, "textures": st.textures.len(), "written": ok, "complete": ok - partial, "partial": partial, "bcpack_only": bcpack, "failed": failed, "index": idx}));
                 } else {
