@@ -618,7 +618,8 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
         Cmd::Extract { archive, filter, out: oa } => {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
-            let sel = filter.to_filter()?.select(&ix)?;
+            let selected = filter.to_filter()?.select_exports(&ix)?;
+            let sel: Vec<_> = selected.iter().collect();
             do_export(&a, &sel, oa, pr, out)?;
         }
         Cmd::ExtractCategory { category, name, limit, out: oa } => {
@@ -1086,18 +1087,23 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             out.print(&json!({"ok": true}));
         }
         Cmd::Inspect { id } => {
-            let (aid, off) = id.rsplit_once('@').ok_or_else(|| anyhow!("id must be <archive>@<hexoffset>"))?;
+            let (aid, _) = id.rsplit_once('@').ok_or_else(|| anyhow!("id must be <archive>@<hexoffset>"))?;
             let a = ws.resolve(aid)?;
             let ix = ws.load_index(&a)?;
-            let off = u64::from_str_radix(off, 16)?;
-            let e = ix.entries.iter().find(|e| e.off == off).ok_or_else(|| anyhow!("no entry at {off:#x}"))?;
+            let (e, member) = export::ModelResolver::new(&ix.entries).resolve(&ix.entries, &id)?;
+            let selected = member.map(|name| export::member_entry(e, name)).transpose()?;
+            let e = selected.as_ref().unwrap_or(e);
             let mut v = entry_json(e, true);
             if matches!(e.kind, Kind::RageObj | Kind::Resource) {
                 let r = sixng_core::resource::Resource::load(&a.path, e)?;
                 if e.rtype.as_deref() == Some("txd") {
                     v["textures"] = json!(sixng_core::texture::find_textures(&r));
                 } else {
-                    v["drawable"] = json!(sixng_core::drawable::describe(&r));
+                    let mut info = sixng_core::drawable::describe(&r);
+                    if let Some(name) = member {
+                        sixng_core::drawable::select_member(&r, &mut info, name)?;
+                    }
+                    v["drawable"] = json!(info);
                 }
             } else {
                 let data = sixng_core::scan::read_entry(&a.path, e)?;

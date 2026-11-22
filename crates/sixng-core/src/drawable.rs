@@ -9,6 +9,74 @@
 use crate::resource::{find_resource_name, Resource};
 use serde::{Deserialize, Serialize};
 
+/// One drawable root in a drawable dictionary, in name-string order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DictMember {
+    pub name: String,
+    pub root: usize,
+}
+
+/// Resolve and validate one drawable LOD entry and its model pointer array.
+fn lod_models(r: &Resource, root: usize, lod: usize) -> Option<Vec<usize>> {
+    let entry = r.sys_off(r.u64(root + 0x50 + 8 * lod))?;
+    if entry + 16 > r.sys.len() {
+        return None;
+    }
+    let array = r.sys_off(r.u64(entry))?;
+    let count = r.u16(entry + 8) as usize;
+    if !(1..64).contains(&count) || array + 8 * count > r.sys.len() {
+        return None;
+    }
+    (0..count).map(|i| r.sys_off(r.u64(array + 8 * i))).collect()
+}
+
+/// Find named drawable roots with valid LOD tables. A single drawable is
+/// deliberately not a dictionary. A root with its own drawable LOD table is
+/// also not a dictionary: other named drawables are its embedded parts.
+/// All pointers resolve against assembled sys.
+pub fn dictionary_members(r: &Resource) -> Vec<DictMember> {
+    use std::collections::{HashMap, HashSet};
+    if find_resource_name(&r.sys).is_some_and(|(_, tag)| tag == "ft") || (0..4).any(|lod| lod_models(r, 0, lod).is_some()) {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    for (at, suffix) in r.sys.windows(4).enumerate() {
+        if suffix != b".#dr" || r.sys.get(at + 4) != Some(&0) {
+            continue;
+        }
+        let mut start = at;
+        while start > 0 && crate::resource::is_name_char(r.sys[start - 1]) {
+            start -= 1;
+        }
+        if at - start >= 2 {
+            names.push((start, String::from_utf8_lossy(&r.sys[start..at]).into_owned()));
+        }
+    }
+    if names.len() < 2 {
+        return Vec::new();
+    }
+    // Scan aligned references once, rather than once per member name.
+    let mut references: HashMap<usize, Vec<usize>> = names.iter().map(|(offset, _)| (*offset, Vec::new())).collect();
+    for location in (0xA8..r.sys.len().saturating_sub(7)).step_by(8) {
+        if let Some(target) = r.sys_off(r.u64(location)) {
+            if let Some(locations) = references.get_mut(&target) {
+                locations.push(location);
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut members = Vec::new();
+    for (start, name) in names {
+        for &location in references.get(&start).into_iter().flatten() {
+            let root = location - 0xA8;
+            if (0..4).any(|lod| lod_models(r, root, lod).is_some()) && seen.insert(name.clone()) {
+                members.push(DictMember { name: name.clone(), root });
+            }
+        }
+    }
+    if members.len() < 2 { Vec::new() } else { members }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GfxBuffer {
     pub struct_off: u64,
@@ -41,6 +109,8 @@ pub struct MeshBlobHeader {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DrawableInfo {
+    #[serde(default)]
+    pub members: Vec<String>,
     pub name: Option<String>,
     pub tag: Option<String>,
     /// Floats at +0x2C..+0x4C of the root object (radius?, bbox min, bbox max).
@@ -302,19 +372,98 @@ pub fn strings(sys: &[u8], min: usize) -> Vec<String> {
 /// Drawables keep it at +0x30 (min) / +0x40 (max) of the root. A fragment
 /// root has other data there; its drawable is at the pointer in +0x18.
 pub fn drawable_bounds(r: &Resource) -> Option<[[f32; 3]; 2]> {
-    let at = |o: usize| -> Option<[[f32; 3]; 2]> {
-        if r.sys.len() < o + 0x4c {
-            return None;
-        }
-        let b = [[r.f32(o + 0x30), r.f32(o + 0x34), r.f32(o + 0x38)], [r.f32(o + 0x40), r.f32(o + 0x44), r.f32(o + 0x48)]];
-        let sane = |v: f32| v.is_finite() && v.abs() < 1e5 && (v == 0.0 || v.abs() > 1e-20);
-        let ok = b.iter().flatten().all(|&v| sane(v)) && (0..3).all(|k| b[1][k] >= b[0][k]) && (0..3).any(|k| b[1][k] - b[0][k] > 1e-3);
-        ok.then_some(b)
-    };
+    let at = |o| bounds_at(r, o);
     if find_resource_name(&r.sys).map_or(false, |t| t.1 == "ft") {
         return r.sys_off(r.u64(0x18)).and_then(at).or_else(|| at(0));
     }
     at(0)
+}
+
+/// Apply the same validation to root and decoded geometry bounds.
+fn sane_bounds(b: [[f32; 3]; 2]) -> Option<[[f32; 3]; 2]> {
+    let sane = |v: f32| v.is_finite() && v.abs() < 1e5 && (v == 0.0 || v.abs() > 1e-20);
+    (b.iter().flatten().all(|&v| sane(v)) && (0..3).all(|k| b[1][k] >= b[0][k])
+        && (0..3).any(|k| b[1][k] - b[0][k] > 1e-3)).then_some(b)
+}
+
+fn bounds_at(r: &Resource, o: usize) -> Option<[[f32; 3]; 2]> {
+    if r.sys.len() < o + 0x4c { return None; }
+    sane_bounds([[r.f32(o + 0x30), r.f32(o + 0x34), r.f32(o + 0x38)],
+        [r.f32(o + 0x40), r.f32(o + 0x44), r.f32(o + 0x48)]])
+}
+
+/// Bounds for a selected member prefer its highest populated LOD's geometry.
+/// Ordinary drawables/fragments retain their existing root bounds behaviour.
+pub fn model_bounds(r: &Resource, member: Option<&str>) -> Option<[[f32; 3]; 2]> {
+    let Some(name) = member else { return drawable_bounds(r) };
+    let members = dictionary_members(r);
+    let index = members.iter().position(|m| m.name == name)?;
+    let bufs = find_buffers(r);
+    let geoms = find_geometries(r, &bufs);
+    let models = find_models(r, &geoms);
+    let lod = models.iter().filter(|m| m.member == Some(index as u32)).map(|m| m.lod).min();
+    let mut b = [[f32::MAX; 3], [f32::MIN; 3]];
+    for m in models.iter().filter(|m| m.member == Some(index as u32) && Some(m.lod) == lod) {
+        for &gi in &m.geometries {
+            let buf = &bufs[geoms[gi].vertex_buffer];
+            if let Some(h) = &buf.mesh_blob {
+                let end = (buf.gfx_off + buf.bytes).min(r.gfx.len() as u64) as usize;
+                if let Some(bytes) = r.gfx.get(buf.gfx_off as usize..end) {
+                    let ib = &bufs[geoms[gi].index_buffer];
+                    let ib_end = (ib.gfx_off + ib.bytes).min(r.gfx.len() as u64) as usize;
+                    let indices = r.gfx.get(ib.gfx_off as usize..ib_end).unwrap_or_default();
+                    for p in decode_mesh(bytes, h, indices).positions {
+                        if !p.iter().all(|v| v.is_finite()) { return bounds_at(r, members[index].root); }
+                        for k in 0..3 { b[0][k] = b[0][k].min(p[k]); b[1][k] = b[1][k].max(p[k]); }
+                    }
+                }
+            }
+        }
+    }
+    sane_bounds(b).or_else(|| bounds_at(r, members[index].root))
+}
+
+/// Keep only the assets referenced by one dictionary member and remap indices.
+pub fn select_member(r: &Resource, info: &mut DrawableInfo, name: &str) -> anyhow::Result<()> {
+    use std::collections::{BTreeSet, HashMap};
+    let index = info.members.iter().position(|n| n == name)
+        .ok_or_else(|| anyhow::anyhow!("no drawable member {name}"))?;
+    info.models.retain(|m| m.member == Some(index as u32));
+    info.name = Some(name.to_string());
+    let root = dictionary_members(r)[index].root;
+    info.bounds_raw = (0..8).map(|i| r.f32(root + 0x2c + i * 4)).collect();
+    info.bounds = model_bounds(r, Some(name));
+    // Model shader indices are local to the member's shader group. The
+    // resource-wide longest run may belong to a different drawable.
+    if let Some(array) = r.sys_off(r.u64(root + 0x10)).and_then(|s| r.sys_off(r.u64(s + 0x10))) {
+        let shaders = shaders_at(r, array);
+        if !shaders.is_empty() {
+            info.shaders = shaders;
+        }
+    }
+    let shader_ids: BTreeSet<usize> = info.models.iter().flat_map(|m| m.shader_indices.iter().map(|&i| i as usize)).collect();
+    let mut shader_map = HashMap::new();
+    info.shaders = info.shaders.iter().enumerate().filter(|(i, _)| shader_ids.contains(i)).map(|(i, s)| {
+        let mut s = s.clone(); s.index = shader_map.len(); shader_map.insert(i, s.index); s
+    }).collect();
+    for m in &mut info.models { for i in &mut m.shader_indices { *i = shader_map.get(&(*i as usize)).copied().unwrap_or(u16::MAX as usize) as u16; } }
+    let geom_ids: BTreeSet<usize> = info.models.iter().flat_map(|m| m.geometries.iter().copied()).collect();
+    let geom_map: HashMap<usize, usize> = geom_ids.iter().enumerate().map(|(new, &old)| (old, new)).collect();
+    info.geometries = geom_ids.iter().map(|&i| info.geometries[i].clone()).collect();
+    for m in &mut info.models { for i in &mut m.geometries { *i = geom_map[i]; } }
+    let buf_ids: BTreeSet<usize> = info.geometries.iter().flat_map(|g| [g.vertex_buffer, g.index_buffer]).collect();
+    let buf_map: HashMap<usize, usize> = buf_ids.iter().enumerate().map(|(new, &old)| (old, new)).collect();
+    info.buffers = buf_ids.iter().map(|&i| info.buffers[i].clone()).collect();
+    for g in &mut info.geometries { g.vertex_buffer = buf_map[&g.vertex_buffer]; g.index_buffer = buf_map[&g.index_buffer]; }
+    let hashes: BTreeSet<u32> = info.shaders.iter().flat_map(|s| &s.textures).filter_map(|t| u32::from_str_radix(&t.hash32, 16).ok()).collect();
+    // Embedded texture slots point straight to texture structs; external
+    // references use hashes. Keep both forms, including unnamed embedded data.
+    let embedded_offsets: BTreeSet<u64> = info.shaders.iter().flat_map(|s| {
+        let slots = r.sys_off(r.u64(s.record_off as usize + 0x10));
+        (0..s.param_hashes.len()).filter_map(move |i| slots.and_then(|at| r.sys_off(r.u64(at + 8 * i))).map(|at| at as u64))
+    }).collect();
+    info.embedded_textures.retain(|t| embedded_offsets.contains(&t.struct_off) || hashes.contains(&crate::meta7a::joaat(&t.name)));
+    Ok(())
 }
 
 pub fn describe(r: &Resource) -> DrawableInfo {
@@ -323,6 +472,7 @@ pub fn describe(r: &Resource) -> DrawableInfo {
     let buffers = find_buffers(r);
     let geometries = find_geometries(r, &buffers);
     DrawableInfo {
+        members: dictionary_members(r).into_iter().map(|m| m.name).collect(),
         name: nt.as_ref().map(|x| x.0.clone()),
         tag: nt.map(|x| x.1),
         bounds_raw,
@@ -787,6 +937,9 @@ pub fn find_geometries(r: &Resource, bufs: &[GfxBuffer]) -> Vec<Geometry> {
 /// indices (one per geometry).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {
+    /// Index into `dictionary_members`, absent for ordinary drawables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<u32>,
     pub struct_off: u64,
     /// Indices into `DrawableInfo::geometries`.
     pub geometries: Vec<usize>,
@@ -868,10 +1021,15 @@ pub fn find_shaders(r: &Resource) -> Vec<Shader> {
         }
         o += 8 * n.max(1);
     }
-    let (arr, n) = best;
-    (0..n)
-        .filter_map(|k| {
-            let s = r.sys_off(r.u64(arr + 8 * k))?;
+    shaders_at(r, best.0)
+}
+
+/// Decode consecutive pointers to "atem" records starting at this array.
+fn shaders_at(r: &Resource, arr: usize) -> Vec<Shader> {
+    (arr..r.sys.len().saturating_sub(7)).step_by(8)
+        .map_while(|at| r.sys_off(r.u64(at)).filter(|&s| r.sys.get(s + 4..s + 8) == Some(b"atem")))
+        .enumerate()
+        .map(|(k, s)| {
             let mut sh = Shader { index: k, record_off: s as u64, name_hash: format!("{:08x}", r.u32(s)), param_hashes: vec![], textures: vec![], flags: r.sys.get(s + 0x38..s + 0x40).map(|b| b.to_vec()).unwrap_or_default() };
             if let Some(pt) = r.sys_off(r.u64(s + 0x20)) {
                 let np = r.sys.get(pt + 1).copied().unwrap_or(0) as usize;
@@ -892,7 +1050,7 @@ pub fn find_shaders(r: &Resource) -> Vec<Shader> {
                     }
                 }
             }
-            Some(sh)
+            sh
         })
         .collect()
 }
@@ -910,11 +1068,42 @@ pub fn find_models(r: &Resource, geoms: &[Geometry]) -> Vec<Model> {
             if let (Some(a), Some(m)) = (r.sys_off(r.u64(o)), r.sys_off(r.u64(o + 0x18))) {
                 let g: Option<Vec<usize>> = (0..n).map(|k| r.sys_off(r.u64(a + 8 * k)).and_then(|x| by_rec.get(&x).copied())).collect();
                 if let Some(g) = g {
-                    out.push(Model { struct_off: o as u64, geometries: g, shader_indices: (0..n).map(|k| r.u16(m + 2 * k)).collect(), lod: 0, part: false, bone_palette: model_palette(r, o) });
+                    out.push(Model { member: None, struct_off: o as u64, geometries: g, shader_indices: (0..n).map(|k| r.u16(m + 2 * k)).collect(), lod: 0, part: false, bone_palette: model_palette(r, o) });
                 }
             }
         }
         o += 8;
+    }
+    let members = dictionary_members(r);
+    if !members.is_empty() {
+        let model_at: HashMap<usize, usize> = out.iter().enumerate()
+            .filter_map(|(i, m)| m.struct_off.checked_sub(8).map(|o| (o as usize, i))).collect();
+        let mut occurrences = Vec::new();
+        let mut covered = vec![false; out.len()];
+        for (member, d) in members.iter().enumerate() {
+            for lod in 0..4 {
+                if let Some(models) = lod_models(r, d.root, lod) {
+                    for offset in models {
+                        if let Some(&i) = model_at.get(&offset) {
+                            let mut model = out[i].clone();
+                            model.member = Some(member as u32);
+                            model.lod = lod;
+                            model.part = false;
+                            occurrences.push(model);
+                            covered[i] = true;
+                        }
+                    }
+                }
+            }
+        }
+        // Uncovered models are embedded parts; dictionary tables determine LODs.
+        for (i, mut model) in out.into_iter().enumerate() {
+            if !covered[i] {
+                model.part = true;
+                occurrences.push(model);
+            }
+        }
+        return occurrences;
     }
     // LOD table: model structs are referenced (at struct - 8) from arrays of
     // pointers; each array is referenced by a LOD entry.
@@ -964,4 +1153,274 @@ pub fn find_models(r: &Resource, geoms: &[Geometry]) -> Vec<Model> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod dictionary_tests {
+    use super::*;
+
+    fn put64(r: &mut Resource, at: usize, value: u64) {
+        r.sys[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn fixture() -> (Resource, Vec<Geometry>) {
+        let mut r = Resource { sys: vec![0; 0x1000], gfx: vec![], gfx_base: 0 };
+        let mut geoms = Vec::new();
+        for (i, name) in ["alpha-01", "beta_02"].iter().enumerate() {
+            let root = 0x100 + i * 0x100;
+            let string = 0x800 + i * 0x20;
+            let entry = 0x400 + i * 0x20;
+            let array = 0x480 + i * 0x10;
+            let model = 0x508 + i * 0x100;
+            let geometry_array = 0x580 + i * 0x100;
+            let shader_array = 0x590 + i * 0x100;
+            let geometry = 0x700 + i * 0x20;
+            let text = format!("{name}.#dr\0");
+            r.sys[string..string + text.len()].copy_from_slice(text.as_bytes());
+            put64(&mut r, root + 0xA8, 0x5000_0000 | string as u64);
+            // Physical LOD slots matter, even with holes before them.
+            put64(&mut r, root + 0x50 + if i == 0 { 16 } else { 0 }, 0x5000_0000 | entry as u64);
+            put64(&mut r, entry, 0x5000_0000 | array as u64);
+            // Spare capacity is permitted by the dictionary layout.
+            r.sys[entry + 8..entry + 12].copy_from_slice(&[1, 0, 2, 0]);
+            put64(&mut r, array, 0x5000_0000 | (model - 8) as u64);
+            put64(&mut r, model, 0x5000_0000 | geometry_array as u64);
+            r.sys[model + 8..model + 12].copy_from_slice(&[1, 0, 1, 0]);
+            put64(&mut r, model + 0x18, 0x5000_0000 | shader_array as u64);
+            put64(&mut r, geometry_array, 0x5000_0000 | geometry as u64);
+            geoms.push(Geometry { vertex_buffer: i, index_buffer: i, record_off: (geometry + 8) as u64 });
+        }
+        (r, geoms)
+    }
+
+    #[test]
+    fn members_and_models_follow_each_roots_lod_slots() {
+        let (r, geoms) = fixture();
+        assert_eq!(dictionary_members(&r), vec![
+            DictMember { name: "alpha-01".into(), root: 0x100 },
+            DictMember { name: "beta_02".into(), root: 0x200 },
+        ]);
+        let models = find_models(&r, &geoms);
+        assert_eq!(models.len(), 2);
+        assert_eq!((models[0].member, models[0].lod, models[0].part), (Some(0), 2, false));
+        assert_eq!((models[1].member, models[1].lod, models[1].part), (Some(1), 0, false));
+        assert_eq!(describe(&r).members, ["alpha-01", "beta_02"]);
+    }
+
+    #[test]
+    fn shared_models_keep_each_member_and_lod_occurrence() {
+        let (mut r, geoms) = fixture();
+        // Both members and two slots of alpha reference the same model.
+        put64(&mut r, 0x490, 0x5000_0500);
+        put64(&mut r, 0x168, 0x5000_0400);
+        let models = find_models(&r, &geoms);
+        let occurrences: Vec<_> = models.iter().filter(|m| m.struct_off == 0x508)
+            .map(|m| (m.member, m.lod, m.part, m.geometries.clone())).collect();
+        assert_eq!(occurrences, [
+            (Some(0), 2, false, vec![0]),
+            (Some(0), 3, false, vec![0]),
+            (Some(1), 0, false, vec![0]),
+        ]);
+        assert!(models.iter().any(|m| m.struct_off == 0x608 && m.member.is_none() && m.part));
+        for (name, lods) in [("alpha-01", vec![2, 3]), ("beta_02", vec![0])] {
+            let mut info = describe(&r);
+            info.models = models.clone();
+            info.geometries = geoms.clone();
+            info.buffers = (0..2).map(|i| GfxBuffer { struct_off: i, gfx_off: i, bytes: 0, flags: 0, kind_hint: 8, mesh_blob: None }).collect();
+            select_member(&r, &mut info, name).unwrap();
+            assert_eq!(info.models.iter().map(|m| m.lod).collect::<Vec<_>>(), lods);
+            assert!(info.models.iter().all(|m| m.geometries == [0]));
+        }
+    }
+
+    #[test]
+    fn named_nested_drawables_are_parts_of_an_ordinary_drawable() {
+        let (mut r, geoms) = fixture();
+        // The resource root is itself a named drawable, with beta nested inside.
+        put64(&mut r, 0xA8, 0x5000_0800);
+        put64(&mut r, 0x58, 0x5000_0400);
+        for entry in [0x400, 0x420] {
+            r.sys[entry + 10..entry + 12].copy_from_slice(&1u16.to_le_bytes());
+        }
+        assert!(dictionary_members(&r).is_empty());
+        assert!(describe(&r).members.is_empty());
+        let models = find_models(&r, &geoms);
+        assert_eq!((models[0].member, models[0].lod, models[0].part), (None, 1, false));
+        assert_eq!((models[1].member, models[1].part), (None, true));
+    }
+
+    #[test]
+    fn plain_drawable_and_fragment_keep_the_main_lod_and_embedded_parts() {
+        let (mut r, geoms) = fixture();
+        // A single named drawable is not treated as a dictionary.
+        put64(&mut r, 0x2A8, 0);
+        for entry in [0x400, 0x420] {
+            r.sys[entry + 10..entry + 12].copy_from_slice(&1u16.to_le_bytes());
+        }
+        put64(&mut r, 0x58, 0x5000_0400);
+        assert!(dictionary_members(&r).is_empty());
+        let models = find_models(&r, &geoms);
+        assert_eq!((models[0].member, models[0].lod, models[0].part), (None, 1, false));
+        assert!(models[1].part);
+        // The fragment's main drawable is reached through root + 0x18.
+        r.sys[0x80a..0x80c].copy_from_slice(b"ft");
+        put64(&mut r, 0x18, 0x5000_0100);
+        let models = find_models(&r, &geoms);
+        assert_eq!((models[0].member, models[0].lod, models[0].part), (None, 2, false));
+        assert!(models[1].part);
+    }
+
+    #[test]
+    fn member_bounds_prefer_own_geometry_even_without_lod_zero() {
+        let (mut r, _) = fixture();
+        // One float-position vertex buffer and its paired index buffer for alpha.
+        r.gfx = vec![0; 0x94];
+        r.gfx[0..4].copy_from_slice(&0x3063u32.to_le_bytes());
+        r.gfx[4..8].copy_from_slice(&0x4201u32.to_le_bytes()); // next stream at 0x84: three vertices
+        for (i, p) in [[-8.0f32, -2.0, 1.0], [6.0, 4.0, 3.0], [0.0, 0.0, 0.0]].iter().enumerate() {
+            for (k, v) in p.iter().enumerate() { r.gfx[0x60 + i * 12 + k * 4..0x64 + i * 12 + k * 4].copy_from_slice(&v.to_le_bytes()); }
+        }
+        for (offset, gfx_offset, words) in [(0x900, 0, 0x24u32), (0x920, 0x90, 1)] {
+            r.sys[offset + 8..offset + 12].copy_from_slice(&words.to_le_bytes());
+            r.sys[offset + 12..offset + 16].copy_from_slice(&[4, 0, 8, 0]);
+            put64(&mut r, offset + 0x18, 0x6000_0000 | gfx_offset);
+        }
+        put64(&mut r, 0x708, 0x5000_0900);
+        put64(&mut r, 0x740, 0x5000_0b00);
+        put64(&mut r, 0xb00, 0x5000_0920);
+        // The other member has no geometry; it must not borrow alpha's bounds.
+        assert_eq!(model_bounds(&r, Some("alpha-01")), Some([[-8.0, -2.0, 0.0], [6.0, 4.0, 3.0]]));
+        assert!(model_bounds(&r, Some("beta_02")).is_none());
+    }
+
+    #[test]
+    fn member_selection_uses_its_own_shader_array_and_textures() {
+        let (mut r, geoms) = fixture();
+        r.sys.resize(0x1400, 0);
+        for (i, texture) in ["alpha_texture", "beta_texture"].iter().enumerate() {
+            let base = 0x1000 + i * 0x200;
+            put64(&mut r, 0x100 + i * 0x100 + 0x10, 0x5000_0000 | base as u64);
+            put64(&mut r, base + 0x10, 0x5000_0000 | (base + 0x20) as u64);
+            put64(&mut r, base + 0x20, 0x5000_0000 | (base + 0x40) as u64);
+            // Beta has the longest run, so the global heuristic chooses it.
+            if i == 1 {
+                put64(&mut r, base + 0x28, 0x5000_0000 | (base + 0x80) as u64);
+                r.sys[base + 0x84..base + 0x88].copy_from_slice(b"atem");
+            }
+            r.sys[base + 0x40..base + 0x44].copy_from_slice(&(0xa000_0000u32 + i as u32).to_le_bytes());
+            r.sys[base + 0x44..base + 0x48].copy_from_slice(b"atem");
+            put64(&mut r, base + 0x50, 0x5000_0000 | (base + 0xe0) as u64);
+            put64(&mut r, base + 0x60, 0x5000_0000 | (base + 0xc0) as u64);
+            r.sys[base + 0xc1] = 1;
+            r.sys[base + 0xc8..base + 0xcc].copy_from_slice(&0x12345678u32.to_le_bytes());
+            put64(&mut r, base + 0xe0, 0x5000_0000 | (base + 0x100) as u64);
+            put64(&mut r, base + 0x130, 0x5000_0000 | (base + 0x140) as u64);
+            r.sys[base + 0x150..base + 0x154].copy_from_slice(&6u32.to_le_bytes());
+            r.sys[base + 0x158..base + 0x15c].copy_from_slice(&crate::meta7a::joaat(texture).to_le_bytes());
+        }
+        let mut original = describe(&r);
+        assert_eq!(original.shaders.len(), 2);
+        assert_eq!(original.shaders[0].name_hash, "a0000001");
+        original.models = find_models(&r, &geoms);
+        original.geometries = geoms;
+        original.buffers = (0..2).map(|i| GfxBuffer { struct_off: i, gfx_off: i, bytes: 0, flags: 0, kind_hint: 8, mesh_blob: None }).collect();
+        original.embedded_textures = ["alpha_texture", "beta_texture", "", ""].iter().enumerate().map(|(i, name)| crate::texture::TexInfo {
+            name: name.to_string(), width: 1, height: 1, depth: 1, mips: 1, dxgi_format: 28,
+            format: String::new(), struct_off: if i < 2 { 0 } else { 0x1100 + (i as u64 - 2) * 0x200 },
+            data_off: 0, size_field: 0, swizzle: String::new(),
+        }).collect();
+        for (i, name) in ["alpha-01", "beta_02"].iter().enumerate() {
+            let mut info = original.clone();
+            select_member(&r, &mut info, name).unwrap();
+            assert_eq!(info.shaders.len(), 1);
+            assert_eq!(info.shaders[0].index, 0);
+            assert_eq!(info.shaders[0].record_off, 0x1040 + i as u64 * 0x200);
+            assert_eq!(info.shaders[0].name_hash, format!("{:08x}", 0xa000_0000u32 + i as u32));
+            let texture = ["alpha_texture", "beta_texture"][i];
+            assert_eq!(info.shaders[0].textures.len(), 1);
+            assert_eq!(info.shaders[0].textures[0].hash32, format!("{:08x}", crate::meta7a::joaat(texture)));
+            assert_eq!(info.models[0].shader_indices, [0]);
+            assert_eq!(info.embedded_textures.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), [texture, ""]);
+            assert_eq!(info.embedded_textures[1].struct_off, 0x1100 + i as u64 * 0x200);
+        }
+        // Unrecognised member layouts retain the resource-wide fallback.
+        for (group, array) in [(0, 0), (0x5000_1000, 0), (0x5000_1000, 0x5000_1100), (0x5000_1000, 0x5000_13fc)] {
+            put64(&mut r, 0x110, group);
+            put64(&mut r, 0x1010, array);
+            let mut info = original.clone();
+            select_member(&r, &mut info, "alpha-01").unwrap();
+            assert_eq!(info.shaders[0].name_hash, "a0000001");
+            assert_eq!(info.embedded_textures.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["beta_texture", ""]);
+        }
+    }
+
+    #[test]
+    fn member_selection_scopes_assets_and_validates_bounds() {
+        let (mut r, mut geoms) = fixture();
+        for (o, value) in [(0x130, -2.0f32), (0x134, -3.0), (0x138, -4.0), (0x140, 2.0), (0x144, 3.0), (0x148, 4.0)] {
+            r.sys[o..o + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let mut info = describe(&r);
+        info.models = find_models(&r, &geoms);
+        info.models[0].shader_indices = vec![2];
+        geoms[0].vertex_buffer = 2; geoms[0].index_buffer = 3;
+        geoms[1].vertex_buffer = 0; geoms[1].index_buffer = 1;
+        info.geometries = geoms;
+        info.buffers = (0..4).map(|i| GfxBuffer { struct_off: i, gfx_off: i, bytes: 0, flags: 0, kind_hint: 8, mesh_blob: None }).collect();
+        info.shaders = (0..3).map(|i| Shader { index: i, record_off: i as u64, name_hash: format!("shader{i}"), param_hashes: vec![], textures: vec![], flags: vec![] }).collect();
+        info.shaders[2].textures.push(TexRef { param: 0, param_hash: String::new(), hash64: String::new(), hash32: format!("{:08x}", crate::meta7a::joaat("own")) });
+        info.embedded_textures = ["other", "own"].iter().map(|name| crate::texture::TexInfo {
+            name: name.to_string(), width: 1, height: 1, depth: 1, mips: 1, dxgi_format: 28,
+            format: String::new(), struct_off: 0, data_off: 0, size_field: 0, swizzle: String::new(),
+        }).collect();
+        info.shaders[2].record_off = 0xc00;
+        info.shaders[2].param_hashes.push("embedded".into());
+        put64(&mut r, 0xc10, 0x5000_0c80);
+        put64(&mut r, 0xc80, 0x5000_0d00);
+        let mut unnamed = info.embedded_textures[0].clone();
+        unnamed.name.clear(); unnamed.struct_off = 0xd00;
+        info.embedded_textures.push(unnamed);
+        select_member(&r, &mut info, "alpha-01").unwrap();
+        assert_eq!(info.models.len(), 1);
+        assert_eq!(info.models[0].shader_indices, [0]);
+        assert_eq!(info.models[0].geometries, [0]);
+        assert_eq!(info.shaders.len(), 1);
+        assert_eq!((info.shaders[0].index, info.shaders[0].name_hash.as_str()), (0, "shader2"));
+        assert_eq!(info.buffers.iter().map(|b| b.gfx_off).collect::<Vec<_>>(), [2, 3]);
+        assert_eq!((info.geometries[0].vertex_buffer, info.geometries[0].index_buffer), (0, 1));
+        assert_eq!(info.embedded_textures.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["own", ""]);
+        assert_eq!(info.bounds, Some([[-2.0, -3.0, -4.0], [2.0, 3.0, 4.0]]));
+        r.sys[0x140..0x144].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(model_bounds(&r, Some("alpha-01")).is_none());
+    }
+
+    #[test]
+    fn member_names_require_nul_and_fragments_never_have_members() {
+        let (mut r, _) = fixture();
+        r.sys[0x80c] = b'x'; // alpha-01.#dr must end here
+        assert!(dictionary_members(&r).is_empty());
+        let (mut r, _) = fixture();
+        r.sys[0x40..0x4c].copy_from_slice(b"fragment.#ft");
+        assert!(dictionary_members(&r).is_empty());
+    }
+
+    #[test]
+    fn invalid_arrays_single_members_and_duplicate_names_are_rejected() {
+        let (mut r, _) = fixture();
+        // A second valid root referencing the same name does not add a member.
+        put64(&mut r, 0x3A8, 0x5000_0800);
+        put64(&mut r, 0x350, 0x5000_0400);
+        assert_eq!(dictionary_members(&r).len(), 2);
+        // Array starts in sys but extends beyond its end.
+        put64(&mut r, 0x420, 0x5000_0ffc);
+        assert!(dictionary_members(&r).is_empty());
+        put64(&mut r, 0x420, 0x5000_0490);
+        // Every array element must be a valid system pointer.
+        put64(&mut r, 0x490, 0x6000_0600);
+        assert!(dictionary_members(&r).is_empty());
+        put64(&mut r, 0x490, 0x5000_0600);
+        r.sys[0x428..0x42a].copy_from_slice(&64u16.to_le_bytes());
+        assert!(dictionary_members(&r).is_empty());
+        assert!(dictionary_members(&Resource { sys: vec![], gfx: vec![], gfx_base: 0 }).is_empty());
+    }
 }

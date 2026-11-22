@@ -675,16 +675,16 @@ impl Baker {
             for (arch, ids) in by_arch {
                 let Ok(a) = ws.resolve(arch) else { continue };
                 let Ok(ix) = ws.load_index(&a) else { continue };
-                let by_id: HashMap<&str, &sixng_core::scan::Entry> = ix.entries.iter().map(|e| (e.id.as_str(), e)).collect();
+                let resolver = sixng_core::export::ModelResolver::new(&ix.entries);
                 let res: Vec<(String, [f32; 6])> = ids
                     .par_iter()
                     .filter_map(|id| {
-                        let e = by_id.get(id)?;
-                        let r = sixng_core::resource::Resource::load_sys(&a.path, e).ok()?;
+                        let (e, member) = resolver.resolve(&ix.entries, id).ok()?;
+                        let r = if member.is_some() { sixng_core::resource::Resource::load(&a.path, e) } else { sixng_core::resource::Resource::load_sys(&a.path, e) }.ok()?;
                         if r.sys.len() < 0x50 {
                             return None;
                         }
-                        let d = sixng_core::drawable::drawable_bounds(&r)?;
+                        let d = sixng_core::drawable::model_bounds(&r, member)?;
                         let b = [d[0][0], d[0][1], d[0][2], d[1][0], d[1][1], d[1][2]];
                         let ok = b.iter().all(|v| v.is_finite() && v.abs() < 20000.0) && b[3] >= b[0] && b[4] >= b[1];
                         ok.then(|| (id.to_string(), b))

@@ -77,8 +77,14 @@ fn archive_of(id: &str) -> &str {
 
 /// Export folder of a model under an output root, if it was exported.
 pub fn export_dir(out: &Path, id: &str) -> Option<PathBuf> {
+    let (id, member) = id.split_once('#').map_or((id, None), |(id, member)| (id, Some(member)));
     let (a, off) = id.split_once('@')?;
-    let d = out.join("models").join(a.trim_end_matches(".rpf"));
+    let d = out.join("models").join(sixng_core::game::index_stem(a));
+    if let Some(member) = member {
+        let off = u64::from_str_radix(off.trim_start_matches("0x"), 16).ok()?;
+        let path = d.join(format!("{}_{off:x}_member", crate::model_view::export_sanitize(member)));
+        return path.is_dir().then_some(path);
+    }
     let suffix = format!("_{}", off.to_ascii_lowercase());
     std::fs::read_dir(&d).ok()?.flatten().map(|e| e.path()).find(|p| p.is_dir() && p.file_name().map_or(false, |f| f.to_string_lossy().ends_with(&suffix)))
 }

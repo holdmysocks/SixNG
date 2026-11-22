@@ -313,7 +313,7 @@ impl ModelView {
                 self.status = format!(
                     "{} — LOD{} · {} meshes · {} materials · {} tris · {} verts · {} joints · {} textures",
                     l.source,
-                    l.lod,
+                    shown_lod(&l.lods, l.lod, &l.info),
                     l.model.meshes.len(),
                     l.model.materials.len(),
                     l.model.triangles,
@@ -663,8 +663,10 @@ impl ModelView {
                     ui.separator();
                     ui.label("LOD");
                     let mut want = None;
+                    let primary = primary_lod(&l.info);
                     for k in 0..l.lods.len() {
-                        if ui.selectable_label(l.lod == k, format!("{k}")).clicked() && l.lod != k {
+                        let level = lod_level(&l.lods[k]).unwrap_or(primary);
+                        if ui.selectable_label(l.lod == k, format!("{level}")).clicked() && l.lod != k {
                             want = Some(k);
                         }
                     }
@@ -823,7 +825,7 @@ impl ModelView {
             ui.label(if src == "linked" { "faces the game links to this head" } else { "automatic: faces of the same sex, body type and ethnicity" });
             if let Some(k) = step {
                 HEAD_SKIN.store(k, std::sync::atomic::Ordering::Relaxed);
-                let lod = self.loaded.as_ref().map_or(0, |l| l.lod);
+                let lod = self.loaded.as_ref().and_then(|l| lod_level(&l.lods[l.lod])).unwrap_or(0);
                 let q = self.query.clone();
                 self.keep_cam_once = true;
                 self.open(&q, lod, ui.ctx());
@@ -1020,6 +1022,26 @@ pub(crate) fn out_root_of(p: &Path) -> PathBuf {
     p.parent().unwrap_or(Path::new(".")).to_path_buf()
 }
 
+/// Physical LOD of the primary model (model.glb): the lowest populated slot.
+fn primary_lod(info: &serde_json::Value) -> usize {
+    info["meshes"].as_array().into_iter().flatten().filter_map(|m| m["lod"].as_u64()).min().unwrap_or(0) as usize
+}
+
+/// Physical LOD number of the loaded file at `index`.
+fn shown_lod(lods: &[PathBuf], index: usize, info: &serde_json::Value) -> usize {
+    lods.get(index).and_then(|p| lod_level(p)).unwrap_or_else(|| primary_lod(info))
+}
+
+fn lod_level(path: &Path) -> Option<usize> {
+    path.file_stem()?.to_str()?.strip_prefix("model_lod")?.parse().ok()
+}
+
+/// Choose by physical slot, falling back to the preceding populated LOD.
+/// model.glb is the primary fallback, even when its physical slot is not zero.
+pub(crate) fn lod_index(lods: &[PathBuf], lod: usize) -> usize {
+    lods.iter().rposition(|p| lod_level(p).unwrap_or(0) <= lod).unwrap_or(0)
+}
+
 pub(crate) fn lods_in(dir: &Path) -> Vec<PathBuf> {
     let mut v = vec![];
     if dir.join("model.glb").exists() {
@@ -1028,8 +1050,6 @@ pub(crate) fn lods_in(dir: &Path) -> Vec<PathBuf> {
             let p = dir.join(format!("model_lod{k}.glb"));
             if p.exists() {
                 v.push(p);
-            } else {
-                break;
             }
         }
     }
@@ -1134,6 +1154,7 @@ fn load_query_sel(ws: &Workspace, cache: &Path, q: &str, sel: Option<Vec<u64>>, 
         let info = serde_json::json!({ "assembled_from": names, "ids": parts.iter().map(|e| e.id.clone()).collect::<Vec<_>>(), "errors": errs });
         return Ok(Loaded { model, lods: first.into_iter().take(1).collect(), lod: 0, out_root: cache.to_path_buf(), source: format!("{} (outfit, {} parts)", prefix, names.len()), info, parts: opts, selected, base: String::new() });
     }
+    let (q, member) = q.split_once('#').map_or((q, None), |(id, member)| (id, Some(member)));
     // entry: "<archive>@<hex>" or a name regex (in levels unless "archive:regex")
     let (archive, rest) = match q.split_once('@') {
         Some((a, o)) => (a.to_string(), Some(o.to_string())),
@@ -1145,20 +1166,23 @@ fn load_query_sel(ws: &Workspace, cache: &Path, q: &str, sel: Option<Vec<u64>>, 
     let (a, ix) = index_for(ws, &archive, idx)?;
     let e = match rest {
         Some(o) if !o.starts_with('~') => {
-            let off = u64::from_str_radix(o.trim_start_matches("0x"), 16)?;
-            ix.entries.iter().find(|e| e.off == off).ok_or_else(|| anyhow::anyhow!("no entry at {o} in {}", a.id))?
+            let id = format!("{o}{}", member.map_or(String::new(), |m| format!("#{m}")));
+            export::ModelResolver::new(&ix.entries).resolve(&ix.entries, &id)?.0
         }
         Some(re) => find_name(&ix, re.trim_start_matches('~'))?,
         None => unreachable!(),
     };
+    let selected = member.map(|name| export::member_entry(e, name)).transpose()?;
+    let e = selected.as_ref().unwrap_or(e);
     let (model, lods, info) = export_load(&a, e, cache, lod)?;
-    let lod = lod.min(lods.len() - 1);
+    let level = lod;
+    let lod = lod_index(&lods, level);
     // animals: the fragment is a skeleton with a placeholder plane; add the textured parts
     let name = e.name.as_deref().unwrap_or("");
     if crate::assemble::is_animal(name) && e.rtype.as_deref() == Some("ft") {
         let opts = crate::assemble::animal_options(&ix, name);
         let (selected, parts) = pick(&ix, &opts, &sel);
-        let (m, _, names, _) = load_parts(&a, &parts, cache, lod, Some(model));
+        let (m, _, names, _) = load_parts(&a, &parts, cache, level, Some(model));
         let model = m.expect("root model passed in");
         let mut info = info;
         if let Some(o) = info.as_object_mut() {
@@ -1176,7 +1200,7 @@ fn load_query_sel(ws: &Workspace, cache: &Path, q: &str, sel: Option<Vec<u64>>, 
 fn export_load(a: &sixng_core::game::ArchiveInfo, e: &sixng_core::scan::Entry, cache: &Path, lod: usize) -> anyhow::Result<(glb::Model, Vec<PathBuf>, serde_json::Value)> {
     // Heads are exported again each time (small), so the chosen face variant applies.
     let head = sixng_core::headskin::is_head(e.name.as_deref().unwrap_or(""));
-    let dir = cache.join("models").join(sixng_core::game::index_stem(&a.id)).join(format!("{}_{:x}", export_sanitize(e.name.as_deref().unwrap_or("unnamed")), e.off));
+    let dir = cache.join("models").join(sixng_core::game::index_stem(&a.id)).join(export::export_base_name(e));
     // Cached exports from before tint palettes were applied: export again.
     let stale_tint = std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| j.contains("\"tintpalettetex\"") && !j.contains("\"tint_applied\""));
     let opts = ExportOptions { out: cache.to_path_buf(), png: true, dds: false, raw: false, force: head || stale_tint, skip_embedded_textures: false, body_shape: Vec::new(), head_skin: HEAD_SKIN.load(std::sync::atomic::Ordering::Relaxed) };
@@ -1185,7 +1209,7 @@ fn export_load(a: &sixng_core::game::ArchiveInfo, e: &sixng_core::scan::Entry, c
     if lods.is_empty() {
         return Err(anyhow::anyhow!("{} exported no model.glb (status {}, files {:?}{})", e.id, item.status, item.files, item.error.map(|x| format!(", {x}")).unwrap_or_default()));
     }
-    let lod = lod.min(lods.len() - 1);
+    let lod = lod_index(&lods, lod);
     let info: serde_json::Value = std::fs::read(dir.join("model.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     if let Some(h) = info.get("head_skin") {
         let n = h["count"].as_u64().unwrap_or(0) as usize;
@@ -1225,7 +1249,7 @@ fn find_name<'a>(ix: &'a ArchiveIndex, re: &str) -> anyhow::Result<&'a sixng_cor
             best = Some(e);
         }
     }
-    best.filter(|e| matches!(e.rtype.as_deref(), Some("ft") | Some("dr"))).ok_or_else(|| anyhow::anyhow!("no drawable/fragment named like {re}"))
+    best.filter(|e| matches!(e.rtype.as_deref(), Some("ft") | Some("dr") | Some("dd"))).ok_or_else(|| anyhow::anyhow!("no drawable/fragment named like {re}"))
 }
 
 /// Same rule as sixng_core::export::sanitize (kept local: it is private there).
@@ -1240,10 +1264,10 @@ pub(crate) fn assembly_ids(ws: &Workspace, idx: &Arc<Mutex<HashMap<String, Arc<A
         let (_, ix) = index_for(ws, archive, idx).ok()?;
         return Some(crate::assemble::outfit_parts(&ix, prefix).iter().map(|e| e.id.clone()).collect());
     }
-    let (archive, off) = id.split_once('@')?;
+    let (archive, _) = id.split_once('@')?;
     let (_, ix) = index_for(ws, archive, idx).ok()?;
-    let off = u64::from_str_radix(off, 16).ok()?;
-    let e = ix.entries.iter().find(|e| e.off == off)?;
+    let (e, member) = export::ModelResolver::new(&ix.entries).resolve(&ix.entries, id).ok()?;
+    if member.is_some() { return None; }
     let name = e.name.as_deref()?;
     if e.rtype.as_deref() == Some("ft") && crate::assemble::is_animal(name) {
         let parts = crate::assemble::animal_parts(&ix, name);
@@ -1257,4 +1281,27 @@ pub(crate) fn assembly_ids(ws: &Workspace, idx: &Arc<Mutex<HashMap<String, Arc<A
 /// sRGB [0,1] triple as an egui colour.
 fn srgb32(c: [f32; 3]) -> egui::Color32 {
     egui::Color32::from_rgb((c[0] * 255.0).round() as u8, (c[1] * 255.0).round() as u8, (c[2] * 255.0).round() as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lod_discovery_keeps_physical_numbers_across_holes() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("sixng-lod-discovery-test-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Slots 2 and 3 export as model.glb and model_lod3.glb.
+        for name in ["model.glb", "model_lod3.glb", "model_lod5.glb"] {
+            std::fs::write(dir.join(name), []).unwrap();
+        }
+        let lods = lods_in(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(lods, [dir.join("model.glb"), dir.join("model_lod3.glb"), dir.join("model_lod5.glb")]);
+        assert_eq!(lods.iter().map(|p| lod_level(p)).collect::<Vec<_>>(), [None, Some(3), Some(5)]);
+        for (level, index) in [(0, 0), (2, 0), (3, 1), (4, 1), (5, 2), (7, 2)] {
+            assert_eq!(lod_index(&lods, level), index);
+        }
+    }
 }

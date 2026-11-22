@@ -161,7 +161,7 @@ pub fn find_resource_name(sys: &[u8]) -> Option<(String, String)> {
 
 /// Resource names are lowercase. Stopping at anything else (including
 /// uppercase) avoids picking up stray bytes in front of the string.
-fn is_name_char(c: u8) -> bool {
+pub(crate) fn is_name_char(c: u8) -> bool {
     c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-'
 }
 

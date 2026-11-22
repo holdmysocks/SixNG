@@ -53,6 +53,7 @@ impl Workspace {
     }
     pub fn load_index(&self, a: &ArchiveInfo) -> Result<ArchiveIndex> {
         scan::load_index(&scan::index_path(&self.index_dir(), &a.id))
+            .and_then(|ix| { anyhow::ensure!(ix.tool_version == crate::INDEX_VERSION, "index version mismatch"); Ok(ix) })
             .with_context(|| format!("{} is not indexed yet, or the index is from an older version (run `sixng index {}`)", a.id, a.id))
     }
     /// Build (or load) the index and run the name pass.
@@ -79,7 +80,7 @@ pub fn recover_names(archive: &Path, ix: &mut ArchiveIndex, progress: Progress) 
         .collect();
     let total = idx.len() as u64;
     let done = AtomicU64::new(0);
-    let results: Vec<(usize, Option<String>, Option<String>)> = idx
+    let results: Vec<(usize, Option<String>, Option<String>, Vec<String>)> = idx
         .par_chunks(256)
         .flat_map_iter(|chunk| {
             let mut f = fs::File::open(archive).ok();
@@ -89,17 +90,20 @@ pub fn recover_names(archive: &Path, ix: &mut ArchiveIndex, progress: Progress) 
                 let sys = f.as_mut().and_then(|f| crate::resource::read_sys(f, e).ok().map(|x| x.0));
                 let mut name = None;
                 let mut rtype = None;
+                let mut members = Vec::new();
                 if let Some(sys) = sys {
                     if let Some((n, t)) = find_resource_name(&sys) {
                         name = Some(n);
                         rtype = Some(t);
+                        let r = Resource { sys, gfx: vec![], gfx_base: 0 };
+                        members = crate::drawable::dictionary_members(&r).into_iter().map(|m| m.name).collect();
                     } else if looks_like_txd(&sys) {
                         rtype = Some("txd".into());
                         let r = Resource { sys, gfx: vec![], gfx_base: 0 };
                         name = texture::dict_name(&r);
                     }
                 }
-                out.push((i, name, rtype));
+                out.push((i, name, rtype, members));
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                 if d % 2000 == 0 {
                     progress("names", d, total);
@@ -108,9 +112,10 @@ pub fn recover_names(archive: &Path, ix: &mut ArchiveIndex, progress: Progress) 
             out
         })
         .collect();
-    for (i, n, t) in results {
+    for (i, n, t, members) in results {
         ix.entries[i].name = n;
         ix.entries[i].rtype = t;
+        ix.entries[i].members = members;
     }
     progress("names", total, total);
     ix.names_done = true;
@@ -130,16 +135,36 @@ pub struct Filter {
 
 impl Filter {
     pub fn select<'a>(&self, ix: &'a ArchiveIndex) -> Result<Vec<&'a Entry>> {
+        self.select_entries(ix.entries.iter())
+    }
+
+    /// Export selection also accepts explicit `<entry id>#<member name>` ids.
+    pub fn select_exports(&self, ix: &ArchiveIndex) -> Result<Vec<Entry>> {
+        let mut members = Vec::new();
+        let mut filter = self.clone();
+        let resolver = ModelResolver::new(&ix.entries);
+        for id in &mut filter.ids {
+            if let Some((_base, name)) = id.trim().split_once('#') {
+                let (e, _) = resolver.resolve(&ix.entries, id.trim())?;
+                let selected = member_entry(e, name)?;
+                *id = selected.id.clone();
+                if !members.iter().any(|e: &Entry| e.id == selected.id) {
+                    members.push(selected);
+                }
+            }
+        }
+        Ok(filter.select_entries(ix.entries.iter().chain(members.iter()))?.into_iter().cloned().collect())
+    }
+
+    fn select_entries<'a>(&self, entries: impl Iterator<Item = &'a Entry>) -> Result<Vec<&'a Entry>> {
         let re = self.name.as_deref().map(Regex::new).transpose()?;
         let ex = self.exclude_name.as_deref().map(Regex::new).transpose()?;
         // ids as a set: lists can hold tens of thousands of entries
         let idset: std::collections::HashSet<String> = self.ids.iter().map(|i| i.trim().to_ascii_lowercase()).collect();
-        let mut v: Vec<&Entry> = ix
-            .entries
-            .iter()
+        let mut v: Vec<&Entry> = entries
             .filter(|e| self.kinds.is_empty() || self.kinds.contains(&e.kind))
             .filter(|e| self.rtypes.is_empty() || e.rtype.as_ref().is_some_and(|t| self.rtypes.contains(t)))
-            .filter(|e| idset.is_empty() || idset.contains(&e.id.to_ascii_lowercase()) || idset.contains(&format!("{:x}", e.off)))
+            .filter(|e| idset.is_empty() || idset.contains(&e.id.to_ascii_lowercase()) || idset.contains(&format!("{:x}{}", e.off, e.id.split_once('#').map_or(String::new(), |(_, m)| format!("#{m}")))))
             .filter(|e| e.usize >= self.min_size)
             .filter(|e| match &re {
                 Some(r) => e.name.as_deref().is_some_and(|n| r.is_match(n)) || r.is_match(&e.id),
@@ -583,8 +608,56 @@ fn rel(out: &Path, p: &Path) -> String {
     p.strip_prefix(out).unwrap_or(p).to_string_lossy().replace('\\', "/")
 }
 
+/// Indexed resolution shared by all model-id consumers. Accepts full ids or bare hex offsets.
+pub struct ModelResolver {
+    entries: std::collections::HashMap<u64, usize>,
+}
+impl ModelResolver {
+    pub fn new(entries: &[Entry]) -> Self {
+        Self { entries: entries.iter().enumerate().map(|(i, e)| (e.off, i)).collect() }
+    }
+    pub fn resolve<'a, 's>(&self, entries: &'a [Entry], id: &'s str) -> Result<(&'a Entry, Option<&'s str>)> {
+        let (base, member) = id.split_once('#').map_or((id, None), |(b, m)| (b, Some(m)));
+        let hex = base.rsplit_once('@').map_or(base, |(_, off)| off);
+        let off = u64::from_str_radix(hex.trim_start_matches("0x"), 16)?;
+        let e = self.entries.get(&off).and_then(|&i| entries.get(i)).ok_or_else(|| anyhow!("no entry {base}"))?;
+        if let Some((archive, _)) = base.rsplit_once('@') {
+            let source_archive = e.id.rsplit_once('@').map_or("", |(a, _)| a);
+            anyhow::ensure!(archive.eq_ignore_ascii_case(source_archive) || game::index_stem(archive).eq_ignore_ascii_case(&game::index_stem(source_archive)), "no entry {base}");
+        }
+        if let Some(name) = member {
+            anyhow::ensure!(matches!(e.kind, Kind::RageObj | Kind::Resource) && matches!(e.rtype.as_deref(), Some("dr" | "dd")), "{} is not a drawable dictionary", e.id);
+            member_entry(e, name)?;
+        }
+        Ok((e, member))
+    }
+}
+
+/// Select a dictionary member while retaining stream metadata.
+/// The member is validated against the resource when exported.
+pub fn member_entry(e: &Entry, member: &str) -> Result<Entry> {
+    if member.len() < 2 || !member.bytes().all(crate::resource::is_name_char) {
+        return Err(anyhow!("invalid drawable member name: {member}"));
+    }
+    let mut selected = e.clone();
+    selected.id = format!("{}#{member}", e.id.split('#').next().unwrap());
+    selected.name = Some(member.to_string());
+    Ok(selected)
+}
+
+/// Shared cache directory name for whole resources and selected members.
+pub fn export_base_name(e: &Entry) -> String {
+    let member = e.id.split_once('#').map(|(_, name)| name);
+    let name = member.or(e.name.as_deref()).unwrap_or("unnamed");
+    format!("{}_{:x}{}", sanitize(name), e.off, if member.is_some() { "_member" } else { "" })
+}
+
 /// Export one entry. Returns the files written.
 pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<ExportedItem> {
+    // Callers may pass a suffixed id directly on a cloned index entry.
+    let selected = e.id.split_once('#').map(|(_, member)| member_entry(e, member)).transpose()?;
+    let e = selected.as_ref().unwrap_or(e);
+    let requested_member = e.id.split_once('#').map(|(_, member)| member);
     let astem = game::index_stem(&a.id);
     let mut item = ExportedItem {
         id: e.id.clone(),
@@ -597,7 +670,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
         error: None,
         warnings: vec![],
     };
-    let base_name = format!("{}_{:x}", sanitize(e.name.as_deref().unwrap_or("unnamed")), e.off);
+    let base_name = export_base_name(e);
     // Unnamed carved resources have no type; those with shaders are drawables
     // (reached through archetype links, `sixng link-archetypes`).
     let drawable_like = e.kind == Kind::RageObj && e.rtype.is_none() && Resource::load_sys(&a.path, e).map(|r| !crate::drawable::find_shaders(&r).is_empty()).unwrap_or(false);
@@ -633,13 +706,21 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
         (Kind::RageObj | Kind::Resource, Some(_)) => {
             let dir = o.out.join("models").join(&astem).join(&base_name);
             let marker = dir.join("model.json");
-            if marker.exists() && !o.force {
+            // Old exports could leave the primary mesh in model_lodN.glb.
+            // Repair those caches, while keeping resources without meshes cached.
+            let missing_model = !dir.join("model.glb").exists() && (requested_member.is_some()
+                || fs::read(&marker).ok().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .and_then(|meta| meta["meshes"].as_array().map(|meshes| !meshes.is_empty())).unwrap_or(false));
+            if marker.exists() && !o.force && !missing_model {
                 item.status = "skipped".into();
                 return Ok(item);
             }
             fs::create_dir_all(dir.join("buffers"))?;
             let r = Resource::load(&a.path, e)?;
-            let info = crate::drawable::describe(&r);
+            let mut info = crate::drawable::describe(&r);
+            if let Some(name) = requested_member {
+                crate::drawable::select_member(&r, &mut info, name)?;
+            }
             let mut bufs = Vec::new();
             for (i, b) in info.buffers.iter().enumerate() {
                 let end = (b.gfx_off + b.bytes).min(r.gfx.len() as u64) as usize;
@@ -759,7 +840,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 }
             }
             let rest: Vec<usize> = (0..info.geometries.len()).filter(|&i| !used[i]).collect();
-            if !rest.is_empty() {
+            if requested_member.is_none() && !rest.is_empty() {
                 let prims = rest.into_iter().filter_map(|gi| prims_of(gi, None, &mut mesh_meta)).collect();
                 lod_groups[0].push(crate::gltf::NodeGroup { name: "unassigned".into(), prims });
             }
@@ -781,6 +862,8 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     let _ = fs::remove_file(old.path());
                 }
             }
+            let lods = lod_exports(&lod_groups);
+            let primary = lods.first().map_or(0, |l| l.0);
             if ntris > 0 {
                 let mats: Vec<crate::gltf::Material> = info.shaders.iter().zip(shader_tex.iter()).map(|(s, st)| crate::gltf::Material {
                     name: format!("shader{:02}_{}", s.index, s.name_hash),
@@ -802,18 +885,16 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     },
                     extras: serde_json::json!({"shader_name_hash": s.name_hash, "shader_name": crate::names::shader(&s.name_hash), "classification": classify_shader(s, st), "textures": st.entries, "texture_fallback": st.fallback}),
                 }).collect();
-                for (lod, groups) in lod_groups.iter().enumerate() {
-                    if groups.iter().all(|g| g.prims.is_empty()) {
-                        continue;
-                    }
-                    let fname = if lod == 0 { "model.glb".to_string() } else { format!("model_lod{lod}.glb") };
+                for (lod, fname) in &lods {
+                    let lod = *lod;
+                    let groups = &lod_groups[lod];
                     let p = dir.join(&fname);
                     let mut ex = extras.clone();
                     ex["lod"] = serde_json::json!(lod);
                     let nm = format!("{}{}", e.name.as_deref().unwrap_or("model"), if lod == 0 { String::new() } else { format!("_lod{lod}") });
                     fs::write(&p, crate::gltf::mesh_glb(&nm, groups, &mats, &joints, ex))?;
                     item.files.push(rel(&o.out, &p));
-                    if lod == 0 {
+                    if glb_file.is_none() {
                         glb_file = Some(rel(&dir, &p));
                     }
                     lod_files.push(rel(&dir, &p));
@@ -831,7 +912,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
             let paired: std::collections::HashSet<usize> = info.geometries.iter().map(|g| g.vertex_buffer).collect();
             let mut prims = Vec::new();
             for (i, b) in info.buffers.iter().enumerate() {
-                if let (Some(h), false) = (&b.mesh_blob, paired.contains(&i)) {
+                if let (Some(h), false, true) = (&b.mesh_blob, paired.contains(&i), requested_member.is_none()) {
                     let pos = crate::drawable::decode_positions(slice(i), h);
                     prims.push(crate::gltf::PointPrim { name: format!("blob{:02}_{:x}", i, b.gfx_off), positions: pos });
                 }
@@ -846,7 +927,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
             let geometry_bbox = {
                 let mut g = [[f32::MAX; 3], [f32::MIN; 3]];
                 let mut any = false;
-                for mm in mesh_meta.iter().filter(|mm| mm["lod"].as_u64().unwrap_or(0) == 0) {
+                for mm in mesh_meta.iter().filter(|mm| mm["lod"].as_u64().unwrap_or(0) == if requested_member.is_some() { primary as u64 } else { 0 }) {
                     if let Ok(b) = serde_json::from_value::<[[f32; 3]; 2]>(mm["bbox"].clone()) {
                         any = true;
                         for k in 0..3 {
@@ -860,14 +941,14 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
             let j = serde_json::json!({
                 "source": { "archive": a.id, "id": e.id, "offset": e.off, "streams": e.streams },
                 "name": e.name, "type": e.rtype,
-                "geometry": "triangle meshes, one GLB per LOD (model.glb = LOD0, model_lodN.glb). Y-up, metres; one node per geometry grouped by model; fragments carry the skeleton as glTF joints and a rigid skin (JOINTS_0 = bone). Mesh blobs without an index buffer go to points.glb. Material names are shader index + unresolved name hash.",
+                "geometry": "triangle meshes, one GLB per LOD (model.glb = lowest populated LOD, model_lodN.glb). Y-up, metres; one node per geometry grouped by model; fragments carry the skeleton as glTF joints and a rigid skin (JOINTS_0 = bone). Mesh blobs without an index buffer go to points.glb. Material names are shader index + unresolved name hash.",
                 "glb": glb_file, "lod_glbs": lod_files, "parts_glb": parts_file,
                 "parts_note": "model_parts.glb: models of embedded drawables (fragment children at root+0x10, nested sub-drawables), not LODs. LOD levels come from the main drawable's LOD group (+0x50 + 8*k). Placement of fragment-child parts is unverified.", "points_glb": points_file, "vertex_count": nverts, "triangle_count": ntris,
                 "coordinate_system": COORDS,
                 "surface_hint": e.name.as_deref().and_then(surface_hint),
                 "surface_hint_source": "model name (collision/material surface types are not decoded yet)",
                 "geometry_bbox": geometry_bbox,
-                "geometry_bbox_note": "RAGE model space (Z-up) [min, max] over the LOD0 meshes, from the decoded vertices. Prefer it to drawable.bounds / bounds_raw: on some fragments and drawables the stored bbox is offset or rotated (route-sign prefabs, dn_20_scaffolding_02); the archetype definitions agree with the geometry.",
+                "geometry_bbox_note": "RAGE model space (Z-up) [min, max] over the primary meshes (LOD0, or the lowest populated LOD for a dictionary member), from the decoded vertices. Prefer it to drawable.bounds / bounds_raw: on some fragments and drawables the stored bbox is offset or rotated (route-sign prefabs, dn_20_scaffolding_02); the archetype definitions agree with the geometry.",
                 "meshes": mesh_meta,
                 "wheel_mounts": info.skeleton.iter().filter(|b| b.name.starts_with("wheel_") && b.name.len() <= 9 && b.pivot.is_some()).map(|b| serde_json::json!({"bone": b.name, "pivot": b.pivot})).collect::<Vec<_>>(),
                 "wheel_mounts_note": "Wheel centres (model space, RAGE Z-up). Rims and tyres are shared models (rim_<class>_NNN, tyre_<class>_NNN) authored for the left-front at unit scale (rim radius 0.5); mirror X for right-hand wheels and scale by the vehicle's wheel size (not decoded yet).",
@@ -1131,12 +1212,20 @@ pub fn model_names_base(ws: &Workspace) -> std::collections::HashMap<u32, (Strin
     for a in ws.archives() {
         let Ok(ix) = ws.load_index(&a) else { continue };
         for e in &ix.entries {
-            if let (Some(n), Some("dr" | "ft" | "dd")) = (&e.name, e.rtype.as_deref()) {
-                m.entry(crate::meta7a::joaat(n)).or_insert_with(|| (n.clone(), e.id.clone()));
-            }
+            register_model_names(&mut m, e);
         }
     }
     m
+}
+
+fn register_model_names(m: &mut std::collections::HashMap<u32, (String, String)>, e: &Entry) {
+    // Register members first: the entry name is often its first member's name.
+    for n in &e.members {
+        m.entry(crate::meta7a::joaat(n)).or_insert_with(|| (n.clone(), format!("{}#{n}", e.id)));
+    }
+    if let (Some(n), Some("dr" | "ft" | "dd")) = (&e.name, e.rtype.as_deref()) {
+        m.entry(crate::meta7a::joaat(n)).or_insert_with(|| (n.clone(), e.id.clone()));
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1755,7 +1844,7 @@ fn interior_second_pass(
 }
 
 fn entry_off(id: &str) -> u64 {
-    id.rsplit('@').next().and_then(|x| u64::from_str_radix(x, 16).ok()).unwrap_or(0)
+    id.split('#').next().unwrap_or(id).rsplit('@').next().and_then(|x| u64::from_str_radix(x, 16).ok()).unwrap_or(0)
 }
 
 /// One collision file per interior archetype. Bounds are unnamed, but the
@@ -2090,7 +2179,7 @@ pub fn link_archetypes(ws: &Workspace, a: &ArchiveInfo, metas: &[&Entry], candid
                 progress(&e.id, d, total);
             }
             let r = Resource::load_sys(&a.path, e).ok()?;
-            if r.sys.len() < 0x4c || crate::drawable::find_shaders(&r).is_empty() {
+            if !e.members.is_empty() || !crate::drawable::dictionary_members(&r).is_empty() || r.sys.len() < 0x4c || crate::drawable::find_shaders(&r).is_empty() {
                 return None;
             }
             let emb = if e.name.is_none() { crate::resource::find_resource_name(&r.sys).map(|t| t.0) } else { None };
@@ -2161,7 +2250,7 @@ pub fn link_archetypes(ws: &Workspace, a: &ArchiveInfo, metas: &[&Entry], candid
     // Locality: the archive is stored in name order, so an unnamed drawable
     // sits between the named entries around its (guessed) name, and near the
     // drawables of the other archetypes defined in the same meta file.
-    let off_of = |id: &str| id.rsplit_once('@').and_then(|x| u64::from_str_radix(x.1, 16).ok()).unwrap_or(0);
+    let off_of = |id: &str| entry_off(id);
     let mut by_name: Vec<(String, u64)> = names.values().map(|(n, id)| (n.to_ascii_lowercase(), off_of(id))).collect();
     by_name.sort();
     let mut meta_span: HashMap<&str, (u64, u64)> = HashMap::new();
@@ -2187,15 +2276,14 @@ pub fn link_archetypes(ws: &Workspace, a: &ArchiveInfo, metas: &[&Entry], candid
         let pred = by_name[..i].last().map(|x| x.1)?;
         let succ = by_name.get(i).map(|x| x.1)?;
         let (lo, hi) = (pred.min(succ), pred.max(succ));
+        if lo == hi { return None; }
         // other named entries inside the gap mean the name order does not hold here
         let a = named_offs.partition_point(|&o| o <= lo);
         let b = named_offs.partition_point(|&o| o < hi);
         if b > a {
             return None;
         }
-        let s = draw_by_off.partition_point(|x| x.0 <= lo);
-        let e = draw_by_off.partition_point(|x| x.0 < hi);
-        let inside = &draw_by_off[s..e];
+        let inside = gap_candidates(&draw_by_off, lo, hi)?;
         match inside.len() {
             1 => Some((draws[inside[0].1].0.clone(), "name-order gap (single candidate)")),
             2..=6 => {
@@ -2290,11 +2378,231 @@ pub fn link_archetypes(ws: &Workspace, a: &ArchiveInfo, metas: &[&Entry], candid
         }
         links.insert(format!("{h:08x}"), v);
     }
-    let stats = serde_json::json!({"archetype_defs": defs.len(), "unresolved_archetypes": unresolved.len(), "candidate_drawables": draws.len(),
+    let unique_defs: HashSet<_> = defs.iter().map(|d| d.0).collect();
+    let stats = serde_json::json!({"archetype_defs": defs.len(), "unique_archetypes": unique_defs.len(), "unresolved_archetypes": unresolved.len(), "candidate_drawables": draws.len(),
+        "named_archetypes": unique_defs.len() - unresolved.len(),
+        "named_member_archetypes": unique_defs.iter().filter(|h| names.get(h).is_some_and(|n| n.1.contains('#'))).count(),
         "linked_by_bbox": n_bbox, "linked_by_bbox_and_locality": n_local, "ambiguous": n_amb, "linked_by_drawable_dictionary": n_dd, "linked_by_name_order_gap": n_gap, "linked_by_embedded_name": n_emb, "embedded_names_found": embedded.len(), "names_guessed": n_name});
     let doc = serde_json::json!({"note": "Archetypes (struct 82d6fc83) with no named drawable, linked first by the name stored inside an unindexed drawable (joaat match), else to the one drawable (unnamed, or named but not matching its own archetype) whose bounds equal the archetype bbox (0.03 m; ambiguous and degenerate boxes are not linked); names guessed by joaat of sibling-name stems. Merged into model_id resolution (placements, lights, ...). Regenerate with `sixng link-archetypes` after re-indexing.",
         "stats": stats, "links": links});
     fs::create_dir_all(ws.index_dir())?;
     fs::write(links_path(ws), serde_json::to_vec_pretty(&doc)?)?;
     Ok(stats)
+}
+
+/// Strictly interior candidates; equal or empty archive spans cannot identify a model.
+fn gap_candidates(draws: &[(u64, usize)], lo: u64, hi: u64) -> Option<&[(u64, usize)]> {
+    if lo >= hi { return None; }
+    let s = draws.partition_point(|x| x.0 <= lo);
+    let e = draws.partition_point(|x| x.0 < hi);
+    if s >= e { return None; }
+    Some(&draws[s..e])
+}
+
+fn lod_exports(groups: &[Vec<crate::gltf::NodeGroup>]) -> Vec<(usize, String)> {
+    let mut lods = Vec::new();
+    for (lod, gs) in groups.iter().enumerate() {
+        if gs.iter().all(|g| g.prims.is_empty()) { continue; }
+        let name = if lods.is_empty() { "model.glb".into() } else { format!("model_lod{lod}.glb") };
+        lods.push((lod, name));
+    }
+    lods
+}
+
+#[cfg(test)]
+mod dictionary_tests {
+    use super::*;
+
+    #[test]
+    fn name_gap_rejects_same_dictionary_and_empty_spans() {
+        let draws = [(10, 0), (20, 1), (30, 2)];
+        assert!(gap_candidates(&draws, 20, 20).is_none());
+        assert!(gap_candidates(&draws, 10, 20).is_none());
+        assert!(gap_candidates(&draws, 21, 29).is_none());
+        assert_eq!(gap_candidates(&draws, 10, 30), Some(&draws[1..2]));
+    }
+
+    #[test]
+    fn lowest_populated_lod_is_primary_without_reordering_other_lods() {
+        let group = || crate::gltf::NodeGroup { name: "member".into(), prims: vec![crate::gltf::TriPrim {
+            name: "triangle".into(), positions: vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: None, tangents: None, uvs: vec![], colors: None, tint: None, indices: vec![0, 1, 2],
+            material: None, joints: None, weights: None, joints1: None, weights1: None,
+        }] };
+        let mut groups = vec![vec![], vec![], vec![group()], vec![group()], vec![], vec![group()]];
+        assert_eq!(lod_exports(&groups), [(2, "model.glb".into()), (3, "model_lod3.glb".into()), (5, "model_lod5.glb".into())]);
+        groups[0].push(group());
+        assert_eq!(lod_exports(&groups)[0], (0, "model.glb".into()));
+        assert_eq!(lod_exports(&groups)[1], (2, "model_lod2.glb".into()));
+    }
+
+    fn entry() -> Entry {
+        Entry {
+            id: "levels.rpf@10".into(), off: 0x10, csize: 100, usize: 100,
+            streams: vec![[0x10, 100, 100]], kind: Kind::RageObj,
+            sub: String::new(), ext: "bin".into(), name: Some("alpha_01".into()),
+            rtype: Some("dr".into()), members: vec!["alpha_01".into(), "beta_02".into()],
+        }
+    }
+
+    #[test]
+    fn cached_ordinary_drawable_with_meshes_regenerates_missing_primary_glb() {
+        use std::io::Write;
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let work = std::env::temp_dir().join(format!("sixng-export-cache-test-{stamp}"));
+        fs::create_dir_all(&work).unwrap();
+        let mut sys = vec![0u8; 0x600];
+        let put64 = |data: &mut [u8], at: usize, value: u64| data[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        // Ordinary drawable with one triangle, present only at LOD 2.
+        for (at, target) in [(0x60, 0x100), (0x100, 0x120), (0x120, 0x180),
+            (0x188, 0x200), (0x1a0, 0x220), (0x200, 0x280), (0x288, 0x400),
+            (0x2c0, 0x480), (0x480, 0x420)] {
+            put64(&mut sys, at, 0x5000_0000 | target);
+        }
+        for at in [0x108, 0x190] { sys[at..at + 4].copy_from_slice(&[1, 0, 1, 0]); }
+        let mut gfx = vec![0u8; 0xb8];
+        gfx[..4].copy_from_slice(&0x3063u32.to_le_bytes());
+        gfx[4..8].copy_from_slice(&0x4201u32.to_le_bytes()); // positions end at 0x84
+        for (i, p) in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]].iter().enumerate() {
+            for (k, v) in p.iter().enumerate() { gfx[0x60 + i * 12 + k * 4..0x64 + i * 12 + k * 4].copy_from_slice(&v.to_le_bytes()); }
+        }
+        // One meshlet with one triangle and three vertex remaps.
+        for (at, value) in [(0x90, 1u16), (0x94, 1), (0x98, 3), (0xb2, 1), (0xb4, 2)] {
+            gfx[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        gfx[0xac..0xb0].copy_from_slice(&(1u32 << 7 | 2 << 14).to_le_bytes());
+        for (at, offset, words) in [(0x400, 0u64, 0x24u32), (0x420, 0x90, 10)] {
+            sys[at + 8..at + 12].copy_from_slice(&words.to_le_bytes());
+            sys[at + 12..at + 16].copy_from_slice(&[4, 0, 8, 0]);
+            put64(&mut sys, at + 0x18, 0x6000_0000 | offset);
+        }
+        let mut e = entry();
+        e.members.clear();
+        e.streams.clear();
+        let mut archive = Vec::new();
+        for data in [&sys, &gfx] {
+            let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(data).unwrap();
+            let compressed = encoder.finish().unwrap();
+            e.streams.push([archive.len() as u64, compressed.len() as u64, data.len() as u64]);
+            archive.extend(compressed);
+        }
+        let a = ArchiveInfo { id: "levels.rpf".into(), path: work.join("levels.rpf"), size: archive.len() as u64, container: "rpf9".into() };
+        fs::write(&a.path, archive).unwrap();
+        let o = ExportOptions { out: work.join("out"), png: false, dds: false, raw: false,
+            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0 };
+        let dir = o.out.join("models/levels").join(export_base_name(&e));
+        fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("model.json");
+        fs::write(&marker, br#"{"meshes":[{"lod":2}],"glb":null,"lod_glbs":["model_lod2.glb"]}"#).unwrap();
+        fs::write(dir.join("model_lod2.glb"), b"old layout").unwrap();
+        let item = export_entry(&a, &e, &o).unwrap();
+        assert_eq!(item.status, "ok");
+        assert_eq!(&fs::read(dir.join("model.glb")).unwrap()[..4], b"glTF");
+        assert!(!dir.join("model_lod2.glb").exists());
+        let meta: serde_json::Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+        assert_eq!(meta["glb"], "model.glb");
+        assert_eq!(meta["meshes"][0]["lod"], 2);
+        assert_eq!(meta["triangle_count"], 1);
+        assert_eq!(export_entry(&a, &e, &o).unwrap().status, "skipped");
+        fs::remove_file(dir.join("model.glb")).unwrap();
+        // Resources with no meshes must remain cached even without a GLB.
+        for metadata in [br#"{"meshes":[]}"#.as_slice(), b"{}"] {
+            fs::write(&marker, metadata).unwrap();
+            assert_eq!(export_entry(&a, &e, &o).unwrap().status, "skipped");
+            assert_eq!(fs::read(&marker).unwrap(), metadata);
+        }
+        e.rtype = Some("txd".into());
+        let tdir = o.out.join("textures/levels").join(export_base_name(&e));
+        fs::create_dir_all(&tdir).unwrap();
+        fs::write(tdir.join("dictionary.json"), b"{}").unwrap();
+        assert_eq!(export_entry(&a, &e, &o).unwrap().status, "skipped");
+        fs::remove_dir_all(work).unwrap();
+    }
+
+    #[test]
+    fn indexed_member_names_override_the_first_resource_name() {
+        let e: Entry = serde_json::from_slice(&serde_json::to_vec(&entry()).unwrap()).unwrap();
+        let mut names = std::collections::HashMap::new();
+        register_model_names(&mut names, &e);
+        for name in &e.members {
+            assert_eq!(names[&crate::meta7a::joaat(name)], (name.clone(), format!("{}#{name}", e.id)));
+        }
+        let selected = member_entry(&e, "alpha_01").unwrap();
+        assert_eq!(selected.streams, e.streams);
+        assert_eq!(selected.name.as_deref(), Some("alpha_01"));
+        assert_eq!(export_base_name(&selected), "alpha_01_10_member");
+        assert_eq!(export_base_name(&e), "alpha_01_10");
+        assert_eq!(entry_off(&selected.id), e.off);
+        assert!(!export_base_name(&selected).contains('#'));
+        assert!(member_entry(&e, "../bad").is_err());
+    }
+
+    #[test]
+    fn workspace_rejects_older_index_versions() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let work = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../target/index-version-test-{stamp}"));
+        let ws = Workspace { game: work.clone(), work: work.clone() };
+        let a = ArchiveInfo { id: "levels.rpf".into(), path: work.join("levels.rpf"), size: 100, container: "rpf9".into() };
+        let mut ix = ArchiveIndex {
+            tool_version: "4".into(), archive: a.id.clone(), path: String::new(), size: 100,
+            mtime: 0, header: None, container: "rpf9".into(), entries: vec![entry()], stats: Default::default(), names_done: true,
+        };
+        fs::create_dir_all(ws.index_dir()).unwrap();
+        scan::save_index(&ws.index_dir(), &ix).unwrap();
+        assert!(ws.load_index(&a).unwrap_err().to_string().contains("index is from an older version"));
+        ix.tool_version = crate::INDEX_VERSION.into();
+        scan::save_index(&ws.index_dir(), &ix).unwrap();
+        assert!(ws.load_index(&a).is_ok());
+        fs::remove_dir_all(work).unwrap();
+    }
+
+    #[test]
+    fn resolver_rejects_members_on_non_drawables() {
+        let mut e = entry();
+        e.rtype = Some("txd".into());
+        let entries = [e];
+        let resolver = ModelResolver::new(&entries);
+        assert!(resolver.resolve(&entries, "10#alpha_01").is_err());
+        assert!(resolver.resolve(&entries, "levels.rpf@10").is_ok());
+        assert!(resolver.resolve(&entries, "LEVELS.RPF@10").is_ok());
+        assert!(resolver.resolve(&entries, "0x10").is_ok());
+        assert!(resolver.resolve(&entries, "other.rpf@10").is_err());
+    }
+
+    #[test]
+    fn export_filter_uses_resolved_member_ids() {
+        let ix = ArchiveIndex {
+            tool_version: crate::INDEX_VERSION.into(), archive: "levels.rpf".into(),
+            path: String::new(), size: 100, mtime: 0, header: None, container: "rpf9".into(),
+            entries: vec![entry()], stats: Default::default(), names_done: true,
+        };
+        for id in ["0x10#beta_02", "levels@10#beta_02", "LEVELS.RPF@10#beta_02", " 10#beta_02 "] {
+            let f = Filter { ids: vec![id.into()], ..Default::default() };
+            let selected = f.select_exports(&ix).unwrap();
+            assert_eq!(selected.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["levels.rpf@10#beta_02"], "{id}");
+        }
+        let f = Filter { ids: vec!["levels.rpf@10".into(), "0x10#beta_02".into(), "levels@10#beta_02".into()], ..Default::default() };
+        assert_eq!(f.select_exports(&ix).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn export_filter_accepts_member_ids_and_preserves_plain_entry_selection() {
+        let e = entry();
+        let ix = ArchiveIndex {
+            tool_version: crate::INDEX_VERSION.into(), archive: "levels.rpf".into(),
+            path: String::new(), size: 100, mtime: 0, header: None, container: "rpf9".into(),
+            entries: vec![e.clone()], stats: Default::default(), names_done: true,
+        };
+        let f = Filter { ids: vec![format!("{}#beta_02", e.id)], ..Default::default() };
+        let selected = f.select_exports(&ix).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "levels.rpf@10#beta_02");
+        assert_eq!(selected[0].name.as_deref(), Some("beta_02"));
+        let bare = Filter { ids: vec!["10#beta_02".into()], ..Default::default() };
+        assert_eq!(bare.select_exports(&ix).unwrap()[0].id, selected[0].id);
+        assert_eq!(Filter::default().select_exports(&ix).unwrap()[0].id, e.id);
+        let f = Filter { ids: vec![e.id.clone(), format!("{}#alpha_01", e.id)], ..Default::default() };
+        assert_eq!(f.select_exports(&ix).unwrap().len(), 2);
+    }
 }

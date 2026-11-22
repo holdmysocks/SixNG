@@ -251,29 +251,36 @@ impl ModelPicker {
                         log(&format!("index {a}: {} entries", ix.entries.len()));
                         for e in ix.entries.iter() {
                             let rtype: &'static str = match e.rtype.as_deref() {
-                                Some("dr") => "dr",
+                                Some("dr" | "dd") => "dr",
                                 Some("ft") => "ft",
                                 _ => continue,
                             };
-                            let name = e.name.clone().unwrap_or_else(|| format!("unnamed_{:x}", e.off));
-                            let lname = name.to_ascii_lowercase();
-                            let cat = categorise(e.name.as_deref(), rtype, &vehicle_re);
-                            // animals: only the roots (their parts are put together in the viewer);
-                            // people: pieces of a named character are shown through its outfit
-                            // entry below; generic pieces (masks, costumes, `char_` items) have
-                            // no outfit, so they stay listed unless they are real LOD copies
-                            let variant = match cat {
-                                Cat::Animals => rtype == "dr" || lname.contains("_bounds"),
-                                Cat::People => {
-                                    !crate::assemble::is_whole_ped(&lname)
-                                        && (crate::assemble::outfit_prefix(&lname).is_some() || is_variant(&lname))
-                                }
-                                _ => e.name.is_some() && is_variant(&lname),
+                            let choices: Vec<(String, Option<&str>)> = if e.members.is_empty() {
+                                vec![(e.id.clone(), e.name.as_deref())]
+                            } else {
+                                e.members.iter().map(|name| (format!("{}#{name}", e.id), Some(name.as_str()))).collect()
                             };
-                            if let Some(p) = crate::assemble::outfit_prefix(&lname) {
-                                *outfits.entry(p).or_insert(0) += e.usize;
+                            for (id, source_name) in choices {
+                                let name = source_name.map(str::to_string).unwrap_or_else(|| format!("unnamed_{:x}", e.off));
+                                let lname = name.to_ascii_lowercase();
+                                let cat = categorise(source_name, rtype, &vehicle_re);
+                                // animals: only the roots (their parts are put together in the viewer)
+                                let variant = match cat {
+                                    Cat::Animals => rtype == "dr" || lname.contains("_bounds"),
+                                    // people: pieces of a named character are shown through its outfit
+                                    // entry below; generic pieces (masks, costumes, `char_` items) have
+                                    // no outfit, so they stay listed unless they are real LOD copies
+                                    Cat::People => {
+                                        !crate::assemble::is_whole_ped(&lname)
+                                            && (crate::assemble::outfit_prefix(&lname).is_some() || is_variant(&lname))
+                                    }
+                                    _ => source_name.is_some() && is_variant(&lname),
+                                };
+                                if let Some(p) = crate::assemble::outfit_prefix(&lname) {
+                                    *outfits.entry(p).or_insert(0) += e.usize;
+                                }
+                                v.push(Item { cat, variant, lname, name, id, rtype, bytes: e.usize });
                             }
-                            v.push(Item { cat, variant, lname, name, id: e.id.clone(), rtype, bytes: e.usize });
                         }
                         let arch = a.to_string();
                         for (p, bytes) in std::mem::take(&mut outfits) {

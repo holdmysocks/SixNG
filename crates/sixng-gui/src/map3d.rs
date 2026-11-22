@@ -2359,7 +2359,7 @@ static LOAD_T: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::A
 /// Archive id -> (entry offset -> entry index), built once per archive.
 /// Also caches resolved archives (name -> info): resolving lists the game
 /// folder each time.
-pub(crate) type OffMaps = Arc<Mutex<HashMap<String, Arc<HashMap<u64, usize>>>>>;
+pub(crate) type OffMaps = Arc<Mutex<HashMap<String, Arc<sixng_core::export::ModelResolver>>>>;
 pub(crate) type ArcCache = Arc<Mutex<HashMap<String, (sixng_core::game::ArchiveInfo, Arc<ArchiveIndex>)>>>;
 
 /// Merge the meshes of a model that share a material (and are not skinned)
@@ -2400,7 +2400,7 @@ fn merge_meshes(mut m: glb::Model) -> glb::Model {
 pub(crate) fn load_model(ws: &Workspace, cache: &Path, id: &str, lod: usize, opts: &glb::LoadOpts, idx: &Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>, offs: &OffMaps, arcs: &ArcCache) -> anyhow::Result<glb::Model> {
     let t0 = Instant::now();
     let add = |k: usize, t: Instant| LOAD_T[k].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-    let (archive, off) = id.split_once('@').ok_or_else(|| anyhow::anyhow!("bad model id {id}"))?;
+    let (archive, _) = id.split_once('@').ok_or_else(|| anyhow::anyhow!("bad model id {id}"))?;
     let got = arcs.lock().unwrap().get(archive).cloned();
     let (a, ix) = match got {
         Some(v) => v,
@@ -2410,20 +2410,21 @@ pub(crate) fn load_model(ws: &Workspace, cache: &Path, id: &str, lod: usize, opt
             v
         }
     };
-    let off = u64::from_str_radix(off.trim_start_matches("0x"), 16)?;
     let map = {
         let got = offs.lock().unwrap().get(&a.id).cloned();
         match got {
             Some(m) => m,
             None => {
-                let m = Arc::new(ix.entries.iter().enumerate().map(|(i, e)| (e.off, i)).collect::<HashMap<u64, usize>>());
+                let m = Arc::new(sixng_core::export::ModelResolver::new(&ix.entries));
                 offs.lock().unwrap().insert(a.id.clone(), m.clone());
                 m
             }
         }
     };
-    let e = map.get(&off).map(|&i| &ix.entries[i]).ok_or_else(|| anyhow::anyhow!("no entry {id}"))?;
-    let dir = cache.join("models").join(sixng_core::game::index_stem(&a.id)).join(format!("{}_{:x}", model_view::export_sanitize(e.name.as_deref().unwrap_or("unnamed")), e.off));
+    let (e, member) = map.resolve(&ix.entries, id)?;
+    let selected = member.map(|name| sixng_core::export::member_entry(e, name)).transpose()?;
+    let e = selected.as_ref().unwrap_or(e);
+    let dir = cache.join("models").join(sixng_core::game::index_stem(&a.id)).join(sixng_core::export::export_base_name(e));
     add(0, t0);
     if !dir.join("model.glb").exists() {
         let t1 = Instant::now();
@@ -2437,7 +2438,7 @@ pub(crate) fn load_model(ws: &Workspace, cache: &Path, id: &str, lod: usize, opt
         anyhow::bail!("{id} has no model.glb");
     }
     let t2 = Instant::now();
-    let r = glb::load_with(&lods[lod.min(lods.len() - 1)], cache, opts);
+    let r = glb::load_with(&lods[model_view::lod_index(&lods, lod)], cache, opts);
     add(2, t2);
     LOAD_T[3].fetch_add(1, Ordering::Relaxed);
     r

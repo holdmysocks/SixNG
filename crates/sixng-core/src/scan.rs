@@ -212,6 +212,9 @@ pub struct Entry {
     /// Resource type tag from the name suffix (dr, ft, dd, td, ...) or "txd".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtype: Option<String>,
+    /// Names of drawable dictionary members, recovered with the system page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,6 +295,7 @@ pub fn group_streams(archive_id: &str, mut streams: Vec<RawStream>) -> Vec<Entry
                 ext,
                 name: None,
                 rtype: None,
+                members: Vec::new(),
             });
         }
         next_off = aligned_end;
