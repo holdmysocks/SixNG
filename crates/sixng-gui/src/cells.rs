@@ -30,7 +30,10 @@ use std::sync::Arc;
 pub const CELL_SIZE: [f32; 6] = [128.0, 256.0, 512.0, 1024.0, 2048.0, 2048.0];
 
 /// Class boundaries (m, at the default LOD scale); the last is "no limit".
-pub const BOUNDS: [f32; 20] = [0.0, 16.0, 24.0, 36.0, 54.0, 81.0, 121.0, 182.0, 273.0, 410.0, 615.0, 922.0, 1384.0, 2076.0, 3114.0, 4671.0, 7006.0, 10509.0, 15764.0, 1.0e9];
+pub const BOUNDS: [f32; 20] = [
+    0.0, 16.0, 24.0, 36.0, 54.0, 81.0, 121.0, 182.0, 273.0, 410.0, 615.0, 922.0, 1384.0, 2076.0,
+    3114.0, 4671.0, 7006.0, 10509.0, 15764.0, 1.0e9,
+];
 
 /// Texture array layer size (px) and bytes of one BC3 layer with its mips.
 pub const LAYER_PX: u32 = 64;
@@ -62,7 +65,11 @@ impl CellKey {
     /// Cell of a placement position (RAGE coordinates), on the map grid.
     pub fn of(level: u8, x: f32, y: f32) -> Self {
         let s = CELL_SIZE[level.min(5) as usize];
-        CellKey { level: level.min(5), cx: ((x - crate::mapbake::X0) / s).floor() as i32, cy: ((crate::mapbake::Y1 - y) / s).floor() as i32 }
+        CellKey {
+            level: level.min(5),
+            cx: ((x - crate::mapbake::X0) / s).floor() as i32,
+            cy: ((crate::mapbake::Y1 - y) / s).floor() as i32,
+        }
     }
     /// x0, y0, x1, y1 (RAGE coordinates).
     pub fn rect(&self) -> [f32; 4] {
@@ -163,7 +170,10 @@ pub struct CellCpu {
 
 impl CellCpu {
     pub fn bytes(&self) -> usize {
-        self.verts.len() * std::mem::size_of::<CellV>() + self.indices.len() * 4 + self.ents.len() * 32 + self.chunks.iter().map(|c| c.data.len()).sum::<usize>()
+        self.verts.len() * std::mem::size_of::<CellV>()
+            + self.indices.len() * 4
+            + self.ents.len() * 32
+            + self.chunks.iter().map(|c| c.data.len()).sum::<usize>()
     }
 }
 
@@ -204,7 +214,8 @@ fn layer_rgba(img: &glb::Image) -> Option<Vec<u8>> {
         let sy = (y * h / n).min(h - 1);
         for x in 0..n {
             let sx = (x * w / n).min(w - 1);
-            out[(y * n + x) * 4..(y * n + x) * 4 + 4].copy_from_slice(&src[(sy * w + sx) * 4..(sy * w + sx) * 4 + 4]);
+            out[(y * n + x) * 4..(y * n + x) * 4 + 4]
+                .copy_from_slice(&src[(sy * w + sx) * 4..(sy * w + sx) * 4 + 4]);
         }
     }
     Some(out)
@@ -218,7 +229,11 @@ fn layer_bc3(rgba: Vec<u8>) -> Vec<Vec<u8>> {
 /// placements in a cell are at least the near ring away (the low LOD,
 /// where a model has one); the other levels have one drawable.
 pub fn drawable_lod(level: u8) -> usize {
-    if level == 0 { 2 } else { 0 }
+    if level == 0 {
+        2
+    } else {
+        0
+    }
 }
 
 /// Vertex clustering: vertices in the same `grid` cube merge (mean
@@ -233,7 +248,11 @@ fn simplify(verts: &mut Vec<CellV>, idx: &mut Vec<u32>, grid: f32) {
     let mut acc: Vec<([f32; 3], [f32; 3], f32)> = Vec::with_capacity(verts.len() / 2);
     let mut remap = Vec::with_capacity(verts.len());
     for v in verts.iter() {
-        let q = ((v.pos[0] * inv).floor() as i32, (v.pos[1] * inv).floor() as i32, (v.pos[2] * inv).floor() as i32);
+        let q = (
+            (v.pos[0] * inv).floor() as i32,
+            (v.pos[1] * inv).floor() as i32,
+            (v.pos[2] * inv).floor() as i32,
+        );
         let n = [v.nrm[0] as f32, v.nrm[1] as f32, v.nrm[2] as f32];
         let k = *at.entry(q).or_insert_with(|| {
             out.push(*v);
@@ -256,7 +275,11 @@ fn simplify(verts: &mut Vec<CellV>, idx: &mut Vec<u32>, grid: f32) {
     }
     let mut ni = Vec::with_capacity(idx.len() / 2);
     for t in idx.chunks_exact(3) {
-        let (a, b, c) = (remap[t[0] as usize], remap[t[1] as usize], remap[t[2] as usize]);
+        let (a, b, c) = (
+            remap[t[0] as usize],
+            remap[t[1] as usize],
+            remap[t[2] as usize],
+        );
         if a != b && b != c && a != c {
             ni.extend_from_slice(&[a, b, c]);
         }
@@ -268,7 +291,12 @@ fn simplify(verts: &mut Vec<CellV>, idx: &mut Vec<u32>, grid: f32) {
 /// Merge the placements of a cell. `load` gives a model (64 px textures)
 /// at a drawable LOD, or None when it cannot be loaded; `max_layers` is the
 /// device's array layer limit.
-pub fn build(key: CellKey, ents: &[CellEnt], max_layers: u32, load: &mut dyn FnMut(&str, usize) -> Option<Arc<glb::Model>>) -> CellCpu {
+pub fn build(
+    key: CellKey,
+    ents: &[CellEnt],
+    max_layers: u32,
+    load: &mut dyn FnMut(&str, usize) -> Option<Arc<glb::Model>>,
+) -> CellCpu {
     let r = key.rect();
     let origin = gl([(r[0] + r[2]) * 0.5, (r[1] + r[3]) * 0.5, 0.0]);
     let max_layers = max_layers.clamp(2, 2048) as usize;
@@ -283,17 +311,39 @@ pub fn build(key: CellKey, ents: &[CellEnt], max_layers: u32, load: &mut dyn FnM
     let mut models: HashMap<&str, Option<Arc<glb::Model>>> = HashMap::new();
     let mut table: Vec<[f32; 8]> = Vec::new();
     for e in ents {
-        let Some(m) = models.entry(e.model.as_str()).or_insert_with(|| load(&e.model, drawable_lod(key.level))).clone() else { continue };
+        let Some(m) = models
+            .entry(e.model.as_str())
+            .or_insert_with(|| load(&e.model, drawable_lod(key.level)))
+            .clone()
+        else {
+            continue;
+        };
         if table.len() > u16::MAX as usize {
             break;
         }
         let ent = table.len() as u16;
         let c = gl(e.ctr) - origin;
-        table.push([c.x, c.y, c.z, e.lo, e.hi, if e.fb.is_some() { 1.0 } else { 0.0 }, e.fb.unwrap_or(0.0), 0.0]);
+        table.push([
+            c.x,
+            c.y,
+            c.z,
+            e.lo,
+            e.hi,
+            if e.fb.is_some() { 1.0 } else { 0.0 },
+            e.fb.unwrap_or(0.0),
+            0.0,
+        ]);
         // group by quantised range (rounded outwards: the shader does the exact test)
-        let gk = (class_of(e.fb.unwrap_or(e.lo)), (class_of(e.hi) + 1).min(BOUNDS.len() as u8 - 1));
+        let gk = (
+            class_of(e.fb.unwrap_or(e.lo)),
+            (class_of(e.hi) + 1).min(BOUNDS.len() as u8 - 1),
+        );
         let gi = *group_of.entry(gk).or_insert_with(|| {
-            groups.push(Group { lo: BOUNDS[gk.0 as usize], hi: BOUNDS[gk.1 as usize], bb: [[f32::MAX; 3], [f32::MIN; 3]] });
+            groups.push(Group {
+                lo: BOUNDS[gk.0 as usize],
+                hi: BOUNDS[gk.1 as usize],
+                bb: [[f32::MAX; 3], [f32::MIN; 3]],
+            });
             groups.len() - 1
         });
         let rot = Mat4::from_rotation_y(e.yaw);
@@ -370,7 +420,15 @@ pub fn build(key: CellKey, ents: &[CellEnt], max_layers: u32, load: &mut dyn FnM
                     g.bb[1][a] = g.bb[1][a].max(w[a]);
                 }
                 let s = |c: f32| (c.clamp(-1.0, 1.0) * 127.0).round() as i8;
-                mv.push(CellV { pos: p.into(), uv: [f16(v.uv0[0]), f16(v.uv0[1])], nrm: [s(n.x), s(n.y), s(n.z), (amode | (cls << 2)) as i8], base: bf, tint: v.tint, layer, ent });
+                mv.push(CellV {
+                    pos: p.into(),
+                    uv: [f16(v.uv0[0]), f16(v.uv0[1])],
+                    nrm: [s(n.x), s(n.y), s(n.z), (amode | (cls << 2)) as i8],
+                    base: bf,
+                    tint: v.tint,
+                    layer,
+                    ent,
+                });
             }
             let mut mi = me.indices.clone();
             simplify(&mut mv, &mut mi, e.grid);
@@ -390,21 +448,39 @@ pub fn build(key: CellKey, ents: &[CellEnt], max_layers: u32, load: &mut dyn FnM
         let first = indices.len() as u32;
         verts.extend(v);
         indices.extend(ix.into_iter().map(|i| i + vb));
-        batches.push(Batch { group: k.0, chunk: k.1, pass: k.2, first, count: indices.len() as u32 - first });
+        batches.push(Batch {
+            group: k.0,
+            chunk: k.1,
+            pass: k.2,
+            first,
+            count: indices.len() as u32 - first,
+        });
     }
     let chunks = chunks
         .into_iter()
         .map(|layers| {
-            let mut data = Vec::with_capacity(layers.len() * (0..LAYER_MIPS).map(mip_bytes).sum::<usize>());
+            let mut data =
+                Vec::with_capacity(layers.len() * (0..LAYER_MIPS).map(mip_bytes).sum::<usize>());
             for l in 0..LAYER_MIPS as usize {
                 for ly in &layers {
                     data.extend_from_slice(&ly[l]);
                 }
             }
-            Chunk { layers: layers.len() as u32, data }
+            Chunk {
+                layers: layers.len() as u32,
+                data,
+            }
         })
         .collect();
-    CellCpu { origin: origin.into(), groups, batches, chunks, verts, indices, ents: table }
+    CellCpu {
+        origin: origin.into(),
+        groups,
+        batches,
+        chunks,
+        verts,
+        indices,
+        ents: table,
+    }
 }
 
 const MAGIC: &[u8; 4] = b"SXC3";
@@ -412,14 +488,23 @@ const MAGIC: &[u8; 4] = b"SXC3";
 pub fn write(path: &Path, c: &CellCpu) -> std::io::Result<u64> {
     let mut b: Vec<u8> = Vec::with_capacity(c.bytes() + 1024);
     b.extend_from_slice(MAGIC);
-    for v in [c.groups.len(), c.batches.len(), c.chunks.len(), c.verts.len(), c.indices.len(), c.ents.len()] {
+    for v in [
+        c.groups.len(),
+        c.batches.len(),
+        c.chunks.len(),
+        c.verts.len(),
+        c.indices.len(),
+        c.ents.len(),
+    ] {
         b.extend_from_slice(&(v as u32).to_le_bytes());
     }
     for f in c.origin {
         b.extend_from_slice(&f.to_le_bytes());
     }
     for g in &c.groups {
-        for f in [g.lo, g.hi, g.bb[0][0], g.bb[0][1], g.bb[0][2], g.bb[1][0], g.bb[1][1], g.bb[1][2]] {
+        for f in [
+            g.lo, g.hi, g.bb[0][0], g.bb[0][1], g.bb[0][2], g.bb[1][0], g.bb[1][1], g.bb[1][2],
+        ] {
             b.extend_from_slice(&f.to_le_bytes());
         }
     }
@@ -466,19 +551,40 @@ pub fn read(path: &Path) -> Option<CellCpu> {
         *o += 4;
         Some(v)
     };
-    let (ng, nb, nc, nv, ni, ne) = (u(&mut o)? as usize, u(&mut o)? as usize, u(&mut o)? as usize, u(&mut o)? as usize, u(&mut o)? as usize, u(&mut o)? as usize);
+    let (ng, nb, nc, nv, ni, ne) = (
+        u(&mut o)? as usize,
+        u(&mut o)? as usize,
+        u(&mut o)? as usize,
+        u(&mut o)? as usize,
+        u(&mut o)? as usize,
+        u(&mut o)? as usize,
+    );
     let origin = [f(&mut o)?, f(&mut o)?, f(&mut o)?];
     let mut groups = Vec::with_capacity(ng);
     for _ in 0..ng {
         let v: Vec<f32> = (0..8).map(|_| f(&mut o)).collect::<Option<_>>()?;
-        groups.push(Group { lo: v[0], hi: v[1], bb: [[v[2], v[3], v[4]], [v[5], v[6], v[7]]] });
+        groups.push(Group {
+            lo: v[0],
+            hi: v[1],
+            bb: [[v[2], v[3], v[4]], [v[5], v[6], v[7]]],
+        });
     }
     let mut batches = Vec::with_capacity(nb);
     for _ in 0..nb {
         let gc = b.get(o..o + 8)?;
-        let (group, chunk, pass) = (u16::from_le_bytes([gc[0], gc[1]]), u16::from_le_bytes([gc[2], gc[3]]), gc[4]);
+        let (group, chunk, pass) = (
+            u16::from_le_bytes([gc[0], gc[1]]),
+            u16::from_le_bytes([gc[2], gc[3]]),
+            gc[4],
+        );
         o += 8;
-        batches.push(Batch { group, chunk, pass, first: u(&mut o)?, count: u(&mut o)? });
+        batches.push(Batch {
+            group,
+            chunk,
+            pass,
+            first: u(&mut o)?,
+            count: u(&mut o)?,
+        });
     }
     let mut sizes = Vec::with_capacity(nc);
     for _ in 0..nc {
@@ -493,10 +599,21 @@ pub fn read(path: &Path) -> Option<CellCpu> {
     o += ne * 32;
     let mut chunks = Vec::with_capacity(nc);
     for (layers, len) in sizes {
-        chunks.push(Chunk { layers, data: b.get(o..o + len)?.to_vec() });
+        chunks.push(Chunk {
+            layers,
+            data: b.get(o..o + len)?.to_vec(),
+        });
         o += len;
     }
-    Some(CellCpu { origin, groups, batches, chunks, verts, indices, ents })
+    Some(CellCpu {
+        origin,
+        groups,
+        batches,
+        chunks,
+        verts,
+        indices,
+        ents,
+    })
 }
 
 #[cfg(test)]
@@ -510,18 +627,83 @@ mod tests {
         assert_eq!(class_of(5.0e9), 19);
         let k = CellKey::of(0, crate::mapbake::X0 + 130.0, crate::mapbake::Y1 - 10.0);
         assert_eq!((k.cx, k.cy), (1, 0));
-        assert_eq!(k.dist(crate::mapbake::X0 + 200.0, crate::mapbake::Y1 - 50.0), 0.0);
+        assert_eq!(
+            k.dist(crate::mapbake::X0 + 200.0, crate::mapbake::Y1 - 50.0),
+            0.0
+        );
         assert!((0..LAYER_MIPS).map(mip_bytes).sum::<usize>() == 5488);
     }
 
     #[test]
     fn write_read_round_trip() {
-        let img = glb::Image { key: "a".into(), mips: vec![(8, 8, vec![200; 256])], srgb: true, bc: None };
-        let mesh = glb::Mesh { name: String::new(), verts: vec![glb::Vertex { pos: [0.0, 0.0, 0.0], nrm: [0.0, 1.0, 0.0], tan: [0.0; 4], uv0: [0.0; 2], uv1: [0.0; 2], col: [255; 4], joints: [0; 4], weights: [0; 4], tint: [255; 4] }; 3], indices: vec![0, 1, 2], material: Some(0), skinned: false, has_tangents: false, uv_sets: 1, centre: [0.0; 3] };
-        let mat = glb::Material { name: String::new(), class: "opaque".into(), alpha_mode: "OPAQUE".into(), base_factor: [1.0; 4], base: Some(0), normal: None, packed: None, emissive: None, slots: vec![], gap: "ok".into(), shader_hash: String::new(), decal: None };
-        let model = Arc::new(glb::Model { path: Default::default(), meshes: vec![mesh], materials: vec![mat], joints: vec![], images: vec![img], bbox: [[0.0; 3]; 2], triangles: 1, vertices: 3, extras: serde_json::Value::Null });
+        let img = glb::Image {
+            key: "a".into(),
+            mips: vec![(8, 8, vec![200; 256])],
+            srgb: true,
+            bc: None,
+        };
+        let mesh = glb::Mesh {
+            name: String::new(),
+            verts: vec![
+                glb::Vertex {
+                    pos: [0.0, 0.0, 0.0],
+                    nrm: [0.0, 1.0, 0.0],
+                    tan: [0.0; 4],
+                    uv0: [0.0; 2],
+                    uv1: [0.0; 2],
+                    col: [255; 4],
+                    joints: [0; 4],
+                    weights: [0; 4],
+                    tint: [255; 4]
+                };
+                3
+            ],
+            indices: vec![0, 1, 2],
+            material: Some(0),
+            skinned: false,
+            has_tangents: false,
+            uv_sets: 1,
+            centre: [0.0; 3],
+        };
+        let mat = glb::Material {
+            name: String::new(),
+            class: "opaque".into(),
+            alpha_mode: "OPAQUE".into(),
+            base_factor: [1.0; 4],
+            base: Some(0),
+            normal: None,
+            packed: None,
+            emissive: None,
+            slots: vec![],
+            gap: "ok".into(),
+            shader_hash: String::new(),
+            decal: None,
+        };
+        let model = Arc::new(glb::Model {
+            path: Default::default(),
+            meshes: vec![mesh],
+            materials: vec![mat],
+            joints: vec![],
+            images: vec![img],
+            bbox: [[0.0; 3]; 2],
+            triangles: 1,
+            vertices: 3,
+            extras: serde_json::Value::Null,
+        });
         let p = [crate::mapbake::X0 + 10.0, crate::mapbake::Y1 - 10.0, 5.0];
-        let ents = vec![CellEnt { model: "m".into(), pos: p, yaw: 0.5, ctr: p, lo: 0.0, hi: 300.0, grid: 0.0, fb: None }; 2];
+        let ents = vec![
+            CellEnt {
+                model: "m".into(),
+                pos: p,
+                yaw: 0.5,
+                ctr: p,
+                lo: 0.0,
+                hi: 300.0,
+                grid: 0.0,
+                fb: None
+            };
+            2
+        ];
         let key = CellKey::of(0, ents[0].pos[0], ents[0].pos[1]);
         let c = build(key, &ents, 256, &mut |_, _| Some(model.clone()));
         assert_eq!(c.verts.len(), 6);
@@ -544,7 +726,15 @@ mod tests {
 
     #[test]
     fn simplify_merges_close_vertices() {
-        let v = |x: f32| CellV { pos: [x, 0.0, (x * 7.0).fract()], uv: [0; 2], nrm: [0, 127, 0, 4], base: [255; 4], tint: [255; 4], layer: 0, ent: 0 };
+        let v = |x: f32| CellV {
+            pos: [x, 0.0, (x * 7.0).fract()],
+            uv: [0; 2],
+            nrm: [0, 127, 0, 4],
+            base: [255; 4],
+            tint: [255; 4],
+            layer: 0,
+            ent: 0,
+        };
         // a strip of 200 thin triangles 1 cm apart
         let mut verts: Vec<CellV> = (0..202).map(|i| v(i as f32 * 0.01)).collect();
         let mut idx: Vec<u32> = (0..200).flat_map(|i| [i, i + 1, i + 2]).collect();

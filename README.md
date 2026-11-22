@@ -74,10 +74,13 @@ cargo build --release
 This produces `target\release\sixng.exe` (CLI) and
 `target\release\sixng-gui.exe` (GUI).
 
-**macOS** (Apple Silicon, tested on macOS with Rust 1.100): the same
+**macOS** (minimum macOS 27.0; Apple Silicon, tested on macOS with Rust 1.100): the same
 `cargo build --release` works once CMake is installed (`brew install cmake`).
-It produces `target/release/sixng` and `target/release/sixng-gui`; the GUI
-renders through Metal. `scripts/macos-app.sh` builds `dist/SixNG.app` (GUI and CLI, ad-hoc
+It produces `target/release/sixng` and `target/release/sixng-gui`; launching the
+GUI without arguments opens the native Metal 4 window directly. WGPU 30 remains
+available as an explicit legacy path. Some GPU-dependent views are not yet
+ported to Metal 4. `scripts/macos-app.sh` builds
+`dist/SixNG.app` (GUI and CLI, ad-hoc
 signed, not notarised); `scripts/macos-app.sh --universal` makes it run on
 both Apple Silicon and Intel Macs (needs `rustup target add
 aarch64-apple-darwin x86_64-apple-darwin`). The app keeps its settings and default work folder
@@ -825,6 +828,24 @@ crates/sixng-gui    `sixng-gui` binary (eframe/egui)
 docs/images/        README screenshots
 work/               indexes and output (git-ignored)
 ```
+
+## Metal 4 rendering
+
+On macOS, a no-argument GUI launch uses a native `CAMetalLayer`, `MTL4CommandQueue`,
+and MTL4 renderer for the application window and egui UI. WGPU 30 is retained
+for compatibility and command-line automation; launching with `--legacy-wgpu`
+selects the old eframe/WGPU window.
+
+```sh
+cargo run -p sixng-gui
+cargo run -p sixng-gui -- --legacy-wgpu
+cargo run -p sixng-gui -- --metal4-window
+```
+
+The 3D map renderer uses MTL4 for streamed models, far-field terrain, and
+road/light overlays. WGPU-specific viewer features and screenshot capture are
+not yet at full parity on the MTL4 path. The local `metal-rust` fork and its
+Apache-2.0 licences are under `vendor/`.
 
 ## Licence
 

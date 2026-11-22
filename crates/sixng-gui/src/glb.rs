@@ -131,7 +131,9 @@ impl<'a> Doc<'a> {
     /// Raw elements of an accessor as f32 (normalised for u8/u16).
     fn floats(&self, acc: usize) -> Result<(Vec<f32>, usize)> {
         let a = &self.j["accessors"][acc];
-        let n = a["count"].as_u64().ok_or_else(|| anyhow!("accessor count"))? as usize;
+        let n = a["count"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("accessor count"))? as usize;
         let comps = match a["type"].as_str().unwrap_or("") {
             "SCALAR" => 1,
             "VEC2" => 2,
@@ -143,14 +145,18 @@ impl<'a> Doc<'a> {
         let ct = a["componentType"].as_u64().unwrap_or(0);
         let norm = a["normalized"].as_bool().unwrap_or(false);
         let bv = &self.j["bufferViews"][a["bufferView"].as_u64().unwrap_or(0) as usize];
-        let off = bv["byteOffset"].as_u64().unwrap_or(0) as usize + a["byteOffset"].as_u64().unwrap_or(0) as usize;
+        let off = bv["byteOffset"].as_u64().unwrap_or(0) as usize
+            + a["byteOffset"].as_u64().unwrap_or(0) as usize;
         let csz = match ct {
             5126 | 5125 => 4,
             5123 | 5122 => 2,
             5121 | 5120 => 1,
             _ => return Err(anyhow!("component type {ct}")),
         };
-        let stride = bv["byteStride"].as_u64().map(|s| s as usize).unwrap_or(comps * csz);
+        let stride = bv["byteStride"]
+            .as_u64()
+            .map(|s| s as usize)
+            .unwrap_or(comps * csz);
         let mut out = Vec::with_capacity(n * comps);
         for i in 0..n {
             for c in 0..comps {
@@ -186,11 +192,17 @@ impl<'a> Doc<'a> {
         let n = a["count"].as_u64().unwrap_or(0) as usize;
         let ct = a["componentType"].as_u64().unwrap_or(0);
         let bv = &self.j["bufferViews"][a["bufferView"].as_u64().unwrap_or(0) as usize];
-        let off = bv["byteOffset"].as_u64().unwrap_or(0) as usize + a["byteOffset"].as_u64().unwrap_or(0) as usize;
+        let off = bv["byteOffset"].as_u64().unwrap_or(0) as usize
+            + a["byteOffset"].as_u64().unwrap_or(0) as usize;
         Ok((0..n)
             .map(|i| match ct {
-                5125 => u32::from_le_bytes(self.bin[off + 4 * i..off + 4 * i + 4].try_into().unwrap()),
-                5123 => u16::from_le_bytes(self.bin[off + 2 * i..off + 2 * i + 2].try_into().unwrap()) as u32,
+                5125 => {
+                    u32::from_le_bytes(self.bin[off + 4 * i..off + 4 * i + 4].try_into().unwrap())
+                }
+                5123 => {
+                    u16::from_le_bytes(self.bin[off + 2 * i..off + 2 * i + 2].try_into().unwrap())
+                        as u32
+                }
                 _ => self.bin[off + i] as u32,
             })
             .collect())
@@ -199,20 +211,33 @@ impl<'a> Doc<'a> {
     fn joints4(&self, acc: usize) -> Result<Vec<[u16; 4]>> {
         let a = &self.j["accessors"][acc];
         if a["componentType"].as_u64() != Some(5123) {
-            return Ok(self.u8x4(acc)?.into_iter().map(|c| c.map(|x| x as u16)).collect());
+            return Ok(self
+                .u8x4(acc)?
+                .into_iter()
+                .map(|c| c.map(|x| x as u16))
+                .collect());
         }
         let n = a["count"].as_u64().unwrap_or(0) as usize;
         let bv = &self.j["bufferViews"][a["bufferView"].as_u64().unwrap_or(0) as usize];
-        let off = bv["byteOffset"].as_u64().unwrap_or(0) as usize + a["byteOffset"].as_u64().unwrap_or(0) as usize;
+        let off = bv["byteOffset"].as_u64().unwrap_or(0) as usize
+            + a["byteOffset"].as_u64().unwrap_or(0) as usize;
         let r = |o: usize| u16::from_le_bytes([self.bin[o], self.bin[o + 1]]);
-        Ok((0..n).map(|i| { let o = off + 8 * i; [r(o), r(o + 2), r(o + 4), r(o + 6)] }).collect())
+        Ok((0..n)
+            .map(|i| {
+                let o = off + 8 * i;
+                [r(o), r(o + 2), r(o + 4), r(o + 6)]
+            })
+            .collect())
     }
     fn u8x4(&self, acc: usize) -> Result<Vec<[u8; 4]>> {
         let a = &self.j["accessors"][acc];
         let n = a["count"].as_u64().unwrap_or(0) as usize;
         let bv = &self.j["bufferViews"][a["bufferView"].as_u64().unwrap_or(0) as usize];
-        let off = bv["byteOffset"].as_u64().unwrap_or(0) as usize + a["byteOffset"].as_u64().unwrap_or(0) as usize;
-        Ok((0..n).map(|i| self.bin[off + 4 * i..off + 4 * i + 4].try_into().unwrap()).collect())
+        let off = bv["byteOffset"].as_u64().unwrap_or(0) as usize
+            + a["byteOffset"].as_u64().unwrap_or(0) as usize;
+        Ok((0..n)
+            .map(|i| self.bin[off + 4 * i..off + 4 * i + 4].try_into().unwrap())
+            .collect())
     }
 }
 
@@ -265,7 +290,14 @@ fn slot_status(t: &Value) -> (String, u32) {
     let st = t["status"].as_str().unwrap_or("");
     let mip = t["mip_used"].as_u64().unwrap_or(0) as u32;
     if st.starts_with("ok") {
-        (if mip > 0 { "lowmip".into() } else { "ok".into() }, mip)
+        (
+            if mip > 0 {
+                "lowmip".into()
+            } else {
+                "ok".into()
+            },
+            mip,
+        )
     } else if st.contains("BCPack") {
         ("flat".into(), 0)
     } else if st.contains("not in any") {
@@ -288,7 +320,12 @@ fn half(pw: u32, ph: u32, p: &[u8]) -> (u32, u32, Vec<u8>) {
         for x in 0..nw {
             let (x0, x1) = ((x * 2).min(pw - 1) * 4, (x * 2 + 1).min(pw - 1) * 4);
             for c in 0..4 {
-                orow[x * 4 + c] = ((r0[x0 + c] as u32 + r0[x1 + c] as u32 + r1[x0 + c] as u32 + r1[x1 + c] as u32 + 2) >> 2) as u8;
+                orow[x * 4 + c] = ((r0[x0 + c] as u32
+                    + r0[x1 + c] as u32
+                    + r1[x0 + c] as u32
+                    + r1[x1 + c] as u32
+                    + 2)
+                    >> 2) as u8;
             }
         }
     }
@@ -317,7 +354,8 @@ pub static LOWTEX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 pub const LOWTEX_CAP: u64 = 4 << 30;
 /// Texture loader counters: reduced-copy hits, full decodes, full-decode µs, full-decode megapixels.
 /// [4]: µs in the whole image step (reads, reductions, mip chains, cache writes).
-pub static TEX_T: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+pub static TEX_T: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// Smaller reduced copies (<= TINY_TEX px) for the first, distant loads of
 /// the 3D map, in `<cache>/lowtex128`, with their own byte count and cap.
@@ -342,7 +380,8 @@ fn read_bc(sp: &Path) -> Option<(Vec<(u32, u32, Vec<u8>)>, crate::bc::Bc)> {
     let alpha = b[4] != 0;
     let n = b[5] as usize;
     let (mut o, mut dims, mut levels) = (6usize, Vec::with_capacity(n), Vec::with_capacity(n));
-    let u = |o: usize| -> Option<u32> { Some(u32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?)) };
+    let u =
+        |o: usize| -> Option<u32> { Some(u32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?)) };
     for _ in 0..n {
         let (w, h, len) = (u(o)?, u(o + 4)?, u(o + 8)? as usize);
         o += 12;
@@ -392,7 +431,16 @@ fn reduce_to(mut img: (u32, u32, Vec<u8>), size: u32) -> (u32, u32, Vec<u8>) {
 fn write_small(sp: &Path, img: &(u32, u32, Vec<u8>), counter: &std::sync::atomic::AtomicU64) {
     let _ = std::fs::create_dir_all(sp.parent().unwrap());
     let tmp = sp.with_extension("tmp");
-    if image::save_buffer_with_format(&tmp, &img.2, img.0, img.1, image::ExtendedColorType::Rgba8, image::ImageFormat::Png).is_ok() {
+    if image::save_buffer_with_format(
+        &tmp,
+        &img.2,
+        img.0,
+        img.1,
+        image::ExtendedColorType::Rgba8,
+        image::ImageFormat::Png,
+    )
+    .is_ok()
+    {
         let n = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
         counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
         let _ = std::fs::rename(&tmp, sp);
@@ -450,18 +498,33 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
         if opts.no_textures {
             return None;
         }
-        if opts.skip_keys.as_ref().is_some_and(|s| s.lock().unwrap().contains(&key)) {
-            images.push(Image { key: key.clone(), mips: Vec::new(), srgb, bc: None });
+        if opts
+            .skip_keys
+            .as_ref()
+            .is_some_and(|s| s.lock().unwrap().contains(&key))
+        {
+            images.push(Image {
+                key: key.clone(),
+                mips: Vec::new(),
+                srgb,
+                bc: None,
+            });
             img_by_key.insert(key, images.len() - 1);
             return Some(images.len() - 1);
         }
         use std::sync::atomic::Ordering::Relaxed;
         let t_img = std::time::Instant::now();
-        let spbc = (opts.bc && opts.small_cache && opts.max_tex == BC_TEX).then(|| small_path_in(out_root, "bc64", &p).with_extension("bc"));
+        let spbc = (opts.bc && opts.small_cache && opts.max_tex == BC_TEX)
+            .then(|| small_path_in(out_root, "bc64", &p).with_extension("bc"));
         if let Some((mips, bc)) = spbc.as_ref().and_then(|sp| read_bc(sp)) {
             TEX_T[0].fetch_add(1, Relaxed);
             TEX_T[4].fetch_add(t_img.elapsed().as_micros() as u64, Relaxed);
-            images.push(Image { key: key.clone(), mips, srgb, bc: Some(bc) });
+            images.push(Image {
+                key: key.clone(),
+                mips,
+                srgb,
+                bc: Some(bc),
+            });
             img_by_key.insert(key, images.len() - 1);
             return Some(images.len() - 1);
         }
@@ -512,7 +575,12 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             cur = reduce_to(cur, opts.max_tex);
         }
         let mips = mip_chain(cur.0, cur.1, cur.2);
-        let mut im = Image { key: key.clone(), mips, srgb, bc: None };
+        let mut im = Image {
+            key: key.clone(),
+            mips,
+            srgb,
+            bc: None,
+        };
         if opts.bc {
             im.compress();
             if let (Some(sp), Some(bc)) = (spbc.as_ref(), im.bc.as_ref()) {
@@ -536,23 +604,42 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
     let mut materials = Vec::new();
     for m in d.j["materials"].as_array().cloned().unwrap_or_default() {
         let ex = &m["extras"];
-        let class = ex["classification"]["class"].as_str().unwrap_or("opaque").to_string();
+        let class = ex["classification"]["class"]
+            .as_str()
+            .unwrap_or("opaque")
+            .to_string();
         let alpha_mode = m["alphaMode"].as_str().unwrap_or("OPAQUE").to_string();
-        let base_factor: [f32; 4] = serde_json::from_value(m["pbrMetallicRoughness"]["baseColorFactor"].clone()).unwrap_or([1.0; 4]);
+        let base_factor: [f32; 4] =
+            serde_json::from_value(m["pbrMetallicRoughness"]["baseColorFactor"].clone())
+                .unwrap_or([1.0; 4]);
         // Tiny (<= 8 px) textures are engine defaults/placeholders (e.g. a 4x4
         // all-zero "packed data" map). Read as data they mean AO 0 (black walls)
         // or a flat-black normal, so the packed and normal slots ignore them.
         let tex_list = ex["textures"].as_array().cloned().unwrap_or_default();
         let tiny_png = |t: &Value| -> Option<String> {
             let (w, h) = (t["width"].as_u64()?, t["height"].as_u64()?);
-            (w <= 8 && h <= 8).then(|| t["png"].as_str().map(|s| s.rsplit('/').next().unwrap_or(s).to_string())).flatten()
+            (w <= 8 && h <= 8)
+                .then(|| {
+                    t["png"]
+                        .as_str()
+                        .map(|s| s.rsplit('/').next().unwrap_or(s).to_string())
+                })
+                .flatten()
         };
-        let tiny: std::collections::HashSet<String> = tex_list.iter().filter_map(|t| tiny_png(t)).collect();
-        let is_tiny = |p: &Path| p.file_name().map_or(false, |f| tiny.contains(&f.to_string_lossy().to_string()));
+        let tiny: std::collections::HashSet<String> =
+            tex_list.iter().filter_map(|t| tiny_png(t)).collect();
+        let is_tiny = |p: &Path| {
+            p.file_name()
+                .map_or(false, |f| tiny.contains(&f.to_string_lossy().to_string()))
+        };
         let with_png: Vec<&Value> = tex_list.iter().filter(|t| t["png"].is_string()).collect();
-        let placeholder_only = !with_png.is_empty() && with_png.iter().all(|t| tiny_png(t).is_some());
-        let base = uri_of(&m["pbrMetallicRoughness"]["baseColorTexture"]).and_then(|p| add_img(p, true, &mut images));
-        let normal = uri_of(&m["normalTexture"]).filter(|p| !opts.base_only && !is_tiny(p)).and_then(|p| add_img(p, false, &mut images));
+        let placeholder_only =
+            !with_png.is_empty() && with_png.iter().all(|t| tiny_png(t).is_some());
+        let base = uri_of(&m["pbrMetallicRoughness"]["baseColorTexture"])
+            .and_then(|p| add_img(p, true, &mut images));
+        let normal = uri_of(&m["normalTexture"])
+            .filter(|p| !opts.base_only && !is_tiny(p))
+            .and_then(|p| add_img(p, false, &mut images));
         let mut slots = Vec::new();
         let mut packed = None;
         let mut emissive = None;
@@ -560,12 +647,16 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             let role = slot_role(&t);
             let (status, mip) = slot_status(&t);
             let png = t["png"].as_str().map(|s| s.to_string());
-            if role == "packed_rma" && packed.is_none() && !opts.base_only && tiny_png(&t).is_none() {
+            if role == "packed_rma" && packed.is_none() && !opts.base_only && tiny_png(&t).is_none()
+            {
                 if let Some(p) = &png {
                     packed = add_img(out_root.join(p), false, &mut images);
                 }
             }
-            if class == "emissive" && emissive.is_none() && (role == "colour" || role == "base_colour") {
+            if class == "emissive"
+                && emissive.is_none()
+                && (role == "colour" || role == "base_colour")
+            {
                 if let Some(p) = &png {
                     emissive = add_img(out_root.join(p), true, &mut images);
                 }
@@ -577,7 +668,10 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                 png,
                 status,
                 mip,
-                size: [t["width"].as_u64().unwrap_or(0) as u32, t["height"].as_u64().unwrap_or(0) as u32],
+                size: [
+                    t["width"].as_u64().unwrap_or(0) as u32,
+                    t["height"].as_u64().unwrap_or(0) as u32,
+                ],
                 format: t["format"].as_str().unwrap_or("").into(),
             });
         }
@@ -590,16 +684,25 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
         };
         let decal = if ex["classification"]["render_bucket"].as_str() == Some("decal") {
             // exports before 2026-11-20 lack the decal block: same rule by class
-            Some(ex["classification"]["decal"]["order"].as_u64().unwrap_or(if class == "terrain_multilayer" { 0 } else { 1 }).min(7) as u8)
+            Some(
+                ex["classification"]["decal"]["order"]
+                    .as_u64()
+                    .unwrap_or(if class == "terrain_multilayer" { 0 } else { 1 })
+                    .min(7) as u8,
+            )
         } else {
             None
         };
-        let (alpha_mode, base_factor) = if opts.hide_placeholders && placeholder_only && class == "opaque" {
-            // cutout with alpha 0: discarded by the shader
-            ("MASK".to_string(), [base_factor[0], base_factor[1], base_factor[2], 0.0])
-        } else {
-            (alpha_mode, base_factor)
-        };
+        let (alpha_mode, base_factor) =
+            if opts.hide_placeholders && placeholder_only && class == "opaque" {
+                // cutout with alpha 0: discarded by the shader
+                (
+                    "MASK".to_string(),
+                    [base_factor[0], base_factor[1], base_factor[2], 0.0],
+                )
+            } else {
+                (alpha_mode, base_factor)
+            };
         materials.push(Material {
             name: m["name"].as_str().unwrap_or("").into(),
             class,
@@ -618,10 +721,27 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
     // skeleton
     let mut joints = Vec::new();
     if let Some(skin) = d.j["skins"].get(0) {
-        let jn: Vec<usize> = skin["joints"].as_array().map(|a| a.iter().filter_map(|x| x.as_u64().map(|v| v as usize)).collect()).unwrap_or_default();
-        let ibm = skin["inverseBindMatrices"].as_u64().and_then(|a| d.floats(a as usize).ok()).map(|x| x.0).unwrap_or_default();
+        let jn: Vec<usize> = skin["joints"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64().map(|v| v as usize))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let ibm = skin["inverseBindMatrices"]
+            .as_u64()
+            .and_then(|a| d.floats(a as usize).ok())
+            .map(|x| x.0)
+            .unwrap_or_default();
         let mut parent_of: HashMap<usize, usize> = HashMap::new();
-        for (i, n) in d.j["nodes"].as_array().cloned().unwrap_or_default().iter().enumerate() {
+        for (i, n) in d.j["nodes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+        {
             for c in n["children"].as_array().cloned().unwrap_or_default() {
                 if let Some(c) = c.as_u64() {
                     parent_of.insert(c as usize, i);
@@ -631,14 +751,23 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
         let pos_of: HashMap<usize, usize> = jn.iter().enumerate().map(|(k, &n)| (n, k)).collect();
         for (k, &n) in jn.iter().enumerate() {
             let nd = &d.j["nodes"][n];
-            let local: [f32; 16] = serde_json::from_value(nd["matrix"].clone()).unwrap_or([1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.]);
+            let local: [f32; 16] = serde_json::from_value(nd["matrix"].clone()).unwrap_or([
+                1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+            ]);
             let mut ib = [0f32; 16];
             if ibm.len() >= (k + 1) * 16 {
                 ib.copy_from_slice(&ibm[k * 16..k * 16 + 16]);
             } else {
-                ib = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
+                ib = [
+                    1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+                ];
             }
-            joints.push(Joint { name: nd["name"].as_str().unwrap_or("").into(), parent: parent_of.get(&n).and_then(|p| pos_of.get(p).copied()), local, ibm: ib });
+            joints.push(Joint {
+                name: nd["name"].as_str().unwrap_or("").into(),
+                parent: parent_of.get(&n).and_then(|p| pos_of.get(p).copied()),
+                local,
+                ibm: ib,
+            });
         }
     }
     // meshes
@@ -647,14 +776,28 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
     let mut hi = [f32::MIN; 3];
     let mut tris = 0;
     let mut nverts = 0;
-    for (mi, mesh) in d.j["meshes"].as_array().cloned().unwrap_or_default().iter().enumerate() {
-        let skinned = d.j["nodes"].as_array().map(|ns| ns.iter().any(|n| n["mesh"].as_u64() == Some(mi as u64) && n.get("skin").is_some())).unwrap_or(false);
+    for (mi, mesh) in d.j["meshes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        let skinned = d.j["nodes"]
+            .as_array()
+            .map(|ns| {
+                ns.iter()
+                    .any(|n| n["mesh"].as_u64() == Some(mi as u64) && n.get("skin").is_some())
+            })
+            .unwrap_or(false);
         for p in mesh["primitives"].as_array().cloned().unwrap_or_default() {
             if p["mode"].as_u64().unwrap_or(4) != 4 {
                 continue;
             }
             let at = &p["attributes"];
-            let Some(pa) = at["POSITION"].as_u64() else { continue };
+            let Some(pa) = at["POSITION"].as_u64() else {
+                continue;
+            };
             let (pos, _) = d.floats(pa as usize)?;
             let n = pos.len() / 3;
             let mut v = vec![Vertex::default(); n];
@@ -695,8 +838,19 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                     }
                 }
             }
-            if at.as_object().map(|o| o.keys().any(|k| k == "TEXCOORD_2")).unwrap_or(false) {
-                uv_sets += at.as_object().unwrap().keys().filter(|k| k.starts_with("TEXCOORD_") && *k != "TEXCOORD_0" && *k != "TEXCOORD_1").count();
+            if at
+                .as_object()
+                .map(|o| o.keys().any(|k| k == "TEXCOORD_2"))
+                .unwrap_or(false)
+            {
+                uv_sets += at
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .filter(|k| {
+                        k.starts_with("TEXCOORD_") && *k != "TEXCOORD_0" && *k != "TEXCOORD_1"
+                    })
+                    .count();
             }
             if let Some(a) = at["_COLOR0"].as_u64() {
                 let c = d.u8x4(a as usize)?;
@@ -710,7 +864,9 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                     v[i].tint = c[i];
                 }
             }
-            if let (true, Some(a), Some(w)) = (skinned, at["JOINTS_0"].as_u64(), at["WEIGHTS_0"].as_u64()) {
+            if let (true, Some(a), Some(w)) =
+                (skinned, at["JOINTS_0"].as_u64(), at["WEIGHTS_0"].as_u64())
+            {
                 let js = d.joints4(a as usize)?;
                 let ws = d.u8x4(w as usize)?;
                 for i in 0..n.min(js.len()) {
@@ -732,7 +888,11 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                     let (pa, pb, pc) = (v[a].pos, v[b].pos, v[c].pos);
                     let e1 = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
                     let e2 = [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]];
-                    let fnrm = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+                    let fnrm = [
+                        e1[1] * e2[2] - e1[2] * e2[1],
+                        e1[2] * e2[0] - e1[0] * e2[2],
+                        e1[0] * e2[1] - e1[1] * e2[0],
+                    ];
                     for i in [a, b, c] {
                         for k in 0..3 {
                             acc[i][k] += fnrm[k];
@@ -741,7 +901,11 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                 }
                 for (x, s) in v.iter_mut().zip(acc) {
                     let l = (s[0] * s[0] + s[1] * s[1] + s[2] * s[2]).sqrt();
-                    x.nrm = if l > 0.0 { [s[0] / l, s[1] / l, s[2] / l] } else { [0.0, 1.0, 0.0] };
+                    x.nrm = if l > 0.0 {
+                        [s[0] / l, s[1] / l, s[2] / l]
+                    } else {
+                        [0.0, 1.0, 0.0]
+                    };
                 }
             }
             tris += indices.len() / 3;
@@ -822,16 +986,27 @@ mod bench {
     #[test]
     #[ignore]
     fn bench_first_tex() {
-        let Some(work) = std::env::var_os("SIXNG_WORK") else { return };
+        let Some(work) = std::env::var_os("SIXNG_WORK") else {
+            return;
+        };
         let root = Path::new(&work).join(crate::GUI_CACHE);
-        let take = |d: &str| -> Vec<PathBuf> { std::fs::read_dir(root.join(d)).map(|r| r.filter_map(|e| Some(e.ok()?.path())).take(2000).collect()).unwrap_or_default() };
+        let take = |d: &str| -> Vec<PathBuf> {
+            std::fs::read_dir(root.join(d))
+                .map(|r| r.filter_map(|e| Some(e.ok()?.path())).take(2000).collect())
+                .unwrap_or_default()
+        };
         let t = std::time::Instant::now();
         let pngs = take("lowtex128");
         let mut n = 0;
         for p in &pngs {
             if let Some(v) = load_png(p) {
                 let v = reduce_to(v, BC_TEX);
-                let mut im = Image { key: String::new(), mips: mip_chain(v.0, v.1, v.2), srgb: true, bc: None };
+                let mut im = Image {
+                    key: String::new(),
+                    mips: mip_chain(v.0, v.1, v.2),
+                    srgb: true,
+                    bc: None,
+                };
                 im.compress();
                 n += 1;
             }

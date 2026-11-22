@@ -4,12 +4,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["metal4-poc"]
+metal4-poc = ["dep:metal-rust", "dep:objc2"]
+
+[[example]]
+name = "metal4_window"
+path = "examples/metal4_window.rs"
+required-features = ["metal4-poc"]
+
 [dependencies]
 # live GPU object counts for the map stream log (checks that evicted models are freed)
-wgpu = { version = "24", default-features = false, features = ["counters"] }
+wgpu = { version = "30", default-features = false, features = ["counters"] }
 sixng-core = { path = "../sixng-core" }
 anyhow.workspace = true
-eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "x11", "wayland"] }
+eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "x11", "wayland"] }
+egui-winit = { version = "0.36.2", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
 winit = "0.30"
 glam = { version = "0.29", features = ["bytemuck"] }
 image.workspace = true
@@ -27,6 +37,8 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+metal-rust = { git = "https://github.com/maple-quartz18/Metal-Rust.git", rev = "618787057460de02dfe130f13d1c9aaa376aebd9", optional = true }
+objc2 = { version = "0.6.4", optional = true }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

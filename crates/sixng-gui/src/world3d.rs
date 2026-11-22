@@ -24,6 +24,8 @@
 use crate::glb;
 use crate::mapbake::{CELL, COARSE, H, W, X0, Y1};
 use crate::render3d::{Camera, GpuModel, Instance, Renderer3D};
+#[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+use crate::render3d_metal4::{GpuModel4, Renderer3D4};
 use eframe::egui_wgpu::{self, wgpu};
 use glam::{Mat4, Vec3, Vec4};
 use std::collections::{HashMap, HashSet};
@@ -55,7 +57,12 @@ pub struct Key {
 
 impl Key {
     fn node(l: u8, x: u32, y: u32) -> Key {
-        Key { l, x, y, ground: false }
+        Key {
+            l,
+            x,
+            y,
+            ground: false,
+        }
     }
     fn span(&self) -> f32 {
         ROOT / (1u32 << self.l) as f32
@@ -72,11 +79,40 @@ impl Key {
         self.span() / self.cells() as f32
     }
     fn cells(&self) -> usize {
-        if self.l <= DATA_LEVEL { N } else { N >> (self.l - DATA_LEVEL) }
+        if self.l <= DATA_LEVEL {
+            N
+        } else {
+            N >> (self.l - DATA_LEVEL)
+        }
     }
     fn children(&self) -> [Key; 4] {
         let (l, x, y) = (self.l + 1, self.x * 2, self.y * 2);
-        [Key { l, x, y, ground: self.ground }, Key { l, x: x + 1, y, ground: self.ground }, Key { l, x, y: y + 1, ground: self.ground }, Key { l, x: x + 1, y: y + 1, ground: self.ground }]
+        [
+            Key {
+                l,
+                x,
+                y,
+                ground: self.ground,
+            },
+            Key {
+                l,
+                x: x + 1,
+                y,
+                ground: self.ground,
+            },
+            Key {
+                l,
+                x,
+                y: y + 1,
+                ground: self.ground,
+            },
+            Key {
+                l,
+                x: x + 1,
+                y: y + 1,
+                ground: self.ground,
+            },
+        ]
     }
     fn with(&self, ground: bool) -> Key {
         Key { ground, ..*self }
@@ -89,7 +125,10 @@ impl Key {
             let sh = self.l - DATA_LEVEL;
             let n = 1u32 << sh;
             let f = 1.0 / n as f32;
-            ((DATA_LEVEL, self.x >> sh, self.y >> sh), [(self.x % n) as f32 * f, (self.y % n) as f32 * f, f])
+            (
+                (DATA_LEVEL, self.x >> sh, self.y >> sh),
+                [(self.x % n) as f32 * f, (self.y % n) as f32 * f, f],
+            )
         }
     }
 }
@@ -112,7 +151,8 @@ impl Level {
     }
     /// Clamped to the grid (for normals at edges).
     fn get_clamped(&self, c: i64, r: i64) -> f32 {
-        self.h[(r.clamp(0, self.ny as i64 - 1) as usize) * self.nx + c.clamp(0, self.nx as i64 - 1) as usize]
+        self.h[(r.clamp(0, self.ny as i64 - 1) as usize) * self.nx
+            + c.clamp(0, self.nx as i64 - 1) as usize]
     }
     fn down(&self, max: bool) -> Level {
         let (nx, ny) = (self.nx.div_ceil(2), self.ny.div_ceil(2));
@@ -164,7 +204,11 @@ pub struct Pyramids {
 impl Pyramids {
     pub fn build(h8: &[f32]) -> Pyramids {
         let (nx, ny) = (W / COARSE, H / COARSE);
-        let roof6 = Level { nx, ny, h: h8.to_vec() };
+        let roof6 = Level {
+            nx,
+            ny,
+            h: h8.to_vec(),
+        };
         // Opening (min then max over ~100 m) removes buildings and keeps
         // hills; a 3x3 mean smooths the steps. Water stays water.
         const R: usize = 6;
@@ -256,8 +300,17 @@ fn gl(p: [f32; 3]) -> [f32; 3] {
     [p[0], p[2], -p[1]]
 }
 
-fn node_model(py: &Pyramids, k: Key, tiles: &PathBuf, tex_keys: &Mutex<HashSet<String>>) -> glb::Model {
-    let lvl = if k.ground { &py.ground[k.l.min(DATA_LEVEL) as usize] } else { &py.roof[k.l.min(DATA_LEVEL) as usize] };
+fn node_model(
+    py: &Pyramids,
+    k: Key,
+    tiles: &PathBuf,
+    tex_keys: &Mutex<HashSet<String>>,
+) -> glb::Model {
+    let lvl = if k.ground {
+        &py.ground[k.l.min(DATA_LEVEL) as usize]
+    } else {
+        &py.roof[k.l.min(DATA_LEVEL) as usize]
+    };
     let n = k.cells();
     let cs = k.cell();
     let (c0, r0) = (k.x as i64 * n as i64, k.y as i64 * n as i64);
@@ -270,10 +323,18 @@ fn node_model(py: &Pyramids, k: Key, tiles: &PathBuf, tex_keys: &Mutex<HashSet<S
             let raw = lvl.get(c, r);
             inside.push(raw.is_finite() || raw.is_nan());
             // ground nodes are lifted by GROUND_LIFT when drawn; water stays under the sea plane
-            let z = if raw.is_finite() { raw - SINK } else { WATER_Z - SINK - if k.ground { GROUND_LIFT } else { 0.0 } };
+            let z = if raw.is_finite() {
+                raw - SINK
+            } else {
+                WATER_Z - SINK - if k.ground { GROUND_LIFT } else { 0.0 }
+            };
             let hz = |dc: i64, dr: i64| {
                 let v = lvl.get_clamped(c + dc, r + dr);
-                if v.is_finite() { v } else { WATER_Z }
+                if v.is_finite() {
+                    v
+                } else {
+                    WATER_Z
+                }
             };
             let zx = hz(1, 0) - hz(-1, 0);
             let zy = hz(0, -1) - hz(0, 1); // rows go south
@@ -282,7 +343,17 @@ fn node_model(py: &Pyramids, k: Key, tiles: &PathBuf, tex_keys: &Mutex<HashSet<S
             let y = Y1 - (r as f32 + 0.5) * cs;
             let u = u0 + (i as f32 + 0.5) / n as f32 * us;
             let v = v0 + (j as f32 + 0.5) / n as f32 * us;
-            verts.push(glb::Vertex { pos: gl([x, y, z]), nrm: gl([nr.x, nr.y, nr.z]), tan: [1.0, 0.0, 0.0, 1.0], uv0: [u, v], uv1: [0.0, 0.0], col: [255, 255, 255, 255], joints: [0; 4], weights: [0; 4], tint: [255; 4] });
+            verts.push(glb::Vertex {
+                pos: gl([x, y, z]),
+                nrm: gl([nr.x, nr.y, nr.z]),
+                tan: [1.0, 0.0, 0.0, 1.0],
+                uv0: [u, v],
+                uv1: [0.0, 0.0],
+                col: [255, 255, 255, 255],
+                joints: [0; 4],
+                weights: [0; 4],
+                tint: [255; 4],
+            });
         }
     }
     let w = n + 1;
@@ -322,9 +393,19 @@ fn node_model(py: &Pyramids, k: Key, tiles: &PathBuf, tex_keys: &Mutex<HashSet<S
         }
     };
     skirt((0..w).collect(), false, &mut verts, &mut idx);
-    skirt((0..w).map(|i| n * w + i).collect(), true, &mut verts, &mut idx);
+    skirt(
+        (0..w).map(|i| n * w + i).collect(),
+        true,
+        &mut verts,
+        &mut idx,
+    );
     skirt((0..w).map(|j| j * w).collect(), true, &mut verts, &mut idx);
-    skirt((0..w).map(|j| j * w + n).collect(), false, &mut verts, &mut idx);
+    skirt(
+        (0..w).map(|j| j * w + n).collect(),
+        false,
+        &mut verts,
+        &mut idx,
+    );
 
     // tile texture (shared by key; decoded only when not yet on the GPU)
     let key = format!("world/{tz}/{tx}_{ty}");
@@ -332,15 +413,29 @@ fn node_model(py: &Pyramids, k: Key, tiles: &PathBuf, tex_keys: &Mutex<HashSet<S
     let mut images = Vec::new();
     let mut base = None;
     if tex_keys.lock().unwrap().contains(&key) {
-        images.push(glb::Image { key: key.clone(), mips: Vec::new(), srgb: true, bc: None });
+        images.push(glb::Image {
+            key: key.clone(),
+            mips: Vec::new(),
+            srgb: true,
+            bc: None,
+        });
         base = Some(0);
     } else if let Ok(img) = image::open(&path) {
         let img = img.to_rgba8();
         let (iw, ih) = img.dimensions();
-        images.push(glb::Image { key: key.clone(), mips: glb::mip_chain(iw, ih, img.into_raw()), srgb: true, bc: None });
+        images.push(glb::Image {
+            key: key.clone(),
+            mips: glb::mip_chain(iw, ih, img.into_raw()),
+            srgb: true,
+            bc: None,
+        });
         base = Some(0);
     }
-    let base_factor = if base.is_some() { [1.0, 1.0, 1.0, 1.0] } else { SEA };
+    let base_factor = if base.is_some() {
+        [1.0, 1.0, 1.0, 1.0]
+    } else {
+        SEA
+    };
     let rect = k.rect();
     let centre = gl([(rect[0] + rect[2]) * 0.5, (rect[1] + rect[3]) * 0.5, 0.0]);
     // counter-clockwise seen from above: the coverage pass culls back faces
@@ -349,9 +444,41 @@ fn node_model(py: &Pyramids, k: Key, tiles: &PathBuf, tex_keys: &Mutex<HashSet<S
     }
     let tris = idx.len() / 3;
     let nv = verts.len();
-    let mesh = glb::Mesh { name: format!("world {}/{}/{}", k.l, k.x, k.y), verts, indices: idx, material: Some(0), skinned: false, has_tangents: false, uv_sets: 1, centre };
-    let mat = glb::Material { name: "world".into(), class: "map_tile".into(), alpha_mode: "OPAQUE".into(), base_factor, base, normal: None, packed: None, emissive: None, slots: vec![], gap: "ok".into(), shader_hash: String::new(), decal: None };
-    glb::Model { path: PathBuf::new(), meshes: vec![mesh], materials: vec![mat], joints: vec![], images, bbox: [[rect[0], -10.0, -rect[3]], [rect[2], 500.0, -rect[1]]], triangles: tris, vertices: nv, extras: Default::default() }
+    let mesh = glb::Mesh {
+        name: format!("world {}/{}/{}", k.l, k.x, k.y),
+        verts,
+        indices: idx,
+        material: Some(0),
+        skinned: false,
+        has_tangents: false,
+        uv_sets: 1,
+        centre,
+    };
+    let mat = glb::Material {
+        name: "world".into(),
+        class: "map_tile".into(),
+        alpha_mode: "OPAQUE".into(),
+        base_factor,
+        base,
+        normal: None,
+        packed: None,
+        emissive: None,
+        slots: vec![],
+        gap: "ok".into(),
+        shader_hash: String::new(),
+        decal: None,
+    };
+    glb::Model {
+        path: PathBuf::new(),
+        meshes: vec![mesh],
+        materials: vec![mat],
+        joints: vec![],
+        images,
+        bbox: [[rect[0], -10.0, -rect[3]], [rect[2], 500.0, -rect[1]]],
+        triangles: tris,
+        vertices: nv,
+        extras: Default::default(),
+    }
 }
 
 struct Shared {
@@ -364,6 +491,14 @@ struct Shared {
 
 struct Node {
     gm: GpuModel,
+    used: u64,
+    tex: String,
+    bytes: u64,
+}
+
+#[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+struct Node4 {
+    gm: GpuModel4,
     used: u64,
     tex: String,
     bytes: u64,
@@ -400,10 +535,18 @@ pub struct World {
     nodes: HashMap<Key, Node>,
     tex_cache: HashMap<String, wgpu::Texture>,
     tex_refs: HashMap<String, u32>,
+    #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+    nodes4: HashMap<Key, Node4>,
+    #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+    tex_cache4: HashMap<String, metal_rust::metal::Texture>,
+    #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+    tex_refs4: HashMap<String, u32>,
     tex_keys: Arc<Mutex<HashSet<String>>>,
     zmax: HashMap<(u8, u32, u32), f32>,
     selected: Vec<Key>,
     ocean: Option<GpuModel>,
+    #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+    ocean4: Option<GpuModel4>,
     frame: u64,
     /// Node budget (resident), from the quality setting.
     pub max_nodes: usize,
@@ -415,15 +558,29 @@ pub struct World {
 impl World {
     pub fn new(map_dir: PathBuf) -> World {
         World {
-            shared: Arc::new(Shared { queue: Mutex::new(Vec::new()), cv: Condvar::new(), inflight: Mutex::new(HashSet::new()), stop: AtomicBool::new(false), py: OnceLock::new() }),
+            shared: Arc::new(Shared {
+                queue: Mutex::new(Vec::new()),
+                cv: Condvar::new(),
+                inflight: Mutex::new(HashSet::new()),
+                stop: AtomicBool::new(false),
+                py: OnceLock::new(),
+            }),
             rx: None,
             nodes: HashMap::new(),
             tex_cache: HashMap::new(),
             tex_refs: HashMap::new(),
+            #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+            nodes4: HashMap::new(),
+            #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+            tex_cache4: HashMap::new(),
+            #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+            tex_refs4: HashMap::new(),
             tex_keys: Arc::new(Mutex::new(HashSet::new())),
             zmax: HashMap::new(),
             selected: Vec::new(),
             ocean: None,
+            #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+            ocean4: None,
             frame: 0,
             max_nodes: 700,
             stats: Stats::default(),
@@ -434,7 +591,10 @@ impl World {
 
     /// Pyramids built and nothing queued or loading.
     pub fn idle(&self) -> bool {
-        self.ready() && self.stats.drawn > 0 && self.shared.queue.lock().unwrap().is_empty() && self.shared.inflight.lock().unwrap().is_empty()
+        self.ready()
+            && self.stats.drawn > 0
+            && self.shared.queue.lock().unwrap().is_empty()
+            && self.shared.inflight.lock().unwrap().is_empty()
     }
 
     pub fn ready(&self) -> bool {
@@ -455,7 +615,10 @@ impl World {
                 let t0 = std::time::Instant::now();
                 let py = Pyramids::build(&h8);
                 let _ = sh.py.set(Arc::new(py));
-                eprintln!("[world] height pyramids in {:.0} ms", t0.elapsed().as_secs_f32() * 1000.0);
+                eprintln!(
+                    "[world] height pyramids in {:.0} ms",
+                    t0.elapsed().as_secs_f32() * 1000.0
+                );
                 sh.cv.notify_all();
             });
         }
@@ -473,7 +636,13 @@ impl World {
                             return;
                         }
                         if !q.is_empty() && sh.py.get().is_some() {
-                            let (bi, _) = q.iter().enumerate().fold((0, f32::MAX), |a, (i, r)| if r.1 < a.1 { (i, r.1) } else { a });
+                            let (bi, _) = q.iter().enumerate().fold((0, f32::MAX), |a, (i, r)| {
+                                if r.1 < a.1 {
+                                    (i, r.1)
+                                } else {
+                                    a
+                                }
+                            });
                             let k = q.swap_remove(bi).0;
                             sh.inflight.lock().unwrap().insert(k);
                             break k;
@@ -502,7 +671,9 @@ impl World {
 
     /// Upload finished nodes (time-boxed); returns true if any arrived.
     pub fn poll(&mut self, rs: &egui_wgpu::RenderState, ren: &Renderer3D, budget_ms: f32) -> bool {
-        let Some(rx) = self.rx.take() else { return false };
+        let Some(rx) = self.rx.take() else {
+            return false;
+        };
         let t0 = std::time::Instant::now();
         let mut any = false;
         while t0.elapsed().as_secs_f32() * 1000.0 < budget_ms {
@@ -517,19 +688,88 @@ impl World {
                 // models leave open: it draws in the coverage pass (pixels no
                 // real surface covers), lifted a little above its estimate
                 // so it also covers ground-level coarse slabs there.
-                ren.set_instances(rs, &mut gm, &[Instance::new(glam::Mat4::from_translation(Vec3::Y * (SINK + GROUND_LIFT)), false).fallback()]);
+                ren.set_instances(
+                    rs,
+                    &mut gm,
+                    &[Instance::new(
+                        glam::Mat4::from_translation(Vec3::Y * (SINK + GROUND_LIFT)),
+                        false,
+                    )
+                    .fallback()],
+                );
             }
             if !tex.is_empty() && self.tex_cache.contains_key(&tex) {
                 *self.tex_refs.entry(tex.clone()).or_insert(0) += 1;
                 self.tex_keys.lock().unwrap().insert(tex.clone());
             }
             let bytes = gm.meshes.iter().map(|g| g.bytes()).sum::<u64>();
-            if let Some(old) = self.nodes.insert(k, Node { gm, used: self.frame, tex, bytes }) {
+            if let Some(old) = self.nodes.insert(
+                k,
+                Node {
+                    gm,
+                    used: self.frame,
+                    tex,
+                    bytes,
+                },
+            ) {
                 self.release_tex(&old.tex);
             }
         }
         self.rx = Some(rx);
         any
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+    pub fn poll_mtl4(&mut self, ren: &mut Renderer3D4, budget_ms: f32) -> anyhow::Result<bool> {
+        let Some(rx) = self.rx.take() else {
+            return Ok(false);
+        };
+        let t0 = std::time::Instant::now();
+        let mut any = false;
+        while t0.elapsed().as_secs_f32() * 1000.0 < budget_ms {
+            let Ok((k, model)) = rx.try_recv() else {
+                break;
+            };
+            self.shared.inflight.lock().unwrap().remove(&k);
+            any = true;
+            let tex = model
+                .images
+                .first()
+                .map(|image| image.key.clone())
+                .unwrap_or_default();
+            let gm = match ren.upload_shared(&model, &mut self.tex_cache4) {
+                Ok(gm) => gm,
+                Err(error) => {
+                    self.rx = Some(rx);
+                    return Err(error);
+                }
+            };
+            if !tex.is_empty() && self.tex_cache4.contains_key(&tex) {
+                *self.tex_refs4.entry(tex.clone()).or_insert(0) += 1;
+                self.tex_keys.lock().unwrap().insert(tex.clone());
+            }
+            let bytes = gm.buffer_bytes();
+            if let Some(old) = self.nodes4.insert(
+                k,
+                Node4 {
+                    gm,
+                    used: self.frame,
+                    tex,
+                    bytes,
+                },
+            ) {
+                if let Err(error) = ren.release_model(&old.gm) {
+                    self.rx = Some(rx);
+                    return Err(error);
+                }
+                if let Err(error) = self.release_tex4(&old.tex, ren) {
+                    self.rx = Some(rx);
+                    return Err(error);
+                }
+            }
+        }
+        self.rx = Some(rx);
+        Ok(any)
     }
 
     fn release_tex(&mut self, tex: &str) {
@@ -541,13 +781,49 @@ impl World {
             if *r == 0 {
                 self.tex_refs.remove(tex);
                 self.tex_cache.remove(tex);
-                self.tex_keys.lock().unwrap().remove(tex);
+                #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+                let cached_by_mtl4 = self.tex_cache4.contains_key(tex);
+                #[cfg(not(all(target_os = "macos", feature = "metal4-poc")))]
+                let cached_by_mtl4 = false;
+                if !cached_by_mtl4 {
+                    self.tex_keys.lock().unwrap().remove(tex);
+                }
             }
         }
     }
 
+    #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+    fn release_tex4(&mut self, tex: &str, ren: &mut Renderer3D4) -> anyhow::Result<()> {
+        if tex.is_empty() {
+            return Ok(());
+        }
+        if let Some(refs) = self.tex_refs4.get_mut(tex) {
+            *refs = refs.saturating_sub(1);
+            if *refs == 0 {
+                self.tex_refs4.remove(tex);
+                if let Some(texture) = self.tex_cache4.remove(tex) {
+                    ren.release_texture(&texture)?;
+                }
+                if !self.tex_cache.contains_key(tex) {
+                    self.tex_keys.lock().unwrap().remove(tex);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Pick the nodes to draw this frame and queue the missing ones.
     pub fn select(&mut self, v: &View) {
+        self.select_inner(v, false);
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+    pub fn select_mtl4(&mut self, v: &View, ren: &mut Renderer3D4) -> anyhow::Result<()> {
+        self.select_inner(v, true);
+        self.evict_mtl4(ren)
+    }
+
+    fn select_inner(&mut self, v: &View, mtl4: bool) {
         self.frame += 1;
         self.selected.clear();
         if !self.ready() {
@@ -586,31 +862,40 @@ impl World {
             // more nodes than the budget)
             let straddles = near < v.ground_r && far > v.ground_r && k.span() / near * k_px > 48.0;
             // below the data level only the ground/roof boundary splits further
-            let split = (k.l < DATA_LEVEL && err_px > v.tau) || (k.l < MAX_LEVEL && straddles && k.l >= 4);
+            let split =
+                (k.l < DATA_LEVEL && err_px > v.tau) || (k.l < MAX_LEVEL && straddles && k.l >= 4);
             let prio = near / k.span();
             let ground = far <= v.ground_r && (v.ground_ok)(r);
             let me = k.with(ground);
             if split {
-                let kids: Vec<Key> = k.children().into_iter().filter(|c| py.node_inside(*c)).collect();
+                let kids: Vec<Key> = k
+                    .children()
+                    .into_iter()
+                    .filter(|c| py.node_inside(*c))
+                    .collect();
                 // children replace this node only when all are loaded (either variant)
-                let all = kids.iter().all(|c| self.nodes.contains_key(&c.with(false)) || self.nodes.contains_key(&c.with(true)));
+                let all = kids.iter().all(|c| {
+                    self.node_loaded(c.with(false), mtl4) || self.node_loaded(c.with(true), mtl4)
+                });
                 if all {
                     stack.extend(kids);
                     continue;
                 }
                 for c in &kids {
-                    if !self.nodes.contains_key(&c.with(false)) && !self.nodes.contains_key(&c.with(true)) {
+                    if !self.node_loaded(c.with(false), mtl4)
+                        && !self.node_loaded(c.with(true), mtl4)
+                    {
                         want.push((c.with(false), prio * 0.5));
                     }
                 }
             }
             // draw this node: the wanted variant if loaded, else the other
-            let pick = if self.nodes.contains_key(&me) {
+            let pick = if self.node_loaded(me, mtl4) {
                 Some(me)
             } else {
                 want.push((me, prio));
                 let other = me.with(!ground);
-                self.nodes.contains_key(&other).then_some(other)
+                self.node_loaded(other, mtl4).then_some(other)
             };
             if let Some(p) = pick {
                 if p.ground {
@@ -621,7 +906,12 @@ impl World {
             }
         }
         for k in &out {
-            if let Some(n) = self.nodes.get_mut(k) {
+            if mtl4 {
+                #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+                if let Some(n) = self.nodes4.get_mut(k) {
+                    n.used = self.frame;
+                }
+            } else if let Some(n) = self.nodes.get_mut(k) {
                 n.used = self.frame;
             }
         }
@@ -637,11 +927,78 @@ impl World {
         self.stats.drawn = self.selected.len();
         self.stats.ground = ground_n;
         self.stats.max_level = max_level;
-        self.evict();
-        self.stats.resident = self.nodes.len();
-        self.stats.tris = self.selected.iter().filter_map(|k| self.nodes.get(k)).map(|n| n.gm.meshes.iter().map(|m| m.n_idx as usize / 3).sum::<usize>()).sum();
-        let tex_bytes: u64 = self.tex_cache.len() as u64 * 350_000;
-        self.stats.gpu_bytes = self.nodes.values().map(|n| n.bytes).sum::<u64>() + tex_bytes;
+        if !mtl4 {
+            self.evict();
+        }
+        #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+        {
+            self.stats.resident = if mtl4 {
+                self.nodes4.len()
+            } else {
+                self.nodes.len()
+            };
+            self.stats.tris = if mtl4 {
+                self.selected
+                    .iter()
+                    .filter_map(|k| self.nodes4.get(k))
+                    .map(|n| {
+                        n.gm.meshes
+                            .iter()
+                            .map(|m| m.n_idx as usize / 3)
+                            .sum::<usize>()
+                    })
+                    .sum()
+            } else {
+                self.selected
+                    .iter()
+                    .filter_map(|k| self.nodes.get(k))
+                    .map(|n| {
+                        n.gm.meshes
+                            .iter()
+                            .map(|m| m.n_idx as usize / 3)
+                            .sum::<usize>()
+                    })
+                    .sum()
+            };
+            let (node_bytes, texture_count) = if mtl4 {
+                (
+                    self.nodes4.values().map(|n| n.bytes).sum::<u64>(),
+                    self.tex_cache4.len(),
+                )
+            } else {
+                (
+                    self.nodes.values().map(|n| n.bytes).sum::<u64>(),
+                    self.tex_cache.len(),
+                )
+            };
+            self.stats.gpu_bytes = node_bytes + texture_count as u64 * 350_000;
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal4-poc")))]
+        {
+            self.stats.resident = self.nodes.len();
+            self.stats.tris = self
+                .selected
+                .iter()
+                .filter_map(|k| self.nodes.get(k))
+                .map(|n| {
+                    n.gm.meshes
+                        .iter()
+                        .map(|m| m.n_idx as usize / 3)
+                        .sum::<usize>()
+                })
+                .sum();
+            let tex_bytes: u64 = self.tex_cache.len() as u64 * 350_000;
+            self.stats.gpu_bytes = self.nodes.values().map(|n| n.bytes).sum::<u64>() + tex_bytes;
+        }
+    }
+
+    fn node_loaded(&self, key: Key, mtl4: bool) -> bool {
+        #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+        if mtl4 {
+            return self.nodes4.contains_key(&key);
+        }
+        let _ = mtl4;
+        self.nodes.contains_key(&key)
     }
 
     fn evict(&mut self) {
@@ -649,7 +1006,12 @@ impl World {
             return;
         }
         let keep: HashSet<Key> = self.selected.iter().copied().collect();
-        let mut old: Vec<(u64, Key)> = self.nodes.iter().filter(|(k, _)| !keep.contains(k)).map(|(k, n)| (n.used, *k)).collect();
+        let mut old: Vec<(u64, Key)> = self
+            .nodes
+            .iter()
+            .filter(|(k, _)| !keep.contains(k))
+            .map(|(k, n)| (n.used, *k))
+            .collect();
         old.sort();
         let n = (self.nodes.len() - self.max_nodes).min(old.len());
         for (_, k) in old.into_iter().take(n) {
@@ -657,6 +1019,31 @@ impl World {
                 self.release_tex(&node.tex);
             }
         }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+    fn evict_mtl4(&mut self, ren: &mut Renderer3D4) -> anyhow::Result<()> {
+        if self.nodes4.len() > self.max_nodes {
+            let keep: HashSet<Key> = self.selected.iter().copied().collect();
+            let mut old: Vec<(u64, Key)> = self
+                .nodes4
+                .iter()
+                .filter(|(key, _)| !keep.contains(key))
+                .map(|(key, node)| (node.used, *key))
+                .collect();
+            old.sort();
+            let count = (self.nodes4.len() - self.max_nodes).min(old.len());
+            for (_, key) in old.into_iter().take(count) {
+                if let Some(node) = self.nodes4.remove(&key) {
+                    ren.release_model(&node.gm)?;
+                    self.release_tex4(&node.tex, ren)?;
+                }
+            }
+        }
+        self.stats.resident = self.nodes4.len();
+        self.stats.gpu_bytes = self.nodes4.values().map(|node| node.bytes).sum::<u64>()
+            + self.tex_cache4.len() as u64 * 350_000;
+        Ok(())
     }
 
     /// The selected nodes plus a sea plane to the horizon.
@@ -673,6 +1060,20 @@ impl World {
             }
         }
         v
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+    pub fn models_mtl4(&mut self, ren: &mut Renderer3D4) -> anyhow::Result<Vec<&GpuModel4>> {
+        if self.ocean4.is_none() {
+            self.ocean4 = Some(ren.upload_shared(&ocean_model(), &mut self.tex_cache4)?);
+        }
+        let mut models: Vec<&GpuModel4> = self.ocean4.iter().collect();
+        for key in &self.selected {
+            if let Some(node) = self.nodes4.get(key) {
+                models.push(&node.gm);
+            }
+        }
+        Ok(models)
     }
 }
 
@@ -703,9 +1104,56 @@ fn ocean_model() -> glb::Model {
     let (cx, cy) = (X0 + W as f32 * CELL * 0.5, Y1 - H as f32 * CELL * 0.5);
     let e = 120_000.0;
     let z = WATER_Z - SINK - 0.5;
-    let v = |x: f32, y: f32| glb::Vertex { pos: gl([x, y, z]), nrm: [0.0, 1.0, 0.0], tan: [1.0, 0.0, 0.0, 1.0], uv0: [0.0, 0.0], uv1: [0.0, 0.0], col: [255; 4], joints: [0; 4], weights: [0; 4], tint: [255; 4] };
-    let verts = vec![v(cx - e, cy - e), v(cx + e, cy - e), v(cx - e, cy + e), v(cx + e, cy + e)];
-    let mesh = glb::Mesh { name: "sea".into(), verts, indices: vec![0, 2, 1, 1, 2, 3], material: Some(0), skinned: false, has_tangents: false, uv_sets: 1, centre: gl([cx, cy, z]) };
-    let mat = glb::Material { name: "sea".into(), class: "map_tile".into(), alpha_mode: "OPAQUE".into(), base_factor: SEA, base: None, normal: None, packed: None, emissive: None, slots: vec![], gap: "ok".into(), shader_hash: String::new(), decal: None };
-    glb::Model { path: PathBuf::new(), meshes: vec![mesh], materials: vec![mat], joints: vec![], images: vec![], bbox: [[cx - e, z, -(cy + e)], [cx + e, z, -(cy - e)]], triangles: 2, vertices: 4, extras: Default::default() }
+    let v = |x: f32, y: f32| glb::Vertex {
+        pos: gl([x, y, z]),
+        nrm: [0.0, 1.0, 0.0],
+        tan: [1.0, 0.0, 0.0, 1.0],
+        uv0: [0.0, 0.0],
+        uv1: [0.0, 0.0],
+        col: [255; 4],
+        joints: [0; 4],
+        weights: [0; 4],
+        tint: [255; 4],
+    };
+    let verts = vec![
+        v(cx - e, cy - e),
+        v(cx + e, cy - e),
+        v(cx - e, cy + e),
+        v(cx + e, cy + e),
+    ];
+    let mesh = glb::Mesh {
+        name: "sea".into(),
+        verts,
+        indices: vec![0, 2, 1, 1, 2, 3],
+        material: Some(0),
+        skinned: false,
+        has_tangents: false,
+        uv_sets: 1,
+        centre: gl([cx, cy, z]),
+    };
+    let mat = glb::Material {
+        name: "sea".into(),
+        class: "map_tile".into(),
+        alpha_mode: "OPAQUE".into(),
+        base_factor: SEA,
+        base: None,
+        normal: None,
+        packed: None,
+        emissive: None,
+        slots: vec![],
+        gap: "ok".into(),
+        shader_hash: String::new(),
+        decal: None,
+    };
+    glb::Model {
+        path: PathBuf::new(),
+        meshes: vec![mesh],
+        materials: vec![mat],
+        joints: vec![],
+        images: vec![],
+        bbox: [[cx - e, z, -(cy + e)], [cx + e, z, -(cy - e)]],
+        triangles: 2,
+        vertices: 4,
+        extras: Default::default(),
+    }
 }

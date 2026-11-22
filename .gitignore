@@ -1,5 +1,7 @@
 # build output
 /target
+# vendored Cargo crates' local build output
+/vendor/*/target/
 # indexes, extracted game data, scratch, logs (never commit game data)
 /work
 *.log

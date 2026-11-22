@@ -16,7 +16,11 @@ pub struct Bc {
 
 /// Bytes per 4x4 block.
 pub fn block_bytes(alpha: bool) -> usize {
-    if alpha { 16 } else { 8 }
+    if alpha {
+        16
+    } else {
+        8
+    }
 }
 
 /// Compress a mip chain (level 0 must be a multiple of 4 on both sides).
@@ -27,7 +31,10 @@ pub fn compress(mips: &[(u32, u32, Vec<u8>)]) -> Option<Bc> {
         return None;
     }
     let alpha = px0.chunks_exact(4).any(|p| p[3] < 250);
-    let levels = mips.iter().map(|(w, h, px)| compress_level(*w, *h, px, alpha)).collect();
+    let levels = mips
+        .iter()
+        .map(|(w, h, px)| compress_level(*w, *h, px, alpha))
+        .collect();
     Some(Bc { alpha, levels })
 }
 
@@ -58,7 +65,9 @@ fn compress_level(w: u32, h: u32, px: &[u8], alpha: bool) -> Vec<u8> {
 
 /// BC3 for every level, whatever the alpha (texture arrays need one format).
 pub fn compress_bc3(mips: &[(u32, u32, Vec<u8>)]) -> Vec<Vec<u8>> {
-    mips.iter().map(|(w, h, px)| compress_level(*w, *h, px, true)).collect()
+    mips.iter()
+        .map(|(w, h, px)| compress_level(*w, *h, px, true))
+        .collect()
 }
 
 /// Decode level 0 of a block-compressed image back to RGBA8.
@@ -74,23 +83,70 @@ pub fn decode(bc: &Bc, w: u32, h: u32) -> Vec<u8> {
     for by in 0..bh {
         for bx in 0..bw {
             let b = &src[(by * bw + bx) * bb..(by * bw + bx + 1) * bb];
-            let (ab, cb) = if bc.alpha { (Some(&b[..8]), &b[8..]) } else { (None, b) };
+            let (ab, cb) = if bc.alpha {
+                (Some(&b[..8]), &b[8..])
+            } else {
+                (None, b)
+            };
             let c0 = u16::from_le_bytes([cb[0], cb[1]]);
             let c1 = u16::from_le_bytes([cb[2], cb[3]]);
             let idx = u32::from_le_bytes([cb[4], cb[5], cb[6], cb[7]]);
             let (a, b2) = (from565(c0), from565(c1));
             let four = c0 > c1 || bc.alpha;
             let pal: [[i32; 4]; 4] = if four {
-                [[a[0], a[1], a[2], 255], [b2[0], b2[1], b2[2], 255], [(2 * a[0] + b2[0]) / 3, (2 * a[1] + b2[1]) / 3, (2 * a[2] + b2[2]) / 3, 255], [(a[0] + 2 * b2[0]) / 3, (a[1] + 2 * b2[1]) / 3, (a[2] + 2 * b2[2]) / 3, 255]]
+                [
+                    [a[0], a[1], a[2], 255],
+                    [b2[0], b2[1], b2[2], 255],
+                    [
+                        (2 * a[0] + b2[0]) / 3,
+                        (2 * a[1] + b2[1]) / 3,
+                        (2 * a[2] + b2[2]) / 3,
+                        255,
+                    ],
+                    [
+                        (a[0] + 2 * b2[0]) / 3,
+                        (a[1] + 2 * b2[1]) / 3,
+                        (a[2] + 2 * b2[2]) / 3,
+                        255,
+                    ],
+                ]
             } else {
-                [[a[0], a[1], a[2], 255], [b2[0], b2[1], b2[2], 255], [(a[0] + b2[0]) / 2, (a[1] + b2[1]) / 2, (a[2] + b2[2]) / 2, 255], [0, 0, 0, 0]]
+                [
+                    [a[0], a[1], a[2], 255],
+                    [b2[0], b2[1], b2[2], 255],
+                    [
+                        (a[0] + b2[0]) / 2,
+                        (a[1] + b2[1]) / 2,
+                        (a[2] + b2[2]) / 2,
+                        255,
+                    ],
+                    [0, 0, 0, 0],
+                ]
             };
             let alphas: Option<[i32; 8]> = ab.map(|ab| {
                 let (a0, a1) = (ab[0] as i32, ab[1] as i32);
                 if a0 > a1 {
-                    [a0, a1, (6 * a0 + a1) / 7, (5 * a0 + 2 * a1) / 7, (4 * a0 + 3 * a1) / 7, (3 * a0 + 4 * a1) / 7, (2 * a0 + 5 * a1) / 7, (a0 + 6 * a1) / 7]
+                    [
+                        a0,
+                        a1,
+                        (6 * a0 + a1) / 7,
+                        (5 * a0 + 2 * a1) / 7,
+                        (4 * a0 + 3 * a1) / 7,
+                        (3 * a0 + 4 * a1) / 7,
+                        (2 * a0 + 5 * a1) / 7,
+                        (a0 + 6 * a1) / 7,
+                    ]
                 } else {
-                    [a0, a1, (4 * a0 + a1) / 5, (3 * a0 + 2 * a1) / 5, (2 * a0 + 3 * a1) / 5, (a0 + 4 * a1) / 5, 0, 255]
+                    [
+                        a0,
+                        a1,
+                        (4 * a0 + a1) / 5,
+                        (3 * a0 + 2 * a1) / 5,
+                        (2 * a0 + 3 * a1) / 5,
+                        (a0 + 4 * a1) / 5,
+                        0,
+                        255,
+                    ]
                 }
             });
             let abits = ab.map(|ab| {
@@ -131,7 +187,11 @@ fn from565(v: u16) -> [i32; 3] {
     let r = ((v >> 11) & 31) as i32;
     let g = ((v >> 5) & 63) as i32;
     let b = (v & 31) as i32;
-    [(r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2)]
+    [
+        (r << 3) | (r >> 2),
+        (g << 2) | (g >> 4),
+        (b << 3) | (b >> 2),
+    ]
 }
 
 fn colour_block(blk: &[[u8; 4]; 16], out: &mut Vec<u8>) {
@@ -157,11 +217,26 @@ fn colour_block(blk: &[[u8; 4]; 16], out: &mut Vec<u8>) {
     if c0 != c1 {
         // four-colour mode (c0 > c1): c0, c1, 2/3 c0 + 1/3 c1, 1/3 c0 + 2/3 c1
         let (a, b) = (from565(c0), from565(c1));
-        let pal = [a, b, [(2 * a[0] + b[0]) / 3, (2 * a[1] + b[1]) / 3, (2 * a[2] + b[2]) / 3], [(a[0] + 2 * b[0]) / 3, (a[1] + 2 * b[1]) / 3, (a[2] + 2 * b[2]) / 3]];
+        let pal = [
+            a,
+            b,
+            [
+                (2 * a[0] + b[0]) / 3,
+                (2 * a[1] + b[1]) / 3,
+                (2 * a[2] + b[2]) / 3,
+            ],
+            [
+                (a[0] + 2 * b[0]) / 3,
+                (a[1] + 2 * b[1]) / 3,
+                (a[2] + 2 * b[2]) / 3,
+            ],
+        ];
         for (i, p) in blk.iter().enumerate() {
             let mut best = (i32::MAX, 0u32);
             for (k, q) in pal.iter().enumerate() {
-                let d = (p[0] as i32 - q[0]).pow(2) + (p[1] as i32 - q[1]).pow(2) + (p[2] as i32 - q[2]).pow(2);
+                let d = (p[0] as i32 - q[0]).pow(2)
+                    + (p[1] as i32 - q[1]).pow(2)
+                    + (p[2] as i32 - q[2]).pow(2);
                 if d < best.0 {
                     best = (d, k as u32);
                 }
@@ -186,7 +261,16 @@ fn alpha_block(blk: &[[u8; 4]; 16], out: &mut Vec<u8>) {
     if hi > lo {
         // a0 > a1: eight values from a0 to a1
         let (a0, a1) = (hi as i32, lo as i32);
-        let pal: [i32; 8] = [a0, a1, (6 * a0 + a1) / 7, (5 * a0 + 2 * a1) / 7, (4 * a0 + 3 * a1) / 7, (3 * a0 + 4 * a1) / 7, (2 * a0 + 5 * a1) / 7, (a0 + 6 * a1) / 7];
+        let pal: [i32; 8] = [
+            a0,
+            a1,
+            (6 * a0 + a1) / 7,
+            (5 * a0 + 2 * a1) / 7,
+            (4 * a0 + 3 * a1) / 7,
+            (3 * a0 + 4 * a1) / 7,
+            (2 * a0 + 5 * a1) / 7,
+            (a0 + 6 * a1) / 7,
+        ];
         for (i, p) in blk.iter().enumerate() {
             let a = p[3] as i32;
             let k = (0..8).min_by_key(|&k| (a - pal[k]).abs()).unwrap() as u64;
@@ -205,7 +289,20 @@ mod tests {
         let c1 = u16::from_le_bytes([b[2], b[3]]);
         let idx = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
         let (a, c) = (from565(c0), from565(c1));
-        let pal = [a, c, [(2 * a[0] + c[0]) / 3, (2 * a[1] + c[1]) / 3, (2 * a[2] + c[2]) / 3], [(a[0] + 2 * c[0]) / 3, (a[1] + 2 * c[1]) / 3, (a[2] + 2 * c[2]) / 3]];
+        let pal = [
+            a,
+            c,
+            [
+                (2 * a[0] + c[0]) / 3,
+                (2 * a[1] + c[1]) / 3,
+                (2 * a[2] + c[2]) / 3,
+            ],
+            [
+                (a[0] + 2 * c[0]) / 3,
+                (a[1] + 2 * c[1]) / 3,
+                (a[2] + 2 * c[2]) / 3,
+            ],
+        ];
         let mut o = [[0; 3]; 16];
         for i in 0..16 {
             o[i] = pal[((idx >> (2 * i)) & 3) as usize];
@@ -218,7 +315,12 @@ mod tests {
         let mut px = Vec::new();
         for _y in 0..8u32 {
             for x in 0..8u32 {
-                px.extend_from_slice(&[(x * 32) as u8, (x * 16) as u8, 128, if x < 4 { 255 } else { 40 }]);
+                px.extend_from_slice(&[
+                    (x * 32) as u8,
+                    (x * 16) as u8,
+                    128,
+                    if x < 4 { 255 } else { 40 },
+                ]);
             }
         }
         let bc = compress(&[(8, 8, px.clone())]).unwrap();
@@ -246,7 +348,10 @@ mod tests {
             for x in 0..4 {
                 let o = (y * 8 + x) * 4;
                 for c in 0..3 {
-                    assert!((blk0[y * 4 + x][c] - px[o + c] as i32).abs() <= 24, "texel {x},{y} c{c}");
+                    assert!(
+                        (blk0[y * 4 + x][c] - px[o + c] as i32).abs() <= 24,
+                        "texel {x},{y} c{c}"
+                    );
                 }
             }
         }

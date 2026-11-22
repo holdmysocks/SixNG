@@ -20,7 +20,6 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
-
 pub const CELL: f32 = 2.0;
 pub const COARSE: usize = 4; // coarse grid = 8 m
 pub const TILE: usize = 256;
@@ -43,15 +42,27 @@ pub const LAYERS: &[(&str, &str)] = &[
 pub fn log(work: &Path, msg: &str) {
     let p = work.join("map").join("bake.log");
     let _ = std::fs::create_dir_all(p.parent().unwrap());
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(p)
+    {
         let _ = writeln!(f, "{} {msg}", chrono_like());
     }
     eprintln!("{msg}");
 }
 
 fn chrono_like() -> String {
-    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    format!("[{:02}:{:02}:{:02}]", (t / 3600) % 24, (t / 60) % 60, t % 60)
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!(
+        "[{:02}:{:02}:{:02}]",
+        (t / 3600) % 24,
+        (t / 60) % 60,
+        t % 60
+    )
 }
 
 #[inline]
@@ -73,10 +84,30 @@ pub fn unhq(v: u64) -> Option<f32> {
 
 /// Rasterise a triangle (cell-space x/y, world z) into cells, calling f(c, r, z).
 fn raster_tri(p: [[f32; 3]; 3], mut f: impl FnMut(usize, usize, f32)) {
-    let minx = p.iter().map(|v| v[0]).fold(f32::MAX, f32::min).floor().max(0.0) as i64;
-    let maxx = p.iter().map(|v| v[0]).fold(f32::MIN, f32::max).ceil().min(W as f32 - 1.0) as i64;
-    let miny = p.iter().map(|v| v[1]).fold(f32::MAX, f32::min).floor().max(0.0) as i64;
-    let maxy = p.iter().map(|v| v[1]).fold(f32::MIN, f32::max).ceil().min(H as f32 - 1.0) as i64;
+    let minx = p
+        .iter()
+        .map(|v| v[0])
+        .fold(f32::MAX, f32::min)
+        .floor()
+        .max(0.0) as i64;
+    let maxx = p
+        .iter()
+        .map(|v| v[0])
+        .fold(f32::MIN, f32::max)
+        .ceil()
+        .min(W as f32 - 1.0) as i64;
+    let miny = p
+        .iter()
+        .map(|v| v[1])
+        .fold(f32::MAX, f32::min)
+        .floor()
+        .max(0.0) as i64;
+    let maxy = p
+        .iter()
+        .map(|v| v[1])
+        .fold(f32::MIN, f32::max)
+        .ceil()
+        .min(H as f32 - 1.0) as i64;
     if minx > maxx || miny > maxy {
         return;
     }
@@ -94,12 +125,18 @@ fn raster_tri(p: [[f32; 3]; 3], mut f: impl FnMut(usize, usize, f32)) {
     for cy in miny..=maxy {
         for cx in minx..=maxx {
             let (x, y) = (cx as f32 + 0.5, cy as f32 + 0.5);
-            let w1 = ((x - p[0][0]) * (p[2][1] - p[0][1]) - (p[2][0] - p[0][0]) * (y - p[0][1])) / d;
-            let w2 = ((p[1][0] - p[0][0]) * (y - p[0][1]) - (x - p[0][0]) * (p[1][1] - p[0][1])) / d;
+            let w1 =
+                ((x - p[0][0]) * (p[2][1] - p[0][1]) - (p[2][0] - p[0][0]) * (y - p[0][1])) / d;
+            let w2 =
+                ((p[1][0] - p[0][0]) * (y - p[0][1]) - (x - p[0][0]) * (p[1][1] - p[0][1])) / d;
             let w0 = 1.0 - w1 - w2;
             let inside = w0 >= -1e-4 && w1 >= -1e-4 && w2 >= -1e-4;
             if inside || small {
-                let z = if inside { w0 * p[0][2] + w1 * p[1][2] + w2 * p[2][2] } else { p.iter().map(|v| v[2]).fold(f32::MIN, f32::max) };
+                let z = if inside {
+                    w0 * p[0][2] + w1 * p[1][2] + w2 * p[2][2]
+                } else {
+                    p.iter().map(|v| v[2]).fold(f32::MIN, f32::max)
+                };
                 f(cx as usize, cy as usize, z);
             }
         }
@@ -115,10 +152,30 @@ fn raster_quad(c: [[f32; 2]; 4], cs: usize, w: usize, h: usize, mut f: impl FnMu
             [x / cs as f32, y / cs as f32, 0.0]
         })
         .collect();
-    let minx = cc.iter().map(|v| v[0]).fold(f32::MAX, f32::min).floor().max(0.0) as i64;
-    let maxx = cc.iter().map(|v| v[0]).fold(f32::MIN, f32::max).ceil().min(w as f32 - 1.0) as i64;
-    let miny = cc.iter().map(|v| v[1]).fold(f32::MAX, f32::min).floor().max(0.0) as i64;
-    let maxy = cc.iter().map(|v| v[1]).fold(f32::MIN, f32::max).ceil().min(h as f32 - 1.0) as i64;
+    let minx = cc
+        .iter()
+        .map(|v| v[0])
+        .fold(f32::MAX, f32::min)
+        .floor()
+        .max(0.0) as i64;
+    let maxx = cc
+        .iter()
+        .map(|v| v[0])
+        .fold(f32::MIN, f32::max)
+        .ceil()
+        .min(w as f32 - 1.0) as i64;
+    let miny = cc
+        .iter()
+        .map(|v| v[1])
+        .fold(f32::MAX, f32::min)
+        .floor()
+        .max(0.0) as i64;
+    let maxy = cc
+        .iter()
+        .map(|v| v[1])
+        .fold(f32::MIN, f32::max)
+        .ceil()
+        .min(h as f32 - 1.0) as i64;
     if minx > maxx || miny > maxy {
         return;
     }
@@ -142,7 +199,9 @@ fn raster_quad(c: [[f32; 2]; 4], cs: usize, w: usize, h: usize, mut f: impl FnMu
         }
     }
     if !any {
-        let m = cc.iter().fold([0.0f32; 2], |a, v| [a[0] + v[0] / 4.0, a[1] + v[1] / 4.0]);
+        let m = cc
+            .iter()
+            .fold([0.0f32; 2], |a, v| [a[0] + v[0] / 4.0, a[1] + v[1] / 4.0]);
         if m[0] >= 0.0 && m[1] >= 0.0 && (m[0] as usize) < w && (m[1] as usize) < h {
             f(m[0] as usize, m[1] as usize);
         }
@@ -156,8 +215,18 @@ fn yaw_of(q: [f32; 4]) -> f32 {
 
 pub fn corners(pos: [f32; 3], yaw: f32, lo: [f32; 2], hi: [f32; 2], s: f32) -> [[f32; 2]; 4] {
     let (sn, cs) = yaw.sin_cos();
-    let t = |x: f32, y: f32| [pos[0] + (x * cs - y * sn) * s, pos[1] + (x * sn + y * cs) * s];
-    [t(lo[0], lo[1]), t(hi[0], lo[1]), t(hi[0], hi[1]), t(lo[0], hi[1])]
+    let t = |x: f32, y: f32| {
+        [
+            pos[0] + (x * cs - y * sn) * s,
+            pos[1] + (x * sn + y * cs) * s,
+        ]
+    };
+    [
+        t(lo[0], lo[1]),
+        t(hi[0], lo[1]),
+        t(hi[0], hi[1]),
+        t(lo[0], hi[1]),
+    ]
 }
 
 // ------------------------------------------------------------------ inputs
@@ -228,14 +297,27 @@ pub const RF_DEGENERATE: u8 = 32;
 /// Model bounds unknown: lo/hi are a placeholder unit cube.
 pub const RF_BBOX_UNKNOWN: u8 = 64;
 /// Bits that hide a placement by default.
-pub const RF_HIDE: u8 = RF_PLACEHOLDER | RF_VFX_PROXY | RF_INTERIOR_PROXY | RF_SHADOW_PROXY | RF_LIGHT_PROXY | RF_DEGENERATE;
+pub const RF_HIDE: u8 = RF_PLACEHOLDER
+    | RF_VFX_PROXY
+    | RF_INTERIOR_PROXY
+    | RF_SHADOW_PROXY
+    | RF_LIGHT_PROXY
+    | RF_DEGENERATE;
 
 pub fn rflag_names(f: u8) -> Vec<&'static str> {
-    [(RF_PLACEHOLDER, "placeholder"), (RF_VFX_PROXY, "vfx_proxy"), (RF_INTERIOR_PROXY, "interior_proxy"), (RF_SHADOW_PROXY, "shadow_proxy"), (RF_LIGHT_PROXY, "light_proxy"), (RF_DEGENERATE, "degenerate"), (RF_BBOX_UNKNOWN, "bbox_unknown")]
-        .iter()
-        .filter(|(b, _)| f & b != 0)
-        .map(|(_, n)| *n)
-        .collect()
+    [
+        (RF_PLACEHOLDER, "placeholder"),
+        (RF_VFX_PROXY, "vfx_proxy"),
+        (RF_INTERIOR_PROXY, "interior_proxy"),
+        (RF_SHADOW_PROXY, "shadow_proxy"),
+        (RF_LIGHT_PROXY, "light_proxy"),
+        (RF_DEGENERATE, "degenerate"),
+        (RF_BBOX_UNKNOWN, "bbox_unknown"),
+    ]
+    .iter()
+    .filter(|(b, _)| f & b != 0)
+    .map(|(_, n)| *n)
+    .collect()
 }
 
 fn reason_bit(r: Option<&str>) -> u8 {
@@ -249,7 +331,14 @@ fn reason_bit(r: Option<&str>) -> u8 {
     }
 }
 
-pub const KIND_NAMES: [&str; 6] = ["other", "building", "prop", "vegetation", "lod", "interior shell"];
+pub const KIND_NAMES: [&str; 6] = [
+    "other",
+    "building",
+    "prop",
+    "vegetation",
+    "lod",
+    "interior shell",
+];
 
 fn lod_level(s: &str) -> u8 {
     match s {
@@ -272,7 +361,12 @@ pub fn kind_of(name: &str, lod: u8, b: Option<&[f32; 6]>) -> u8 {
     if n.starts_with("int_") || n.contains("_shell") {
         return 5;
     }
-    if n.starts_with("veg_") || n.contains("_tree") || n.contains("grass") || n.contains("bush") || n.contains("hedge") {
+    if n.starts_with("veg_")
+        || n.contains("_tree")
+        || n.contains("grass")
+        || n.contains("bush")
+        || n.contains("hedge")
+    {
         return 3;
     }
     if n.starts_with("prop_") || n.starts_with("p_") {
@@ -282,7 +376,26 @@ pub fn kind_of(name: &str, lod: u8, b: Option<&[f32; 6]>) -> u8 {
         let ex = (b[3] - b[0]).abs();
         let ey = (b[4] - b[1]).abs();
         let ez = (b[5] - b[2]).abs();
-        let groundish = ["ground", "terrain", "_land", "rock", "cliff", "bank", "culvert", "stormdrain", "_road", "pavement", "_dtl", "details", "decal", "wall", "fence", "tunnel"].iter().any(|k| n.contains(k));
+        let groundish = [
+            "ground",
+            "terrain",
+            "_land",
+            "rock",
+            "cliff",
+            "bank",
+            "culvert",
+            "stormdrain",
+            "_road",
+            "pavement",
+            "_dtl",
+            "details",
+            "decal",
+            "wall",
+            "fence",
+            "tunnel",
+        ]
+        .iter()
+        .any(|k| n.contains(k));
         if ex * ey >= 36.0 && ez >= 3.0 && ex.max(ey) <= 250.0 && !groundish {
             return 1;
         }
@@ -299,7 +412,10 @@ struct Strings {
 }
 impl Strings {
     fn new() -> Self {
-        Strings { list: vec![String::new()], map: HashMap::new() }
+        Strings {
+            list: vec![String::new()],
+            map: HashMap::new(),
+        }
     }
     fn id(&mut self, s: &str) -> u32 {
         if let Some(&i) = self.map.get(s) {
@@ -324,13 +440,24 @@ fn glb_tris(j: &Value, bin: &[u8]) -> Vec<(Option<usize>, String, Vec<[f32; 3]>,
     let acc = |i: usize| -> Option<(usize, usize, u64, usize)> {
         let a = &j["accessors"][i];
         let bv = &j["bufferViews"][a["bufferView"].as_u64()? as usize];
-        let off = bv["byteOffset"].as_u64().unwrap_or(0) as usize + a["byteOffset"].as_u64().unwrap_or(0) as usize;
-        Some((off, a["count"].as_u64()? as usize, a["componentType"].as_u64()?, bv["byteStride"].as_u64().unwrap_or(0) as usize))
+        let off = bv["byteOffset"].as_u64().unwrap_or(0) as usize
+            + a["byteOffset"].as_u64().unwrap_or(0) as usize;
+        Some((
+            off,
+            a["count"].as_u64()? as usize,
+            a["componentType"].as_u64()?,
+            bv["byteStride"].as_u64().unwrap_or(0) as usize,
+        ))
     };
     for m in j["meshes"].as_array().into_iter().flatten() {
         let name = m["name"].as_str().unwrap_or("").to_string();
         for p in m["primitives"].as_array().into_iter().flatten() {
-            let Some((po, pn, _, ps)) = p["attributes"]["POSITION"].as_u64().and_then(|i| acc(i as usize)) else { continue };
+            let Some((po, pn, _, ps)) = p["attributes"]["POSITION"]
+                .as_u64()
+                .and_then(|i| acc(i as usize))
+            else {
+                continue;
+            };
             let stride = if ps == 0 { 12 } else { ps };
             if po + pn * stride > bin.len() {
                 continue;
@@ -338,19 +465,35 @@ fn glb_tris(j: &Value, bin: &[u8]) -> Vec<(Option<usize>, String, Vec<[f32; 3]>,
             let pos: Vec<[f32; 3]> = (0..pn)
                 .map(|k| {
                     let o = po + k * stride;
-                    let g = |q: usize| f32::from_le_bytes(bin[o + 4 * q..o + 4 * q + 4].try_into().unwrap());
+                    let g = |q: usize| {
+                        f32::from_le_bytes(bin[o + 4 * q..o + 4 * q + 4].try_into().unwrap())
+                    };
                     [g(0), -g(2), g(1)]
                 })
                 .collect();
             let idx: Vec<u32> = match p["indices"].as_u64().and_then(|i| acc(i as usize)) {
                 Some((io, n, ct, _)) => match ct {
-                    5125 if io + 4 * n <= bin.len() => (0..n).map(|k| u32::from_le_bytes(bin[io + 4 * k..io + 4 * k + 4].try_into().unwrap())).collect(),
-                    5123 if io + 2 * n <= bin.len() => (0..n).map(|k| u16::from_le_bytes(bin[io + 2 * k..io + 2 * k + 2].try_into().unwrap()) as u32).collect(),
+                    5125 if io + 4 * n <= bin.len() => (0..n)
+                        .map(|k| {
+                            u32::from_le_bytes(bin[io + 4 * k..io + 4 * k + 4].try_into().unwrap())
+                        })
+                        .collect(),
+                    5123 if io + 2 * n <= bin.len() => (0..n)
+                        .map(|k| {
+                            u16::from_le_bytes(bin[io + 2 * k..io + 2 * k + 2].try_into().unwrap())
+                                as u32
+                        })
+                        .collect(),
                     _ => continue,
                 },
                 None => (0..pn as u32).collect(),
             };
-            out.push((p["material"].as_u64().map(|m| m as usize), name.clone(), pos, idx));
+            out.push((
+                p["material"].as_u64().map(|m| m as usize),
+                name.clone(),
+                pos,
+                idx,
+            ));
         }
     }
     out
@@ -367,7 +510,16 @@ impl Baker {
     pub fn new(game: &str, work: &str) -> Self {
         let w = PathBuf::from(work);
         let pf = w.join("placements_full").join("placements").join("levels");
-        Baker { out: w.join("out"), placements: if pf.exists() { pf } else { w.join("out").join("placements").join("levels") }, work: w, game: game.to_string() }
+        Baker {
+            out: w.join("out"),
+            placements: if pf.exists() {
+                pf
+            } else {
+                w.join("out").join("placements").join("levels")
+            },
+            work: w,
+            game: game.to_string(),
+        }
     }
     fn mapdir(&self) -> PathBuf {
         self.work.join("map")
@@ -378,13 +530,35 @@ impl Baker {
         let md = self.mapdir();
         std::fs::create_dir_all(&md)?;
         let want = |s: &str| only.is_empty() || only.iter().any(|o| o == s);
-        log(&self.work, &format!("bake start: placements {} out {}", self.placements.display(), self.out.display()));
+        log(
+            &self.work,
+            &format!(
+                "bake start: placements {} out {}",
+                self.placements.display(),
+                self.out.display()
+            ),
+        );
 
         // ---------------- placements
         let (ents, strings, files, interiors) = self.read_placements()?;
-        log(&self.work, &format!("placements: {} entities, {} interiors ({:.0}s)", ents.len(), interiors.len(), t0.elapsed().as_secs_f32()));
+        log(
+            &self.work,
+            &format!(
+                "placements: {} entities, {} interiors ({:.0}s)",
+                ents.len(),
+                interiors.len(),
+                t0.elapsed().as_secs_f32()
+            ),
+        );
         let bounds = self.model_bounds(&strings, &ents)?;
-        log(&self.work, &format!("model bounds: {} ({:.0}s)", bounds.len(), t0.elapsed().as_secs_f32()));
+        log(
+            &self.work,
+            &format!(
+                "model bounds: {} ({:.0}s)",
+                bounds.len(),
+                t0.elapsed().as_secs_f32()
+            ),
+        );
 
         // ---------------- collision top surface
         let top: Vec<AtomicU64> = (0..W * H).map(|_| AtomicU64::new(0)).collect();
@@ -398,15 +572,24 @@ impl Baker {
         } else {
             let b = std::fs::read(md.join("top.bin"))?;
             for (k, v) in top.iter().enumerate() {
-                v.store(u64::from_le_bytes(b[8 * k..8 * k + 8].try_into()?), Ordering::Relaxed);
+                v.store(
+                    u64::from_le_bytes(b[8 * k..8 * k + 8].try_into()?),
+                    Ordering::Relaxed,
+                );
             }
         }
-        log(&self.work, &format!("collision done ({:.0}s)", t0.elapsed().as_secs_f32()));
+        log(
+            &self.work,
+            &format!("collision done ({:.0}s)", t0.elapsed().as_secs_f32()),
+        );
 
         // ---------------- navmesh
         let nav: Vec<AtomicU8> = (0..W * H).map(|_| AtomicU8::new(0)).collect();
         self.navmesh_pass(&nav)?;
-        log(&self.work, &format!("navmesh done ({:.0}s)", t0.elapsed().as_secs_f32()));
+        log(
+            &self.work,
+            &format!("navmesh done ({:.0}s)", t0.elapsed().as_secs_f32()),
+        );
 
         // ---------------- entity rasters
         let (cw, ch) = (W / COARSE, H / COARSE);
@@ -450,7 +633,9 @@ impl Baker {
                 }
                 4 => {
                     let lv = e.lod.max(1);
-                    raster_quad(c, COARSE, cw, ch, |x, y| lod[y * cw + x] = lod[y * cw + x].max(lv));
+                    raster_quad(c, COARSE, cw, ch, |x, y| {
+                        lod[y * cw + x] = lod[y * cw + x].max(lv)
+                    });
                 }
                 _ => {}
             }
@@ -475,7 +660,10 @@ impl Baker {
         }
         // batches (instanced vegetation / props)
         self.batches_pass(&mut veg, &mut prop, cw, ch);
-        log(&self.work, &format!("entity rasters done ({:.0}s)", t0.elapsed().as_secs_f32()));
+        log(
+            &self.work,
+            &format!("entity rasters done ({:.0}s)", t0.elapsed().as_secs_f32()),
+        );
 
         // ---------------- heights 8 m + vector data
         let mut h8 = vec![f32::NAN; cw * ch];
@@ -484,7 +672,9 @@ impl Baker {
                 let mut m = f32::NAN;
                 for dy in 0..COARSE {
                     for dx in 0..COARSE {
-                        if let Some(z) = unhq(top[(y * COARSE + dy) * W + x * COARSE + dx].load(Ordering::Relaxed)) {
+                        if let Some(z) = unhq(
+                            top[(y * COARSE + dy) * W + x * COARSE + dx].load(Ordering::Relaxed),
+                        ) {
                             m = if m.is_nan() { z } else { m.max(z) };
                         }
                     }
@@ -497,7 +687,13 @@ impl Baker {
         std::fs::write(md.join("interiors.json"), serde_json::to_vec(&interiors)?)?;
         self.write_roads(&md)?;
         let nl = self.write_lights(&md, &interiors)?;
-        log(&self.work, &format!("vectors done: {nl} lights ({:.0}s)", t0.elapsed().as_secs_f32()));
+        log(
+            &self.work,
+            &format!(
+                "vectors done: {nl} lights ({:.0}s)",
+                t0.elapsed().as_secs_f32()
+            ),
+        );
 
         // ---------------- local ground (min filter) for the building test
         let mut gmin = vec![f32::NAN; cw * ch];
@@ -506,7 +702,9 @@ impl Baker {
                 let mut m = f32::NAN;
                 for dy in 0..COARSE {
                     for dx in 0..COARSE {
-                        if let Some(z) = unhq(top[(y * COARSE + dy) * W + x * COARSE + dx].load(Ordering::Relaxed)) {
+                        if let Some(z) = unhq(
+                            top[(y * COARSE + dy) * W + x * COARSE + dx].load(Ordering::Relaxed),
+                        ) {
                             m = if m.is_nan() { z } else { m.min(z) };
                         }
                     }
@@ -537,12 +735,29 @@ impl Baker {
 
         // ---------------- tiles
         let zmax = 6u32;
-        let src = Src { ground: &ground, top: &top, nav: &nav, bld: &bld, veg: &veg, prop: &prop, gap_flat: &gap_flat, gap_low: &gap_low, gap_w: &gap_w, lod: &lod, surf: &surf_cat, cw, ch };
+        let src = Src {
+            ground: &ground,
+            top: &top,
+            nav: &nav,
+            bld: &bld,
+            veg: &veg,
+            prop: &prop,
+            gap_flat: &gap_flat,
+            gap_low: &gap_low,
+            gap_w: &gap_w,
+            lod: &lod,
+            surf: &surf_cat,
+            cw,
+            ch,
+        };
         let mut tile_counts = serde_json::Map::new();
         for (layer, _) in LAYERS {
             let n = self.write_pyramid(&md, layer, zmax, &src)?;
             tile_counts.insert(layer.to_string(), json!(n));
-            log(&self.work, &format!("tiles {layer}: {n} ({:.0}s)", t0.elapsed().as_secs_f32()));
+            log(
+                &self.work,
+                &format!("tiles {layer}: {n} ({:.0}s)", t0.elapsed().as_secs_f32()),
+            );
         }
         let meta = json!({
             "x0": X0, "y1": Y1, "cell_m": CELL, "w": W, "h": H, "tile": TILE, "zmax": zmax, "coarse_cells": COARSE,
@@ -555,19 +770,26 @@ impl Baker {
             "seconds": t0.elapsed().as_secs_f64(),
         });
         std::fs::write(md.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
-        log(&self.work, &format!("bake done in {:.0}s", t0.elapsed().as_secs_f32()));
+        log(
+            &self.work,
+            &format!("bake done in {:.0}s", t0.elapsed().as_secs_f32()),
+        );
         Ok(())
     }
 
     #[allow(clippy::type_complexity)]
     fn read_placements(&self) -> Result<(Vec<Ent>, Strings, Vec<String>, Vec<Value>)> {
         let idx = self.placements.join("index.jsonl");
-        let f = BufReader::new(std::fs::File::open(&idx).map_err(|e| anyhow!("{}: {e}", idx.display()))?);
+        let f = BufReader::new(
+            std::fs::File::open(&idx).map_err(|e| anyhow!("{}: {e}", idx.display()))?,
+        );
         let mut files = Vec::new();
         let mut parent_of: HashMap<String, String> = HashMap::new();
         for l in f.lines() {
             let l = l?;
-            let Ok(p) = serde_json::from_str::<PIndex>(&l) else { continue };
+            let Ok(p) = serde_json::from_str::<PIndex>(&l) else {
+                continue;
+            };
             let Some(bb) = p.bbox else { continue };
             if sixng_core::surface::is_local_xy(&bb) {
                 continue; // interior-space entity lists (placed via interiors.jsonl)
@@ -575,7 +797,10 @@ impl Baker {
             if let (Some(id), Some(pid)) = (&p.id, &p.parent_id) {
                 parent_of.insert(id.clone(), pid.clone());
             }
-            let name = Path::new(&p.file).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let name = Path::new(&p.file)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
             files.push(self.placements.join(name));
         }
         let done = AtomicUsize::new(0);
@@ -588,7 +813,14 @@ impl Baker {
                 if n % 2000 == 0 {
                     eprintln!("placements {n}/{}", files.len());
                 }
-                Some((pf.id.unwrap_or_else(|| p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()), pf.entities))
+                Some((
+                    pf.id.unwrap_or_else(|| {
+                        p.file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default()
+                    }),
+                    pf.entities,
+                ))
             })
             .collect();
         let mut strings = Strings::new();
@@ -602,12 +834,25 @@ impl Baker {
             let parent_file = parent_of.get(&id).cloned();
             file_ids.push(id);
             for e in es {
-                let reason = sixng_core::meta7a::render_hint(e.name.as_deref(), e.model_id.is_some());
-                let (pi, ld, cld) = e.lod.as_ref().map(|l| (l.parent_index, l.lod_dist.unwrap_or(-1.0), l.child_lod_dist.unwrap_or(0.0))).unwrap_or((None, -1.0, 0.0));
+                let reason =
+                    sixng_core::meta7a::render_hint(e.name.as_deref(), e.model_id.is_some());
+                let (pi, ld, cld) = e
+                    .lod
+                    .as_ref()
+                    .map(|l| {
+                        (
+                            l.parent_index,
+                            l.lod_dist.unwrap_or(-1.0),
+                            l.child_lod_dist.unwrap_or(0.0),
+                        )
+                    })
+                    .unwrap_or((None, -1.0, 0.0));
                 if let (Some(pi), Some(pf)) = (pi, &parent_file) {
                     pending.push((ents.len(), pf.clone(), pi));
                 }
-                let name = e.name.unwrap_or_else(|| format!("{:08x}", e.archetype.unwrap_or(0)));
+                let name = e
+                    .name
+                    .unwrap_or_else(|| format!("{:08x}", e.archetype.unwrap_or(0)));
                 let model = e.model_id.unwrap_or_default();
                 ents.push(Ent {
                     parent: u32::MAX,
@@ -621,7 +866,11 @@ impl Baker {
                     name: strings.id(&name),
                     model: strings.id(&model),
                     file: fi as u32,
-                    lod: e.lod.and_then(|l| l.level).map(|s| lod_level(&s)).unwrap_or(0),
+                    lod: e
+                        .lod
+                        .and_then(|l| l.level)
+                        .map(|s| lod_level(&s))
+                        .unwrap_or(0),
                     arch: e.archetype.unwrap_or(0) as u32,
                 });
             }
@@ -639,11 +888,21 @@ impl Baker {
         log(&self.work, &format!("LOD parents linked: {linked}"));
         // interiors
         let mut interiors = Vec::new();
-        let ip = self.out.join("placements").join("levels").join("interiors.jsonl");
-        let ip = if ip.exists() { ip } else { self.placements.join("interiors.jsonl") };
+        let ip = self
+            .out
+            .join("placements")
+            .join("levels")
+            .join("interiors.jsonl");
+        let ip = if ip.exists() {
+            ip
+        } else {
+            self.placements.join("interiors.jsonl")
+        };
         if let Ok(f) = std::fs::File::open(&ip) {
             for l in BufReader::new(f).lines().map_while(|l| l.ok()) {
-                let Ok(v) = serde_json::from_str::<Value>(&l) else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(&l) else {
+                    continue;
+                };
                 interiors.push(json!({
                     "archetype": v["archetype"], "interior_file": v["interior_file"], "map": v["map"],
                     "position": v["position"], "rotation_world": v["rotation_world"], "bbox": v["bbox"],
@@ -659,13 +918,23 @@ impl Baker {
     /// drawable root (+0x30 min, +0x40 max). Cached in map/model_bounds.json.
     fn model_bounds(&self, strings: &Strings, ents: &[Ent]) -> Result<HashMap<u32, [f32; 6]>> {
         let cache = self.mapdir().join("model_bounds.json");
-        let mut known: HashMap<String, [f32; 6]> = std::fs::read(&cache).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let mut known: HashMap<String, [f32; 6]> = std::fs::read(&cache)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
         let mut need: Vec<u32> = ents.iter().map(|e| e.model).collect();
         need.sort();
         need.dedup();
-        let missing: Vec<&str> = need.iter().map(|&m| strings.list[m as usize].as_str()).filter(|s| !s.is_empty() && !known.contains_key(*s)).collect();
+        let missing: Vec<&str> = need
+            .iter()
+            .map(|&m| strings.list[m as usize].as_str())
+            .filter(|s| !s.is_empty() && !known.contains_key(*s))
+            .collect();
         if !missing.is_empty() {
-            let ws = sixng_core::export::Workspace::new(&self.game, self.work.to_str().unwrap_or("work"));
+            let ws = sixng_core::export::Workspace::new(
+                &self.game,
+                self.work.to_str().unwrap_or("work"),
+            );
             let mut by_arch: HashMap<&str, Vec<&str>> = HashMap::new();
             for m in &missing {
                 if let Some((a, _)) = m.split_once('@') {
@@ -680,22 +949,39 @@ impl Baker {
                     .par_iter()
                     .filter_map(|id| {
                         let (e, member) = resolver.resolve(&ix.entries, id).ok()?;
-                        let r = if member.is_some() { sixng_core::resource::Resource::load(&a.path, e) } else { sixng_core::resource::Resource::load_sys(&a.path, e) }.ok()?;
+                        let r = if member.is_some() {
+                            sixng_core::resource::Resource::load(&a.path, e)
+                        } else {
+                            sixng_core::resource::Resource::load_sys(&a.path, e)
+                        }
+                        .ok()?;
                         if r.sys.len() < 0x50 {
                             return None;
                         }
                         let d = sixng_core::drawable::model_bounds(&r, member)?;
                         let b = [d[0][0], d[0][1], d[0][2], d[1][0], d[1][1], d[1][2]];
-                        let ok = b.iter().all(|v| v.is_finite() && v.abs() < 20000.0) && b[3] >= b[0] && b[4] >= b[1];
+                        let ok = b.iter().all(|v| v.is_finite() && v.abs() < 20000.0)
+                            && b[3] >= b[0]
+                            && b[4] >= b[1];
                         ok.then(|| (id.to_string(), b))
                     })
                     .collect();
-                log(&self.work, &format!("bounds {arch}: {} of {}", res.len(), ids.len()));
+                log(
+                    &self.work,
+                    &format!("bounds {arch}: {} of {}", res.len(), ids.len()),
+                );
                 known.extend(res);
             }
             std::fs::write(&cache, serde_json::to_vec(&known)?)?;
         }
-        Ok(need.into_iter().filter_map(|m| known.get(strings.list[m as usize].as_str()).map(|b| (m, *b))).collect())
+        Ok(need
+            .into_iter()
+            .filter_map(|m| {
+                known
+                    .get(strings.list[m as usize].as_str())
+                    .map(|b| (m, *b))
+            })
+            .collect())
     }
 
     fn collision_pass(&self, top: &[AtomicU64]) -> Result<()> {
@@ -709,26 +995,47 @@ impl Baker {
         }
         for l in f.lines() {
             let l = l?;
-            let Ok(c) = serde_json::from_str::<CI>(&l) else { continue };
+            let Ok(c) = serde_json::from_str::<CI>(&l) else {
+                continue;
+            };
             let Some(bb) = c.bbox else { continue };
             if sixng_core::surface::is_local_xy(&bb) {
                 continue;
             }
-            let name = Path::new(&c.file).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let name = Path::new(&c.file)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
             files.push(dir.join(name));
         }
-        log(&self.work, &format!("collision files (world space): {}", files.len()));
+        log(
+            &self.work,
+            &format!("collision files (world space): {}", files.len()),
+        );
         let done = AtomicUsize::new(0);
         files.par_iter().for_each(|p| {
             let Ok((j, bin)) = read_glb(p) else { return };
             for (_, name, pos, idx) in glb_tris(&j, &bin) {
-                let surf = name.strip_prefix("surface_").and_then(|s| u16::from_str_radix(s, 16).ok()).unwrap_or(0xffff) as u64;
+                let surf = name
+                    .strip_prefix("surface_")
+                    .and_then(|s| u16::from_str_radix(s, 16).ok())
+                    .unwrap_or(0xffff) as u64;
                 for t in idx.chunks_exact(3) {
-                    let (Some(a), Some(b), Some(c)) = (pos.get(t[0] as usize), pos.get(t[1] as usize), pos.get(t[2] as usize)) else { continue };
+                    let (Some(a), Some(b), Some(c)) = (
+                        pos.get(t[0] as usize),
+                        pos.get(t[1] as usize),
+                        pos.get(t[2] as usize),
+                    ) else {
+                        continue;
+                    };
                     // skip vertical faces
                     let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
                     let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-                    let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+                    let n = [
+                        u[1] * v[2] - u[2] * v[1],
+                        u[2] * v[0] - u[0] * v[2],
+                        u[0] * v[1] - u[1] * v[0],
+                    ];
                     let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
                     if l < 1e-9 || (n[2] / l).abs() < 0.2 {
                         continue;
@@ -752,14 +1059,33 @@ impl Baker {
 
     fn navmesh_pass(&self, nav: &[AtomicU8]) -> Result<()> {
         let dir = self.out.join("navmesh").join("navmeshes");
-        let files: Vec<PathBuf> = std::fs::read_dir(&dir).map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.extension().map(|x| x == "glb").unwrap_or(false)).collect()).unwrap_or_default();
+        let files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().map(|x| x == "glb").unwrap_or(false))
+                    .collect()
+            })
+            .unwrap_or_default();
         files.par_iter().for_each(|p| {
             let Ok((j, bin)) = read_glb(p) else { return };
             for (mat, _, pos, idx) in glb_tris(&j, &bin) {
-                let road = mat.map(|m| j["materials"][m]["extras"]["road"].as_bool().unwrap_or(false)).unwrap_or(false);
+                let road = mat
+                    .map(|m| {
+                        j["materials"][m]["extras"]["road"]
+                            .as_bool()
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
                 let bit = if road { 1 } else { 2 };
                 for t in idx.chunks_exact(3) {
-                    let (Some(a), Some(b), Some(c)) = (pos.get(t[0] as usize), pos.get(t[1] as usize), pos.get(t[2] as usize)) else { continue };
+                    let (Some(a), Some(b), Some(c)) = (
+                        pos.get(t[0] as usize),
+                        pos.get(t[1] as usize),
+                        pos.get(t[2] as usize),
+                    ) else {
+                        continue;
+                    };
                     let q = |w: &[f32; 3]| {
                         let (x, y) = cell_of(w[0], w[1]);
                         [x, y, w[2]]
@@ -774,16 +1100,35 @@ impl Baker {
     }
 
     fn batches_pass(&self, veg: &mut [f32], prop: &mut [f32], cw: usize, ch: usize) {
-        let p = self.out.join("placements").join("levels").join("batches.jsonl");
-        let Ok(f) = std::fs::File::open(&p) else { return };
+        let p = self
+            .out
+            .join("placements")
+            .join("levels")
+            .join("batches.jsonl");
+        let Ok(f) = std::fs::File::open(&p) else {
+            return;
+        };
         for l in BufReader::new(f).lines().map_while(|l| l.ok()) {
-            let Ok(v) = serde_json::from_str::<Value>(&l) else { continue };
-            let Ok(bb) = serde_json::from_value::<[[f32; 3]; 2]>(v["bbox"].clone()) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(&l) else {
+                continue;
+            };
+            let Ok(bb) = serde_json::from_value::<[[f32; 3]; 2]>(v["bbox"].clone()) else {
+                continue;
+            };
             let n = v["count"].as_f64().unwrap_or(0.0) as f32;
-            let grass = v["kind"].as_str().map(|k| k == "grass").unwrap_or(false) || v["name"].as_str().map(|s| s.starts_with("veg_")).unwrap_or(false);
+            let grass = v["kind"].as_str().map(|k| k == "grass").unwrap_or(false)
+                || v["name"]
+                    .as_str()
+                    .map(|s| s.starts_with("veg_"))
+                    .unwrap_or(false);
             let (x0, y0) = cell_of(bb[0][0], bb[1][1]);
             let (x1, y1) = cell_of(bb[1][0], bb[0][1]);
-            let (x0, y0, x1, y1) = ((x0 as i64 / COARSE as i64).max(0), (y0 as i64 / COARSE as i64).max(0), (x1 as i64 / COARSE as i64).min(cw as i64 - 1), (y1 as i64 / COARSE as i64).min(ch as i64 - 1));
+            let (x0, y0, x1, y1) = (
+                (x0 as i64 / COARSE as i64).max(0),
+                (y0 as i64 / COARSE as i64).max(0),
+                (x1 as i64 / COARSE as i64).min(cw as i64 - 1),
+                (y1 as i64 / COARSE as i64).min(ch as i64 - 1),
+            );
             if x0 > x1 || y0 > y1 {
                 continue;
             }
@@ -804,22 +1149,49 @@ impl Baker {
     /// model id -> (flat share, lowmip share) of its materials.
     fn read_gaps(&self) -> HashMap<String, (f32, f32)> {
         let mut m = HashMap::new();
-        let Ok(f) = std::fs::File::open(self.work.join("texture_gaps_models.jsonl.gz")) else { return m };
+        let Ok(f) = std::fs::File::open(self.work.join("texture_gaps_models.jsonl.gz")) else {
+            return m;
+        };
         let r = BufReader::new(flate2::read::GzDecoder::new(f));
         for l in r.lines().map_while(|l| l.ok()) {
-            let Ok(v) = serde_json::from_str::<Value>(&l) else { continue };
-            let Some(id) = v["model_id"].as_str() else { continue };
-            let mats = v["materials"].as_array().map(|a| a.len()).unwrap_or(0).max(1) as f32;
-            let flat = v["materials"].as_array().map(|a| a.iter().filter(|x| x["status"] == "flat").count()).unwrap_or(0) as f32;
-            let low = v["materials"].as_array().map(|a| a.iter().filter(|x| x["status"] == "lowmip").count()).unwrap_or(0) as f32;
+            let Ok(v) = serde_json::from_str::<Value>(&l) else {
+                continue;
+            };
+            let Some(id) = v["model_id"].as_str() else {
+                continue;
+            };
+            let mats = v["materials"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0)
+                .max(1) as f32;
+            let flat = v["materials"]
+                .as_array()
+                .map(|a| a.iter().filter(|x| x["status"] == "flat").count())
+                .unwrap_or(0) as f32;
+            let low = v["materials"]
+                .as_array()
+                .map(|a| a.iter().filter(|x| x["status"] == "lowmip").count())
+                .unwrap_or(0) as f32;
             // materials not listed are fine; the record lists affected ones only
-            let total = v["material_count"].as_f64().map(|x| x as f32).unwrap_or(mats);
+            let total = v["material_count"]
+                .as_f64()
+                .map(|x| x as f32)
+                .unwrap_or(mats);
             m.insert(id.to_string(), (flat / total, low / total));
         }
         m
     }
 
-    fn write_entities(&self, md: &Path, ents: &[Ent], kinds: &[u8], bounds: &HashMap<u32, [f32; 6]>, strings: &Strings, files: &[String]) -> Result<()> {
+    fn write_entities(
+        &self,
+        md: &Path,
+        ents: &[Ent],
+        kinds: &[u8],
+        bounds: &HashMap<u32, [f32; 6]>,
+        strings: &Strings,
+        files: &[String],
+    ) -> Result<()> {
         let mut f = std::io::BufWriter::new(std::fs::File::create(md.join("entities.bin"))?);
         for (e, &k) in ents.iter().zip(kinds) {
             let known = bounds.get(&e.model).copied();
@@ -853,43 +1225,92 @@ impl Baker {
             };
             f.write_all(bytemuck::bytes_of(&rec))?;
         }
-        std::fs::write(md.join("strings.json"), serde_json::to_vec(&json!({"strings": strings.list, "files": files}))?)?;
+        std::fs::write(
+            md.join("strings.json"),
+            serde_json::to_vec(&json!({"strings": strings.list, "files": files}))?,
+        )?;
         Ok(())
     }
 
     fn write_roads(&self, md: &Path) -> Result<()> {
         let p = self.out.join("paths").join("levels").join("graph.json");
-        let Ok(b) = std::fs::read(&p) else { return Ok(()) };
+        let Ok(b) = std::fs::read(&p) else {
+            return Ok(());
+        };
         let g: Value = serde_json::from_slice(&b)?;
         let nodes = g["nodes"].as_array().cloned().unwrap_or_default();
-        let np = |i: usize| -> Option<[f32; 3]> { serde_json::from_value(nodes.get(i)?["p"].clone()).ok() };
+        let np = |i: usize| -> Option<[f32; 3]> {
+            serde_json::from_value(nodes.get(i)?["p"].clone()).ok()
+        };
         let mut links = Vec::new();
         for l in g["links"].as_array().into_iter().flatten() {
-            let (Some(a), Some(b)) = (l["from"].as_u64(), l["to"].as_u64()) else { continue };
-            let (Some(pa), Some(pb)) = (np(a as usize), np(b as usize)) else { continue };
+            let (Some(a), Some(b)) = (l["from"].as_u64(), l["to"].as_u64()) else {
+                continue;
+            };
+            let (Some(pa), Some(pb)) = (np(a as usize), np(b as usize)) else {
+                continue;
+            };
             let na = &nodes[a as usize];
             let flags = l["flags"].as_u64().unwrap_or(0);
             links.push(json!([
-                pa[0], pa[1], pa[2], pb[0], pb[1], pb[2],
-                na["speed"].as_f64().unwrap_or(0.0), l["lanes_from"], l["lanes_to"], flags,
-                na["road_class"], na["kind"], a, b
+                pa[0],
+                pa[1],
+                pa[2],
+                pb[0],
+                pb[1],
+                pb[2],
+                na["speed"].as_f64().unwrap_or(0.0),
+                l["lanes_from"],
+                l["lanes_to"],
+                flags,
+                na["road_class"],
+                na["kind"],
+                a,
+                b
             ]));
         }
         let mut nflags = Vec::new();
         for n in &nodes {
-            nflags.push(json!([n["p"], n["flag_names"], n["speed"], n["density"], n["street"]]));
+            nflags.push(json!([
+                n["p"],
+                n["flag_names"],
+                n["speed"],
+                n["density"],
+                n["street"]
+            ]));
         }
-        std::fs::write(md.join("roads.json"), serde_json::to_vec(&json!({"links": links, "nodes": nflags, "flags_note": g["flags_note"]}))?)?;
+        std::fs::write(
+            md.join("roads.json"),
+            serde_json::to_vec(
+                &json!({"links": links, "nodes": nflags, "flags_note": g["flags_note"]}),
+            )?,
+        )?;
         let mut juncs = Vec::new();
         for jn in g["junctions"].as_array().into_iter().flatten() {
-            let Some(n) = jn["node"].as_u64() else { continue };
+            let Some(n) = jn["node"].as_u64() else {
+                continue;
+            };
             let Some(p) = np(n as usize) else { continue };
             let ents = jn["entrances"].as_array().cloned().unwrap_or_default();
-            let stop = ents.iter().filter(|e| e["stop"].as_bool() == Some(true)).count();
-            let yld = ents.iter().filter(|e| e["yield"].as_bool() == Some(true)).count();
+            let stop = ents
+                .iter()
+                .filter(|e| e["stop"].as_bool() == Some(true))
+                .count();
+            let yld = ents
+                .iter()
+                .filter(|e| e["yield"].as_bool() == Some(true))
+                .count();
             let phases: Vec<Value> = jn["phases"].as_array().cloned().unwrap_or_default();
-            let entr: Vec<Value> = ents.iter().filter_map(|e| np(e["node"].as_u64()? as usize).map(|q| json!([q[0], q[1], e["stop"], e["yield"]]))).collect();
-            juncs.push(json!({"p": p, "entrances": entr, "stop": stop, "yield": yld, "phases": phases}));
+            let entr: Vec<Value> = ents
+                .iter()
+                .filter_map(|e| {
+                    np(e["node"].as_u64()? as usize)
+                        .map(|q| json!([q[0], q[1], e["stop"], e["yield"]]))
+                })
+                .collect();
+            juncs.push(
+                json!({"p": p, "entrances": entr, "stop": stop, "yield": yld, "phases": phases}),
+            );
         }
         std::fs::write(md.join("junctions.json"), serde_json::to_vec(&juncs)?)?;
         Ok(())
@@ -900,7 +1321,10 @@ impl Baker {
         // (archetype, light) -> time mask, falloff exponent
         let mut sets: HashMap<(String, u64), (u32, f32)> = HashMap::new();
         if let Ok(f) = std::fs::File::open(dir.join("sets.jsonl")) {
-            for l in BufReader::with_capacity(1 << 20, f).lines().map_while(|l| l.ok()) {
+            for l in BufReader::with_capacity(1 << 20, f)
+                .lines()
+                .map_while(|l| l.ok())
+            {
                 #[derive(Deserialize)]
                 struct L {
                     time_flags: Option<String>,
@@ -911,17 +1335,33 @@ impl Baker {
                     archetype: String,
                     lights: Vec<L>,
                 }
-                let Ok(s) = serde_json::from_str::<S>(&l) else { continue };
+                let Ok(s) = serde_json::from_str::<S>(&l) else {
+                    continue;
+                };
                 for (k, li) in s.lights.iter().enumerate() {
-                    let m = li.time_flags.as_deref().and_then(|t| u32::from_str_radix(t, 16).ok()).unwrap_or(0xff_ffff) & 0xff_ffff;
-                    sets.insert((s.archetype.clone(), k as u64), (m, li.falloff_exponent.unwrap_or(8.0)));
+                    let m = li
+                        .time_flags
+                        .as_deref()
+                        .and_then(|t| u32::from_str_radix(t, 16).ok())
+                        .unwrap_or(0xff_ffff)
+                        & 0xff_ffff;
+                    sets.insert(
+                        (s.archetype.clone(), k as u64),
+                        (m, li.falloff_exponent.unwrap_or(8.0)),
+                    );
                 }
             }
         }
         // interior instances by interior file
         let mut inst: HashMap<String, Vec<([f32; 3], [f32; 4])>> = HashMap::new();
         for v in interiors {
-            let (Some(f), Ok(p), Ok(q)) = (v["interior_file"].as_str(), serde_json::from_value::<[f32; 3]>(v["position"].clone()), serde_json::from_value::<[f32; 4]>(v["rotation_world"].clone())) else { continue };
+            let (Some(f), Ok(p), Ok(q)) = (
+                v["interior_file"].as_str(),
+                serde_json::from_value::<[f32; 3]>(v["position"].clone()),
+                serde_json::from_value::<[f32; 4]>(v["rotation_world"].clone()),
+            ) else {
+                continue;
+            };
             inst.entry(f.to_string()).or_default().push((p, q));
         }
         let rot = |q: [f32; 4], v: [f32; 3]| -> [f32; 3] {
@@ -945,25 +1385,47 @@ impl Baker {
             #[serde(rename = "type")]
             ty: Option<u8>,
         }
-        for l in BufReader::with_capacity(1 << 20, f).lines().map_while(|l| l.ok()) {
-            let Ok(w) = serde_json::from_str::<WL>(&l) else { continue };
+        for l in BufReader::with_capacity(1 << 20, f)
+            .lines()
+            .map_while(|l| l.ok())
+        {
+            let Ok(w) = serde_json::from_str::<WL>(&l) else {
+                continue;
+            };
             let c = u32::from_str_radix(&w.colour, 16).unwrap_or(0xffffff);
-            let (mask, fexp) = sets.get(&(w.archetype.clone(), w.light)).copied().unwrap_or((0xff_ffff, 8.0));
+            let (mask, fexp) = sets
+                .get(&(w.archetype.clone(), w.light))
+                .copied()
+                .unwrap_or((0xff_ffff, 8.0));
             let night = w.night_only.unwrap_or(false);
             let interior_map = inst.contains_key(&w.map);
             let positions: Vec<[f32; 3]> = if w.space == "world" {
                 vec![w.p]
             } else {
-                inst.get(&w.map).map(|v| v.iter().map(|(p, q)| {
-                    let r = rot(*q, w.p);
-                    [p[0] + r[0], p[1] + r[1], p[2] + r[2]]
-                }).collect()).unwrap_or_default()
+                inst.get(&w.map)
+                    .map(|v| {
+                        v.iter()
+                            .map(|(p, q)| {
+                                let r = rot(*q, w.p);
+                                [p[0] + r[0], p[1] + r[1], p[2] + r[2]]
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
             };
             for p in positions {
                 let rec = LightRec {
                     pos: p,
                     rgb_type: [(c >> 16) as u8, (c >> 8) as u8, c as u8, w.ty.unwrap_or(0)],
-                    mask: if mask == 0 { if night { 0xe0_007f } else { 0xff_ffff } } else { mask },
+                    mask: if mask == 0 {
+                        if night {
+                            0xe0_007f
+                        } else {
+                            0xff_ffff
+                        }
+                    } else {
+                        mask
+                    },
                     intensity: w.intensity.unwrap_or(1.0),
                     range: w.range.unwrap_or(1.0),
                     flags: (interior_map || w.space != "world") as u8 | ((night as u8) << 1),
@@ -980,10 +1442,19 @@ impl Baker {
 
     fn surface_categories(&self) -> SurfPal {
         let mut cat: HashMap<u16, String> = HashMap::new();
-        if let Some(v) = std::fs::read(self.out.join("collision").join("levels").join("surface_categories.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
+        if let Some(v) = std::fs::read(
+            self.out
+                .join("collision")
+                .join("levels")
+                .join("surface_categories.json"),
+        )
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        {
             if let Some(o) = v["surfaces"].as_object() {
                 for (k, s) in o {
-                    if let (Ok(id), Some(c)) = (u16::from_str_radix(k, 16), s["category"].as_str()) {
+                    if let (Ok(id), Some(c)) = (u16::from_str_radix(k, 16), s["category"].as_str())
+                    {
                         cat.insert(id, c.to_string());
                     }
                 }
@@ -1029,7 +1500,19 @@ impl Baker {
         loop {
             let dir = base.join(z.to_string());
             std::fs::create_dir_all(&dir)?;
-            count += cur.par_iter().filter(|(&(x, y), px)| image::save_buffer(dir.join(format!("{x}_{y}.png")), px, TILE as u32, TILE as u32, image::ExtendedColorType::Rgba8).is_ok()).count();
+            count += cur
+                .par_iter()
+                .filter(|(&(x, y), px)| {
+                    image::save_buffer(
+                        dir.join(format!("{x}_{y}.png")),
+                        px,
+                        TILE as u32,
+                        TILE as u32,
+                        image::ExtendedColorType::Rgba8,
+                    )
+                    .is_ok()
+                })
+                .count();
             if z == 0 {
                 break;
             }
@@ -1038,7 +1521,10 @@ impl Baker {
                 .into_par_iter()
                 .filter_map(|k| {
                     let (x, y) = (k % nw, k / nw);
-                    let kids: Vec<Option<&Vec<u8>>> = [(0, 0), (1, 0), (0, 1), (1, 1)].iter().map(|(dx, dy)| cur.get(&(2 * x + dx, 2 * y + dy))).collect();
+                    let kids: Vec<Option<&Vec<u8>>> = [(0, 0), (1, 0), (0, 1), (1, 1)]
+                        .iter()
+                        .map(|(dx, dy)| cur.get(&(2 * x + dx, 2 * y + dy)))
+                        .collect();
                     if kids.iter().all(|k| k.is_none()) {
                         return None;
                     }
@@ -1153,8 +1639,14 @@ pub fn category_colour(c: &str) -> [u8; 3] {
     } else if has("metal") {
         [120, 140, 160]
     } else {
-        let h = c.bytes().fold(2166136261u32, |a, b| (a ^ b as u32).wrapping_mul(16777619));
-        [(80 + (h & 0x7f)) as u8, (80 + ((h >> 8) & 0x7f)) as u8, (80 + ((h >> 16) & 0x7f)) as u8]
+        let h = c
+            .bytes()
+            .fold(2166136261u32, |a, b| (a ^ b as u32).wrapping_mul(16777619));
+        [
+            (80 + (h & 0x7f)) as u8,
+            (80 + ((h >> 8) & 0x7f)) as u8,
+            (80 + ((h >> 16) & 0x7f)) as u8,
+        ]
     }
 }
 
@@ -1169,7 +1661,12 @@ impl SurfPal {
         }
     }
     fn legend(&self) -> Value {
-        Value::Array(self.names.iter().map(|n| json!([n, category_colour(n)])).collect())
+        Value::Array(
+            self.names
+                .iter()
+                .map(|n| json!([n, category_colour(n)]))
+                .collect(),
+        )
     }
 }
 
@@ -1190,13 +1687,25 @@ struct Src<'a> {
 }
 
 fn hypso(z: f32) -> [f32; 3] {
-    let stops: [(f32, [f32; 3]); 7] = [(-50.0, [0.20, 0.35, 0.55]), (0.0, [0.55, 0.60, 0.45]), (15.0, [0.50, 0.62, 0.38]), (60.0, [0.62, 0.66, 0.42]), (150.0, [0.70, 0.62, 0.45]), (350.0, [0.62, 0.55, 0.48]), (800.0, [0.95, 0.95, 0.95])];
+    let stops: [(f32, [f32; 3]); 7] = [
+        (-50.0, [0.20, 0.35, 0.55]),
+        (0.0, [0.55, 0.60, 0.45]),
+        (15.0, [0.50, 0.62, 0.38]),
+        (60.0, [0.62, 0.66, 0.42]),
+        (150.0, [0.70, 0.62, 0.45]),
+        (350.0, [0.62, 0.55, 0.48]),
+        (800.0, [0.95, 0.95, 0.95]),
+    ];
     for k in 0..stops.len() - 1 {
         let (a, ca) = stops[k];
         let (b, cb) = stops[k + 1];
         if z <= b {
             let t = ((z - a) / (b - a)).clamp(0.0, 1.0);
-            return [ca[0] + (cb[0] - ca[0]) * t, ca[1] + (cb[1] - ca[1]) * t, ca[2] + (cb[2] - ca[2]) * t];
+            return [
+                ca[0] + (cb[0] - ca[0]) * t,
+                ca[1] + (cb[1] - ca[1]) * t,
+                ca[2] + (cb[2] - ca[2]) * t,
+            ];
         }
     }
     stops[stops.len() - 1].1
@@ -1211,15 +1720,24 @@ impl Src<'_> {
         let ck = (r / COARSE).min(self.ch - 1) * self.cw + (c / COARSE).min(self.cw - 1);
         match layer {
             "terrain" => {
-                let Some(z) = self.h(c, r) else { return [40, 80, 140, 255] };
-                let zx = self.h(c + 1, r).unwrap_or(z) - self.h(c.saturating_sub(1), r).unwrap_or(z);
-                let zy = self.h(c, r + 1).unwrap_or(z) - self.h(c, r.saturating_sub(1)).unwrap_or(z);
+                let Some(z) = self.h(c, r) else {
+                    return [40, 80, 140, 255];
+                };
+                let zx =
+                    self.h(c + 1, r).unwrap_or(z) - self.h(c.saturating_sub(1), r).unwrap_or(z);
+                let zy =
+                    self.h(c, r + 1).unwrap_or(z) - self.h(c, r.saturating_sub(1)).unwrap_or(z);
                 // light from the north-west
                 let n = glam::Vec3::new(-zx / (2.0 * CELL), zy / (2.0 * CELL), 1.0).normalize();
                 let l = glam::Vec3::new(-0.5, 0.5, 0.7).normalize();
                 let shade = (n.dot(l)).clamp(0.0, 1.0) * 0.75 + 0.35;
                 let t = hypso(z);
-                [(t[0] * shade * 255.0).min(255.0) as u8, (t[1] * shade * 255.0).min(255.0) as u8, (t[2] * shade * 255.0).min(255.0) as u8, 255]
+                [
+                    (t[0] * shade * 255.0).min(255.0) as u8,
+                    (t[1] * shade * 255.0).min(255.0) as u8,
+                    (t[2] * shade * 255.0).min(255.0) as u8,
+                    255,
+                ]
             }
             "surfaces" => {
                 let v = self.top[k].load(Ordering::Relaxed);
@@ -1240,9 +1758,18 @@ impl Src<'_> {
                     // keep footprint cells that stand clear of the local ground
                     let g = self.ground[ck];
                     match self.h(c, r) {
-                        Some(z) if !g.is_nan() && z - g > 3.0 && self.nav[k].load(Ordering::Relaxed) & 1 == 0 => {
+                        Some(z)
+                            if !g.is_nan()
+                                && z - g > 3.0
+                                && self.nav[k].load(Ordering::Relaxed) & 1 == 0 =>
+                        {
                             let t = ((z - g) / 60.0).clamp(0.0, 1.0);
-                            [(235.0 - 60.0 * t) as u8, (120.0 - 40.0 * t) as u8, (60.0 + 120.0 * t) as u8, 230]
+                            [
+                                (235.0 - 60.0 * t) as u8,
+                                (120.0 - 40.0 * t) as u8,
+                                (60.0 + 120.0 * t) as u8,
+                                230,
+                            ]
                         }
                         _ => [0, 0, 0, 0],
                     }
@@ -1263,7 +1790,12 @@ impl Src<'_> {
                 if v + p < 0.01 {
                     return [0, 0, 0, 0];
                 }
-                [(p * 255.0) as u8, (v * 220.0) as u8, (p * 200.0) as u8, (((v + p).min(1.0)) * 200.0 + 40.0) as u8]
+                [
+                    (p * 255.0) as u8,
+                    (v * 220.0) as u8,
+                    (p * 200.0) as u8,
+                    (((v + p).min(1.0)) * 200.0 + 40.0) as u8,
+                ]
             }
             "gaps" => {
                 let w = self.gap_w[ck];
@@ -1273,16 +1805,30 @@ impl Src<'_> {
                 let f = (self.gap_flat[ck] / w).clamp(0.0, 1.0);
                 let l = (self.gap_low[ck] / w).clamp(0.0, 1.0);
                 let s = (f + 0.5 * l).clamp(0.0, 1.0);
-                let col = if f >= l { [230, 40, 40] } else { [240, 180, 30] };
+                let col = if f >= l {
+                    [230, 40, 40]
+                } else {
+                    [240, 180, 30]
+                };
                 let g = [50.0, 170.0, 80.0];
                 let mix = |a: f32, b: f32| (a + (b - a) * s) as u8;
-                [mix(g[0], col[0] as f32), mix(g[1], col[1] as f32), mix(g[2], col[2] as f32), (90.0 + 140.0 * s) as u8]
+                [
+                    mix(g[0], col[0] as f32),
+                    mix(g[1], col[1] as f32),
+                    mix(g[2], col[2] as f32),
+                    (90.0 + 140.0 * s) as u8,
+                ]
             }
             "lod" => match self.lod[ck] {
                 0 => [0, 0, 0, 0],
                 v => {
                     let t = (v as f32 / 5.0).min(1.0);
-                    [(80.0 + 120.0 * (1.0 - t)) as u8, (60.0 + 80.0 * (1.0 - t)) as u8, (180.0 - 60.0 * t) as u8, (40.0 + 15.0 * v as f32) as u8]
+                    [
+                        (80.0 + 120.0 * (1.0 - t)) as u8,
+                        (60.0 + 80.0 * (1.0 - t)) as u8,
+                        (180.0 - 60.0 * t) as u8,
+                        (40.0 + 15.0 * v as f32) as u8,
+                    ]
                 }
             },
             _ => [0, 0, 0, 0],

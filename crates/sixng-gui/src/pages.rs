@@ -1,7 +1,7 @@
 //! App pages around the viewers: the first-run setup wizard, Settings,
 //! Status, and the Ctrl+K search palette.
 
-use crate::{save_settings, AppSettings, App, Tab};
+use crate::{save_settings, App, AppSettings, Tab};
 use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -68,7 +68,10 @@ const PAGES: &[(Tab, &str)] = &[
 ];
 
 fn now() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn tree_size(p: &Path) -> (u64, u64) {
@@ -76,7 +79,9 @@ fn tree_size(p: &Path) -> (u64, u64) {
     let mut files = 0;
     let mut stack = vec![p.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
         for e in rd.flatten() {
             let Ok(ft) = e.file_type() else { continue };
             if ft.is_dir() {
@@ -94,14 +99,25 @@ fn tree_size(p: &Path) -> (u64, u64) {
 /// a folder is the game install.
 fn count_rpf(dir: &str) -> usize {
     let mut n = 0;
-    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
     for e in rd.flatten() {
         let p = e.path();
-        if p.extension().map_or(false, |x| x.eq_ignore_ascii_case("rpf")) {
+        if p.extension()
+            .map_or(false, |x| x.eq_ignore_ascii_case("rpf"))
+        {
             n += 1;
         } else if p.is_dir() {
             if let Ok(rd2) = std::fs::read_dir(&p) {
-                n += rd2.flatten().filter(|e| e.path().extension().map_or(false, |x| x.eq_ignore_ascii_case("rpf"))).count();
+                n += rd2
+                    .flatten()
+                    .filter(|e| {
+                        e.path()
+                            .extension()
+                            .map_or(false, |x| x.eq_ignore_ascii_case("rpf"))
+                    })
+                    .count();
             }
         }
     }
@@ -151,7 +167,13 @@ impl App {
         let mut changed = false;
         ui.label(label);
         ui.horizontal(|ui| {
-            changed |= ui.add(egui::TextEdit::singleline(v).desired_width(420.0).hint_text(hint)).changed();
+            changed |= ui
+                .add(
+                    egui::TextEdit::singleline(v)
+                        .desired_width(420.0)
+                        .hint_text(hint),
+                )
+                .changed();
             if ui.button("Browse…").clicked() {
                 if let Some(p) = rfd::FileDialog::new().pick_folder() {
                     *v = p.display().to_string();
@@ -164,12 +186,13 @@ impl App {
     }
 
     /// First-run wizard: folders, then what to prepare, then progress.
-    pub(crate) fn setup_ui(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    pub(crate) fn setup_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(16.0);
-                    let logo = crate::banner(ctx);
+                    let logo = crate::banner(&ctx);
                     let s = logo.size_vec2();
                     ui.image((logo.id(), s * (90.0 / s.y)));
                     ui.add_space(6.0);
@@ -191,23 +214,48 @@ impl App {
 
     fn setup_folders(&mut self, ui: &mut egui::Ui) {
         ui.strong("1. Folders");
-        egui::Grid::new("setup_folders").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-            Self::folder_row(ui, "Game folder", &mut self.game, "the GTA VI install (contains the .rpf archives)");
-            Self::folder_row(ui, "Work folder", &mut self.work, "indexes, map bake, caches and exports");
-        });
+        egui::Grid::new("setup_folders")
+            .num_columns(2)
+            .spacing([10.0, 8.0])
+            .show(ui, |ui| {
+                Self::folder_row(
+                    ui,
+                    "Game folder",
+                    &mut self.game,
+                    "the GTA VI install (contains the .rpf archives)",
+                );
+                Self::folder_row(
+                    ui,
+                    "Work folder",
+                    &mut self.work,
+                    "indexes, map bake, caches and exports",
+                );
+            });
         let n = count_rpf(self.game.trim());
         let ok = n > 0;
         if self.game.trim().is_empty() {
             ui.weak("Pick the game folder.");
         } else if ok {
-            ui.colored_label(egui::Color32::from_rgb(120, 200, 120), format!("✔ {n} archives found."));
+            ui.colored_label(
+                egui::Color32::from_rgb(120, 200, 120),
+                format!("✔ {n} archives found."),
+            );
         } else {
-            ui.colored_label(egui::Color32::from_rgb(230, 150, 90), "No .rpf archives in this folder (or one level down). Is it the game install?");
+            ui.colored_label(
+                egui::Color32::from_rgb(230, 150, 90),
+                "No .rpf archives in this folder (or one level down). Is it the game install?",
+            );
         }
         ui.weak("The work folder needs room: about 1 GB for the indexes, 5–15 GB for world data and the map, more for exports.");
         ui.add_space(10.0);
         ui.horizontal(|ui| {
-            if ui.add_enabled(ok && !self.work.trim().is_empty(), egui::Button::new("Next ▶")).clicked() {
+            if ui
+                .add_enabled(
+                    ok && !self.work.trim().is_empty(),
+                    egui::Button::new("Next ▶"),
+                )
+                .clicked()
+            {
                 self.game = self.game.trim().to_string();
                 self.work = self.work.trim().to_string();
                 if !Path::new(&self.out).is_absolute() || self.out.is_empty() {
@@ -223,7 +271,10 @@ impl App {
                 let ws = self.ws();
                 let missing = self.rpf_archives().filter(|a| !ws.is_indexed(a)).count();
                 self.setup.index_all = missing > 0;
-                self.setup.link = !Path::new(&self.work).join("index").join("archetype_links.json").exists();
+                self.setup.link = !Path::new(&self.work)
+                    .join("index")
+                    .join("archetype_links.json")
+                    .exists();
                 let (req, _) = crate::bakejob::BakeJob::missing_inputs(&self.work);
                 self.setup.world = !req.is_empty();
                 self.setup.bake = !Path::new(&self.work).join("map").join("meta.json").exists();
@@ -247,7 +298,10 @@ impl App {
         let indexed = self.rpf_archives().filter(|a| ws.is_indexed(a)).count();
         let (req, opt) = crate::bakejob::BakeJob::missing_inputs(&self.work);
         let baked = Path::new(&self.work).join("map").join("meta.json").exists();
-        let links = Path::new(&self.work).join("index").join("archetype_links.json").exists();
+        let links = Path::new(&self.work)
+            .join("index")
+            .join("archetype_links.json")
+            .exists();
         let s = &mut self.setup;
         ui.checkbox(&mut s.index_all, format!("Index the archives ({indexed} of {total} done)"))
             .on_hover_text("Finds every file inside the archives and recovers names. Needed for everything else. About 10–30 minutes the first time, ~1 GB.");
@@ -255,10 +309,25 @@ impl App {
             .on_hover_text("Matches map entries whose model name is unknown to the right model by shape. Optional; makes more of the map show up. A few minutes.");
         ui.checkbox(&mut s.world, format!("Export world data{}", if req.is_empty() { " (done)".to_string() } else { format!(" (missing: {})", req.join(", ")) }))
             .on_hover_text("Placements, collision, navmesh, road paths, lights and interiors for the whole map, into <work>/out. Needed for the map. 10–40 minutes, several GB.");
-        ui.checkbox(&mut s.bake, format!("Bake the map{}", if baked { " (done; tick to re-bake)" } else { "" }))
-            .on_hover_text("Builds the 2D/3D map files from the world data. About 2 minutes and a few GB of RAM.");
+        ui.checkbox(
+            &mut s.bake,
+            format!(
+                "Bake the map{}",
+                if baked {
+                    " (done; tick to re-bake)"
+                } else {
+                    ""
+                }
+            ),
+        )
+        .on_hover_text(
+            "Builds the 2D/3D map files from the world data. About 2 minutes and a few GB of RAM.",
+        );
         if !opt.is_empty() {
-            ui.weak(format!("Optional layers not exported yet: {}.", opt.join(", ")));
+            ui.weak(format!(
+                "Optional layers not exported yet: {}.",
+                opt.join(", ")
+            ));
         }
         if !self.jobs.cli_found() {
             ui.colored_label(egui::Color32::from_rgb(230, 150, 90), "sixng.exe was not found next to this app, so jobs cannot run. Keep both exes in the same folder.");
@@ -268,12 +337,17 @@ impl App {
             if ui.button("◀ Back").clicked() {
                 self.setup.step = 0;
             }
-            let any = self.setup.index_all || self.setup.link || self.setup.world || self.setup.bake;
+            let any =
+                self.setup.index_all || self.setup.link || self.setup.world || self.setup.bake;
             if ui.add_enabled(any, egui::Button::new("Start ▶")).clicked() {
                 self.start_setup_jobs();
                 self.setup.step = 2;
             }
-            if ui.button("Skip for now").on_hover_text("Go to the Library; run these later from Settings → Run setup again").clicked() {
+            if ui
+                .button("Skip for now")
+                .on_hover_text("Go to the Library; run these later from Settings → Run setup again")
+                .clicked()
+            {
                 self.finish_setup();
             }
         });
@@ -283,15 +357,33 @@ impl App {
         let out = self.world_out();
         let mut ids = Vec::new();
         if self.setup.index_all {
-            ids.push((self.jobs.enqueue("Index all archives", vec!["index".into()]), "Index all archives".to_string()));
+            ids.push((
+                self.jobs
+                    .enqueue("Index all archives", vec!["index".into()]),
+                "Index all archives".to_string(),
+            ));
         }
         if self.setup.link {
-            ids.push((self.jobs.enqueue("Link unnamed buildings", vec!["link-archetypes".into()]), "Link unnamed buildings".to_string()));
+            ids.push((
+                self.jobs
+                    .enqueue("Link unnamed buildings", vec!["link-archetypes".into()]),
+                "Link unnamed buildings".to_string(),
+            ));
         }
         if self.setup.world {
-            ids.push((self.jobs.enqueue("Export world data", vec!["world".into(), "all".into(), "-o".into(), out]), "Export world data".to_string()));
+            ids.push((
+                self.jobs.enqueue(
+                    "Export world data",
+                    vec!["world".into(), "all".into(), "-o".into(), out],
+                ),
+                "Export world data".to_string(),
+            ));
         }
-        self.setup.bake_after = if self.setup.bake { Some(ids.iter().map(|x| x.0).collect()) } else { None };
+        self.setup.bake_after = if self.setup.bake {
+            Some(ids.iter().map(|x| x.0).collect())
+        } else {
+            None
+        };
         self.setup.bake_started = false;
         self.setup.jobs = ids;
     }
@@ -312,11 +404,15 @@ impl App {
 
     /// Start the bake once the wizard's jobs are done (called every frame).
     pub(crate) fn setup_tick(&mut self) {
-        let Some(after) = &self.setup.bake_after else { return };
+        let Some(after) = &self.setup.bake_after else {
+            return;
+        };
         if self.setup.bake_started {
             return;
         }
-        let done = after.iter().all(|id| self.jobs.state_of(*id).map_or(true, |j| j.state.finished()));
+        let done = after
+            .iter()
+            .all(|id| self.jobs.state_of(*id).map_or(true, |j| j.state.finished()));
         if done {
             self.setup.bake_started = true;
             if let Err(e) = self.bake.start(&self.game, &self.work) {
@@ -328,53 +424,65 @@ impl App {
     fn setup_progress(&mut self, ui: &mut egui::Ui) {
         ui.strong("3. Preparing");
         let mut all_done = true;
-        egui::Grid::new("setup_prog").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
-            for (id, label) in self.setup.jobs.clone() {
-                ui.label(&label);
-                match self.jobs.state_of(id) {
-                    Some(j) => {
-                        let (stage, f, _, _) = j.progress();
-                        if j.state.finished() {
-                            ui.label(j.state.label());
+        egui::Grid::new("setup_prog")
+            .num_columns(3)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                for (id, label) in self.setup.jobs.clone() {
+                    ui.label(&label);
+                    match self.jobs.state_of(id) {
+                        Some(j) => {
+                            let (stage, f, _, _) = j.progress();
+                            if j.state.finished() {
+                                ui.label(j.state.label());
+                                ui.label("");
+                            } else {
+                                all_done = false;
+                                ui.add(
+                                    egui::ProgressBar::new(f)
+                                        .desired_width(260.0)
+                                        .show_percentage(),
+                                );
+                                ui.weak(stage);
+                            }
+                        }
+                        None => {
+                            ui.label("?");
                             ui.label("");
-                        } else {
-                            all_done = false;
-                            ui.add(egui::ProgressBar::new(f).desired_width(260.0).show_percentage());
-                            ui.weak(stage);
                         }
                     }
-                    None => {
-                        ui.label("?");
+                    ui.end_row();
+                }
+                if self.setup.bake_after.is_some() {
+                    ui.label("Bake the map");
+                    if self.bake.running() {
+                        all_done = false;
+                        ui.spinner();
+                        ui.weak(&self.bake.last_line);
+                    } else if self.setup.bake_started {
+                        ui.label(self.bake.result.clone().unwrap_or_else(|| "done".into()));
+                        ui.label("");
+                    } else {
+                        all_done = false;
+                        ui.weak("waits for the steps above");
                         ui.label("");
                     }
+                    ui.end_row();
                 }
-                ui.end_row();
-            }
-            if self.setup.bake_after.is_some() {
-                ui.label("Bake the map");
-                if self.bake.running() {
-                    all_done = false;
-                    ui.spinner();
-                    ui.weak(&self.bake.last_line);
-                } else if self.setup.bake_started {
-                    ui.label(self.bake.result.clone().unwrap_or_else(|| "done".into()));
-                    ui.label("");
-                } else {
-                    all_done = false;
-                    ui.weak("waits for the steps above");
-                    ui.label("");
-                }
-                ui.end_row();
-            }
-        });
+            });
         ui.add_space(10.0);
         if all_done {
             ui.colored_label(egui::Color32::from_rgb(120, 200, 120), "All done.");
         } else {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(300));
         }
         ui.horizontal(|ui| {
-            let label = if all_done { "Open the Library ▶" } else { "Continue in the background ▶" };
+            let label = if all_done {
+                "Open the Library ▶"
+            } else {
+                "Continue in the background ▶"
+            };
             if ui.button(label).clicked() {
                 self.finish_setup();
             }
@@ -392,17 +500,33 @@ impl App {
             let mut g = self.game.clone();
             let mut w = self.work.clone();
             let mut o = self.out.clone();
-            egui::Grid::new("settings_grid").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                Self::folder_row(ui, "Game folder", &mut g, "");
-                Self::folder_row(ui, "Work folder", &mut w, "");
-                Self::folder_row(ui, "Export folder", &mut o, "where Export and extract jobs write");
-                ui.label("Thumbnail cache");
-                ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut self.thumb_budget_mb).range(16..=65536).suffix(" MB"));
-                    ui.weak(format!("{} used in {}", crate::human(self.library.thumbs.used), Path::new(&self.work).join("thumbs").display()));
+            egui::Grid::new("settings_grid")
+                .num_columns(2)
+                .spacing([10.0, 8.0])
+                .show(ui, |ui| {
+                    Self::folder_row(ui, "Game folder", &mut g, "");
+                    Self::folder_row(ui, "Work folder", &mut w, "");
+                    Self::folder_row(
+                        ui,
+                        "Export folder",
+                        &mut o,
+                        "where Export and extract jobs write",
+                    );
+                    ui.label("Thumbnail cache");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut self.thumb_budget_mb)
+                                .range(16..=65536)
+                                .suffix(" MB"),
+                        );
+                        ui.weak(format!(
+                            "{} used in {}",
+                            crate::human(self.library.thumbs.used),
+                            Path::new(&self.work).join("thumbs").display()
+                        ));
+                    });
+                    ui.end_row();
                 });
-                ui.end_row();
-            });
             let folders_changed = g != self.game || w != self.work;
             self.out = o;
             if folders_changed {
@@ -421,14 +545,22 @@ impl App {
                     self.rebuild_views();
                 }
                 if ui.button("Run setup again").clicked() {
-                    self.setup = Setup { open: true, ..Default::default() };
+                    self.setup = Setup {
+                        open: true,
+                        ..Default::default()
+                    };
                 }
                 if !self.settings_msg.is_empty() {
                     ui.label(&self.settings_msg);
                 }
             });
             ui.add_space(6.0);
-            ui.weak(format!("Settings file: {}", crate::settings_path().map(|p| p.display().to_string()).unwrap_or_else(|| "(none)".into())));
+            ui.weak(format!(
+                "Settings file: {}",
+                crate::settings_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(none)".into())
+            ));
             ui.weak("The command-line tool (sixng.exe) reads the same game folder.");
         });
     }
@@ -440,24 +572,44 @@ impl App {
             self.status.computing = true;
             if !self.status.previous_read {
                 self.status.previous_read = true;
-                self.status.previous = std::fs::read(work.join("status_snapshot.json")).ok().and_then(|b| serde_json::from_slice(&b).ok());
+                self.status.previous = std::fs::read(work.join("status_snapshot.json"))
+                    .ok()
+                    .and_then(|b| serde_json::from_slice(&b).ok());
             }
             let slot = self.status.sizes.clone();
             let w = work.clone();
             let ctx = ui.ctx().clone();
             std::thread::spawn(move || {
                 let mut dirs = Vec::new();
-                let mut tops: Vec<PathBuf> = std::fs::read_dir(&w).map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect()).unwrap_or_default();
+                let mut tops: Vec<PathBuf> = std::fs::read_dir(&w)
+                    .map(|rd| {
+                        rd.flatten()
+                            .map(|e| e.path())
+                            .filter(|p| p.is_dir())
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 tops.sort();
                 for t in tops {
                     let rel = t.file_name().unwrap().to_string_lossy().to_string();
                     if rel == "out" {
                         // one row per output category
-                        let mut subs: Vec<PathBuf> = std::fs::read_dir(&t).map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect()).unwrap_or_default();
+                        let mut subs: Vec<PathBuf> = std::fs::read_dir(&t)
+                            .map(|rd| {
+                                rd.flatten()
+                                    .map(|e| e.path())
+                                    .filter(|p| p.is_dir())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
                         subs.sort();
                         for s in subs {
                             let (b, f) = tree_size(&s);
-                            dirs.push((format!("out/{}", s.file_name().unwrap().to_string_lossy()), b, f));
+                            dirs.push((
+                                format!("out/{}", s.file_name().unwrap().to_string_lossy()),
+                                b,
+                                f,
+                            ));
                         }
                         continue;
                     }
@@ -465,7 +617,10 @@ impl App {
                     dirs.push((rel, b, f));
                 }
                 let snap = Snapshot { when: now(), dirs };
-                let _ = std::fs::write(w.join("status_snapshot.json"), serde_json::to_vec(&snap).unwrap_or_default());
+                let _ = std::fs::write(
+                    w.join("status_snapshot.json"),
+                    serde_json::to_vec(&snap).unwrap_or_default(),
+                );
                 *slot.lock().unwrap() = Some(snap);
                 ctx.request_repaint();
             });
@@ -473,7 +628,11 @@ impl App {
         if !self.status.gaps_loading {
             self.status.gaps_loading = true;
             let slot = self.status.gaps.clone();
-            let cands = [work.join("texture_gaps.json"), PathBuf::from(&self.out).join("texture_gaps.json"), work.join("out").join("texture_gaps.json")];
+            let cands = [
+                work.join("texture_gaps.json"),
+                PathBuf::from(&self.out).join("texture_gaps.json"),
+                work.join("out").join("texture_gaps.json"),
+            ];
             std::thread::spawn(move || {
                 let r = match cands.iter().find(|p| p.exists()) {
                     None => Err("not computed yet".to_string()),
@@ -485,7 +644,9 @@ impl App {
             });
         }
         let ws = self.ws();
-        self.model.picker.ensure_loaded(ws.clone(), self.model.indexes.clone(), ui.ctx());
+        self.model
+            .picker
+            .ensure_loaded(ws.clone(), self.model.indexes.clone(), ui.ctx());
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.heading("Status");
             ui.add_space(4.0);
@@ -657,16 +818,28 @@ impl App {
             return;
         }
         let ws = self.ws();
-        self.model.picker.ensure_loaded(ws, self.model.indexes.clone(), ctx);
+        self.model
+            .picker
+            .ensure_loaded(ws, self.model.indexes.clone(), ctx);
         let q = self.palette.query.to_lowercase();
-        let mut hits: Vec<Hit> = PAGES.iter().filter(|(_, n)| q.is_empty() || n.to_lowercase().contains(&q)).map(|(t, n)| Hit::Page(*t, n)).collect();
+        let mut hits: Vec<Hit> = PAGES
+            .iter()
+            .filter(|(_, n)| q.is_empty() || n.to_lowercase().contains(&q))
+            .map(|(t, n)| Hit::Page(*t, n))
+            .collect();
         if let Some(items) = self.model.picker.items() {
             let label = |id: &str| -> Option<(String, &'static str)> {
                 let it = items.iter().find(|it| it.id == id)?;
-                Some((format!("{} · {}", crate::library::display_name(&it.name), it.name), "model"))
+                Some((
+                    format!("{} · {}", crate::library::display_name(&it.name), it.name),
+                    "model",
+                ))
             };
             if q.is_empty() {
-                for (ids, kind) in [(self.model.picker.favourites().to_vec(), "favourite"), (self.model.picker.recents().to_vec(), "recent")] {
+                for (ids, kind) in [
+                    (self.model.picker.favourites().to_vec(), "favourite"),
+                    (self.model.picker.recents().to_vec(), "recent"),
+                ] {
                     for id in ids.iter().take(8) {
                         if let Some((l, _)) = label(id) {
                             hits.push(Hit::Model(id.clone(), l, kind));
@@ -677,7 +850,11 @@ impl App {
                 let mut n = 0;
                 for it in items.iter() {
                     if it.lname.contains(&q) && !it.variant {
-                        hits.push(Hit::Model(it.id.clone(), format!("{} · {}", crate::library::display_name(&it.name), it.name), "model"));
+                        hits.push(Hit::Model(
+                            it.id.clone(),
+                            format!("{} · {}", crate::library::display_name(&it.name), it.name),
+                            "model",
+                        ));
                         n += 1;
                         if n >= 40 {
                             break;
@@ -686,57 +863,78 @@ impl App {
                 }
             }
         }
-        let (down, up, enter) = ctx.input(|i| (i.key_pressed(egui::Key::ArrowDown), i.key_pressed(egui::Key::ArrowUp), i.key_pressed(egui::Key::Enter)));
+        let (down, up, enter) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::Enter),
+            )
+        });
         if down {
             self.palette.cursor = (self.palette.cursor + 1).min(hits.len().saturating_sub(1));
         }
         if up {
             self.palette.cursor = self.palette.cursor.saturating_sub(1);
         }
-        let mut chosen: Option<usize> = if enter && !hits.is_empty() { Some(self.palette.cursor.min(hits.len() - 1)) } else { None };
-        let screen = ctx.screen_rect();
+        let mut chosen: Option<usize> = if enter && !hits.is_empty() {
+            Some(self.palette.cursor.min(hits.len() - 1))
+        } else {
+            None
+        };
+        let screen = ctx.content_rect();
         egui::Area::new(egui::Id::new("palette"))
             .order(egui::Order::Foreground)
             .fixed_pos(egui::pos2(screen.center().x - 300.0, screen.top() + 60.0))
             .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).inner_margin(10.0).show(ui, |ui| {
-                    ui.set_width(600.0);
-                    let r = ui.add(egui::TextEdit::singleline(&mut self.palette.query).hint_text("Search models and pages…  (Esc closes)").desired_width(f32::INFINITY));
-                    if self.palette.focus {
-                        r.request_focus();
-                        self.palette.focus = false;
-                    }
-                    if r.changed() {
-                        self.palette.cursor = 0;
-                    }
-                    ui.separator();
-                    if q.is_empty() {
-                        ui.weak("Pages, favourites and recent models. Type to search all models.");
-                    }
-                    egui::ScrollArea::vertical().max_height(420.0).min_scrolled_height((hits.len() as f32 * 22.0).min(420.0)).show(ui, |ui| {
-                        for (i, h) in hits.iter().enumerate() {
-                            let (txt, kind) = match h {
-                                Hit::Page(_, n) => (n.to_string(), "page"),
-                                Hit::Model(_, l, k) => (l.clone(), *k),
-                            };
-                            let sel = i == self.palette.cursor;
-                            let r = ui.horizontal(|ui| {
-                                let r = ui.selectable_label(sel, txt);
-                                ui.weak(kind);
-                                r
+                egui::Frame::popup(ui.style())
+                    .inner_margin(10.0)
+                    .show(ui, |ui| {
+                        ui.set_width(600.0);
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut self.palette.query)
+                                .hint_text("Search models and pages…  (Esc closes)")
+                                .desired_width(f32::INFINITY),
+                        );
+                        if self.palette.focus {
+                            r.request_focus();
+                            self.palette.focus = false;
+                        }
+                        if r.changed() {
+                            self.palette.cursor = 0;
+                        }
+                        ui.separator();
+                        if q.is_empty() {
+                            ui.weak(
+                                "Pages, favourites and recent models. Type to search all models.",
+                            );
+                        }
+                        egui::ScrollArea::vertical()
+                            .max_height(420.0)
+                            .min_scrolled_height((hits.len() as f32 * 22.0).min(420.0))
+                            .show(ui, |ui| {
+                                for (i, h) in hits.iter().enumerate() {
+                                    let (txt, kind) = match h {
+                                        Hit::Page(_, n) => (n.to_string(), "page"),
+                                        Hit::Model(_, l, k) => (l.clone(), *k),
+                                    };
+                                    let sel = i == self.palette.cursor;
+                                    let r = ui.horizontal(|ui| {
+                                        let r = ui.selectable_label(sel, txt);
+                                        ui.weak(kind);
+                                        r
+                                    });
+                                    if sel && (up || down) {
+                                        r.inner.scroll_to_me(None);
+                                    }
+                                    if r.inner.clicked() {
+                                        chosen = Some(i);
+                                    }
+                                }
+                                if hits.is_empty() {
+                                    ui.weak("No matches.");
+                                }
                             });
-                            if sel && (up || down) {
-                                r.inner.scroll_to_me(None);
-                            }
-                            if r.inner.clicked() {
-                                chosen = Some(i);
-                            }
-                        }
-                        if hits.is_empty() {
-                            ui.weak("No matches.");
-                        }
                     });
-                });
             });
         if let Some(i) = chosen {
             match &hits[i] {

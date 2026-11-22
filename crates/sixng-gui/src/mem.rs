@@ -16,7 +16,9 @@ pub struct MemInfo {
 
 #[cfg(windows)]
 pub fn query() -> MemInfo {
-    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
+    };
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     unsafe {
@@ -25,7 +27,8 @@ pub fn query() -> MemInfo {
         let ok = GlobalMemoryStatusEx(&mut ms) != 0;
         let mut pc: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
         pc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
-        let ok2 = GetProcessMemoryInfo(GetCurrentProcess(), &mut pc as *mut _ as *mut _, pc.cb) != 0;
+        let ok2 =
+            GetProcessMemoryInfo(GetCurrentProcess(), &mut pc as *mut _ as *mut _, pc.cb) != 0;
         MemInfo {
             total: if ok { ms.ullTotalPhys } else { 16 << 30 },
             avail: if ok { ms.ullAvailPhys } else { 8 << 30 },
@@ -39,24 +42,49 @@ pub fn query() -> MemInfo {
     fn sysctl<T: Copy + Default>(name: &std::ffi::CStr) -> Option<T> {
         let mut v = T::default();
         let mut len = std::mem::size_of::<T>();
-        let r = unsafe { libc::sysctlbyname(name.as_ptr(), &mut v as *mut T as *mut _, &mut len, std::ptr::null_mut(), 0) };
+        let r = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                &mut v as *mut T as *mut _,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
         (r == 0 && len == std::mem::size_of::<T>()).then_some(v)
     }
     let total = sysctl::<u64>(c"hw.memsize").unwrap_or(16 << 30);
     // percentage of RAM the kernel considers available (free + reclaimable)
-    let avail = sysctl::<u32>(c"kern.memorystatus_level").map_or(8 << 30, |pct| total / 100 * pct.min(100) as u64);
+    let avail = sysctl::<u32>(c"kern.memorystatus_level")
+        .map_or(8 << 30, |pct| total / 100 * pct.min(100) as u64);
     // physical footprint: what Activity Monitor shows as "Memory"
     let process = unsafe {
         let mut ri: libc::rusage_info_v2 = std::mem::zeroed();
-        let ok = libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V2, &mut ri as *mut _ as *mut _) == 0;
-        if ok { ri.ri_phys_footprint } else { 0 }
+        let ok = libc::proc_pid_rusage(
+            libc::getpid(),
+            libc::RUSAGE_INFO_V2,
+            &mut ri as *mut _ as *mut _,
+        ) == 0;
+        if ok {
+            ri.ri_phys_footprint
+        } else {
+            0
+        }
     };
-    MemInfo { total, avail, process }
+    MemInfo {
+        total,
+        avail,
+        process,
+    }
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
 pub fn query() -> MemInfo {
-    MemInfo { total: 16 << 30, avail: 8 << 30, process: 0 }
+    MemInfo {
+        total: 16 << 30,
+        avail: 8 << 30,
+        process: 0,
+    }
 }
 
 /// Memory limits for the 3D map, derived from the installed RAM.
@@ -123,7 +151,11 @@ fn gpu_sampler_start() {
         std::thread::spawn(|| {
             use std::sync::atomic::Ordering::Relaxed;
             use windows_sys::Win32::System::Performance::*;
-            let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+            let wide = |s: &str| {
+                s.encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect::<Vec<u16>>()
+            };
             let pid = std::process::id();
             unsafe {
                 let mut q: isize = 0;
@@ -140,17 +172,28 @@ fn gpu_sampler_start() {
                 }
                 let sum = |c: isize| -> Option<u64> {
                     let (mut size, mut n) = (0u32, 0u32);
-                    let r = PdhGetFormattedCounterArrayW(c, PDH_FMT_LARGE, &mut size, &mut n, std::ptr::null_mut());
+                    let r = PdhGetFormattedCounterArrayW(
+                        c,
+                        PDH_FMT_LARGE,
+                        &mut size,
+                        &mut n,
+                        std::ptr::null_mut(),
+                    );
                     if r != PDH_MORE_DATA || size == 0 {
                         return None;
                     }
                     // the buffer also holds the instance names: allocate it as u64s for alignment
                     let mut buf = vec![0u64; (size as usize).div_ceil(8)];
                     let items = buf.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W;
-                    if PdhGetFormattedCounterArrayW(c, PDH_FMT_LARGE, &mut size, &mut n, items) != 0 {
+                    if PdhGetFormattedCounterArrayW(c, PDH_FMT_LARGE, &mut size, &mut n, items) != 0
+                    {
                         return None;
                     }
-                    Some((0..n as usize).map(|i| (*items.add(i)).FmtValue.Anonymous.largeValue.max(0) as u64).sum())
+                    Some(
+                        (0..n as usize)
+                            .map(|i| (*items.add(i)).FmtValue.Anonymous.largeValue.max(0) as u64)
+                            .sum(),
+                    )
                 };
                 loop {
                     if PdhCollectQueryData(q) == 0 {
@@ -174,7 +217,9 @@ fn gpu_sampler_start() {}
 pub fn lower_thread_priority() {
     #[cfg(windows)]
     unsafe {
-        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+        };
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     }
 }
@@ -201,9 +246,22 @@ mod tests {
     #[test]
     fn macos_figures_are_real() {
         let m = super::query();
-        assert!(m.total >= 4 << 30 && m.total % (1 << 20) == 0, "total {}", m.total);
+        assert!(
+            m.total >= 4 << 30 && m.total % (1 << 20) == 0,
+            "total {}",
+            m.total
+        );
         assert!(m.avail > 0 && m.avail <= m.total, "avail {}", m.avail);
-        assert!(m.process > 1 << 20 && m.process < m.total, "process {}", m.process);
-        eprintln!("total {} GB, avail {} GB, process {} MB", m.total >> 30, m.avail >> 30, m.process >> 20);
+        assert!(
+            m.process > 1 << 20 && m.process < m.total,
+            "process {}",
+            m.process
+        );
+        eprintln!(
+            "total {} GB, avail {} GB, process {} MB",
+            m.total >> 30,
+            m.avail >> 30,
+            m.process >> 20
+        );
     }
 }
