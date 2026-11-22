@@ -117,6 +117,7 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
             }
             if let Some(o) = mi.as_object_mut() {
                 o.remove("_struct");
+                o.remove("_struct_name");
             }
             models.entry(h).or_insert_with(|| json!({"model": name(h), "model_hash": format!("{h:08x}"), "model_info": null, "configurations": [], "palettes": [], "part_groups": []}))["model_info"] = mi;
         }

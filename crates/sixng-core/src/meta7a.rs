@@ -83,6 +83,20 @@ pub fn field_name(h: u32) -> String {
     m.get(&h).map(|s| s.to_string()).or_else(|| crate::names::lookup(h, crate::names::Ctx::Field)).unwrap_or_else(|| format!("{h:08x}"))
 }
 
+/// Struct names that resolve: the map formats' struct hashes are the
+/// case-sensitive joaat of the GTA V type names, with `::` written as `__`.
+const STRUCT_NAMES: &[&str] = &[
+    "CMapData", "CMapTypes", "CEntityDef", "CBaseArchetypeDef", "CMloArchetypeDef", "CMloInstanceDef", "CMloRoomDef", "CMloPortalDef",
+    "CMloEntitySet", "CLightAttrDef", "CExtensionDefLightEffect", "rage__fwInstancedMapData", "rage__fwPropInstanceListDef",
+    "rage__fwPropInstanceListDef__InstanceData", "rage__fwGrassInstanceListDef", "rage__fwGrassInstanceListDef__InstanceData",
+];
+
+/// The type name of a struct hash, when it is one of the resolved ones.
+pub fn struct_name(h: u32) -> Option<&'static str> {
+    static M: std::sync::OnceLock<HashMap<u32, &'static str>> = std::sync::OnceLock::new();
+    M.get_or_init(|| STRUCT_NAMES.iter().map(|n| (crate::names::joaat_exact(n), *n)).collect()).get(&h).copied()
+}
+
 impl<'a> Meta<'a> {
     pub fn parse(r: &'a Resource) -> Option<Self> {
         if !is_meta(r) {
@@ -299,6 +313,9 @@ impl<'a> Meta<'a> {
         }
         let mut out = serde_json::Map::new();
         out.insert("_struct".into(), serde_json::json!(format!("{hash:08x}")));
+        if let Some(n) = struct_name(hash) {
+            out.insert("_struct_name".into(), serde_json::json!(n));
+        }
         for m in &sd.members {
             if m.hash == 0x100 {
                 continue;
@@ -314,11 +331,12 @@ impl<'a> Meta<'a> {
     pub fn schema(&self) -> serde_json::Value {
         let mut v = serde_json::Map::new();
         for (h, sd) in &self.structs {
-            v.insert(
-                format!("{h:08x}"),
-                serde_json::json!({"size": sd.size, "count": self.objects(*h).len(),
-                    "members": sd.members.iter().map(|m| format!("{:08x}:{:02x}:{:08x}", m.hash, m.ty, m.extra)).collect::<Vec<_>>()}),
-            );
+            let mut s = serde_json::json!({"size": sd.size, "count": self.objects(*h).len(),
+                "members": sd.members.iter().map(|m| format!("{:08x}:{:02x}:{:08x}", m.hash, m.ty, m.extra)).collect::<Vec<_>>()});
+            if let Some(n) = struct_name(*h) {
+                s["name"] = serde_json::json!(n);
+            }
+            v.insert(format!("{h:08x}"), s);
         }
         serde_json::Value::Object(v)
     }
@@ -625,4 +643,21 @@ pub fn mlo_instances(m: &Meta) -> Vec<MloInstance> {
             MloInstance { archetype: r.u32(o + 0x44), position: p, rotation_world: q, gltf: gltf_transform(p, [-q[0], -q[1], -q[2], q[3]], 1.0, 1.0) }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn struct_names() {
+        assert_eq!(struct_name(MAPDATA), Some("CMapData"));
+        assert_eq!(struct_name(ENTITY), Some("CEntityDef"));
+        assert_eq!(struct_name(0x0b18_11f1), Some("CMloRoomDef"));
+        assert_eq!(struct_name(0xf14a_15be), Some("rage__fwInstancedMapData"));
+        assert_eq!(struct_name(0xed86_f522), Some("rage__fwGrassInstanceListDef__InstanceData"));
+        assert_eq!(STRUCT_NAMES.len(), 16);
+        // the vehicle configuration struct does not resolve
+        assert_eq!(struct_name(0x5101_9114), None);
+    }
 }
