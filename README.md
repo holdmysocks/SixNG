@@ -74,12 +74,13 @@ cargo build --release
 This produces `target\release\sixng.exe` (CLI) and
 `target\release\sixng-gui.exe` (GUI).
 
-**macOS** (minimum macOS 27.0; Apple Silicon, tested on macOS with Rust 1.100): the same
-`cargo build --release` works once CMake is installed (`brew install cmake`).
-It produces `target/release/sixng` and `target/release/sixng-gui`; launching the
-GUI without arguments opens the native Metal 4 window directly. WGPU 30 remains
-available as an explicit legacy path. Some GPU-dependent views are not yet
-ported to Metal 4. `scripts/macos-app.sh` builds
+**macOS** (minimum macOS 11.0; Apple Silicon, tested on macOS with Rust 1.100):
+the same `cargo build --release` works once CMake is installed
+(`brew install cmake`) and uses the existing WGPU renderer.
+`cargo build -p sixng-gui --release --features metal4-poc` opts into the
+experimental native Metal 4 window. It is used only on macOS 26 or later with a
+Metal 4-capable GPU; otherwise the app falls back to WGPU. Some GPU-dependent
+views are not yet ported to Metal 4. `scripts/macos-app.sh` builds
 `dist/SixNG.app` (GUI and CLI, ad-hoc
 signed, not notarised); `scripts/macos-app.sh --universal` makes it run on
 both Apple Silicon and Intel Macs (needs `rustup target add
@@ -831,21 +832,20 @@ work/               indexes and output (git-ignored)
 
 ## Metal 4 rendering
 
-On macOS, a no-argument GUI launch uses a native `CAMetalLayer`, `MTL4CommandQueue`,
-and MTL4 renderer for the application window and egui UI. WGPU 30 is retained
-for compatibility and command-line automation; launching with `--legacy-wgpu`
-selects the old eframe/WGPU window.
+The standard build uses the WGPU renderer. The experimental Metal 4 path is
+opt-in with `metal4-poc`; it is selected at runtime only on macOS 26 or later
+with a Metal 4-capable GPU. Otherwise the GUI falls back to WGPU.
 
 ```sh
 cargo run -p sixng-gui
-cargo run -p sixng-gui -- --legacy-wgpu
-cargo run -p sixng-gui -- --metal4-window
+cargo run -p sixng-gui --features metal4-poc
+cargo run -p sixng-gui --features metal4-poc -- --metal4-window
 ```
 
 The 3D map renderer uses MTL4 for streamed models, far-field terrain, and
 road/light overlays. WGPU-specific viewer features and screenshot capture are
-not yet at full parity on the MTL4 path. The local `metal-rust` fork and its
-Apache-2.0 licences are under `vendor/`.
+not yet at full parity on the MTL4 path. The pinned `metal-rust` fork and its
+Apache-2.0 license changes are documented in `THIRD_PARTY_NOTICES.md`.
 
 ## Licence
 

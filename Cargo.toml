@@ -16,6 +16,12 @@ rayon = "1.10"
 clap = { version = "4.5", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
+# Keep the published 1.0.0 API as the baseline; this pinned fork contains the
+# small MTL4 and Objective-C wrapper additions used by the prototype.
+[patch.crates-io]
+metal-rust = { git = "https://github.com/maple-quartz18/Metal-Rust.git", rev = "618787057460de02dfe130f13d1c9aaa376aebd9" }
+metal-rust-ffi = { git = "https://github.com/maple-quartz18/Metal-Rust.git", rev = "618787057460de02dfe130f13d1c9aaa376aebd9" }
+
 [profile.release]
 opt-level = 3
 debug = 1

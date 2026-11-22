@@ -5,7 +5,6 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["metal4-poc"]
 metal4-poc = ["dep:metal-rust", "dep:objc2"]
 
 [[example]]
@@ -37,7 +36,7 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
-metal-rust = { git = "https://github.com/maple-quartz18/Metal-Rust.git", rev = "618787057460de02dfe130f13d1c9aaa376aebd9", optional = true }
+metal-rust = { version = "=1.0.0", optional = true }
 objc2 = { version = "0.6.4", optional = true }
 
 [target.'cfg(windows)'.build-dependencies]

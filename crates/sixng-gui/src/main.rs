@@ -169,7 +169,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
     if cli.has("metal4-window") || cli.args.is_empty() {
-        return metal4_app::run(App::new(cli)).map_err(Into::into);
+        match metal4_app::is_available() {
+            Ok(true) => return metal4_app::run(App::new(cli)).map_err(Into::into),
+            Ok(false) => {
+                eprintln!("Metal 4 is unavailable on this Mac; falling back to WGPU.");
+            }
+            Err(error) => {
+                eprintln!("Could not check Metal 4 support ({error:#}); falling back to WGPU.");
+            }
+        }
     }
     if cli.has("bake-map") {
         let game = default_game();

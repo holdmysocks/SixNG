@@ -16,14 +16,14 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 if [ $universal = 1 ]; then
   for t in aarch64-apple-darwin x86_64-apple-darwin; do
-    MACOSX_DEPLOYMENT_TARGET=27.0 cargo build --release --target $t
+    MACOSX_DEPLOYMENT_TARGET=11.0 cargo build --release --target $t
   done
   for b in sixng-gui sixng; do
     lipo -create -output "$app/Contents/MacOS/$b" \
       "$target/aarch64-apple-darwin/release/$b" "$target/x86_64-apple-darwin/release/$b"
   done
 else
-  MACOSX_DEPLOYMENT_TARGET=27.0 cargo build --release
+  MACOSX_DEPLOYMENT_TARGET=11.0 cargo build --release
   cp "$target/release/sixng-gui" "$target/release/sixng" "$app/Contents/MacOS/"
 fi
 
@@ -48,7 +48,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$version</string>
   <key>CFBundleVersion</key><string>$version</string>
-  <key>LSMinimumSystemVersion</key><string>27.0</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST

@@ -8,6 +8,7 @@ mod macos {
     use super::UiApp;
     use anyhow::{bail, Context};
     use eframe::egui::{self, ViewportCommand, ViewportId};
+    use metal_rust::foundation::{OperatingSystemVersion, ProcessInfo};
     use metal_rust::metal::{Device, GPUFamily, PixelFormat, ResidencySet};
     use metal_rust::quartz_core::Layer;
     use objc2::msg_send;
@@ -22,6 +23,28 @@ mod macos {
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use winit::window::{Window, WindowId};
 
+    fn is_macos_26_or_later(version: &OperatingSystemVersion) -> bool {
+        (
+            version.major_version,
+            version.minor_version,
+            version.patch_version,
+        ) >= (26, 0, 0)
+    }
+
+    fn os_supports_metal4() -> bool {
+        is_macos_26_or_later(&ProcessInfo::current().operating_system_version())
+    }
+
+    pub fn is_available() -> anyhow::Result<bool> {
+        if !os_supports_metal4() {
+            return Ok(false);
+        }
+        let Some(device) = Device::system_default() else {
+            return Ok(false);
+        };
+        Ok(device.supports_family(GPUFamily::GPUFamilyMetal4)?)
+    }
+
     struct Renderer {
         device: Device,
         layer: Layer,
@@ -35,6 +58,9 @@ mod macos {
 
     impl Renderer {
         fn new(window: &Window) -> anyhow::Result<Self> {
+            if !os_supports_metal4() {
+                bail!("Metal 4 requires macOS 26 or later");
+            }
             let device = Device::system_default().context("no Metal device")?;
             if !device.supports_family(GPUFamily::GPUFamilyMetal4)? {
                 bail!("{} does not support the Metal 4 GPU family", device.name());
@@ -343,6 +369,9 @@ mod macos {
     }
 
     pub fn run<T: UiApp + 'static>(sixng: T) -> anyhow::Result<()> {
+        if !is_available()? {
+            bail!("Metal 4 requires macOS 26 or later and a Metal 4-capable GPU");
+        }
         let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
         let mut app = HostApp {
             window: None,
@@ -361,6 +390,28 @@ mod macos {
             None => Ok(()),
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{is_macos_26_or_later, OperatingSystemVersion};
+
+        #[test]
+        fn metal4_os_gate_starts_at_macos_26() {
+            let version = |major_version, minor_version, patch_version| OperatingSystemVersion {
+                major_version,
+                minor_version,
+                patch_version,
+            };
+            assert!(!is_macos_26_or_later(&version(25, 9, 0)));
+            assert!(is_macos_26_or_later(&version(26, 0, 0)));
+            assert!(is_macos_26_or_later(&version(27, 0, 0)));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn is_available() -> anyhow::Result<bool> {
+    macos::is_available()
 }
 
 #[cfg(target_os = "macos")]

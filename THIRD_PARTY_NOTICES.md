@@ -161,13 +161,15 @@ THE SOFTWARE.
 
 ## metal-rust
 
-The optional macOS Metal 4 prototype uses the `metal-rust` and `metal-rust-ffi`
-1.0.0 crates from the Apache-2.0-licensed
-https://github.com/gamesir-labs/Metal-Rust project. They are consumed from the
-`maple-quartz18/Metal-Rust` fork at revision
-`618787057460de02dfe130f13d1c9aaa376aebd9`, which adds checked MTL4
-render-pass color-attachment setup and a retained function-descriptor
-conversion needed by the prototype. Cargo fetches the source; it is not
+The optional macOS Metal 4 prototype uses the Apache-2.0-licensed
+`metal-rust` and `metal-rust-ffi` 1.0.0 crates published from
+https://github.com/gamesir-labs/Metal-Rust. Cargo patches those crates to
+`maple-quartz18/Metal-Rust` revision
+`618787057460de02dfe130f13d1c9aaa376aebd9`; the fork adds checked MTL4
+color-attachment setup, retained function-descriptor access, typed drawable
+signaling, CAMetalLayer pointer access, and a CPU-visible buffer read helper.
+Corresponding FFI wrappers and tests are included in that fork. The published
+crates remain the versioned dependency baseline; no binding sources are
 vendored in this repository.
 
 Rust crate dependencies keep their own licences; see `Cargo.lock` and each
