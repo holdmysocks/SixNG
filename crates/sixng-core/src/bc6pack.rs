@@ -22,7 +22,9 @@
 //!   lanes 2-4, x = `il(E, O)` of lanes 5-7, y = E and z = O of lanes 8-10.
 //!   Modes with a 12- or 16-bit w keep bits 10.. of w reversed relative to
 //!   the block field (the BC6H layout stores them that way). One-region
-//!   blocks copy region 0 into the region-1 state.
+//!   blocks set z to x. For y, untransformed modes copy w; transformed modes
+//!   write w into the y field's (delta) width, offset by half its range, so
+//!   a two-region block that follows predicts y from the low bits of w.
 //! - **Indices.** As BC7: lanes 11-14 hold rows 0-3, each symbol two zigzag
 //!   deltas with interleaved bits (E = columns 0-1, O = columns 2-3; rows 0-2
 //!   put the left pixel on the odd bits, row 3 on the even bits), on a 4-bit
@@ -266,7 +268,7 @@ pub fn decode_lanes(lane: &[&[u16]], blocks: usize, t: &Tables) -> (Bc6Output, V
                 f.ep[e][c] = if e == 0 { rev_hi(v, b) } else { v } as u16;
             }
         }
-        if !m.two_regions { st[2] = st[0]; st[3] = st[1]; }
+        if !m.two_regions { st[2] = one_region_y(m, &st[0]); st[3] = st[1]; }
         let ib = if m.two_regions { 3 } else { 4 };
         let mut q = pq;
         for k in 0..4 {
@@ -287,6 +289,16 @@ pub fn decode_lanes(lane: &[&[u16]], blocks: usize, t: &Tables) -> (Bc6Output, V
         if let Some(blk) = pack(&f) { out[i * 16..i * 16 + 16].copy_from_slice(&blk); }
     }
     (Bc6Output { blocks: out, unfitted_blocks: unfitted }, ep, ix, taint)
+}
+
+/// Region-1 first-endpoint state left by a one-region block. Untransformed: a copy of w.
+/// Transformed: w written into a delta-width field, offset by half its range.
+fn one_region_y(m: &ModeInfo, w: &[u16; 3]) -> [u16; 3] {
+    if !m.transformed { return *w; }
+    std::array::from_fn(|c| {
+        let v = (w[c] >> (16 - m.ep_bits)) as u32;
+        ((v << (16 - m.delta_bits[c])) as u16) ^ 0x8000
+    })
 }
 
 /// BCPack BC6H chunk bytes + block count -> BC6H blocks, with given tables.
@@ -353,6 +365,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn one_region_y_state() {
+        // untransformed (10-bit, mode index 10): y state is w
+        assert_eq!(one_region_y(&MODES[10], &[0x5600, 0x5640, 0x8000]), [0x5600, 0x5640, 0x8000]);
+        // 11-bit w = 0x328 into the 9-bit delta width: low 9 bits 0x128, MSB-aligned, offset by half
+        let w = (0x328u16 << 5, 0u16, 0xffe0u16);
+        let y = one_region_y(&MODES[11], &[w.0, w.1, w.2]);
+        assert_eq!(y, [(0x128 << 7) ^ 0x8000, 0x8000, (0x1ff << 7) ^ 0x8000]);
+        // 6-bit read of that state (mode index 1): bits 8..13 of w with the top bit flipped
+        assert_eq!(y[0] >> 10, 5);
     }
 
     #[test]
