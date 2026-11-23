@@ -222,6 +222,8 @@ pub struct ModelView {
     pub rim_ratio: f32,
     /// Take the rim size from the configuration's wheel fitment record.
     pub rim_auto: bool,
+    /// The loaded vehicle's wheelScale / wheelScaleRear as stored.
+    veh_wheel_scale: Option<(f32, f32)>,
     rim_baked: f32,
     pub wheel_tyre: String,
     pub wheel_scale: f32,
@@ -239,7 +241,10 @@ pub struct ModelView {
     /// and the arch-fit factor on the whole wheel: [width, fit].
     wheel_xs: (String, Vec<[f32; 2]>),
     pub veh_cfg: Option<usize>,
-    wheel_pending: Arc<Mutex<Option<Result<Vec<Loaded>, String>>>>,
+    /// Finished wheel loads, each with the rim|tyre key it was asked for:
+    /// only the one for the current key is used (an older request can
+    /// finish after a newer one was made).
+    wheel_pending: Arc<Mutex<Vec<(String, Result<Vec<Loaded>, String>)>>>,
     wheel_key: String,
     wheels: Vec<GpuModel>,
     wheel_loading: bool,
@@ -460,6 +465,7 @@ impl ModelView {
             wheel_orig: Vec::new(),
             rim_ratio: 0.0,
             rim_auto: true,
+            veh_wheel_scale: None,
             rim_baked: -1.0,
             wheel_tyre: "tyre_muscle_001_hi".into(),
             wheel_scale: 0.37,
@@ -471,7 +477,7 @@ impl ModelView {
             wheel_boxes: Vec::new(),
             wheel_xs: (String::new(), Vec::new()),
             veh_cfg: None,
-            wheel_pending: Arc::new(Mutex::new(None)),
+            wheel_pending: Arc::new(Mutex::new(Vec::new())),
             wheel_key: String::new(),
             wheels: Vec::new(),
             wheel_loading: false,
@@ -846,7 +852,8 @@ impl ModelView {
         let Some(l) = self
             .loaded
             .as_ref()
-            .filter(|l| l.info["wheel_mounts"].as_array().is_some_and(|a| !a.is_empty()))
+            // a vehicle: it has wheels, or part colours (boats, aircraft)
+            .filter(|l| l.info["wheel_mounts"].as_array().is_some_and(|a| !a.is_empty()) || l.info["part_colours"].is_object())
         else {
             return true;
         };
@@ -1147,7 +1154,10 @@ impl ModelView {
     /// configuration is applied when a car opens.
     fn vehicle_ui(&mut self, ui: &mut egui::Ui) {
         let Some(l) = &self.loaded else { return };
-        if !l.info["wheel_mounts"].as_array().is_some_and(|a| !a.is_empty()) {
+        // a vehicle has wheels, or part colours (boats, aircraft without
+        // wheel bones): those get their configurations and paint too
+        let wheeled = l.info["wheel_mounts"].as_array().is_some_and(|a| !a.is_empty());
+        if !wheeled && !l.info["part_colours"].is_object() {
             return;
         }
         let key = crate::vehicle_db::model_key(&l.source);
@@ -1159,6 +1169,9 @@ impl ModelView {
             return;
         };
         let Some(v) = crate::vehicle_db::find(&db, &key) else {
+            if !wheeled {
+                return;
+            }
             // No wheelScale to go by: plain car wheels, sized so the tyre
             // reaches 5 cm below the lowest point of the body (an estimate).
             if self.veh_applied != key {
@@ -1319,7 +1332,36 @@ impl ModelView {
         }
     }
 
+    /// The rim radius / tyre radius the wheels are shaped to. A
+    /// configuration's wheel fitment record gives it on cars. Two-wheelers
+    /// have no such record; there wheelScale is the rim radius (0.217 on a
+    /// BMX whose tyre is 0.268, 0.254 / 0.223 on a dirt bike), so the ratio
+    /// is wheelScale over the tyre radius of the collision discs. On cars
+    /// wheelScale is not the rim radius, so it is only used where no
+    /// fitment record exists and the result is a plausible wheel.
+    fn rim_ratio_now(&self) -> f32 {
+        if self.rim_ratio > 0.0 || !self.rim_auto {
+            return self.rim_ratio;
+        }
+        let Some((front, rear)) = self.veh_wheel_scale else { return 0.0 };
+        let mounts = self.mounts();
+        let ratios: Vec<f32> = mounts
+            .iter()
+            .zip(self.discs())
+            .filter_map(|((bone, _), d)| {
+                let r = d?[0];
+                (r > 0.0).then(|| if is_rear(bone) { rear } else { front } / r)
+            })
+            .collect();
+        if ratios.is_empty() {
+            return 0.0;
+        }
+        let mean = ratios.iter().sum::<f32>() / ratios.len() as f32;
+        if (0.55..=0.95).contains(&mean) { mean } else { 0.0 }
+    }
+
     fn apply_scale(&mut self, v: &crate::vehicle_db::Vehicle) {
+        self.veh_wheel_scale = v.wheel_scale.map(|f| (f, v.wheel_scale_rear.unwrap_or(f)));
         self.steer_mult = v.steer_wheel_mult.filter(|m| *m > 0.0).unwrap_or(1.0);
         let lock = v.steer_lock.filter(|l| *l > 0.01 && *l < 1.6);
         self.steer_lock_known = lock.is_some();
@@ -1335,7 +1377,11 @@ impl ModelView {
 
     fn apply_config(&mut self, v: &crate::vehicle_db::Vehicle, i: usize) {
         let c = &v.configs[i];
-        if let Some(col) = c.colour {
+        // A configuration without a colour of its own (stored as pure
+        // magenta) takes the most frequent colour of the vehicle's first
+        // paint list that has one.
+        let listed = || v.palettes.iter().flatten().map(|p| p.0).find(|c| !crate::vehicle_db::is_placeholder(*c));
+        if let Some(col) = c.colour.or_else(listed) {
             self.look.paint = col;
         }
         if self.rim_auto {
@@ -1580,7 +1626,13 @@ impl ModelView {
                 self.has_lamps = l.model.joints.iter().any(|j| self.lamps.kind(&j.name).is_some());
             }
         }
-        if let Some(r) = self.wheel_pending.lock().unwrap().take() {
+        let arrived = {
+            let mut q = self.wheel_pending.lock().unwrap();
+            // results for wheels that are no longer wanted are dropped
+            q.retain(|x| x.0 == self.wheel_key);
+            q.pop().map(|x| x.1)
+        };
+        if let Some(r) = arrived {
             self.wheel_loading = false;
             match r {
                 Ok(ls) => {
@@ -1611,8 +1663,9 @@ impl ModelView {
             (None, None) => false,
             _ => true,
         };
-        if !self.wheel_src.is_empty() && (self.rim_baked != self.rim_ratio || look_changed) {
-            self.rim_baked = self.rim_ratio;
+        let rim_ratio = self.rim_ratio_now();
+        if !self.wheel_src.is_empty() && (self.rim_baked != rim_ratio || look_changed) {
+            self.rim_baked = rim_ratio;
             self.wheel_look = self.part_look_table.clone();
             // Rim and tyre colours: their vertices carry part ids of the
             // vehicle they are fitted to (vertex colour alpha), coloured
@@ -1630,7 +1683,7 @@ impl ModelView {
                     }
                 }
             }
-            let k = rim_factor(&self.wheel_boxes, self.rim_ratio);
+            let k = rim_factor(&self.wheel_boxes, rim_ratio);
             for (l, orig) in self.wheel_src.iter_mut().zip(&self.wheel_orig) {
                 let tread: Vec<bool> = l.model.joints.iter().map(|j| j.name.to_ascii_lowercase().contains("tread_profile")).collect();
                 for (m, o) in l.model.meshes.iter_mut().zip(orig) {
@@ -1683,7 +1736,7 @@ impl ModelView {
         self.update_brakes(rs, ctx);
         let key = format!("{}|{}", self.wheel_rim, self.wheel_tyre);
         if key != self.wheel_key {
-            self.wheel_key = key;
+            self.wheel_key = key.clone();
             self.wheels.clear();
             self.wheel_loading = true;
             let qs = [
@@ -1701,7 +1754,7 @@ impl ModelView {
                     .filter(|q| q.len() > 3)
                     .map(|q| load_query(&ws, &cache, q, 0, &idx).map_err(|e| format!("{e:#}")))
                     .collect();
-                *slot.lock().unwrap() = Some(r);
+                slot.lock().unwrap().push((key, r));
                 ctx.request_repaint();
             });
         }
@@ -2581,7 +2634,7 @@ impl ModelView {
                             egui::TextEdit::singleline(&mut self.wheel_tyre).desired_width(140.0),
                         );
                     });
-                    ui.checkbox(&mut self.rim_auto, "rim size from the configuration").on_hover_text("The configuration's wheel fitment record stores rim radius / tyre radius (0.82 on a sports car, 0.65 on a truck). The tyre's outer radius comes from the wheel's collision disc. Offsets that other parts add to the fitment are not applied.");
+                    ui.checkbox(&mut self.rim_auto, "rim size from the configuration").on_hover_text("The configuration's wheel fitment record stores rim radius / tyre radius (0.82 on a sports car, 0.65 on a truck). Two-wheelers have no such record: there wheelScale is the rim radius and is used instead. The tyre's outer radius comes from the wheel's collision disc. Offsets that other parts add to the fitment are not applied.");
                     ui.add_enabled_ui(!self.rim_auto, |ui| {
                         ui.add(egui::Slider::new(&mut self.rim_ratio, 0.0..=0.95).text("rim / tyre radius")).on_hover_text("0 = the proportions of the tyre model");
                     });

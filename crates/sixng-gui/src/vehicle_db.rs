@@ -78,6 +78,11 @@ struct Colour {
     srgb_if_linear: String,
 }
 
+/// Pure magenta: the colour stored where none is set.
+pub fn is_placeholder(c: [f32; 3]) -> bool {
+    c[0] > 0.99 && c[1] < 0.01 && c[2] > 0.99
+}
+
 fn hex(s: &str) -> Option<[f32; 3]> {
     let s = s.trim_start_matches('#');
     let v = u32::from_str_radix(s, 16).ok()?;
@@ -245,7 +250,9 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
             .map(|c| Config {
                 rim_ratio: c.rim_ratio,
                 parts_key: c.parts_key,
-                colour: c.colour.and_then(|c| hex(&c.srgb_if_linear)),
+                // pure magenta is stored where a configuration has no body
+                // colour of its own (aircraft, some trailers)
+                colour: c.colour.and_then(|c| hex(&c.srgb_if_linear)).filter(|c| !is_placeholder(*c)),
                 rim: c.rim,
                 tyre: c.tyre,
                 brake_disc: c.parts.iter().find(|p| p.starts_with("brakedisc_")).cloned(),
