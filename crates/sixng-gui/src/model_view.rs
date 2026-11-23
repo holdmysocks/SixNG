@@ -181,6 +181,15 @@ pub struct ModelView {
     rim_applied: [f32; 3],
     /// Material names of the loaded wheel models (rim, tyre).
     wheel_mats: Vec<Vec<String>>,
+    /// The loaded wheel models and their vertex positions as loaded: the
+    /// rim size is baked into the vertices before upload.
+    wheel_src: Vec<Loaded>,
+    wheel_orig: Vec<Vec<Vec<[f32; 3]>>>,
+    /// Rim radius / tyre radius the wheels are shaped to; 0 = as modelled.
+    pub rim_ratio: f32,
+    /// Take the rim size from the configuration's wheel fitment record.
+    pub rim_auto: bool,
+    rim_baked: f32,
     pub wheel_tyre: String,
     pub wheel_scale: f32,
     pub wheel_scale_rear: f32,
@@ -399,6 +408,11 @@ impl ModelView {
             rim_colour: RIM_ALLOY,
             rim_applied: RIM_ALLOY,
             wheel_mats: Vec::new(),
+            wheel_src: Vec::new(),
+            wheel_orig: Vec::new(),
+            rim_ratio: 0.0,
+            rim_auto: true,
+            rim_baked: -1.0,
             wheel_tyre: "tyre_muscle_001_hi".into(),
             wheel_scale: 0.37,
             wheel_scale_rear: 0.37,
@@ -1262,6 +1276,9 @@ impl ModelView {
         if let Some(col) = c.colour {
             self.look.paint = col;
         }
+        if self.rim_auto {
+            self.rim_ratio = c.rim_ratio.unwrap_or(0.0);
+        }
         if let Some(r) = &c.rim {
             self.wheel_rim = format!("{r}_hi");
         }
@@ -1427,27 +1444,56 @@ impl ModelView {
                     self.rim_applied = c;
                     self.wheel_boxes = ls.iter().map(|l| l.model.bbox).collect();
                     self.wheel_mats = ls.iter().map(|l| l.model.materials.iter().map(|m| m.name.clone()).collect()).collect();
-                    let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
-                    self.wheels = ls
-                        .iter()
-                        .map(|l| {
-                            let mut g = ren.upload(rs, &l.model, &[]);
-                            // rims take the rim colour (the game sets it per
-                            // vehicle; it is not in the files)
-                            for (k, m) in l.model.materials.iter().enumerate() {
-                                if m.name.ends_with(RIM_SHADER) {
-                                    ren.set_material_base(rs, &mut g, k, [c[0], c[1], c[2], 1.0]);
-                                }
-                            }
-                            g
-                        })
-                        .collect();
+                    self.wheel_orig = ls.iter().map(|l| l.model.meshes.iter().map(|m| m.verts.iter().map(|v| v.pos).collect()).collect()).collect();
+                    self.wheel_src = ls;
+                    self.rim_baked = -1.0;
+                    let _ = c;
                 }
                 Err(e) => {
                     self.status = format!("{} · wheels: {e}", self.status);
                     self.wheels.clear();
                 }
             }
+        }
+        // Shape rim and tyre to the rim size, then upload. All bones of a
+        // shared wheel model sit on the hub, so the game can only shape the
+        // wheel by scaling them: the rim and the tyre's bead (rim and
+        // tyre_profile bones) to the rim radius, the tread (tread_profile
+        // bones) to the tyre radius. The instances scale the whole wheel to
+        // the tyre radius, so here everything but the tread is scaled by
+        // rim ratio x tyre model radius / rim model radius.
+        if !self.wheel_src.is_empty() && self.rim_baked != self.rim_ratio {
+            self.rim_baked = self.rim_ratio;
+            let k = rim_factor(&self.wheel_boxes, self.rim_ratio);
+            for (l, orig) in self.wheel_src.iter_mut().zip(&self.wheel_orig) {
+                let tread: Vec<bool> = l.model.joints.iter().map(|j| j.name.to_ascii_lowercase().contains("tread_profile")).collect();
+                for (m, o) in l.model.meshes.iter_mut().zip(orig) {
+                    for (v, p) in m.verts.iter_mut().zip(o) {
+                        let wt: f32 = (0..4).filter(|&i| tread.get(v.joints[i] as usize).copied().unwrap_or(false)).map(|i| v.weights[i] as f32 / 255.0).sum();
+                        let f = k * (1.0 - wt) + wt;
+                        v.pos = [p[0], p[1] * f, p[2] * f];
+                    }
+                }
+            }
+            let c = self.rim_colour;
+            self.rim_applied = c;
+            let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+            self.wheels = self
+                .wheel_src
+                .iter()
+                .map(|l| {
+                    let mut g = ren.upload(rs, &l.model, &[]);
+                    // rims take the rim colour (the game sets it per
+                    // vehicle; it is not in the files)
+                    for (k, m) in l.model.materials.iter().enumerate() {
+                        if m.name.ends_with(RIM_SHADER) {
+                            ren.set_material_base(rs, &mut g, k, [c[0], c[1], c[2], 1.0]);
+                        }
+                    }
+                    g
+                })
+                .collect();
+            // the instances are set again below
         }
         if self.rim_applied != self.rim_colour {
             self.rim_applied = self.rim_colour;
@@ -2271,6 +2317,10 @@ impl ModelView {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.wheel_tyre).desired_width(140.0),
                         );
+                    });
+                    ui.checkbox(&mut self.rim_auto, "rim size from the configuration").on_hover_text("The configuration's wheel fitment record stores rim radius / tyre radius (0.82 on a sports car, 0.65 on a truck). The tyre's outer radius comes from the wheel's collision disc. Offsets that other parts add to the fitment are not applied.");
+                    ui.add_enabled_ui(!self.rim_auto, |ui| {
+                        ui.add(egui::Slider::new(&mut self.rim_ratio, 0.0..=0.95).text("rim / tyre radius")).on_hover_text("0 = the proportions of the tyre model");
                     });
                     ui.checkbox(&mut self.wheel_auto, "size the wheels from the vehicle's data").on_hover_text(format!("scale = {WHEEL_FACTOR:.0} x wheelScale (front / rear): wheelScale is the rim radius in metres and the shared rims have radius 0.5. The tyre is scaled with the rim; used only where the vehicle stores no wheel size. Most do: each wheel has a collision disc with the tyre's radius and width, and the wheel is sized and placed to it. Without one, the wheel is sized to fill its arch and narrowed to fit the fork (estimates)."));
                     ui.add_enabled_ui(!self.wheel_auto, |ui| {
@@ -3101,6 +3151,19 @@ fn find_hinges(model: &glb::Model) -> HashMap<usize, (u8, Vec3, f32)> {
 
 fn is_rear(bone: &str) -> bool {
     bone.strip_prefix("wheel_").map(|s| s.chars().nth(1) == Some('r')).unwrap_or(false)
+}
+
+/// Radial scale of rim and tyre bead that puts the rim at `ratio` x the
+/// tyre's outer radius (1 with no ratio, a single model, or a ratio the
+/// models cannot take).
+fn rim_factor(boxes: &[[[f32; 3]; 2]], ratio: f32) -> f32 {
+    let radius = |b: &[[f32; 3]; 2]| b[0][1].abs().max(b[1][1].abs()).max(b[0][2].abs()).max(b[1][2].abs());
+    let mut r: Vec<f32> = boxes.iter().map(radius).collect();
+    r.sort_by(f32::total_cmp);
+    match (r.first(), r.last()) {
+        (Some(&rim), Some(&tyre)) if r.len() >= 2 && ratio > 0.0 && rim > 0.0 && tyre > rim => (ratio * tyre / rim).clamp(0.5, 0.97 * tyre / rim),
+        _ => 1.0,
+    }
 }
 
 /// Outer radius and width of the tyre among the wheel models (the one with
