@@ -239,6 +239,13 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
         emissive = emissive + i.lamp * F.misc.y;
         if (cls == 5u || cls == 6u) { alpha = max(alpha, min(lamp_i, 1.0) * 0.85); }
     }
+    // brake heat (instance extra.z < 0, set on brake discs): a hot disc
+    // glows from dull red to orange
+    if (i.extra.z < -0.001) {
+        let heat = min(-i.extra.z, 1.0);
+        emissive = emissive + mix(vec3(0.5, 0.015, 0.0), vec3(1.5, 0.32, 0.03), heat) * heat * heat * F.misc.y;
+        albedo = albedo * (1.0 - 0.6 * heat);
+    }
     // wet look: darker albedo, glossy up-facing surfaces
     let wet = F.misc.x * smoothstep(0.3, 0.8, n.y);
     albedo = albedo * (1.0 - 0.45 * F.misc.x);

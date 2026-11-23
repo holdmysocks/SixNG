@@ -154,6 +154,8 @@ pub struct ModelView {
     steer_mult: f32,
     /// The steering wheel's joint and the axis it turns about (joint space).
     steer_wheel: Option<(usize, Vec3)>,
+    /// How hot the brake discs glow, 0 (cold) to 1.
+    pub brake_heat: f32,
     /// Vehicle lamps that are on.
     pub lamps: Lamps,
     /// The loaded model has lamp bones.
@@ -396,6 +398,7 @@ impl ModelView {
             steer: 0.0,
             steer_mult: 1.0,
             steer_wheel: None,
+            brake_heat: 0.0,
             lamps: Lamps::default(),
             has_lamps: false,
             bonnet_open: 0.0,
@@ -1438,6 +1441,7 @@ impl ModelView {
         }
         let steers: Vec<Mat4> = spots.iter().map(|(bone, _, _)| self.steer_at(bone)).collect();
         let wheel_spin = self.wheel_spin;
+        let brake_heat = self.brake_heat.clamp(0.0, 1.0);
         if let Some(ren) = &self.renderer {
             for (is_disc, g) in self.brakes.iter_mut() {
                 let inst: Vec<render3d::Instance> = spots
@@ -1447,7 +1451,12 @@ impl ModelView {
                         let right = bone.strip_prefix("wheel_").map(|s| s.starts_with('r')).unwrap_or(false);
                         let mirror = if right { Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0)) } else { Mat4::IDENTITY };
                         let spin = if *is_disc { Mat4::from_quat(Quat::from_rotation_x(wheel_spin)) } else { Mat4::IDENTITY };
-                        render3d::Instance::new(*steer * Mat4::from_translation(*p) * spin * mirror * Mat4::from_scale(Vec3::splat(r / 0.5)), false)
+                        let mut inst = render3d::Instance::new(*steer * Mat4::from_translation(*p) * spin * mirror * Mat4::from_scale(Vec3::splat(r / 0.5)), false);
+                        if *is_disc {
+                            // negative extra.z = brake heat (see the shader)
+                            inst.extra[2] = -brake_heat;
+                        }
+                        inst
                     })
                     .collect();
                 ren.set_instances(rs, g, &inst);
@@ -2379,6 +2388,9 @@ impl ModelView {
                         self.steer_mult
                     ));
                     self.steer = deg.to_radians();
+                }
+                if !self.brakes.is_empty() {
+                    ui.add(egui::Slider::new(&mut self.brake_heat, 0.0..=1.0).text("brake glow")).on_hover_text("Makes the brake discs glow as if hot, from dull red to orange. A viewer effect on the fitted disc models: how the game heats and lights its discs is not read from the files.");
                 }
                 if self.has_lamps {
                     let l = &mut self.lamps;
