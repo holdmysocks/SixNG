@@ -30,6 +30,10 @@ pub const RMA_ORDERS: [&str; 4] = [
     "ignore packed",
 ];
 pub const FINISHES: [&str; 4] = ["metallic", "matte", "chrome", "gloss"];
+/// `standard_vehicle_2lyr_wheel_inst`: the rim material of the shared wheels.
+const RIM_SHADER: &str = "_c5cdbdd2";
+/// Default rim colour: a plain alloy (the true per-vehicle colour is not decoded).
+const RIM_ALLOY: [f32; 3] = [0.6, 0.6, 0.62];
 pub const SLOTS: [&str; 4] = ["base colour", "normal", "packed RMA", "emissive"];
 
 /// Which side-panel controls do something for a model.
@@ -141,6 +145,12 @@ pub struct ModelView {
     keep_cam_once: bool,
     pub wheels_on: bool,
     pub wheel_rim: String,
+    /// Rim colour (linear). The game sets it per vehicle at runtime and no
+    /// decoded table holds it, so it starts as a plain alloy.
+    pub rim_colour: [f32; 3],
+    rim_applied: [f32; 3],
+    /// Material names of the loaded wheel models (rim, tyre).
+    wheel_mats: Vec<Vec<String>>,
     pub wheel_tyre: String,
     pub wheel_scale: f32,
     pub wheel_scale_rear: f32,
@@ -335,6 +345,9 @@ impl ModelView {
             keep_cam_once: false,
             wheels_on: true,
             wheel_rim: "rim_muscle_001_hi".into(),
+            rim_colour: RIM_ALLOY,
+            rim_applied: RIM_ALLOY,
+            wheel_mats: Vec::new(),
             wheel_tyre: "tyre_muscle_001_hi".into(),
             wheel_scale: 0.37,
             wheel_scale_rear: 0.37,
@@ -1180,15 +1193,19 @@ impl ModelView {
             self.wheel_loading = false;
             match r {
                 Ok(ls) => {
+                    let c = self.rim_colour;
+                    self.rim_applied = c;
+                    self.wheel_mats = ls.iter().map(|l| l.model.materials.iter().map(|m| m.name.clone()).collect()).collect();
                     let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
                     self.wheels = ls
                         .iter()
                         .map(|l| {
                             let mut g = ren.upload(rs, &l.model, &[]);
-                            // rims take the secondary colour
-                            for k in 0..g.mat_class.len() {
-                                if g.mat_class[k] == 10 {
-                                    ren.set_material_secondary(rs, &mut g, k, true);
+                            // rims take the rim colour (the game sets it per
+                            // vehicle; it is not in the files)
+                            for (k, m) in l.model.materials.iter().enumerate() {
+                                if m.name.ends_with(RIM_SHADER) {
+                                    ren.set_material_base(rs, &mut g, k, [c[0], c[1], c[2], 1.0]);
                                 }
                             }
                             g
@@ -1198,6 +1215,19 @@ impl ModelView {
                 Err(e) => {
                     self.status = format!("{} · wheels: {e}", self.status);
                     self.wheels.clear();
+                }
+            }
+        }
+        if self.rim_applied != self.rim_colour {
+            self.rim_applied = self.rim_colour;
+            let c = self.rim_colour;
+            if let Some(ren) = &self.renderer {
+                for (g, names) in self.wheels.iter_mut().zip(&self.wheel_mats) {
+                    for (k, n) in names.iter().enumerate() {
+                        if n.ends_with(RIM_SHADER) {
+                            ren.set_material_base(rs, g, k, [c[0], c[1], c[2], 1.0]);
+                        }
+                    }
                 }
             }
         }
@@ -1285,7 +1315,7 @@ impl ModelView {
             let j = &js[i];
             let mut local = Mat4::from_cols_array(&j.local);
             let n = j.name.to_lowercase();
-            if spin != 0.0 && n.starts_with("wheel_") && !n.contains("dummy") {
+            if spin != 0.0 && is_wheel_bone(&n) {
                 local = local * Mat4::from_quat(Quat::from_rotation_x(spin));
             }
             if door != 0.0
@@ -1861,6 +1891,11 @@ impl ModelView {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.wheel_rim).desired_width(140.0),
                         );
+                        ui.color_edit_button_rgb(&mut self.rim_colour)
+                            .on_hover_text("rim colour. The game sets it per vehicle while it runs and it is not in the decoded vehicle data, so every car opens with a plain alloy");
+                        if ui.small_button("alloy").on_hover_text("back to the plain alloy").clicked() {
+                            self.rim_colour = RIM_ALLOY;
+                        }
                     });
                     ui.horizontal(|ui| {
                         ui.label("tyre");
@@ -2488,6 +2523,16 @@ fn load_query_sel(
     })
 }
 
+/// A wheel's own bone (`wheel_lf`, `wheel_rr`, `wheel_lm1`), not one of its
+/// helpers: `wheel_turn_lf` steers a motorcycle's fork and
+/// `wheel_parent_lr` / `wheel_lr_drive` carry the swingarm and the drive,
+/// so spinning those threw the fork and the rear end around.
+fn is_wheel_bone(n: &str) -> bool {
+    let Some(r) = n.strip_prefix("wheel_") else { return false };
+    let b = r.as_bytes();
+    b.len() >= 2 && matches!(b[0], b'l' | b'r') && matches!(b[1], b'f' | b'm' | b'r') && b[2..].iter().all(|c| c.is_ascii_digit())
+}
+
 /// Export one entry into the viewer cache and load the GLB of a LOD level.
 fn export_load(
     a: &sixng_core::game::ArchiveInfo,
@@ -2514,6 +2559,11 @@ fn export_load(
                 || j.contains("\"car_paint\"") && !j.contains("\"paint_rule\"")
                 // and from before wiper masks, water stencils and runtime screen overlays were left out
                 || (j.contains("bd71bdbf") || j.contains("fc34f08b") || j.contains("a800afccf01aa36b")) && !j.contains("\"hidden\"")
+                // and from before rims stopped taking their placeholder tint palette
+                || (j.contains("c5cdbdd2") || j.contains("99ad6fc9")) && j.contains("\"tintpalettetex\"") && !j.contains("a placeholder of marker colours")
+                // and from before the 4 x u16 joint stream (0x4A) was read: body and
+                // trim meshes that did not follow their bones
+                || j.contains("\"skinned\"") && !j.contains("\"joint_format\"")
         });
     // Cached animal parts from before part skins (eyes, tint-mask coats).
     let stale_animal = e.name.as_deref().is_some_and(|n| sixng_core::partskin::animal_root(n).is_some())

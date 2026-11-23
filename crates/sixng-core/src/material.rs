@@ -212,6 +212,8 @@ pub fn gltf_fields(c: &Value, has_base: bool) -> Value {
         Some("chrome") => Some((1.0, 0.12, [0.9, 0.9, 0.9, 1.0])),
         // interior plastics, fabric, mechanical parts: colours not decoded
         Some("trim") => Some((0.0, 0.6, [0.11, 0.11, 0.115, 1.0])),
+        // wheel rims: colour set at runtime; a plain alloy
+        Some("rim") => Some((1.0, 0.35, [0.6, 0.6, 0.62, 1.0])),
         _ => None,
     };
     if let Some((metal, rough, colour)) = stand {
@@ -630,6 +632,8 @@ mod paint_tests {
         assert_eq!(g["pbrMetallicRoughness"]["baseColorFactor"][3], 0.0);
         assert!(g["emissiveFactor"].is_null());
         assert_eq!(classify("fc34f08b", &opaque)["stand_in"], "hidden");
+        let rim = gltf_fields(&json!({"class": "opaque", "alpha_mode": "OPAQUE", "stand_in": "rim"}), false);
+        assert_eq!(rim["pbrMetallicRoughness"]["metallicFactor"], 1.0);
         let trim = gltf_fields(&json!({"class": "opaque", "alpha_mode": "OPAQUE", "stand_in": "trim"}), false);
         assert_eq!(trim["pbrMetallicRoughness"]["metallicFactor"], 0.0);
         assert_eq!(trim["pbrMetallicRoughness"]["baseColorFactor"][3], 1.0);

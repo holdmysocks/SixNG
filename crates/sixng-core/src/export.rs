@@ -334,6 +334,15 @@ const EMISSIVE_PARAM: &str = "8e0d63ee";
 /// the screen's stored picture. No store holds it (552 vehicle models bind
 /// it), so that overlay is left out and the stored picture shows.
 const RUNTIME_SCREEN: &str = "a800afccf01aa36b";
+/// `standard_vehicle_2lyr_wheel_inst`, the shader of the shared `rim_*`
+/// models. Its embedded tint palette (129 x 1, the same in every rim) is a
+/// placeholder: entries 0-7 are pure red, yellow, green, blue, magenta,
+/// grey, orange and cyan, then shades of them. The game writes the wheel
+/// colours over it, so it is not multiplied into the rim.
+const WHEEL_RIM: &str = "c5cdbdd2";
+/// `standard_vehicle_2lyr_tyre_inst`: the shared `tyre_*` models carry the
+/// same placeholder palette.
+const WHEEL_TYRE: &str = "99ad6fc9";
 
 #[derive(Default)]
 struct ShaderTextures {
@@ -455,6 +464,14 @@ fn classify_shader(s: &crate::drawable::Shader, st: &ShaderTextures) -> serde_js
             c["family"] = if textured { "vehicle interior, trim and mechanical parts (two-layer shader with a layer detail texture)" } else { "vehicle interior, lamp housings and mechanical parts (two-layer shader on interior, lamp or mechanical bones)" }.into();
         }
     }
+    // Shared wheel rims (`standard_vehicle_2lyr_wheel_inst`): the colour is
+    // set per vehicle while the game runs; nothing stored gives it.
+    if s.name_hash == WHEEL_RIM {
+        c["class"] = "opaque".into();
+        c["stand_in"] = "rim".into();
+        c["family"] = "wheel rim (standard_vehicle_2lyr_wheel_inst)".into();
+        c["rim_note"] = "rim colour is set per vehicle at runtime and is not decoded: a plain alloy stand-in. The embedded tint palette is a placeholder of marker colours (red, yellow, green, ...) and is not applied".into();
+    }
     if is_hidden_screen(st) {
         c["stand_in"] = "hidden".into();
         c["hidden_note"] = "runtime screen overlay: its colour map is drawn by the game while it runs (dials, needles, navigation) and is not in the files; left out so the stored screen picture under it shows".into();
@@ -515,7 +532,9 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                             }
                             match texture::embedded_rgba(r, et) {
                                 Ok(rgba) => {
-                                    if t.param_hash == TINT_PALETTE && et.height == 1 {
+                                    if t.param_hash == TINT_PALETTE && et.height == 1 && (s.name_hash == WHEEL_RIM || s.name_hash == WHEEL_TYRE) {
+                                        e["applied"] = "not applied: a placeholder of marker colours that the game replaces with the wheel colours".into();
+                                    } else if t.param_hash == TINT_PALETTE && et.height == 1 {
                                         st.tint_palette = Some(rgba.chunks(4).map(|p| [p[0], p[1], p[2], p[3]]).collect());
                                         let (len, rows) = texture::tint_layout(et.width);
                                         e["tint_row_length"] = len.into();
@@ -1073,7 +1092,7 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             "uv_sets": m.uvs.len(), "uv_slots": m.uvs.iter().map(|u| u.0).collect::<Vec<_>>(),
             "normals": m.normals.is_some(), "vertex_colors_raw": m.colors.is_some(),
             "triangles_flipped_to_match_normals": m.flipped, "triangles_dropped": m.dropped, "normals_rebuilt_from_faces": m.rebuilt_normals,
-            "position_axis_order": m.axis_order, "skinned": m.joints.is_some(),
+            "position_axis_order": m.axis_order, "skinned": m.joints.is_some(), "joint_format": m.joint_format.map(|f| format!("{f:02x}")),
             "skin_influences": m.joints.as_ref().map(|j| j.iter().zip(m.weights.as_ref().unwrap()).enumerate().map(|(i, (a, w))| w.iter().filter(|&&x| x > 0).count().max(1).min(a.len()) + m.weights1.as_ref().map_or(0, |w1| w1[i].iter().filter(|&&x| x > 0).count())).max().unwrap_or(1)),
             "bones": skin_used.as_ref().map(|u| u.iter().filter_map(|&i| skin.joints.get(i as usize).map(|x| x.name.clone())).collect::<Vec<_>>()),
             // Joint indices with no bone (out of range, or a palette

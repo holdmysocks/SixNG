@@ -569,7 +569,8 @@ pub struct Mesh {
     /// Skin joints per vertex (skeleton bone indices). Stream 8: format
     /// 0x25 = 4 x u8 blend indices; format 0x00 is sized per vertex:
     /// 1 byte = one u8 bone, 2 = one u16 bone (rigid), 4 = 4 x u8,
-    /// 8 = 4 x u16 blend indices. Format 0x8C (ped heads and clothing) = 4 x
+    /// 8 = 4 x u16 blend indices. Format 0x4A = 4 x u16 blend indices
+    /// (vehicle body and trim meshes). Format 0x8C (ped heads and clothing) = 4 x
     /// u32 per vertex, the joint index in the low 12 bits of each; in stream
     /// 8 bits 12-15 and the high u16 hold other per-vertex data (on a
     /// jacket, 0 of 82,042 weighted low-12-bit indices fall outside the bone
@@ -583,6 +584,8 @@ pub struct Mesh {
     /// meshes; the 8 weights together sum to 255 and are sorted descending.
     pub joints1: Option<Vec<[u16; 4]>>,
     pub weights1: Option<Vec<[u8; 4]>>,
+    /// Format code of the joint stream (stream 8), when the mesh has one.
+    pub joint_format: Option<u32>,
     /// Tangents (x, y, z, w), model space like the normals: stream 11,
     /// format 0x27 = R10G10B10A2 (xyz = v / 1023 * 2 - 1, A2 = 3 when the
     /// bitangent is flipped, so w = -1). Orthonormalised against the normal.
@@ -763,14 +766,16 @@ pub fn decode_mesh(blob: &[u8], h: &MeshBlobHeader, ib: &[u8]) -> Mesh {
         Some((o, 0x8c)) => blob.get(o..o + 16 * v).map(quad_u32),
         // one u16 bone per vertex (rigid, skeletons over 255 bones)
         Some((o, 0x00)) if (2..4).contains(&jw) => blob.get(o..o + 2 * v).map(|b| b.chunks_exact(2).map(|c| [u16le(c), 0, 0, 0]).collect()),
-        // 4 x u16 blend indices
+        // 4 x u16 blend indices (0x4A: vehicle bodies and trim on skeletons
+        // over 255 bones, weights in stream 6)
+        Some((o, 0x4a)) => blob.get(o..o + 8 * v).map(|b| b.chunks_exact(8).map(|c| [u16le(&c[0..]), u16le(&c[2..]), u16le(&c[4..]), u16le(&c[6..])]).collect()),
         Some((o, 0x00)) if (8..16).contains(&jw) => blob.get(o..o + 8 * v).map(|b| b.chunks_exact(8).map(|c| [u16le(&c[0..]), u16le(&c[2..]), u16le(&c[4..]), u16le(&c[6..])]).collect()),
         // 4 x u8 blend indices in a format-0 stream
         Some((o, 0x00)) if (4..8).contains(&jw) => blob.get(o..o + 4 * v).map(|b| b.chunks_exact(4).map(|c| [c[0] as u16, c[1] as u16, c[2] as u16, c[3] as u16]).collect()),
         Some((o, 0x00)) if jw < 2 => blob.get(o..o + v).map(|b| b.iter().map(|&j| [j as u16, 0, 0, 0]).collect()),
         _ => None,
     };
-    let blend = joints.is_some() && (matches!(stream(8).map(|s| s.1), Some(0x25 | 0x8c)) || (4..16).contains(&jw));
+    let blend = joints.is_some() && (matches!(stream(8).map(|s| s.1), Some(0x25 | 0x8c | 0x4a)) || (4..16).contains(&jw));
     let weights: Option<Vec<[u8; 4]>> = joints.as_ref().map(|j| {
         if blend {
             stream(6)
@@ -840,7 +845,7 @@ pub fn decode_mesh(blob: &[u8], h: &MeshBlobHeader, ib: &[u8]) -> Mesh {
                 for k in 0..n0 { let x = indices[k] + v as u32; indices.push(x); }
                 for u in uvs.iter_mut() { let c = u.1.clone(); u.1.extend(c); }
                 let colors: Option<Vec<[u8; 4]>> = colors.map(|c: Vec<[u8; 4]>| { let mut d = c.clone(); d.extend(c); d });
-                return Mesh { positions: pos2, normals: Some(nrm2), uvs, colors, indices, flipped: 0, dropped, axis_order: [0, 1, 2], joints: None, weights: None, joints1: None, weights1: None, tangents: None, rebuilt_normals: 0 };
+                return Mesh { positions: pos2, normals: Some(nrm2), uvs, colors, indices, flipped: 0, dropped, axis_order: [0, 1, 2], joints: None, weights: None, joints1: None, weights1: None, joint_format: None, tangents: None, rebuilt_normals: 0 };
             }
         }
     }
@@ -960,7 +965,8 @@ pub fn decode_mesh(blob: &[u8], h: &MeshBlobHeader, ib: &[u8]) -> Mesh {
             .map(|(i, c)| tangent_decode(u32::from_le_bytes(c.try_into().unwrap()), normals.as_ref().map(|n| n[i])))
             .collect::<Vec<_>>()
     });
-    Mesh { positions, normals, uvs, colors, indices, flipped, dropped, axis_order, joints, weights, joints1, weights1, tangents, rebuilt_normals }
+    let joint_format = stream(8).map(|s| s.1);
+    Mesh { positions, normals, uvs, colors, indices, flipped, dropped, axis_order, joints, weights, joints1, weights1, joint_format, tangents, rebuilt_normals }
 }
 
 /// A geometry: a mesh blob paired with its meshlet index buffer.
