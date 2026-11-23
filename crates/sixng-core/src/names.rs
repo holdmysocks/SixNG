@@ -27,7 +27,14 @@ use std::path::{Path, PathBuf};
 pub const DERIVED_EXACT: &[&str] = &["fMass", "fInitialDragCoeff", "fDriveBiasFront", "fDriveBiasRear", "fBrakeForce", "fHandBrakeForce", "fSteeringLock", "fLowSpeedTractionLossMult", "fSuspensionCompDamp", "fSuspensionReboundDamp", "fSuspensionUpperLimit", "fSuspensionLowerLimit", "fSuspensionRaise", "fAntiRollBarForce", "fCollisionDamageMult", "fWeaponDamageMult", "fDeformationDamageMult", "fEngineDamageMult", "fPetrolTankVolume", "fOilVolume", "fPetrolConsumptionRate", "fStoppieBalancePoint", "fWheelieBalancePoint", "fBackEndPopUpBuildingImpulseMult", "fBackEndPopUpCarImpulseMult", "fBackEndPopUpMaxDeltaSpeed", "fSideSlipMult", "fPitchMult", "fYawMult", "fRollMult", "fLiftMult", "fMoveRes", "fThrust", "fThrustFallOff", "fWeaponDamageScaledToVehHealthMult", "fWheelMass", "fGearRatios", "fFinalDriveRatio", "Wheels", "Lights", "Sirens", "modelName", "metallic", "colors", "Color", "Name", "Type", "Key", "Item", "Flags", "Value", "Data", "Items", "Index", "Entries", "Count", "dirtLevelMax", "gameName", "buoyancySphereOffset", "minSeatHeight", "envEffScaleMin", "NmBraceOverrideSet", "layout", "type", "frequency", "plateType", "audioNameHash", "animConvRoofWindowsAffected", "vehicleMakeName", "damageMapScale", "bumpersNeedToCollideWithMap", "AllowJoyriding", "maxNum", "pretendOccupantsScale", "animConvRoofName", "animConvRoofDictName", "explosionInfo", "wheelScaleRear", "dirtLevelMin", "vehicleClass", "swankness", "needsRopeTexture", "ptfxAssetName", "wheelScale", "vfxInfoName", "visibleSpawnDistScale", "wheelType", "rewards", "envEffScaleMin2", "doorsWithCollisionWhenClosed", "defaultBodyHealth", "envEffScaleMax", "lodDistances", "txdName", "AllowSundayDriving", "driveableDoors", "HDTextureDist", "envEffScaleMax2", "steerWheelMult", "buoyancySphereSizeScale", "weaponForceMult", "pOverrideRagdollThreshold", "identicalModelSpawnDistance", "maxNumOfSameColor", "handlingId", "damageOffsetScale",
     // map, light, vehicle, handling and material fields resolved against the
     // hashes in the format notes
-    "timeFlags", "lightType", "handling", "slots", "options", "probability", "ParentName", "HandlingData", "StateName"];
+    "timeFlags", "lightType", "handling", "slots", "options", "probability", "ParentName", "HandlingData", "StateName",
+    // from GTA6-Asset-Info pull request 86 (hash matches against public GTA V
+    // name lists): the variation sets' paint-colour list, the animation
+    // rotation property, the minigame dialogue field next to MissionId, and
+    // the wardrobe field that holds body-type words (the name fits loosely)
+    "colours", "bonerotation", "BankName", "pedtype",
+    // same method: the body colour of a vehicle configuration
+    "colour"];
 
 pub const DERIVED: &[&str] = &[
     // texture parameters of the minigame pack's water and interior shaders (joaat search, 2026-11-23)
@@ -323,6 +330,13 @@ mod tests {
         assert_eq!(joaat_exact("ParentName"), 0x49a0_1a86);
         assert_eq!(joaat_exact("HandlingData"), 0x41c8_dec7);
         assert_eq!(joaat_exact("StateName"), 0x3ead_dcd7);
+        assert_eq!(joaat_exact("colours"), 0x8c86_6829);
+        assert_eq!(joaat_exact("bonerotation"), 0x98e1_750c);
+        assert_eq!(joaat_exact("BankName"), 0x8d6b_17bd);
+        assert_eq!(joaat_exact("pedtype"), 0x3a57_a0fc);
+        assert_eq!(joaat_exact("colour"), 0x5bdc_13e3);
+        assert_eq!(lookup(0x8c86_6829, Ctx::Field).as_deref(), Some("colours"));
+        assert_eq!(lookup(0x5bdc_13e3, Ctx::Field).as_deref(), Some("colour"));
         assert_eq!(lookup(0x49a0_1a86, Ctx::Field).as_deref(), Some("ParentName"));
         // derived names resolve without a dictionary file
         assert_eq!(lookup(0xc8e8_c282, Ctx::Param).as_deref(), Some("diffusetex"));
