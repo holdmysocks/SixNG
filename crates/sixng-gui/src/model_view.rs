@@ -2657,6 +2657,77 @@ fn load_query_sel(
             fur_skin: Arc::new(colours),
         });
     }
+    // weapons: the model is a skeleton with a placeholder shell; the parts
+    // (receiver, barrel, stock, magazine ...) are separate models that mount
+    // on its attach-point bones
+    if sixng_core::weapon::is_weapon(name) {
+        let opts = sixng_core::weapon::weapon_options(&ix.entries, name);
+        if !opts.is_empty() {
+            let (selected, parts) = pick(&ix, &opts, &sel);
+            let bones = |info: &serde_json::Value| -> Vec<(String, sixng_core::weapon::Mat)> {
+                info["drawable"]["skeleton"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|b| Some((b["name"].as_str()?.to_string(), serde_json::from_value(b["bind_matrix"].clone()).ok()?)))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let mut got = Vec::new();
+            let mut errs = Vec::new();
+            for p in &parts {
+                let pn = p.name.clone().unwrap_or_default();
+                match export_load(&a, p, cache, level) {
+                    Ok((m, _, pi)) => got.push((sixng_core::weapon::part_slot(name, &pn).unwrap_or_default(), bones(&pi), m, pn)),
+                    Err(err) => errs.push(format!("{pn}: {err:#}")),
+                }
+            }
+            let placed = sixng_core::weapon::place(&bones(&info), &got.iter().map(|g| (g.0.clone(), g.1.clone())).collect::<Vec<_>>());
+            let mut model = model;
+            let (mut names, mut loose) = (Vec::new(), Vec::new());
+            if placed.iter().any(|t| t.is_some()) {
+                // the shell stands in for the parts
+                model.meshes.clear();
+                model.triangles = 0;
+                model.vertices = 0;
+            }
+            for ((_, _, mut m, pn), t) in got.into_iter().zip(placed) {
+                match t {
+                    Some(t) => {
+                        // RAGE model space (Z-up) to glTF (Y-up): (x, y, z) -> (x, z, -y)
+                        let c = Mat4::from_cols_array(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+                        transform_model(&mut m, c * Mat4::from_cols_array(&t) * c.inverse());
+                        glb::merge(&mut model, m);
+                        names.push(pn);
+                    }
+                    None => loose.push(pn),
+                }
+            }
+            let mut info = info;
+            if let Some(o) = info.as_object_mut() {
+                o.insert("assembled_from".into(), serde_json::json!(names));
+                o.insert("parts_without_mount".into(), serde_json::json!(loose));
+                o.insert("assembly_note".into(), "weapon parts mount on attach-point bones (a part's AAP_<slot> root on the WAP_<slot> bone of the base or of another part). The lowest-numbered variant of each slot is shown: which variant the game gives a weapon by default is not decoded. Parts listed in parts_without_mount found no attach point on this build and are left out.".into());
+                if !errs.is_empty() {
+                    o.insert("part_errors".into(), serde_json::json!(errs));
+                }
+            }
+            return Ok(Loaded {
+                model,
+                lods: lods.into_iter().skip(lod).take(1).collect(),
+                lod: 0,
+                out_root: cache.to_path_buf(),
+                source: format!("{} {} (+{} parts)", e.id, name, names.len()),
+                info,
+                parts: opts,
+                selected,
+                base: String::new(),
+                fur: None,
+                fur_skin: Arc::new(Vec::new()),
+            });
+        }
+    }
     Ok(Loaded {
         model,
         lods,
@@ -2775,6 +2846,31 @@ fn is_wheel_bone(n: &str) -> bool {
     b.len() >= 2 && matches!(b[0], b'l' | b'r') && matches!(b[1], b'f' | b'm' | b'r') && b[2..].iter().all(|c| c.is_ascii_digit())
 }
 
+/// Move a model's geometry by a rigid transform (weapon parts onto their
+/// attach points).
+fn transform_model(m: &mut glb::Model, t: Mat4) {
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for me in &mut m.meshes {
+        let mut c = Vec3::ZERO;
+        for v in &mut me.verts {
+            let p = t.transform_point3(Vec3::from(v.pos));
+            v.pos = p.to_array();
+            v.nrm = t.transform_vector3(Vec3::from(v.nrm)).to_array();
+            let tan = t.transform_vector3(Vec3::new(v.tan[0], v.tan[1], v.tan[2]));
+            v.tan = [tan.x, tan.y, tan.z, v.tan[3]];
+            c += p;
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        me.centre = (c / me.verts.len().max(1) as f32).to_array();
+    }
+    if lo[0] <= hi[0] {
+        m.bbox = [lo, hi];
+    }
+}
+
 /// Export one entry into the viewer cache and load the GLB of a LOD level.
 fn export_load(
     a: &sixng_core::game::ArchiveInfo,
@@ -2808,6 +2904,8 @@ fn export_load(
                 || j.contains("\"skinned\"") && !j.contains("\"joint_format\"")
                 // and from before the wheels' collision discs were read
                 || (j.contains("\"bone\": \"wheel_") || j.contains("\"bone\":\"wheel_")) && !j.contains("\"wheel_discs\"")
+                // and weapon parts from before their stand-in surface
+                || j.contains("e68a4a98") && !j.contains("\"gunmetal\"")
         });
     // Cached animal parts from before part skins (eyes, tint-mask coats).
     let stale_animal = e.name.as_deref().is_some_and(|n| sixng_core::partskin::animal_root(n).is_some())

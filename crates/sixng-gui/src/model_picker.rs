@@ -11,7 +11,8 @@ use sixng_core::export::Workspace;
 use sixng_core::scan::ArchiveIndex;
 
 /// Archives with models (drawables `dr`, fragments `ft`).
-const ARCHIVES: &[&str] = &["levels", "packs"];
+/// `data` holds the weapons and their parts.
+const ARCHIVES: &[&str] = &["levels", "packs", "data"];
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Cat {
@@ -20,6 +21,7 @@ pub enum Cat {
     VehicleParts,
     Wheels,
     Weapons,
+    WeaponParts,
     People,
     Animals,
     Props,
@@ -35,6 +37,7 @@ pub const CATS: &[(Cat, &str)] = &[
     (Cat::VehicleParts, "Vehicle parts"),
     (Cat::Wheels, "Wheels"),
     (Cat::Weapons, "Weapons"),
+    (Cat::WeaponParts, "Weapon parts"),
     (Cat::People, "People"),
     (Cat::Animals, "Animals"),
     (Cat::Props, "Props"),
@@ -82,7 +85,13 @@ fn categorise(name: Option<&str>, rtype: &str, vehicle_re: &regex::Regex) -> Cat
     if n.starts_with("rim_") || n.starts_with("tyre_") || n.starts_with("wheel_") {
         Cat::Wheels
     } else if n.starts_with("w_") || n.starts_with("wpn_") {
-        Cat::Weapons
+        // a weapon's own model, a single-model attachment or kit item, or a
+        // placeholder shape; the parts of a weapon are listed with the props
+        if sixng_core::weapon::is_weapon(&n) || !n.starts_with("w_") || n.starts_with("w_preset_") || n.starts_with("w_root_") {
+            Cat::Weapons
+        } else {
+            Cat::WeaponParts
+        }
     } else if n.starts_with("prop_")
         || n.starts_with("p_")
         || n.starts_with("prefab_")

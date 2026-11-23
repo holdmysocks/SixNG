@@ -121,6 +121,9 @@ pub fn classify(name_hash: &str, flags: &[u8]) -> Value {
         ("99ad6fc9", _) => Some("rubber"),
         (_, Some(n)) if n.starts_with("standard_vehicle") && n.contains("tyre") => Some("rubber"),
         ("03b27476", _) => Some("chrome"),
+        // `weapon`: no colour map (two packed data maps and a normal map);
+        // the colour comes from a material palette that is not decoded
+        ("e68a4a98", _) => Some("gunmetal"),
         // wiper sweep mask: drawn by the game only into its rain mask
         ("bd71bdbf", _) => Some("hidden"),
         // vehicle_water_stencil: a lid over a boat's hull opening that the
@@ -214,6 +217,9 @@ pub fn gltf_fields(c: &Value, has_base: bool) -> Value {
         Some("trim") => Some((0.0, 0.6, [0.11, 0.11, 0.115, 1.0])),
         // wheel rims: colour set at runtime; a plain alloy
         Some("rim") => Some((1.0, 0.35, [0.6, 0.6, 0.62, 1.0])),
+        // weapons: dark blued steel for every part (wood and polymer
+        // furniture included, their colours are not decoded)
+        Some("gunmetal") => Some((0.7, 0.45, [0.05, 0.05, 0.055, 1.0])),
         _ => None,
     };
     if let Some((metal, rough, colour)) = stand {
@@ -632,6 +638,7 @@ mod paint_tests {
         assert_eq!(g["pbrMetallicRoughness"]["baseColorFactor"][3], 0.0);
         assert!(g["emissiveFactor"].is_null());
         assert_eq!(classify("fc34f08b", &opaque)["stand_in"], "hidden");
+        assert_eq!(classify("e68a4a98", &opaque)["stand_in"], "gunmetal");
         let rim = gltf_fields(&json!({"class": "opaque", "alpha_mode": "OPAQUE", "stand_in": "rim"}), false);
         assert_eq!(rim["pbrMetallicRoughness"]["metallicFactor"], 1.0);
         let trim = gltf_fields(&json!({"class": "opaque", "alpha_mode": "OPAQUE", "stand_in": "trim"}), false);
