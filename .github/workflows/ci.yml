@@ -1,8 +1,11 @@
 name: CI
 
 on:
+  # A PR runs once (pull_request); a push to a PR branch would run it twice.
   push:
+    branches: [master]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build:
