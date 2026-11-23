@@ -18,6 +18,8 @@ struct File {
 struct Veh {
     model: Option<String>,
     #[serde(default)]
+    model_hash: Option<String>,
+    #[serde(default)]
     model_info: Option<Info>,
     #[serde(default)]
     configurations: Vec<Cfg>,
@@ -114,7 +116,7 @@ impl VehicleDb {
             State::Idle => {}
         }
         let path = Self::path(work);
-        *st = State::Loading(if path.exists() {
+        *st = State::Loading(if path.exists() && !is_old(&path) {
             "reading vehicle data …".into()
         } else {
             "building vehicle data (sixng vehicles, a few seconds) …".into()
@@ -145,15 +147,29 @@ impl VehicleDb {
     }
 }
 
+/// A table from before `format` (model info matched by gameName only, names
+/// missing where the index had none yet): built again. `format` is the
+/// file's first key, so its head is enough.
+fn is_old(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 64];
+    let Ok(n) = std::fs::File::open(path).and_then(|mut f| f.read(&mut head)) else { return false };
+    let h = String::from_utf8_lossy(&head[..n]);
+    let v = h.split("\"format\":").nth(1).and_then(|x| x.trim().split(|c: char| !c.is_ascii_digit()).next().and_then(|d| d.parse::<u32>().ok()));
+    v.unwrap_or(0) < sixng_core::vehicles::FORMAT
+}
+
 fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, Vehicle>> {
-    if !path.exists() {
+    let old = is_old(path);
+    if !path.exists() || old {
         let ws = sixng_core::export::Workspace::new(game, work);
         sixng_core::vehicles::build(&ws, &Path::new(work).join("out"))?;
     }
     let f: File = serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(path)?))?;
     let mut m = HashMap::new();
     for v in f.vehicles {
-        let Some(name) = v.model else { continue };
+        // unnamed models go in under their name hash (see `find`)
+        let Some(name) = v.model.or(v.model_hash) else { continue };
         let configs = v
             .configurations
             .into_iter()
@@ -196,6 +212,12 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
         );
     }
     Ok(m)
+}
+
+/// The vehicle of a model key: by name, else by the joaat of the name.
+pub fn find<'a>(db: &'a HashMap<String, Vehicle>, key: &str) -> Option<&'a Vehicle> {
+    db.get(key)
+        .or_else(|| db.get(&format!("{:08x}", sixng_core::meta7a::joaat(key))))
 }
 
 /// Model name of a loaded source string (`packs.rpf@… phoenix_hi` -> `phoenix`).

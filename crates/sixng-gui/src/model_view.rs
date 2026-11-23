@@ -104,9 +104,13 @@ pub struct Automation {
     pub find_hair: bool,
 }
 
-/// Shared-wheel scale per unit of the car's wheelScale: fitted by eye on
-/// phoenix (0.37 at wheelScale 0.2277); the game's rule is not decoded.
-pub const WHEEL_FACTOR: f32 = 0.37 / 0.227_721;
+/// Shared-wheel scale per unit of the car's wheelScale. Every shared rim
+/// model has radius 0.5 and wheelScale reads as the rim radius in metres
+/// (0.217 on a BMX = 20 inch wheel, 0.303 on a cruiser bicycle, 0.25 / 0.22
+/// on a dirt bike = 21 / 18 inch), so the rim is scaled by wheelScale / 0.5.
+/// The tyre is scaled with it; the game shapes it through the wheel's own
+/// bones (rim_scale, wheel_width_mover, tyre_profile), which is not decoded.
+pub const WHEEL_FACTOR: f32 = 2.0;
 
 pub struct ModelView {
     pub query: String,
@@ -159,6 +163,12 @@ pub struct ModelView {
     pub vehicles: crate::vehicle_db::VehicleDb,
     /// Model the vehicle data was applied to, and the chosen configuration.
     veh_applied: String,
+    /// A helicopter on skids (see `vehicle_ui`): no shared wheels are fitted.
+    veh_no_wheels: bool,
+    /// Bounding boxes of the loaded wheel models (rim, tyre).
+    wheel_boxes: Vec<[[f32; 3]; 2]>,
+    /// Width factor per wheel mount (two-wheelers), and what it was made for.
+    wheel_xs: (String, Vec<f32>),
     pub veh_cfg: Option<usize>,
     wheel_pending: Arc<Mutex<Option<Result<Vec<Loaded>, String>>>>,
     wheel_key: String,
@@ -354,6 +364,9 @@ impl ModelView {
             wheel_auto: true,
             vehicles: crate::vehicle_db::VehicleDb::new(),
             veh_applied: String::new(),
+            veh_no_wheels: false,
+            wheel_boxes: Vec::new(),
+            wheel_xs: (String::new(), Vec::new()),
             veh_cfg: None,
             wheel_pending: Arc::new(Mutex::new(None)),
             wheel_key: String::new(),
@@ -739,10 +752,11 @@ impl ModelView {
             crate::vehicle_db::State::Failed(_) => true,
             crate::vehicle_db::State::Ready(db) => {
                 let key = crate::vehicle_db::model_key(&l.source);
-                !db.contains_key(&key) || self.veh_applied == key
+                crate::vehicle_db::find(db, &key).is_none() || self.veh_applied == key
             }
         };
         let wheels = !self.wheels_on
+            || self.veh_no_wheels
             || (!self.wheel_loading
                 && self.wheel_key == format!("{}|{}", self.wheel_rim, self.wheel_tyre));
         veh && wheels
@@ -1041,13 +1055,35 @@ impl ModelView {
             }
             return;
         };
-        let Some(v) = db.get(&key) else {
-            ui.label(egui::RichText::new(format!("no vehicle data for '{key}'")).weak());
+        let Some(v) = crate::vehicle_db::find(&db, &key) else {
+            // No wheelScale to go by: plain car wheels, sized so the tyre
+            // reaches 5 cm below the lowest point of the body (an estimate).
+            if self.veh_applied != key {
+                let floor = l.model.bbox[0][1];
+                let axle = self.mounts().iter().map(|m| m.1.y).fold(f32::MAX, f32::min);
+                self.veh_applied = key.clone();
+                self.veh_cfg = None;
+                self.veh_no_wheels = false;
+                if self.wheel_auto && axle < f32::MAX {
+                    // tyre_car_001 has radius 0.79 at unit scale
+                    let sc = ((axle - floor + 0.05) / 0.79).clamp(0.1, 1.2);
+                    self.wheel_rim = "rim_muscle_001_hi".into();
+                    self.wheel_tyre = "tyre_car_001_hi".into();
+                    self.wheel_scale = sc;
+                    self.wheel_scale_rear = sc;
+                }
+            }
+            ui.label(egui::RichText::new(format!("no vehicle data for '{key}': wheel size estimated from the model")).weak());
             ui.separator();
             return;
         };
         if self.veh_applied != key {
             self.veh_applied = key.clone();
+            // helicopters: no configuration names a rim and wheelScale is a
+            // token value (0.05 to 0.08); their wheel bones mark the skids
+            self.veh_no_wheels = !v.configs.is_empty()
+                && v.configs.iter().all(|c| c.rim.is_none())
+                && v.wheel_scale.is_some_and(|w| w < 0.1);
             self.veh_cfg = None;
             if !v.configs.is_empty() {
                 self.apply_config(v, 0);
@@ -1162,7 +1198,26 @@ impl ModelView {
         if let Some(r) = &c.rim {
             self.wheel_rim = format!("{r}_hi");
         }
-        if let Some(t) = &c.tyre {
+        // A configuration without a tyre takes the tyre of another
+        // configuration of the same vehicle, else a plain one of the rim's kind
+        // (not the tyre of whatever vehicle was open before).
+        let kind = |r: &str| {
+            if r.starts_with("rim_motorbike_bicycle") {
+                "tyre_bicycle_hybrid_001"
+            } else if r.starts_with("rim_motorbike") {
+                "tyre_motorbike_001"
+            } else if r.starts_with("rim_industrial") || r.starts_with("rim_truck") {
+                "tyre_truck_001"
+            } else {
+                "tyre_car_001"
+            }
+        };
+        let tyre = c
+            .tyre
+            .clone()
+            .or_else(|| v.configs.iter().find_map(|x| x.tyre.clone()))
+            .or_else(|| c.rim.as_deref().map(|r| kind(r).to_string()));
+        if let Some(t) = tyre {
             self.wheel_tyre = format!("{t}_hi");
         }
         self.veh_cfg = Some(i);
@@ -1195,6 +1250,7 @@ impl ModelView {
                 Ok(ls) => {
                     let c = self.rim_colour;
                     self.rim_applied = c;
+                    self.wheel_boxes = ls.iter().map(|l| l.model.bbox).collect();
                     self.wheel_mats = ls.iter().map(|l| l.model.materials.iter().map(|m| m.name.clone()).collect()).collect();
                     let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
                     self.wheels = ls
@@ -1232,7 +1288,7 @@ impl ModelView {
             }
         }
         let mounts = self.mounts();
-        if !self.wheels_on || mounts.is_empty() {
+        if !self.wheels_on || self.veh_no_wheels || mounts.is_empty() {
             return;
         }
         let key = format!("{}|{}", self.wheel_rim, self.wheel_tyre);
@@ -1259,9 +1315,35 @@ impl ModelView {
                 ctx.request_repaint();
             });
         }
+        // Two-wheelers: the stored data gives no wheel width, and at the rim's
+        // scale a tyre is as wide as a car's. Narrow the wheel to fit between
+        // the fork legs or the swingarm (an estimate).
+        let xs_key = format!(
+            "{}|{}|{}|{}|{}",
+            self.loaded.as_ref().map(|l| l.source.as_str()).unwrap_or(""),
+            self.wheel_scale,
+            self.wheel_scale_rear,
+            self.wheel_key,
+            self.wheel_boxes.len()
+        );
+        if self.wheel_xs.0 != xs_key {
+            let v = match &self.loaded {
+                Some(l) => mounts
+                    .iter()
+                    .map(|(bone, p)| {
+                        let sc = if is_rear(bone) { self.wheel_scale_rear } else { self.wheel_scale };
+                        fork_fit(&l.model, *p, sc, &self.wheel_boxes)
+                    })
+                    .collect(),
+                None => vec![],
+            };
+            self.wheel_xs = (xs_key, v);
+        }
+        let xs = self.wheel_xs.1.clone();
         let inst: Vec<render3d::Instance> = mounts
             .iter()
-            .map(|(bone, p)| {
+            .enumerate()
+            .map(|(mi, (bone, p))| {
                 let right = bone
                     .strip_prefix("wheel_")
                     .map(|s| s.starts_with('r'))
@@ -1272,17 +1354,17 @@ impl ModelView {
                     Mat4::IDENTITY
                 };
                 let spin = Mat4::from_quat(Quat::from_rotation_x(self.wheel_spin));
-                let rear = bone
-                    .strip_prefix("wheel_")
-                    .map(|s| s.chars().nth(1) == Some('r'))
-                    .unwrap_or(false);
+                let rear = is_rear(bone);
                 let sc = if rear {
                     self.wheel_scale_rear
                 } else {
                     self.wheel_scale
                 };
                 render3d::Instance::new(
-                    Mat4::from_translation(*p) * spin * mirror * Mat4::from_scale(Vec3::splat(sc)),
+                    Mat4::from_translation(*p)
+                        * spin
+                        * mirror
+                        * Mat4::from_scale(Vec3::new(sc * xs.get(mi).copied().unwrap_or(1.0), sc, sc)),
                     false,
                 )
             })
@@ -1597,7 +1679,7 @@ impl ModelView {
         self.size = px;
         self.update_wheels(rs, &ctx);
         let (globals, skin) = self.joint_mats();
-        let show_wheels = self.wheels_on && !self.mounts().is_empty();
+        let show_wheels = self.wheels_on && !self.veh_no_wheels && !self.mounts().is_empty();
         let (under, top) = self.lines(&globals);
         let settled = self.idle_for_shot();
         let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
@@ -1903,14 +1985,14 @@ impl ModelView {
                             egui::TextEdit::singleline(&mut self.wheel_tyre).desired_width(140.0),
                         );
                     });
-                    ui.checkbox(&mut self.wheel_auto, "size from the car's wheelScale").on_hover_text(format!("scale = {WHEEL_FACTOR:.3} x wheelScale (front / rear). The factor is fitted by eye on phoenix; the game's exact rule is not decoded."));
+                    ui.checkbox(&mut self.wheel_auto, "size from the car's wheelScale").on_hover_text(format!("scale = {WHEEL_FACTOR:.0} x wheelScale (front / rear): wheelScale is the rim radius in metres and the shared rims have radius 0.5. The tyre is scaled with the rim; on two-wheelers the width is narrowed to fit the fork (an estimate, no width is stored)."));
                     ui.add_enabled_ui(!self.wheel_auto, |ui| {
                         ui.add(
-                            egui::Slider::new(&mut self.wheel_scale, 0.2..=0.8)
+                            egui::Slider::new(&mut self.wheel_scale, 0.1..=1.2)
                                 .text("front wheel scale"),
                         );
                         ui.add(
-                            egui::Slider::new(&mut self.wheel_scale_rear, 0.2..=0.8)
+                            egui::Slider::new(&mut self.wheel_scale_rear, 0.1..=1.2)
                                 .text("rear wheel scale"),
                         );
                     });
@@ -2521,6 +2603,42 @@ fn load_query_sel(
         fur: None,
         fur_skin: Default::default(),
     })
+}
+
+fn is_rear(bone: &str) -> bool {
+    bone.strip_prefix("wheel_").map(|s| s.chars().nth(1) == Some('r')).unwrap_or(false)
+}
+
+/// Width factor of a shared wheel on a two-wheeler (mount on the centre
+/// line): the widest the tyre can be and still pass between the body parts
+/// beside it (fork legs, swingarm, stays), measured in the band between half
+/// and 92 % of the tyre radius around the axle. 1.0 for other vehicles and
+/// where nothing is beside the wheel. `p` and the model are in glTF space;
+/// the wheel's axle is X.
+fn fork_fit(model: &glb::Model, p: Vec3, scale: f32, boxes: &[[[f32; 3]; 2]]) -> f32 {
+    if p.x.abs() > 0.05 || boxes.is_empty() {
+        return 1.0;
+    }
+    // the tyre is the wheel model with the largest radius
+    let radius = |b: &[[f32; 3]; 2]| b[0][1].abs().max(b[1][1].abs()).max(b[0][2].abs()).max(b[1][2].abs());
+    let Some(tyre) = boxes.iter().max_by(|a, b| radius(a).total_cmp(&radius(b))) else { return 1.0 };
+    let (r, w) = (radius(tyre) * scale, (tyre[1][0] - tyre[0][0]) * scale);
+    if r <= 0.0 || w <= 0.0 {
+        return 1.0;
+    }
+    let mut half = f32::MAX;
+    for m in &model.meshes {
+        for v in &m.verts {
+            let d = ((v.pos[1] - p.y).powi(2) + (v.pos[2] - p.z).powi(2)).sqrt();
+            if d > 0.5 * r && d < 0.92 * r {
+                half = half.min((v.pos[0] - p.x).abs());
+            }
+        }
+    }
+    if half == f32::MAX {
+        return 1.0;
+    }
+    (0.9 * 2.0 * half / w).clamp(0.08, 1.0)
 }
 
 /// A wheel's own bone (`wheel_lf`, `wheel_rr`, `wheel_lm1`), not one of its

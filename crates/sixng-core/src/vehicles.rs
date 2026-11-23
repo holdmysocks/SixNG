@@ -31,6 +31,10 @@ pub const CONFIG: u32 = 0x5101_9114;
 pub const VARIATION: u32 = 0xfc1c_7000;
 const GAME_NAME: u32 = 0x120e_5836;
 const OWNER: u32 = 0xfb1f_80ff;
+/// `handlingId` (case-sensitive joaat).
+const HANDLING_ID: u32 = 0xec41_bd9c;
+/// Layout version of vehicles.json; the model viewer rebuilds older files.
+pub const FORMAT: u32 = 2;
 const COLOUR: u32 = 0x5bdc_13e3;
 const PARTS: u32 = 0xe89b_8540;
 const PALETTE: u32 = 0x8c86_6829;
@@ -108,16 +112,25 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
     // Per-vehicle pack resources repeat rows of the merged table: keep each
     // distinct row once per model.
     let mut seen: std::collections::HashSet<(u32, String)> = std::collections::HashSet::new();
+    let mut by_handling: Vec<(u32, Value)> = Vec::new();
     for (id, infos, cfgs, vars) in found {
         sources.push(id);
         for mut mi in infos {
             let h = get(&mi, GAME_NAME).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-            if models.get(&h).is_some_and(|m| !m["model_info"].is_null()) {
-                continue;
-            }
             if let Some(o) = mi.as_object_mut() {
                 o.remove("_struct");
                 o.remove("_struct_name");
+            }
+            // `gameName` is not always the model: 46 of 325 records carry
+            // another name there (bison4's says bison900, mobilityscooter's
+            // an unresolved hash) while `handlingId` is the name the
+            // configurations and the drawable use. Kept for the second pass.
+            let hid = get(&mi, HANDLING_ID).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            if hid != 0 && hid != h {
+                by_handling.push((hid, mi.clone()));
+            }
+            if models.get(&h).is_some_and(|m| !m["model_info"].is_null()) {
+                continue;
             }
             models.entry(h).or_insert_with(|| json!({"model": name(h), "model_hash": format!("{h:08x}"), "model_info": null, "configurations": [], "palettes": [], "part_groups": []}))["model_info"] = mi;
         }
@@ -179,6 +192,16 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
             }
         }
     }
+    // Models whose record is filed under another `gameName`: take the
+    // record whose `handlingId` names them.
+    for (hid, mi) in by_handling {
+        if let Some(m) = models.get_mut(&hid) {
+            if m["model_info"].is_null() {
+                m["model_info"] = mi;
+                m["model_info_via"] = "handlingId".into();
+            }
+        }
+    }
     let list: Vec<&Value> = models.values().collect();
     let with_info = list.iter().filter(|m| !m["model_info"].is_null()).count();
     let named = list.iter().filter(|m| !m["model"].is_null()).count();
@@ -186,7 +209,8 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("vehicles.json");
     std::fs::write(&path, serde_json::to_vec_pretty(&json!({
-        "note": "Per vehicle model: model_info (vehicles.meta-like; wheelScale / wheelScaleRear size the wheels; the shared rim_* models have radius 0.5 and the tyres 0.875, and the model viewer scales both by 1.625 x wheelScale, a factor fitted by eye, not the game's verified rule), configurations (body colour ARGB + the part models incl. rim and tyre), palettes (ARGB paint-colour lists; colours repeat, so repetition reads as the draw weight), part_groups (weighted part choices). Names resolve where known; others are joaat hex.",
+        "note": "Per vehicle model: model_info (vehicles.meta-like; wheelScale / wheelScaleRear read as the rim radius in metres (0.217 on a BMX, 0.25 / 0.22 on a dirt bike); the shared rim_* models have radius 0.5, so the model viewer scales rim and tyre by wheelScale / 0.5. The game shapes the tyre through the wheel model's own bones, which is not decoded), configurations (body colour ARGB + the part models incl. rim and tyre), palettes (ARGB paint-colour lists; colours repeat, so repetition reads as the draw weight), part_groups (weighted part choices). Names resolve where known; others are joaat hex.",
+        "format": FORMAT,
         "sources": sources,
         "vehicles": list,
     }))?)?;
