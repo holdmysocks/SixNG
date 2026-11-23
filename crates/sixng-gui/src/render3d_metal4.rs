@@ -581,6 +581,7 @@ struct Target {
     motion: Texture,
     upscale: Option<Texture>,
     depth: Texture,
+    depth_resident: bool,
 }
 
 pub struct Renderer3D4 {
@@ -1156,7 +1157,11 @@ impl Renderer3D4 {
         let depth_attachment = RenderPassDepthAttachmentDescriptor::new()?;
         depth_attachment.set_texture(Some(&target.depth))?;
         depth_attachment.set_load_action(LoadAction::LoadActionClear)?;
-        depth_attachment.set_store_action(StoreAction::StoreActionDontCare)?;
+        depth_attachment.set_store_action(if self.temporal_mode == TemporalUpscaleMode::Off {
+            StoreAction::StoreActionDontCare
+        } else {
+            StoreAction::StoreActionStore
+        })?;
         depth_attachment.set_clear_depth(0.0)?;
         pass.set_depth_attachment(Some(&depth_attachment))?;
 
@@ -1427,11 +1432,22 @@ impl Renderer3D4 {
             PixelFormat::DEPTH32_FLOAT,
             size[0] as usize,
             size[1] as usize,
-            ResourceOptions::MEMORYLESS,
-            TextureUsage::RENDER_TARGET,
+            if self.temporal_mode == TemporalUpscaleMode::Off {
+                ResourceOptions::MEMORYLESS
+            } else {
+                ResourceOptions::PRIVATE
+            },
+            if self.temporal_mode == TemporalUpscaleMode::Off {
+                TextureUsage::RENDER_TARGET
+            } else {
+                TextureUsage::RENDER_TARGET.union(TextureUsage::SHADER_READ)
+            },
         )?;
         let depth = self.device.new_texture(&depth_descriptor)?;
         let mut allocations = vec![ResidencyAllocation::Texture(&color), ResidencyAllocation::Texture(&motion)];
+        if self.temporal_mode != TemporalUpscaleMode::Off {
+            allocations.push(ResidencyAllocation::Texture(&depth));
+        }
         if let Some(upscale) = &upscale {
             allocations.push(ResidencyAllocation::Texture(upscale));
         }
@@ -1440,13 +1456,25 @@ impl Renderer3D4 {
 
         if let Some(old) = self.target.take() {
             let mut removals = vec![ResidencyAllocation::Texture(&old.color), ResidencyAllocation::Texture(&old.motion)];
+            if old.depth_resident {
+                removals.push(ResidencyAllocation::Texture(&old.depth));
+            }
             if let Some(upscale) = &old.upscale {
                 removals.push(ResidencyAllocation::Texture(upscale));
             }
             self.residency.remove_allocations(&removals)?;
             self.residency.commit()?;
         }
-        self.target = Some(Target { size, display_size, color, motion, upscale, depth });
+        let depth_resident = self.temporal_mode != TemporalUpscaleMode::Off;
+        self.target = Some(Target {
+            size,
+            display_size,
+            color,
+            motion,
+            upscale,
+            depth,
+            depth_resident,
+        });
         if self.temporal_mode != TemporalUpscaleMode::Off {
             let Ok(descriptor) = metal_rust::metal_fx::TemporalScalerDescriptor::new() else {
                 self.temporal_mode = TemporalUpscaleMode::Off;
