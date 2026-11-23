@@ -51,6 +51,8 @@ pub enum Fmt {
     Rgba8,
     Bgra8,
     R8,
+    /// A8_UNORM: white RGB for previewing the stored alpha mask.
+    A8,
     Rg8,
     /// R16_FLOAT, shown as grey clamped to 0..1.
     R16f,
@@ -76,7 +78,8 @@ impl Fmt {
             97..=99 => Fmt::Bc7,
             27..=29 | 30 | 31 | 32 => Fmt::Rgba8,
             87 | 88 | 90 | 91 => Fmt::Bgra8,
-            60 | 61 | 62 | 63 | 64 | 65 => Fmt::R8,
+            60 | 61 | 62 | 63 | 64 => Fmt::R8,
+            65 => Fmt::A8,
             48..=52 => Fmt::Rg8,
             54 => Fmt::R16f,
             53 | 56 | 57 => Fmt::R16,
@@ -87,7 +90,7 @@ impl Fmt {
     }
     pub fn block_dim(&self) -> u32 {
         match self {
-            Fmt::Rgba8 | Fmt::Bgra8 | Fmt::R8 | Fmt::Rg8 | Fmt::R16f | Fmt::R16 | Fmt::Rgba16 | Fmt::Rgba16f | Fmt::Unknown => 1,
+            Fmt::Rgba8 | Fmt::Bgra8 | Fmt::R8 | Fmt::A8 | Fmt::Rg8 | Fmt::R16f | Fmt::R16 | Fmt::Rgba16 | Fmt::Rgba16f | Fmt::Unknown => 1,
             _ => 4,
         }
     }
@@ -98,7 +101,7 @@ impl Fmt {
             Fmt::Rgba8 | Fmt::Bgra8 => 4,
             Fmt::Rg8 | Fmt::R16f | Fmt::R16 => 2,
             Fmt::Rgba16 | Fmt::Rgba16f => 8,
-            Fmt::R8 => 1,
+            Fmt::R8 | Fmt::A8 => 1,
             Fmt::Unknown => 0,
         }
     }
@@ -417,7 +420,7 @@ pub fn to_rgba(fmt: Fmt, data: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
         Fmt::Bc6u => crate::bc6h::decode_image(data, wu, hu, &mut img, false),
         Fmt::Bc6s => crate::bc6h::decode_image(data, wu, hu, &mut img, true),
         Fmt::Bc7 => td::decode_bc7(data, wu, hu, &mut img),
-        Fmt::Rgba8 | Fmt::Bgra8 | Fmt::R8 | Fmt::Rg8 | Fmt::R16f | Fmt::R16 | Fmt::Rgba16 | Fmt::Rgba16f => {
+        Fmt::Rgba8 | Fmt::Bgra8 | Fmt::R8 | Fmt::A8 | Fmt::Rg8 | Fmt::R16f | Fmt::R16 | Fmt::Rgba16 | Fmt::Rgba16f => {
             let bpe = fmt.bytes_per_elem() as usize;
             let mut out = vec![255u8; wu * hu * 4];
             for i in 0..wu * hu {
@@ -433,6 +436,7 @@ pub fn to_rgba(fmt: Fmt, data: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
                         o[2] = s[0];
                         o[3] = s[3];
                     }
+                    Fmt::A8 => o[3] = s[0],
                     Fmt::R8 => {
                         o[0] = s[0];
                         o[1] = s[0];
@@ -530,6 +534,23 @@ pub(crate) fn f16(h: u16) -> f32 {
         31 if m == 0.0 => f32::INFINITY,
         31 => 0.0,
         _ => (1.0 + m / 1024.0) * 2f32.powi(e - 15),
+    }
+}
+
+#[cfg(test)]
+mod alpha_tests {
+    use super::*;
+
+    #[test]
+    fn a8_preview_preserves_alpha() {
+        let rgba = to_rgba(Fmt::from_dxgi(65), &[0, 128, 255], 3, 1).unwrap();
+        assert_eq!(rgba, [255, 255, 255, 0, 255, 255, 255, 128, 255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn r8_preview_stays_opaque_grey() {
+        let rgba = to_rgba(Fmt::from_dxgi(61), &[0, 128, 255], 3, 1).unwrap();
+        assert_eq!(rgba, [0, 0, 0, 255, 128, 128, 128, 255, 255, 255, 255, 255]);
     }
 }
 
