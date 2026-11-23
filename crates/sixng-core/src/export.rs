@@ -328,6 +328,12 @@ const NOT_BODY_BONES: [&str; 22] = [
 ];
 /// `emissivetex`: the lit parts of a lamp or panel.
 const EMISSIVE_PARAM: &str = "8e0d63ee";
+/// The texture the game draws vehicle screens into while it runs (dials,
+/// needles, navigation): bound as the colour and emissive map of a second
+/// `standard_vehicle_emissive_layer` mesh that lies about 1 mm in front of
+/// the screen's stored picture. No store holds it (552 vehicle models bind
+/// it), so that overlay is left out and the stored picture shows.
+const RUNTIME_SCREEN: &str = "a800afccf01aa36b";
 
 #[derive(Default)]
 struct ShaderTextures {
@@ -449,7 +455,21 @@ fn classify_shader(s: &crate::drawable::Shader, st: &ShaderTextures) -> serde_js
             c["family"] = if textured { "vehicle interior, trim and mechanical parts (two-layer shader with a layer detail texture)" } else { "vehicle interior, lamp housings and mechanical parts (two-layer shader on interior, lamp or mechanical bones)" }.into();
         }
     }
+    if is_hidden_screen(st) {
+        c["stand_in"] = "hidden".into();
+        c["hidden_note"] = "runtime screen overlay: its colour map is drawn by the game while it runs (dials, needles, navigation) and is not in the files; left out so the stored screen picture under it shows".into();
+    }
     c
+}
+
+/// A screen overlay whose picture only exists at runtime (`RUNTIME_SCREEN`).
+fn is_hidden_screen(st: &ShaderTextures) -> bool {
+    st.entries.iter().any(|e| e["role_guess"] == "base_color" && e["hash64"] == RUNTIME_SCREEN && !e["status"].as_str().is_some_and(|x| x.starts_with("ok")))
+}
+
+/// Not a visible surface: no colour, normal or emissive map is written.
+fn is_hidden(s: &crate::drawable::Shader, st: &ShaderTextures) -> bool {
+    classify_shader(s, st)["stand_in"] == "hidden"
 }
 
 /// Shaders drawn with the runtime body colour (see `classify_shader`).
@@ -1118,9 +1138,11 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         name: format!("shader{:02}_{}", s.index, s.name_hash),
         // Paint: the colour slot is the engine-default white; any sRGB
         // fallback (decal layer, masks) would be wrong as albedo.
-        base_color_uri: if is_paint(s, st) { None } else { st.base.clone() },
-        normal_uri: st.normal.clone(),
-        gltf: {
+        base_color_uri: if is_paint(s, st) || is_hidden(s, st) { None } else { st.base.clone() },
+        normal_uri: if is_hidden(s, st) { None } else { st.normal.clone() },
+        gltf: if is_hidden(s, st) {
+            crate::material::gltf_fields(&classify_shader(s, st), false)
+        } else {
             let mut g = crate::material::gltf_fields(&classify_shader(s, st), st.base.is_some() && !is_paint(s, st));
             // Lamps, neon, screens: the emissive shaders (`standard_emissive`,
             // `standard_emissive_layer` …, by recovered name) sit in any

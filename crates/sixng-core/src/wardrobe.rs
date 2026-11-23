@@ -217,3 +217,95 @@ mod tests {
         assert_eq!(m[&h], ("tanktopcasual_fr1_028".to_string(), "tanktopcasual_fr1_028_disheveled_un_full".to_string()));
     }
 }
+
+/// Per-model variation lists (a packs PSO: map of model name hash -> items
+/// `a5ea6310` {`fc7eaa76` variation id, `fee182a6` outfit type, Scale}). For
+/// the arcade zombies they list exactly the clothing sets, each with its own
+/// body scale; the outfit type is shared between models (the female and male
+/// tactical sets have the same one). Head sets are not listed. Returns
+/// variation id -> (model hash, outfit type, scale).
+pub fn variation_lists(pso_json: &Value) -> HashMap<u32, (u32, u32, f64)> {
+    let mut out = HashMap::new();
+    for (k, objs) in pso_json["objects"].as_object().into_iter().flatten() {
+        if !k.starts_with("78262a67") {
+            continue;
+        }
+        for o in objs.as_array().into_iter().flatten() {
+            let Some(model) = o["Key"].as_u64() else { continue };
+            for it in o["Item"].as_array().into_iter().flatten() {
+                if let (Some(v), Some(c)) = (it[crate::meta7a::field_name(0xfc7e_aa76)].as_u64(), it[crate::meta7a::field_name(0xfee1_82a6)].as_u64()) {
+                    out.insert(v as u32, (model as u32, c as u32, it["Scale"].as_f64().unwrap_or(1.0)));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Dirt presets from common.rpf's graphics definitions (`<CGraphicsDefinitionsData>`,
+/// plain XML): per `DirtDefinitions` item its scalar settings, the cloth and
+/// skin modifiers, the colour (`ColorLookup` resolved from `CannedColors`, RGB
+/// 0..255) and the alpha mask (`AlphaMasksLookup` resolved from `AlphaChannels`:
+/// dirt-mask texture channels with probabilities). Keyed by preset name.
+pub fn dirt_presets(xml: &str) -> HashMap<String, Value> {
+    use regex::Regex;
+    let section = |name: &str| -> &str {
+        let (a, b) = (format!("<{name}>"), format!("</{name}>"));
+        xml.find(&a).and_then(|i| xml[i..].find(&b).map(|j| &xml[i + a.len()..i + j])).unwrap_or("")
+    };
+    let num = |s: &str| s.parse::<f64>().ok();
+    let colour_re = Regex::new(r#"(?s)<Item\s+key="([^"]+)"\s+w="([^"]+)"\s+x="([^"]+)"\s+y="([^"]+)"\s+z="([^"]+)""#).unwrap();
+    let colours: HashMap<&str, Value> = colour_re.captures_iter(section("CannedColors")).map(|c| (c.get(1).unwrap().as_str(), serde_json::json!([num(&c[3]), num(&c[4]), num(&c[5])]))).collect();
+    let item_re = Regex::new(r#"(?s)<Item key="([^"]+)">(.*?)\n    </Item>"#).unwrap();
+    let chan_re = Regex::new(r#"(?s)<Probability value="([^"]+)" />\s*<Channel value="([^"]+)" />"#).unwrap();
+    let masks: HashMap<&str, Value> = item_re
+        .captures_iter(section("AlphaChannels"))
+        .map(|c| (c.get(1).unwrap().as_str(), serde_json::json!(chan_re.captures_iter(c.get(2).unwrap().as_str()).map(|m| serde_json::json!({"channel": num(&m[2]), "probability": num(&m[1])})).collect::<Vec<_>>())))
+        .collect();
+    let val_re = Regex::new(r#"<(\w+) value="([^"]+)" />"#).unwrap();
+    let block_re = Regex::new(r#"(?s)<(\w+DirtModifiers)>(.*?)</\w+DirtModifiers>"#).unwrap();
+    let text_re = Regex::new(r#"<(AlphaMasksLookup|ColorLookup)>([^<]*)</"#).unwrap();
+    let mut out = HashMap::new();
+    for c in item_re.captures_iter(section("DirtDefinitions")) {
+        let body = c.get(2).unwrap().as_str();
+        let mut m = serde_json::Map::new();
+        let mut rest = body.to_string();
+        for b in block_re.captures_iter(body) {
+            let v: serde_json::Map<String, Value> = val_re.captures_iter(&b[2]).map(|x| (x[1].to_string(), serde_json::json!(num(&x[2])))).collect();
+            m.insert(b[1].to_string(), Value::Object(v));
+            rest = rest.replace(&b[0], "");
+        }
+        for x in val_re.captures_iter(&rest) {
+            let v = match &x[2] {
+                "true" => serde_json::json!(true),
+                "false" => serde_json::json!(false),
+                s => serde_json::json!(num(s)),
+            };
+            m.insert(x[1].to_string(), v);
+        }
+        for t in text_re.captures_iter(body) {
+            m.insert(t[1].to_string(), serde_json::json!(&t[2]));
+            match &t[1] {
+                "ColorLookup" => m.insert("color_rgb".into(), colours.get(&t[2]).cloned().unwrap_or(Value::Null)),
+                _ => m.insert("mask_channels".into(), masks.get(&t[2]).cloned().unwrap_or(Value::Null)),
+            };
+        }
+        out.insert(c[1].to_string(), Value::Object(m));
+    }
+    out
+}
+
+#[cfg(test)]
+mod dirt_tests {
+    #[test]
+    fn dirt_preset_resolves_colour_and_mask() {
+        let xml = "<CGraphicsDefinitionsData>\n  <CannedColors>\n    <Item\n      key=\"Blood_Red\"\n      w=\"-1.000000\"\n      x=\"86.000000\"\n      y=\"20.000000\"\n      z=\"24.000000\"\n     />\n  </CannedColors>\n  <AlphaChannels>\n    <Item key=\"DIRT_MASK_FILTHY\">\n      <Name>DIRT_MASK_FILTHY</Name>\n      <Channels>\n        <Item>\n          <Probability value=\"50.000000\" />\n          <Channel value=\"2\" />\n        </Item>\n      </Channels>\n    </Item>\n  </AlphaChannels>\n  <DirtDefinitions>\n    <Item key=\"AM_Dirtdefinition_BloodEffect\">\n      <AlphaCurve value=\"1.500000\" />\n      <SkinDirtModifiers>\n        <DirtBoostStrength value=\"0.500000\" />\n      </SkinDirtModifiers>\n      <AlphaMasksLookup>DIRT_MASK_FILTHY</AlphaMasksLookup>\n      <ColorLookup>Blood_Red</ColorLookup>\n      <IgnoreZoneColor value=\"true\" />\n    </Item>\n  </DirtDefinitions>\n</CGraphicsDefinitionsData>\n";
+        let p = super::dirt_presets(xml);
+        let b = &p["AM_Dirtdefinition_BloodEffect"];
+        assert_eq!(b["color_rgb"], serde_json::json!([86.0, 20.0, 24.0]));
+        assert_eq!(b["mask_channels"][0]["channel"], serde_json::json!(2.0));
+        assert_eq!(b["SkinDirtModifiers"]["DirtBoostStrength"], serde_json::json!(0.5));
+        assert_eq!(b["AlphaCurve"], serde_json::json!(1.5));
+        assert_eq!(b["IgnoreZoneColor"], serde_json::json!(true));
+    }
+}

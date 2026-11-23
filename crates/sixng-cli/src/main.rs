@@ -545,7 +545,7 @@ enum Cmd {
         #[arg(default_value = "levels")]
         archive: String,
     },
-    /// Ped wardrobe variations (packs.rpf meta resources with struct f795e8ba, one per ped model): per variation its parts (slot, name, drawable), as JSON. Drawables are found through the item's textures, so run `texture-users` first. A variation is a clothing set or a head set (head, eyes, teeth); a full look is one of each. `parts` and `tex_remap` per variation are ready for `outfit <name> --parts … --tex-remap …` (the remap carries the variation's own skin / dirt / blood textures).
+    /// Ped wardrobe variations (packs.rpf meta resources with struct f795e8ba, one per ped model): per variation its parts (slot, name, drawable), as JSON. Drawables are found through the item's textures, so run `texture-users` first. A variation is a clothing set or a head set (head, eyes, teeth); a full look is one of each. `parts` and `tex_remap` per variation are ready for `outfit <name> --parts … --tex-remap …` (the remap carries the item textures that differ from the drawable's own). `listed` is the model's variation list entry (model hash, outfit type, body scale): the clothing sets the game picks from; head sets are not listed and pair with any of them. `dirt` holds the variation's dirt or blood preset from common.rpf (colour, dirt-mask channels, cloth and skin strengths), which the game applies at run time and the export does not.
     PedVariations {
         /// Resource offsets (hex) or entry ids, e.g. 2b21010
         #[arg(required = true)]
@@ -1638,6 +1638,31 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let ix = ws.load_index(&a)?;
             let tu = sixng_core::texusers::TexUsers::load(&sixng_core::texusers::path(&ws))?;
             let pre = sixng_core::wardrobe::prefixes(ix.entries.iter().filter(|e| e.kind == Kind::RageObj).filter_map(|e| e.name.as_deref()));
+            // per-model variation lists (PSO files holding struct a5ea6310)
+            let mut lists = std::collections::HashMap::new();
+            for e in ix.entries.iter().filter(|e| e.kind == Kind::Pso) {
+                let Ok(b) = sixng_core::scan::read_entry(&a.path, e) else { continue };
+                let tag = 0xa5ea_6310u32;
+                if !b.windows(4).any(|w| w == tag.to_le_bytes() || w == tag.to_be_bytes()) {
+                    continue;
+                }
+                if let Some(p) = sixng_core::pso::parse(&b) {
+                    lists.extend(sixng_core::wardrobe::variation_lists(&p.to_json()));
+                }
+            }
+            // dirt / blood presets from common.rpf's graphics definitions, if indexed
+            let dirt = ws
+                .resolve("common")
+                .ok()
+                .and_then(|ca| {
+                    let cix = ws.load_index(&ca).ok()?;
+                    cix.entries.iter().filter(|e| e.kind == Kind::Xml).find_map(|e| {
+                        let b = sixng_core::scan::read_entry(&ca.path, e).ok()?;
+                        let s = String::from_utf8_lossy(&b);
+                        s.contains("<CGraphicsDefinitionsData>").then(|| sixng_core::wardrobe::dirt_presets(&s))
+                    })
+                })
+                .unwrap_or_default();
             let mut res = serde_json::Map::new();
             for id in ids {
                 let off = id.rsplit('@').next().unwrap_or(id).trim_start_matches("0x");
@@ -1652,7 +1677,9 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                         let mut d: Vec<&str> = v.parts.iter().filter_map(|p| p.drawable.as_deref()).collect();
                         d.dedup();
                         let remap: Vec<String> = v.parts.iter().flat_map(|p| p.tex_remap.iter().map(|(a, b)| format!("{a}={b}"))).collect();
-                        json!({"id": v.id, "scale": v.scale, "tags": v.tags, "parts": d.iter().map(|n| format!("^{n}$")).collect::<Vec<_>>().join(","), "tex_remap": remap.join(","), "items": v.parts})
+                        let dv: serde_json::Map<String, serde_json::Value> = v.parts.iter().flat_map(|p| p.tags.values().flatten()).filter_map(|w| dirt.get(w).map(|d| (w.clone(), d.clone()))).collect();
+                        let listed = u32::from_str_radix(&v.id, 16).ok().and_then(|i| lists.get(&i)).map(|&(m, c, s)| json!({"model": format!("{m:08x}"), "outfit_type": format!("{c:08x}"), "scale": s}));
+                        json!({"id": v.id, "scale": v.scale, "listed": listed, "tags": v.tags, "parts": d.iter().map(|n| format!("^{n}$")).collect::<Vec<_>>().join(","), "tex_remap": remap.join(","), "dirt": dv, "items": v.parts})
                     })
                     .collect();
                 res.insert(e.id.clone(), json!(vs));
