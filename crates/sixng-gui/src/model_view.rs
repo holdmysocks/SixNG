@@ -143,6 +143,23 @@ pub struct ModelView {
     pub roof_down: bool,
     /// The loaded model's roof clip (model path it was read for, the clip).
     roof_anim: (PathBuf, Option<glb::Anim>),
+    /// Its other clips (a sunroof) and how far each is played, 0..1.
+    clips: Vec<glb::Anim>,
+    clip_pos: Vec<f32>,
+    /// Automation: play every other clip to this position.
+    pub clip_pos_all: f32,
+    /// Bonnet and boot opening (radians at the hinge).
+    pub bonnet_open: f32,
+    pub boot_open: f32,
+    /// Hinged panels of the loaded model: joint index -> (0 = door, 1 =
+    /// bonnet, 2 = boot; rotation axis; sign that swings it open).
+    hinges: HashMap<usize, (u8, Vec3, f32)>,
+    /// Brake disc and caliper models at the wheels.
+    brakes: Vec<(bool, GpuModel)>,
+    brake_pending: Arc<Mutex<Option<Vec<(bool, Loaded)>>>>,
+    brake_key: String,
+    brake_loading: bool,
+    veh_brake: (Option<String>, Option<String>),
     pub paint_on: bool,
     /// Side-panel controls that apply to the loaded model, keyed by (GLB path, triangles).
     caps: Option<(PathBuf, usize, Caps)>,
@@ -354,6 +371,17 @@ impl ModelView {
             roof_fold: 0.0,
             roof_down: false,
             roof_anim: (PathBuf::new(), None),
+            clips: Vec::new(),
+            clip_pos: Vec::new(),
+            clip_pos_all: 0.0,
+            bonnet_open: 0.0,
+            boot_open: 0.0,
+            hinges: HashMap::new(),
+            brakes: Vec::new(),
+            brake_pending: Arc::new(Mutex::new(None)),
+            brake_key: String::new(),
+            brake_loading: false,
+            veh_brake: (None, None),
             paint_on: true,
             caps: None,
             material_sel: None,
@@ -772,7 +800,7 @@ impl ModelView {
             || self.veh_no_wheels
             || (!self.wheel_loading
                 && self.wheel_key == format!("{}|{}", self.wheel_rim, self.wheel_tyre));
-        veh && wheels
+        veh && wheels && !self.brake_loading
     }
 
     pub fn cache_dir(&self) -> PathBuf {
@@ -1080,8 +1108,10 @@ impl ModelView {
                 if self.wheel_auto && axle < f32::MAX {
                     // tyre_car_001 has radius 0.79 at unit scale
                     let sc = ((axle - floor + 0.05) / 0.79).clamp(0.1, 1.2);
-                    self.wheel_rim = "rim_muscle_001_hi".into();
-                    self.wheel_tyre = "tyre_car_001_hi".into();
+                    let (rim, tyre) = self.plain_wheels();
+                    self.wheel_rim = rim.into();
+                    self.wheel_tyre = tyre.into();
+                    self.veh_brake = (None, None);
                     self.wheel_scale = sc;
                     self.wheel_scale_rear = sc;
                 }
@@ -1104,10 +1134,13 @@ impl ModelView {
             if !v.configs.is_empty() {
                 self.apply_config(v, 0);
             } else {
-                // no configuration names a rim or tyre: plain ones, not
-                // those of the vehicle opened before
-                self.wheel_rim = "rim_muscle_001_hi".into();
-                self.wheel_tyre = "tyre_car_001_hi".into();
+                // no configuration names a rim or tyre: plain ones of a kind
+                // that suits the stored tyre size, not those of the vehicle
+                // opened before
+                let (rim, tyre) = self.plain_wheels();
+                self.wheel_rim = rim.into();
+                self.wheel_tyre = tyre.into();
+                self.veh_brake = (None, None);
                 self.apply_scale(v);
             }
         }
@@ -1201,6 +1234,20 @@ impl ModelView {
         ui.separator();
     }
 
+    /// A plain rim and tyre for a vehicle whose data names none, by the
+    /// largest stored tyre radius: tractor-sized over 0.7 m, truck-sized over
+    /// 0.45 m, else a car's.
+    fn plain_wheels(&self) -> (&'static str, &'static str) {
+        let r = self.discs().iter().flatten().map(|d| d[0]).fold(0.0f32, f32::max);
+        if r > 0.7 {
+            ("rim_industrial_020_hi", "tyre_tractor_001_hi")
+        } else if r > 0.45 {
+            ("rim_truck_003_hi", "tyre_truck_001_hi")
+        } else {
+            ("rim_muscle_001_hi", "tyre_car_001_hi")
+        }
+    }
+
     fn apply_scale(&mut self, v: &crate::vehicle_db::Vehicle) {
         if self.wheel_auto {
             if let Some(f) = v.wheel_scale {
@@ -1253,6 +1300,12 @@ impl ModelView {
             }
             .into();
         }
+        // like the tyre: a configuration without brake parts takes those of
+        // another configuration of the vehicle
+        self.veh_brake = (
+            c.brake_disc.clone().or_else(|| v.configs.iter().find_map(|x| x.brake_disc.clone())),
+            c.caliper.clone().or_else(|| v.configs.iter().find_map(|x| x.caliper.clone())),
+        );
         self.veh_cfg = Some(i);
         self.apply_scale(v);
     }
@@ -1279,6 +1332,65 @@ impl ModelView {
             .unwrap_or_default()
     }
 
+    /// Brake discs and calipers. A configuration names a `brakedisc_*` and a
+    /// `caliper_*` model; both are modelled around a disc of radius 0.5 and
+    /// are scaled to the wheel's stored brake disc (the smaller collision
+    /// disc on its axle line) and put on its centre. The disc turns with the
+    /// wheel, the caliper does not.
+    fn update_brakes(&mut self, rs: &egui_wgpu::RenderState, ctx: &egui::Context) {
+        if let Some(ls) = self.brake_pending.lock().unwrap().take() {
+            self.brake_loading = false;
+            let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+            self.brakes = ls.iter().map(|(disc, l)| (*disc, ren.upload(rs, &l.model, &[]))).collect();
+        }
+        let spots: Vec<(String, Vec3, f32)> = self
+            .loaded
+            .as_ref()
+            .and_then(|l| l.info["wheel_mounts"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|m| {
+                let c: [f32; 3] = serde_json::from_value(m["brake_centre"].clone()).ok()?;
+                Some((m["bone"].as_str()?.to_string(), Vec3::new(c[0], c[2], -c[1]), m["brake_radius"].as_f64()? as f32))
+            })
+            .collect();
+        let (disc, caliper) = if spots.is_empty() { (None, None) } else { self.veh_brake.clone() };
+        let key = format!("{disc:?}|{caliper:?}");
+        if key != self.brake_key {
+            self.brake_key = key;
+            self.brakes.clear();
+            let qs: Vec<(bool, String)> = [(true, disc), (false, caliper)].into_iter().filter_map(|(d, n)| n.map(|n| (d, format!("^{n}_hi$")))).collect();
+            if !qs.is_empty() {
+                self.brake_loading = true;
+                let ws = Workspace::new(&self.game, &self.work);
+                let cache = self.cache_dir();
+                let slot = self.brake_pending.clone();
+                let idx = self.indexes.clone();
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    // a part that does not load is left out
+                    let r: Vec<(bool, Loaded)> = qs.iter().filter_map(|(d, q)| load_query(&ws, &cache, q, 0, &idx).ok().map(|l| (*d, l))).collect();
+                    *slot.lock().unwrap() = Some(r);
+                    ctx.request_repaint();
+                });
+            }
+        }
+        if let Some(ren) = &self.renderer {
+            for (is_disc, g) in self.brakes.iter_mut() {
+                let inst: Vec<render3d::Instance> = spots
+                    .iter()
+                    .map(|(bone, p, r)| {
+                        let right = bone.strip_prefix("wheel_").map(|s| s.starts_with('r')).unwrap_or(false);
+                        let mirror = if right { Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0)) } else { Mat4::IDENTITY };
+                        let spin = if *is_disc { Mat4::from_quat(Quat::from_rotation_x(self.wheel_spin)) } else { Mat4::IDENTITY };
+                        render3d::Instance::new(Mat4::from_translation(*p) * spin * mirror * Mat4::from_scale(Vec3::splat(r / 0.5)), false)
+                    })
+                    .collect();
+                ren.set_instances(rs, g, &inst);
+            }
+        }
+    }
+
     /// Stored wheel size per mount (tyre radius, half width in metres), from
     /// the fragment's collision discs.
     fn discs(&self) -> Vec<Option<[f32; 2]>> {
@@ -1298,9 +1410,13 @@ impl ModelView {
         // the roof clip of the loaded convertible, read once per model file
         if let Some(l) = &self.loaded {
             if self.roof_anim.0 != l.model.path {
-                let roof = l.info["roof_animation"]["status"] == "ok";
-                let a = if roof { glb::load_anims(&l.model.path).ok().and_then(|v| v.into_iter().find(|a| a.name.to_ascii_lowercase().ends_with("/roof"))) } else { None };
-                self.roof_anim = (l.model.path.clone(), a);
+                let any = l.info["roof_animation"]["animations"].as_array().is_some_and(|a| !a.is_empty()) || l.info["roof_animation"]["status"] == "ok";
+                let mut all = if any { glb::load_anims(&l.model.path).unwrap_or_default() } else { Vec::new() };
+                let roof = all.iter().position(|a| a.name.to_ascii_lowercase().ends_with("/roof")).map(|i| all.remove(i));
+                self.roof_anim = (l.model.path.clone(), roof);
+                self.clip_pos = vec![self.clip_pos_all; all.len()];
+                self.clips = all;
+                self.hinges = find_hinges(&l.model);
             }
         }
         if let Some(r) = self.wheel_pending.lock().unwrap().take() {
@@ -1350,6 +1466,7 @@ impl ModelView {
         if !self.wheels_on || self.veh_no_wheels || mounts.is_empty() {
             return;
         }
+        self.update_brakes(rs, ctx);
         let key = format!("{}|{}", self.wheel_rim, self.wheel_tyre);
         if key != self.wheel_key {
             self.wheel_key = key;
@@ -1489,22 +1606,34 @@ impl ModelView {
         };
         // the roof clip replaces the local transform of the joints it drives
         let posed: Vec<glb::Joint>;
-        let js: &[glb::Joint] = match &self.roof_anim.1 {
-            Some(a) if self.roof_fold > 0.0 && self.roof_anim.0 == l.model.path => {
-                let t = self.roof_fold * a.duration;
+        // clips being played: (clip, position 0..1)
+        let mut playing: Vec<(&glb::Anim, f32)> = Vec::new();
+        if self.roof_anim.0 == l.model.path {
+            if let Some(a) = &self.roof_anim.1 {
+                if self.roof_fold > 0.0 {
+                    playing.push((a, self.roof_fold));
+                }
+            }
+            playing.extend(self.clips.iter().zip(&self.clip_pos).filter(|(_, p)| **p > 0.0).map(|(a, p)| (a, *p)));
+        }
+        let js: &[glb::Joint] = match playing.is_empty() {
+            false => {
                 let mut v: Vec<glb::Joint> = l.model.joints.iter().map(|j| glb::Joint { name: j.name.clone(), parent: j.parent, local: j.local, ibm: j.ibm }).collect();
                 let mut trs: Vec<Option<(Vec3, Quat, Vec3)>> = vec![None; v.len()];
-                for c in &a.channels {
-                    let Some(j) = v.get(c.joint) else { continue };
-                    let e = trs[c.joint].get_or_insert_with(|| {
-                        let (s, r, t) = Mat4::from_cols_array(&j.local).to_scale_rotation_translation();
-                        (t, r, s)
-                    });
-                    let x = c.sample(t);
-                    match c.path {
-                        0 => e.0 = Vec3::new(x[0], x[1], x[2]),
-                        1 => e.1 = Quat::from_xyzw(x[0], x[1], x[2], x[3]).normalize(),
-                        _ => e.2 = Vec3::new(x[0], x[1], x[2]),
+                for (a, pos) in &playing {
+                    let t = pos * a.duration;
+                    for c in &a.channels {
+                        let Some(j) = v.get(c.joint) else { continue };
+                        let e = trs[c.joint].get_or_insert_with(|| {
+                            let (s, r, t) = Mat4::from_cols_array(&j.local).to_scale_rotation_translation();
+                            (t, r, s)
+                        });
+                        let x = c.sample(t);
+                        match c.path {
+                            0 => e.0 = Vec3::new(x[0], x[1], x[2]),
+                            1 => e.1 = Quat::from_xyzw(x[0], x[1], x[2], x[3]).normalize(),
+                            _ => e.2 = Vec3::new(x[0], x[1], x[2]),
+                        }
                     }
                 }
                 for (j, e) in v.iter_mut().zip(trs) {
@@ -1515,15 +1644,18 @@ impl ModelView {
                 posed = v;
                 &posed
             }
-            _ => &l.model.joints,
+            true => &l.model.joints,
         };
+        // hinged panels: this frame's rotation per joint
+        let open = [self.door_open, self.bonnet_open, self.boot_open];
+        let swing: HashMap<usize, Mat4> = self.hinges.iter().filter(|(_, h)| open[h.0 as usize] != 0.0).map(|(i, h)| (*i, Mat4::from_quat(Quat::from_axis_angle(h.1, h.2 * open[h.0 as usize])))).collect();
         let mut global: Vec<Option<Mat4>> = vec![None; js.len()];
         fn g(
             i: usize,
             js: &[glb::Joint],
             global: &mut Vec<Option<Mat4>>,
             spin: f32,
-            door: f32,
+            swing: &HashMap<usize, Mat4>,
             roof_down: bool,
             depth: usize,
         ) -> Mat4 {
@@ -1536,15 +1668,8 @@ impl ModelView {
             if spin != 0.0 && is_wheel_bone(&n) {
                 local = local * Mat4::from_quat(Quat::from_rotation_x(spin));
             }
-            if door != 0.0
-                && matches!(
-                    n.as_str(),
-                    "door_dside_f" | "door_dside_r" | "door_pside_f" | "door_pside_r"
-                )
-            {
-                // hinge axis is vertical (glTF +Y); driver side is -X
-                let side = if n.contains("dside") { -1.0 } else { 1.0 };
-                local = local * Mat4::from_quat(Quat::from_rotation_y(side * door));
+            if let Some(m) = swing.get(&i) {
+                local = local * *m;
             }
             // roof down: collapse what hangs on convertible_roof, but not the
             // cover that closes over the stowed roof
@@ -1552,14 +1677,14 @@ impl ModelView {
                 local = local * Mat4::from_scale(Vec3::ZERO);
             }
             let m = match j.parent {
-                Some(p) if p != i && depth < 64 => g(p, js, global, spin, door, roof_down, depth + 1) * local,
+                Some(p) if p != i && depth < 64 => g(p, js, global, spin, swing, roof_down, depth + 1) * local,
                 _ => local,
             };
             global[i] = Some(m);
             m
         }
         let gl: Vec<Mat4> = (0..js.len())
-            .map(|i| g(i, js, &mut global, self.wheel_spin, self.door_open, self.roof_down && self.roof_anim.1.is_none(), 0))
+            .map(|i| g(i, js, &mut global, self.wheel_spin, &swing, self.roof_down && self.roof_anim.1.is_none(), 0))
             .collect();
         let skin: Vec<Mat4> = gl
             .iter()
@@ -1834,6 +1959,7 @@ impl ModelView {
         let mut models: Vec<&GpuModel> = self.gpu.iter().collect();
         if show_wheels {
             models.extend(self.wheels.iter());
+            models.extend(self.brakes.iter().map(|b| &b.1));
         }
         if self.hair.show {
             models.extend(self.hair.gpu.iter());
@@ -2106,6 +2232,16 @@ impl ModelView {
                 }
                 if caps.doors {
                     ui.add(egui::Slider::new(&mut self.door_open, 0.0..=1.3).text("doors open"));
+                }
+                if self.hinges.values().any(|h| h.0 == 1) {
+                    ui.add(egui::Slider::new(&mut self.bonnet_open, 0.0..=1.1).text("bonnet open"));
+                }
+                if self.hinges.values().any(|h| h.0 == 2) {
+                    ui.add(egui::Slider::new(&mut self.boot_open, 0.0..=1.1).text("boot open"));
+                }
+                for (a, p) in self.clips.iter().zip(self.clip_pos.iter_mut()) {
+                    let n = a.name.rsplit('/').next().unwrap_or(&a.name).trim_end_matches("_anim").replace('_', " ");
+                    ui.add(egui::Slider::new(p, 0.0..=1.0).text(n)).on_hover_text(format!("plays the vehicle's clip {} ({:.1} s)", a.name, a.duration));
                 }
                 if caps.roof || self.roof_anim.1.is_some() {
                     match &self.roof_anim.1 {
@@ -2827,6 +2963,63 @@ fn load_query_sel(
     })
 }
 
+/// The hinged panels of a vehicle: door, bonnet and boot bones, with the
+/// axis and the direction that opens them. Doors turn about the vertical
+/// through their bone, away from the car's centre line; bonnet and boot turn
+/// about the lateral axis so that the panel rises. The direction comes from
+/// where the panel's vertices lie relative to its bone (a front-hinged
+/// bonnet and a rear-hinged door open the right way); the opening angle is
+/// the slider's, not a stored limit.
+fn find_hinges(model: &glb::Model) -> HashMap<usize, (u8, Vec3, f32)> {
+    let kind = |n: &str| match n.to_ascii_lowercase().as_str() {
+        "door_dside_f" | "door_dside_r" | "door_pside_f" | "door_pside_r" => Some(0u8),
+        "bonnet" => Some(1),
+        "boot" => Some(2),
+        _ => None,
+    };
+    // hinge bone of each joint (itself or its nearest hinge ancestor)
+    let mut owner: Vec<Option<usize>> = vec![None; model.joints.len()];
+    for i in 0..model.joints.len() {
+        let (mut k, mut depth) = (Some(i), 0);
+        while let Some(j) = k {
+            if kind(&model.joints[j].name).is_some() {
+                owner[i] = Some(j);
+                break;
+            }
+            depth += 1;
+            k = model.joints[j].parent.filter(|p| *p != j && depth < 64);
+        }
+    }
+    let mut sum: HashMap<usize, (Vec3, f32)> = HashMap::new();
+    for me in model.meshes.iter().filter(|m| m.skinned) {
+        for v in &me.verts {
+            if let Some(h) = owner.get(v.joints[0] as usize).copied().flatten() {
+                let e = sum.entry(h).or_insert((Vec3::ZERO, 0.0));
+                e.0 += Vec3::from(v.pos);
+                e.1 += 1.0;
+            }
+        }
+    }
+    sum.into_iter()
+        .filter_map(|(h, (s, n))| {
+            let centre = s / n.max(1.0);
+            let pivot = Mat4::from_cols_array(&model.joints[h].ibm).inverse().w_axis.truncate();
+            let d = centre - pivot;
+            let k = kind(&model.joints[h].name)?;
+            Some((
+                h,
+                if k == 0 {
+                    // about Y a point moves in x by d.z * angle: outwards from the centre line
+                    (k, Vec3::Y, if centre.x * d.z >= 0.0 { 1.0 } else { -1.0 })
+                } else {
+                    // about X a point moves in y by -d.z * angle: upwards
+                    (k, Vec3::X, if d.z > 0.0 { -1.0 } else { 1.0 })
+                },
+            ))
+        })
+        .collect()
+}
+
 fn is_rear(bone: &str) -> bool {
     bone.strip_prefix("wheel_").map(|s| s.chars().nth(1) == Some('r')).unwrap_or(false)
 }
@@ -2992,6 +3185,8 @@ fn export_load(
                 || (j.contains("\"bone\": \"wheel_") || j.contains("\"bone\":\"wheel_") || j.contains("\"wheel_discs\"")) && !j.contains("\"wheel_mounts_version\"")
                 // and convertibles from before their roof clip was written
                 || (j.contains("\"convertible_roof\"") || j.contains("\"wheel_mounts_version\"")) && !j.contains("\"roof_animation\"")
+                // and from before brake discs and the vehicle's other clips
+                || j.contains("\"wheel_mounts_version\"") && !j.contains("\"wheel_mounts_version\": 3")
                 // and weapon parts from before their stand-in surface
                 || j.contains("e68a4a98") && !j.contains("\"gunmetal\"")
         });

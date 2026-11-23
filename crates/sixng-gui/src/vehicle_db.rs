@@ -40,6 +40,8 @@ struct Cfg {
     colour: Option<Colour>,
     rim: Option<String>,
     tyre: Option<String>,
+    #[serde(default)]
+    parts: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -64,6 +66,9 @@ pub struct Config {
     pub colour: Option<[f32; 3]>,
     pub rim: Option<String>,
     pub tyre: Option<String>,
+    /// `brakedisc_*` and `caliper_*` part models of the configuration.
+    pub brake_disc: Option<String>,
+    pub caliper: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -177,6 +182,8 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
                 colour: c.colour.and_then(|c| hex(&c.srgb_if_linear)),
                 rim: c.rim,
                 tyre: c.tyre,
+                brake_disc: c.parts.iter().find(|p| p.starts_with("brakedisc_")).cloned(),
+                caliper: c.parts.iter().find(|p| p.starts_with("caliper_")).cloned(),
             })
             .collect();
         let palettes = v

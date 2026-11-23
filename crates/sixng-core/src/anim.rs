@@ -636,6 +636,16 @@ pub fn vehicle_roof(game_root: &std::path::Path, work: &std::path::Path, model: 
     Ok(d.clip("roof").is_some().then_some((de, d)))
 }
 
+/// A vehicle's own clip dictionary `va_<model>` with whatever clips it holds
+/// (`roof` on a convertible, `sunroof_r_anim` on one SUV).
+pub fn vehicle_clips(game_root: &std::path::Path, work: &std::path::Path, model: &str) -> Result<Option<(DictEntry, ClipDictionary)>> {
+    let m = model.to_ascii_lowercase();
+    let m = m.strip_suffix("_hi").or_else(|| m.strip_suffix("_mid")).unwrap_or(&m);
+    let want = format!("va_{m}");
+    let Some(de) = level_dictionaries(game_root, work)?.into_iter().find(|d| d.name.eq_ignore_ascii_case(&want)) else { return Ok(None) };
+    load_dictionary(game_root, work, &de.id).map(Some)
+}
+
 pub fn load_dictionary(game_root: &std::path::Path, work: &std::path::Path, q: &str) -> Result<(DictEntry, ClipDictionary)> {
     if let Some((arch, _)) = q.split_once(".rpf@").filter(|(a, _)| *a != "anim") {
         let arch = format!("{arch}.rpf");

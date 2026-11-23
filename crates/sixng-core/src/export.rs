@@ -506,17 +506,31 @@ fn roof_animation(a: &ArchiveInfo, name: &str, joints: &[crate::gltf::Joint]) ->
     let Some(work) = crate::names::work_dir() else {
         return (Vec::new(), serde_json::json!({"status": "not looked up: no work directory is set"}));
     };
-    match crate::anim::vehicle_roof(&game_root(a), &work, name) {
+    match crate::anim::vehicle_clips(&game_root(a), &work, name) {
         Ok(Some((de, d))) => {
-            let c = d.clip("roof").expect("vehicle_roof checked the clip");
-            let (channels, stats) = crate::outfit::clip_channels(&d, c, joints);
-            let n = channels.len();
-            let anim = crate::gltf::Animation { name: format!("{}/{}", d.name, c.short_name()), channels };
+            // every clip of the vehicle's dictionary; the roof clip first
+            let mut anims = Vec::new();
+            let mut list = Vec::new();
+            let mut clips: Vec<&crate::anim::Clip> = d.clips.iter().filter(|c| c.kind == 1).collect();
+            clips.sort_by_key(|c| !c.short_name().eq_ignore_ascii_case("roof"));
+            for c in clips {
+                let (channels, stats) = crate::outfit::clip_channels(&d, c, joints);
+                if channels.is_empty() {
+                    continue;
+                }
+                let name = format!("{}/{}", d.name, c.short_name());
+                list.push(serde_json::json!({"name": name, "clip": c.short_name(), "duration": c.duration, "channels": channels.len(), "coverage": stats}));
+                anims.push(crate::gltf::Animation { name, channels });
+            }
+            let roof = list.iter().find(|x| x["clip"].as_str().is_some_and(|s| s.eq_ignore_ascii_case("roof"))).cloned();
             let info = serde_json::json!({
-                "status": "ok", "name": anim.name, "dictionary": d.name, "source": de.id, "duration": c.duration, "channels": n, "coverage": stats,
-                "note": "The model info names the clip as in GTA V (animConvRoofDictName = joaat of va_<model>, animConvRoofName = joaat of roof). Time 0 is the roof up, the end the roof stowed. Written into the GLB as a glTF animation of the joint nodes.",
+                "status": if roof.is_some() { "ok" } else if list.is_empty() { "the vehicle's clip dictionary has no clip on this skeleton" } else { "no roof clip (other clips, see animations)" },
+                "name": roof.as_ref().map(|r| r["name"].clone()), "dictionary": d.name, "source": de.id,
+                "duration": roof.as_ref().map(|r| r["duration"].clone()), "channels": roof.as_ref().map(|r| r["channels"].clone()), "coverage": roof.as_ref().map(|r| r["coverage"].clone()),
+                "animations": list,
+                "note": "The model info names the roof clip as in GTA V (animConvRoofDictName = joaat of va_<model>, animConvRoofName = joaat of roof). Time 0 is the roof up, the end the roof stowed. Every clip of the vehicle's va_<model> dictionary is written into the GLB as a glTF animation of the joint nodes.",
             });
-            (vec![anim], info)
+            (anims, info)
         }
         Ok(None) => (Vec::new(), serde_json::json!({"status": "no va_<model> clip dictionary with a roof clip in levels.rpf"})),
         Err(e) => (Vec::new(), serde_json::json!({"status": format!("not read: {e:#}")})),
@@ -1062,9 +1076,12 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     let near: Vec<&crate::bounds::WheelDisc> = wheel_discs.iter().filter(|d| (d.centre[0] - p[0]).abs() < 0.15 && (d.centre[1] - p[1]).abs() < 0.03 && (d.centre[2] - p[2]).abs() < 0.03).collect();
                     let big = near.iter().map(|d| d.radius).fold(0.0f32, f32::max);
                     let d = near.iter().filter(|d| d.radius > big - 1e-3).min_by(|a, b| (a.centre[0] - p[0]).abs().total_cmp(&(b.centre[0] - p[0]).abs())).copied();
-                    serde_json::json!({"bone": b.name, "pivot": b.pivot, "radius": d.map(|d| d.radius), "half_width": d.map(|d| d.half_width), "centre": d.map(|d| d.centre)})
+// the brake disc: the largest of the clearly smaller discs there
+                    let brake = near.iter().filter(|x| x.radius < 0.75 * big).max_by(|a, b| a.radius.total_cmp(&b.radius));
+                    serde_json::json!({"bone": b.name, "pivot": b.pivot, "radius": d.map(|d| d.radius), "half_width": d.map(|d| d.half_width), "centre": d.map(|d| d.centre),
+                        "brake_radius": brake.map(|d| d.radius), "brake_centre": brake.map(|d| d.centre)})
                 }).collect::<Vec<_>>(),
-                "wheel_mounts_version": 2,
+                "wheel_mounts_version": 3,
                 "roof_animation": roof_info,
                 "wheel_discs": wheel_discs,
                 "wheel_discs_note": "Disc bounds of the fragment's physics (type 8 children of its composite bound): centre, radius and half width in metres. The largest disc on a wheel bone's axle line is the wheel (its centre, radius and half_width are repeated in wheel_mounts); a thinner one is the brake disc.",

@@ -1607,6 +1607,9 @@ impl App {
         m.door_open = c.f("door").unwrap_or(0.0);
         m.roof_down = c.has("roof-down");
         m.roof_fold = c.f("roof").unwrap_or(0.0);
+        m.clip_pos_all = c.f("clips").unwrap_or(0.0);
+        m.bonnet_open = c.f("bonnet").unwrap_or(0.0);
+        m.boot_open = c.f("boot").unwrap_or(0.0);
         if let Some(v) = c.f("yaw") {
             m.cam.yaw = v;
         }
