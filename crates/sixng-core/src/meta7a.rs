@@ -133,15 +133,30 @@ impl<'a> Meta<'a> {
         Some(Meta { r, structs, blocks, pso: false })
     }
 
-    /// Resolve a pointer field: a real system pointer (`0x5xxxxxxx`) or a
-    /// pool reference into the instance blocks: u64 with the 1-based block
-    /// index in the low 12 bits and the byte offset in bits 20+.
+    /// Resolve a pointer field: a pool reference into the instance blocks
+    /// (u64 with the 1-based block index in the low 12 bits and the byte
+    /// offset in bits 20+) or, failing that, a real system
+    /// or graphics pointer (`0x5xxxxxxx` / `0x6xxxxxxx`).
+    ///
+    /// Pool references come first: one whose byte offset is 0x500-0x5FF or
+    /// 0x600-0x6FF with a zero low byte (`0x5000_0003` = block 3, offset
+    /// 0x500) also reads as a real pointer to a few bytes into the page,
+    /// which turned 1.8% of prop-batch instances into garbage. In the map
+    /// resources no pointer, array or map member needs the real reading.
     pub fn ptr(&self, v: u64) -> Option<(u32, usize)> {
+        if let Some(p) = self.pool_ref(v) {
+            return Some(p);
+        }
         if !self.pso {
             if let Some(o) = self.r.meta_off(v) {
                 return Some((0, o));
             }
         }
+        None
+    }
+
+    /// A pool reference: (struct hash of the block, sys offset).
+    fn pool_ref(&self, v: u64) -> Option<(u32, usize)> {
         let bi = (v & 0xFFF) as usize;
         let off = (v >> 20) as usize;
         let &(h, size, o) = self.blocks.get(bi.checked_sub(1)?)?;

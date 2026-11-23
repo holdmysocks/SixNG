@@ -12,6 +12,34 @@ pub struct Resource {
     pub gfx_base: usize,
 }
 
+/// How far past the last indexed stream `load_meta` looks for a graphics
+/// page compressed as a stream of its own.
+const PAGE_SEARCH: usize = 256 << 10;
+
+/// The first zlib stream at a 16-byte aligned offset in `buf` (within
+/// `PAGE_SEARCH`) that ends after inflating to between `need` bytes and
+/// `need` rounded up to 64 KiB (pages are padded to whole 64 KiB chunks).
+pub fn find_page_stream(buf: &[u8], need: usize) -> Option<Vec<u8>> {
+    let max = (need + 0xFFFF) & !0xFFFF;
+    let mut at = 0;
+    while at + 2 <= buf.len().min(PAGE_SEARCH + 2) {
+        let (a, b) = (buf[at], buf[at + 1]);
+        if a == 0x78 && (u16::from(a) << 8 | u16::from(b)) % 31 == 0 {
+            let mut d = flate2::Decompress::new(true);
+            let mut out = vec![0u8; max + 1];
+            if let Ok(flate2::Status::StreamEnd) = d.decompress(&buf[at..], &mut out, flate2::FlushDecompress::Finish) {
+                let n = d.total_out() as usize;
+                if (need..=max).contains(&n) {
+                    out.truncate(n);
+                    return Some(out);
+                }
+            }
+        }
+        at += 16;
+    }
+    None
+}
+
 pub const SYS_BASE: u64 = 0x5000_0000;
 pub const GFX_BASE: u64 = 0x6000_0000;
 
@@ -27,7 +55,8 @@ impl Resource {
         let mut r = Self::load_parts(archive, e, true)?;
         // Small graphics pages are stored uncompressed right after the last
         // zlib stream (16-byte aligned), so the stream index does not see
-        // them. Read as much as the meta block table needs from there.
+        // them. Read as much as the meta block table needs from there, or
+        // find the page's own stream (below).
         if r.gfx.is_empty() && r.sys.get(0x10..0x15) == Some(b"0DRPz") {
             let need = r.meta_gfx_extent();
             if need > 0 && need <= 64 << 20 {
@@ -36,10 +65,31 @@ impl Resource {
                     let pos = (last[0] + last[1] + 15) & !15;
                     let mut f = File::open(archive)?;
                     f.seek(SeekFrom::Start(pos))?;
-                    let mut buf = vec![0u8; need];
-                    let n = f.read(&mut buf)?;
+                    // When the last stream fills whole 64 KiB chunks, the page
+                    // is not stored there but compressed on its own a few KiB
+                    // further on (the stream index lists it as a separate
+                    // `bin` entry), inflating to the block extent or that
+                    // rounded up to 64 KiB. Only search then: small pages
+                    // (64 bytes) can match unrelated streams.
+                    let full_chunk = last[2] > 0 && last[2] % 0x10000 == 0;
+                    let window = if full_chunk { PAGE_SEARCH + need + need / 8 + 1024 } else { need };
+                    let mut buf = vec![0u8; window];
+                    let mut n = 0;
+                    while n < buf.len() {
+                        let k = f.read(&mut buf[n..])?;
+                        if k == 0 {
+                            break;
+                        }
+                        n += k;
+                    }
                     buf.truncate(n);
-                    r.gfx = buf;
+                    r.gfx = match full_chunk.then(|| find_page_stream(&buf, need)).flatten() {
+                        Some(page) => page,
+                        None => {
+                            buf.truncate(need);
+                            buf
+                        }
+                    };
                 }
             }
         }
@@ -244,4 +294,37 @@ pub fn read_sys(f: &mut File, e: &Entry) -> Result<(Vec<u8>, usize)> {
         n += 1;
     }
     Ok((sys, n))
+}
+
+#[cfg(test)]
+mod page_stream_tests {
+    use super::find_page_stream;
+    use std::io::Write;
+
+    fn zlib(data: &[u8]) -> Vec<u8> {
+        let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    #[test]
+    fn finds_separate_page_stream() {
+        let page: Vec<u8> = (0..45568u32).map(|i| (i * 7 % 251) as u8).collect();
+        // Unrelated bytes, a small unrelated stream, then the page at a
+        // 16-byte aligned offset.
+        let mut buf = vec![0xAAu8; 0x2000];
+        let other = zlib(&[1, 2, 3, 4]);
+        buf[0x100..0x100 + other.len()].copy_from_slice(&other);
+        buf.extend(zlib(&page));
+        assert_eq!(find_page_stream(&buf, 45568).as_deref(), Some(&page[..]));
+        // A page padded to whole 64 KiB chunks also matches.
+        let mut padded = page.clone();
+        padded.resize(0x10000, 0);
+        let mut buf2 = vec![0u8; 0x40];
+        buf2.extend(zlib(&padded));
+        assert_eq!(find_page_stream(&buf2, 45568).map(|p| p.len()), Some(0x10000));
+        // Too small or too large: no match.
+        assert!(find_page_stream(&buf, 50000).is_none());
+        assert!(find_page_stream(&buf2, 0x10001).is_none());
+    }
 }

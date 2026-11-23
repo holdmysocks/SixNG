@@ -172,3 +172,74 @@ pub fn grass_batches(r: &Resource, m: &Meta) -> Vec<GrassBatch> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meta7a::StructDef;
+    use std::collections::HashMap;
+
+    fn put_f32(b: &mut [u8], o: usize, v: f32) {
+        b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// One prop batch whose instance array is the pool reference
+    /// `0x5000_0003` (block 3, byte offset 0x500): it also reads as a real
+    /// system pointer to sys offset 3, which must not win.
+    fn synthetic(n: usize) -> (Resource, Vec<(u32, u32, usize)>) {
+        let mut sys = vec![0u8; 0x2000];
+        // Decoy bytes at sys offset 3 (what the real-pointer reading hits).
+        for b in &mut sys[3..3 + 64 * n] {
+            *b = 0x7f;
+        }
+        let batch = 0x200;
+        sys[batch + 0x44..batch + 0x48].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        sys[batch + 0x90..batch + 0x98].copy_from_slice(&0x5000_0003u64.to_le_bytes());
+        sys[batch + 0x98..batch + 0x9A].copy_from_slice(&(n as u16).to_le_bytes());
+        // Instance block 3 at 0x800; the array starts 0x500 into it.
+        let inst = 0x800 + 0x500;
+        for k in 0..n {
+            let q = inst + 64 * k;
+            // rotation identity scaled by 2, translation (100 + k, 200, 30)
+            put_f32(&mut sys, q, 2.0);
+            put_f32(&mut sys, q + 12, 100.0 + k as f32);
+            put_f32(&mut sys, q + 16 + 4, 2.0);
+            put_f32(&mut sys, q + 16 + 12, 200.0);
+            put_f32(&mut sys, q + 32 + 8, 2.0);
+            put_f32(&mut sys, q + 32 + 12, 30.0);
+        }
+        let blocks = vec![(0x1111, 0x10, 0x100), (PROP_BATCH, 368, batch), (PROP_INSTANCE, 0x700, 0x800)];
+        (Resource { sys, gfx: Vec::new(), gfx_base: 0 }, blocks)
+    }
+
+    fn meta<'a>(r: &'a Resource, blocks: Vec<(u32, u32, usize)>) -> Meta<'a> {
+        let structs = HashMap::from([(PROP_BATCH, StructDef { hash: PROP_BATCH, size: 368, members: vec![] }), (PROP_INSTANCE, StructDef { hash: PROP_INSTANCE, size: 64, members: vec![] })]);
+        Meta { r, structs, blocks, pso: false }
+    }
+
+    #[test]
+    fn pool_reference_wins_over_real_pointer() {
+        let (r, blocks) = synthetic(4);
+        let m = meta(&r, blocks);
+        assert_eq!(m.ptr(0x5000_0003), Some((PROP_INSTANCE, 0xD00)));
+        // Same for the graphics-page look-alike (offset 0x600).
+        assert_eq!(m.ptr(0x6000_0003), Some((PROP_INSTANCE, 0xE00)));
+        // Not a valid pool reference (no block 0x10): the real pointer is used.
+        assert_eq!(m.ptr(0x5000_0010), Some((0, 0x10)));
+    }
+
+    #[test]
+    fn prop_batch_at_ambiguous_pool_reference() {
+        let (r, blocks) = synthetic(5);
+        let m = meta(&r, blocks);
+        let b = prop_batches(&r, &m);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].archetype, 0x1234_5678);
+        assert_eq!(b[0].instances.len(), 5);
+        for (k, i) in b[0].instances.iter().enumerate() {
+            assert_eq!(i.p, [100.0 + k as f32, 200.0, 30.0]);
+            assert_eq!(i.s, [2.0, 2.0, 2.0]);
+            assert!((i.q[3] - 1.0).abs() < 1e-6);
+        }
+    }
+}
