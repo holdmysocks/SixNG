@@ -253,7 +253,8 @@ pub fn decode_states(chunk: &[u8], blocks: usize, t: &Tables) -> Option<(Bc7Outp
         let (b1, b2) = index_bits(mode);
         let mut q = pq;
         for (set, lanes_, b) in [(0usize, [11usize, 12, 13, 14], b1), (1, [6, 7, 8, 10], b2)] {
-            if b == 0 { continue; }
+            // a block without a secondary index set leaves that set at zero
+            if b == 0 { q[set] = [0; 16]; continue; }
             for (k, &l) in lanes_.iter().enumerate() {
                 for h in 0..2 {
                     let s16 = sym(l, i, h) as u32;
