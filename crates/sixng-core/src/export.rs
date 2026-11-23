@@ -332,6 +332,8 @@ const VEHICLE_PALETTE: &str = "19df25d7";
 /// `lyr0diffusetex`, `lyr1diffusetex`: a layer's detail map (linear: grey
 /// detail in R and G around 0.5, a wear mask in B), not a colour.
 const LAYER_DETAIL: [&str; 2] = ["346394ea", "7d4f12e2"];
+/// `lyr0materialatex`: red blends metalness, green roughness.
+const LAYER_MATERIAL_A: &str = "2bb2ede8";
 /// Vehicle bones whose meshes are not body panels (substring of the bone
 /// name): interior, lamps, mechanical parts.
 const NOT_BODY_BONES: [&str; 22] = [
@@ -685,7 +687,16 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                         }
                         e["mean_rgba"] = serde_json::json!(stt.mean_rgba.map(|x| x.round()));
                         if t.param_hash == VEHICLE_PALETTE && tx.width == 128 && tx.height == 256 && stt.mip == 0 {
-                            st.vehicle_palette = image::open(&p).ok().map(|i| i.to_rgba8().pixels().map(|p| p.0).collect());
+                            // every slice of the array, one after the other
+                            // (the PNG is slice 0 only)
+                            st.vehicle_palette = store.data(tx).ok().map(|d| {
+                                (0..tx.slices().max(1))
+                                    .flat_map(|sl| crate::ttpf::decode_rgba_slice(tx, &d, 0, sl).map(|x| x.0).unwrap_or_else(|_| vec![0; 128 * 256 * 4]))
+                                    .collect::<Vec<u8>>()
+                                    .chunks_exact(4)
+                                    .map(|c| [c[0], c[1], c[2], c[3]])
+                                    .collect()
+                            });
                         }
                         if stt.normal_like {
                             e["looks_like_normal_map"] = true.into();
@@ -1226,8 +1237,23 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             .collect();
         if g.is_empty() { 0.5 } else { (g.iter().sum::<f64>() / g.len() as f64 / 255.0) as f32 }
     };
+    // Metalness and roughness sit between a surface's low and high by the
+    // red and green of the layer's material map (`lyr0materialatex`): its
+    // mean over the model's materials (0.5 when none decoded).
+    let mat_blend: [f32; 2] = {
+        let e: Vec<&serde_json::Value> = shader_tex
+            .iter()
+            .filter(|st| st.vehicle_palette.is_some())
+            .flat_map(|st| st.entries.iter())
+            .filter(|e| e["param_hash"] == LAYER_MATERIAL_A && e["status"].as_str().is_some_and(|x| x.starts_with("ok")) && e["width"].as_u64().is_some_and(|w| w >= 32))
+            .collect();
+        std::array::from_fn(|k| {
+            let v: Vec<f64> = e.iter().filter_map(|e| e["mean_rgba"][k].as_f64()).collect();
+            if v.is_empty() { 0.5 } else { (v.iter().sum::<f64>() / v.len() as f64 / 255.0) as f32 }
+        })
+    };
     let part_looks = match (&part_tables, e.name.as_deref(), shader_tex.iter().find_map(|st| st.vehicle_palette.as_ref())) {
-        (Some(t), Some(n), Some(pal)) => t.looks_json(n, pal, ramp_u),
+        (Some(t), Some(n), Some(pal)) => t.looks_json(n, pal, ramp_u, mat_blend),
         _ => serde_json::Value::Null,
     };
     let slice = |i: usize| {
@@ -1301,7 +1327,7 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         }
         // Vehicles: the colour of each part id from the vehicle's part set.
         if let (Some((_, parts)), Some(pal), Some(c)) = (&part_set, material.and_then(|s| shader_tex.get(s)).and_then(|st| st.vehicle_palette.as_ref()), &m.colors) {
-            tint = Some(crate::vehcolour::vertex_colours(parts, pal, ramp_u, c.iter().map(|c| c[3])));
+            tint = Some(crate::vehcolour::vertex_colours(parts, pal, ramp_u, mat_blend, c.iter().map(|c| c[3])));
             if let Some(mm) = mesh_meta.last_mut() {
                 mm["part_colours_applied"] = true.into();
             }
