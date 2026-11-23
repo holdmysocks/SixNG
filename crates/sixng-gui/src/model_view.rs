@@ -2469,6 +2469,14 @@ impl ModelView {
             let t = self.gear_up.clamp(0.0, 1.0);
             let late = ((t - 0.6) / 0.4).clamp(0.0, 1.0);
             for p in &self.gear {
+                if p.hide {
+                    if late > 0.0 {
+                        let m = Mat4::from_scale(Vec3::splat(1e-5));
+                        let m = swing.get(&p.joint).map_or(m, |s| *s * m);
+                        swing.insert(p.joint, m);
+                    }
+                    continue;
+                }
                 let a = p.angle * if p.door { late * late * (3.0 - 2.0 * late) } else { t };
                 if a != 0.0 {
                     let m = match p.follow {
@@ -5081,6 +5089,8 @@ struct GearPart {
     /// a wheel bone outside the leg's bones that sits in a leg's mesh: the
     /// leg's pivot and axis in model space, which it turns about instead
     follow: Option<(Vec3, Vec3)>,
+    /// a door's actuator rod: drawn only while the doors are open
+    hide: bool,
 }
 
 /// The retractable landing gear of an aircraft: only models with gear door
@@ -5096,7 +5106,9 @@ struct GearPart {
 ///   inwards;
 /// - a door that does not hang on a leg turns about its longer horizontal
 ///   side until it lies level: towards the nearest leg when it hangs
-///   straight down, the way it already leans otherwise.
+///   straight down, the way it already leans otherwise;
+/// - wheel bones and brace or strut bones that hang from the body instead
+///   of a leg bone go up with the leg they belong to, as one piece.
 fn find_gear(model: &glb::Model) -> Vec<GearPart> {
     let kind = |n: &str| -> Option<bool> {
         let n = n.to_ascii_lowercase();
@@ -5164,7 +5176,7 @@ fn find_gear(model: &glb::Model) -> Vec<GearPart> {
         let axis = local(i, down.cross(dir));
         if axis != Vec3::ZERO {
             let b = boxes[&i];
-            out.push(GearPart { joint: i, axis, angle: quarter, door: false, bbox: [b.0, b.1], follow: None });
+            out.push(GearPart { joint: i, axis, angle: quarter, door: false, bbox: [b.0, b.1], follow: None, hide: false });
         }
     }
     for &(i, p, c, e) in &doors {
@@ -5200,7 +5212,7 @@ fn find_gear(model: &glb::Model) -> Vec<GearPart> {
         let axis = local(i, hang.cross(want));
         let angle = hang.dot(want).clamp(-1.0, 1.0).acos();
         if axis != Vec3::ZERO && angle > 0.02 {
-            out.push(GearPart { joint: i, axis, angle, door: true, bbox: NOWHERE, follow: None });
+            out.push(GearPart { joint: i, axis, angle, door: true, bbox: NOWHERE, follow: None, hide: false });
         }
     }
     // wheel bones that hang on no leg bone but sit in a leg's mesh
@@ -5213,7 +5225,69 @@ fn find_gear(model: &glb::Model) -> Vec<GearPart> {
         let p = pivot(i);
         if let Some(g) = out.iter().find(|g| !g.door && p.cmpge(g.bbox[0] - pad).all() && p.cmple(g.bbox[1] + pad).all()) {
             let to_model = Mat4::from_cols_array(&model.joints[g.joint].ibm).inverse();
-            followers.push(GearPart { joint: i, axis: Vec3::ZERO, angle: g.angle, door: false, bbox: NOWHERE, follow: Some((to_model.w_axis.truncate(), to_model.transform_vector3(g.axis).normalize_or_zero())) });
+            followers.push(GearPart { joint: i, axis: Vec3::ZERO, angle: g.angle, door: false, bbox: NOWHERE, follow: Some((to_model.w_axis.truncate(), to_model.transform_vector3(g.axis).normalize_or_zero())), hide: false });
+        }
+    }
+    // braces and struts that hang from the body, not from a leg bone
+    // (`IK_landgear_upr_strt_rr`, `landgear_strut_rr_1_mesh` ...): the top
+    // one of each chain goes with the nearest leg, within 1.2 of the leg's
+    // height, and takes the bones below it along
+    // door actuator rods (`strut_01_female_lookat_lf`, `strut_male_mesh_f`):
+    // two halves that aim at each other; they are not posed here, so they
+    // are put away once the doors start to close
+    let is_rod = |i: usize| {
+        let n = model.joints[i].name.to_ascii_lowercase();
+        n.contains("strut") && (n.contains("female") || n.contains("male"))
+    };
+    for i in (0..model.joints.len()).filter(|i| is_rod(*i)) {
+        followers.push(GearPart { joint: i, axis: Vec3::ZERO, angle: 0.0, door: true, bbox: NOWHERE, follow: None, hide: true });
+    }
+    let is_brace = |i: usize| {
+        let n = model.joints[i].name.to_ascii_lowercase();
+        (n.contains("landgear") || n.contains("strut")) && !is_rod(i) && kinds[i].is_none() && !owner[i].is_some_and(|o| kinds[o] == Some(false))
+    };
+    // the top brace above each joint, and the middle of each brace's mesh
+    let top_brace: Vec<Option<usize>> = (0..model.joints.len())
+        .map(|i| {
+            let (mut k, mut depth, mut top) = (Some(i), 0, None);
+            while let Some(j) = k {
+                if is_brace(j) {
+                    top = Some(j);
+                }
+                depth += 1;
+                k = model.joints[j].parent.filter(|q| *q != j && depth < 64);
+            }
+            top
+        })
+        .collect();
+    let mut middles: HashMap<usize, (Vec3, f32)> = HashMap::new();
+    for me in model.meshes.iter().filter(|m| m.skinned) {
+        for v in &me.verts {
+            if let Some(o) = (0..4).filter(|k| v.weights[*k] > 127).find_map(|k| top_brace.get(v.joints[k] as usize).copied().flatten()) {
+                let e = middles.entry(o).or_insert((Vec3::ZERO, 0.0));
+                *e = (e.0 + Vec3::from(v.pos), e.1 + 1.0);
+            }
+        }
+    }
+    for i in 0..model.joints.len() {
+        if top_brace[i] != Some(i) {
+            continue;
+        }
+        let p = pivot(i);
+        let near = legs.iter().filter(|l| (l.1 - p).length() < 1.2 * l.3.y).min_by(|a, b| (a.1 - p).length().total_cmp(&(b.1 - p).length()));
+        if let Some(g) = near.and_then(|l| out.iter().find(|g| g.joint == l.0 && !g.door)) {
+            let to_model = Mat4::from_cols_array(&model.joints[g.joint].ibm).inverse();
+            let (leg_pivot, leg_axis) = (to_model.w_axis.truncate(), to_model.transform_vector3(g.axis).normalize_or_zero());
+            // going up with the leg must lift the brace; one anchored on
+            // the far side of the leg's pivot would swing down and out
+            // instead, and is put away with the doors
+            let mid = middles.get(&i).filter(|m| m.1 > 0.0).map_or(p, |m| m.0 / m.1);
+            let up = leg_pivot + Quat::from_axis_angle(leg_axis, g.angle) * (mid - leg_pivot);
+            if up.y >= mid.y - 0.02 {
+                followers.push(GearPart { joint: i, axis: Vec3::ZERO, angle: g.angle, door: false, bbox: NOWHERE, follow: Some((leg_pivot, leg_axis)), hide: false });
+            } else {
+                followers.push(GearPart { joint: i, axis: Vec3::ZERO, angle: 0.0, door: true, bbox: NOWHERE, follow: None, hide: true });
+            }
         }
     }
     out.extend(followers);
