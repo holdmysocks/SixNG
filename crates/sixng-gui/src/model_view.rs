@@ -181,6 +181,8 @@ pub struct ModelView {
     pub lamps: Lamps,
     /// The loaded model has lamp bones.
     has_lamps: bool,
+    /// The siren sound on loop (the user's choice among the game's).
+    pub siren_sound: crate::siren_sound::SirenSound,
     /// The siren pattern playing: 0 off, n the nth of `sirens`.
     pub siren: usize,
     /// The siren patterns of the loaded vehicle that reach its bones.
@@ -445,6 +447,7 @@ impl ModelView {
             wheel_look: None,
             lamps: Lamps::default(),
             has_lamps: false,
+            siren_sound: Default::default(),
             siren: 0,
             sirens: Vec::new(),
             veh_lights: None,
@@ -2280,6 +2283,9 @@ impl ModelView {
                 (Some(l), Some(v)) => find_sirens(&l.model, v, &self.cfg_patterns),
                 _ => Vec::new(),
             };
+            if self.sirens.is_empty() {
+                self.siren_sound.want = 0;
+            }
             // kept while nothing is known yet (a pattern asked for on the command line)
             if !self.sirens.is_empty() {
                 self.siren = self.siren.min(self.sirens.len());
@@ -2656,6 +2662,28 @@ impl ModelView {
                         })
                         .response
                         .on_hover_text("The vehicle's light patterns that reach its siren and strobe bones. Read from the game's files: which lamps a pattern uses, each lamp's phase offset in the cycle and its flash type number, the pattern's speed, and the lamp's light archetype name. Not read: what a flash type looks like over time (0 is shown as off, 1 as steady, 6 as an even blink, every other number as a double flash), the length of the cycle (shown as one second at speed 1) and the colours behind the archetype names (red and amber by name, everything else white). Patterns marked 'pack' are in the vehicle's light pack without a part of this configuration linking them.");
+                }
+                if !self.sirens.is_empty() {
+                    let s = &mut self.siren_sound;
+                    let label = |i: usize| if i == 0 { "off" } else { crate::siren_sound::SOUNDS[i - 1].0 };
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_label("siren sound")
+                            .selected_text(label(s.want))
+                            .show_ui(ui, |ui| {
+                                for i in 0..=crate::siren_sound::SOUNDS.len() {
+                                    ui.selectable_value(&mut s.want, i, label(i));
+                                }
+                            })
+                            .response
+                            .on_hover_text("Loops one of the game's siren sounds, found by its name in the sound definitions of audio.rpf (RESIDENT_VEHICLES_SIREN_WAIL_01 ..., _QUICK_01 ..., _FIRETRUCK_WAIL_01). Which vehicle plays which is not read from the files, so the choice is yours. Needs audio.rpf's banks scanned (open the Audio page once).");
+                        if s.update(&self.game, &self.work) {
+                            ui.spinner();
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                        }
+                    });
+                    if let Some(e) = &s.error {
+                        ui.colored_label(egui::Color32::from_rgb(230, 120, 90), e);
+                    }
                 }
                 if self.hinges.values().any(|h| h.0 == 2) {
                     ui.add(egui::Slider::new(&mut self.boot_open, 0.0..=1.1).text("boot open"));

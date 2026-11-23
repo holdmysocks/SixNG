@@ -38,6 +38,7 @@ mod model_picker;
 mod model_view;
 mod pages;
 mod render3d;
+mod siren_sound;
 #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
 mod render3d_metal4;
 mod texture_view;

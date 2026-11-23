@@ -514,6 +514,29 @@ pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], ban
 /// short, joins it with the next entry, the skipped chunks filled with zeros,
 /// but only when the skipped bytes lie past the object data (in the hash
 /// tables, of which only the lengths are read), so every object is intact.
+/// The wave of each simple sound named in `want` (name hashes): container
+/// name hash and stream id, from the sound files (schema 166) among
+/// `entries`. A sound file split over two entries is read whole.
+pub fn sound_waves(archive: &std::path::Path, entries: &[&crate::scan::Entry], want: &[u32]) -> std::collections::HashMap<u32, (u32, u32)> {
+    let mut by_off: Vec<&crate::scan::Entry> = entries.to_vec();
+    by_off.sort_by_key(|e| e.off);
+    let mut out = std::collections::HashMap::new();
+    for e in entries {
+        let Ok(b) = crate::scan::read_entry(archive, e) else { continue };
+        if !is_audio_meta(&b) || u32::from_le_bytes(b[0..4].try_into().unwrap()) != SCHEMA_SOUNDS {
+            continue;
+        }
+        let Some(m) = parse(&b).ok().or_else(|| stitch(archive, e, &b, &by_off).and_then(|(full, _)| parse(&full).ok())) else { continue };
+        for o in &m.objects {
+            let (Ok(h), Some(w)) = (u32::from_str_radix(&o.hash, 16), &o.wave) else { continue };
+            if let (true, Ok(c), Ok(s)) = (want.contains(&h), u32::from_str_radix(&w.container, 16), u32::from_str_radix(&w.stream, 16)) {
+                out.insert(h, (c, s));
+            }
+        }
+    }
+    out
+}
+
 fn stitch(path: &std::path::Path, e: &crate::scan::Entry, b: &[u8], by_off: &[&crate::scan::Entry]) -> Option<(Vec<u8>, serde_json::Value)> {
     let last = e.streams.last()?;
     let end = (last[0] + last[1] + 15) & !15;
