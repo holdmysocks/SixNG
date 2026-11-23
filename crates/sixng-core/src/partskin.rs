@@ -31,7 +31,7 @@ use std::sync::OnceLock;
 const PRESET: u32 = 0xf795_e8ba;
 const TAG_DRAWABLE: u32 = 0x1c11_4e61;
 const PARAM_BASE: u32 = 0x44e2_1c90;
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Preset {
@@ -42,6 +42,10 @@ pub struct Preset {
     pub albedo: u64,
     /// Normal map of the "base" parameter, 0 if none.
     pub normal: u64,
+    /// `41acf8eb` of the "base" parameter: on fur presets the GUID of the
+    /// fur asset (see `furlink`), 0 if none.
+    #[serde(default)]
+    pub guid: u64,
     pub tint: [u8; 3],
     pub palette: u32,
     /// Drawables listed under the drawable tag (joaat of the name).
@@ -121,6 +125,7 @@ fn presets_of(m: &Meta, names: &HashMap<u32, &str>) -> Vec<Preset> {
             slot: u(0xb536_67be) as u32,
             albedo,
             normal: hx(&t[k(0xd689_b17f).as_str()]),
+            guid: hx(&t[k(0x41ac_f8eb).as_str()]),
             tint: [u(0xc4d7_5d79) as u8, u(0xf4fb_3dec) as u8, u(0xab5d_2a85) as u8],
             palette: u(0x5ecf_9331) as u32,
             drawables: p[k(0x12f8_5293).as_str()]
@@ -218,7 +223,7 @@ mod tests {
     use super::*;
 
     fn preset(name: u32, own: Option<&str>, slot: u32, albedo: u64, tint: [u8; 3], palette: u32) -> Preset {
-        Preset { name, own: own.map(str::to_string), slot, albedo, normal: 0, tint, palette, drawables: vec![] }
+        Preset { name, own: own.map(str::to_string), slot, albedo, normal: 0, guid: 0, tint, palette, drawables: vec![] }
     }
 
     #[test]

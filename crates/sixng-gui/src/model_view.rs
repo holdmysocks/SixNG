@@ -72,6 +72,11 @@ pub struct Loaded {
     pub selected: Vec<u64>,
     /// Query without the `#parts=` selection.
     pub base: String,
+    /// Animals: the fur variants and their grooms (`furlink`), or why none.
+    pub fur: Option<Result<sixng_core::furlink::FurLink, String>>,
+    /// Animals: skin samples (RAGE model space position, linear colour) the
+    /// fur takes its colour from.
+    pub fur_skin: SkinColours,
 }
 
 /// A finished load, tagged with the request it answers.
@@ -154,6 +159,8 @@ pub struct ModelView {
 }
 
 type GroomList = Result<Vec<sixng_core::groom::GroomInfo>, String>;
+/// Skin samples: position (RAGE model space) and linear colour.
+pub type SkinColours = Arc<Vec<([f32; 3], [u8; 3])>>;
 
 /// Strand hair / fur shown with the model: grooms picked from the packs
 /// catalog (no groom-to-ped link is stored), drawn as crossed ribbons.
@@ -171,6 +178,14 @@ pub struct Hair {
     loading: bool,
     gpu: Vec<GpuModel>,
     pub status: String,
+    /// Animals: the fur link of the model shown, and the body / head
+    /// variants chosen from it.
+    fur: Option<sixng_core::furlink::FurLink>,
+    fur_note: String,
+    fur_pick: [String; 2],
+    /// Colour each strand from the skin under its root (automatic fur).
+    pub skin_colour: bool,
+    skin: SkinColours,
 }
 
 impl Default for Hair {
@@ -189,16 +204,71 @@ impl Default for Hair {
             loading: false,
             gpu: Vec::new(),
             status: String::new(),
+            fur: None,
+            fur_note: String::new(),
+            fur_pick: [String::new(), String::new()],
+            skin_colour: true,
+            skin: Default::default(),
         }
     }
 }
 
 impl Hair {
     fn want_key(&self) -> String {
-        format!("{:?}|{}|{:?}", self.selected, self.width_mm, self.colour)
+        format!("{:?}|{}|{:?}|{}", self.selected, self.width_mm, self.colour, self.skin_colour && !self.skin.is_empty())
     }
     pub fn settled(&self) -> bool {
         !self.loading && !self.listing && self.key == self.want_key()
+    }
+
+    /// Show the grooms of the chosen body and head variants.
+    fn apply_fur(&mut self) {
+        let Some(l) = &self.fur else { return };
+        let mut sel: Vec<u64> = Vec::new();
+        for g in self.fur_pick.iter().filter_map(|n| l.variants.iter().find(|v| v.name == *n)).flat_map(|v| v.grooms.iter().copied()) {
+            if !sel.contains(&g) {
+                sel.push(g);
+            }
+        }
+        self.selected = sel;
+    }
+
+    /// A model finished loading: take its fur link (animals) and show the
+    /// default variants, or drop the fur of the previous animal.
+    fn on_loaded(&mut self, fur: &Option<Result<sixng_core::furlink::FurLink, String>>, skin: &SkinColours, source: &str) {
+        match fur {
+            Some(Ok(l)) => {
+                self.skin = skin.clone();
+                if self.fur.as_ref().is_some_and(|f| f.root == l.root) {
+                    return;
+                }
+                // guide strands are sparse: wider ribbons read as a coat
+                if self.width_mm == 1.0 {
+                    self.width_mm = 3.0;
+                }
+                self.fur_pick = ["body", "head"].map(|s| l.default_variant(s).map(|v| v.name.clone()).unwrap_or_default());
+                self.fur_note.clear();
+                self.fur = Some(l.clone());
+                self.apply_fur();
+            }
+            other => {
+                // a LOD or part change of the same animal keeps its fur
+                if self.fur.as_ref().is_some_and(|f| !source.contains(&f.root)) {
+                    self.fur = None;
+                    self.selected.clear();
+                    self.skin = Default::default();
+                    if self.width_mm == 3.0 {
+                        self.width_mm = 1.0;
+                    }
+                }
+                if self.fur.is_none() {
+                    self.fur_note = match other {
+                        Some(Err(e)) => e.clone(),
+                        _ => String::new(),
+                    };
+                }
+            }
+        }
     }
 }
 
@@ -323,6 +393,7 @@ impl ModelView {
             self.hair.width_mm / 1000.0,
             self.hair.colour,
         );
+        let skin = if self.hair.skin_colour { self.hair.skin.clone() } else { Default::default() };
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<Vec<glb::Model>> {
@@ -334,10 +405,21 @@ impl ModelView {
                     // linear colour from the sRGB picker value
                     let lin = rgb.map(|c| c.powf(2.2));
                     let p = dir.join(format!("{off:x}.glb"));
-                    std::fs::write(
-                        &p,
-                        g.ribbon_glb(&format!("groom_{off:x}"), hw, lin, serde_json::json!({})),
-                    )?;
+                    let glb_bytes = if skin.is_empty() {
+                        g.ribbon_glb(&format!("groom_{off:x}"), hw, lin, serde_json::json!({}))
+                    } else {
+                        // each strand takes the colour of the nearest skin sample to its root
+                        let k = g.points_per_strand.max(1);
+                        let cols: Vec<[u8; 3]> = (0..g.strands)
+                            .map(|s| {
+                                let r = g.points[s * k];
+                                let d = |p: &[f32; 3]| (p[0] - r[0]).powi(2) + (p[1] - r[1]).powi(2) + (p[2] - r[2]).powi(2);
+                                skin.iter().min_by(|a, b| d(&a.0).total_cmp(&d(&b.0))).map_or([255; 3], |x| x.1)
+                            })
+                            .collect();
+                        g.ribbon_glb_coloured(&format!("groom_{off:x}"), hw, &cols, serde_json::json!({}))
+                    };
+                    std::fs::write(&p, glb_bytes)?;
                     out.push(glb::load(&p, &dir)?);
                 }
                 Ok(out)
@@ -352,7 +434,34 @@ impl ModelView {
     /// to the view, set width and colour.
     fn hair_ui(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new("Hair and fur (grooms)").default_open(!self.hair.selected.is_empty()).show(ui, |ui| {
-            ui.label(egui::RichText::new("Strand grooms from packs.rpf. The game files do not say which groom belongs to which character, so pick them here. Shown as ribbons; width and colour are display choices.").weak());
+            ui.label(egui::RichText::new("Strand grooms from packs.rpf. Animals get their fur automatically (worked out from the order of the files and a fit to the skin, not from a stored link); for characters pick grooms here. Shown as ribbons; width and colour are display choices.").weak());
+            if let Some(l) = self.hair.fur.clone() {
+                let mut changed = false;
+                for (k, slot) in ["body", "head"].iter().enumerate() {
+                    let opts: Vec<&sixng_core::furlink::Variant> = l.variants.iter().filter(|v| v.slot == *slot && !v.grooms.is_empty()).collect();
+                    if opts.is_empty() {
+                        continue;
+                    }
+                    let short = |n: &str| n.split_once("_fur_").map_or(n.to_string(), |x| x.1.to_string());
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{slot} fur"));
+                        egui::ComboBox::from_id_salt(("fur_variant", k)).selected_text(if self.hair.fur_pick[k].is_empty() { "none".to_string() } else { short(&self.hair.fur_pick[k]) }).show_ui(ui, |ui| {
+                            changed |= ui.selectable_value(&mut self.hair.fur_pick[k], String::new(), "none").changed();
+                            for v in &opts {
+                                let label = format!("{} · {} piece(s){}", short(&v.name), v.grooms.len(), if v.known { "" } else { " · count inferred" });
+                                changed |= ui.selectable_value(&mut self.hair.fur_pick[k], v.name.clone(), label).changed();
+                            }
+                        });
+                    });
+                }
+                if changed {
+                    self.hair.apply_fur();
+                }
+                let with = if l.roots.len() > 1 { format!("; walked together with {}", l.roots.iter().filter(|r| **r != l.root).cloned().collect::<Vec<_>>().join(", ")) } else { String::new() };
+                ui.label(egui::RichText::new(format!("{} of {} groom pieces in this run fit the skin; {:.0} % of the pieces with a known count sit on their own slot{with}.", l.fitting, l.block, l.agreement * 100.0)).weak().small());
+            } else if !self.hair.fur_note.is_empty() {
+                ui.label(egui::RichText::new(format!("No automatic fur: {}", self.hair.fur_note)).weak().small());
+            }
             let Some(list) = &self.hair.list else {
                 if self.hair.listing {
                     ui.horizontal(|ui| {
@@ -406,6 +515,9 @@ impl ModelView {
             ui.horizontal(|ui| {
                 ui.add(egui::Slider::new(&mut self.hair.width_mm, 0.2..=5.0).text("width (mm)"));
                 ui.color_edit_button_rgb(&mut self.hair.colour);
+                if !self.hair.skin.is_empty() {
+                    ui.checkbox(&mut self.hair.skin_colour, "colour from the skin").on_hover_text("Each strand takes the colour of the skin texture under its root. A display choice: the game colours fur with its own textures and tints.");
+                }
                 if ui.button("Clear").clicked() {
                     self.hair.selected.clear();
                 }
@@ -642,6 +754,8 @@ impl ModelView {
                     parts,
                     selected,
                     base,
+                    fur: None,
+                    fur_skin: Default::default(),
                 })
                 .map_err(|e| format!("{e:#}"));
             finish_load(&slot, &latest, gen, r);
@@ -706,6 +820,7 @@ impl ModelView {
                     );
                 }
                 self.gpu = Some(g);
+                self.hair.on_loaded(&l.fur, &l.fur_skin, &l.source);
                 self.loaded = Some(l);
                 self.frames_since_load = 0;
                 self.apply_paint(rs);
@@ -1894,16 +2009,33 @@ fn load_parts(
     cache: &Path,
     lod: usize,
     mut model: Option<glb::Model>,
-) -> (Option<glb::Model>, Vec<PathBuf>, Vec<String>, Vec<String>) {
+) -> (Option<glb::Model>, Vec<PathBuf>, Vec<String>, Vec<String>, Vec<(String, Vec<[f32; 3]>)>, Vec<([f32; 3], [u8; 3])>) {
     let mut first = Vec::new();
     let mut names = Vec::new();
     let mut errs = Vec::new();
+    let mut skin = Vec::new();
+    let mut colours = Vec::new();
     let mut fresh = true;
     for e in parts {
         match export_load(a, e, cache, lod) {
             Ok((m, lods, _)) => {
                 if first.is_empty() {
                     first = lods;
+                }
+                // skin points per part, in RAGE model space (glTF is Y-up)
+                let pts: Vec<[f32; 3]> = m
+                    .meshes
+                    .iter()
+                    .flat_map(|me| {
+                        let v: Vec<[f32; 3]> = me.verts.iter().map(|v| [v.pos[0], -v.pos[2], v.pos[1]]).collect();
+                        sixng_core::furlink::skin_points(&v, &me.indices)
+                    })
+                    .collect();
+                let step = (pts.len() / 60_000).max(1);
+                skin.push((e.name.clone().unwrap_or_default(), pts.into_iter().step_by(step).collect()));
+                // skin colour at the vertices of the body and head (not eyes or teeth)
+                if e.name.as_deref().is_some_and(|n| n.contains("_body_") || n.contains("_head_")) {
+                    colours.extend(skin_colours(&m));
                 }
                 match &mut model {
                     Some(into) if fresh => {
@@ -1921,7 +2053,37 @@ fn load_parts(
             Err(err) => errs.push(format!("{}: {err:#}", e.id)),
         }
     }
-    (model, first, names, errs)
+    (model, first, names, errs, skin, colours)
+}
+
+/// Linear colour of the base texture at each vertex of a part (every
+/// vertex up to 20,000, then every n-th), with its RAGE-space position.
+fn skin_colours(m: &glb::Model) -> Vec<([f32; 3], [u8; 3])> {
+    let lin = |v: u8| {
+        let c = v as f32 / 255.0;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    };
+    let total: usize = m.meshes.iter().map(|me| me.verts.len()).sum();
+    let step = (total / 20_000).max(1);
+    let mut out = Vec::new();
+    for me in &m.meshes {
+        let Some(mat) = me.material.and_then(|i| m.materials.get(i)) else { continue };
+        let img = mat.base.and_then(|i| m.images.get(i)).and_then(|im| im.mips.first().filter(|l| l.2.len() >= (l.0 * l.1 * 4) as usize).map(|l| (l, im.srgb)));
+        for v in me.verts.iter().step_by(step) {
+            let mut c = [mat.base_factor[0], mat.base_factor[1], mat.base_factor[2]];
+            if let Some(((w, h, px), srgb)) = img {
+                let x = ((v.uv0[0].rem_euclid(1.0)) * *w as f32) as usize % *w as usize;
+                let y = ((v.uv0[1].rem_euclid(1.0)) * *h as f32) as usize % *h as usize;
+                let o = (y * *w as usize + x) * 4;
+                let t = if mat.tint_mask { [px[o + 1]; 3] } else { [px[o], px[o + 1], px[o + 2]] };
+                for k in 0..3 {
+                    c[k] *= if srgb { lin(t[k]) } else { t[k] as f32 / 255.0 };
+                }
+            }
+            out.push(([v.pos[0], -v.pos[2], v.pos[1]], c.map(|x| (x.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)));
+        }
+    }
+    out
 }
 
 /// The chosen parts: the selection when given, else the defaults.
@@ -1980,6 +2142,8 @@ fn load_query_sel(
             parts: Vec::new(),
             selected: Vec::new(),
             base: String::new(),
+            fur: None,
+            fur_skin: Default::default(),
         });
     }
     // character outfit: "<archive>#outfit:<prefix>"
@@ -1993,7 +2157,7 @@ fn load_query_sel(
         if parts.is_empty() {
             return Err(anyhow::anyhow!("no parts of {prefix} selected"));
         }
-        let (model, first, names, errs) = load_parts(&a, &parts, cache, lod, None);
+        let (model, first, names, errs, _, _) = load_parts(&a, &parts, cache, lod, None);
         let model = model
             .ok_or_else(|| anyhow::anyhow!("no part of {prefix} loaded: {}", errs.join("; ")))?;
         let info = serde_json::json!({ "assembled_from": names, "ids": parts.iter().map(|e| e.id.clone()).collect::<Vec<_>>(), "errors": errs });
@@ -2007,6 +2171,8 @@ fn load_query_sel(
             parts: opts,
             selected,
             base: String::new(),
+            fur: None,
+            fur_skin: Default::default(),
         });
     }
     let (q, member) = q
@@ -2045,8 +2211,16 @@ fn load_query_sel(
     if crate::assemble::is_animal(name) && e.rtype.as_deref() == Some("ft") {
         let opts = crate::assemble::animal_options(&ix, name);
         let (selected, parts) = pick(&ix, &opts, &sel);
-        let (m, _, names, _) = load_parts(&a, &parts, cache, level, Some(model));
+        let (m, _, names, _, skin, colours) = load_parts(&a, &parts, cache, level, Some(model));
         let model = m.expect("root model passed in");
+        // fur: the grooms of this animal's fur variants (cached per animal)
+        let fur = match sixng_core::names::work_dir() {
+            Some(work) if !skin.is_empty() => Some(sixng_core::furlink::for_animal(&work, &a, &ix.entries, name, &skin).map_err(|e| {
+                eprintln!("[fur] {name}: {e:#}");
+                format!("{e:#}")
+            })),
+            _ => None,
+        };
         let mut info = info;
         if let Some(o) = info.as_object_mut() {
             o.insert("assembled_from".into(), serde_json::json!(names));
@@ -2072,6 +2246,8 @@ fn load_query_sel(
             parts: opts,
             selected,
             base: String::new(),
+            fur,
+            fur_skin: Arc::new(colours),
         });
     }
     Ok(Loaded {
@@ -2084,6 +2260,8 @@ fn load_query_sel(
         parts: Vec::new(),
         selected: Vec::new(),
         base: String::new(),
+        fur: None,
+        fur_skin: Default::default(),
     })
 }
 

@@ -204,6 +204,24 @@ impl Groom {
         crate::gltf::mesh_glb(name, &[crate::gltf::NodeGroup { name: name.to_string(), prims: vec![prim] }], &[mat], &[], extras)
     }
 
+    /// Ribbon GLB with one colour per strand (`strand_rgb`, linear RGB,
+    /// written as COLOR_0 on a white material): fur coloured from the skin
+    /// under each root. Strands past the list are white.
+    pub fn ribbon_glb_coloured(&self, name: &str, half_width: f32, strand_rgb: &[[u8; 3]], extras: serde_json::Value) -> Vec<u8> {
+        let (positions, normals, uv, indices) = self.ribbons(half_width);
+        let per = self.points_per_strand * 4;
+        let tint: Vec<[u8; 4]> = (0..positions.len()).map(|i| strand_rgb.get(i / per.max(1)).map_or([255; 4], |c| [c[0], c[1], c[2], 255])).collect();
+        let prim = crate::gltf::TriPrim { name: name.to_string(), positions, normals: Some(normals), tangents: None, uvs: vec![uv], colors: None, tint: Some(tint), indices, material: Some(0), joints: None, weights: None, joints1: None, weights1: None };
+        let mat = crate::gltf::Material {
+            name: "fur".into(),
+            base_color_uri: None,
+            normal_uri: None,
+            gltf: serde_json::json!({"doubleSided": true, "pbrMetallicRoughness": {"baseColorFactor": [1.0, 1.0, 1.0, 1.0], "metallicFactor": 0.0, "roughnessFactor": 0.7}}),
+            extras: serde_json::json!({"note": "display ribbons; COLOR_0 = the skin colour under each strand's root (a display choice, not from the groom)"}),
+        };
+        crate::gltf::mesh_glb(name, &[crate::gltf::NodeGroup { name: name.to_string(), prims: vec![prim] }], &[mat], &[], extras)
+    }
+
     /// Share of strand roots inside the stored root box (a layout check).
     pub fn roots_in_box(&self) -> f32 {
         let k = self.points_per_strand;
