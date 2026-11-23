@@ -8,7 +8,7 @@ fn main() -> anyhow::Result<()> {
         let Ok(v) = u64::from_str_radix(h, 16) else { continue };
         match set.get(v) {
             Some((s, t)) => {
-                let r = sixng_core::ttpf::write_png(s, t, out);
+                let r = sixng_core::ttpf::write_png(s, t, out, false);
                 println!("{h} {} {}x{} fmt {} decodable {} -> {}", s.label(), t.width, t.height, t.dxgi_format, t.decodable(), r.map(|(p, st)| format!("{} mean {:?} mip {}", p.display(), st.mean_rgba, st.mip)).unwrap_or_else(|e| format!("ERR {e:#}")));
             }
             None => println!("{h} not in any store"),
