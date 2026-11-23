@@ -17,6 +17,8 @@ struct File {
 #[derive(Deserialize)]
 struct Veh {
     #[serde(default)]
+    lights: Option<LightsRec>,
+    #[serde(default)]
     steering_lock: Option<f32>,
     #[serde(default)]
     display_name: Option<String>,
@@ -61,7 +63,55 @@ struct Info {
 }
 
 #[derive(Deserialize)]
+struct LightsRec {
+    #[serde(default)]
+    patterns: std::collections::BTreeMap<String, PatternRec>,
+    #[serde(default)]
+    pack: Vec<String>,
+    #[serde(default)]
+    archetypes: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct PatternRec {
+    #[serde(default)]
+    slot: String,
+    #[serde(default)]
+    speed: f32,
+    #[serde(default)]
+    lamps: Vec<LampRec>,
+}
+
+#[derive(Deserialize)]
+struct LampRec {
+    bone: String,
+    #[serde(default)]
+    steps: Vec<(f32, u32)>,
+}
+
+/// One light pattern of a vehicle: per lamp the bone name hash and its
+/// steps of (phase offset, flash type number).
+pub struct LightPattern {
+    pub name: String,
+    pub slot: String,
+    pub speed: f32,
+    pub lamps: Vec<(u32, Vec<(f32, u32)>)>,
+}
+
+/// A vehicle's light patterns (`lights` of vehicles.json).
+#[derive(Default)]
+pub struct Lights {
+    pub patterns: Vec<LightPattern>,
+    /// names of the patterns in the vehicle's own light pack
+    pub pack: Vec<String>,
+    /// lamp bone name hash -> light archetype name (or its hash)
+    pub archetypes: HashMap<u32, String>,
+}
+
+#[derive(Deserialize)]
 struct Cfg {
+    #[serde(default)]
+    light_patterns: Vec<String>,
     #[serde(default)]
     rim_ratio: Option<f32>,
     #[serde(default)]
@@ -107,6 +157,8 @@ pub struct Config {
     pub rim_ratio: Option<f32>,
     /// Key of the configuration's part list (names its part colours in an export).
     pub parts_key: Option<String>,
+    /// Names of the light patterns the configuration's parts link.
+    pub light_patterns: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -117,6 +169,8 @@ pub struct Vehicle {
     pub steer_wheel_mult: Option<f32>,
     /// `fSteeringLock` of the handling record (radians).
     pub steer_lock: Option<f32>,
+    /// Light patterns (sirens, strobes).
+    pub lights: Option<std::sync::Arc<Lights>>,
     /// The game's own name for the model, with its make ("Bravado '19 Buffalo").
     pub display: Option<String>,
     pub configs: Vec<Config>,
@@ -250,6 +304,7 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
             .map(|c| Config {
                 rim_ratio: c.rim_ratio,
                 parts_key: c.parts_key,
+                light_patterns: c.light_patterns,
                 // pure magenta is stored where a configuration has no body
                 // colour of its own (aircraft, some trailers)
                 colour: c.colour.and_then(|c| hex(&c.srgb_if_linear)).filter(|c| !is_placeholder(*c)),
@@ -292,6 +347,14 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
                 wheel_scale_rear: wr,
                 steer_wheel_mult: sm,
                 steer_lock: v.steering_lock,
+                lights: v.lights.map(|l| {
+                    let hex = |s: &str| u32::from_str_radix(s, 16).unwrap_or(0);
+                    std::sync::Arc::new(Lights {
+                        patterns: l.patterns.into_iter().map(|(name, p)| LightPattern { name, slot: p.slot, speed: p.speed, lamps: p.lamps.into_iter().map(|x| (hex(&x.bone), x.steps)).collect() }).collect(),
+                        pack: l.pack,
+                        archetypes: l.archetypes.into_iter().map(|(k, v)| (hex(&k), v)).collect(),
+                    })
+                }),
                 display,
                 configs,
                 palettes,

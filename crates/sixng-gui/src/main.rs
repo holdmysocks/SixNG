@@ -1632,6 +1632,7 @@ impl App {
         m.cfg_request = c.u("config").map(|v| v as usize);
         m.brake_heat = c.f("brake-glow").unwrap_or(0.0);
         m.windows_down = c.f("windows").unwrap_or(0.0);
+        m.siren = c.f("siren").unwrap_or(0.0) as usize;
         m.lamps = c.get("lights").map(model_view::Lamps::parse).unwrap_or_default();
         m.boot_open = c.f("boot").unwrap_or(0.0);
         if let Some(v) = c.f("yaw") {

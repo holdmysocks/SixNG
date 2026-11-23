@@ -34,7 +34,7 @@ const OWNER: u32 = 0xfb1f_80ff;
 /// `handlingId` (case-sensitive joaat).
 const HANDLING_ID: u32 = 0xec41_bd9c;
 /// Layout version of vehicles.json; the model viewer rebuilds older files.
-pub const FORMAT: u32 = 8;
+pub const FORMAT: u32 = 9;
 /// A mod part or kit of one vehicle (in that vehicle's own pack resource):
 /// `name` joaat of the part model's name, or of a kit's name (the names of
 /// its left and right models without the side word:
@@ -194,6 +194,9 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
     let name = |h: u32| names.get(&h).cloned();
     // rim radius / tyre radius of the wheel fitment records (in the library)
     let fits = crate::names::work_dir().and_then(|w| crate::vehcolour::tables(&crate::export::game_root(a), &w).ok());
+    // light patterns (sirens, strobes), reached through configuration parts
+    let lights = crate::names::work_dir().and_then(|w| crate::vehlights::build(&crate::export::game_root(a), &w).ok());
+    let mut parts_of: HashMap<u32, std::collections::BTreeSet<u32>> = HashMap::new();
     let mut models: BTreeMap<u32, Value> = BTreeMap::new();
     let mut sources = Vec::new();
     let (mut n_cfg, mut n_pal, mut n_rim) = (0, 0, 0);
@@ -243,7 +246,10 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
             let colour = get(&c, COLOUR).and_then(|x| x.as_u64()).map(|x| argb(x as u32));
             let e = models.entry(h).or_insert_with(|| json!({"model": name(h), "model_hash": format!("{h:08x}"), "model_info": null, "configurations": [], "palettes": [], "part_groups": []}));
             let rim_ratio = fits.as_ref().and_then(|t| parts.iter().find_map(|p| t.rim_ratio.get(&format!("{p:08x}"))));
+            parts_of.entry(h).or_default().extend(parts.iter().copied());
+            let patterns: Vec<String> = lights.as_ref().map(|l| l.linked(&parts).iter().map(|n| format!("{n:08x}")).collect()).unwrap_or_default();
             e["configurations"].as_array_mut().unwrap().push(json!({
+                "light_patterns": patterns,
                 "rim_ratio": rim_ratio,
                 "parts_key": crate::vehcolour::config_key(&parts),
                 "colour": colour, "rim": rims.first(), "tyre": tyres.first(), "rims": rims, "tyres": tyres,
@@ -303,6 +309,15 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
             m["mods"] = json!(mods);
         }
     }
+    let mut n_lights = 0;
+    if let Some(l) = &lights {
+        for (h, parts) in &parts_of {
+            if let (Some(m), Some(v)) = (models.get_mut(h), l.for_vehicle(parts)) {
+                n_lights += 1;
+                m["lights"] = v;
+            }
+        }
+    }
     // The game's own names: the text tables in data.rpf hold a string under
     // the model's name hash (`gameName`) and one under `vehicleMakeName`.
     // vehicleMakeName (case-sensitive joaat)
@@ -345,10 +360,10 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("vehicles.json");
     std::fs::write(&path, serde_json::to_vec_pretty(&json!({
-        "note": "Per vehicle model: model_info (vehicles.meta-like; wheelScale / wheelScaleRear are not understood: they are not the rim radius (0.219 on comet7, whose rim is 0.82 x a 0.35 m tyre). A wheel's size, width and position are in the model's export (model.json wheel_mounts, from the collision discs), and the rim's share of it in the configuration's rim_ratio), configurations (body colour ARGB + the part models incl. rim and tyre; parts_key = a key of the part list that a vehicle export's model.json part_colours.configs uses to name the part colours of this configuration; rim_ratio = rim radius / tyre radius from the configuration's wheel fitment record, slot 39d5e253, where it has one), palettes (ARGB paint-colour lists; colours repeat, so repetition reads as the draw weight), part_groups (weighted part choices). steering_lock is fSteeringLock of the model's handling record (radians, the largest angle of the steered wheels; from the PSO files in data.rpf, joined by handlingId). display_name and make are the game's own text for the model's name hash and its vehicleMakeName (from the first text table in data.rpf that has them: English). Names resolve where known; others are joaat hex.",
+        "note": "Per vehicle model: model_info (vehicles.meta-like; wheelScale / wheelScaleRear are not understood: they are not the rim radius (0.219 on comet7, whose rim is 0.82 x a 0.35 m tyre). A wheel's size, width and position are in the model's export (model.json wheel_mounts, from the collision discs), and the rim's share of it in the configuration's rim_ratio), configurations (body colour ARGB + the part models incl. rim and tyre; parts_key = a key of the part list that a vehicle export's model.json part_colours.configs uses to name the part colours of this configuration; rim_ratio = rim radius / tyre radius from the configuration's wheel fitment record, slot 39d5e253, where it has one), palettes (ARGB paint-colour lists; colours repeat, so repetition reads as the draw weight), part_groups (weighted part choices). lights are the vehicle's light patterns (sirens, strobes, indicators): patterns by name with slot, speed, clock and per lamp the bone name hash (joaat of siren12, indicator_lf ...) and steps of [phase offset, flash type number]; pack names the patterns of the vehicle's own light pack, a configuration's light_patterns the ones its parts link; archetypes gives a lamp bone's light archetype name (red, amber, led ..., a hash where the name is not known). What a flash type number looks like over time is not decoded. steering_lock is fSteeringLock of the model's handling record (radians, the largest angle of the steered wheels; from the PSO files in data.rpf, joined by handlingId). display_name and make are the game's own text for the model's name hash and its vehicleMakeName (from the first text table in data.rpf that has them: English). Names resolve where known; others are joaat hex.",
         "format": FORMAT,
         "sources": sources,
         "vehicles": list,
     }))?)?;
-    Ok(json!({"models": list.len(), "named": named, "with_model_info": with_info, "configurations": n_cfg, "configurations_with_rim": n_rim, "palettes": n_pal, "display_names": n_named, "steering_locks": n_lock, "file": path}))
+    Ok(json!({"models": list.len(), "named": named, "with_model_info": with_info, "configurations": n_cfg, "configurations_with_rim": n_rim, "palettes": n_pal, "display_names": n_named, "light_patterns": n_lights, "steering_locks": n_lock, "file": path}))
 }

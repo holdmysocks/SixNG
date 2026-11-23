@@ -181,6 +181,15 @@ pub struct ModelView {
     pub lamps: Lamps,
     /// The loaded model has lamp bones.
     has_lamps: bool,
+    /// The siren pattern playing: 0 off, n the nth of `sirens`.
+    pub siren: usize,
+    /// The siren patterns of the loaded vehicle that reach its bones.
+    sirens: Vec<Siren>,
+    /// The loaded vehicle's light patterns and the names the configuration
+    /// on show links.
+    veh_lights: Option<Arc<crate::vehicle_db::Lights>>,
+    cfg_patterns: Vec<String>,
+    siren_dirty: bool,
     /// Bonnet and boot opening (radians at the hinge).
     pub bonnet_open: f32,
     pub boot_open: f32,
@@ -436,6 +445,11 @@ impl ModelView {
             wheel_look: None,
             lamps: Lamps::default(),
             has_lamps: false,
+            siren: 0,
+            sirens: Vec::new(),
+            veh_lights: None,
+            cfg_patterns: Vec::new(),
+            siren_dirty: false,
             bonnet_open: 0.0,
             boot_open: 0.0,
             hinges: HashMap::new(),
@@ -1363,6 +1377,11 @@ impl ModelView {
     fn apply_scale(&mut self, v: &crate::vehicle_db::Vehicle) {
         self.veh_wheel_scale = v.wheel_scale.map(|f| (f, v.wheel_scale_rear.unwrap_or(f)));
         self.steer_mult = v.steer_wheel_mult.filter(|m| *m > 0.0).unwrap_or(1.0);
+        if !matches!((&self.veh_lights, &v.lights), (Some(a), Some(b)) if Arc::ptr_eq(a, b)) {
+            self.veh_lights = v.lights.clone();
+            self.cfg_patterns.clear();
+            self.siren_dirty = true;
+        }
         let lock = v.steer_lock.filter(|l| *l > 0.01 && *l < 1.6);
         self.steer_lock_known = lock.is_some();
         self.steer_lock = lock.unwrap_or(35f32.to_radians());
@@ -1388,6 +1407,8 @@ impl ModelView {
             self.rim_ratio = c.rim_ratio.unwrap_or(0.0);
         }
         self.part_look_want = c.parts_key.clone();
+        self.cfg_patterns = c.light_patterns.clone();
+        self.siren_dirty = true;
         if let Some(r) = &c.rim {
             self.wheel_rim = format!("{r}_hi");
         }
@@ -1624,6 +1645,7 @@ impl ModelView {
                 self.steer_wheel = find_steering_wheel(&l.model);
                 self.window_movers = find_window_movers(&l.model);
                 self.has_lamps = l.model.joints.iter().any(|j| self.lamps.kind(&j.name).is_some());
+                self.siren_dirty = true;
             }
         }
         let arrived = {
@@ -2252,7 +2274,18 @@ impl ModelView {
         let (globals, mut skin) = self.joint_mats();
         // Lit lamps: the light of each lamp bone rides in the bottom row of
         // its joint matrix (see the shader). Not on the Metal renderer.
-        if self.has_lamps && cfg!(not(target_os = "macos")) {
+        if self.siren_dirty {
+            self.siren_dirty = false;
+            self.sirens = match (&self.loaded, &self.veh_lights) {
+                (Some(l), Some(v)) => find_sirens(&l.model, v, &self.cfg_patterns),
+                _ => Vec::new(),
+            };
+            // kept while nothing is known yet (a pattern asked for on the command line)
+            if !self.sirens.is_empty() {
+                self.siren = self.siren.min(self.sirens.len());
+            }
+        }
+        if (self.has_lamps || !self.sirens.is_empty()) && cfg!(not(target_os = "macos")) {
             let t = ctx.input(|i| i.time);
             if let Some(l) = &self.loaded {
                 for (j, m) in l.model.joints.iter().zip(skin.iter_mut()) {
@@ -2263,8 +2296,22 @@ impl ModelView {
                     }
                 }
             }
+            let siren = self.siren.checked_sub(1).and_then(|i| self.sirens.get(i));
+            if let Some(s) = siren {
+                for (ji, steps, col) in &s.lamps {
+                    let k = steps.iter().map(|(o, ty)| flash(*ty, t * s.speed as f64 - *o as f64)).fold(0.0, f32::max);
+                    if let (true, Some(m)) = (k > 0.0, skin.get_mut(*ji)) {
+                        m.x_axis.w = col[0] * k;
+                        m.y_axis.w = col[1] * k;
+                        m.z_axis.w = col[2] * k;
+                    }
+                }
+            }
             if self.lamps.left || self.lamps.right || self.lamps.hazard {
                 ctx.request_repaint_after(std::time::Duration::from_millis(60));
+            }
+            if siren.is_some() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
             }
         }
         let show_wheels = self.wheels_on && !self.veh_no_wheels && !self.mounts().is_empty();
@@ -2597,6 +2644,18 @@ impl ModelView {
                     })
                     .response
                     .on_hover_text("Lamps are found by their bones (headlight_l, taillight_l, brakelight_l, reversinglight_l, indicator_lf ... and the _glass bone of each lens). A lit lamp's reflector and lens glow in a fixed colour for its kind, and its LED mesh (standard_vehicle_emissive_animated_bones) shows its own colour map. How bright the game makes each lamp, and the light it casts, are not read from the files.");
+                }
+                if !self.sirens.is_empty() {
+                    let label = |i: usize, s: &[Siren]| if i == 0 { "off".to_string() } else { s[i - 1].label.clone() };
+                    egui::ComboBox::from_label("siren lights")
+                        .selected_text(label(self.siren, &self.sirens))
+                        .show_ui(ui, |ui| {
+                            for i in 0..=self.sirens.len() {
+                                ui.selectable_value(&mut self.siren, i, label(i, &self.sirens));
+                            }
+                        })
+                        .response
+                        .on_hover_text("The vehicle's light patterns that reach its siren and strobe bones. Read from the game's files: which lamps a pattern uses, each lamp's phase offset in the cycle and its flash type number, the pattern's speed, and the lamp's light archetype name. Not read: what a flash type looks like over time (0 is shown as off, 1 as steady, 6 as an even blink, every other number as a double flash), the length of the cycle (shown as one second at speed 1) and the colours behind the archetype names (red and amber by name, everything else white). Patterns marked 'pack' are in the vehicle's light pack without a part of this configuration linking them.");
                 }
                 if self.hinges.values().any(|h| h.0 == 2) {
                     ui.add(egui::Slider::new(&mut self.boot_open, 0.0..=1.1).text("boot open"));
@@ -3560,6 +3619,84 @@ fn find_steering_wheel(model: &glb::Model) -> Option<(usize, Vec3)> {
         Vec3::Z
     };
     Some((ji, axis))
+}
+
+/// One siren pattern on the loaded model: per lamp the joint, its steps of
+/// (phase offset, flash type number) and its light (linear colour x intensity).
+struct Siren {
+    label: String,
+    speed: f32,
+    lamps: Vec<(usize, Vec<(f32, u32)>, [f32; 3])>,
+}
+
+/// The light patterns of `lights` that reach a siren, strobe or beacon bone
+/// of `model`: the ones `linked` by the configuration first, then the rest
+/// of the vehicle's light pack. A lamp's lens bone (`<lamp>_glass`) flashes
+/// with it.
+fn find_sirens(model: &glb::Model, lights: &crate::vehicle_db::Lights, linked: &[String]) -> Vec<Siren> {
+    let mut by_hash: HashMap<u32, Vec<(usize, f32)>> = HashMap::new();
+    let mut special = std::collections::HashSet::new();
+    for (i, j) in model.joints.iter().enumerate() {
+        let n = j.name.to_ascii_lowercase();
+        let (base, k) = n.strip_suffix("_glass").map_or((n.as_str(), 1.0), |b| (b, 0.7));
+        let h = sixng_core::meta7a::joaat(base);
+        if ["siren", "strobe", "beacon"].iter().any(|w| base.contains(w)) {
+            special.insert(h);
+        }
+        by_hash.entry(h).or_default().push((i, k));
+    }
+    let colour = |bone: u32| -> [f32; 3] {
+        let a = lights.archetypes.get(&bone).map(|s| s.as_str()).unwrap_or("");
+        if a.contains("red") {
+            [1.6, 0.04, 0.02]
+        } else if a.contains("amber") {
+            [1.5, 0.6, 0.03]
+        } else if a.contains("warm") {
+            [1.5, 1.3, 1.0]
+        } else {
+            [1.5, 1.5, 1.5]
+        }
+    };
+    let mut out: Vec<(bool, Siren)> = Vec::new();
+    for p in &lights.patterns {
+        let is_linked = linked.contains(&p.name);
+        if !is_linked && !lights.pack.contains(&p.name) {
+            continue;
+        }
+        if !p.lamps.iter().any(|(b, s)| special.contains(b) && s.iter().any(|x| x.1 != 0)) {
+            continue;
+        }
+        let mut lamps = Vec::new();
+        for (b, steps) in &p.lamps {
+            let c = colour(*b);
+            for (ji, k) in by_hash.get(b).into_iter().flatten() {
+                lamps.push((*ji, steps.clone(), [c[0] * k, c[1] * k, c[2] * k]));
+            }
+        }
+        let n = p.lamps.iter().filter(|(b, s)| by_hash.contains_key(b) && s.iter().any(|x| x.1 != 0)).count();
+        let flashing = p.lamps.iter().any(|(_, s)| s.iter().any(|x| x.1 > 1));
+        let speed = if p.speed != 1.0 { format!(", speed {}", p.speed) } else { String::new() };
+        let label = format!("{} {} (slot {}, {n} lamps{speed}{})", if flashing { "flashing" } else { "steady" }, p.name, p.slot, if is_linked { "" } else { ", pack" });
+        out.push((is_linked, Siren { label, speed: if p.speed > 0.0 { p.speed } else { 1.0 }, lamps }));
+    }
+    // linked first, flashing before steady
+    out.sort_by_key(|(l, s)| (!*l, s.label.starts_with("steady")));
+    out.into_iter().map(|x| x.1).collect()
+}
+
+/// Brightness 0..1 of a flash type at `phase` (in cycles; the lamp's offset
+/// already taken off). Only the type numbers are in the files: 0 is taken
+/// as off, 1 as steady, 6 (the indicators' type) as an even blink, and
+/// every other number as a double flash at the start of the cycle.
+fn flash(ty: u32, phase: f64) -> f32 {
+    let p = phase.rem_euclid(1.0);
+    let on = match ty {
+        0 => false,
+        1 => true,
+        6 => p < 0.5,
+        _ => p < 0.1 || (0.18..0.28).contains(&p),
+    };
+    if on { 1.0 } else { 0.0 }
 }
 
 /// Which vehicle lamps are on.

@@ -322,6 +322,17 @@ impl<'a> Meta<'a> {
                 }
                 json!((0..n).filter_map(|i| self.value(sd, el, p + i * esz, depth)).collect::<Vec<_>>())
             }
+            // Half float (2 bytes).
+            0x20 => {
+                let h = r.u16(p);
+                let (s, e, f) = (if h & 0x8000 != 0 { -1.0f32 } else { 1.0 }, (h >> 10) & 0x1f, (h & 0x3ff) as f32);
+                let x = match e {
+                    0 => f / 1024.0 * 2f32.powi(-14),
+                    31 => f32::MAX,
+                    _ => (1.0 + f / 1024.0) * 2f32.powi(e as i32 - 15),
+                };
+                json!(s * x)
+            }
             _ => json!({"type": m.ty, "sub": m.sub, "hex": r.sys.get(p..p + 16).map(|b| b.iter().map(|x| format!("{x:02x}")).collect::<String>())}),
         })
     }
