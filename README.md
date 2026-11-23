@@ -459,6 +459,20 @@ again**).
     (about a minute) and loads the texture-users index (about 10 s).
   - Watches and rings are modelled at their own root bone and moved onto
     their attach bone (the left wrist when there are two).
+- **Hair on characters.** Nothing in the files links a hair asset to its
+  strand grooms; `hairlink` places them by the name words in the asset
+  registry, archive order, piece counts and geometry, with a model
+  probability. The Character panel lists each hair asset (hair, brows,
+  beard, lashes) with that percentage. Shown at the start: 50 % or more,
+  or 20 % or more when every piece is rooted on this head (a probable
+  style, not a certain one). Pieces whose strand roots do not lie on the
+  head are left out, and a piece two neighbouring assets claim goes to
+  the stronger claim. The hair is grown to its stored strand count (capped
+  per piece) and drawn 6 mm wide so it reads as hair (`--hair-width MM`).
+  Colour: row tint 0 of `ped_tint_hair` for the items that name that
+  palette (a few hundred, mostly named characters); the others leave the
+  colour to the game, so the viewer starts dark and has a colour picker.
+  Hats do not flatten the hair.
 - **Body sliders** (weight −1…1, muscle 0…1; `--body <w>,<m>` for
   screenshots): the skin and head are posed with the game's body-shape rig
   on the shared skeleton. Clothes and accessories follow the skin under

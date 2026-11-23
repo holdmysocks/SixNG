@@ -1619,6 +1619,7 @@ impl App {
         m.look.tint = !c.has("no-tint");
         m.hair.show = !c.has("no-fur");
         m.auto.find_hair = c.has("find-hair");
+        m.auto.hair_width = c.f("hair-width");
         m.show_skeleton = c.has("skeleton");
         m.show_normals = c.has("normals");
         m.decal_bias = !c.has("no-decal-bias");
