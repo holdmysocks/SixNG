@@ -768,9 +768,18 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
         let pos_of: HashMap<usize, usize> = jn.iter().enumerate().map(|(k, &n)| (n, k)).collect();
         for (k, &n) in jn.iter().enumerate() {
             let nd = &d.j["nodes"][n];
-            let local: [f32; 16] = serde_json::from_value(nd["matrix"].clone()).unwrap_or([
-                1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
-            ]);
+            // a matrix, or translation / rotation / scale (a GLB with an
+            // animation writes its joints that way)
+            let local: [f32; 16] = serde_json::from_value(nd["matrix"].clone()).unwrap_or_else(|_| {
+                let v3 = |k: &str, d: [f32; 3]| serde_json::from_value::<[f32; 3]>(nd[k].clone()).unwrap_or(d);
+                let q: [f32; 4] = serde_json::from_value(nd["rotation"].clone()).unwrap_or([0.0, 0.0, 0.0, 1.0]);
+                glam::Mat4::from_scale_rotation_translation(
+                    glam::Vec3::from(v3("scale", [1.0; 3])),
+                    glam::Quat::from_xyzw(q[0], q[1], q[2], q[3]).normalize(),
+                    glam::Vec3::from(v3("translation", [0.0; 3])),
+                )
+                .to_cols_array()
+            });
             let mut ib = [0f32; 16];
             if ibm.len() >= (k + 1) * 16 {
                 ib.copy_from_slice(&ibm[k * 16..k * 16 + 16]);
@@ -993,6 +1002,85 @@ pub fn merge(into: &mut Model, other: Model) {
     }
     into.triangles += other.triangles;
     into.vertices += other.vertices;
+}
+
+/// One animated joint property of a GLB animation: path 0 = translation,
+/// 1 = rotation (x, y, z, w), 2 = scale; linear keys.
+pub struct AnimChannel {
+    pub joint: usize,
+    pub path: u8,
+    pub times: Vec<f32>,
+    pub values: Vec<[f32; 4]>,
+}
+
+pub struct Anim {
+    pub name: String,
+    pub duration: f32,
+    pub channels: Vec<AnimChannel>,
+}
+
+impl AnimChannel {
+    /// Value at time `t` (clamped to the keys; rotations take the shorter arc).
+    pub fn sample(&self, t: f32) -> [f32; 4] {
+        let n = self.times.len().min(self.values.len());
+        if n == 0 {
+            return [0.0, 0.0, 0.0, 1.0];
+        }
+        let i = self.times[..n].partition_point(|&x| x <= t);
+        if i == 0 {
+            return self.values[0];
+        }
+        if i >= n {
+            return self.values[n - 1];
+        }
+        let (a, b) = (self.values[i - 1], self.values[i]);
+        let f = ((t - self.times[i - 1]) / (self.times[i] - self.times[i - 1]).max(1e-9)).clamp(0.0, 1.0);
+        if self.path == 1 {
+            let s = if a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3] < 0.0 { -1.0 } else { 1.0 };
+            let q = [0, 1, 2, 3].map(|k| a[k] + (s * b[k] - a[k]) * f);
+            let l = q.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+            q.map(|x| x / l)
+        } else {
+            [0, 1, 2, 3].map(|k| a[k] + (b[k] - a[k]) * f)
+        }
+    }
+}
+
+/// The animations of a GLB whose channels drive joints of its first skin
+/// (the roof clip of a convertible). Joint indices are skin joint indices,
+/// as in `Model::joints`.
+pub fn load_anims(path: &Path) -> Result<Vec<Anim>> {
+    let data = std::fs::read(path)?;
+    if data.len() < 20 || &data[0..4] != b"glTF" {
+        return Err(anyhow!("not a GLB"));
+    }
+    let jl = u32::from_le_bytes(data[12..16].try_into()?) as usize;
+    let j: Value = serde_json::from_slice(&data[20..20 + jl])?;
+    let bin = data.get(20 + jl + 8..).unwrap_or(&[]);
+    let d = Doc { j, bin };
+    let skin: Vec<u64> = d.j["skins"][0]["joints"].as_array().map(|a| a.iter().filter_map(|x| x.as_u64()).collect()).unwrap_or_default();
+    let mut out = Vec::new();
+    for an in d.j["animations"].as_array().cloned().unwrap_or_default() {
+        let mut channels = Vec::new();
+        for ch in an["channels"].as_array().cloned().unwrap_or_default() {
+            let Some(joint) = ch["target"]["node"].as_u64().and_then(|n| skin.iter().position(|&x| x == n)) else { continue };
+            let path = match ch["target"]["path"].as_str() {
+                Some("translation") => 0,
+                Some("rotation") => 1,
+                Some("scale") => 2,
+                _ => continue,
+            };
+            let s = &an["samplers"][ch["sampler"].as_u64().unwrap_or(0) as usize];
+            let (Some(i), Some(o)) = (s["input"].as_u64(), s["output"].as_u64()) else { continue };
+            let (times, _) = d.floats(i as usize)?;
+            let (vals, comps) = d.floats(o as usize)?;
+            let values = vals.chunks_exact(comps.max(1)).map(|c| [c[0], c.get(1).copied().unwrap_or(0.0), c.get(2).copied().unwrap_or(0.0), c.get(3).copied().unwrap_or(0.0)]).collect();
+            channels.push(AnimChannel { joint, path, times, values });
+        }
+        let duration = channels.iter().filter_map(|c| c.times.last().copied()).fold(0.0f32, f32::max);
+        out.push(Anim { name: an["name"].as_str().unwrap_or("").to_string(), duration, channels });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

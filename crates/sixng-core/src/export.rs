@@ -496,6 +496,33 @@ fn is_hidden(s: &crate::drawable::Shader, st: &ShaderTextures) -> bool {
     classify_shader(s, st)["stand_in"] == "hidden"
 }
 
+/// The roof clip of a convertible as a glTF animation `va_<model>/roof`, and what model.json says
+/// about it (null for other models).
+fn roof_animation(a: &ArchiveInfo, name: &str, joints: &[crate::gltf::Joint]) -> (Vec<crate::gltf::Animation>, serde_json::Value) {
+    // vehicles only (not every convertible has a `convertible_roof` bone)
+    if !joints.iter().any(|j| j.name.eq_ignore_ascii_case("convertible_roof") || is_wheel_mount(&j.name)) {
+        return (Vec::new(), serde_json::Value::Null);
+    }
+    let Some(work) = crate::names::work_dir() else {
+        return (Vec::new(), serde_json::json!({"status": "not looked up: no work directory is set"}));
+    };
+    match crate::anim::vehicle_roof(&game_root(a), &work, name) {
+        Ok(Some((de, d))) => {
+            let c = d.clip("roof").expect("vehicle_roof checked the clip");
+            let (channels, stats) = crate::outfit::clip_channels(&d, c, joints);
+            let n = channels.len();
+            let anim = crate::gltf::Animation { name: format!("{}/{}", d.name, c.short_name()), channels };
+            let info = serde_json::json!({
+                "status": "ok", "name": anim.name, "dictionary": d.name, "source": de.id, "duration": c.duration, "channels": n, "coverage": stats,
+                "note": "The model info names the clip as in GTA V (animConvRoofDictName = joaat of va_<model>, animConvRoofName = joaat of roof). Time 0 is the roof up, the end the roof stowed. Written into the GLB as a glTF animation of the joint nodes.",
+            });
+            (vec![anim], info)
+        }
+        Ok(None) => (Vec::new(), serde_json::json!({"status": "no va_<model> clip dictionary with a roof clip in levels.rpf"})),
+        Err(e) => (Vec::new(), serde_json::json!({"status": format!("not read: {e:#}")})),
+    }
+}
+
 /// A wheel bone that carries a wheel: `wheel_lf`, `wheel_rm1`, and the inner
 /// wheel of a dual pair, `wheel_lr_inr`. Not the helpers (`wheel_turn_lf`,
 /// `wheel_lr_drive`, `wheel_parent_lr`).
@@ -956,6 +983,8 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
             }
             let lods = lod_exports(&lod_groups);
             let primary = lods.first().map_or(0, |l| l.0);
+            // Convertibles: the roof-folding clip as a glTF animation.
+            let (roof_anims, roof_info) = roof_animation(a, e.name.as_deref().unwrap_or(""), &joints);
             if ntris > 0 {
                 for (lod, fname) in &lods {
                     let lod = *lod;
@@ -964,7 +993,9 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     let mut ex = extras.clone();
                     ex["lod"] = serde_json::json!(lod);
                     let nm = format!("{}{}", e.name.as_deref().unwrap_or("model"), if lod == 0 { String::new() } else { format!("_lod{lod}") });
-                    fs::write(&p, crate::gltf::mesh_glb(&nm, groups, &mats, &joints, ex))?;
+                    ex["roof_animation"] = roof_info.clone();
+                    let opt = crate::gltf::GlbOptions { animations: &roof_anims, ..Default::default() };
+                    fs::write(&p, crate::gltf::mesh_glb_with(&nm, groups, &mats, &joints, ex, &opt))?;
                     item.files.push(rel(&o.out, &p));
                     if glb_file.is_none() {
                         glb_file = Some(rel(&dir, &p));
@@ -1034,6 +1065,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     serde_json::json!({"bone": b.name, "pivot": b.pivot, "radius": d.map(|d| d.radius), "half_width": d.map(|d| d.half_width), "centre": d.map(|d| d.centre)})
                 }).collect::<Vec<_>>(),
                 "wheel_mounts_version": 2,
+                "roof_animation": roof_info,
                 "wheel_discs": wheel_discs,
                 "wheel_discs_note": "Disc bounds of the fragment's physics (type 8 children of its composite bound): centre, radius and half width in metres. The largest disc on a wheel bone's axle line is the wheel (its centre, radius and half_width are repeated in wheel_mounts); a thinner one is the brake disc.",
                 "wheel_mounts_note": "Wheel centres (model space, RAGE Z-up). Rims and tyres are shared models (rim_<class>_NNN, tyre_<class>_NNN) authored for the left-front at unit scale (rim radius 0.5); mirror X for right-hand wheels and scale by the vehicle's wheel size (not decoded yet).",

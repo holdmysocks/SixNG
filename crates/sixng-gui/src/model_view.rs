@@ -136,8 +136,13 @@ pub struct ModelView {
     pub joint_labels: bool,
     pub wheel_spin: f32,
     pub door_open: f32,
-    /// Convertibles: hide the soft top (the folding animation is not found).
+    /// Convertibles: how far the roof is folded, 0 = up, 1 = stowed (the
+    /// position in the car's `va_<model>/roof` clip).
+    pub roof_fold: f32,
+    /// Convertibles without that clip: hide the soft top.
     pub roof_down: bool,
+    /// The loaded model's roof clip (model path it was read for, the clip).
+    roof_anim: (PathBuf, Option<glb::Anim>),
     pub paint_on: bool,
     /// Side-panel controls that apply to the loaded model, keyed by (GLB path, triangles).
     caps: Option<(PathBuf, usize, Caps)>,
@@ -346,7 +351,9 @@ impl ModelView {
             joint_labels: true,
             wheel_spin: 0.0,
             door_open: 0.0,
+            roof_fold: 0.0,
             roof_down: false,
+            roof_anim: (PathBuf::new(), None),
             paint_on: true,
             caps: None,
             material_sel: None,
@@ -1288,6 +1295,14 @@ impl ModelView {
     }
 
     fn update_wheels(&mut self, rs: &egui_wgpu::RenderState, ctx: &egui::Context) {
+        // the roof clip of the loaded convertible, read once per model file
+        if let Some(l) = &self.loaded {
+            if self.roof_anim.0 != l.model.path {
+                let roof = l.info["roof_animation"]["status"] == "ok";
+                let a = if roof { glb::load_anims(&l.model.path).ok().and_then(|v| v.into_iter().find(|a| a.name.to_ascii_lowercase().ends_with("/roof"))) } else { None };
+                self.roof_anim = (l.model.path.clone(), a);
+            }
+        }
         if let Some(r) = self.wheel_pending.lock().unwrap().take() {
             self.wheel_loading = false;
             match r {
@@ -1472,7 +1487,36 @@ impl ModelView {
         let Some(l) = &self.loaded else {
             return (vec![], vec![]);
         };
-        let js = &l.model.joints;
+        // the roof clip replaces the local transform of the joints it drives
+        let posed: Vec<glb::Joint>;
+        let js: &[glb::Joint] = match &self.roof_anim.1 {
+            Some(a) if self.roof_fold > 0.0 && self.roof_anim.0 == l.model.path => {
+                let t = self.roof_fold * a.duration;
+                let mut v: Vec<glb::Joint> = l.model.joints.iter().map(|j| glb::Joint { name: j.name.clone(), parent: j.parent, local: j.local, ibm: j.ibm }).collect();
+                let mut trs: Vec<Option<(Vec3, Quat, Vec3)>> = vec![None; v.len()];
+                for c in &a.channels {
+                    let Some(j) = v.get(c.joint) else { continue };
+                    let e = trs[c.joint].get_or_insert_with(|| {
+                        let (s, r, t) = Mat4::from_cols_array(&j.local).to_scale_rotation_translation();
+                        (t, r, s)
+                    });
+                    let x = c.sample(t);
+                    match c.path {
+                        0 => e.0 = Vec3::new(x[0], x[1], x[2]),
+                        1 => e.1 = Quat::from_xyzw(x[0], x[1], x[2], x[3]).normalize(),
+                        _ => e.2 = Vec3::new(x[0], x[1], x[2]),
+                    }
+                }
+                for (j, e) in v.iter_mut().zip(trs) {
+                    if let Some((t, r, s)) = e {
+                        j.local = Mat4::from_scale_rotation_translation(s, r, t).to_cols_array();
+                    }
+                }
+                posed = v;
+                &posed
+            }
+            _ => &l.model.joints,
+        };
         let mut global: Vec<Option<Mat4>> = vec![None; js.len()];
         fn g(
             i: usize,
@@ -1515,7 +1559,7 @@ impl ModelView {
             m
         }
         let gl: Vec<Mat4> = (0..js.len())
-            .map(|i| g(i, js, &mut global, self.wheel_spin, self.door_open, self.roof_down, 0))
+            .map(|i| g(i, js, &mut global, self.wheel_spin, self.door_open, self.roof_down && self.roof_anim.1.is_none(), 0))
             .collect();
         let skin: Vec<Mat4> = gl
             .iter()
@@ -2063,8 +2107,15 @@ impl ModelView {
                 if caps.doors {
                     ui.add(egui::Slider::new(&mut self.door_open, 0.0..=1.3).text("doors open"));
                 }
-                if caps.roof {
-                    ui.checkbox(&mut self.roof_down, "roof down").on_hover_text("hides the soft top and its frame (everything under the convertible_roof bone except the roof cover). The folding animation itself was not found in the game's animations.");
+                if caps.roof || self.roof_anim.1.is_some() {
+                    match &self.roof_anim.1 {
+                        Some(a) => {
+                            ui.add(egui::Slider::new(&mut self.roof_fold, 0.0..=1.0).text("roof fold")).on_hover_text(format!("plays the car's own roof clip ({}, {:.1} s): 0 = roof up, 1 = stowed", a.name, a.duration));
+                        }
+                        None => {
+                            ui.checkbox(&mut self.roof_down, "roof down").on_hover_text("no roof clip was found for this car: hides the soft top and its frame (everything under the convertible_roof bone except the roof cover)");
+                        }
+                    }
                 }
                 if caps.mounts {
                     ui.checkbox(&mut self.wheels_on, "fit shared wheels at the wheel mounts");
@@ -2939,6 +2990,8 @@ fn export_load(
                 // and from before the wheels' collision discs were read
                 // and the inner wheels of dual pairs
                 || (j.contains("\"bone\": \"wheel_") || j.contains("\"bone\":\"wheel_") || j.contains("\"wheel_discs\"")) && !j.contains("\"wheel_mounts_version\"")
+                // and convertibles from before their roof clip was written
+                || (j.contains("\"convertible_roof\"") || j.contains("\"wheel_mounts_version\"")) && !j.contains("\"roof_animation\"")
                 // and weapon parts from before their stand-in surface
                 || j.contains("e68a4a98") && !j.contains("\"gunmetal\"")
         });

@@ -1606,6 +1606,7 @@ impl App {
         m.wheel_spin = c.f("spin").unwrap_or(0.0);
         m.door_open = c.f("door").unwrap_or(0.0);
         m.roof_down = c.has("roof-down");
+        m.roof_fold = c.f("roof").unwrap_or(0.0);
         if let Some(v) = c.f("yaw") {
             m.cam.yaw = v;
         }

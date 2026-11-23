@@ -590,6 +590,52 @@ pub fn dictionaries(game_root: &std::path::Path, work: &std::path::Path) -> Resu
 /// archive also works: map archives keep unnamed clip dictionaries for
 /// animated map objects (cables, canopies, flags: 39 in the minigame pack,
 /// `pack/shared_minigame000/shared_minigame000.rpf@273af010`).
+/// Cache of the clip dictionaries in `levels.rpf`, in `<work>/index`.
+pub const LEVEL_DICT_CACHE: &str = "levels.clipdicts.json";
+
+/// The clip dictionaries of `levels.rpf` (170: map object clips and the
+/// vehicle dictionaries `va_<model>`). They are entries without a recovered
+/// name, so every unnamed object's system page is read once and the names
+/// are cached in `<work>/index/levels.clipdicts.json`.
+pub fn level_dictionaries(game_root: &std::path::Path, work: &std::path::Path) -> Result<Vec<DictEntry>> {
+    use rayon::prelude::*;
+    let cache = work.join("index").join(LEVEL_DICT_CACHE);
+    if let Ok(b) = std::fs::read(&cache) {
+        if let Ok(v) = serde_json::from_slice::<Vec<DictEntry>>(&b) {
+            return Ok(v);
+        }
+    }
+    let ixp = crate::scan::index_path(&work.join("index"), "levels.rpf");
+    let ix = crate::scan::load_index(&ixp).map_err(|e| anyhow!("levels.rpf index ({}): {e}; run `sixng index levels` first", ixp.display()))?;
+    let arch = game_root.join("levels.rpf");
+    let mut v: Vec<DictEntry> = ix
+        .entries
+        .par_iter()
+        .filter(|e| e.kind == crate::classify::Kind::RageObj && !e.streams.is_empty() && e.rtype.is_none() && e.name.is_none())
+        .filter_map(|e| {
+            let r = crate::resource::Resource::load_sys(&arch, e).ok()?;
+            Some(DictEntry { name: dictionary_name(&r.sys)?, id: e.id.clone() })
+        })
+        .collect();
+    v.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+    let _ = std::fs::write(&cache, serde_json::to_vec(&v)?);
+    Ok(v)
+}
+
+/// A convertible's roof animation. The vehicle's model info names it as in
+/// GTA V: `animConvRoofDictName` = joaat("va_<model>") and `animConvRoofName`
+/// = joaat("roof"). The dictionary is in `levels.rpf`; its one clip moves the
+/// bones under `convertible_roof` from roof up (time 0) to roof stowed.
+/// `model` may carry a LOD suffix (`_hi`, `_mid`).
+pub fn vehicle_roof(game_root: &std::path::Path, work: &std::path::Path, model: &str) -> Result<Option<(DictEntry, ClipDictionary)>> {
+    let m = model.to_ascii_lowercase();
+    let m = m.strip_suffix("_hi").or_else(|| m.strip_suffix("_mid")).unwrap_or(&m);
+    let want = format!("va_{m}");
+    let Some(de) = level_dictionaries(game_root, work)?.into_iter().find(|d| d.name.eq_ignore_ascii_case(&want)) else { return Ok(None) };
+    let (de, d) = load_dictionary(game_root, work, &de.id)?;
+    Ok(d.clip("roof").is_some().then_some((de, d)))
+}
+
 pub fn load_dictionary(game_root: &std::path::Path, work: &std::path::Path, q: &str) -> Result<(DictEntry, ClipDictionary)> {
     if let Some((arch, _)) = q.split_once(".rpf@").filter(|(a, _)| *a != "anim") {
         let arch = format!("{arch}.rpf");
