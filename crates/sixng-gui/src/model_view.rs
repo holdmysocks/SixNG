@@ -4094,6 +4094,7 @@ fn load_query_sel(
                 }));
                 opts.iter_mut().for_each(|o| o.default = false);
                 let mut info = LookInfo { model: look.model.clone(), labels: look.outfits.iter().map(|o| o.label.clone()).collect(), current: k, ..Default::default() };
+                info.notes.extend(look.note.clone());
                 for (oi, o) in look.outfits.iter().enumerate() {
                     for p in &o.parts {
                         if p.strands {
@@ -4126,7 +4127,7 @@ fn load_query_sel(
                             // by the item's hair asset, else by the character's own placeholder
                             let Some(l) = u64::from_str_radix(guid, 16).ok().and_then(|g| t.resolve(g, look.fit.as_deref())).or_else(|| guid.is_empty().then(|| t.by_placeholder(placeholder)).flatten()) else { continue };
                             let colour = info.strand_tints.iter().find(|t| t.0 == *slot && t.1 == 0x1e64_f584).and_then(|t| Some(sixng_core::pedtint::palettes(&ws.game).ok()?.get(&t.1)?.sample(t.2, 128)));
-                            info.hair.push(HairPick { slot: slot.clone(), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: t.uncontested(l), off_head: 0, shown: l.confidence >= 0.5, colour });
+                            info.hair.push(HairPick { slot: slot.clone(), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: t.uncontested(l), off_head: 0, shown: l.confidence >= 0.5 && slot != "body hair", colour });
                         }
                     }
                     Err(e) => info.notes.push(format!("Strand hair: {e}")),
@@ -4173,7 +4174,9 @@ fn load_query_sel(
                             on * 10 >= n * 8
                         });
                         h.off_head = all - h.grooms.len();
-                        h.shown = !h.grooms.is_empty() && (h.confidence >= 0.5 || (h.confidence >= 0.2 && h.off_head == 0));
+                        // body hair is fine fuzz in the game; drawn at hair
+                        // width it reads as fur, so it is offered but starts off
+                        h.shown = h.slot != "body hair" && !h.grooms.is_empty() && (h.confidence >= 0.5 || (h.confidence >= 0.2 && h.off_head == 0));
                     }
                 }
             }

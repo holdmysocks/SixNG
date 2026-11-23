@@ -53,7 +53,7 @@ pub fn decode(r: &Resource, v: usize) -> Result<Vec<[f32; 3]>> {
 }
 
 /// Triangle meshes of a drawable resource: (positions, UV0), one per geometry.
-fn meshes(r: &Resource) -> Vec<(Vec<[f32; 3]>, Vec<[f32; 2]>)> {
+pub(crate) fn meshes(r: &Resource) -> Vec<(Vec<[f32; 3]>, Vec<[f32; 2]>)> {
     let bufs = crate::drawable::find_buffers(r);
     let geoms = crate::drawable::find_geometries(r, &bufs);
     let slice = |i: usize| {

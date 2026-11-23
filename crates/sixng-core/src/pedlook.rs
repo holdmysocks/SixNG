@@ -34,7 +34,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 4;
 const VARIATION: u32 = 0xa9d5_7751;
 const LIST_ITEM: u32 = 0xa5ea_6310;
 
@@ -51,20 +51,50 @@ pub struct Models {
     version: u32,
     /// joaat(model name) -> row
     pub by_model: BTreeMap<u32, ModelRow>,
-    /// joaat(head drawable name) -> wardrobe resources with an item that
-    /// names that head (tag `4bfd27dd`). Many characters are listed under
+    /// joaat(drawable name or name prefix) -> wardrobe resources with an
+    /// item that names that head (tag `4bfd27dd`) or that strand-hair
+    /// placeholder (tag `023e5a2f`, the name without `_full`). Many characters are listed under
     /// a model name that is not their drawable prefix (`cs_lucia_*`); their
     /// head finds their wardrobe.
     #[serde(default)]
     pub heads: BTreeMap<u32, Vec<u64>>,
+    /// Character name of the ped model table (a packs PSO, record struct
+    /// `eb66d086`, field `dc3dfe39`) -> the models (`Name`) that carry it.
+    /// `player_story000_00` carries joaat("lucia"), `player_story000_01`
+    /// joaat("jason"); for 47 of 114 `cs_` models it is the model name
+    /// without `cs_`.
+    #[serde(default)]
+    pub aliases: BTreeMap<u32, Vec<u32>>,
 }
 
 fn build(packs: &Path, ix: &ArchiveIndex) -> Models {
     use crate::classify::Kind;
     // outfit lists, in order
     let mut lists: BTreeMap<u32, Vec<(u32, u32, f32)>> = BTreeMap::new();
+    let mut aliases: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     for e in ix.entries.iter().filter(|e| e.kind == Kind::Pso) {
         let Ok(b) = crate::scan::read_entry(packs, e) else { continue };
+        // the ped model table: character name -> models
+        const MODEL_INFO: u32 = 0xeb66_d086;
+        if b.windows(4).any(|w| w == MODEL_INFO.to_le_bytes() || w == MODEL_INFO.to_be_bytes()) {
+            if let Some(p) = crate::pso::parse(&b) {
+                let j = p.to_json();
+                let f = crate::meta7a::field_name;
+                for (k, objs) in j["objects"].as_object().into_iter().flatten() {
+                    if !k.ends_with("eb66d086") {
+                        continue;
+                    }
+                    for o in objs.as_array().into_iter().flatten() {
+                        if let (Some(name), Some(alias)) = (o["Name"].as_u64(), o[f(0xdc3d_fe39)].as_u64().filter(|&x| x != 0)) {
+                            let v = aliases.entry(alias as u32).or_default();
+                            if !v.contains(&(name as u32)) {
+                                v.push(name as u32);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if !b.windows(4).any(|w| w == LIST_ITEM.to_le_bytes() || w == LIST_ITEM.to_be_bytes()) {
             continue;
         }
@@ -110,7 +140,7 @@ fn build(packs: &Path, ix: &ArchiveIndex) -> Models {
             if !vars.is_empty() {
                 for o in m.objects(0xf795_e8ba) {
                     let Some(p) = m.object(0xf795_e8ba, o, 1) else { continue };
-                    for t in p[f(0x12f8_5293)].as_array().into_iter().flatten().filter(|t| t["Key"].as_u64() == Some(0x4bfd_27dd)) {
+                    for t in p[f(0x12f8_5293)].as_array().into_iter().flatten().filter(|t| matches!(t["Key"].as_u64(), Some(0x4bfd_27dd) | Some(0x023e_5a2f))) {
                         v.extend(t["Item"].as_array().into_iter().flatten().filter_map(|x| x.as_u64()).map(|h| (true, h as u32, e.off)));
                     }
                 }
@@ -143,7 +173,7 @@ fn build(packs: &Path, ix: &ArchiveIndex) -> Models {
             by_model.insert(model, ModelRow { resource, outfits });
         }
     }
-    Models { version: CACHE_VERSION, by_model, heads }
+    Models { version: CACHE_VERSION, by_model, heads, aliases }
 }
 
 /// The model table (built from the packs.rpf index on first use, about ten
@@ -261,6 +291,10 @@ pub struct Look {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fit: Option<String>,
     pub outfits: Vec<Outfit>,
+    /// How the outfits were found when no stored link names this model: a
+    /// head-shape match or a wardrobe that names its hair.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Strand-hair item words (3-vertex placeholder drawables).
@@ -375,8 +409,135 @@ fn look_uncached(game_root: &Path, a: &ArchiveInfo, ix: &ArchiveIndex, model: &s
     if let Some(l) = out {
         return Ok(l);
     }
+    // The ped model table names a model after this character: `cs_lucia`
+    // -> the one model whose character name is joaat("lucia"). That model's
+    // outfits, with this character's own head when it has one.
+    if let Some(l) = look_by_alias(t, a, ix, model) {
+        return Ok(l);
+    }
+    // A head no wardrobe names: the character whose head has the nearest shape
+    if let Some(l) = look_by_head_shape(t, a, ix, model) {
+        return Ok(l);
+    }
     // no outfit data at all (cutscene-only models): its own parts
     own_look(a, ix, model).ok_or_else(|| last_err.unwrap_or_else(|| format!("{model} is not in the game's outfit list, and no wardrobe names its head")))
+}
+
+/// Vertex positions of a drawable's largest mesh.
+fn mesh_points(a: &ArchiveInfo, e: &crate::scan::Entry) -> Option<Vec<[f32; 3]>> {
+    let r = Resource::load(&a.path, e).ok()?;
+    crate::headdelta::meshes(&r).into_iter().map(|m| m.0).max_by_key(|p| p.len())
+}
+
+/// For a character the outfit list has under another model: the model
+/// whose character name in the ped model table is this prefix without its
+/// first word (`cs_lucia` -> "lucia" -> `player_story000_00`), when exactly
+/// one model carries that name. The character's own head and eyes replace
+/// the model's when it has them (`cs_jason` has none).
+fn look_by_alias(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Option<Look> {
+    let short = model.split_once('_')?.1;
+    let [target] = t.aliases.get(&joaat(short))?.as_slice() else { return None };
+    let row = t.by_model.get(target)?;
+    let mut l = look_row(a, ix, model, row, false).ok()?;
+    let names: Vec<String> = ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| e.name.as_ref().map(|n| n.to_ascii_lowercase())).filter(|n| n.starts_with(&format!("{model}_head_"))).collect();
+    let head = names.iter().filter(|n| !n.contains("_eye") && !n.contains("_earring")).min().cloned();
+    let eyes = head.as_ref().and_then(|h| [format!("{}_eyes_full", h.trim_end_matches("_full")), format!("{}_eyes", h.trim_end_matches("_full"))].into_iter().find(|n| names.contains(n)));
+    let was = l.outfits.first().and_then(|o| o.parts.iter().find(|p| p.slot == "head")).map(|p| crate::outfit::outfit_prefix(&p.drawable).unwrap_or_default()).unwrap_or_default();
+    for o in &mut l.outfits {
+        for p in &mut o.parts {
+            match (p.slot.as_str(), &head, &eyes) {
+                ("head", Some(h), _) => {
+                    p.drawable = h.clone();
+                    p.skins.clear();
+                    p.found_by = "own";
+                }
+                ("eyes", Some(_), Some(e)) => {
+                    p.drawable = e.clone();
+                    p.found_by = "own";
+                }
+                _ => {}
+            }
+        }
+    }
+    l.note = Some(match head {
+        Some(_) => format!("{model} is not in the outfit list under its own name. The ped model table names one model after \"{short}\" ({was}); its outfits are shown with this character's own head."),
+        None => format!("{model} has no head of its own and is not in the outfit list. The ped model table names one model after \"{short}\" ({was}); that model's outfits and head are shown."),
+    });
+    Some(l)
+}
+
+/// For a character whose head no wardrobe names (`cs_lucia`): the outfits
+/// of the character whose head has the nearest shape, worn with this
+/// character's own head. Candidates are the heads of the same fit and
+/// ethnicity code (`_head_fr1_lat_`) that a wardrobe names. The match
+/// counts only when it stands out: the nearest head is at most 0.6 of the
+/// candidates' median distance, among at least five. At 0.8 it linked
+/// unrelated people (`cs_vern` to `cs_kai` at 0.69, `hc_jasonsmom` to a
+/// hotel guest at 0.75), so the bar is where only `u_m_m_deal_dook` ->
+/// `cs_dook` (0.52) passes. A shape match is evidence, not a stored link;
+/// the look says so.
+fn look_by_head_shape(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Option<Look> {
+    let drs = crate::outfit::dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
+        let n = e.name.as_ref()?.to_ascii_lowercase();
+        (item_word(&n) == "head" && !n.contains("_eye") && !n.contains("_earring")).then_some((n, e))
+    }));
+    let own_p = format!("{model}_head_");
+    let (own_name, own_e) = drs.iter().find(|(n, _)| n.starts_with(&own_p))?;
+    // "_head_fr1_lat_"
+    let i = own_name.find("_head_")?;
+    let code: String = own_name[i..].split('_').take(4).collect::<Vec<_>>().join("_") + "_";
+    let own = mesh_points(a, own_e)?;
+    let own: Vec<[f32; 3]> = own.into_iter().step_by(5).collect();
+    let cands: Vec<(&String, &&crate::scan::Entry)> = drs.iter().filter(|(n, _)| n.contains(&code) && !n.starts_with(&own_p) && (t.heads.contains_key(&joaat(n)) || t.heads.contains_key(&joaat(n.trim_end_matches("_full"))))).collect();
+    let mut dist: Vec<(f32, &String)> = cands
+        .par_iter()
+        .filter_map(|(n, e)| {
+            let p: Vec<[f32; 3]> = mesh_points(a, e)?.into_iter().step_by(2).collect();
+            if p.len() < 1000 {
+                return None;
+            }
+            let sum: f32 = own.iter().map(|q| p.iter().map(|r| (q[0] - r[0]).powi(2) + (q[1] - r[1]).powi(2) + (q[2] - r[2]).powi(2)).fold(f32::MAX, f32::min).sqrt()).sum();
+            Some((sum / own.len() as f32, *n))
+        })
+        .collect();
+    dist.sort_by(|x, y| x.0.total_cmp(&y.0));
+    if dist.len() < 5 {
+        return None;
+    }
+    let median = dist[dist.len() / 2].0;
+    // the nearest head that stands out and whose character has outfits
+    for (d, name) in dist.iter().take(1).filter(|(d, _)| *d <= 0.6 * median) {
+        let Some(other) = crate::outfit::outfit_prefix(name) else { continue };
+        let Ok(mut l) = look_uncached_listed(t, a, ix, &other) else { continue };
+        let own_eyes = [format!("{}_eyes_full", own_name.trim_end_matches("_full")), format!("{}_eyes", own_name.trim_end_matches("_full"))].into_iter().find(|n| ix.entries.iter().any(|e| e.name.as_ref().is_some_and(|x| x.eq_ignore_ascii_case(n))));
+        for o in &mut l.outfits {
+            for p in &mut o.parts {
+                if p.slot == "head" {
+                    p.drawable = own_name.clone();
+                    p.skins.clear();
+                    p.found_by = "own";
+                } else if p.slot == "eyes" {
+                    if let Some(e) = &own_eyes {
+                        p.drawable = e.clone();
+                        p.found_by = "own";
+                    }
+                }
+            }
+        }
+        l.note = Some(format!("{model} is not in the outfit data. Its head is nearest in shape to the head of {other} ({:.1} mm mean distance; the median over {} heads of that kind is {:.1} mm), so that character's outfits are shown with this head. A shape match, not a stored link.", d * 1000.0, dist.len(), median * 1000.0));
+        l.model = model.to_string();
+        return Some(l);
+    }
+    None
+}
+
+/// The outfits of a character by its stored links only (model name, or a
+/// wardrobe that names its head).
+fn look_uncached_listed(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Result<Look, String> {
+    if let Some(row) = t.by_model.get(&joaat(model)) {
+        return look_row(a, ix, model, row, false);
+    }
+    rows_by_head(t, ix, model).into_iter().find_map(|row| look_row(a, ix, model, row, true).ok()).ok_or_else(|| "no outfits".to_string())
 }
 
 /// A look made of a character's own drawables, for models the outfit data
@@ -415,7 +576,7 @@ fn own_look(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Option<Look> {
         }
     }
     let main: Vec<String> = parts.iter().filter(|p| ["full", "outer", "top", "bottom"].contains(&p.slot.as_str())).map(|p| pretty(item_word(&p.drawable))).collect();
-    Some(Look { model: model.to_string(), resource: format!("{} (own parts: the outfit data does not cover this model)", a.id), fit, outfits: vec![Outfit { id: String::new(), outfit_type: String::new(), scale: 0.0, label: format!("own parts: {}", main.join(", ")), body_shape: None, parts, unresolved: vec![] }] })
+    Some(Look { model: model.to_string(), resource: format!("{} (own parts: the outfit data does not cover this model)", a.id), fit, outfits: vec![Outfit { id: String::new(), outfit_type: String::new(), scale: 0.0, label: format!("own parts: {}", main.join(", ")), body_shape: None, parts, unresolved: vec![] }], note: Some("The outfit data does not cover this model: it is shown in its own parts.".into()) })
 }
 
 /// The outfits of one model row. `own_head`: keep only the outfits whose
@@ -540,7 +701,7 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
             return Err(format!("{model} is not in the game's outfit list, and no listed outfit of the wardrobe that names its head wears that head"));
         }
     }
-    Ok(Look { model: model.to_string(), resource: format!("{}@{:x}", a.id, row.resource), fit, outfits })
+    Ok(Look { model: model.to_string(), resource: format!("{}@{:x}", a.id, row.resource), fit, outfits, note: None })
 }
 
 #[cfg(test)]
