@@ -54,6 +54,8 @@ struct Info {
     wheel_scale: Option<f32>,
     #[serde(rename = "wheelScaleRear")]
     wheel_scale_rear: Option<f32>,
+    #[serde(rename = "steerWheelMult")]
+    steer_wheel_mult: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -100,6 +102,8 @@ pub struct Config {
 pub struct Vehicle {
     pub wheel_scale: Option<f32>,
     pub wheel_scale_rear: Option<f32>,
+    /// `steerWheelMult` of the model info.
+    pub steer_wheel_mult: Option<f32>,
     /// The game's own name for the model, with its make ("Bravado '19 Buffalo").
     pub display: Option<String>,
     pub configs: Vec<Config>,
@@ -261,15 +265,16 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
             Some(mk) if !n.to_lowercase().starts_with(&mk.to_lowercase()) => format!("{mk} {n}"),
             _ => n.clone(),
         });
-        let (ws, wr) = v
+        let (ws, wr, sm) = v
             .model_info
-            .map(|i| (i.wheel_scale, i.wheel_scale_rear))
-            .unwrap_or((None, None));
+            .map(|i| (i.wheel_scale, i.wheel_scale_rear, i.steer_wheel_mult))
+            .unwrap_or((None, None, None));
         m.insert(
             name.to_ascii_lowercase(),
             Vehicle {
                 wheel_scale: ws,
                 wheel_scale_rear: wr,
+                steer_wheel_mult: sm,
                 display,
                 configs,
                 palettes,

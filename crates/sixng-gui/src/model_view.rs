@@ -148,6 +148,12 @@ pub struct ModelView {
     clip_pos: Vec<f32>,
     /// Automation: play every other clip to this position.
     pub clip_pos_all: f32,
+    /// Steering: angle of the front wheels in radians (positive = left).
+    pub steer: f32,
+    /// `steerWheelMult` of the loaded vehicle (1 when it has none).
+    steer_mult: f32,
+    /// The steering wheel's joint and the axis it turns about (joint space).
+    steer_wheel: Option<(usize, Vec3)>,
     /// Vehicle lamps that are on.
     pub lamps: Lamps,
     /// The loaded model has lamp bones.
@@ -387,6 +393,9 @@ impl ModelView {
             clips: Vec::new(),
             clip_pos: Vec::new(),
             clip_pos_all: 0.0,
+            steer: 0.0,
+            steer_mult: 1.0,
+            steer_wheel: None,
             lamps: Lamps::default(),
             has_lamps: false,
             bonnet_open: 0.0,
@@ -1278,6 +1287,7 @@ impl ModelView {
     }
 
     fn apply_scale(&mut self, v: &crate::vehicle_db::Vehicle) {
+        self.steer_mult = v.steer_wheel_mult.filter(|m| *m > 0.0).unwrap_or(1.0);
         if self.wheel_auto {
             if let Some(f) = v.wheel_scale {
                 self.wheel_scale = f * WHEEL_FACTOR;
@@ -1343,6 +1353,25 @@ impl ModelView {
     }
 
     /// Wheel mounts of the loaded car (bone, glTF-space pivot).
+    /// The turn steering gives what is fitted at a wheel bone (shared
+    /// wheels, brake discs, calipers): a rotation about the vertical through
+    /// the wheel's `wheel_turn_*` ancestor; identity for unsteered wheels.
+    fn steer_at(&self, bone: &str) -> Mat4 {
+        let Some(l) = self.loaded.as_ref().filter(|_| self.steer != 0.0) else { return Mat4::IDENTITY };
+        let js = &l.model.joints;
+        let mut k = js.iter().position(|j| j.name.eq_ignore_ascii_case(bone));
+        let mut depth = 0;
+        while let Some(i) = k.filter(|_| depth < 64) {
+            if is_steer_bone(&js[i].name) {
+                let pivot = Mat4::from_cols_array(&js[i].ibm).inverse().w_axis.truncate();
+                return Mat4::from_translation(pivot) * Mat4::from_rotation_y(self.steer) * Mat4::from_translation(-pivot);
+            }
+            k = js[i].parent.filter(|p| *p != i);
+            depth += 1;
+        }
+        Mat4::IDENTITY
+    }
+
     fn mounts(&self) -> Vec<(String, Vec3)> {
         let Some(l) = &self.loaded else { return vec![] };
         l.info["wheel_mounts"]
@@ -1407,15 +1436,18 @@ impl ModelView {
                 });
             }
         }
+        let steers: Vec<Mat4> = spots.iter().map(|(bone, _, _)| self.steer_at(bone)).collect();
+        let wheel_spin = self.wheel_spin;
         if let Some(ren) = &self.renderer {
             for (is_disc, g) in self.brakes.iter_mut() {
                 let inst: Vec<render3d::Instance> = spots
                     .iter()
-                    .map(|(bone, p, r)| {
+                    .zip(&steers)
+                    .map(|((bone, p, r), steer)| {
                         let right = bone.strip_prefix("wheel_").map(|s| s.starts_with('r')).unwrap_or(false);
                         let mirror = if right { Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0)) } else { Mat4::IDENTITY };
-                        let spin = if *is_disc { Mat4::from_quat(Quat::from_rotation_x(self.wheel_spin)) } else { Mat4::IDENTITY };
-                        render3d::Instance::new(Mat4::from_translation(*p) * spin * mirror * Mat4::from_scale(Vec3::splat(r / 0.5)), false)
+                        let spin = if *is_disc { Mat4::from_quat(Quat::from_rotation_x(wheel_spin)) } else { Mat4::IDENTITY };
+                        render3d::Instance::new(*steer * Mat4::from_translation(*p) * spin * mirror * Mat4::from_scale(Vec3::splat(r / 0.5)), false)
                     })
                     .collect();
                 ren.set_instances(rs, g, &inst);
@@ -1449,6 +1481,7 @@ impl ModelView {
                 self.clip_pos = vec![self.clip_pos_all; all.len()];
                 self.clips = all;
                 self.hinges = find_hinges(&l.model);
+                self.steer_wheel = find_steering_wheel(&l.model);
                 self.has_lamps = l.model.joints.iter().any(|j| self.lamps.kind(&j.name).is_some());
             }
         }
@@ -1646,7 +1679,8 @@ impl ModelView {
                         self.wheel_scale
                     };
                 render3d::Instance::new(
-                    Mat4::from_translation(*p)
+                    self.steer_at(bone)
+                        * Mat4::from_translation(*p)
                         * spin
                         * mirror
                         * Mat4::from_scale(Vec3::new(sc * width, sc, sc)),
@@ -1711,6 +1745,22 @@ impl ModelView {
         // hinged panels: this frame's rotation per joint
         let open = [self.door_open, self.bonnet_open, self.boot_open];
         let swing: HashMap<usize, Mat4> = self.hinges.iter().filter(|(_, h)| open[h.0 as usize] != 0.0).map(|(i, h)| (*i, Mat4::from_quat(Quat::from_axis_angle(h.1, h.2 * open[h.0 as usize])))).collect();
+        // steering: the wheel_turn bones turn about the vertical, the
+        // steering wheel about its own axis
+        let mut swing = swing;
+        if self.steer != 0.0 {
+            for (i, j) in js.iter().enumerate() {
+                if is_steer_bone(&j.name) {
+                    let (_, r, _) = Mat4::from_cols_array(&j.local).to_scale_rotation_translation();
+                    let turn = Mat4::from_quat(r.inverse() * Quat::from_rotation_y(self.steer) * r);
+                    let m = swing.get(&i).map_or(turn, |m| *m * turn);
+                    swing.insert(i, m);
+                }
+            }
+            if let Some((i, axis)) = self.steer_wheel {
+                swing.insert(i, Mat4::from_quat(Quat::from_axis_angle(axis, self.steer * STEERING_RATIO * self.steer_mult)));
+            }
+        }
         let mut global: Vec<Option<Mat4>> = vec![None; js.len()];
         fn g(
             i: usize,
@@ -2320,6 +2370,15 @@ impl ModelView {
                 }
                 if self.hinges.values().any(|h| h.0 == 1) {
                     ui.add(egui::Slider::new(&mut self.bonnet_open, 0.0..=1.1).text("bonnet open"));
+                }
+                if let Some(l) = self.loaded.as_ref().filter(|l| l.model.joints.iter().any(|j| is_steer_bone(&j.name))) {
+                    let _ = l;
+                    let mut deg = self.steer.to_degrees();
+                    ui.add(egui::Slider::new(&mut deg, -40.0..=40.0).text("steering (degrees)")).on_hover_text(format!(
+                        "Turns the wheel_turn bones (front wheels, a motorcycle's fork) about the vertical and what is fitted to them. The steering wheel turns {STEERING_RATIO:.0} x steerWheelMult ({:.2}) as far. No steering lock was found in the game's data, so the range is fixed; both wheels take the same angle; a fork turns about the vertical, not its own rake.",
+                        self.steer_mult
+                    ));
+                    self.steer = deg.to_radians();
                 }
                 if self.has_lamps {
                     let l = &mut self.lamps;
@@ -3221,6 +3280,47 @@ fn rim_factor(boxes: &[[[f32; 3]; 2]], ratio: f32) -> f32 {
         (Some(&rim), Some(&tyre)) if r.len() >= 2 && ratio > 0.0 && rim > 0.0 && tyre > rim => (ratio * tyre / rim).clamp(0.5, 0.97 * tyre / rim),
         _ => 1.0,
     }
+}
+
+/// Steering wheel turn per unit of road wheel angle, before the vehicle's
+/// steerWheelMult (an estimate: about 1.2 turns each way at 35 degrees on a
+/// car whose steerWheelMult is 0.7).
+const STEERING_RATIO: f32 = 17.0;
+
+/// A bone that steering turns (`wheel_turn_lf`, `wheel_turn_rf`).
+fn is_steer_bone(n: &str) -> bool {
+    n.to_ascii_lowercase().starts_with("wheel_turn_")
+}
+
+/// The steering wheel's joint and the axis it turns about, in joint space:
+/// the direction in which the vertices skinned to it are thinnest (a
+/// steering wheel is a flat ring around its column).
+fn find_steering_wheel(model: &glb::Model) -> Option<(usize, Vec3)> {
+    let ji = model.joints.iter().position(|j| j.name.eq_ignore_ascii_case("steeringwheel"))?;
+    let ibm = Mat4::from_cols_array(&model.joints[ji].ibm);
+    let (mut lo, mut hi, mut n) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN), 0usize);
+    for m in &model.meshes {
+        for v in &m.verts {
+            if (0..4).any(|k| v.joints[k] as usize == ji && v.weights[k] > 127) {
+                let p = ibm.transform_point3(Vec3::from(v.pos));
+                lo = lo.min(p);
+                hi = hi.max(p);
+                n += 1;
+            }
+        }
+    }
+    if n < 8 {
+        return None;
+    }
+    let e = hi - lo;
+    let axis = if e.x <= e.y && e.x <= e.z {
+        Vec3::X
+    } else if e.y <= e.z {
+        Vec3::Y
+    } else {
+        Vec3::Z
+    };
+    Some((ji, axis))
 }
 
 /// Which vehicle lamps are on.
