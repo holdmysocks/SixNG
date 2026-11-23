@@ -94,9 +94,11 @@ pub struct Object {
     /// Sound files: the bytes after the header (hex), when the header decodes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
-    /// Decoded class fields where the layout is known (class 16: three name
-    /// hashes, the slot bit count and mask, a value and the child slots,
-    /// which are all empty (0xff) in the files: filled at run time).
+    /// Decoded class fields where the layout is known. Class 16: three name
+    /// hashes, the slot bit count and mask, a value and the child slots
+    /// (all empty, 0xff, in the files: filled at run time). Class 54: its own
+    /// name hash, a group hash, a count, an f32 weight and two optional
+    /// hashes. Class 56: a count and a hash (its two refs are `children`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fields: Option<serde_json::Value>,
 }
@@ -298,6 +300,22 @@ pub fn parse_with(b: &[u8], streams: Option<&std::collections::HashSet<u32>>) ->
                     _ => &[],
                 };
                 let mut kids: Vec<u32> = Vec::new();
+                if o.class == 54 && body.len() == 23 {
+                    let h = |p: usize| format!("{:08x}", u32at(body, p));
+                    let opt = |p: usize| (u32at(body, p) != 0).then(|| h(p));
+                    o.fields = Some(serde_json::json!({
+                        "name": h(0),
+                        "group": h(4),
+                        "count": body[8],
+                        "weight": f32::from_le_bytes(body[9..13].try_into().unwrap()),
+                        "hash_a": opt(13),
+                        "hash_b": opt(17),
+                        "tail": u16::from_le_bytes([body[21], body[22]]),
+                    }));
+                }
+                if o.class == 56 && body.len() == 14 {
+                    o.fields = Some(serde_json::json!({"count": body[0], "hash": format!("{:08x}", u32at(body, 2))}));
+                }
                 if o.class == 16 && body.len() >= 23 {
                     let c = body.len().checked_sub(1).and_then(|_| (0..=40usize).find(|&c| body.len() >= c + 2 && body[body.len() - c - 1] as usize == c && body[body.len() - c - 2] == 2));
                     if let Some(c) = c {
