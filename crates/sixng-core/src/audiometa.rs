@@ -104,9 +104,10 @@ const NO_HEADER: [u8; 4] = [17, 49, 56, 57];
 fn field_size(i: usize, j: usize) -> Option<usize> {
     Some(match (i, j) {
         (1, 0) => 8,
-        (2, 4) | (2, 5) | (3, 2) | (4, 5) | (5, 3) => 4,
-        (3, 7) | (4, 2) | (4, 7) => 1,
-        (0, 1) | (1, 2..=5) | (2, 0..=3) | (2, 6) | (2, 7) | (3, 0) | (3, 1) | (3, 3) | (3, 5) | (4, 1) => 2,
+        (1, 1) | (2, 4) | (2, 5) | (3, 2) | (4, 0) | (4, 5) | (5, 1..=4) | (5, 6) | (5, 7) | (6, 0..=3) | (6, 5) | (7, 1) | (7, 4..=6) => 4,
+        (0, 1) | (0, 3) => 3,
+        (3, 7) | (4, 2) | (4, 6) | (4, 7) | (5, 0) => 1,
+        (1, 2..=6) | (2, 0..=3) | (2, 6) | (2, 7) | (3, 0) | (3, 1) | (3, 3..=6) | (4, 1) => 2,
         _ => return None,
     })
 }
@@ -265,19 +266,30 @@ pub fn parse_with(b: &[u8], streams: Option<&std::collections::HashSet<u32>>) ->
             if let Some(e) = body_at {
                 let body = &d[e..];
                 let at = |p: usize| (p + 4 <= body.len()).then(|| u32at(body, p));
+                // Child refs at fixed body offsets, checked on the 242k-object
+                // main sound file: >= 96% valid indices, and nearer the parent
+                // in data order than chance.
                 let fixed: &[usize] = match o.class {
                     1 => &[6],
                     2 => &[56],
+                    3 => &[29, 33],
                     5 => &[0, 4, 8],
-                    16 => &[15],
-                    20 | 27 => &[0],
-                    28 => &[0, 4],
-                    30 => &[0, 25],
-                    48 => &[0, 8],
+                    9 => &[20],
+                    10 | 28 => &[0, 4],
+                    19 => &[33],
+                    20 | 27 | 29 | 30 | 31 | 36 | 40 | 48 => &[0],
+                    41 => &[0, 6, 12],
+                    46 => &[9],
                     _ => &[],
                 };
                 let mut kids: Vec<u32> = Vec::new();
-                if o.class == 15 {
+                if o.class == 24 {
+                    // a count byte, then that many refs, at the end of the body
+                    if let Some(n) = (1..=64usize).find(|&n| body.len() > 4 * n && body[body.len() - 4 * n - 1] as usize == n) {
+                        let s = body.len() - 4 * n;
+                        kids = (0..n).filter_map(|i| at(s + 4 * i)).collect();
+                    }
+                } else if o.class == 15 {
                     let mut p = 7 + *body.get(6).unwrap_or(&0) as usize;
                     let n = body.get(p).copied().unwrap_or(0) as usize;
                     p += 1;
@@ -403,18 +415,30 @@ pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], ban
     std::fs::create_dir_all(&dir)?;
     let (mut ok, mut bad) = (0, 0);
     let mut lines = String::new();
+    let mut by_off: Vec<&crate::scan::Entry> = entries.to_vec();
+    by_off.sort_by_key(|e| e.off);
     for e in entries {
         let Ok(b) = crate::scan::read_entry(&a.path, e) else { continue };
         if !is_audio_meta(&b) {
             continue;
         }
-        match parse_with(&b, (!known.is_empty()).then_some(&known)) {
+        let mut parsed = parse_with(&b, (!known.is_empty()).then_some(&known));
+        let mut stitched = None;
+        if parsed.is_err() {
+            if let Some((full, info)) = stitch(&a.path, e, &b, &by_off) {
+                if let Ok(m) = parse_with(&full, (!known.is_empty()).then_some(&known)) {
+                    parsed = Ok(m);
+                    stitched = Some(info);
+                }
+            }
+        }
+        match parsed {
             Ok(mut m) => {
                 let linked = if m.schema == SCHEMA_SOUNDS && !banks.is_empty() { Some(link(&mut m, banks)) } else { None };
                 ok += 1;
                 let file = format!("{:x}.json", e.off);
-                std::fs::write(dir.join(&file), serde_json::to_vec_pretty(&serde_json::json!({"id": e.id, "meta": m}))?)?;
-                lines += &serde_json::json!({"id": e.id, "file": file, "schema": m.schema, "objects": m.objects.len(), "table_counts": m.table_counts, "classes": m.classes, "waves_linked": linked.map(|l| serde_json::json!({"in_bank": l.0, "waves": l.1}))}).to_string();
+                std::fs::write(dir.join(&file), serde_json::to_vec_pretty(&serde_json::json!({"id": e.id, "meta": m, "stitched": stitched}))?)?;
+                lines += &serde_json::json!({"id": e.id, "file": file, "schema": m.schema, "objects": m.objects.len(), "table_counts": m.table_counts, "classes": m.classes, "waves_linked": linked.map(|l| serde_json::json!({"in_bank": l.0, "waves": l.1})), "stitched": stitched}).to_string();
             }
             Err(x) => {
                 bad += 1;
@@ -425,6 +449,30 @@ pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], ban
     }
     std::fs::write(dir.join("index.jsonl"), lines)?;
     Ok((ok, bad))
+}
+
+/// A large file can be indexed as two entries with stored (not zlib) 64 KiB
+/// chunks between them, which the stream scan does not read. When `b` is cut
+/// short, joins it with the next entry, the skipped chunks filled with zeros,
+/// but only when the skipped bytes lie past the object data (in the hash
+/// tables, of which only the lengths are read), so every object is intact.
+fn stitch(path: &std::path::Path, e: &crate::scan::Entry, b: &[u8], by_off: &[&crate::scan::Entry]) -> Option<(Vec<u8>, serde_json::Value)> {
+    let last = e.streams.last()?;
+    let end = (last[0] + last[1] + 15) & !15;
+    let next = by_off.iter().find(|x| x.off >= end)?;
+    let gap = next.off - end;
+    if gap % 0x10000 != 0 || gap > 16 * 0x10000 || b.len() < 8 {
+        return None;
+    }
+    let data_end = 8 + u32::from_le_bytes(b[4..8].try_into().ok()?) as u64;
+    if (b.len() as u64) < data_end {
+        return None;
+    }
+    let tail = crate::scan::read_entry(path, next).ok()?;
+    let mut full = b.to_vec();
+    full.resize(b.len() + gap as usize, 0);
+    full.extend_from_slice(&tail);
+    Some((full, serde_json::json!({"next": next.id, "unread_bytes": gap, "unread_at": format!("{:#x}", b.len())})))
 }
 
 #[cfg(test)]
