@@ -95,6 +95,9 @@ pub struct Automation {
     pub ui_shot: Option<PathBuf>,
     /// Model to open once the first one is shown (`--then`, tests switching).
     pub then: Option<String>,
+    /// `--find-hair`: fit grooms to the model and show the run with the
+    /// most strands (tests "Find grooms on this model").
+    pub find_hair: bool,
 }
 
 /// Shared-wheel scale per unit of the car's wheelScale: fitted by eye on
@@ -198,6 +201,10 @@ pub struct Hair {
     pub density: f32,
     /// What the last coat build drew (strands drawn / stored).
     coat_note: Arc<Mutex<String>>,
+    /// Grooms found on the loaded model's skin ("Find grooms on this model").
+    fits: Option<Result<Vec<sixng_core::furlink::OnSkin>, String>>,
+    fits_pending: Arc<Mutex<Option<Result<Vec<sixng_core::furlink::OnSkin>, String>>>>,
+    fitting: bool,
     skin: SkinColours,
 }
 
@@ -225,6 +232,9 @@ impl Default for Hair {
             full_coat: true,
             density: 1.0,
             coat_note: Arc::new(Mutex::new(String::new())),
+            fits: None,
+            fits_pending: Arc::new(Mutex::new(None)),
+            fitting: false,
             skin: Default::default(),
         }
     }
@@ -383,8 +393,12 @@ impl ModelView {
                     let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
                     self.hair.gpu = models.iter().map(|m| ren.upload(rs, m, &[])).collect();
                     self.hair.status = format!("{} groom(s) shown", models.len());
+                    if std::env::var_os("SIXNG_DEBUG_FUR").is_some() {
+                        eprintln!("[hair] {} groom(s), {} triangles, selected {:x?}", models.len(), models.iter().map(|m| m.triangles).sum::<usize>(), self.hair.selected);
+                    }
                 }
                 Err(e) => {
+                    eprintln!("[hair] {e}");
                     self.hair.gpu.clear();
                     self.hair.status = e;
                 }
@@ -401,6 +415,9 @@ impl ModelView {
             return;
         }
         self.hair.loading = true;
+        if std::env::var_os("SIXNG_DEBUG_FUR").is_some() {
+            eprintln!("[hair] loading {} groom(s)", self.hair.selected.len());
+        }
         let ws = Workspace::new(&self.game, &self.work);
         let idx = self.indexes.clone();
         let slot = self.hair.pending.clone();
@@ -470,11 +487,123 @@ impl ModelView {
         });
     }
 
+    /// "Find grooms on this model": for people, whose hair has no decoded
+    /// link. Lists the groom pieces whose roots lie on the loaded mesh, in
+    /// archive order with a gap between runs (the pieces of one style are
+    /// neighbours), to tick on and off.
+    fn hair_fit_ui(&mut self, ui: &mut egui::Ui) {
+        if let Some(r) = self.hair.fits_pending.lock().unwrap().take() {
+            self.hair.fitting = false;
+            self.hair.fits = Some(r);
+        }
+        if self.hair.fur.is_some() || self.loaded.is_none() {
+            return;
+        }
+        // automation: start the fit, then show the run with the most strands
+        let auto_start = self.auto.find_hair && !self.hair.fitting && self.hair.fits.is_none();
+        if let (true, Some(Ok(list))) = (self.auto.find_hair, &self.hair.fits) {
+            let mut runs: Vec<Vec<&sixng_core::furlink::OnSkin>> = Vec::new();
+            for g in list {
+                match runs.last_mut() {
+                    Some(r) if r.last().is_some_and(|p| g.piece == p.piece + 1) => r.push(g),
+                    _ => runs.push(vec![g]),
+                }
+            }
+            if let Some(r) = runs.iter().filter(|r| r.len() <= 8).max_by_key(|r| r.iter().map(|g| g.strands).sum::<u32>()) {
+                self.hair.selected = r.iter().map(|g| g.off).collect();
+                // let the screenshot wait for these grooms
+                self.frames_since_load = 0;
+                if std::env::var_os("SIXNG_DEBUG_FUR").is_some() {
+                    eprintln!("[hair] picked run #{} with {} piece(s)", r[0].piece, r.len());
+                }
+            }
+            self.auto.find_hair = false;
+        } else if matches!(self.hair.fits, Some(Err(_))) {
+            self.auto.find_hair = false;
+        }
+        if self.hair.fitting {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("fitting grooms to the model …");
+            });
+        } else if ui.button("Find grooms on this model").on_hover_text("Lists the grooms whose strand roots lie on this mesh (a head, or a whole character). Hair made for this head shape fits; which style a character wears is not decoded.").clicked() || auto_start {
+            let pts: Vec<[f32; 3]> = self
+                .loaded
+                .as_ref()
+                .map(|l| {
+                    let p: Vec<[f32; 3]> = l.model.meshes.iter().flat_map(|me| sixng_core::furlink::skin_points(&me.verts.iter().map(|v| [v.pos[0], -v.pos[2], v.pos[1]]).collect::<Vec<_>>(), &me.indices)).collect();
+                    let step = (p.len() / 60_000).max(1);
+                    p.into_iter().step_by(step).collect()
+                })
+                .unwrap_or_default();
+            self.hair.fitting = true;
+            let (ws, idx, slot, work, ctx) = (Workspace::new(&self.game, &self.work), self.indexes.clone(), self.hair.fits_pending.clone(), PathBuf::from(&self.work), ui.ctx().clone());
+            std::thread::spawn(move || {
+                let r = index_for(&ws, "packs", &idx).and_then(|(a, ix)| sixng_core::furlink::on_skin(&work, &a, &ix.entries, &pts)).map_err(|e| format!("{e:#}"));
+                *slot.lock().unwrap() = Some(r);
+                ctx.request_repaint();
+            });
+        }
+        match &self.hair.fits {
+            Some(Err(e)) => {
+                ui.label(egui::RichText::new(e).weak());
+            }
+            Some(Ok(list)) if list.is_empty() => {
+                ui.label(egui::RichText::new("No groom lies on this mesh.").weak());
+            }
+            Some(Ok(list)) => {
+                // runs of neighbouring pieces: one row each
+                let mut runs: Vec<Vec<sixng_core::furlink::OnSkin>> = Vec::new();
+                for g in list {
+                    match runs.last_mut() {
+                        Some(r) if r.last().is_some_and(|p| g.piece == p.piece + 1) => r.push(g.clone()),
+                        _ => runs.push(vec![g.clone()]),
+                    }
+                }
+                ui.label(egui::RichText::new(format!("{} groom pieces in {} runs lie on this mesh. The pieces of one style are neighbours, but styles made for the same head follow each other without a marker: a short run is one style, a long run is many (open it and tick pieces).", list.len(), runs.len())).weak().small());
+                egui::ScrollArea::vertical().id_salt("hair_fits").max_height(260.0).show(ui, |ui| {
+                    for r in &runs {
+                        let offs: Vec<u64> = r.iter().map(|g| g.off).collect();
+                        let n_on = offs.iter().filter(|o| self.hair.selected.contains(o)).count();
+                        let strands: u32 = r.iter().map(|g| g.strands).sum();
+                        let longest = r.iter().map(|g| g.length_mm).fold(0.0, f32::max);
+                        let label = format!("#{}{} · {} piece(s) · {} strands · up to {:.0} mm", r[0].piece, if r.len() > 1 { format!("-{}", r[r.len() - 1].piece) } else { String::new() }, r.len(), strands, longest);
+                        if r.len() <= 8 {
+                            let mut on = n_on == offs.len();
+                            if ui.checkbox(&mut on, label).on_hover_text(format!("packs.rpf@{:x} onwards", r[0].off)).changed() {
+                                self.hair.selected.retain(|x| !offs.contains(x));
+                                if on {
+                                    self.hair.selected.extend(offs);
+                                }
+                            }
+                        } else {
+                            // many styles in a row: tick pieces one by one
+                            egui::CollapsingHeader::new(format!("{label}{}", if n_on > 0 { format!(" · {n_on} shown") } else { String::new() })).id_salt(("hair_run", r[0].piece)).show(ui, |ui| {
+                                for g in r {
+                                    let mut on = self.hair.selected.contains(&g.off);
+                                    if ui.checkbox(&mut on, format!("#{} · {} strands · {:.0} mm", g.piece, g.strands, g.length_mm)).on_hover_text(format!("packs.rpf@{:x}", g.off)).changed() {
+                                        if on {
+                                            self.hair.selected.push(g.off);
+                                        } else {
+                                            self.hair.selected.retain(|x| *x != g.off);
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
+                });
+            }
+            None => {}
+        }
+    }
+
     /// Hair and fur panel: browse the grooms by region and bone, add them
     /// to the view, set width and colour.
     fn hair_ui(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Hair and fur (grooms)").default_open(!self.hair.selected.is_empty()).show(ui, |ui| {
+        egui::CollapsingHeader::new("Hair and fur (grooms)").default_open(!self.hair.selected.is_empty() || self.auto.find_hair).show(ui, |ui| {
             ui.label(egui::RichText::new("Strand grooms from packs.rpf. Animals get their fur automatically (worked out from the order of the files and a fit to the skin, not from a stored link); for characters pick grooms here. Shown as ribbons; width and colour are display choices.").weak());
+            self.hair_fit_ui(ui);
             if let Some(l) = self.hair.fur.clone() {
                 let mut changed = false;
                 for (k, slot) in ["body", "head"].iter().enumerate() {
@@ -582,7 +711,7 @@ impl ModelView {
 
     /// Car extras settled: vehicle data applied and the fitted wheels loaded.
     fn idle_for_shot(&self) -> bool {
-        if !self.hair.settled() || self.auto.then.is_some() {
+        if !self.hair.settled() || self.auto.then.is_some() || self.auto.find_hair || self.hair.fitting {
             return false;
         }
         let Some(l) = self
@@ -1548,7 +1677,7 @@ impl ModelView {
         if let Some(path) = self.auto.screenshot.clone() {
             self.auto.frames += 1;
             let ready = (self.gpu.is_some() && self.frames_since_load >= 3 && settled)
-                || (!self.loading && self.auto.frames > 600);
+                || (!self.loading && !self.hair.fitting && !self.auto.find_hair && self.hair.settled() && self.auto.frames > 600);
             if ready {
                 if let Some((w, h, px)) = ren.read_back(rs) {
                     match render3d::save_png(&path, w, h, &px) {
@@ -1756,7 +1885,7 @@ impl ModelView {
         ui.separator();
         // Grooms go on characters: rigged models that are not vehicles (or
         // nothing loaded), and wherever some are already picked.
-        if (caps.joints && !caps.mounts) || self.loaded.is_none() || !self.hair.selected.is_empty() {
+        if (caps.joints && !caps.mounts) || self.loaded.is_none() || !self.hair.selected.is_empty() || self.auto.find_hair {
             // on the panel itself, not inside the collapsed section
             if !self.hair.selected.is_empty() {
                 let label = if self.hair.fur.is_some() { "fur guide strands" } else { "hair guide strands" };

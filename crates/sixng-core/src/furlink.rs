@@ -349,6 +349,63 @@ fn assets_of(roots: &[String], all: &[crate::scan::Entry], skins: &crate::partsk
         .collect()
 }
 
+/// A groom piece whose strand roots lie on a skin.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OnSkin {
+    /// Densest groom of the piece (archive offset).
+    pub off: u64,
+    /// Position of the piece among all pieces (archive order): pieces of
+    /// one hair or fur asset are neighbours.
+    pub piece: usize,
+    pub strands: u32,
+    /// Median distance of the roots from the skin, millimetres.
+    pub dist_mm: f32,
+    /// Mean strand length, millimetres.
+    pub length_mm: f32,
+}
+
+/// The groom pieces whose roots lie on `pts` (skin points in RAGE model
+/// space, see `skin_points`): median root distance under `FIT`. For
+/// people no link from a hair model to its grooms is decoded (their hair
+/// assets are in the piece table, but nothing readable names the
+/// placeholder), so this is how hair is found for a head: every style
+/// made for that head shape fits it, and the pieces of one style are
+/// neighbours in the list.
+pub fn on_skin(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], pts: &[[f32; 3]]) -> Result<Vec<OnSkin>> {
+    if pts.is_empty() {
+        return Err(anyhow!("no mesh to fit grooms to"));
+    }
+    let cat = crate::groom::catalog_cached(work, a, all)?;
+    let pcs = pieces(&cat);
+    let by_off: HashMap<u64, &crate::scan::Entry> = all.iter().map(|e| (e.off, e)).collect();
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for p in pts {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    let m = 0.04;
+    let mut out: Vec<OnSkin> = pcs
+        .par_iter()
+        .enumerate()
+        .filter_map(|(i, p)| {
+            if !(0..3).all(|k| p.root_box[0][k] >= lo[k] - m && p.root_box[1][k] <= hi[k] + m) {
+                return None;
+            }
+            let g = crate::groom::parse(&Resource::load(&a.path, by_off.get(&p.lods[0])?).ok()?).ok()?;
+            let k = g.points_per_strand.max(1);
+            let step = (g.strands / 40).max(1);
+            let roots: Vec<[f32; 3]> = (0..g.strands).step_by(step).filter_map(|s| g.points.get(s * k).copied()).collect();
+            let d = median_dist(&roots, pts);
+            let len = if g.lengths.is_empty() { 0.0 } else { g.lengths.iter().sum::<f32>() / g.lengths.len() as f32 };
+            (d < FIT).then_some(OnSkin { off: p.lods[0], piece: i, strands: p.strands, dist_mm: d * 1000.0, length_mm: len * 1000.0 })
+        })
+        .collect();
+    out.sort_by_key(|x| x.piece);
+    Ok(out)
+}
+
 /// Root of a fur placeholder name.
 fn fur_root(name: &str) -> Option<&str> {
     name.split_once("_fur_").map(|x| x.0)
