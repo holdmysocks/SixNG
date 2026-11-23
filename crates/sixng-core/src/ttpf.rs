@@ -132,7 +132,7 @@ fn fix_mip_counts(textures: &mut [TtpfTex], end: Option<u64>) {
     }
     for (i, gap, at_end) in spans {
         let t = &textures[i];
-        if gap == t.size || t.tile_mode() > 3 {
+        if t.dimension() == 3 || gap == t.size || t.tile_mode() > 3 {
             continue;
         }
         let fmt = crate::texture::Fmt::from_dxgi(t.dxgi_format);
@@ -397,18 +397,19 @@ impl TtpfSet {
 }
 
 impl TtpfTex {
-    /// Mip count: d0 bits 28-31 + 1 (UI textures have 1-2, a 1024 map
-    /// texture 7, i.e. down to 16 px). On cube maps (tile modes 9-12) the
-    /// field is the count itself: "2" cubes store one mip per face.
+    /// Mip count: packed mips (d0 bits 28-31) plus the low 3 descriptor bits
+    /// (`d1 & 7`). For 2D/array/volume descriptors those bits are the non-tail
+    /// mip count. On cube maps (tile modes 9-12) they also count the extra
+    /// full-resolution copies, but the face's mip chain still includes them:
+    /// graphics #177 is a 64x64 BC7 cube with packed 6 plus 1, seven face mips
+    /// down to 1x1, and the 1x1 mip averages the 2x2 parent on every face.
+    /// Example: `d0 >> 28 == 1`, `d1 & 7 == 0` is one mip, not two; treating
+    /// it as two moves mip 0 into the shared tail tile and reads zeros.
     pub fn mips(&self) -> u32 {
         if let Some(m) = self.mips_fixed {
             return m;
         }
-        if (9..=12).contains(&self.tile_mode()) {
-            (self.d0 >> 28).max(1)
-        } else {
-            (self.d0 >> 28) + 1
-        }
+        ((self.d0 >> 28) + (self.d1 & 7)).max(1)
     }
     /// A `TexInfo` describing this texture, with `data_off` = 0 relative to
     /// the bytes returned by `Ttpf::data`.
@@ -469,6 +470,20 @@ impl TtpfTex {
             _ => None,
         }
     }
+    /// Descriptor dimension: 1 = 2D/2D array, 2 = cube, 3 = 3D volume.
+    pub fn dimension(&self) -> u32 {
+        (self.d1 >> 21) & 3
+    }
+    /// Raw 9-bit descriptor mode (`d1 >> 23`); bit 0 is a flag and the rest
+    /// select the tiling/tile mode.
+    pub fn raw_mode(&self) -> u32 {
+        self.d1 >> 23
+    }
+    /// A 3D volume in the supported subset: dimension 3, mode 2, one mip,
+    /// uncompressed. Other dimension-3 descriptors are rejected by `layout`.
+    pub fn is_volume(&self) -> bool {
+        self.dimension() == 3 && self.raw_mode() == 2
+    }
     /// Mip-chain layout (`None` for unsupported tile modes or element sizes:
     /// 1-, 2-, 4-, 8- and 16-byte elements are mapped).
     /// Array size (d1 bits 10-19, plus 1). 1 for almost all textures; 6 on
@@ -482,6 +497,14 @@ impl TtpfTex {
             return None;
         }
         let bd = fmt.block_dim();
+        if self.dimension() == 3 {
+            // 3D volumes: only raw mode 2, one mip, uncompressed is measured.
+            // Reject anything else instead of falling through to a 2D layout.
+            if self.raw_mode() != 2 || bd != 1 || self.mips() != 1 {
+                return None;
+            }
+            return crate::gfx10::Layout::new_volume(crate::gfx10::Swizzle::S4K, self.width, self.height, self.slices(), fmt.bytes_per_elem());
+        }
         let l = crate::gfx10::Layout::new(self.swizzle()?, self.width.div_ceil(bd), self.height.div_ceil(bd), self.mips(), fmt.bytes_per_elem())?;
         match self.tile_mode() {
             9..=12 => l.with_cube_copies(self.slices(), self.tile_mode() - 8, self.cube_base),
@@ -600,14 +623,80 @@ mod tests {
 
     #[test]
     fn mip_count_from_store_spacing() {
-        // 1024x1024 BC1, tile mode 1, mip field 0 (descriptor says 1 mip),
-        // followed by the next texture 688128 bytes later = 3 mips.
+        // 1024x1024 BC1, tile mode 1, packed field 0 plus non-tail bits 3:
+        // the descriptor already describes 3 mips. The spacing agrees and
+        // fix_mip_counts must not change it.
         let mut v = vec![tex(0x00ffc3ff, 0x0120023b, 0x1000), tex(0x00ffc3ff, 0x0120023b, 0x1000 + 688128)];
-        assert_eq!(v[0].mips(), 1);
+        assert_eq!((v[0].mips(), v[0].size), (3, 688128));
         fix_mip_counts(&mut v, None);
         assert_eq!((v[0].mips(), v[0].size), (3, 688128));
         // the last texture has no neighbour and keeps the descriptor count
         assert_eq!(v[1].mips_fixed, None);
+    }
+
+    #[test]
+    fn cube_mips_include_the_non_tail_count() {
+        // graphics #177: 64x64 BC7 cube, packed 6 + non_tail 1.
+        // The seventh face mip is 1x1 and averages the 2x2 face mip.
+        let t = tex(1611644991, 171972369, 0x1000);
+        assert_eq!(t.mips(), 7);
+        let l = t.layout().expect("64x64 BC7 cube layout");
+        assert_eq!(l.mips.len(), 7);
+        assert_eq!((l.mips[6].w, l.mips[6].h), (1, 1));
+    }
+
+    #[test]
+    fn volume_is_detected_and_laid_out_as_a_volume() {
+        // graphics #200: 32x64x32 R16G16B16A16_FLOAT, mode 2, packed mip 1.
+        let t = tex(269467679, 23100496, 0x1000);
+        assert!(t.is_volume());
+        assert_eq!((t.dimension(), t.raw_mode(), t.mips()), (3, 2, 1));
+        let l = t.layout().expect("volume layout");
+        assert_eq!(l.total, 524288);
+        assert_eq!(l.slices, 32);
+        assert_eq!(l.mip_span(0), (0, 524288));
+        let v = l.volume.expect("volume info");
+        assert_eq!((v.bw, v.bh, v.bd), (8, 8, 8));
+        assert_eq!(v.z_tile_stride, 131072);
+        // Z is interleaved: the second slice starts inside the first tile,
+        // not a whole 32x64 plane later.
+        assert_eq!(l.addr(0, 1, 0, 0), 16);
+    }
+
+    #[test]
+    fn volume_rejects_unmeasured_modes_mips_and_block_formats() {
+        let d0 = 269467679;
+        let d1 = 23100496;
+        // Mode 4 is still dimension 3, but it is not the measured layout and
+        // must not silently use a 2D one.
+        let mode4 = tex(d0, (d1 & !(0x1FF << 23)) | (4 << 23), 0x1000);
+        assert_eq!(mode4.dimension(), 3);
+        assert!(mode4.layout().is_none());
+        // More than one mip: the volume layout has a single interleaved level.
+        let two = tex((d0 & 0x0FFF_FFFF) | (2 << 28), d1, 0x1000);
+        assert_eq!(two.mips(), 2);
+        assert!(two.layout().is_none());
+        // Block-compressed data does not use the uncompressed volume tiles.
+        let bc = tex(d0, (d1 & !(0x7F << 3)) | (98 << 3), 0x1000);
+        assert_eq!(bc.dimension(), 3);
+        assert!(bc.layout().is_none());
+        assert!(!bc.decodable());
+    }
+
+    #[test]
+    fn mip_count_does_not_add_one_for_zero_non_tail_bits() {
+        // graphics #151: 16x8 R8G8B8A8_UNORM, packed field 1, d1 & 7 == 0.
+        // It has one mip. Adding one puts mip 0 in the shared tail origin and
+        // decodes 512 zero bytes; the descriptor's first mip is at offset 0.
+        let t = tex(268550159, 18874592, 0x1000);
+        assert_eq!(t.mips(), 1);
+        assert_eq!(t.size, 4096);
+        let l = t.layout().expect("16x8 RGBA8 layout");
+        assert_eq!(l.mips.len(), 1);
+        assert_eq!(l.total, 4096);
+        assert_eq!(l.mips[0].offset, 0);
+        // A non-zero non-tail count still adds to the packed field.
+        assert_eq!(tex(0x00ffc3ff, 0x0120023b, 0x1000).mips(), 3);
     }
 
     #[test]
