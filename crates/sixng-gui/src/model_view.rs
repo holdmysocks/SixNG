@@ -54,7 +54,7 @@ impl Caps {
         let m = &l.model;
         let names: Vec<String> = m.joints.iter().map(|j| j.name.to_lowercase()).collect();
         Caps {
-            paint: m.materials.iter().any(|x| x.class == "car_paint"),
+            paint: m.materials.iter().any(|x| x.class == "car_paint" || x.parts),
             wheels: names.iter().any(|n| n.starts_with("wheel_") && !n.contains("dummy")),
             doors: names.iter().any(|n| matches!(n.as_str(), "door_dside_f" | "door_dside_r" | "door_pside_f" | "door_pside_r")),
             roof: names.iter().any(|n| n == "convertible_roof"),
@@ -3339,6 +3339,9 @@ fn export_load(
             ["99ad6fc9", "389206d1", "03b27476", "5a693bbe", "29648098"].iter().any(|h| j.contains(h)) && !j.contains("\"stand_in\"")
                 // and from before interior and trim stopped taking the body colour
                 || j.contains("\"car_paint\"") && !j.contains("\"paint_rule\"")
+                // and from before the part colours were decoded (materials that
+                // bind the vehicle material palette)
+                || j.contains("\"19df25d7\"") && !j.contains(&format!("\"part_colours_version\": {}", sixng_core::vehcolour::EXPORT_VERSION)) && !j.contains(&format!("\"part_colours_version\":{}", sixng_core::vehcolour::EXPORT_VERSION))
                 // and from before wiper masks, water stencils and runtime screen overlays were left out
                 || (j.contains("bd71bdbf") || j.contains("fc34f08b") || j.contains("a800afccf01aa36b")) && !j.contains("\"hidden\"")
                 // and from before rims stopped taking their placeholder tint palette

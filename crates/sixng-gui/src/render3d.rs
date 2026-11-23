@@ -1293,6 +1293,7 @@ impl Uploader {
             emissive: None,
             mr: None,
             tint_mask: false,
+            parts: false,
             slots: vec![],
             gap: "ok".into(),
             shader_hash: String::new(),
@@ -1336,7 +1337,7 @@ impl Uploader {
             let mr = mt.mr.map_or(0, |[m, r]| {
                 let q = |x: f32| (x.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
                 0x100 | (q(m) << 16) | (q(r) << 24)
-            }) | if mt.tint_mask { 0x200 } else { 0 };
+            }) | if mt.tint_mask { 0x200 } else { 0 } | if mt.parts { 0x400 } else { 0 };
             let u = MatU {
                 base,
                 flags: [has, class_id(&mt.class), alpha, gap | mr],

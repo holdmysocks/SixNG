@@ -63,6 +63,9 @@ pub struct Material {
     /// The base texture is a tint mask (animal coats): its green channel
     /// (shading) is shown as grey.
     pub tint_mask: bool,
+    /// Vehicle parts coloured per vertex (COLOR_0; alpha 254 = the primary
+    /// body paint, 0-100 = roughness x 100, 101-201 = the same on metal).
+    pub parts: bool,
     pub slots: Vec<Slot>,
     /// worst slot status: ok / lowmip / flat
     pub gap: String,
@@ -729,6 +732,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             emissive,
             mr,
             tint_mask: ex["classification"]["tint_mask"] == true,
+            parts: ex["classification"]["stand_in"] == "parts",
             slots,
             gap: gap.into(),
             shader_hash: ex["shader_name_hash"].as_str().unwrap_or("").into(),

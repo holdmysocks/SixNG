@@ -217,6 +217,8 @@ pub fn gltf_fields(c: &Value, has_base: bool) -> Value {
         Some("trim") => Some((0.0, 0.6, [0.11, 0.11, 0.115, 1.0])),
         // wheel rims: colour set at runtime; a plain alloy
         Some("rim") => Some((1.0, 0.35, [0.6, 0.6, 0.62, 1.0])),
+        // vehicle parts coloured per vertex (COLOR_0): a white base
+        Some("parts") => Some((0.0, 0.5, [1.0, 1.0, 1.0, 1.0])),
         // weapons: dark blued steel for every part (wood and polymer
         // furniture included, their colours are not decoded)
         Some("gunmetal") => Some((0.7, 0.45, [0.05, 0.05, 0.055, 1.0])),

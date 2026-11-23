@@ -184,7 +184,16 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     var emissive = vec3(0.0);
     var pearl = vec3(0.0);
     // classes: 1 opaque 2 alpha 3 cutout 4 decal 5 glass 6 window 7 emissive 8 water 9 terrain 10 car_paint
-    if (cls == 10u) {
+    // vehicle parts coloured per vertex: tint alpha 254 marks the primary
+    // body paint, 0-100 is the part's roughness x 100, 101-201 the same on metal
+    var painted = cls == 10u;
+    if ((M.flags.w & 1024u) != 0u) {
+        let ta = i.tint.a * 255.0;
+        if (ta > 253.5 && ta < 254.5) { painted = true; }
+        else if (ta < 100.5) { rough = clamp(ta / 100.0, 0.04, 1.0); metal = 0.0; }
+        else if (ta < 201.5) { rough = clamp((ta - 101.0) / 100.0, 0.04, 1.0); metal = 1.0; }
+    }
+    if (painted) {
         albedo = F.paint1.rgb;
         if ((has & 16u) != 0u) { albedo = F.misc2.yzw; }
         if (F.mode.z == 0u) { metal = 0.6; rough = 0.28; }

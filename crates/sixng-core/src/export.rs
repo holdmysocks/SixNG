@@ -366,6 +366,12 @@ struct ShaderTextures {
     tint_palette: Option<Vec<[u8; 4]>>,
     /// Ped clothing colour baked from the shade map (`bake_ped_tint`).
     ped_tint: Option<serde_json::Value>,
+    /// The vehicle material palette (128 x 256 sRGB RGBA8), when this
+    /// shader binds it and it decoded.
+    vehicle_palette: Option<Vec<[u8; 4]>>,
+    /// The meshes of this shader are coloured per part id from the vehicle's
+    /// part set (`vehcolour`). Set once the meshes are decoded.
+    vehicle_parts: Option<String>,
     /// Vehicles: most of the bones this shader's meshes hang on are
     /// interior, lamp or mechanical bones (`NOT_BODY_BONES`), so it is not
     /// body paint. Set once the meshes are decoded.
@@ -462,7 +468,15 @@ fn classify_shader(s: &crate::drawable::Shader, st: &ShaderTextures) -> serde_js
     // seats, the steering wheel and lamp housings hang on their own. Only
     // untextured materials on body bones are taken as body paint; the rest
     // gets a neutral stand-in.
-    if c["class"] == "car_paint" {
+    if let Some(set) = &st.vehicle_parts {
+        if c["class"] == "car_paint" || c["stand_in"] == "trim" {
+            c["class"] = "opaque".into();
+            c["stand_in"] = "parts".into();
+            c["family"] = "vehicle body, interior and mechanical parts (two-layer shader), coloured per part id".into();
+            c["part_set"] = set.clone().into();
+            c["parts_note"] = "GLB COLOR_0 holds each vertex's colour (linear): the vehicle's part set names a colour record per part id (vertex colour alpha, kept in _COLOR0); fixed materials take the middle of their row of the material palette, paints the record's own colour. COLOR_0 alpha 254 marks the primary body paint (the stored default is a dark grey; a configuration's body colour replaces it), 0-100 is the surface's mean roughness x 100 and 101-201 the same + 101 on parts taken as bare metal (an inference: a bright neutral palette row on a smooth surface). Not decoded: the column of the palette row, per-configuration colour and trim choices, the second layer, metalness".into();
+        }
+    } else if c["class"] == "car_paint" {
         let textured = st.entries.iter().any(|e| LAYER_DETAIL.iter().any(|h| e["param_hash"] == *h) && e["status"].as_str().is_some_and(|x| x.starts_with("ok")));
         c["paint_rule"] = "body paint only where neither layer has a detail texture (lyr0diffusetex, lyr1diffusetex) and the meshes hang on body bones; an inference, the per-part colours are not decoded".into();
         if textured || st.not_body {
@@ -664,6 +678,9 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                             e["mip_used"] = stt.mip.into();
                         }
                         e["mean_rgba"] = serde_json::json!(stt.mean_rgba.map(|x| x.round()));
+                        if t.param_hash == VEHICLE_PALETTE && tx.width == 128 && tx.height == 256 && stt.mip == 0 {
+                            st.vehicle_palette = image::open(&p).ok().map(|i| i.to_rgba8().pixels().map(|p| p.0).collect());
+                        }
                         if stt.normal_like {
                             e["looks_like_normal_map"] = true.into();
                         }
@@ -1082,6 +1099,11 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                         "brake_radius": brake.map(|d| d.radius), "brake_centre": brake.map(|d| d.centre)})
                 }).collect::<Vec<_>>(),
                 "wheel_mounts_version": 3,
+                "part_colours_version": crate::vehcolour::EXPORT_VERSION,
+                "part_colours": shader_tex.iter().any(|st| st.vehicle_palette.is_some()).then(|| match shader_tex.iter().find_map(|st| st.vehicle_parts.as_ref()) {
+                    Some(set) => serde_json::json!({"status": "applied", "part_set": set, "note": "each vertex of the two-layer vehicle materials takes the colour of its part id (GLB COLOR_0; see the materials' classification.parts_note)"}),
+                    None => serde_json::json!({"status": "no part set found for this model: the two-layer materials keep their stand-in colours"}),
+                }),
                 "roof_animation": roof_info,
                 "wheel_discs": wheel_discs,
                 "wheel_discs_note": "Disc bounds of the fragment's physics (type 8 children of its composite bound): centre, radius and half width in metres. The largest disc on a wheel bone's axle line is the wheel (its centre, radius and half_width are repeated in wheel_mounts); a thinner one is the brake disc.",
@@ -1179,6 +1201,10 @@ pub(crate) struct BuiltDrawable {
 pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &crate::drawable::DrawableInfo, dir: &Path, member: bool, o: &ExportOptions, item: &mut ExportedItem) -> BuiltDrawable {
     let head = head_skin_shaders(a, e, &info.shaders, o, item).or_else(|| part_skin_shaders(a, e, &info.shaders, item));
     let shader_tex = link_textures(a, head.as_ref().map_or(&info.shaders[..], |h| &h.0[..]), r, &info.embedded_textures, dir, o, e.name.as_deref());
+    // Vehicles (models whose shaders bind the material palette): the part
+    // set that colours each part id.
+    let part_tables = shader_tex.iter().any(|st| st.vehicle_palette.is_some()).then(crate::names::work_dir).flatten().and_then(|w| crate::vehcolour::tables(&game_root(a), &w).ok());
+    let part_set: Option<(String, Vec<crate::vehcolour::Part>)> = part_tables.as_ref().zip(e.name.as_deref()).and_then(|(t, n)| t.for_model(n)).map(|(k, v)| (k.to_string(), v.to_vec()));
     let slice = |i: usize| {
         let b = &info.buffers[i];
         let end = (b.gfx_off + b.bytes).min(r.gfx.len() as u64) as usize;
@@ -1241,12 +1267,19 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             // to the largest kept influence in the GLB.
             "unresolved_joints": skin_used.as_ref().map(|u| u.iter().filter(|&&i| i as usize >= skin.joints.len()).count()),
         }));
-        let tint = match (material.and_then(|s| shader_tex.get(s)).and_then(|st| st.tint_palette.as_ref()), &m.colors) {
+        let mut tint = match (material.and_then(|s| shader_tex.get(s)).and_then(|st| st.tint_palette.as_ref()), &m.colors) {
             (Some(p), Some(c)) => Some(tint_colours(p, c)),
             _ => None,
         };
         if let Some(mm) = mesh_meta.last_mut() {
             mm["tint_applied"] = tint.is_some().into();
+        }
+        // Vehicles: the colour of each part id from the vehicle's part set.
+        if let (Some((_, parts)), Some(pal), Some(c)) = (&part_set, material.and_then(|s| shader_tex.get(s)).and_then(|st| st.vehicle_palette.as_ref()), &m.colors) {
+            tint = Some(crate::vehcolour::vertex_colours(parts, pal, c.iter().map(|c| c[3])));
+            if let Some(mm) = mesh_meta.last_mut() {
+                mm["part_colours_applied"] = true.into();
+            }
         }
         Some(crate::gltf::TriPrim {
             name, positions: m.positions, normals: m.normals, tangents: m.tangents, uvs: m.uvs.into_iter().map(|u| u.1).collect(),
@@ -1293,6 +1326,9 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         bones.dedup();
         let off = bones.iter().filter(|b| NOT_BODY_BONES.iter().any(|k| b.contains(k))).count();
         st.not_body = !bones.is_empty() && off * 10 >= bones.len() * 7;
+        if st.vehicle_palette.is_some() && mesh_meta.iter().any(|m| m["shader_index"] == si && m["part_colours_applied"] == true) {
+            st.vehicle_parts = part_set.as_ref().map(|p| p.0.clone());
+        }
     }
     let mats: Vec<crate::gltf::Material> = info.shaders.iter().zip(shader_tex.iter()).enumerate().map(|(si, (s, st))| crate::gltf::Material {
         name: format!("shader{:02}_{}", s.index, s.name_hash),

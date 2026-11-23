@@ -8,7 +8,7 @@
 //!   `wheelScale` / `wheelScaleRear`, `wheelType`, `layout`,
 //!   `HDTextureDist`, `lodDistances`, … (about 50 names resolve).
 //! - `51019114` configurations (3,879, about 300 models): `fb1f80ff` model,
-//!   `5bdc13e3` body colour (ARGB u32), `e89b8540` the part models of that
+//!   `5bdc13e3` body colour (u32, red in the low byte), `e89b8540` the part models of that
 //!   configuration (joaat names: frame, bumpers, exhaust, brake disc,
 //!   caliper, **one `rim_*` and one `tyre_*`** in 3,197 of them).
 //! - `fc1c7000` variation sets (4,772): `fb1f80ff` model, `8c866829` an
@@ -34,7 +34,7 @@ const OWNER: u32 = 0xfb1f_80ff;
 /// `handlingId` (case-sensitive joaat).
 const HANDLING_ID: u32 = 0xec41_bd9c;
 /// Layout version of vehicles.json; the model viewer rebuilds older files.
-pub const FORMAT: u32 = 3;
+pub const FORMAT: u32 = 4;
 /// A mod part or kit of one vehicle (in that vehicle's own pack resource):
 /// `name` joaat of the part model's name, or of a kit's name (the names of
 /// its left and right models without the side word:
@@ -61,17 +61,21 @@ const GROUP_ITEMS: u32 = 0xa12f_f3a2;
 const ITEM_PART: u32 = 0x8e66_12bf;
 const ITEM_WEIGHT: u32 = 0xdc73_2774;
 
-/// Colour as stored (ARGB) plus an sRGB reading that assumes the stored
-/// channels are linear (all stored colours are dark, as linear values of
-/// ordinary paints would be; not verified in game).
-fn argb(c: u32) -> Value {
+/// A stored colour (red in the low byte, alpha in the high one: the
+/// library's named colours `4ce375e6` begin with GTA IV's car colour list
+/// only when read that way) as ARGB, plus an sRGB reading that assumes the
+/// stored channels are linear (all stored body colours are dark, as linear
+/// values of ordinary paints would be; not verified in game). `stored` is
+/// the value as it is in the file.
+fn argb(stored: u32) -> Value {
+    let c = (stored & 0xFF00_FF00) | ((stored & 0xFF) << 16) | ((stored >> 16) & 0xFF);
     let s = |x: u32| {
         let l = x as f32 / 255.0;
         let v = if l <= 0.003_130_8 { 12.92 * l } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 };
         (v * 255.0).round().clamp(0.0, 255.0) as u32
     };
     let (r, g, b) = ((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
-    json!({"argb": format!("{c:08x}"), "rgb": format!("#{:06x}", c & 0xFF_FFFF), "srgb_if_linear": format!("#{:02x}{:02x}{:02x}", s(r), s(g), s(b))})
+    json!({"stored": format!("{stored:08x}"), "argb": format!("{c:08x}"), "rgb": format!("#{:06x}", c & 0xFF_FFFF), "srgb_if_linear": format!("#{:02x}{:02x}{:02x}", s(r), s(g), s(b))})
 }
 
 fn get<'v>(v: &'v Value, h: u32) -> Option<&'v Value> {

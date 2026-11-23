@@ -47,6 +47,7 @@ pub mod pso;
 pub mod gfxfont;
 pub mod ptfx;
 pub mod vehicles;
+pub mod vehcolour;
 pub mod weapon;
 pub mod rpf9;
 pub mod scan;
