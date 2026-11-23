@@ -28,7 +28,7 @@
 //!
 //! A configuration's part list names records in the library (`0caef606`),
 //! each with a list of modifier records. Three kinds are applied here, for
-//! a model's first configuration: group definitions, bindings of a group to
+//! the result most of a model's configurations give: group definitions, bindings of a group to
 //! a channel, and assignments of a colour and surface record to a channel
 //! (see the constants). Body panels are bound to one channel that nothing
 //! assigns; it is taken as the body paint.
@@ -50,9 +50,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// Version of what an export writes for part colours (model.json
 /// `part_colours_version`); the model viewer exports older vehicles again.
-pub const EXPORT_VERSION: u32 = 3;
+pub const EXPORT_VERSION: u32 = 4;
 /// Layout version of `<work>/index/vehicle_parts.json`.
-pub const FORMAT: u32 = 4;
+pub const FORMAT: u32 = 5;
 
 const PART_SET: u32 = 0xf142_44fd;
 const SET_COLOURS: u32 = 0x7847_6477;
@@ -320,14 +320,12 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
             let links = |h: u32, key: u32| m.objects(h).into_iter().filter_map(|o| m.object(h, o, 0)).filter_map(|v| Some((num(&v, key)? as u32, u64s(&v)))).collect::<Vec<_>>();
             let single = m.objects(crate::vehicles::MODEL_INFO).len() == 1;
             let (models, elements) = if single { (links(crate::vehicles::VARIATION, OWNER), links(crate::vehicles::MOD_ELEMENT, NAME)) } else { (Vec::new(), Vec::new()) };
-            // the first configuration of each model: its part list
+            // the part list of every configuration, by model
             let mut configs: Vec<(u32, Vec<u32>)> = Vec::new();
             if single {
                 for c in m.objects(crate::vehicles::CONFIG).into_iter().filter_map(|o| m.object(crate::vehicles::CONFIG, o, 0)) {
                     let Some(owner) = num(&c, OWNER) else { continue };
-                    if configs.iter().all(|x| x.0 != owner as u32) {
-                        configs.push((owner as u32, get(&c, CONFIG_PARTS).and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()).unwrap_or_default()));
-                    }
+                    configs.push((owner as u32, get(&c, CONFIG_PARTS).and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()).unwrap_or_default()));
                 }
             }
             // the vehicle's own part records (its body and mod part
@@ -362,16 +360,31 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
             }
         }
     }
-    // A model's first configuration reassigns colours and surfaces to
-    // groups of part ids: the model gets its own copy of the set with
-    // those applied.
+    // A configuration reassigns colours and surfaces to groups of part
+    // ids. Configurations of one model differ (comet7's first one leaves the
+    // rear deck unpainted, 15 of its other 16 paint it), so the model gets
+    // its own copy of the set with the result most of its configurations
+    // give (the earliest of those on a tie).
     for (_, _, _, configs, own) in &found {
-        for (owner, parts) in configs {
+        let mut owners: Vec<u32> = configs.iter().map(|c| c.0).collect();
+        owners.sort();
+        owners.dedup();
+        for owner in owners {
             let key = format!("{owner:08x}");
             let Some(set) = t.models.get(&key).cloned() else { continue };
-            let Some(base) = t.sets.get(&set) else { continue };
-            let mut out = base.clone();
-            if apply_config(&lib, own, parts, &mut out) > 0 {
+            let Some(base) = t.sets.get(&set).cloned() else { continue };
+            // (result, how many configurations give it), in first-seen order
+            let mut results: Vec<(Vec<Part>, usize)> = Vec::new();
+            for (_, parts) in configs.iter().filter(|c| c.0 == owner) {
+                let mut out = base.clone();
+                apply_config(&lib, own, parts, &mut out);
+                match results.iter_mut().find(|r| r.0 == out) {
+                    Some(r) => r.1 += 1,
+                    None => results.push((out, 1)),
+                }
+            }
+            let best = results.iter().map(|r| r.1).max().unwrap_or(0);
+            if let Some((out, _)) = results.into_iter().find(|r| r.1 == best).filter(|r| r.0 != base) {
                 let name = format!("{set}+{key}");
                 t.sets.insert(name.clone(), out);
                 t.models.insert(key, name);
