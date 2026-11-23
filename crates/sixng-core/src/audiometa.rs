@@ -461,7 +461,7 @@ fn stitch(path: &std::path::Path, e: &crate::scan::Entry, b: &[u8], by_off: &[&c
     let end = (last[0] + last[1] + 15) & !15;
     let next = by_off.iter().find(|x| x.off >= end)?;
     let gap = next.off - end;
-    if gap % 0x10000 != 0 || gap > 16 * 0x10000 || b.len() < 8 {
+    if gap % 0x10000 != 0 || gap > 64 * 0x10000 || b.len() < 8 {
         return None;
     }
     let data_end = 8 + u32::from_le_bytes(b[4..8].try_into().ok()?) as u64;
