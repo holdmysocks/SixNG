@@ -37,12 +37,62 @@ pub struct Part {
     /// The drawable to use (`outfit --parts`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drawable: Option<String>,
+    /// Texture overrides of this item (`outfit --tex-remap`): the drawable's
+    /// own texture -> the item's, for the diffuse (`ead733fc`) and normal
+    /// (`Normal`) maps of its first texture set, where the drawable has one
+    /// texture in that slot.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tex_remap: Vec<(String, String)>,
+    /// Tag map entries whose values resolve (tag key hex -> words), along the
+    /// chain, base item first: style, colour, length, dirt / blood presets
+    /// (`AM_Dirtdefinition_BloodEffect`) …
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, Vec<String>>,
+}
+
+/// Resolve a tag map (`12f85293`) into `out`: key hex -> resolved values.
+fn tag_words(v: &Value, pre: &HashMap<u32, (String, String)>, out: &mut BTreeMap<String, Vec<String>>) {
+    for t in v[crate::meta7a::field_name(0x12f8_5293)].as_array().into_iter().flatten() {
+        let Some(k) = t["Key"].as_u64() else { continue };
+        let words: Vec<String> = t["Item"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|x| x.as_u64())
+            .filter_map(|x| pre.get(&(x as u32)).map(|p| p.0.clone()).or_else(|| crate::names::lookup(x as u32, crate::names::Ctx::Field).filter(|n| !n.is_empty())))
+            .collect();
+        if !words.is_empty() {
+            out.insert(format!("{k:08x}"), words);
+        }
+    }
+}
+
+/// The item's override textures: (slot, hash) from the first texture set
+/// (`ebacf18c` / `e7cb9e1b`) along the chain that has any.
+fn set_textures(chain: &[&Value]) -> Vec<(&'static str, u64)> {
+    let f = crate::meta7a::field_name;
+    for c in chain {
+        for s in c[f(0xebac_f18c)].as_array().into_iter().flatten() {
+            let e = &s[f(0xe7cb_9e1b)];
+            let v: Vec<(&str, u64)> = [("diffusetex", e[f(0xead7_33fc)].as_str()), ("bumptex", e["Normal"].as_str())]
+                .into_iter()
+                .filter_map(|(k, x)| Some((k, u64::from_str_radix(x?, 16).ok().filter(|&h| h != 0)?)))
+                .collect();
+            if !v.is_empty() {
+                return v;
+            }
+        }
+    }
+    Vec::new()
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Variation {
     pub id: String,
     pub scale: Value,
+    /// The variation's own tags (Style, BodyShapePreset …), as for parts.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, Vec<String>>,
     pub parts: Vec<Part>,
 }
 
@@ -87,6 +137,16 @@ pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers,
     let tags = |v: &Value, key: u32| -> Vec<u32> {
         v[f(0x12f8_5293)].as_array().into_iter().flatten().filter(|t| t["Key"].as_u64() == Some(key as u64)).flat_map(|t| t["Item"].as_array().cloned().unwrap_or_default()).filter_map(|x| x.as_u64().map(|x| x as u32)).collect()
     };
+    // model name -> its materials (for the override slots)
+    let mut model_mats: HashMap<&str, Vec<u32>> = HashMap::new();
+    for (mi, ms) in tu.material_models.iter().enumerate() {
+        for &m in ms {
+            let (id, name) = &tu.models[m as usize];
+            if id.starts_with(archive) {
+                model_mats.entry(name.as_str()).or_default().push(mi as u32);
+            }
+        }
+    }
     let mut out = Vec::new();
     for v in get(0xa9d5_7751) {
         let mut parts = Vec::new();
@@ -118,9 +178,26 @@ pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers,
             let name = chain.iter().find_map(|c| [0x4bfd_27ddu32, 0x023e_5a2f, 0x2a8c_db1d].iter().flat_map(|&k| tags(c, k)).find_map(|x| pre.get(&x).filter(|p| p.0.contains('_'))));
             let category = chain.iter().find_map(|c| c["Category"].as_u64().filter(|&x| x != 0)).map(|h| crate::names::lookup(h as u32, crate::names::Ctx::Field).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("{h:08x}")));
             let drawable = pick(&counts).or_else(|| name.map(|p| p.1.clone()));
-            parts.push(Part { item: format!("{:08x}", it[f(0x6512_1749)].as_u64().unwrap_or(0)), category, name: name.map(|p| p.0.clone()), drawable });
+            let mut tex_remap = Vec::new();
+            if let Some(mats) = drawable.as_deref().and_then(|d| model_mats.get(d)) {
+                for (slot, new) in set_textures(&chain) {
+                    let mut own: Vec<u64> = mats.iter().flat_map(|&m| tu.materials[m as usize].slots.iter().filter(|s| s.0 == slot).map(|s| s.1)).collect();
+                    own.sort();
+                    own.dedup();
+                    if let [old] = own[..] {
+                        if old != new {
+                            tex_remap.push((format!("{old:016x}"), format!("{new:016x}")));
+                        }
+                    }
+                }
+            }
+            let mut tg = BTreeMap::new();
+            chain.iter().rev().for_each(|c| tag_words(c, pre, &mut tg));
+            parts.push(Part { item: format!("{:08x}", it[f(0x6512_1749)].as_u64().unwrap_or(0)), category, name: name.map(|p| p.0.clone()), drawable, tex_remap, tags: tg });
         }
-        out.push(Variation { id: format!("{:08x}", v[f(0x6512_1749)].as_u64().unwrap_or(0)), scale: v["Scale"].clone(), parts });
+        let mut tags = BTreeMap::new();
+        tag_words(&v, pre, &mut tags);
+        out.push(Variation { id: format!("{:08x}", v[f(0x6512_1749)].as_u64().unwrap_or(0)), scale: v["Scale"].clone(), tags, parts });
     }
     out
 }

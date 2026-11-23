@@ -273,6 +273,11 @@ pub struct ExportOptions {
     /// colour from `sixng vehicles`. None = neutral grey stand-in.
     #[serde(default)]
     pub paint: Option<[f32; 3]>,
+    /// Texture replacements by 64-bit store hash (old -> new), applied where
+    /// a material's textures are resolved: ped variation overrides (skin,
+    /// dirt, blood) from `ped-variations`.
+    #[serde(default)]
+    pub tex_remap: std::collections::HashMap<u64, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -472,8 +477,12 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
             let mut srgb_alpha = None;
             let mut normal_fallback = None;
             for t in &s.textures {
-                let h = u64::from_str_radix(&t.hash64, 16).unwrap_or(0);
+                let h0 = u64::from_str_radix(&t.hash64, 16).unwrap_or(0);
+                let h = o.tex_remap.get(&h0).copied().unwrap_or(h0);
                 let mut e = serde_json::json!({"param": t.param, "param_hash": t.param_hash, "param_name": crate::names::param(&t.param_hash), "hash64": t.hash64, "hash32": t.hash32});
+                if h != h0 {
+                    e["replaced_by"] = format!("{h:016x}").into();
+                }
                 let Some((store, tx)) = set.get(h) else {
                     match emb.get(&h) {
                         Some(et) => {
@@ -2772,7 +2781,7 @@ mod dictionary_tests {
         let a = ArchiveInfo { id: "levels.rpf".into(), path: work.join("levels.rpf"), size: archive.len() as u64, container: "rpf9".into() };
         fs::write(&a.path, archive).unwrap();
         let o = ExportOptions { out: work.join("out"), png: false, dds: false, raw: false,
-            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None };
+            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default() };
         let dir = o.out.join("models/levels").join(export_base_name(&e));
         fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("model.json");

@@ -2397,6 +2397,7 @@ fn export_load(
         body_shape: Vec::new(),
         head_skin: HEAD_SKIN.load(std::sync::atomic::Ordering::Relaxed),
         paint: None,
+        tex_remap: Default::default(),
     };
     let item = export::export_entry(a, e, &opts)?;
     let lods = lods_in(&dir);
