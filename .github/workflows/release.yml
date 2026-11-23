@@ -86,7 +86,13 @@ jobs:
             fi
           done
           if [ "$RUNNER_OS" = macOS ]; then
+            app="dist/$dir/SixNG.app"
+            mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+            cp "dist/$dir/sixng-gui" "$app/Contents/MacOS/sixng-gui"
+            cp packaging/macos/Info.plist "$app/Contents/Info.plist"
+            python3 -c 'import plistlib,sys; path,tag=sys.argv[1:]; version=tag[1:] if tag.startswith("v") else tag; f=open(path,"rb"); plist=plistlib.load(f); f.close(); plist["CFBundleShortVersionString"]=version; plist["CFBundleVersion"]=version; f=open(path,"wb"); plistlib.dump(plist,f); f.close()' "$app/Contents/Info.plist" "$TAG"
             codesign --force --sign - "dist/$dir/sixng" "dist/$dir/sixng-gui"
+            codesign --force --sign - "$app"
           fi
           cp LICENSE README.md THIRD_PARTY_NOTICES.md "dist/$dir/"
           cargo metadata --format-version 1 --locked | python3 -c '
