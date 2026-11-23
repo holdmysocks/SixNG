@@ -1337,7 +1337,9 @@ impl Uploader {
             let mr = mt.mr.map_or(0, |[m, r]| {
                 let q = |x: f32| (x.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
                 0x100 | (q(m) << 16) | (q(r) << 24)
-            }) | if mt.tint_mask { 0x200 } else { 0 } | if mt.parts { 0x400 } else { 0 };
+            }) | if mt.tint_mask { 0x200 } else { 0 } | if mt.parts { 0x400 } else { 0 }
+                // bit 11: a lamp's emissive mesh (standard_vehicle_emissive_animated_bones)
+                | if mt.name.ends_with("29648098") { 0x800 } else { 0 };
             let u = MatU {
                 base,
                 flags: [has, class_id(&mt.class), alpha, gap | mr],

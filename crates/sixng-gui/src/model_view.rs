@@ -148,6 +148,10 @@ pub struct ModelView {
     clip_pos: Vec<f32>,
     /// Automation: play every other clip to this position.
     pub clip_pos_all: f32,
+    /// Vehicle lamps that are on.
+    pub lamps: Lamps,
+    /// The loaded model has lamp bones.
+    has_lamps: bool,
     /// Bonnet and boot opening (radians at the hinge).
     pub bonnet_open: f32,
     pub boot_open: f32,
@@ -383,6 +387,8 @@ impl ModelView {
             clips: Vec::new(),
             clip_pos: Vec::new(),
             clip_pos_all: 0.0,
+            lamps: Lamps::default(),
+            has_lamps: false,
             bonnet_open: 0.0,
             boot_open: 0.0,
             hinges: HashMap::new(),
@@ -1434,6 +1440,7 @@ impl ModelView {
                 self.clip_pos = vec![self.clip_pos_all; all.len()];
                 self.clips = all;
                 self.hinges = find_hinges(&l.model);
+                self.has_lamps = l.model.joints.iter().any(|j| self.lamps.kind(&j.name).is_some());
             }
         }
         if let Some(r) = self.wheel_pending.lock().unwrap().take() {
@@ -1990,7 +1997,24 @@ impl ModelView {
         let px = [(rect.width() * ppp) as u32, (rect.height() * ppp) as u32];
         self.size = px;
         self.update_wheels(rs, &ctx);
-        let (globals, skin) = self.joint_mats();
+        let (globals, mut skin) = self.joint_mats();
+        // Lit lamps: the light of each lamp bone rides in the bottom row of
+        // its joint matrix (see the shader). Not on the Metal renderer.
+        if self.has_lamps && cfg!(not(target_os = "macos")) {
+            let t = ctx.input(|i| i.time);
+            if let Some(l) = &self.loaded {
+                for (j, m) in l.model.joints.iter().zip(skin.iter_mut()) {
+                    if let Some(c) = self.lamps.light(&j.name, t) {
+                        m.x_axis.w = c[0];
+                        m.y_axis.w = c[1];
+                        m.z_axis.w = c[2];
+                    }
+                }
+            }
+            if self.lamps.left || self.lamps.right || self.lamps.hazard {
+                ctx.request_repaint_after(std::time::Duration::from_millis(60));
+            }
+        }
         let show_wheels = self.wheels_on && !self.veh_no_wheels && !self.mounts().is_empty();
         let (under, top) = self.lines(&globals);
         let settled = self.idle_for_shot();
@@ -2281,6 +2305,24 @@ impl ModelView {
                 }
                 if self.hinges.values().any(|h| h.0 == 1) {
                     ui.add(egui::Slider::new(&mut self.bonnet_open, 0.0..=1.1).text("bonnet open"));
+                }
+                if self.has_lamps {
+                    let l = &mut self.lamps;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("lights");
+                        ui.checkbox(&mut l.head, "head");
+                        ui.checkbox(&mut l.high, "high beam");
+                        ui.checkbox(&mut l.day, "daytime");
+                        ui.checkbox(&mut l.tail, "tail");
+                        ui.checkbox(&mut l.brake, "brake");
+                        ui.checkbox(&mut l.reverse, "reversing");
+                        ui.checkbox(&mut l.left, "indicator left");
+                        ui.checkbox(&mut l.right, "indicator right");
+                        ui.checkbox(&mut l.hazard, "hazards");
+                        ui.checkbox(&mut l.interior, "interior");
+                    })
+                    .response
+                    .on_hover_text("Lamps are found by their bones (headlight_l, taillight_l, brakelight_l, reversinglight_l, indicator_lf ... and the _glass bone of each lens). A lit lamp's reflector and lens glow in a fixed colour for its kind, and its LED mesh (standard_vehicle_emissive_animated_bones) shows its own colour map. How bright the game makes each lamp, and the light it casts, are not read from the files.");
                 }
                 if self.hinges.values().any(|h| h.0 == 2) {
                     ui.add(egui::Slider::new(&mut self.boot_open, 0.0..=1.1).text("boot open"));
@@ -3163,6 +3205,80 @@ fn rim_factor(boxes: &[[[f32; 3]; 2]], ratio: f32) -> f32 {
     match (r.first(), r.last()) {
         (Some(&rim), Some(&tyre)) if r.len() >= 2 && ratio > 0.0 && rim > 0.0 && tyre > rim => (ratio * tyre / rim).clamp(0.5, 0.97 * tyre / rim),
         _ => 1.0,
+    }
+}
+
+/// Which vehicle lamps are on.
+#[derive(Clone, Copy, Default, PartialEq)]
+pub struct Lamps {
+    pub head: bool,
+    pub high: bool,
+    pub day: bool,
+    pub tail: bool,
+    pub brake: bool,
+    pub reverse: bool,
+    pub left: bool,
+    pub right: bool,
+    pub hazard: bool,
+    pub interior: bool,
+}
+
+impl Lamps {
+    /// The switch a lamp bone belongs to: 0 head, 1 high beam, 2 daytime,
+    /// 3 tail (and number plate), 4 brake, 5 reversing, 6 left indicator,
+    /// 7 right indicator, 8 interior. The lens bone `<lamp>_glass` goes
+    /// with its lamp.
+    pub fn kind(&self, bone: &str) -> Option<u8> {
+        let n = bone.to_ascii_lowercase();
+        let n = n.strip_suffix("_glass").unwrap_or(&n);
+        Some(if n.starts_with("headlight_hi") {
+            1
+        } else if n.starts_with("headlight_") {
+            0
+        } else if n.starts_with("drlight") {
+            2
+        } else if n.starts_with("taillight") || n.starts_with("platelight") {
+            3
+        } else if n.starts_with("brakelight") {
+            4
+        } else if n.starts_with("reversinglight") {
+            5
+        } else if n.starts_with("indicator_l") {
+            6
+        } else if n.starts_with("indicator_r") {
+            7
+        } else if n.starts_with("interiorlight") {
+            8
+        } else {
+            return None;
+        })
+    }
+
+    /// Light of a lamp bone at time `t` (seconds): linear colour x
+    /// intensity, None when it is off. Indicators blink at 1.5 Hz. The
+    /// colours are fixed per kind (white, red, amber), not read from the files.
+    pub fn light(&self, bone: &str, t: f64) -> Option<[f32; 3]> {
+        let blink = (t * 1.5).fract() < 0.5;
+        let (on, c) = match self.kind(bone)? {
+            0 => (self.head, [1.0, 0.95, 0.85]),
+            1 => (self.high, [1.0, 0.97, 0.92]),
+            2 => (self.day, [0.95, 0.97, 1.0]),
+            3 => (self.tail, [0.55, 0.02, 0.01]),
+            4 => (self.brake, [1.2, 0.04, 0.02]),
+            5 => (self.reverse, [1.0, 1.0, 1.0]),
+            6 => ((self.left || self.hazard) && blink, [1.0, 0.42, 0.02]),
+            7 => ((self.right || self.hazard) && blink, [1.0, 0.42, 0.02]),
+            _ => (self.interior, [1.0, 0.9, 0.75]),
+        };
+        // the lens passes a little less than the reflector shows
+        let k = if bone.to_ascii_lowercase().ends_with("_glass") { 0.7 } else { 1.0 };
+        on.then(|| [c[0] * k, c[1] * k, c[2] * k])
+    }
+
+    /// From a list such as `head,tail,left` (the `--lights` flag).
+    pub fn parse(s: &str) -> Self {
+        let has = |k: &str| s.split(',').any(|x| x.trim().eq_ignore_ascii_case(k));
+        Lamps { head: has("head"), high: has("high"), day: has("day"), tail: has("tail"), brake: has("brake"), reverse: has("reverse"), left: has("left"), right: has("right"), hazard: has("hazard"), interior: has("interior") }
     }
 }
 
