@@ -387,6 +387,14 @@ const MESH_SHADER: &str = r#"
             albedo = float3(0.04, 0.12, 0.16);
             alpha = 0.7;
         }
+        // vehicle parts coloured per vertex: tint alpha 254 marks the primary
+        // body paint, which takes the paint colour
+        if ((material.flags.w & 1024u) != 0u) {
+            const float part_code = input.tint.a * 255.0;
+            if (part_code > 253.5 && part_code < 254.5) {
+                albedo = frame.paint1.rgb;
+            }
+        }
 
         float roughness = 0.75;
         float metalness = 0.0;
@@ -1410,7 +1418,9 @@ impl Renderer3D4 {
             let class = crate::render3d::class_id(&material.class);
             let value = Material4 {
                 base: material.base_factor,
-                flags: [has, class, alpha, gap],
+                // w: gap in bits 0-1; bit 10 = vehicle parts coloured per
+                // vertex (the tint alpha 254 marks the primary body paint)
+                flags: [has, class, alpha, gap | if material.parts { 0x400 } else { 0 }],
             };
             let offset = material_index * MATERIAL_STRIDE;
             material_data[offset..offset + std::mem::size_of::<Material4>()]
