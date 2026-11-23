@@ -222,7 +222,10 @@ pub fn find_skeletons(r: &Resource) -> Vec<Vec<Bone>> {
 }
 
 fn scan_skeletons(r: &Resource, first_only: bool) -> Vec<Vec<Bone>> {
-    let ok_name = |s: &str| !s.is_empty() && s.len() < 96 && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
+    // Vehicle skeletons name their breakable joints with dashes
+    // (`connect-chassis-bumper_f-1`); stopping there cut a motorhome's
+    // skeleton at bone 107, before its wheel bones.
+    let ok_name = |s: &str| !s.is_empty() && s.len() < 96 && s.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b' ' | b'#' | b'+'));
     // q = record start; name ptr at +0x30, u16 fields at +0x40.
     let rec = |q: usize, k: u16| -> Option<Bone> {
         let np = r.sys_off(r.u64(q + 0x30))?;

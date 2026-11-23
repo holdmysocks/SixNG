@@ -1605,6 +1605,7 @@ impl App {
         m.decal_bias = !c.has("no-decal-bias");
         m.wheel_spin = c.f("spin").unwrap_or(0.0);
         m.door_open = c.f("door").unwrap_or(0.0);
+        m.roof_down = c.has("roof-down");
         if let Some(v) = c.f("yaw") {
             m.cam.yaw = v;
         }

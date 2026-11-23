@@ -42,6 +42,7 @@ struct Caps {
     paint: bool,
     wheels: bool,
     doors: bool,
+    roof: bool,
     mounts: bool,
     joints: bool,
     tint: bool,
@@ -56,6 +57,7 @@ impl Caps {
             paint: m.materials.iter().any(|x| x.class == "car_paint"),
             wheels: names.iter().any(|n| n.starts_with("wheel_") && !n.contains("dummy")),
             doors: names.iter().any(|n| matches!(n.as_str(), "door_dside_f" | "door_dside_r" | "door_pside_f" | "door_pside_r")),
+            roof: names.iter().any(|n| n == "convertible_roof"),
             mounts: l.info["wheel_mounts"].as_array().is_some_and(|a| !a.is_empty()),
             joints: !m.joints.is_empty(),
             tint: m.meshes.iter().any(|x| x.verts.iter().any(|v| v.tint != [255, 255, 255, 255] && v.tint != [0, 0, 0, 0])),
@@ -134,6 +136,8 @@ pub struct ModelView {
     pub joint_labels: bool,
     pub wheel_spin: f32,
     pub door_open: f32,
+    /// Convertibles: hide the soft top (the folding animation is not found).
+    pub roof_down: bool,
     pub paint_on: bool,
     /// Side-panel controls that apply to the loaded model, keyed by (GLB path, triangles).
     caps: Option<(PathBuf, usize, Caps)>,
@@ -342,6 +346,7 @@ impl ModelView {
             joint_labels: true,
             wheel_spin: 0.0,
             door_open: 0.0,
+            roof_down: false,
             paint_on: true,
             caps: None,
             material_sel: None,
@@ -1082,9 +1087,12 @@ impl ModelView {
             self.veh_applied = key.clone();
             // helicopters: no configuration names a rim and wheelScale is a
             // token value (0.05 to 0.08); their wheel bones mark the skids
+            // (an electric scooter has the same token wheelScale and no rim,
+            // but its wheels have collision discs)
             self.veh_no_wheels = !v.configs.is_empty()
                 && v.configs.iter().all(|c| c.rim.is_none())
-                && v.wheel_scale.is_some_and(|w| w < 0.1);
+                && v.wheel_scale.is_some_and(|w| w < 0.1)
+                && self.discs().iter().all(|d| d.is_none());
             self.veh_cfg = None;
             if !v.configs.is_empty() {
                 self.apply_config(v, 0);
@@ -1213,6 +1221,9 @@ impl ModelView {
                 "tyre_motorbike_001"
             } else if r.starts_with("rim_industrial") || r.starts_with("rim_truck") {
                 "tyre_truck_001"
+            } else if r.starts_with("rim_train") || r.starts_with("rim_metrotrain") {
+                // a rail wheel: no tyre
+                ""
             } else {
                 "tyre_car_001"
             }
@@ -1222,8 +1233,18 @@ impl ModelView {
             .clone()
             .or_else(|| v.configs.iter().find_map(|x| x.tyre.clone()))
             .or_else(|| c.rim.as_deref().map(|r| kind(r).to_string()));
-        if let Some(t) = tyre {
-            self.wheel_tyre = format!("{t}_hi");
+        if let Some(t) = &tyre {
+            self.wheel_tyre = if t.is_empty() { String::new() } else { format!("{t}_hi") };
+        }
+        // a configuration with a tyre and no rim (an electric scooter): a
+        // rim of the tyre's kind, not the one of the vehicle opened before
+        if c.rim.is_none() {
+            self.wheel_rim = match tyre.as_deref() {
+                Some(t) if t.starts_with("tyre_bicycle") => "rim_motorbike_bicycle_001_hi",
+                Some(t) if t.starts_with("tyre_motorbike") => "rim_motorbike_sports_001_hi",
+                _ => "rim_muscle_001_hi",
+            }
+            .into();
         }
         self.veh_cfg = Some(i);
         self.apply_scale(v);
@@ -1370,7 +1391,9 @@ impl ModelView {
                             let [r, hw] = d.unwrap_or(any);
                             let base = if is_rear(bone) { self.wheel_scale_rear } else { self.wheel_scale };
                             let sc = r / tr;
-                            [(2.0 * hw / (tw * sc)).clamp(0.05, 2.0), sc / base.max(1e-4)]
+                            // a rail wheel has no tyre and comes with its axle: keep its width
+                            let width = if self.wheel_tyre.is_empty() { 1.0 } else { (2.0 * hw / (tw * sc)).clamp(0.05, 2.0) };
+                            [width, sc / base.max(1e-4)]
                         })
                         .collect()
                 }
@@ -1413,7 +1436,8 @@ impl ModelView {
                     .strip_prefix("wheel_")
                     .map(|s| s.starts_with('r'))
                     .unwrap_or(false);
-                let mirror = if right {
+                // the inner wheel of a dual pair faces the other way
+                let mirror = if right != bone.ends_with("_inr") {
                     Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0))
                 } else {
                     Mat4::IDENTITY
@@ -1456,6 +1480,7 @@ impl ModelView {
             global: &mut Vec<Option<Mat4>>,
             spin: f32,
             door: f32,
+            roof_down: bool,
             depth: usize,
         ) -> Mat4 {
             if let Some(m) = global[i] {
@@ -1477,15 +1502,20 @@ impl ModelView {
                 let side = if n.contains("dside") { -1.0 } else { 1.0 };
                 local = local * Mat4::from_quat(Quat::from_rotation_y(side * door));
             }
+            // roof down: collapse what hangs on convertible_roof, but not the
+            // cover that closes over the stowed roof
+            if roof_down && n != "roof_cover_ctrl" && j.parent.is_some_and(|p| js[p].name.eq_ignore_ascii_case("convertible_roof")) {
+                local = local * Mat4::from_scale(Vec3::ZERO);
+            }
             let m = match j.parent {
-                Some(p) if p != i && depth < 64 => g(p, js, global, spin, door, depth + 1) * local,
+                Some(p) if p != i && depth < 64 => g(p, js, global, spin, door, roof_down, depth + 1) * local,
                 _ => local,
             };
             global[i] = Some(m);
             m
         }
         let gl: Vec<Mat4> = (0..js.len())
-            .map(|i| g(i, js, &mut global, self.wheel_spin, self.door_open, 0))
+            .map(|i| g(i, js, &mut global, self.wheel_spin, self.door_open, self.roof_down, 0))
             .collect();
         let skin: Vec<Mat4> = gl
             .iter()
@@ -2032,6 +2062,9 @@ impl ModelView {
                 }
                 if caps.doors {
                     ui.add(egui::Slider::new(&mut self.door_open, 0.0..=1.3).text("doors open"));
+                }
+                if caps.roof {
+                    ui.checkbox(&mut self.roof_down, "roof down").on_hover_text("hides the soft top and its frame (everything under the convertible_roof bone except the roof cover). The folding animation itself was not found in the game's animations.");
                 }
                 if caps.mounts {
                     ui.checkbox(&mut self.wheels_on, "fit shared wheels at the wheel mounts");
@@ -2842,6 +2875,7 @@ fn fork_fit(model: &glb::Model, p: Vec3, scale: f32, boxes: &[[[f32; 3]; 2]]) ->
 /// so spinning those threw the fork and the rear end around.
 fn is_wheel_bone(n: &str) -> bool {
     let Some(r) = n.strip_prefix("wheel_") else { return false };
+    let r = r.strip_suffix("_inr").unwrap_or(r);
     let b = r.as_bytes();
     b.len() >= 2 && matches!(b[0], b'l' | b'r') && matches!(b[1], b'f' | b'm' | b'r') && b[2..].iter().all(|c| c.is_ascii_digit())
 }
@@ -2903,7 +2937,8 @@ fn export_load(
                 // trim meshes that did not follow their bones
                 || j.contains("\"skinned\"") && !j.contains("\"joint_format\"")
                 // and from before the wheels' collision discs were read
-                || (j.contains("\"bone\": \"wheel_") || j.contains("\"bone\":\"wheel_")) && !j.contains("\"wheel_discs\"")
+                // and the inner wheels of dual pairs
+                || (j.contains("\"bone\": \"wheel_") || j.contains("\"bone\":\"wheel_") || j.contains("\"wheel_discs\"")) && !j.contains("\"wheel_mounts_version\"")
                 // and weapon parts from before their stand-in surface
                 || j.contains("e68a4a98") && !j.contains("\"gunmetal\"")
         });

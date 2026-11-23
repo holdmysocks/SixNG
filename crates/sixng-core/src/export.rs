@@ -496,6 +496,17 @@ fn is_hidden(s: &crate::drawable::Shader, st: &ShaderTextures) -> bool {
     classify_shader(s, st)["stand_in"] == "hidden"
 }
 
+/// A wheel bone that carries a wheel: `wheel_lf`, `wheel_rm1`, and the inner
+/// wheel of a dual pair, `wheel_lr_inr`. Not the helpers (`wheel_turn_lf`,
+/// `wheel_lr_drive`, `wheel_parent_lr`).
+fn is_wheel_mount(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    let Some(r) = n.strip_prefix("wheel_") else { return false };
+    let r = r.strip_suffix("_inr").unwrap_or(r);
+    let b = r.as_bytes();
+    b.len() >= 2 && matches!(b[0], b'l' | b'r') && matches!(b[1], b'f' | b'm' | b'r') && b[2..].iter().all(|c| c.is_ascii_digit())
+}
+
 /// Shaders drawn with the runtime body colour (see `classify_shader`).
 fn is_paint(s: &crate::drawable::Shader, st: &ShaderTextures) -> bool {
     classify_shader(s, st)["class"] == "car_paint"
@@ -1012,13 +1023,17 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 "geometry_bbox": geometry_bbox,
                 "geometry_bbox_note": "RAGE model space (Z-up) [min, max] over the primary meshes (LOD0, or the lowest populated LOD for a dictionary member), from the decoded vertices. Prefer it to drawable.bounds / bounds_raw: on some fragments and drawables the stored bbox is offset or rotated (route-sign prefabs, dn_20_scaffolding_02); the archetype definitions agree with the geometry.",
                 "meshes": mesh_meta,
-                "wheel_mounts": info.skeleton.iter().filter(|b| b.name.starts_with("wheel_") && b.name.len() <= 9 && b.pivot.is_some()).map(|b| {
+                "wheel_mounts": info.skeleton.iter().filter(|b| is_wheel_mount(&b.name) && b.pivot.is_some()).map(|b| {
                     // the wheel's collision disc: the largest one on this axle
                     // line (it can sit a few cm in or out of the bone's pivot)
                     let p = b.pivot.unwrap_or_default();
-                    let d = wheel_discs.iter().filter(|d| (d.centre[0] - p[0]).abs() < 0.15 && (d.centre[1] - p[1]).abs() < 0.03 && (d.centre[2] - p[2]).abs() < 0.03).max_by(|a, b| a.radius.total_cmp(&b.radius));
+                    // (of two equally large, the nearer: the outer and inner wheel of a dual pair can be 12 cm apart)
+                    let near: Vec<&crate::bounds::WheelDisc> = wheel_discs.iter().filter(|d| (d.centre[0] - p[0]).abs() < 0.15 && (d.centre[1] - p[1]).abs() < 0.03 && (d.centre[2] - p[2]).abs() < 0.03).collect();
+                    let big = near.iter().map(|d| d.radius).fold(0.0f32, f32::max);
+                    let d = near.iter().filter(|d| d.radius > big - 1e-3).min_by(|a, b| (a.centre[0] - p[0]).abs().total_cmp(&(b.centre[0] - p[0]).abs())).copied();
                     serde_json::json!({"bone": b.name, "pivot": b.pivot, "radius": d.map(|d| d.radius), "half_width": d.map(|d| d.half_width), "centre": d.map(|d| d.centre)})
                 }).collect::<Vec<_>>(),
+                "wheel_mounts_version": 2,
                 "wheel_discs": wheel_discs,
                 "wheel_discs_note": "Disc bounds of the fragment's physics (type 8 children of its composite bound): centre, radius and half width in metres. The largest disc on a wheel bone's axle line is the wheel (its centre, radius and half_width are repeated in wheel_mounts); a thinner one is the brake disc.",
                 "wheel_mounts_note": "Wheel centres (model space, RAGE Z-up). Rims and tyres are shared models (rim_<class>_NNN, tyre_<class>_NNN) authored for the left-front at unit scale (rim radius 0.5); mirror X for right-hand wheels and scale by the vehicle's wheel size (not decoded yet).",
