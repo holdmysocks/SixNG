@@ -76,23 +76,13 @@ jobs:
           set -eu
           dir="SixNG-$TAG-${{ matrix.name }}"
           mkdir -p "dist/$dir"
-          set -- ${{ matrix.targets }}
-          for b in sixng sixng-gui; do
-            if [ $# -gt 1 ]; then
-              lipo -create -output "dist/$dir/$b" $(for t in "$@"; do echo "target/$t/release/$b"; done)
-              lipo -info "dist/$dir/$b"
-            else
-              cp "target/$1/release/$b" "dist/$dir/"
-            fi
-          done
           if [ "$RUNNER_OS" = macOS ]; then
-            app="dist/$dir/SixNG.app"
-            mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-            cp "dist/$dir/sixng" "dist/$dir/sixng-gui" "$app/Contents/MacOS/"
-            cp packaging/macos/Info.plist "$app/Contents/Info.plist"
-            python3 -c 'import plistlib,sys; path,tag=sys.argv[1:]; version=tag[1:] if tag.startswith("v") else tag; f=open(path,"rb"); plist=plistlib.load(f); f.close(); plist["CFBundleShortVersionString"]=version; plist["CFBundleVersion"]=version; f=open(path,"wb"); plistlib.dump(plist,f); f.close()' "$app/Contents/Info.plist" "$TAG"
-            codesign --force --sign - "dist/$dir/sixng" "dist/$dir/sixng-gui"
-            codesign --force --deep --sign - "$app"
+            scripts/macos-app.sh --universal --prebuilt "dist/$dir"
+          else
+            set -- ${{ matrix.targets }}
+            for b in sixng sixng-gui; do
+              cp "target/$1/release/$b" "dist/$dir/"
+            done
           fi
           cp LICENSE README.md THIRD_PARTY_NOTICES.md "dist/$dir/"
           cargo metadata --format-version 1 --locked | python3 -c '
@@ -106,14 +96,23 @@ jobs:
           for n, v, l in rows:
               print(f"{n} {v}: {l}")
           ' > "dist/$dir/RUST_DEPENDENCIES.txt"
-          ./"dist/$dir/sixng" --version
+          if [ "$RUNNER_OS" = macOS ]; then
+            ./"dist/$dir/SixNG.app/Contents/MacOS/sixng" --version
+          else
+            ./"dist/$dir/sixng" --version
+          fi
       - name: Check binaries for build paths
         shell: bash
         run: |
           set -eu
           dir="dist/SixNG-$TAG-${{ matrix.name }}"
           bad=0
-          for b in "$dir/sixng" "$dir/sixng-gui"; do
+          if [ "$RUNNER_OS" = macOS ]; then
+            binaries=("$dir/SixNG.app/Contents/MacOS/sixng" "$dir/SixNG.app/Contents/MacOS/sixng-gui")
+          else
+            binaries=("$dir/sixng" "$dir/sixng-gui")
+          fi
+          for b in "${binaries[@]}"; do
             hits=$( { strings -a "$b" | grep -E -i -e '/home/' -e '/Users/' -e '/runner' -e 'runneradmin' -e '/private/var/' -e 'C:\\Users'
                       strings -a "$b" | grep -F -e "$GITHUB_WORKSPACE" -e "$HOME"; } || true)
             if [ -n "$hits" ]; then
