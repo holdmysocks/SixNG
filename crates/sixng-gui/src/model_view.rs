@@ -4159,9 +4159,14 @@ fn load_query_sel(
             if *BODY_SHAPE.lock().unwrap() == (0.0, 0.0) && !l.hair.is_empty() {
                 const CELL: f32 = 0.012;
                 let key = |p: &[f32; 3]| ((p[0] / CELL).floor() as i32, (p[1] / CELL).floor() as i32, (p[2] / CELL).floor() as i32);
-                let cells: std::collections::HashSet<(i32, i32, i32)> = skin.iter().filter(|(n, _)| n.contains("_head_") || n.starts_with("head_") || n.starts_with("hand_") || n.starts_with("feet_")).flat_map(|(_, pts)| pts.iter().map(key)).collect();
-                if !cells.is_empty() {
+                // hair, brows, beards and lashes must root on the head; body
+                // hair on the head or the body
+                let is_head = |n: &str| n.contains("_head_") || n.starts_with("head_");
+                let head_cells: std::collections::HashSet<(i32, i32, i32)> = skin.iter().filter(|(n, _)| is_head(n)).flat_map(|(_, pts)| pts.iter().map(key)).collect();
+                let all_cells: std::collections::HashSet<(i32, i32, i32)> = skin.iter().filter(|(n, _)| is_head(n) || n.starts_with("hand_") || n.starts_with("feet_")).flat_map(|(_, pts)| pts.iter().map(key)).collect();
+                if !head_cells.is_empty() {
                     for h in &mut l.hair {
+                        let cells = if h.slot == "body hair" { &all_cells } else { &head_cells };
                         let all = h.grooms.len();
                         h.grooms.retain(|&off| {
                             let Ok(g) = sixng_core::groom::load(&a, &ix.entries, off) else { return true };
