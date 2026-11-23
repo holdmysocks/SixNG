@@ -61,6 +61,8 @@ struct VOut {
     @location(5) col: vec4<f32>,
     @location(6) extra: vec4<f32>,
     @location(7) tint: vec4<f32>,
+    // light a lit vehicle lamp adds (linear colour x intensity)
+    @location(8) lamp: vec3<f32>,
 };
 
 fn skin_matrix(v: VIn) -> mat4x4<f32> {
@@ -86,9 +88,18 @@ fn skin_matrix(v: VIn) -> mat4x4<f32> {
 
 fn mesh_vertex(v: VIn) -> VOut {
     let model = mat4x4<f32>(v.m0, v.m1, v.m2, v.m3);
-    let m = model * skin_matrix(v);
+    // The bottom row of a joint matrix is (0, 0, 0, 1). The viewer puts the
+    // light of a lit lamp in its first three entries (lamps hang on their
+    // own bones); it is taken out here before the matrix is used.
+    var sk = skin_matrix(v);
+    let lamp = vec3(sk[0].w, sk[1].w, sk[2].w);
+    sk[0].w = 0.0;
+    sk[1].w = 0.0;
+    sk[2].w = 0.0;
+    let m = model * sk;
     let w = m * vec4(v.pos, 1.0);
     var o: VOut;
+    o.lamp = lamp;
     o.clip = F.view_proj * w;
     o.world = w.xyz;
     o.nrm = (m * vec4(v.nrm, 0.0)).xyz;
@@ -218,6 +229,15 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
         var e = albedo;
         if ((has & 8u) != 0u) { e = textureSample(t_em, samp, i.uv0).rgb; }
         emissive = e * F.misc.y;
+    }
+    // vehicle lamps: a lamp's own emissive mesh (bit 11) is lit only while
+    // its bone is; reflectors and lenses on a lit lamp bone glow in its colour
+    let lamp_i = max(i.lamp.r, max(i.lamp.g, i.lamp.b));
+    if ((M.flags.w & 2048u) != 0u) {
+        emissive = emissive * min(lamp_i, 1.5);
+    } else if (lamp_i > 0.001) {
+        emissive = emissive + i.lamp * F.misc.y;
+        if (cls == 5u || cls == 6u) { alpha = max(alpha, min(lamp_i, 1.0) * 0.85); }
     }
     // wet look: darker albedo, glossy up-facing surfaces
     let wet = F.misc.x * smoothstep(0.3, 0.8, n.y);
