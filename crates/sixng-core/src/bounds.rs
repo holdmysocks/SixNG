@@ -83,6 +83,65 @@ fn f3(r: &Resource, o: usize) -> [f32; 3] {
     [r.f32(o), r.f32(o + 4), r.f32(o + 8)]
 }
 
+/// A wheel's collision disc inside a vehicle fragment.
+#[derive(Debug, Clone, Serialize)]
+pub struct WheelDisc {
+    /// Centre in model space (RAGE Z-up): the wheel bone's pivot.
+    pub centre: [f32; 3],
+    /// Outer radius of the tyre.
+    pub radius: f32,
+    /// Half the tyre's width (the disc's margin).
+    pub half_width: f32,
+}
+
+/// Wheel collision discs of a vehicle fragment. Its physics is an embedded
+/// composite bound (type 6, same layout as a bounds resource but not at the
+/// root); each wheel is a child of type 8, a disc on the X axis: +0x14
+/// radius, +0x2C margin = half the width, bbox max = (margin, radius,
+/// radius). The child's transform (translation at +48 of its 4x4) puts it
+/// on the wheel bone's pivot. A second, thinner disc per wheel is the brake
+/// disc. The composite is found by scanning the system page for its header.
+pub fn wheel_discs(r: &Resource) -> Vec<WheelDisc> {
+    let mut out: Vec<WheelDisc> = Vec::new();
+    let n = r.sys.len();
+    let mut o = 0;
+    while o + 0xA0 <= n {
+        let at = o;
+        o += 16;
+        if r.sys[at + 0x10] != 6 {
+            continue;
+        }
+        let count = r.u16(at + 0x98) as usize;
+        if !(1..=1024).contains(&count) || r.u16(at + 0x9A) as usize != count {
+            continue;
+        }
+        let (Some(kp), Some(tp)) = (r.sys_off(r.u64(at + 0x70)), r.sys_off(r.u64(at + 0x78))) else { continue };
+        if kp + 8 * count > n || tp + 64 * count > n {
+            continue;
+        }
+        for i in 0..count {
+            let Some(k) = r.sys_off(r.u64(kp + 8 * i)) else { continue };
+            if k + 0x50 > n || r.sys[k + 0x10] != 8 {
+                continue;
+            }
+            let (radius, margin) = (r.f32(k + 0x14), r.f32(k + 0x2C));
+            let mx = f3(r, k + 0x20);
+            let disc = radius > 0.03 && radius < 5.0 && margin > 0.0 && (mx[0] - margin).abs() < 2e-3 && (mx[1] - radius).abs() < 2e-3 && (mx[2] - radius).abs() < 2e-3;
+            if !disc {
+                continue;
+            }
+            let centre = f3(r, tp + 64 * i + 48);
+            if centre.iter().all(|c| c.is_finite() && c.abs() < 100.0) {
+                out.push(WheelDisc { centre, radius, half_width: margin });
+            }
+        }
+        if !out.is_empty() {
+            break;
+        }
+    }
+    out
+}
+
 /// True if the resource's root looks like a bound (composite or geometry).
 pub fn is_bound(r: &Resource) -> bool {
     if r.sys.len() < 0x140 {

@@ -900,6 +900,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
             fs::create_dir_all(dir.join("buffers"))?;
             let r = Resource::load(&a.path, e)?;
             let mut info = crate::drawable::describe(&r);
+            let wheel_discs = if info.skeleton.iter().any(|b| b.name.starts_with("wheel_")) { crate::bounds::wheel_discs(&r) } else { Vec::new() };
             if let Some(name) = requested_member {
                 crate::drawable::select_member(&r, &mut info, name)?;
             }
@@ -1011,7 +1012,15 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 "geometry_bbox": geometry_bbox,
                 "geometry_bbox_note": "RAGE model space (Z-up) [min, max] over the primary meshes (LOD0, or the lowest populated LOD for a dictionary member), from the decoded vertices. Prefer it to drawable.bounds / bounds_raw: on some fragments and drawables the stored bbox is offset or rotated (route-sign prefabs, dn_20_scaffolding_02); the archetype definitions agree with the geometry.",
                 "meshes": mesh_meta,
-                "wheel_mounts": info.skeleton.iter().filter(|b| b.name.starts_with("wheel_") && b.name.len() <= 9 && b.pivot.is_some()).map(|b| serde_json::json!({"bone": b.name, "pivot": b.pivot})).collect::<Vec<_>>(),
+                "wheel_mounts": info.skeleton.iter().filter(|b| b.name.starts_with("wheel_") && b.name.len() <= 9 && b.pivot.is_some()).map(|b| {
+                    // the wheel's collision disc: the largest one on this axle
+                    // line (it can sit a few cm in or out of the bone's pivot)
+                    let p = b.pivot.unwrap_or_default();
+                    let d = wheel_discs.iter().filter(|d| (d.centre[0] - p[0]).abs() < 0.15 && (d.centre[1] - p[1]).abs() < 0.03 && (d.centre[2] - p[2]).abs() < 0.03).max_by(|a, b| a.radius.total_cmp(&b.radius));
+                    serde_json::json!({"bone": b.name, "pivot": b.pivot, "radius": d.map(|d| d.radius), "half_width": d.map(|d| d.half_width), "centre": d.map(|d| d.centre)})
+                }).collect::<Vec<_>>(),
+                "wheel_discs": wheel_discs,
+                "wheel_discs_note": "Disc bounds of the fragment's physics (type 8 children of its composite bound): centre, radius and half width in metres. The largest disc on a wheel bone's axle line is the wheel (its centre, radius and half_width are repeated in wheel_mounts); a thinner one is the brake disc.",
                 "wheel_mounts_note": "Wheel centres (model space, RAGE Z-up). Rims and tyres are shared models (rim_<class>_NNN, tyre_<class>_NNN) authored for the left-front at unit scale (rim radius 0.5); mirror X for right-hand wheels and scale by the vehicle's wheel size (not decoded yet).",
                 "drawable": info, "buffer_files": bufs, "texture_files": tex_files,
                 "materials": info.shaders.iter().zip(shader_tex.iter()).enumerate().map(|(si, (s, st))| {

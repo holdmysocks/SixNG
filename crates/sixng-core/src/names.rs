@@ -28,13 +28,13 @@ pub const DERIVED_EXACT: &[&str] = &["fMass", "fInitialDragCoeff", "fDriveBiasFr
     // map, light, vehicle, handling and material fields resolved against the
     // hashes in the format notes
     "timeFlags", "lightType", "handling", "slots", "options", "probability", "ParentName", "HandlingData", "StateName",
-    // from GTA6-Asset-Info pull request 86 (hash matches against public GTA V
-    // name lists): the variation sets' paint-colour list, the animation
+    // script-doc fields (01393259 element / attribute) and the head-skin States list; joaat of the name, 2026-11-23
+    "valueHash", "contentType", "childIndex", "States",
+    // hash matches against public GTA V name lists: the variation sets'
+    // paint-colour list, a vehicle configuration's body colour, the animation
     // rotation property, the minigame dialogue field next to MissionId, and
     // the wardrobe field that holds body-type words (the name fits loosely)
-    "colours", "bonerotation", "BankName", "pedtype",
-    // same method: the body colour of a vehicle configuration
-    "colour"];
+    "colours", "colour", "bonerotation", "BankName", "pedtype"];
 
 pub const DERIVED: &[&str] = &[
     // texture parameters of the minigame pack's water and interior shaders (joaat search, 2026-11-23)
@@ -330,6 +330,10 @@ mod tests {
         assert_eq!(joaat_exact("ParentName"), 0x49a0_1a86);
         assert_eq!(joaat_exact("HandlingData"), 0x41c8_dec7);
         assert_eq!(joaat_exact("StateName"), 0x3ead_dcd7);
+        assert_eq!(joaat_exact("valueHash"), 0x817e_d7a4);
+        assert_eq!(joaat_exact("contentType"), 0x2a8e_416f);
+        assert_eq!(joaat_exact("childIndex"), 0x0129_6aed);
+        assert_eq!(joaat_exact("States"), 0xebac_f18c);
         assert_eq!(joaat_exact("colours"), 0x8c86_6829);
         assert_eq!(joaat_exact("bonerotation"), 0x98e1_750c);
         assert_eq!(joaat_exact("BankName"), 0x8d6b_17bd);
@@ -338,6 +342,7 @@ mod tests {
         assert_eq!(lookup(0x8c86_6829, Ctx::Field).as_deref(), Some("colours"));
         assert_eq!(lookup(0x5bdc_13e3, Ctx::Field).as_deref(), Some("colour"));
         assert_eq!(lookup(0x49a0_1a86, Ctx::Field).as_deref(), Some("ParentName"));
+        assert_eq!(lookup(0x817e_d7a4, Ctx::Field).as_deref(), Some("valueHash"));
         // derived names resolve without a dictionary file
         assert_eq!(lookup(0xc8e8_c282, Ctx::Param).as_deref(), Some("diffusetex"));
     }
