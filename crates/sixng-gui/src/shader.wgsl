@@ -201,6 +201,8 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     if ((M.flags.w & 1024u) != 0u) {
         let ta = i.tint.a * 255.0;
         if (ta > 253.5 && ta < 254.5) { painted = true; }
+        // bit 12: a fitted wheel keeps its stand-in metal and roughness
+        else if ((M.flags.w & 4096u) != 0u) { }
         else if (ta < 100.5) { rough = clamp(ta / 100.0, 0.04, 1.0); metal = 0.0; }
         else if (ta < 201.5) { rough = clamp((ta - 101.0) / 100.0, 0.04, 1.0); metal = 1.0; }
     }

@@ -166,6 +166,11 @@ pub struct ModelView {
     /// Automation: the configuration to choose when a vehicle's data is applied (0-based).
     pub cfg_request: Option<usize>,
     part_look_done: Option<(PathBuf, usize)>,
+    /// The part colours on show (256 x RGBA, by part id), for the fitted
+    /// wheels: a rim's and a tyre's vertices carry part ids of the vehicle.
+    part_look_table: Option<Arc<Vec<[u8; 4]>>>,
+    /// The part colours the uploaded wheels were coloured with.
+    wheel_look: Option<Arc<Vec<[u8; 4]>>>,
     /// Vehicle lamps that are on.
     pub lamps: Lamps,
     /// The loaded model has lamp bones.
@@ -414,6 +419,8 @@ impl ModelView {
             part_look_want: None,
             cfg_request: None,
             part_look_done: None,
+            part_look_table: None,
+            wheel_look: None,
             lamps: Lamps::default(),
             has_lamps: false,
             bonnet_open: 0.0,
@@ -1504,22 +1511,36 @@ impl ModelView {
     /// (model.json `part_colours.looks`); the vertices' part ids are in their
     /// raw vertex colour alpha.
     fn sync_part_look(&mut self, rs: &egui_wgpu::RenderState) {
-        let Some(l) = self.loaded.as_mut() else { return };
+        let Some(l) = self.loaded.as_mut() else {
+            self.part_look_table = None;
+            return;
+        };
         let pc = &l.info["part_colours"];
         let default = pc["default"].as_u64();
-        let Some(idx) = self.part_look_want.as_ref().and_then(|k| pc["configs"][k.as_str()].as_u64()).or(default) else { return };
+        let Some(idx) = self.part_look_want.as_ref().and_then(|k| pc["configs"][k.as_str()].as_u64()).or(default) else {
+            self.part_look_table = None;
+            return;
+        };
         let idx = idx as usize;
+        let decode = |hex: &str| -> Arc<Vec<[u8; 4]>> { Arc::new((0..256).map(|i| std::array::from_fn(|k| u8::from_str_radix(&hex[i * 8 + k * 2..i * 8 + k * 2 + 2], 16).unwrap_or(255))).collect()) };
         // a freshly loaded model shows the default look
         let shown = match &self.part_look_done {
             Some((p, i)) if *p == l.model.path => Some(*i),
             _ => default.map(|d| d as usize),
         };
+        let Some(hex) = pc["looks"][idx].as_str().filter(|h| h.len() == 2048) else {
+            self.part_look_table = None;
+            return;
+        };
         if shown == Some(idx) {
+            if self.part_look_done.as_ref() != Some(&(l.model.path.clone(), idx)) || self.part_look_table.is_none() {
+                self.part_look_table = Some(decode(hex));
+            }
             self.part_look_done = Some((l.model.path.clone(), idx));
             return;
         }
-        let Some(hex) = pc["looks"][idx].as_str().filter(|h| h.len() == 2048) else { return };
-        let look: Vec<[u8; 4]> = (0..256).map(|i| std::array::from_fn(|k| u8::from_str_radix(&hex[i * 8 + k * 2..i * 8 + k * 2 + 2], 16).unwrap_or(255))).collect();
+        let look = decode(hex);
+        self.part_look_table = Some(look.clone());
         let parts: Vec<bool> = l.model.materials.iter().map(|m| m.parts).collect();
         for m in l.model.meshes.iter_mut().filter(|m| m.material.is_some_and(|k| parts.get(k).copied().unwrap_or(false))) {
             for v in m.verts.iter_mut() {
@@ -1576,8 +1597,30 @@ impl ModelView {
         // bones) to the tyre radius. The instances scale the whole wheel to
         // the tyre radius, so here everything but the tread is scaled by
         // rim ratio x tyre model radius / rim model radius.
-        if !self.wheel_src.is_empty() && self.rim_baked != self.rim_ratio {
+        let look_changed = match (&self.wheel_look, &self.part_look_table) {
+            (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
+            (None, None) => false,
+            _ => true,
+        };
+        if !self.wheel_src.is_empty() && (self.rim_baked != self.rim_ratio || look_changed) {
             self.rim_baked = self.rim_ratio;
+            self.wheel_look = self.part_look_table.clone();
+            // Rim and tyre colours: their vertices carry part ids of the
+            // vehicle they are fitted to (vertex colour alpha), coloured
+            // from the vehicle's part colours like its own parts.
+            for l in self.wheel_src.iter_mut() {
+                let wheel: Vec<bool> = l.model.materials.iter().map(|m| m.name.ends_with(RIM_SHADER) || m.name.ends_with("_99ad6fc9")).collect();
+                for (k, m) in l.model.materials.iter_mut().enumerate() {
+                    if wheel[k] {
+                        m.parts = self.wheel_look.is_some();
+                    }
+                }
+                for m in l.model.meshes.iter_mut().filter(|m| m.material.is_some_and(|k| wheel.get(k).copied().unwrap_or(false))) {
+                    for v in m.verts.iter_mut() {
+                        v.tint = self.wheel_look.as_ref().map_or([255; 4], |t| t[v.col[3] as usize]);
+                    }
+                }
+            }
             let k = rim_factor(&self.wheel_boxes, self.rim_ratio);
             for (l, orig) in self.wheel_src.iter_mut().zip(&self.wheel_orig) {
                 let tread: Vec<bool> = l.model.joints.iter().map(|j| j.name.to_ascii_lowercase().contains("tread_profile")).collect();
@@ -1600,8 +1643,10 @@ impl ModelView {
                     // rims take the rim colour (the game sets it per
                     // vehicle; it is not in the files)
                     for (k, m) in l.model.materials.iter().enumerate() {
-                        if m.name.ends_with(RIM_SHADER) {
-                            ren.set_material_base(rs, &mut g, k, [c[0], c[1], c[2], 1.0]);
+                        if m.name.ends_with(RIM_SHADER) || (m.parts && m.name.ends_with("_99ad6fc9")) {
+                            // with part colours the vertices carry the colour
+                            let b = if m.parts { [1.0, 1.0, 1.0, 1.0] } else { [c[0], c[1], c[2], 1.0] };
+                            ren.set_material_base(rs, &mut g, k, b);
                         }
                     }
                     g
