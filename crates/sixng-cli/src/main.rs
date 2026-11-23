@@ -509,6 +509,28 @@ enum Cmd {
         #[arg(long)]
         sprites: bool,
     },
+    /// Timecycle, weather and cloud data (the plain XML files of common.rpf):
+    /// every timecycle modifier (name, attributes, submodifiers, each
+    /// variable's two numbers and the keyframes of animated ones), every
+    /// weather cycle (per region, one number per time sample), the time
+    /// samples, the weather types and the custom cloud groups. The archive
+    /// has no file names; modifier files are named from the game's own file
+    /// list by packing order and content (`fit`). Prints the summary and the
+    /// modifiers matching --name (default: the arcade minigame set, i.e.
+    /// TC_mods_Arcade_Games and every arcade modifier, with the
+    /// submodifiers they use). With -o writes <out>/timecycle/: modifiers,
+    /// cycles, time_samples, weather, custom_clouds, variables, files and
+    /// selected (.json).
+    Timecycle {
+        /// Archive (default common).
+        #[arg(default_value = "common")]
+        archive: String,
+        /// Regex on modifier name or file name (case-insensitive).
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
     /// Fonts of the UI movies (Scaleform font libraries in data.rpf:
     /// DefineFont3 outlines, code table, layout). Lists them as JSON; with
     /// -o writes <out>/fonts/<name>.ttf (TrueType, for CSS @font-face) and
@@ -1543,6 +1565,40 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 std::fs::write(dir.join("index.json"), serde_json::to_vec_pretty(&found.iter().map(|x| &x.0).collect::<Vec<_>>())?)?;
             }
             out.print(&json!({"ok": true, "archive": a.id, "count": found.len(), "dictionaries": found.iter().map(|x| &x.0).collect::<Vec<_>>()}));
+        }
+        Cmd::Timecycle { archive, name, out: po } => {
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            let entries: Vec<&sixng_core::scan::Entry> = ix.entries.iter().collect();
+            let d = sixng_core::timecycle::decode(&a.path, &entries)?;
+            let pat = name.clone().unwrap_or_else(|| "arcade".to_string());
+            let re = regex::RegexBuilder::new(&pat).case_insensitive(true).build()?;
+            let sel = sixng_core::timecycle::select(&d.modifiers, &re);
+            let re_clouds = regex::RegexBuilder::new(&pat).case_insensitive(true).build()?;
+            let clouds: Vec<serde_json::Value> = d.clouds.pointer("/CustomCloudGroupList").and_then(|v| v.as_array()).map(|g| g.iter().filter(|x| re_clouds.is_match(x["Name"].as_str().unwrap_or(""))).cloned().collect()).unwrap_or_default();
+            let summary = json!({
+                "archive": a.id,
+                "modifiers": d.modifiers.len(),
+                "cycles": d.cycles.iter().map(|c| c["name"].clone()).collect::<Vec<_>>(),
+                "hours": d.time["samples"].as_array().map(|s| s.iter().map(|x| x["hour"].clone()).collect::<Vec<_>>()),
+                "files": d.files,
+                "listed_missing": d.missing,
+            });
+            let selected = json!({"pattern": pat, "modifiers": sel, "custom_clouds": clouds});
+            if let Some(po) = po {
+                let dir = po.join("timecycle");
+                std::fs::create_dir_all(&dir)?;
+                let w = |f: &str, v: &serde_json::Value| -> Result<()> { Ok(std::fs::write(dir.join(f), serde_json::to_vec_pretty(v)?)?) };
+                w("modifiers.json", &json!(d.modifiers))?;
+                w("cycles.json", &json!({"hours": summary["hours"], "time_samples": d.time, "cycles": d.cycles}))?;
+                w("time_samples.json", &d.time)?;
+                w("weather.json", &d.weather)?;
+                w("custom_clouds.json", &d.clouds)?;
+                w("variables.json", &sixng_core::timecycle::variables(&d))?;
+                w("files.json", &summary)?;
+                w("selected.json", &selected)?;
+            }
+            out.print(&json!({"ok": true, "summary": summary, "selected": selected}));
         }
         Cmd::Fonts { archive, name, out: po } => {
             let a = ws.resolve(archive)?;

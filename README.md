@@ -257,6 +257,9 @@ ames.json; exports and the app use it.
 .\target\release\sixng.exe outfit hiker_m -o work\out\hiker.glb --parts '^head_mr1_cau_000_m_full','^hand_mr1_000_tshirt','^feet_mr1_000_shortsmid','^tshirtcrewneck_mr1_000.*_full$','^shortscargo_mr1_000','^bootshiking_mr1','^backpackhiking'
 # Particle effect dictionaries: names, rule names, keyframe curves
 .\target\release\sixng.exe ptfx data --name scr_arc -o work\out
+# Timecycle modifiers, weather cycles, time samples, weather types, custom clouds (common.rpf, ~2 s);
+# prints the arcade set (or --name <regex>), -o writes everything
+.\target\release\sixng.exe timecycle -o work\out
 # UI fonts (Scaleform font libraries) as TrueType + three.js typeface JSON
 .\target\release\sixng.exe fonts data -o work\out
 # A vehicle with its body colour (sRGB hex; e.g. srgb_if_linear from vehicles.json)
@@ -307,6 +310,8 @@ checked by rendering (eagle flap, deer walk/run/idle: 91–97 % of tracks land
 on a joint). Animals have a 180° yaw on `SKEL_ROOT` in the bind pose that
 the clips do not carry, so an animated animal faces the other way from its
 bind pose.
+
+**Timecycle and fog** (`sixng timecycle [archive=common] [--name <regex>] [-o <dir>]`, since 2026-11-23): the timecycle data are plain XML files in `common.rpf`, so every variable comes out by name. The archive has no file names; documents are recognised by their root element, and some entries hold several documents back to back (all are read). **Modifiers** (4,593 in 50 files): name, `description`, `group_apply_tag`, `local_apply_index`, `user_flags`, `submodifiers`, and per variable its two numbers as `value` (what the modifier sets) and `b` (meaning not known: 0 in 88 % of records, 1 in 10 %); animated modifiers add `axes` (control value, blend type, one number per keyframe), the weather modules add `high_level_vars` blocks (input/output ranges), and a variable written twice with different numbers is listed under `repeated` (one case; the JSON keeps the last). Each modifier file is named from the game's own list (`TC_Files.meta`) by aligning the packing order (case-insensitive name order) with the modifier names (`fit` in `files.json`: share of names that carry the area code or a word of the file name); all 50 listed files are matched. **Weather cycles** (27 keyframe files, `W_<NAME>.XML` from the weather list): per region (`GLOBAL`, `URBAN`) one number per time sample for about 1,000 variables (light, sky, fog, clouds, post-fx, water …), plus the `High_Level_Vars`; the 13 samples are hours 0, 4, 5, 6, 7, 9, 12, 16, 18, 19, 20, 21 and 22 with their interpolation (`time_samples.json`). `weather.json` (25 weather types and their mods) and `custom_clouds.json` (26 scripted cloud groups) are the same XML as generic JSON. `variables.json` lists the 1,426 variable names with their family (`fog`, `sky`, `postfx` …) and how many modifiers and cycles set them. The **arcade minigames** use the 34 modifiers of `TC_mods_Arcade_Games.xml` (`ARCADE_*`: per-game looks, fog sections, DOF and colour submodifiers), the arcade modifiers of `TC_mods_APFX.xml` (`Overlay_ArcadeCabinetCRT`: `postfx_noise` 1.0, `postfx_noise_size` 0.6, `postfx_exposure_perpixel_amount` 0.75; `ArcadeGame_*`, `ArcadeShooter_*`) and the `arcade_TwinStickShooter` cloud group; the default selection prints those with the 6 submodifiers from other files that they use. The minigame pack itself has no timecycle files. What the engine does with each variable, how strongly a modifier is applied at run time (script or volume strength), and the meaning of `b` and of `user_flags` are not in the data.
 
 **Particle effects** (`sixng ptfx`): the effect dictionaries are unnamed
 resources with small embedded `keyframeTexture`s (16 × 4 half-float RGBA
