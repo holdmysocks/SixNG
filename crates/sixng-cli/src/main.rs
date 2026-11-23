@@ -153,7 +153,7 @@ impl OutArgs {
                     std::process::exit(2);
                 }
             }),
-            tex_remap: Default::default(), ped_tints: Default::default(),
+            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(),
         }
     }
 }
@@ -698,6 +698,29 @@ enum Cmd {
         /// (tint 0). Parts without one are shaded grey.
         #[arg(long, value_delimiter = ',')]
         tint: Vec<String>,
+        /// Use outfit N (0 = the first) of the game's outfit list for this
+        /// model instead of its own parts: clothes, skin meshes, head, eyes
+        /// and teeth (`ped-look` lists the outfits). The head gets the face
+        /// its outfit item names, and parts with a stored tint their tint.
+        /// Stored flat colours, colour tags, the body skin tone and strand
+        /// hair are viewer features and are not in the export.
+        #[arg(long)]
+        look: Option<usize>,
+    },
+    /// The outfits of a character model, from the game's outfit list and the
+    /// model's wardrobe resource (needs the `texture-users` index): per
+    /// outfit its parts (slot, drawable, tint, hair asset), the body-shape
+    /// preset and what did not resolve. The first outfit is the default look
+    /// of the viewer.
+    PedLook {
+        /// Model name (`cs_ali`, `player_story000_00`), or a regex starting
+        /// with `^` for one summary row per matching character (outfit
+        /// count, and whether the default outfit has a head, a body, clothes,
+        /// shoes and hair).
+        model: String,
+        /// Archive holding the parts.
+        #[arg(long, default_value = "packs")]
+        archive: String,
     },
     /// Characters and animals that `outfit` can assemble: named characters
     /// (outfit prefixes such as cs_ali, sc_slow_demon) and animal roots
@@ -930,7 +953,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 out.print(&json!({"ok": true, "results": v}));
             }
         }
-        Cmd::Outfit { character, out: glb, archive, parts, add, list, clip, anim_only, tex, body_shape, head_skin, tex_remap, tint } => {
+        Cmd::Outfit { character, out: glb, archive, parts, add, list, clip, anim_only, tex, body_shape, head_skin, tex_remap, tint, look } => {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
             let prefix = character.to_ascii_lowercase();
@@ -938,7 +961,20 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let opts = if animal { sixng_core::outfit::animal_options(&ix, &prefix) } else { sixng_core::outfit::outfit_options(&ix, &prefix) };
             // a name with no parts of its own is an ad-hoc character made of
             // --parts (generic world peds: head, hand, feet, clothing items)
-            if opts.is_empty() && parts.is_empty() {
+            // --look: the parts of one outfit of the game's outfit list
+            let look_parts: Vec<(u64, sixng_core::pedlook::LookPart)> = match look {
+                Some(k) => {
+                    let l = sixng_core::pedlook::look(&ws.game, &a, &ix, &prefix).map_err(|e| anyhow!(e))?;
+                    let o = l.outfits.get(*k).ok_or_else(|| anyhow!("{prefix} has {} outfits (--look 0..{})", l.outfits.len(), l.outfits.len().saturating_sub(1)))?;
+                    let by_name = sixng_core::outfit::dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
+                        let n = e.name.as_ref()?.to_ascii_lowercase();
+                        o.parts.iter().any(|p| !p.strands && p.drawable == n).then_some((n, e))
+                    }));
+                    o.parts.iter().filter(|p| !p.strands).filter_map(|p| Some((by_name.get(&p.drawable)?.off, p.clone()))).collect()
+                }
+                None => Vec::new(),
+            };
+            if opts.is_empty() && parts.is_empty() && look_parts.is_empty() {
                 bail!("no parts named {prefix}_<item>_<fit>_… (characters) or {prefix}_<part>_NN (animals) in {} (`sixng search '^{prefix}_'` to check the name), and no --parts for an ad-hoc character", a.id);
             }
             if *list {
@@ -966,7 +1002,13 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 }
                 Ok(v)
             };
-            let mut offs: Vec<u64> = if parts.is_empty() { opts.iter().filter(|o| o.default).map(|o| o.off).collect() } else { pick(parts)? };
+            let mut offs: Vec<u64> = if !parts.is_empty() {
+                pick(parts)?
+            } else if !look_parts.is_empty() {
+                look_parts.iter().map(|p| p.0).collect()
+            } else {
+                opts.iter().filter(|o| o.default).map(|o| o.off).collect()
+            };
             for o in pick(add)? {
                 if !offs.contains(&o) {
                     offs.push(o);
@@ -1006,6 +1048,14 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 let hex = |s: &str| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).map_err(|_| anyhow!("--tex-remap: bad hash {s:?}"));
                 eo.tex_remap.insert(hex(k)?, hex(v)?);
             }
+            for (_, p) in &look_parts {
+                if p.slot == "head" && !p.skins.is_empty() {
+                    eo.part_skins.insert(p.drawable.clone(), p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect());
+                }
+                if let Some((pal, t)) = p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t))) {
+                    eo.ped_tints.insert(p.drawable.clone(), (pal, t.rows));
+                }
+            }
             for t in tint {
                 let (name, pal, rows) = sixng_core::pedtint::parse_spec(t).map_err(|e| anyhow!(e))?;
                 eo.ped_tints.insert(name, (pal, rows));
@@ -1013,6 +1063,30 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let mut r = sixng_core::outfit::export_outfit(&a, &sel, &prefix, &glb, &eo, &clip_refs, *anim_only)?;
             r["seconds"] = t.elapsed().as_secs_f64().into();
             out.print(&json!({"ok": true, "result": r}));
+        }
+        Cmd::PedLook { model, archive } => {
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            // a regex (starts with ^): one summary line per matching character
+            if model.starts_with('^') {
+                let re = regex::RegexBuilder::new(model).case_insensitive(true).build()?;
+                let mut rows = Vec::new();
+                for c in sixng_core::outfit::characters(&ix).into_iter().filter(|c| c.kind == "character" && re.is_match(&c.name)) {
+                    rows.push(match sixng_core::pedlook::look(&ws.game, &a, &ix, &c.name) {
+                        Ok(l) => {
+                            let o = &l.outfits[0];
+                            let has = |s: &str| o.parts.iter().any(|p| p.slot == s);
+                            json!({"model": c.name, "outfits": l.outfits.len(), "fit": l.fit, "default": o.label, "parts": o.parts.len(), "head": has("head"), "eyes": has("eyes"), "body": has("body upper") && has("body lower"),
+                                "clothed": has("full") || (has("top") || has("outer")) && has("bottom"), "shoes": has("feet"), "hair": o.parts.iter().filter(|p| p.slot == "hair").map(|p| p.guid.clone().unwrap_or_default()).next(), "unresolved": o.unresolved.len()})
+                        }
+                        Err(e) => json!({"model": c.name, "error": e}),
+                    });
+                }
+                out.print(&json!({"ok": true, "count": rows.len(), "characters": rows}));
+                return Ok(());
+            }
+            let l = sixng_core::pedlook::look(&ws.game, &a, &ix, model).map_err(|e| anyhow!(e))?;
+            out.print(&json!({"ok": true, "look": l}));
         }
         Cmd::Characters { name, kind, archive } => {
             let a = ws.resolve(archive)?;

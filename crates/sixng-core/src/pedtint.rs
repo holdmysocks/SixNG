@@ -164,6 +164,44 @@ pub fn bake(shade: &[u8], tint: Option<(&Palette, u8)>) -> Vec<u8> {
     }).collect()
 }
 
+/// The colour words of the wardrobe colour tag (`e60617ae`): 18 names cover
+/// 99.5 % of the tagged items. The RGB values are ours (a plain rendering of
+/// the word, sRGB), not game data.
+pub const COLOUR_WORDS: &[(&str, [u8; 3])] = &[
+    ("black", [28, 28, 30]),
+    ("blue", [52, 84, 150]),
+    ("white", [235, 235, 232]),
+    ("brown", [104, 72, 48]),
+    ("gold", [201, 162, 74]),
+    ("grey", [128, 130, 133]),
+    ("khaki", [176, 158, 116]),
+    ("red", [170, 36, 40]),
+    ("silver", [186, 188, 192]),
+    ("navy", [30, 42, 84]),
+    ("pink", [224, 140, 168]),
+    ("green", [56, 118, 70]),
+    ("purple", [110, 62, 140]),
+    ("olive", [98, 104, 58]),
+    ("yellow", [224, 196, 64]),
+    ("orange", [220, 120, 40]),
+    ("cream", [236, 226, 198]),
+    ("beige", [212, 196, 164]),
+];
+
+/// The colour word a tag value names (the joaat of the word in lower case,
+/// capitalised or upper case).
+pub fn colour_word(h: u32) -> Option<(&'static str, [u8; 3])> {
+    COLOUR_WORDS.iter().copied().find(|(w, _)| {
+        let cap: String = w[..1].to_ascii_uppercase() + &w[1..];
+        [w.to_string(), cap, w.to_ascii_uppercase()].iter().any(|s| crate::names::joaat_exact(s) == h)
+    })
+}
+
+/// The colour word nearest to an sRGB colour.
+pub fn nearest_word(c: [u8; 3]) -> &'static str {
+    COLOUR_WORDS.iter().min_by_key(|(_, w)| (0..3).map(|k| (w[k] as i32 - c[k] as i32).pow(2)).sum::<i32>()).map(|x| x.0).unwrap_or("grey")
+}
+
 /// The palettes of `textures.rpf` by name hash (read once per run).
 pub fn palettes(game_root: &Path) -> Result<&'static HashMap<u32, Palette>, String> {
     static P: OnceLock<Result<HashMap<u32, Palette>, String>> = OnceLock::new();

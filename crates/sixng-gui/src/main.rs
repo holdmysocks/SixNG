@@ -758,7 +758,7 @@ Optional layers not exported yet (the map works without them): {}.", opt.join(",
             body_shape,
             head_skin: self.head_skin,
             paint: None,
-            tex_remap: Default::default(), ped_tints: Default::default(),
+            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(),
         };
         self.start_task(
             &format!("Extracting {} entries", idxs.len()),
@@ -1641,6 +1641,13 @@ impl App {
             m.cam.pitch = v;
         }
         m.zoom_after_load = c.f("zoom");
+        // --body <weight>,<muscle>: body shape of characters (-1..1, 0..1)
+        if let Some(v) = c.get("body") {
+            let v: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            if !v.is_empty() {
+                m.set_body_shape((v[0].clamp(-1.0, 1.0), v.get(1).copied().unwrap_or(0.0).clamp(0.0, 1.0)));
+            }
+        }
         if let Some(q) = c.get("model") {
             self.tab = Tab::Model;
             let lod = c.u("lod").unwrap_or(0) as usize;

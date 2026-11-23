@@ -128,6 +128,11 @@ fn slot(item: &str) -> Option<&'static str> {
     SLOTS.iter().filter(|(w, _)| item.starts_with(w)).max_by_key(|(w, _)| w.len()).map(|(_, s)| *s)
 }
 
+/// Slot or accessory group of an item word, else the word itself.
+pub fn slot_word(item: &str) -> String {
+    slot(item).map(|s| s.replace('_', " ")).or_else(|| accessory_group(item).map(str::to_string)).unwrap_or_else(|| item.to_string())
+}
+
 /// Group of an accessory item word (`hatflatcap` → hat); None = its own word.
 fn accessory_group(item: &str) -> Option<&'static str> {
     const G: &[(&str, &str)] = &[
@@ -573,7 +578,7 @@ mod tests {
         let parts = outfit_parts(&ix, "player_story000_00");
         assert!(parts.len() >= 5, "{} parts", parts.len());
         let out = std::env::temp_dir().join("sixng_outfit_real").join("outfit.glb");
-        let o = ExportOptions { out: out.parent().unwrap().into(), png: false, dds: false, raw: false, force: true, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default() };
+        let o = ExportOptions { out: out.parent().unwrap().into(), png: false, dds: false, raw: false, force: true, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default() };
         let r = export_outfit(&a, &parts, "player_story000_00", &out, &o, &[(&d, clip)], false).unwrap();
         println!("{}", serde_json::to_string_pretty(&r).unwrap());
         assert_eq!(r["unresolved_influences"], 0);

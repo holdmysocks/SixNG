@@ -283,6 +283,12 @@ pub struct ExportOptions {
     /// Parts without one are shaded grey (`pedtint`).
     #[serde(default)]
     pub ped_tints: std::collections::HashMap<String, (u32, [u8; 3])>,
+    /// Colour and normal textures (store hashes) for drawables that bind no
+    /// colour texture, by lower-case drawable name, best first: a head's
+    /// face from its outfit item (`pedlook`). The first one found in a
+    /// store is used; without one the head-skin table decides.
+    #[serde(default)]
+    pub part_skins: std::collections::HashMap<String, Vec<(u64, u64)>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1411,6 +1417,33 @@ struct SkinSetup {
 /// model.json. None when not a head.
 fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Shader], o: &ExportOptions, item: &mut ExportedItem) -> Option<(Vec<crate::drawable::Shader>, serde_json::Value)> {
     let name = e.name.as_deref()?;
+    let tex = |param_hash: &str, h: u64| crate::drawable::TexRef { param: 0, param_hash: param_hash.into(), hash64: format!("{h:016x}"), hash32: String::new() };
+    // the face the outfit item names, on every shader without a colour texture
+    if let Some(list) = o.part_skins.get(&name.to_ascii_lowercase()) {
+        let set = crate::ttpf::global(&game_root(a));
+        // a shader has its colour texture when the one it binds is in a store
+        let stored = |t: &crate::drawable::TexRef| u64::from_str_radix(&t.hash64, 16).is_ok_and(|h| set.get(h).is_some());
+        let has_albedo = |s: &crate::drawable::Shader| s.textures.iter().any(|t| ALBEDO_PARAMS.contains(&t.param_hash.as_str()) && stored(t));
+        if let (Some(&(alb, nrm)), true) = (list.iter().find(|s| set.get(s.0).is_some()), shaders.iter().any(|s| !has_albedo(s))) {
+            let sh = shaders
+                .iter()
+                .map(|s| {
+                    let mut s = s.clone();
+                    if !has_albedo(&s) {
+                        s.textures.retain(|t| !ALBEDO_PARAMS.contains(&t.param_hash.as_str()));
+                        s.textures.push(tex(ALBEDO_PARAMS[0], alb));
+                        if nrm != 0 && set.get(nrm).is_some() && !s.textures.iter().any(|t| t.param_hash == "1e77bf4c" && stored(t)) {
+                            s.textures.retain(|t| t.param_hash != "1e77bf4c");
+                            s.textures.push(tex("1e77bf4c", nrm));
+                        }
+                    }
+                    s
+                })
+                .collect();
+            let rec = serde_json::json!({"source": "outfit item", "group": "", "index": 0, "count": 1, "albedo": format!("{alb:016x}"), "normal": format!("{nrm:016x}")});
+            return Some((sh, rec));
+        }
+    }
     if !crate::headskin::is_head(name) || shaders.iter().any(|s| !s.textures.is_empty()) {
         return None;
     }
@@ -1427,7 +1460,6 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
         return None;
     };
     let rec = serde_json::json!({"source": c.source, "group": c.group, "index": c.index, "count": c.count, "albedo": format!("{:016x}", c.skin.albedo), "normal": format!("{:016x}", c.skin.normal)});
-    let tex = |param_hash: &str, h: u64| crate::drawable::TexRef { param: 0, param_hash: param_hash.into(), hash64: format!("{h:016x}"), hash32: String::new() };
     let sh = shaders
         .iter()
         .map(|s| {
@@ -3021,7 +3053,7 @@ mod dictionary_tests {
         let a = ArchiveInfo { id: "levels.rpf".into(), path: work.join("levels.rpf"), size: archive.len() as u64, container: "rpf9".into() };
         fs::write(&a.path, archive).unwrap();
         let o = ExportOptions { out: work.join("out"), png: false, dds: false, raw: false,
-            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default() };
+            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default() };
         let dir = o.out.join("models/levels").join(export_base_name(&e));
         fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("model.json");

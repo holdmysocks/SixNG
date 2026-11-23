@@ -83,6 +83,63 @@ pub struct Loaded {
     /// Animals: skin samples (RAGE model space position, linear colour) the
     /// fur takes its colour from.
     pub fur_skin: SkinColours,
+    /// Characters: the outfits of the game's outfit list (`pedlook`) and the
+    /// one shown.
+    pub look: Option<LookInfo>,
+}
+
+/// A character's outfits, for the Parts panel.
+#[derive(Clone, Default)]
+pub struct LookInfo {
+    pub model: String,
+    pub labels: Vec<String>,
+    pub current: usize,
+    /// Body-shape preset of the outfit shown.
+    pub body_shape: Option<String>,
+    /// Strand-hair assets of the outfit shown: (slot, placeholder name, asset GUID).
+    pub strands: Vec<(String, String, String)>,
+    /// What the viewer did or could not do (skin tone source, unresolved items).
+    pub notes: Vec<String>,
+    /// Strand hair found for the outfit's hair assets (`hairlink`).
+    pub hair: Vec<HairPick>,
+}
+
+/// The grooms of one hair asset of an outfit.
+#[derive(Clone)]
+pub struct HairPick {
+    /// hair, brows, beard, lashes, body hair
+    pub slot: String,
+    /// The placeholder the grooms were placed under.
+    pub placeholder: String,
+    /// Model probability of the placement (0..1); under 0.5 it is a guess
+    /// and starts hidden.
+    pub confidence: f32,
+    pub grooms: Vec<u64>,
+}
+
+/// Colouring of one loaded part of an outfit.
+#[derive(Clone, Default)]
+pub struct PartFx {
+    /// Tint palette (name hash) and row of tint 0.
+    pub tint: Option<(u32, u8)>,
+    /// Flat colour of the item (sRGB).
+    pub colour: Option<[u8; 3]>,
+    /// Colour word of the item's colour tag.
+    pub tag: Option<&'static str>,
+    pub head: bool,
+    /// A skin mesh without a colour texture: takes the head's neck tone.
+    pub body: bool,
+    /// Heads: the face textures the outfit item names (colour, normal).
+    pub skins: Vec<(u64, u64)>,
+    /// Skin, head, eyes and teeth: skinned to the shared skeleton only, so
+    /// the body-shape rig moves them. Everything else follows the skin.
+    pub skeletal: bool,
+    /// A garment that covers skin (top, jacket, trousers, dress, shoes,
+    /// gloves): skin right under it is hidden.
+    pub covers: bool,
+    /// A shoe with a heel (name token `sh`, `mh` or `hh`; flat ones have
+    /// `fh`): the feet are posed into it.
+    pub heel: bool,
 }
 
 /// A finished load, tagged with the request it answers.
@@ -90,6 +147,10 @@ type Pending = Arc<Mutex<Option<(u64, Result<Loaded, String>)>>>;
 
 /// Face variant the viewer exports ped heads with (`ExportOptions::head_skin`).
 pub static HEAD_SKIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Body shape the viewer exports outfit parts with: (weight -1..1, muscle
+/// 0..1), the game's body-shape rig on the shared skeleton
+/// (`ExportOptions::body_shape`, `allweight` / `allmuscle`).
+pub static BODY_SHAPE: Mutex<(f32, f32)> = Mutex::new((0.0, 0.0));
 /// Last head exported for the viewer: (variant, variant count, source).
 static HEAD_SKIN_SEEN: Mutex<Option<(usize, usize, String)>> = Mutex::new(None);
 
@@ -206,6 +267,8 @@ pub struct ModelView {
     last_shot: Option<String>,
     pub zoom_after_load: Option<f32>,
     keep_cam_once: bool,
+    /// Body shape of the character shown (`BODY_SHAPE` when it was loaded).
+    body_shape_shown: (f32, f32),
     pub wheels_on: bool,
     pub wheel_rim: String,
     /// Rim colour (linear). The game sets it per vehicle at runtime and no
@@ -265,6 +328,8 @@ pub type SkinColours = Arc<Vec<([f32; 3], [u8; 3])>>;
 /// Strand hair / fur shown with the model: grooms picked from the packs
 /// catalog (no groom-to-ped link is stored), drawn as crossed ribbons.
 pub struct Hair {
+    /// The character outfit the selection was made for (`model#outfit`).
+    pub look_key: String,
     catalog: Arc<Mutex<Option<GroomList>>>,
     list: Option<GroomList>,
     listing: bool,
@@ -305,6 +370,7 @@ pub struct Hair {
 impl Default for Hair {
     fn default() -> Self {
         Hair {
+            look_key: String::new(),
             catalog: Arc::new(Mutex::new(None)),
             list: None,
             listing: false,
@@ -456,6 +522,7 @@ impl ModelView {
             last_shot: None,
             zoom_after_load: None,
             keep_cam_once: false,
+            body_shape_shown: (0.0, 0.0),
             wheels_on: true,
             wheel_rim: "rim_muscle_001_hi".into(),
             rim_colour: RIM_ALLOY,
@@ -876,6 +943,12 @@ impl ModelView {
         Path::new(&self.work).join(crate::GUI_CACHE)
     }
 
+    /// Body shape for characters (weight, muscle), before a model is opened.
+    pub fn set_body_shape(&mut self, shape: (f32, f32)) {
+        *BODY_SHAPE.lock().unwrap() = shape;
+        self.body_shape_shown = shape;
+    }
+
     /// Open by entry id, name regex or .glb path, on a worker thread.
     pub fn open(&mut self, query: &str, lod: usize, ctx: &egui::Context) {
         self.query = query.to_string();
@@ -917,6 +990,84 @@ impl ModelView {
                 )
                 .collect(),
         )
+    }
+
+    /// Character panel: the outfit of the game's outfit list, the body shape
+    /// and what the viewer filled in. Returns the query to reload with.
+    fn look_ui(&mut self, ui: &mut egui::Ui) -> Option<String> {
+        let l = self.loaded.as_ref()?;
+        let look = l.look.as_ref()?;
+        let mut reload = None;
+        ui.heading("Character");
+        egui::Grid::new("look_grid").num_columns(2).show(ui, |ui| {
+            ui.label("Outfit");
+            let text = |k: usize| format!("{}: {}", k + 1, look.labels.get(k).map(String::as_str).unwrap_or("?"));
+            egui::ComboBox::from_id_salt("look_outfit").selected_text(text(look.current)).width(240.0).show_ui(ui, |ui| {
+                for k in 0..look.labels.len() {
+                    let label = if k == 0 { format!("{}  (default)", text(k)) } else { text(k) };
+                    if ui.selectable_label(k == look.current, label).clicked() && k != look.current {
+                        let base = l.base.split("#look=").next().unwrap_or(&l.base);
+                        reload = Some(format!("{base}#look={k}"));
+                    }
+                }
+            });
+            ui.end_row();
+        });
+        ui.label(egui::RichText::new("The outfits the game lists for this character, in its order. The first one is shown by default.").weak().small());
+        let mut shape = *BODY_SHAPE.lock().unwrap();
+        let before = shape;
+        let mut released = false;
+        ui.horizontal(|ui| {
+            ui.label("Body");
+            released |= ui.add(egui::Slider::new(&mut shape.0, -1.0..=1.0).text("weight")).on_hover_text("The game's body-shape rig on the shared skeleton (all weight controls). Body and clothes follow the same bones, so the clothes change with the body.").drag_stopped();
+        });
+        ui.horizontal(|ui| {
+            ui.label("        ");
+            released |= ui.add(egui::Slider::new(&mut shape.1, 0.0..=1.0).text("muscle")).drag_stopped();
+            if ui.button("Reset").clicked() {
+                shape = (0.0, 0.0);
+                released = true;
+            }
+        });
+        if let Some(p) = &look.body_shape {
+            ui.label(egui::RichText::new(format!("Body-shape preset of this outfit: {p} (its control values are not applied; the sliders start neutral).")).weak().small());
+        }
+        if shape != before {
+            *BODY_SHAPE.lock().unwrap() = shape;
+        }
+        // reload when a drag ends (or a value was typed), not on every step
+        if (released || !ui.ctx().input(|i| i.pointer.any_down())) && shape != self.body_shape_shown {
+            self.body_shape_shown = shape;
+            reload = reload.or_else(|| Some(self.query.clone()));
+        }
+        for n in &look.notes {
+            ui.label(egui::RichText::new(n).weak().small());
+        }
+        if !look.hair.is_empty() {
+            ui.label("Hair");
+            for h in &look.hair {
+                let mut on = !h.grooms.is_empty() && h.grooms.iter().all(|g| self.hair.selected.contains(g));
+                let name = h.placeholder.trim_end_matches("_full");
+                let text = format!("{}: {name} ({:.0} %)", h.slot, h.confidence * 100.0);
+                if ui.checkbox(&mut on, text).on_hover_text("The strand grooms placed for this hair asset. Nothing in the game files links a hair asset to its strand files; they are placed by name words, archive order, piece counts and where the strand roots lie. The percentage is that model's probability of this placement: under 50 % it is a guess and starts hidden.").changed() {
+                    self.hair.selected.retain(|g| !h.grooms.contains(g));
+                    if on {
+                        self.hair.selected.extend(h.grooms.iter().copied());
+                    }
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.label("colour");
+                ui.color_edit_button_rgb(&mut self.hair.colour);
+                ui.label(egui::RichText::new("(the hair colour of an outfit is not decoded: pick one)").weak().small());
+            });
+        }
+        let unplaced: Vec<&str> = look.strands.iter().filter(|s| !look.hair.iter().any(|h| h.slot == s.0)).map(|s| s.1.as_str()).collect();
+        if !unplaced.is_empty() {
+            ui.label(egui::RichText::new(format!("Strand hair with no grooms placed: {}", unplaced.join(", "))).weak().small());
+        }
+        ui.separator();
+        reload
     }
 
     /// Parts panel for animals and characters: one choice (or none) per
@@ -1050,7 +1201,7 @@ impl ModelView {
         let lods = l.lods.clone();
         let source = l.source.clone();
         let info = l.info.clone();
-        let (parts, selected, base) = (l.parts.clone(), l.selected.clone(), l.base.clone());
+        let (parts, selected, base, look) = (l.parts.clone(), l.selected.clone(), l.base.clone(), l.look.clone());
         self.loading = true;
         let slot = self.pending.clone();
         let (gen, latest) = self.next_load();
@@ -1069,6 +1220,7 @@ impl ModelView {
                     base,
                     fur: None,
                     fur_skin: Default::default(),
+            look,
                 })
                 .map_err(|e| format!("{e:#}"));
             finish_load(&slot, &latest, gen, r);
@@ -1134,6 +1286,26 @@ impl ModelView {
                 }
                 self.gpu = Some(g);
                 self.hair.on_loaded(&l.fur, &l.fur_skin, &l.source);
+                if let Some(look) = &l.look {
+                    // a character: its confident hair, grown to full density
+                    let key = format!("{}#{}", look.model, look.current);
+                    if self.hair.look_key != key {
+                        self.hair.look_key = key;
+                        self.hair.selected = look.hair.iter().filter(|h| h.confidence >= 0.5).flat_map(|h| h.grooms.iter().copied()).collect();
+                        if !look.hair.is_empty() {
+                            self.hair.full_coat = true;
+                            self.hair.skin_colour = false;
+                            if self.hair.colour == Hair::default().colour {
+                                self.hair.colour = [0.09, 0.06, 0.045];
+                            }
+                        }
+                    }
+                } else if !self.hair.look_key.is_empty() {
+                    self.hair.look_key.clear();
+                    if self.hair.fur.is_none() {
+                        self.hair.selected.clear();
+                    }
+                }
                 self.loaded = Some(l);
                 self.frames_since_load = 0;
                 self.apply_paint(rs);
@@ -2664,7 +2836,7 @@ impl ModelView {
             self.hair_ui(ui);
             ui.separator();
         }
-        if let Some(q) = self.parts_ui(ui) {
+        if let Some(q) = self.look_ui(ui).or_else(|| self.parts_ui(ui)) {
             self.keep_cam_once = true;
             let ctx = ui.ctx().clone();
             self.open(&q, 0, &ctx);
@@ -2962,19 +3134,78 @@ fn load_parts(
     cache: &Path,
     lod: usize,
     mut model: Option<glb::Model>,
-) -> (Option<glb::Model>, Vec<PathBuf>, Vec<String>, Vec<String>, Vec<(String, Vec<[f32; 3]>)>, Vec<([f32; 3], [u8; 3])>, Vec<bool>) {
+    fx: &HashMap<u64, PartFx>,
+    game: &Path,
+) -> (Option<glb::Model>, Vec<PathBuf>, Vec<String>, Vec<String>, Vec<(String, Vec<[f32; 3]>)>, Vec<([f32; 3], [u8; 3])>, Vec<bool>, Vec<String>) {
     let mut first = Vec::new();
     let mut names = Vec::new();
     let mut errs = Vec::new();
     let mut skin = Vec::new();
     let mut colours = Vec::new();
     let mut mask = Vec::new();
+    let mut notes = Vec::new();
     let mut fresh = true;
+    // outfits: the head's neck tone and the material ranges of the skin meshes
+    let mut tone: Option<[f32; 3]> = None;
+    let mut body_mats: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut coloured = 0;
+    // mesh ranges of the skin meshes and of the garments that cover skin
+    let mut skin_meshes: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut cover_meshes: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut heel_meshes: Vec<std::ops::Range<usize>> = Vec::new();
+    // Body shape: the skin and head are posed by the game's rig; clothes
+    // and accessories follow the skin under them (`Wrap`).
+    let shape = if fx.is_empty() { (0.0, 0.0) } else { *BODY_SHAPE.lock().unwrap() };
+    let mut posed: HashMap<u64, anyhow::Result<(glb::Model, Vec<PathBuf>, serde_json::Value)>> = HashMap::new();
+    let mut field: Vec<([f32; 3], [f32; 3])> = Vec::new();
+    if shape != (0.0, 0.0) {
+        for e in parts {
+            let Some(f) = fx.get(&e.off).filter(|f| f.skeletal) else { continue };
+            let mut r = export_load_shaped(a, e, cache, lod, &f.skins, shape);
+            if let Ok((m, _, _)) = &mut r {
+                let before: Vec<[f32; 3]> = m.meshes.iter().flat_map(|me| me.verts.iter().map(|v| v.pos)).collect();
+                apply_pose(m);
+                if f.body || f.head {
+                    field.extend(before.iter().zip(m.meshes.iter().flat_map(|me| me.verts.iter())).map(|(b, v)| (*b, [v.pos[0] - b[0], v.pos[1] - b[1], v.pos[2] - b[2]])));
+                }
+            }
+            posed.insert(e.off, r);
+        }
+        if field.is_empty() {
+            notes.push("Body shape: no skin mesh to shape in this outfit, so it is shown neutral.".to_string());
+        } else {
+            notes.push("Body shape: the skin and head follow the game's body-shape rig. Clothes follow the skin under them (each point moves with the nearest skin), because the game's own data for shaping clothes is not decoded.".to_string());
+        }
+    }
+    let wrap = (!field.is_empty()).then(|| Wrap::new(field));
     for e in parts {
-        match export_load(a, e, cache, lod) {
-            Ok((m, lods, _)) => {
+        let f = fx.get(&e.off);
+        let r = match posed.remove(&e.off) {
+            Some(r) => r,
+            None => export_load_skin(a, e, cache, lod, f.map_or(&[], |f| &f.skins)),
+        };
+        match r {
+            Ok((mut m, lods, _)) => {
                 if first.is_empty() {
                     first = lods;
+                }
+                if let Some(f) = f {
+                    if !f.skeletal {
+                        place_attached(&mut m);
+                        if let Some(w) = &wrap {
+                            w.apply(&mut m);
+                        }
+                    }
+                    if colour_part(&mut m, f, game) {
+                        coloured += 1;
+                    }
+                    if f.head {
+                        tone = neck_tone(&m);
+                    }
+                    // The vertices are final (posed here, or following the
+                    // skin): the renderer must not skin the part that
+                    // happens to come first again.
+                    m.meshes.iter_mut().for_each(|me| me.skinned = false);
                 }
                 // skin points per part, in RAGE model space (glTF is Y-up)
                 let pts: Vec<[f32; 3]> = m
@@ -2990,6 +3221,21 @@ fn load_parts(
                 // skin colour at the vertices of the body and head (not eyes or teeth)
                 if e.name.as_deref().is_some_and(|n| n.contains("_body_") || n.contains("_head_")) {
                     colours.extend(skin_colours(&m, &mut mask));
+                }
+                let mat0 = model.as_ref().map_or(0, |into| into.materials.len());
+                if f.is_some_and(|f| f.body) {
+                    body_mats.push(mat0..mat0 + m.materials.len());
+                }
+                // (an animal root's placeholder meshes are cleared before the first merge)
+                let mesh0 = if fresh { 0 } else { model.as_ref().map_or(0, |into| into.meshes.len()) };
+                if f.is_some_and(|f| f.body) {
+                    skin_meshes.push(mesh0..mesh0 + m.meshes.len());
+                }
+                if f.is_some_and(|f| f.covers) {
+                    cover_meshes.push(mesh0..mesh0 + m.meshes.len());
+                }
+                if f.is_some_and(|f| f.heel) {
+                    heel_meshes.push(mesh0..mesh0 + m.meshes.len());
                 }
                 match &mut model {
                     Some(into) if fresh => {
@@ -3007,7 +3253,560 @@ fn load_parts(
             Err(err) => errs.push(format!("{}: {err:#}", e.id)),
         }
     }
-    (model, first, names, errs, skin, colours, mask)
+    if let (Some(m), false) = (&mut model, body_mats.is_empty()) {
+        match tone {
+            Some(t) => {
+                for i in body_mats.into_iter().flatten() {
+                    let Some(mat) = m.materials.get_mut(i) else { continue };
+                    if mat.base.is_none() {
+                        mat.base_factor = [t[0], t[1], t[2], mat.base_factor[3]];
+                        mat.gap = "skin tone taken from the face texture at the neck".into();
+                    }
+                }
+                notes.push("Body skin: the game builds it at run time and no painted body texture is stored, so the body takes the skin tone of the face texture at the neck.".to_string());
+            }
+            None => notes.push("Body skin: no face texture to take a skin tone from, so the body is shown white.".to_string()),
+        }
+    }
+    if let (Some(m), false, false) = (&mut model, skin_meshes.is_empty(), heel_meshes.is_empty()) {
+        if let Some(deg) = pose_feet_for_heels(m, &skin_meshes, &heel_meshes) {
+            notes.push(format!("Heeled shoes: the feet are tilted {deg:.0} degrees at the ankle with the toes bent back level, the angle that puts most of the foot's skin on the shoe. (The game poses the foot for the shoe's heel class; that pose is not decoded.)"));
+        }
+    }
+    if let (Some(m), false, false) = (&mut model, skin_meshes.is_empty(), cover_meshes.is_empty()) {
+        let hidden = hide_covered_skin(m, &skin_meshes, &cover_meshes);
+        if hidden > 0 {
+            notes.push(format!("Skin under clothes: {hidden} skin triangles that lie right under a garment are hidden, so skin does not show through it. (The game uses skin meshes cut to the garment; which cut goes with which garment is not decoded.)"));
+        }
+    }
+    if coloured > 0 {
+        notes.push(format!("Clothing colours: {coloured} part(s) coloured from the outfit data: the item's stored colour, else row tint 0 of its tint palette (for the generic palette only when it agrees with the item's colour tag), else the colour tag itself (one of 18 words such as navy or khaki, shown in a plain shade of ours). Second and third tints are not applied."));
+    }
+    (model, first, names, errs, skin, colours, mask, notes)
+}
+
+/// Colour a ped clothing part of an outfit: its grey shade maps become the
+/// item's stored colour times the shade, or the tint palette row at the
+/// shade. Returns whether anything was coloured.
+fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path) -> bool {
+    let pal = f.tint.and_then(|(h, row)| sixng_core::pedtint::palettes(game).ok()?.get(&h).map(|p| (p, row)));
+    // `ped_tint_generic_clean` rows are often placeholders the game fills at
+    // run time: such a row counts only when it is the colour the item's
+    // colour tag names.
+    let generic = f.tint.is_some_and(|t| t.0 == 0xa7c8_d8e0);
+    let pal = pal.filter(|(p, row)| !generic || f.tag.is_none_or(|t| sixng_core::pedtint::nearest_word(p.sample(*row, 128)) == t));
+    let word = f.tag.and_then(|t| sixng_core::pedtint::COLOUR_WORDS.iter().find(|w| w.0 == t)).map(|w| w.1);
+    // shade maps are mid grey on plain cloth: 190 keeps the colour there
+    let flat = |c: [u8; 3]| -> [[u8; 3]; 256] { std::array::from_fn(|v| c.map(|x| ((x as f32) * (v as f32 / 190.0)).min(255.0) as u8)) };
+    let lut: [[u8; 3]; 256] = match (f.colour, pal, word) {
+        (Some(c), _, _) => flat(c),
+        (None, Some((p, row)), _) => std::array::from_fn(|v| p.sample(row, v as u8)),
+        (None, None, Some(c)) => flat(c),
+        (None, None, None) => return false,
+    };
+    let mut done = std::collections::HashSet::new();
+    for mat in m.materials.iter().filter(|x| x.ped_shade) {
+        let Some(i) = mat.base else { continue };
+        if !done.insert(i) {
+            continue;
+        }
+        let Some(im) = m.images.get_mut(i).filter(|im| im.bc.is_none()) else { continue };
+        for (_, _, px) in im.mips.iter_mut() {
+            for t in px.chunks_exact_mut(4) {
+                let c = lut[t[1] as usize];
+                t[0] = c[0];
+                t[1] = c[1];
+                t[2] = c[2];
+            }
+        }
+        im.key = format!("{}#{:?}{:?}", im.key, f.colour, f.tint);
+    }
+    !done.is_empty()
+}
+
+/// Attached accessories (a watch, a ring) are modelled at their own root
+/// bone (`Watch_Root`, at the authoring origin under the feet) and carry
+/// attach bones under the body's bones (`Watch_L_Wrist` under the wrist)
+/// that no vertex uses. The game moves the root onto an attach bone; do the
+/// same in the bind pose, so the part sits on the body in the merged model.
+/// The left one is taken when there are two. Parts modelled in place (their
+/// vertices are near the bones that move them) are left alone.
+fn place_attached(m: &mut glb::Model) {
+    use glam::{Mat4, Vec3};
+    if m.joints.is_empty() || m.meshes.iter().any(|me| !me.skinned) {
+        return;
+    }
+    let mut used = vec![false; m.joints.len()];
+    for v in m.meshes.iter().flat_map(|me| &me.verts) {
+        for k in 0..4 {
+            if v.weights[k] > 0 {
+                if let Some(u) = used.get_mut(v.joints[k] as usize) {
+                    *u = true;
+                }
+            }
+        }
+    }
+    let bind = |i: usize| Mat4::from_cols_array(&m.joints[i].ibm).inverse();
+    let pos = |i: usize| bind(i).transform_point3(Vec3::ZERO);
+    let prefix = |i: usize| m.joints[i].name.split('_').next().unwrap_or("").to_string();
+    let Some(first) = used.iter().position(|u| *u) else { return };
+    let pre = prefix(first);
+    // every used bone belongs to the accessory (same name prefix)
+    if pre.is_empty() || ["SKEL", "BM", "MH", "RB", "PH", "GM", "SEC", "FACIAL"].contains(&pre.as_str()) || (0..used.len()).any(|i| used[i] && prefix(i) != pre) {
+        return;
+    }
+    // its root: the topmost ancestor with that prefix
+    let mut root = first;
+    while let Some(p) = m.joints[root].parent.filter(|&p| prefix(p) == pre) {
+        root = p;
+    }
+    // attach bones: same prefix, unused, not under the root
+    let under_root = |mut i: usize| loop {
+        if i == root {
+            return true;
+        }
+        match m.joints[i].parent {
+            Some(p) => i = p,
+            None => return false,
+        }
+    };
+    let mut attach: Vec<usize> = (0..used.len()).filter(|&i| !used[i] && prefix(i) == pre && !under_root(i)).collect();
+    attach.sort_by_key(|&i| (!m.joints[i].name.contains("_L_"), i));
+    let Some(&at) = attach.first() else { return };
+    let c = (Vec3::from(m.bbox[0]) + Vec3::from(m.bbox[1])) * 0.5;
+    if (c - pos(root)).length() > 0.25 || (pos(at) - pos(root)).length() < 0.3 {
+        return;
+    }
+    let t = bind(at) * bind(root).inverse();
+    if !t.is_finite() {
+        return;
+    }
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for me in &mut m.meshes {
+        let mut sum = Vec3::ZERO;
+        for v in &mut me.verts {
+            let p = t.transform_point3(Vec3::from(v.pos));
+            v.pos = p.to_array();
+            v.nrm = t.transform_vector3(Vec3::from(v.nrm)).normalize_or_zero().to_array();
+            let tn = t.transform_vector3(Vec3::new(v.tan[0], v.tan[1], v.tan[2])).normalize_or_zero();
+            v.tan = [tn.x, tn.y, tn.z, v.tan[3]];
+            sum += p;
+            lo = lo.min(p);
+            hi = hi.max(p);
+        }
+        me.centre = (sum / me.verts.len().max(1) as f32).to_array();
+    }
+    if lo.x <= hi.x {
+        m.bbox = [lo.to_array(), hi.to_array()];
+    }
+}
+
+/// Hide the skin triangles that lie right under a garment: a skin vertex is
+/// covered when a point of a garment surface is within 9 mm of the line
+/// through the vertex along its normal, between 15 mm inside and 50 mm
+/// outside the skin; a triangle goes when all three vertices are covered.
+/// Returns the number of triangles hidden.
+fn hide_covered_skin(m: &mut glb::Model, skin: &[std::ops::Range<usize>], cover: &[std::ops::Range<usize>]) -> usize {
+    use glam::Vec3;
+    const CELL: f32 = 0.02;
+    const STEP: f32 = 0.008;
+    let key = |p: Vec3| ((p.x / CELL).floor() as i32, (p.y / CELL).floor() as i32, (p.z / CELL).floor() as i32);
+    // points on the garment surfaces, about 8 mm apart
+    let mut grid: HashMap<(i32, i32, i32), Vec<Vec3>> = HashMap::new();
+    for me in cover.iter().cloned().flatten().filter_map(|i| m.meshes.get(i)) {
+        for t in me.indices.chunks_exact(3) {
+            let [a, b, c] = [t[0], t[1], t[2]].map(|i| Vec3::from(me.verts[i as usize].pos));
+            let n = (((b - a).length().max((c - a).length()).max((c - b).length()) / STEP).ceil() as usize).clamp(1, 40);
+            for i in 0..=n {
+                for j in 0..=(n - i) {
+                    let (u, v) = (i as f32 / n as f32, j as f32 / n as f32);
+                    let p = a + (b - a) * u + (c - a) * v;
+                    grid.entry(key(p)).or_default().push(p);
+                }
+            }
+        }
+    }
+    if grid.is_empty() {
+        return 0;
+    }
+    let covered = |p: Vec3, n: Vec3| -> bool {
+        let k = key(p);
+        // cells within 50 mm
+        for x in -3..=3 {
+            for y in -3..=3 {
+                for z in -3..=3 {
+                    let Some(v) = grid.get(&(k.0 + x, k.1 + y, k.2 + z)) else { continue };
+                    for g in v {
+                        let d = *g - p;
+                        let along = d.dot(n);
+                        if (-0.015..=0.05).contains(&along) && (d - n * along).length_squared() < 0.009 * 0.009 {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    };
+    let mut hidden = 0;
+    for i in skin.iter().cloned().flatten() {
+        let Some(me) = m.meshes.get_mut(i) else { continue };
+        let mut cov: Vec<bool> = me.verts.iter().map(|v| covered(Vec3::from(v.pos), Vec3::from(v.nrm).normalize_or_zero())).collect();
+        // Keep the skin for two rings of vertices in from every edge of the
+        // covered area, so the skin runs on under the hem (no gap between a
+        // shirt and the body). Vertices doubled at texture seams count as
+        // one place.
+        let place = |p: [f32; 3]| ((p[0] * 2000.0).round() as i32, (p[1] * 2000.0).round() as i32, (p[2] * 2000.0).round() as i32);
+        for _ in 0..2 {
+            let open: std::collections::HashSet<(i32, i32, i32)> = me.verts.iter().zip(&cov).filter(|(_, c)| !**c).map(|(v, _)| place(v.pos)).collect();
+            let mut next = cov.clone();
+            for t in me.indices.chunks_exact(3) {
+                if t.iter().any(|&i| !cov[i as usize] || open.contains(&place(me.verts[i as usize].pos))) {
+                    t.iter().for_each(|&i| next[i as usize] = false);
+                }
+            }
+            cov = next;
+        }
+        let before = me.indices.len() / 3;
+        me.indices = me.indices.chunks_exact(3).filter(|t| !t.iter().all(|&i| cov[i as usize])).flatten().copied().collect();
+        hidden += before - me.indices.len() / 3;
+    }
+    m.triangles = m.triangles.saturating_sub(hidden);
+    hidden
+}
+
+/// Pose the feet for heeled shoes: rotate each foot about its ankle (toes
+/// down) and the toes back about the toe joint, by the angle (0 to 44
+/// degrees) that puts the most foot-skin vertices within 10 mm of the shoe
+/// surface and the fewest below the shoe. Uses the skin's own weights on the
+/// shared skeleton's foot and toe bones. Returns the angle when one was
+/// applied.
+fn pose_feet_for_heels(m: &mut glb::Model, skin: &[std::ops::Range<usize>], shoes: &[std::ops::Range<usize>]) -> Option<f32> {
+    use glam::{Mat4, Vec3};
+    let find = |n: &str| m.joints.iter().position(|j| j.name == n);
+    let pos = |i: usize| Mat4::from_cols_array(&m.joints[i].ibm).inverse().transform_point3(Vec3::ZERO);
+    let under = |mut i: usize, root: usize| loop {
+        if i == root {
+            return true;
+        }
+        match m.joints[i].parent.filter(|&p| p != i) {
+            Some(p) => i = p,
+            None => return false,
+        }
+    };
+    // per side: ankle, toe joint, and per joint 0 = other, 1 = foot, 2 = toes
+    let mut sides = Vec::new();
+    for s in ["L", "R"] {
+        let (foot, toe) = (find(&format!("SKEL_{s}_Foot"))?, find(&format!("SKEL_{s}_Toe0"))?);
+        let bm_toe = find(&format!("BM_{s}_Toe"));
+        let kind: Vec<u8> = (0..m.joints.len()).map(|i| if under(i, toe) || bm_toe.is_some_and(|b| under(i, b)) { 2 } else if under(i, foot) { 1 } else { 0 }).collect();
+        sides.push((pos(foot), pos(toe), kind));
+    }
+    // shoe surface points and the shoes' lowest point
+    const CELL: f32 = 0.01;
+    let key = |p: Vec3| ((p.x / CELL).floor() as i32, (p.y / CELL).floor() as i32, (p.z / CELL).floor() as i32);
+    let mut grid: std::collections::HashSet<(i32, i32, i32)> = Default::default();
+    let mut floor = f32::MAX;
+    // heights of the shoe surface per 5 mm column (x, z), for the sole's top
+    let col = |p: Vec3| ((p.x / 0.005).floor() as i32, (p.z / 0.005).floor() as i32);
+    let mut cols: HashMap<(i32, i32), Vec<f32>> = HashMap::new();
+    for me in shoes.iter().cloned().flatten().filter_map(|i| m.meshes.get(i)) {
+        for t in me.indices.chunks_exact(3) {
+            let [a, b, c] = [t[0], t[1], t[2]].map(|i| Vec3::from(me.verts[i as usize].pos));
+            let n = (((b - a).length().max((c - a).length()).max((c - b).length()) / 0.005).ceil() as usize).clamp(1, 40);
+            for i in 0..=n {
+                for j in 0..=(n - i) {
+                    let p = a + (b - a) * (i as f32 / n as f32) + (c - a) * (j as f32 / n as f32);
+                    grid.insert(key(p));
+                    floor = floor.min(p.y);
+                    cols.entry(col(p)).or_default().push(p.y);
+                }
+            }
+        }
+    }
+    if grid.is_empty() {
+        return None;
+    }
+    // The top of the sole in each column: the top of the lowest slab of
+    // surface (walking up from the bottom until a gap of 8 mm). Straps
+    // higher up do not count.
+    let sole: HashMap<(i32, i32), f32> = cols
+        .into_iter()
+        .map(|(k, mut ys)| {
+            ys.sort_by(|a, b| a.total_cmp(b));
+            let mut top = ys[0];
+            for y in &ys[1..] {
+                if *y - top > 0.008 {
+                    break;
+                }
+                top = *y;
+            }
+            (k, top)
+        })
+        .collect();
+    // the two transforms of a side: the foot turned `deg` about the ankle,
+    // and the toes turned back `toes` about the toe joint
+    let mats = |ankle: Vec3, toe: Vec3, deg: f32, toes: f32| -> (Mat4, Mat4) {
+        let about = |c: Vec3, a: f32| Mat4::from_translation(c) * Mat4::from_rotation_x(a) * Mat4::from_translation(-c);
+        // front is +z and up is +y: a positive turn about x takes +z towards -y (toes down)
+        let r1 = about(ankle, deg.to_radians());
+        let r2 = about(r1.transform_point3(toe), -toes.to_radians()) * r1;
+        (r1, r2)
+    };
+    let moved = |v: &glb::Vertex, side: &(Vec3, Vec3, Vec<u8>), mt: &(Mat4, Mat4)| -> Option<Vec3> {
+        let tot: f32 = v.weights.iter().map(|x| *x as f32).sum();
+        let p0 = Vec3::from(v.pos);
+        let (mut p, mut on) = (Vec3::ZERO, 0.0);
+        for k in 0..4 {
+            if v.weights[k] == 0 {
+                continue;
+            }
+            let w = v.weights[k] as f32 / tot.max(1.0);
+            p += w * match side.2.get(v.joints[k] as usize) {
+                Some(1) => {
+                    on += w;
+                    mt.0.transform_point3(p0)
+                }
+                Some(2) => {
+                    on += w;
+                    mt.1.transform_point3(p0)
+                }
+                _ => p0,
+            };
+        }
+        (on > 0.0).then_some(p)
+    };
+    // Fit on both feet: skin that sinks into the sole counts against an
+    // angle (three times), skin resting on the sole (within 8 mm above it)
+    // or touching any shoe surface counts for it.
+    let mut best = (0.0f32, 0.0f32, i64::MIN);
+    for step in 0..=25 {
+        let deg = step as f32 * 2.0;
+        for tstep in 0..=((deg / 4.0) as i32 + 3) {
+            let toes = tstep as f32 * 4.0;
+            let mut score = 0i64;
+            for side in &sides {
+                let mt = mats(side.0, side.1, deg, toes);
+                for me in skin.iter().cloned().flatten().filter_map(|i| m.meshes.get(i)) {
+                    for v in &me.verts {
+                        let Some(p) = moved(v, side, &mt) else { continue };
+                        if p.y < floor - 0.002 {
+                            score -= 3;
+                            continue;
+                        }
+                        match sole.get(&col(p)) {
+                            Some(top) if p.y < *top - 0.003 => score -= 3,
+                            Some(top) if p.y < *top + 0.008 => score += 2,
+                            _ => {
+                                let k = key(p);
+                                if (-1..=1).any(|x| (-1..=1).any(|y| (-1..=1).any(|z| grid.contains(&(k.0 + x, k.1 + y, k.2 + z))))) {
+                                    score += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if score > best.2 {
+                best = (deg, toes, score);
+            }
+        }
+    }
+    if best.0 < 4.0 {
+        return None;
+    }
+    for side in &sides {
+        let mt = mats(side.0, side.1, best.0, best.1);
+        for i in skin.iter().cloned().flatten() {
+            let Some(me) = m.meshes.get_mut(i) else { continue };
+            for v in &mut me.verts {
+                if let Some(p) = moved(v, side, &mt) {
+                    // the normal turns with the stronger of the two parts
+                    let toes = (0..4).filter(|&k| side.2.get(v.joints[k] as usize) == Some(&2)).map(|k| v.weights[k] as u32).sum::<u32>();
+                    let foot = (0..4).filter(|&k| side.2.get(v.joints[k] as usize) == Some(&1)).map(|k| v.weights[k] as u32).sum::<u32>();
+                    let r = if toes > foot { mt.1 } else { mt.0 };
+                    v.nrm = r.transform_vector3(Vec3::from(v.nrm)).normalize_or_zero().to_array();
+                    v.pos = p.to_array();
+                }
+            }
+        }
+    }
+    Some(best.0)
+}
+
+/// Displacement field of the shaped skin: (neutral position, offset) per
+/// skin vertex, in a grid for nearest-point lookups.
+struct Wrap {
+    pts: Vec<([f32; 3], [f32; 3])>,
+    grid: HashMap<(i32, i32, i32), Vec<u32>>,
+}
+
+impl Wrap {
+    const CELL: f32 = 0.04;
+
+    fn key(p: [f32; 3]) -> (i32, i32, i32) {
+        ((p[0] / Self::CELL).floor() as i32, (p[1] / Self::CELL).floor() as i32, (p[2] / Self::CELL).floor() as i32)
+    }
+
+    fn new(pts: Vec<([f32; 3], [f32; 3])>) -> Wrap {
+        let mut grid: HashMap<(i32, i32, i32), Vec<u32>> = HashMap::new();
+        for (i, (p, _)) in pts.iter().enumerate() {
+            grid.entry(Self::key(*p)).or_default().push(i as u32);
+        }
+        Wrap { pts, grid }
+    }
+
+    /// Offset at a point: the inverse-square-distance mean of the six
+    /// nearest skin vertices (searched up to about 30 cm away).
+    fn at(&self, p: [f32; 3]) -> [f32; 3] {
+        let k = Self::key(p);
+        let mut best: Vec<(f32, u32)> = Vec::new();
+        let mut r = 1;
+        loop {
+            best.clear();
+            for x in -r..=r {
+                for y in -r..=r {
+                    for z in -r..=r {
+                        if let Some(v) = self.grid.get(&(k.0 + x, k.1 + y, k.2 + z)) {
+                            for &i in v {
+                                let q = self.pts[i as usize].0;
+                                best.push(((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2), i));
+                            }
+                        }
+                    }
+                }
+            }
+            // points found within (r - 1) cells are certainly the nearest
+            let sure = ((r - 1) as f32 * Self::CELL).powi(2);
+            if best.iter().filter(|b| b.0 <= sure).count() >= 6 || r >= 8 {
+                break;
+            }
+            r += if best.is_empty() { 2 } else { 1 };
+        }
+        if best.is_empty() {
+            return [0.0; 3];
+        }
+        best.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let (mut o, mut wsum) = ([0f32; 3], 0f32);
+        for (d2, i) in best.iter().take(6) {
+            let w = 1.0 / (d2 + 1e-5);
+            let d = self.pts[*i as usize].1;
+            for c in 0..3 {
+                o[c] += d[c] * w;
+            }
+            wsum += w;
+        }
+        o.map(|x| x / wsum)
+    }
+
+    /// Move a part with the skin. Small parts (a watch, glasses, a ring)
+    /// move as one piece by the offset at their centre, so they keep their
+    /// shape; larger ones move point by point.
+    fn apply(&self, m: &mut glb::Model) {
+        use glam::Vec3;
+        let size = (Vec3::from(m.bbox[1]) - Vec3::from(m.bbox[0])).length();
+        let rigid = (size < 0.3).then(|| self.at(((Vec3::from(m.bbox[0]) + Vec3::from(m.bbox[1])) * 0.5).to_array()));
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for me in &mut m.meshes {
+            let mut sum = Vec3::ZERO;
+            for v in &mut me.verts {
+                let o = rigid.unwrap_or_else(|| self.at(v.pos));
+                for c in 0..3 {
+                    v.pos[c] += o[c];
+                }
+                let p = Vec3::from(v.pos);
+                sum += p;
+                lo = lo.min(p);
+                hi = hi.max(p);
+            }
+            me.centre = (sum / me.verts.len().max(1) as f32).to_array();
+        }
+        if lo.x <= hi.x {
+            m.bbox = [lo.to_array(), hi.to_array()];
+        }
+        if std::env::var("SIXNG_DEBUG_WRAP").is_ok() {
+            let far = self.pts.iter().map(|p| Vec3::from(p.1).length()).fold(0f32, f32::max);
+            eprintln!("[wrap] {} verts, size {size:.2}, rigid {:?}, field {} pts max offset {far:.3}, bbox {:?}", m.vertices, rigid, self.pts.len(), m.bbox);
+        }
+    }
+}
+
+/// Skin a part's vertices to the pose its GLB stores (the body shape: the
+/// joints' node transforms against their inverse bind matrices), so the
+/// merged, unskinned model shows it. Uses the first four influences.
+fn apply_pose(m: &mut glb::Model) {
+    use glam::{Mat4, Vec3};
+    let n = m.joints.len();
+    if n == 0 {
+        return;
+    }
+    let mut world: Vec<Option<Mat4>> = vec![None; n];
+    fn w(i: usize, js: &[glb::Joint], out: &mut Vec<Option<glam::Mat4>>, depth: usize) -> glam::Mat4 {
+        if let Some(x) = out[i] {
+            return x;
+        }
+        let l = glam::Mat4::from_cols_array(&js[i].local);
+        let x = match js[i].parent.filter(|&p| p < js.len() && p != i && depth < 256) {
+            Some(p) => w(p, js, out, depth + 1) * l,
+            None => l,
+        };
+        out[i] = Some(x);
+        x
+    }
+    let skin: Vec<Mat4> = (0..n).map(|i| w(i, &m.joints, &mut world, 0) * Mat4::from_cols_array(&m.joints[i].ibm)).collect();
+    if skin.iter().all(|s| s.abs_diff_eq(Mat4::IDENTITY, 1e-5)) {
+        return;
+    }
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for me in m.meshes.iter_mut().filter(|me| me.skinned) {
+        let mut sum = Vec3::ZERO;
+        for v in &mut me.verts {
+            let tot: f32 = v.weights.iter().map(|x| *x as f32).sum();
+            if tot <= 0.0 {
+                continue;
+            }
+            let (p0, n0) = (Vec3::from(v.pos), Vec3::from(v.nrm));
+            let (mut p, mut nr) = (Vec3::ZERO, Vec3::ZERO);
+            for k in 0..4 {
+                let Some(s) = skin.get(v.joints[k] as usize).filter(|_| v.weights[k] > 0) else { continue };
+                let wt = v.weights[k] as f32 / tot;
+                p += s.transform_point3(p0) * wt;
+                nr += s.transform_vector3(n0) * wt;
+            }
+            if p.is_finite() {
+                v.pos = p.to_array();
+                v.nrm = nr.normalize_or_zero().to_array();
+            }
+            sum += Vec3::from(v.pos);
+            lo = lo.min(Vec3::from(v.pos));
+            hi = hi.max(Vec3::from(v.pos));
+        }
+        me.centre = (sum / me.verts.len().max(1) as f32).to_array();
+    }
+    if lo.x <= hi.x {
+        m.bbox = [lo.to_array(), hi.to_array()];
+    }
+}
+
+/// Skin tone (linear RGB) of a head at the base of its neck: the mean of the
+/// face texture at the lowest vertices.
+fn neck_tone(head: &glb::Model) -> Option<[f32; 3]> {
+    let mut mask = Vec::new();
+    let s = skin_colours(head, &mut mask);
+    if s.len() < 50 || !head.materials.iter().any(|m| m.base.is_some()) {
+        return None;
+    }
+    let mut z: Vec<f32> = s.iter().map(|x| x.0[2]).collect();
+    z.sort_by(|a, b| a.total_cmp(b));
+    let cut = z[z.len() * 8 / 100];
+    let low: Vec<_> = s.iter().filter(|x| x.0[2] <= cut).collect();
+    let mut c = [0f32; 3];
+    for x in &low {
+        for k in 0..3 {
+            c[k] += x.1[k] as f32 / 255.0;
+        }
+    }
+    Some(c.map(|v| v / low.len() as f32))
 }
 
 /// Tint-mask coats (grey: only the mask's shading is known) next to
@@ -3133,12 +3932,72 @@ fn load_query_sel(
             base: String::new(),
             fur: None,
             fur_skin: Default::default(),
+            look: None,
         });
     }
-    // character outfit: "<archive>#outfit:<prefix>"
+    // character outfit: "<archive>#outfit:<prefix>[#look=<n>]"
     if let Some((archive, prefix)) = q.split_once("#outfit:") {
+        let (prefix, want_look) = match prefix.split_once("#look=") {
+            Some((p, n)) => (p, n.trim().parse::<usize>().ok()),
+            None => (prefix, None),
+        };
         let (a, ix) = index_for(ws, archive, idx)?;
-        let opts = crate::assemble::outfit_options(&ix, prefix);
+        let mut opts = crate::assemble::outfit_options(&ix, prefix);
+        // The game's outfit list: the character's own outfits (clothes, body,
+        // hair) instead of one own part per slot.
+        let mut fx: HashMap<u64, PartFx> = HashMap::new();
+        let mut look_info = None;
+        let mut look_err = None;
+        match sixng_core::pedlook::look(&ws.game, &a, &ix, prefix) {
+            Ok(look) => {
+                let k = want_look.unwrap_or(0).min(look.outfits.len().saturating_sub(1));
+                let by_name = sixng_core::outfit::dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
+                    let n = e.name.as_ref()?.to_ascii_lowercase();
+                    look.outfits.iter().any(|o| o.parts.iter().any(|p| p.drawable == n)).then_some((n, e))
+                }));
+                opts.iter_mut().for_each(|o| o.default = false);
+                let mut info = LookInfo { model: look.model.clone(), labels: look.outfits.iter().map(|o| o.label.clone()).collect(), current: k, ..Default::default() };
+                for (oi, o) in look.outfits.iter().enumerate() {
+                    for p in &o.parts {
+                        if p.strands {
+                            if oi == k {
+                                info.strands.push((p.slot.clone(), p.drawable.clone(), p.guid.clone().unwrap_or_default()));
+                            }
+                            continue;
+                        }
+                        let Some(e) = by_name.get(&p.drawable) else { continue };
+                        match opts.iter_mut().find(|x| x.off == e.off) {
+                            Some(x) => {
+                                x.group = p.slot.clone();
+                                x.default |= oi == k;
+                            }
+                            None => opts.push(crate::assemble::PartOpt { off: e.off, id: e.id.clone(), name: p.drawable.clone(), group: p.slot.clone(), label: p.drawable.trim_start_matches(&format!("{prefix}_")).to_string(), default: oi == k }),
+                        }
+                        if oi == k {
+                            let body = p.slot == "body upper" || p.slot == "body lower";
+                            fx.insert(e.off, PartFx { tint: p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t.rows[0]))).filter(|t| t.1 != 255), colour: p.colour.map(|c| [c[1], c[2], c[3]]), tag: p.colour_tag, head: p.slot == "head", body, skeletal: body || matches!(p.slot.as_str(), "head" | "eyes" | "teeth" | "teeth accessory"), covers: matches!(p.slot.as_str(), "top" | "outer" | "bottom" | "full" | "feet" | "gloves"), heel: p.slot == "feet" && p.drawable.split('_').any(|t| matches!(t, "sh" | "mh" | "hh")), skins: if p.slot == "head" { p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect() } else { Vec::new() } });
+                        }
+                    }
+                }
+                // strand hair: the grooms placed for each hair asset
+                match sixng_core::hairlink::get(&ws.work, &a, &ix.entries) {
+                    Ok(t) => {
+                        for (slot, _, guid) in &info.strands {
+                            let Some(l) = u64::from_str_radix(guid, 16).ok().and_then(|g| t.resolve(g, look.fit.as_deref())) else { continue };
+                            info.hair.push(HairPick { slot: slot.clone(), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: l.grooms.clone() });
+                        }
+                    }
+                    Err(e) => info.notes.push(format!("Strand hair: {e}")),
+                }
+                let o = &look.outfits[k];
+                info.body_shape = o.body_shape.clone();
+                if !o.unresolved.is_empty() {
+                    info.notes.push(format!("{} item(s) of this outfit have no model: {}", o.unresolved.len(), o.unresolved.join(", ")));
+                }
+                look_info = Some(info);
+            }
+            Err(e) => look_err = Some(e),
+        }
         if opts.is_empty() {
             return Err(anyhow::anyhow!("no parts found for {prefix}"));
         }
@@ -3146,10 +4005,13 @@ fn load_query_sel(
         if parts.is_empty() {
             return Err(anyhow::anyhow!("no parts of {prefix} selected"));
         }
-        let (model, first, names, errs, _, _, _) = load_parts(&a, &parts, cache, lod, None);
+        let (model, first, names, errs, _, _, _, notes) = load_parts(&a, &parts, cache, lod, None, &fx, &ws.game);
         let model = model
             .ok_or_else(|| anyhow::anyhow!("no part of {prefix} loaded: {}", errs.join("; ")))?;
-        let info = serde_json::json!({ "assembled_from": names, "ids": parts.iter().map(|e| e.id.clone()).collect::<Vec<_>>(), "errors": errs });
+        if let Some(l) = &mut look_info {
+            l.notes.extend(notes);
+        }
+        let info = serde_json::json!({ "assembled_from": names, "ids": parts.iter().map(|e| e.id.clone()).collect::<Vec<_>>(), "errors": errs, "outfit_list": look_err.map(|e| format!("not used: {e}")) });
         return Ok(Loaded {
             model,
             lods: first.into_iter().take(1).collect(),
@@ -3162,6 +4024,7 @@ fn load_query_sel(
             base: String::new(),
             fur: None,
             fur_skin: Default::default(),
+            look: look_info,
         });
     }
     let (q, member) = q
@@ -3200,7 +4063,7 @@ fn load_query_sel(
     if crate::assemble::is_animal(name) && e.rtype.as_deref() == Some("ft") {
         let opts = crate::assemble::animal_options(&ix, name);
         let (selected, parts) = pick(&ix, &opts, &sel);
-        let (m, _, names, _, skin, mut colours, mask) = load_parts(&a, &parts, cache, level, Some(model));
+        let (m, _, names, _, skin, mut colours, mask, _) = load_parts(&a, &parts, cache, level, Some(model), &HashMap::new(), &ws.game);
         let mut model = m.expect("root model passed in");
         let borrowed = tint_masks_from_painted(&mut model, &mut colours, &mask);
         // fur: the grooms of this animal's fur variants (cached per animal)
@@ -3241,6 +4104,7 @@ fn load_query_sel(
             base: String::new(),
             fur,
             fur_skin: Arc::new(colours),
+            look: None,
         });
     }
     // weapons: the model is a skeleton with a placeholder shell; the parts
@@ -3311,7 +4175,8 @@ fn load_query_sel(
                 base: String::new(),
                 fur: None,
                 fur_skin: Arc::new(Vec::new()),
-            });
+            look: None,
+        });
         }
     }
     // vehicles: mod parts (bonnets, bumpers, spoilers, exhausts ...) are
@@ -3388,6 +4253,7 @@ fn load_query_sel(
                     base: String::new(),
                     fur: None,
                     fur_skin: Default::default(),
+            look: None,
                 });
             }
             veh_opts = opts;
@@ -3405,6 +4271,7 @@ fn load_query_sel(
         base: String::new(),
         fur: None,
         fur_skin: Default::default(),
+            look: None,
     })
 }
 
@@ -3855,6 +4722,35 @@ fn export_load(
     cache: &Path,
     lod: usize,
 ) -> anyhow::Result<(glb::Model, Vec<PathBuf>, serde_json::Value)> {
+    export_load_skin(a, e, cache, lod, &[])
+}
+
+/// `export_load` with the face textures an outfit names for a head
+/// (`ExportOptions::part_skins`).
+fn export_load_skin(
+    a: &sixng_core::game::ArchiveInfo,
+    e: &sixng_core::scan::Entry,
+    cache: &Path,
+    lod: usize,
+    skins: &[(u64, u64)],
+) -> anyhow::Result<(glb::Model, Vec<PathBuf>, serde_json::Value)> {
+    export_load_shaped(a, e, cache, lod, skins, (0.0, 0.0))
+}
+
+/// `export_load_skin` with a body shape (weight, muscle). Shaped exports go
+/// to their own folder, so the cached neutral models stay neutral.
+fn export_load_shaped(
+    a: &sixng_core::game::ArchiveInfo,
+    e: &sixng_core::scan::Entry,
+    cache: &Path,
+    lod: usize,
+    skins: &[(u64, u64)],
+    shape: (f32, f32),
+) -> anyhow::Result<(glb::Model, Vec<PathBuf>, serde_json::Value)> {
+    let shaped = shape != (0.0, 0.0);
+    let shaped_dir = cache.join("shaped");
+    let cache = if shaped { shaped_dir.as_path() } else { cache };
+    let body_shape = if shaped { sixng_core::bodyshape::parse_spec(&format!("allweight={},allmuscle={}", shape.0, shape.1)).unwrap_or_default() } else { Vec::new() };
     // Heads are exported again each time (small), so the chosen face variant applies.
     let head = sixng_core::headskin::is_head(e.name.as_deref().unwrap_or(""));
     let dir = cache
@@ -3900,12 +4796,13 @@ fn export_load(
         png: true,
         dds: false,
         raw: false,
-        force: head || stale_tint || stale_vehicle || stale_animal,
+        force: head || shaped || !skins.is_empty() || stale_tint || stale_vehicle || stale_animal,
         skip_embedded_textures: false,
-        body_shape: Vec::new(),
+        body_shape,
         head_skin: HEAD_SKIN.load(std::sync::atomic::Ordering::Relaxed),
         paint: None,
         tex_remap: Default::default(), ped_tints: Default::default(),
+        part_skins: e.name.as_ref().filter(|_| !skins.is_empty()).map(|n| (n.to_ascii_lowercase(), skins.to_vec())).into_iter().collect(),
     };
     let item = export::export_entry(a, e, &opts)?;
     let lods = lods_in(&dir);
