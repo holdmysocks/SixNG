@@ -218,6 +218,30 @@ mod tests {
     }
 }
 
+/// Per-model variation lists (a packs PSO: map of model name hash -> items
+/// `a5ea6310` {`fc7eaa76` variation id, `fee182a6` outfit type, Scale}). For
+/// the arcade zombies they list exactly the clothing sets, each with its own
+/// body scale; the outfit type is shared between models (the female and male
+/// tactical sets have the same one). Head sets are not listed. Returns
+/// variation id -> (model hash, outfit type, scale).
+pub fn variation_lists(pso_json: &Value) -> HashMap<u32, (u32, u32, f64)> {
+    let mut out = HashMap::new();
+    for (k, objs) in pso_json["objects"].as_object().into_iter().flatten() {
+        if !k.starts_with("78262a67") {
+            continue;
+        }
+        for o in objs.as_array().into_iter().flatten() {
+            let Some(model) = o["Key"].as_u64() else { continue };
+            for it in o["Item"].as_array().into_iter().flatten() {
+                if let (Some(v), Some(c)) = (it[crate::meta7a::field_name(0xfc7e_aa76)].as_u64(), it[crate::meta7a::field_name(0xfee1_82a6)].as_u64()) {
+                    out.insert(v as u32, (model as u32, c as u32, it["Scale"].as_f64().unwrap_or(1.0)));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Dirt presets from common.rpf's graphics definitions (`<CGraphicsDefinitionsData>`,
 /// plain XML): per `DirtDefinitions` item its scalar settings, the cloth and
 /// skin modifiers, the colour (`ColorLookup` resolved from `CannedColors`, RGB
