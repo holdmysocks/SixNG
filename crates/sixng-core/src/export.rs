@@ -402,6 +402,16 @@ fn classify_shader(s: &crate::drawable::Shader, st: &ShaderTextures) -> serde_js
             c["alpha_note"] = format!("colour texture alpha is constant ({lo}-{hi}), not opacity: drawn opaque").into();
         }
     }
+    // Animal coats (`ped_standard_animal`) whose colour texture is in a
+    // linear format hold a tint mask, not a colour: R and B are patch masks
+    // and G the shading (cattle). The game colours it from the material
+    // preset's tint bytes; without them only G is usable.
+    let mask = s.name_hash == "295b85a9"
+        && st.entries.iter().any(|e| e["role_guess"] == "base_color" && e["status"].as_str().is_some_and(|x| x.starts_with("ok")) && e["format"].as_str().is_some_and(|f| !f.ends_with("_SRGB")));
+    if mask {
+        c["tint_mask"] = true.into();
+        c["tint_mask_note"] = "the colour texture is a tint mask (R, B: patch masks; G: shading), coloured in game through a tint palette that is not decoded: show G as grey".into();
+    }
     c
 }
 
@@ -876,7 +886,14 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 "materials_note": "Textures come from the data/ttdb/*.ttpf stores by 64-bit hash and are written once to <out>/textures/ttpf/<hash>.png. Roles are guessed from the shader parameter hash and the format (sRGB = colour, BC5 / known normal slots = normal map). classification.class is one of opaque/alpha/cutout/decal/glass/window/emissive/water/terrain_multilayer/car_paint, from the shader record flags and known shader families. shader_name and param_name are joaat names from <work>/names/names.json (`sixng names`), null when unknown. slot_role names the PBR map a known parameter slot holds.",
             });
             let mut j = j;
-            if let Some((_, rec)) = &head {
+            if let Some((_, rec)) = head.as_ref().filter(|h| !h.1["preset"].is_null()) {
+                j["part_skin"] = rec.clone();
+                j["part_skin_note"] = "Animal parts: the colour texture comes from the part's material preset (packs.rpf meta, struct f795e8ba) when the drawable's own one is in no store or is a tint mask (cattle: R and B patch masks, G shading, coloured in game by the preset's tint bytes through a palette that is not decoded). preset: name hash of the preset used; slot_presets: how many presets (variations) the part has; replaced: the texture the drawable binds.".into();
+            } else if e.name.as_deref().is_some_and(|n| crate::partskin::animal_root(n).is_some()) {
+                // null: an animal part that needed no preset (dates the export)
+                j["part_skin"] = serde_json::Value::Null;
+            }
+            if let Some((_, rec)) = head.as_ref().filter(|h| h.1["preset"].is_null()) {
                 j["head_skin"] = rec.clone();
                 j["head_skin_note"] = "Heads bind no textures; the face comes from the material preset whose drawable tag lists this head (source \"linked\"), else from the faces of linked heads with the same sex, body type and ethnicity code (\"auto\"). index / count: the variant chosen with --head-skin.".into();
             }
@@ -934,7 +951,7 @@ pub(crate) struct BuiltDrawable {
 /// `o.out`. `member`: `info` is one drawable-dictionary member
 /// (`drawable::select_member`), so geometries outside its models are left out.
 pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &crate::drawable::DrawableInfo, dir: &Path, member: bool, o: &ExportOptions, item: &mut ExportedItem) -> BuiltDrawable {
-    let head = head_skin_shaders(a, e, &info.shaders, o, item);
+    let head = head_skin_shaders(a, e, &info.shaders, o, item).or_else(|| part_skin_shaders(a, e, &info.shaders, item));
     let shader_tex = link_textures(a, head.as_ref().map_or(&info.shaders[..], |h| &h.0[..]), r, &info.embedded_textures, dir, o);
     let slice = |i: usize| {
         let b = &info.buffers[i];
@@ -1127,6 +1144,59 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
         })
         .collect();
     Some((sh, rec))
+}
+
+/// Shaders of an animal part with the colour texture of its material preset
+/// (`partskin`), where the drawable's own one is in no store or is a tint
+/// mask (a linear format), with the choice record for model.json.
+fn part_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Shader], item: &mut ExportedItem) -> Option<(Vec<crate::drawable::Shader>, serde_json::Value)> {
+    let name = e.name.as_deref()?;
+    crate::partskin::animal_root(name)?;
+    let set = crate::ttpf::global(&game_root(a));
+    let painted = |h: u64| set.get(h).is_some_and(|(_, t)| matches!(t.dxgi_format, 29 | 72 | 75 | 78 | 91 | 99));
+    let bound = |s: &crate::drawable::Shader| s.textures.iter().find(|t| ALBEDO_PARAMS.contains(&t.param_hash.as_str())).and_then(|t| u64::from_str_radix(&t.hash64, 16).ok());
+    if !shaders.iter().any(|s| bound(s).is_some_and(|h| !painted(h))) {
+        return None;
+    }
+    let t = match crate::partskin::get(&game_root(a)) {
+        Ok(t) => t,
+        Err(err) => {
+            item.warnings.push(format!("part skin: {err}"));
+            return None;
+        }
+    };
+    let mut recs = Vec::new();
+    let sh = shaders
+        .iter()
+        .map(|s| {
+            let mut s = s.clone();
+            let Some(b) = bound(&s).filter(|&h| !painted(h)) else { return s };
+            let Some(c) = t.choose(name, b, painted) else { return s };
+            for tx in s.textures.iter_mut() {
+                let new = if ALBEDO_PARAMS.contains(&tx.param_hash.as_str()) {
+                    c.albedo
+                } else if tx.param_hash == "1e77bf4c" && c.normal != 0 && set.get(c.normal).is_some() {
+                    c.normal
+                } else {
+                    continue;
+                };
+                tx.hash64 = format!("{new:016x}");
+                tx.hash32 = String::new();
+            }
+            recs.push(serde_json::json!({
+                "shader": s.index, "preset": format!("{:08x}", c.preset), "slot_source": c.slot_source, "slot_presets": c.count,
+                "albedo": format!("{:016x}", c.albedo), "normal": format!("{:016x}", c.normal), "replaced": format!("{b:016x}"),
+                "replaced_was": if set.get(b).is_some() { "a tint mask (linear format)" } else { "in no store" },
+                "tint": c.tint, "tint_palette": format!("{:08x}", c.palette),
+            }));
+            s
+        })
+        .collect();
+    if recs.is_empty() {
+        item.warnings.push("part skin: no preset with a painted colour texture for this part".into());
+        return None;
+    }
+    Some((sh, serde_json::json!({"preset": recs[0]["preset"], "shaders": recs})))
 }
 
 /// Skin joints for a drawable. Normally the drawable's own skeleton, bone k =

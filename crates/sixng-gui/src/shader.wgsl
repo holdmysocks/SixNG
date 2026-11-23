@@ -19,7 +19,7 @@ struct Frame {
 
 struct Mat {
     base: vec4<f32>,
-    flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31
+    flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask
 };
 
 @group(0) @binding(0) var<uniform> F: Frame;
@@ -141,7 +141,10 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let cls = M.flags.y;
     var base = M.base;
     if ((has & 1u) != 0u) {
-        base = base * textureSample(t_base, samp, i.uv0);
+        var bt = textureSample(t_base, samp, i.uv0);
+        // tint mask (animal coats): only the green channel (shading) is a picture
+        if ((M.flags.w & 512u) != 0u) { bt = vec4(vec3(bt.g), 1.0); }
+        base = base * bt;
     }
     if (M.flags.z == 1u && base.a < 0.5) {
         discard;

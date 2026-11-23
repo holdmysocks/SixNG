@@ -1290,6 +1290,7 @@ impl Uploader {
             packed: None,
             emissive: None,
             mr: None,
+            tint_mask: false,
             slots: vec![],
             gap: "ok".into(),
             shader_hash: String::new(),
@@ -1328,11 +1329,12 @@ impl Uploader {
                 .flatten()
                 .unwrap_or(mt.base_factor);
             // w: gap in bits 0-1; a stand-in surface adds bit 8 and its
-            // metallic / roughness factors in bits 16-23 / 24-31
+            // metallic / roughness factors in bits 16-23 / 24-31; bit 9 =
+            // the base texture is a tint mask
             let mr = mt.mr.map_or(0, |[m, r]| {
                 let q = |x: f32| (x.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
                 0x100 | (q(m) << 16) | (q(r) << 24)
-            });
+            }) | if mt.tint_mask { 0x200 } else { 0 };
             let u = MatU {
                 base,
                 flags: [has, class_id(&mt.class), alpha, gap | mr],

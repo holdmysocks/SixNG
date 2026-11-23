@@ -217,6 +217,11 @@ pub fn animal_options(ix: &ArchiveIndex, root: &str) -> Vec<PartOpt> {
     let mut prefixes = vec![format!("{root}_")];
     if let Some((stem, n)) = root.rsplit_once('_') {
         if n.chars().all(|c| c.is_ascii_digit()) {
+            // A variant root without parts of its own (`…_m_01`: a skeleton
+            // only) takes the parts of the lowest-numbered sibling that has
+            // them (`…_m_00_body_00`).
+            let own = prefixes[0].clone();
+            prefixes.extend((0..10).map(|k| format!("{stem}_{k:02}_")).filter(|p| *p != own));
             prefixes.push(format!("{stem}_"));
         }
     }

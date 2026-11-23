@@ -2051,12 +2051,15 @@ fn export_load(
             // by shader hash: exports from before shader names were recovered have no names
             ["99ad6fc9", "389206d1", "03b27476", "5a693bbe", "29648098"].iter().any(|h| j.contains(h)) && !j.contains("\"stand_in\"")
         });
+    // Cached animal parts from before part skins (eyes, tint-mask coats).
+    let stale_animal = e.name.as_deref().is_some_and(|n| sixng_core::partskin::animal_root(n).is_some())
+        && std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| !j.contains("\"part_skin\""));
     let opts = ExportOptions {
         out: cache.to_path_buf(),
         png: true,
         dds: false,
         raw: false,
-        force: head || stale_tint || stale_vehicle,
+        force: head || stale_tint || stale_vehicle || stale_animal,
         skip_embedded_textures: false,
         body_shape: Vec::new(),
         head_skin: HEAD_SKIN.load(std::sync::atomic::Ordering::Relaxed),

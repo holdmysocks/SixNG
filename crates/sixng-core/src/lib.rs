@@ -5,6 +5,7 @@ pub mod bounds;
 pub mod classify;
 pub mod navmesh;
 pub mod lights;
+pub mod partskin;
 pub mod paths;
 pub mod outfit;
 pub mod pedskel;

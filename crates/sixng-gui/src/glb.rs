@@ -60,6 +60,9 @@ pub struct Material {
     /// Metallic and roughness factors of a stand-in surface (tyre rubber,
     /// lamp-reflector chrome); None = the viewer's defaults.
     pub mr: Option<[f32; 2]>,
+    /// The base texture is a tint mask (animal coats): its green channel
+    /// (shading) is shown as grey.
+    pub tint_mask: bool,
     pub slots: Vec<Slot>,
     /// worst slot status: ok / lowmip / flat
     pub gap: String,
@@ -725,6 +728,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             packed,
             emissive,
             mr,
+            tint_mask: ex["classification"]["tint_mask"] == true,
             slots,
             gap: gap.into(),
             shader_hash: ex["shader_name_hash"].as_str().unwrap_or("").into(),
