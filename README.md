@@ -418,6 +418,53 @@ again**).
   set as one rigged GLB). Single ped pieces are hidden as
   variants. Names are made readable: "Iguana (green, male)",
   "Dog (rottweiler, female)", "Farm monster man".
+- **Named characters wear their own outfits** (since 2026-11-23). A
+  character such as `cs_ali` owns only a head, eyes and a hair
+  placeholder; what it wears is in the game's outfit list (one packs PSO,
+  joaat(model name) → outfits in order) and the model's wardrobe resource.
+  The viewer reads both (`pedlook`; needs the `texture-users` index, built
+  from the Textures tab or with `sixng texture-users`) and shows the first
+  listed outfit: clothes, shoes, jewellery, the skin meshes (`hand_*` =
+  upper body, `feet_*` = lower body), the head with the face the outfit
+  item names, eyes and teeth. The **Character** panel has an **Outfit**
+  list (every outfit of that character, in the game's order), the body
+  sliders and notes on what was filled in. `sixng ped-look <model>` prints
+  the same data (per outfit: slot, drawable, how it was found, tint,
+  colour, hair asset, body-shape preset, unresolved items). What is not
+  game data, and is said so in the panel:
+  - **Body skin tone.** No painted body texture is stored (the game builds
+    skin at run time), so the body takes the colour of the face texture at
+    the neck.
+  - **Clothing colours.** An item's stored colour is used when it has one;
+    else row tint 0 of its tint palette (for `ped_tint_generic_clean`
+    only when the row is the colour the item's colour tag names, because
+    those rows are often placeholders); else the colour tag itself: one of
+    18 words (black, blue, khaki, navy …) shown in a plain shade of ours.
+    Second and third tints are not applied.
+  - **Which skin mesh.** Skin meshes come cut to the garment; which cut
+    goes with which garment is not decoded, so the whole one is used and
+    the skin triangles that lie right under a garment (top, jacket,
+    trousers, dress, shoes, gloves) are hidden, so skin does not show
+    through it.
+  - 275 of the 327 named characters resolve: 116 by model name and 159
+    through their head (the outfit list has them under another model
+    name; the wardrobe that names their head is theirs). The rest
+    (`cs_lucia` and `cs_jason`, whose outfits are under
+    `player_story000_00` / `_01`, some `hc_*`, `sc_*` and `u_*`) show
+    their own parts as before. `sixng ped-look "^"` lists every character
+    with what its default outfit has. `sixng outfit <name> --look N`
+    exports outfit N as one rigged GLB (parts, the face, stored tints;
+    not the viewer's skin tone, colour words or hidden skin).
+  - The first character opened builds `<work>/index/ped_models.json`
+    (about a minute) and loads the texture-users index (about 10 s).
+  - Watches and rings are modelled at their own root bone and moved onto
+    their attach bone (the left wrist when there are two).
+- **Body sliders** (weight −1…1, muscle 0…1; `--body <w>,<m>` for
+  screenshots): the skin and head are posed with the game's body-shape rig
+  on the shared skeleton. Clothes and accessories follow the skin under
+  them (each point moves with the nearest skin vertices), because the
+  data the game shapes clothes with is not decoded. Small accessories
+  move as one piece.
 - The viewer's **Parts** panel lists every part an animal or character
   has, grouped by slot (body, eye, crown, shirt, harness …; head, top,
   outer, bottom, feet, hat, glasses …). Pick one per group or "none";

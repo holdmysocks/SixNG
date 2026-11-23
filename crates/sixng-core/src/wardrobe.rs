@@ -52,6 +52,32 @@ pub struct Part {
     /// parent sets; none when no item of the chain stores one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tint: Option<PartTint>,
+    /// The drawable the tag map names outright (a head, a hair or brow
+    /// placeholder, a garment whose tag is its name prefix with the fit).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub named: Option<String>,
+    /// Asset GUID (`41acf8eb`) of the chosen state, first along the chain:
+    /// for hair, brows, beards and lashes the strand-groom asset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guid: Option<String>,
+    /// Flat colour of the chosen state (`46d26d93`, ARGB), when not zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub colour: Option<[u8; 4]>,
+    /// Colour word of the item's colour tag (`e60617ae`), first along the
+    /// chain: black, blue, khaki … (`pedtint::COLOUR_WORDS`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub colour_tag: Option<&'static str>,
+    /// The state the variation asks for (`StateName`), as hex.
+    pub state: String,
+    /// Colour and normal textures (`ead733fc`, `Normal`) of the chosen state
+    /// of each chain item that names a colour texture, item first: a head's
+    /// face. Many are in no store (the game builds body skin at run time).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skins: Vec<(String, String)>,
+    /// Drawables that use the item's textures, with the number of textures
+    /// shared (`pick` takes the best; `pedlook` prefers the model's own fit).
+    #[serde(skip)]
+    pub candidates: BTreeMap<String, usize>,
 }
 
 /// A part's tint, for `outfit --tint <drawable>=<spec>`.
@@ -123,6 +149,11 @@ pub struct Variation {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub tags: BTreeMap<String, Vec<String>>,
     pub parts: Vec<Part>,
+    /// Ids the variation lists that are not items of this resource: other
+    /// variations it includes (an outfit names its head set, body set and
+    /// body-shape preset this way).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub includes: Vec<String>,
 }
 
 /// joaat of every `_`-separated prefix of the drawable names -> (prefix, a
@@ -244,7 +275,21 @@ pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers,
 
     let mut out = Vec::new();
     for v in get(0xa9d5_7751) {
-        let links: Vec<&Value> = v[f(0xfb5b_b20d)].as_array().into_iter().flatten().filter_map(|ln| ln[f(0x6512_1749)].as_u64().and_then(|i| items.get(&i))).collect();
+        // the items the variation lists (with the state it asks for), and the
+        // ids that are not items of this resource: variations it includes
+        let mut includes = Vec::new();
+        let mut states: Vec<u64> = Vec::new();
+        let mut links: Vec<&Value> = Vec::new();
+        for ln in v[f(0xfb5b_b20d)].as_array().into_iter().flatten() {
+            let Some(id) = ln[f(0x6512_1749)].as_u64() else { continue };
+            match items.get(&id) {
+                Some(it) => {
+                    links.push(it);
+                    states.push(ln["StateName"].as_u64().unwrap_or(0));
+                }
+                None => includes.push(format!("{id:08x}")),
+            }
+        }
         // If this variation is a head set, capture the head's stem (walking
         // parent chains) so eyes / eyecaps / lashes tie-break to the same head
         // rather than alphabetically.
@@ -258,7 +303,7 @@ pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers,
             })
         });
         let mut parts = Vec::new();
-        for it in links {
+        for (it, want_state) in links.into_iter().zip(states) {
             let chain = item_chain(it, &items);
             let mut tex = Vec::new();
             chain.iter().for_each(|c| hashes64(c, &mut tex));
@@ -277,6 +322,24 @@ pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers,
             let name = chain.iter().find_map(|c| [0x4bfd_27ddu32, 0x023e_5a2f, 0x2a8c_db1d].iter().flat_map(|&k| tags(c, k)).find_map(|x| pre.get(&x).filter(|p| p.0.contains('_'))));
             let category = chain.iter().find_map(|c| c["Category"].as_u64().filter(|&x| x != 0)).map(|h| crate::names::lookup(h as u32, crate::names::Ctx::Field).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("{h:08x}")));
             let drawable = pick_with_name(&counts, name, ped_class.as_deref(), head_prefix.as_deref());
+            let named = name.filter(|p| p.0.split('_').any(crate::outfit::is_fit)).map(|p| p.1.clone());
+            // the state the variation asks for, else the first, per chain item
+            let state = |c: &Value| -> Option<Value> {
+                let st = c[f(0xebac_f18c)].as_array()?;
+                st.iter().find(|s| s["StateName"].as_u64() == Some(want_state)).or_else(|| st.first()).cloned()
+            };
+            let guid = chain.iter().filter_map(|c| state(c)).find_map(|s| s[f(0xe7cb_9e1b)][f(0x41ac_f8eb)].as_str().filter(|g| g.chars().any(|ch| ch != '0')).map(str::to_string));
+            let skins: Vec<(String, String)> = chain
+                .iter()
+                .filter_map(|c| state(c))
+                .filter_map(|s| {
+                    let e = &s[f(0xe7cb_9e1b)];
+                    let alb = e[f(0xead7_33fc)].as_str().filter(|g| g.chars().any(|ch| ch != '0'))?;
+                    Some((alb.to_string(), e["Normal"].as_str().unwrap_or("0").to_string()))
+                })
+                .collect();
+            let colour_tag = chain.iter().find_map(|c| tags(c, 0xe606_17ae).into_iter().find_map(crate::pedtint::colour_word)).map(|x| x.0);
+            let colour = chain.iter().filter_map(|c| state(c)).find_map(|s| s[f(0x46d2_6d93)].as_u64().filter(|&x| x != 0)).map(|x| (x as u32).to_be_bytes());
             let mut tex_remap = Vec::new();
             if let Some(mats) = drawable.as_deref().and_then(|d| model_mats.get(d)) {
                 for (slot, new) in set_textures(&chain) {
@@ -293,11 +356,11 @@ pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers,
             let mut tg = BTreeMap::new();
             chain.iter().rev().for_each(|c| tag_words(c, pre, &mut tg));
             let tint = chain_tint(&chain);
-            parts.push(Part { item: format!("{:08x}", it[f(0x6512_1749)].as_u64().unwrap_or(0)), category, name: name.map(|p| p.0.clone()), drawable, tex_remap, tags: tg, tint });
+            parts.push(Part { item: format!("{:08x}", it[f(0x6512_1749)].as_u64().unwrap_or(0)), category, name: name.map(|p| p.0.clone()), drawable, tex_remap, tags: tg, tint, named, guid, colour, colour_tag, state: format!("{want_state:08x}"), skins, candidates: counts });
         }
         let mut tags = BTreeMap::new();
         tag_words(&v, pre, &mut tags);
-        out.push(Variation { id: format!("{:08x}", v[f(0x6512_1749)].as_u64().unwrap_or(0)), scale: v["Scale"].clone(), tags, parts });
+        out.push(Variation { id: format!("{:08x}", v[f(0x6512_1749)].as_u64().unwrap_or(0)), scale: v["Scale"].clone(), tags, parts, includes });
     }
     out
 }

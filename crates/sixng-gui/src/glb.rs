@@ -63,6 +63,9 @@ pub struct Material {
     /// The base texture is a tint mask (animal coats): its green channel
     /// (shading) is shown as grey.
     pub tint_mask: bool,
+    /// Ped clothing whose base texture is the grey shade map (`ped_tint` in
+    /// the extras): the viewer colours it with the outfit's tint.
+    pub ped_shade: bool,
     /// Vehicle parts coloured per vertex (COLOR_0; alpha 254 = the primary
     /// body paint, other values = metalness in four steps x 50 + roughness in 50 steps).
     pub parts: bool,
@@ -732,6 +735,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             emissive,
             mr,
             tint_mask: ex["classification"]["tint_mask"] == true,
+            ped_shade: ex["ped_tint"].is_object(),
             parts: ex["classification"]["stand_in"] == "parts",
             slots,
             gap: gap.into(),

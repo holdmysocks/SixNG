@@ -1293,6 +1293,7 @@ impl Uploader {
             emissive: None,
             mr: None,
             tint_mask: false,
+            ped_shade: false,
             parts: false,
             slots: vec![],
             gap: "ok".into(),
