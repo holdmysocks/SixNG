@@ -239,6 +239,18 @@ pub struct ModelView {
     /// direction along the glass and a point on its bottom edge, both in
     /// the joint's own space.
     window_movers: Vec<(usize, Vec3, Vec3)>,
+    /// The moving parts of an aircraft among the loaded model's joints.
+    air: Vec<AirPart>,
+    /// Rotor and propeller speed, 0 (still) to 1; the angle they are at.
+    pub rotor_speed: f32,
+    rotor_angle: f32,
+    /// Control surfaces in radians: flaps and air brakes out, ailerons,
+    /// elevators and rudder either way.
+    pub flaps: f32,
+    pub ailerons: f32,
+    pub elevators: f32,
+    pub rudder: f32,
+    pub airbrakes: f32,
     /// The chosen configuration's key (its part colours), and what the
     /// loaded model's vertices currently show: (model file, look index).
     part_look_want: Option<String>,
@@ -521,6 +533,14 @@ impl ModelView {
             brake_heat: 0.0,
             windows_down: 0.0,
             window_movers: Vec::new(),
+            air: Vec::new(),
+            rotor_speed: 0.0,
+            rotor_angle: 0.0,
+            flaps: 0.0,
+            ailerons: 0.0,
+            elevators: 0.0,
+            rudder: 0.0,
+            airbrakes: 0.0,
             part_look_want: None,
             cfg_request: None,
             part_look_done: None,
@@ -1856,6 +1876,7 @@ impl ModelView {
                 self.hinges = find_hinges(&l.model);
                 self.steer_wheel = find_steering_wheel(&l.model);
                 self.window_movers = find_window_movers(&l.model);
+                self.air = find_air_parts(&l.model);
                 self.has_lamps = l.model.joints.iter().any(|j| self.lamps.kind(&j.name).is_some());
                 self.siren_dirty = true;
             }
@@ -2182,6 +2203,31 @@ impl ModelView {
                 swing.insert(i, Mat4::from_quat(Quat::from_axis_angle(axis, self.steer * STEERING_RATIO * self.steer_mult)));
             }
         }
+        // aircraft: rotors and propellers turn, control surfaces swing
+        // about their hinge, and of the still and the blurred blades only
+        // the set for the speed is left at its size
+        let fast = self.rotor_speed >= 0.5;
+        for p in &self.air {
+            let m = match p.kind {
+                AirKind::Spin => (self.rotor_angle != 0.0).then(|| Mat4::from_quat(Quat::from_axis_angle(p.axis, self.rotor_angle * p.sign))),
+                AirKind::Still => fast.then(|| Mat4::from_scale(Vec3::splat(1e-5))),
+                AirKind::Blur => (!fast).then(|| Mat4::from_scale(Vec3::splat(1e-5))),
+                AirKind::Flap | AirKind::Aileron | AirKind::Elevator | AirKind::Rudder | AirKind::Airbrake => {
+                    let a = match p.kind {
+                        AirKind::Flap => self.flaps,
+                        AirKind::Aileron => self.ailerons,
+                        AirKind::Elevator => self.elevators,
+                        AirKind::Rudder => self.rudder,
+                        _ => self.airbrakes,
+                    };
+                    (a != 0.0).then(|| Mat4::from_quat(Quat::from_axis_angle(p.axis, a * p.sign)))
+                }
+            };
+            if let Some(m) = m {
+                let m = swing.get(&p.joint).map_or(m, |s| *s * m);
+                swing.insert(p.joint, m);
+            }
+        }
         let mut global: Vec<Option<Mat4>> = vec![None; js.len()];
         fn g(
             i: usize,
@@ -2483,6 +2529,13 @@ impl ModelView {
         let px = [(rect.width() * ppp) as u32, (rect.height() * ppp) as u32];
         self.size = px;
         self.update_wheels(rs, &ctx);
+        if self.rotor_speed > 0.0 && self.air.iter().any(|p| p.kind == AirKind::Spin) {
+            // slow enough to see the blades below half speed; the blurred
+            // set turns slowly, as a blur does
+            let rate = if self.rotor_speed < 0.5 { 2.0 + self.rotor_speed * 20.0 } else { 3.0 + self.rotor_speed * 4.0 };
+            self.rotor_angle = (self.rotor_angle + ctx.input(|i| i.stable_dt).min(0.1) * rate) % std::f32::consts::TAU;
+            ctx.request_repaint();
+        }
         let (globals, mut skin) = self.joint_mats();
         // Lit lamps: the light of each lamp bone rides in the bottom row of
         // its joint matrix (see the shader). Not on the Metal renderer.
@@ -2845,6 +2898,33 @@ impl ModelView {
                         self.steer_mult
                     ));
                     self.steer = deg.to_radians();
+                }
+                if !self.air.is_empty() {
+                    let has = |k: AirKind| self.air.iter().any(|p| p.kind == k);
+                    let note = "Aircraft parts are found by their bones. The axis of each is taken from the shape of its mesh (a rotor turns about its thin direction, a control surface about its long one) and the direction from where the mesh lies; the angles are the sliders', not limits read from the files.";
+                    if has(AirKind::Spin) {
+                        ui.add(egui::Slider::new(&mut self.rotor_speed, 0.0..=1.0).text("rotor / propeller speed")).on_hover_text(format!("Turns the rotor_main, rotor_rear and prop_N bones. Below half speed the still blades are shown, from half speed the game's blurred blades (the _fast meshes). {note}"));
+                    }
+                    let deg = |ui: &mut egui::Ui, v: &mut f32, lo: f32, hi: f32, text: &str| {
+                        let mut d = v.to_degrees();
+                        ui.add(egui::Slider::new(&mut d, lo..=hi).text(text)).on_hover_text(note);
+                        *v = d.to_radians();
+                    };
+                    if has(AirKind::Flap) {
+                        deg(ui, &mut self.flaps, 0.0, 40.0, "flaps (degrees down)");
+                    }
+                    if has(AirKind::Aileron) {
+                        deg(ui, &mut self.ailerons, -25.0, 25.0, "ailerons (left down, right up)");
+                    }
+                    if has(AirKind::Elevator) {
+                        deg(ui, &mut self.elevators, -25.0, 25.0, "elevators (degrees down)");
+                    }
+                    if has(AirKind::Rudder) {
+                        deg(ui, &mut self.rudder, -30.0, 30.0, "rudder (degrees)");
+                    }
+                    if has(AirKind::Airbrake) {
+                        deg(ui, &mut self.airbrakes, 0.0, 60.0, "air brakes (degrees up)");
+                    }
                 }
                 if !self.window_movers.is_empty() {
                     ui.add(egui::Slider::new(&mut self.windows_down, 0.0..=1.0).text("windows down")).on_hover_text("Lowers each side window by its mover bone (window_lf_mover ...): the glass is drawn down to its bottom edge, so its top edge drops to the sill. The bones are the game's; the path the game moves the glass along inside the door is not read from the files, so the glass is shortened instead of slid.");
@@ -4516,6 +4596,125 @@ fn rim_factor(boxes: &[[[f32; 3]; 2]], ratio: f32) -> f32 {
 /// child `window_lf`): joint index, the downward direction along the glass
 /// and a point on the glass's bottom edge, in the mover's own space. The
 /// plane of the glass is taken from its triangles.
+/// What an aircraft bone does in the viewer.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum AirKind {
+    /// rotor or propeller hub: turns
+    Spin,
+    /// the blades shown when still or slow (`_slow` meshes)
+    Still,
+    /// the blurred blades shown at speed (`_fast` meshes, `_disc`)
+    Blur,
+    Flap,
+    Aileron,
+    Elevator,
+    Rudder,
+    Airbrake,
+}
+
+/// One moving part of an aircraft: its joint, the axis it turns about (in
+/// the joint's own space) and the sign that turns it the named way (a flap
+/// or elevator down, an air brake up, the left aileron down and the right
+/// one up, the rudder's trailing edge to +X).
+struct AirPart {
+    joint: usize,
+    kind: AirKind,
+    axis: Vec3,
+    sign: f32,
+}
+
+fn air_kind(name: &str) -> Option<AirKind> {
+    let n = name.to_ascii_lowercase();
+    let numbered = |pre: &str| n.strip_prefix(pre).is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()));
+    let blade = n.starts_with("rotor_") || n.starts_with("prop_");
+    Some(if n == "rotor_main" || n == "rotor_rear" || n == "rotor_main_2" || numbered("prop_") {
+        AirKind::Spin
+    } else if blade && (n.ends_with("_fast") || n.contains("_fast_") || n.ends_with("_disc")) {
+        AirKind::Blur
+    } else if blade && (n.ends_with("_slow") || n.contains("_slow_")) {
+        AirKind::Still
+    } else if matches!(n.as_str(), "flap_l" | "flap_r" | "flap_lm" | "flap_rm") {
+        AirKind::Flap
+    } else if n == "aileron_l" || n == "aileron_r" {
+        AirKind::Aileron
+    } else if n == "elevator_l" || n == "elevator_r" {
+        AirKind::Elevator
+    } else if n == "rudder" {
+        AirKind::Rudder
+    } else if n.starts_with("airbrake_") && !n.ends_with("_mesh") && !n.ends_with("_flex") {
+        AirKind::Airbrake
+    } else {
+        return None;
+    })
+}
+
+/// The rotors, propellers and control surfaces of an aircraft. A part's
+/// axis is the axis of its joint along which its mesh (the vertices on the
+/// joint and the joints below it) is thinnest for a rotor or propeller and
+/// longest for a control surface; the sign comes from which way the middle
+/// of the mesh moves.
+fn find_air_parts(model: &glb::Model) -> Vec<AirPart> {
+    let kinds: Vec<Option<AirKind>> = model.joints.iter().map(|j| air_kind(&j.name)).collect();
+    if kinds.iter().all(|k| k.is_none()) {
+        return Vec::new();
+    }
+    let moves = |k: AirKind| !matches!(k, AirKind::Still | AirKind::Blur);
+    // the moving part each joint belongs to (itself or the nearest above)
+    let owner: Vec<Option<usize>> = (0..model.joints.len())
+        .map(|i| {
+            let (mut k, mut depth) = (Some(i), 0);
+            while let Some(j) = k {
+                if kinds[j].is_some_and(moves) {
+                    return Some(j);
+                }
+                depth += 1;
+                k = model.joints[j].parent.filter(|p| *p != j && depth < 64);
+            }
+            None
+        })
+        .collect();
+    // extent and middle of each part's vertices in its joint's space
+    let mut boxes: HashMap<usize, (Vec3, Vec3, Vec3, f32)> = HashMap::new();
+    for me in model.meshes.iter().filter(|m| m.skinned) {
+        for v in &me.verts {
+            let Some(o) = (0..4).filter(|k| v.weights[*k] > 127).find_map(|k| owner.get(v.joints[k] as usize).copied().flatten()) else { continue };
+            let p = Mat4::from_cols_array(&model.joints[o].ibm).transform_point3(Vec3::from(v.pos));
+            let e = boxes.entry(o).or_insert((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN), Vec3::ZERO, 0.0));
+            *e = (e.0.min(p), e.1.max(p), e.2 + p, e.3 + 1.0);
+        }
+    }
+    let mut out = Vec::new();
+    for (i, k) in kinds.iter().enumerate() {
+        let Some(k) = *k else { continue };
+        if !moves(k) {
+            out.push(AirPart { joint: i, kind: k, axis: Vec3::Y, sign: 1.0 });
+            continue;
+        }
+        let Some(&(lo, hi, sum, n)) = boxes.get(&i).filter(|b| b.3 >= 8.0) else { continue };
+        let e = hi - lo;
+        let pick = |want_min: bool| {
+            let v = [e.x, e.y, e.z];
+            let k = (0..3).min_by(|a, b| if want_min { v[*a].total_cmp(&v[*b]) } else { v[*b].total_cmp(&v[*a]) }).unwrap_or(0);
+            [Vec3::X, Vec3::Y, Vec3::Z][k]
+        };
+        let axis = pick(k == AirKind::Spin);
+        // a small turn about the axis moves the middle of the mesh by
+        // axis x middle; in model space that tells down from up
+        let to_model = Mat4::from_cols_array(&model.joints[i].ibm).inverse();
+        let d = to_model.transform_vector3(axis.cross(sum / n));
+        let left = model.joints[i].name.to_ascii_lowercase().ends_with("_l");
+        let sign = match k {
+            AirKind::Spin => 1.0,
+            AirKind::Rudder => if d.x >= 0.0 { 1.0 } else { -1.0 },
+            AirKind::Airbrake => if d.y >= 0.0 { 1.0 } else { -1.0 },
+            // down; the right aileron goes the other way
+            _ => (if d.y <= 0.0 { 1.0 } else { -1.0 }) * if k == AirKind::Aileron && !left { -1.0 } else { 1.0 },
+        };
+        out.push(AirPart { joint: i, kind: k, axis, sign });
+    }
+    out
+}
+
 fn find_window_movers(model: &glb::Model) -> Vec<(usize, Vec3, Vec3)> {
     let mut out = Vec::new();
     for (mi, mover) in model.joints.iter().enumerate() {
