@@ -2300,8 +2300,13 @@ impl ModelView {
         }
         if let Some(path) = self.auto.screenshot.clone() {
             self.auto.frames += 1;
+            // The fallback after 600 frames must not fire while a vehicle's
+            // data, wheels or brakes are still loading (a first export of
+            // the wheel models takes longer than 600 frames, and the shot
+            // then showed the car without wheels); 180 s is the last resort.
+            let busy = self.wheel_loading || self.brake_loading || matches!(&*self.vehicles.state.lock().unwrap(), crate::vehicle_db::State::Loading(_));
             let ready = (self.gpu.is_some() && self.frames_since_load >= 3 && settled)
-                || (!self.loading && !self.hair.fitting && !self.auto.find_hair && self.hair.settled() && self.auto.frames > 600);
+                || (!self.loading && !self.hair.fitting && !self.auto.find_hair && self.hair.settled() && self.auto.frames > 600 && (!busy || ctx.input(|i| i.time) > 180.0));
             if ready {
                 if let Some((w, h, px)) = ren.read_back(rs) {
                     match render3d::save_png(&path, w, h, &px) {
