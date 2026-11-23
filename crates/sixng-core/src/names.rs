@@ -34,7 +34,38 @@ pub const DERIVED_EXACT: &[&str] = &["fMass", "fInitialDragCoeff", "fDriveBiasFr
     // paint-colour list, a vehicle configuration's body colour, the animation
     // rotation property, the minigame dialogue field next to MissionId, and
     // the wardrobe field that holds body-type words (the name fits loosely)
-    "colours", "colour", "bonerotation", "BankName", "pedtype"];
+    "colours", "colour", "bonerotation", "BankName", "pedtype",
+    // vehicle material library fields (surface ranges, detail sets, coat, wear
+    // and colour records): case-sensitive joaat search over camelCase word
+    // combinations, 2026-11-23. One- and two-word names, plus three-word names
+    // that a sibling field confirms (0 / 1, Min / Max, A / B / C, Start / End)
+    "active", "ageWearHash", "albedo", "albedoMultiply", "albedoOptions", "albedoPage", "albedoPalette", "albedoScreen", "albedoSelection",
+    "albedoTag", "alphaThresholdMax", "alphaThresholdMin", "anisoCutoff", "anisoDetailTile", "anisoIndex", "anisoTile", "anisotropyIntensity",
+    "archetype", "asset", "attachBone", "attachBoneId", "attachInfo", "attachOffsets", "baseBleachEnd", "baseBleachMax", "baseBleachMin",
+    "baseBleachStart", "baseCoatRoughness", "blueMarginMax", "blueMarginMin", "blueScratchEnd", "blueScratchStart", "boneId", "boneInfos", "boneName",
+    "boneTag", "branch", "clearCoatIntensity", "clearCoatRoughness", "colorBlue", "colorGreen", "colorRed", "componentName", "controlIntensityA",
+    "controlIntensityB", "controlIntensityC", "controlSpeed", "cooldownMult", "damageScale", "dataCheck", "dataHash", "defaultAlbedo",
+    "defaultPaintType", "defaultSpecular", "detailFadeRange", "detailIndex0", "detailIndex1", "detailRotation", "detailRoughnessStrength0",
+    "detailRoughnessStrength1", "detailStrength0", "detailStrength1", "detailTile0", "detailTile1", "detailTiling0", "detailTiling1",
+    "detailTintStrength0", "detailTintStrength1", "diffuseTexture", "diffuseTiling", "dirtLumMax", "dirtLumScale", "disableCollision",
+    "displayDuration", "displayName", "dustIntensity", "dynamicBoneId", "edgeDensity", "edgeEnd", "edgeIntensity", "edgeStart", "edgeZ",
+    "emissiveBlue", "emissiveCutoff", "emissiveGreen", "emissiveRed", "enableControl", "enableDiffuse", "endColumn", "entityMap", "fabricUser2",
+    "fadeOrientation", "fadePack", "fadeRoll", "fadeScale", "filmThickness", "flakeCoverage", "flakeOrientation", "flakesCutoff", "flakeSize",
+    "forceScale", "fxName", "fxType", "glassAlpha", "greenMarginMax", "greenMarginMin", "group", "id", "inclineComponentsScale", "index",
+    "intensityMax", "intensityMin", "iorCutoff", "ladderFlags", "leftOffset", "lightGroups", "lineOffset", "liveryControls", "liveryEmissive",
+    "liveryMaterials", "lockColor", "lockIntensity", "lodDistance", "lodLevels", "materialName", "materialPresetPalette", "materialPresets",
+    "materialType", "maxBlue", "maxGreen", "maxIntensity", "maxRed", "maxTile", "maxTiling", "maxWear", "metalHigh", "metalLow", "minBlue",
+    "minGreen", "minRandomScale", "minRed", "minTile", "minTiling", "minWear", "modSets", "offsetPosition", "offsetRandomMax", "offsetRandomMin",
+    "offsetRotation", "paintHash", "paintPalette", "paintType", "partId", "positionOffset", "prefix", "primaryMaterial", "primerEnd",
+    "primerGradientEnd", "primerGradientStart", "primerIntensityA", "primerIntensityB", "primerIntensityC", "primerPalette", "primerSets",
+    "primerStart", "primerType", "rainHash", "randomRotation", "redMarginMax", "redMarginMin", "redScratchEnd", "redScratchStart",
+    "reflectorData", "rimBoneId", "rimRatio", "rimSize", "rotationAxis", "rustEnd", "rustEndB", "rustEndC", "rustStart", "rustStartB", "rustStartC",
+    "scannerHash", "secMotion", "seed", "sheenCutoff", "sheenFade", "sheenIntensity", "sheenReflectance", "slot", "spawnDistance",
+    "specOptions", "specTag", "specularColor", "specularCutoff", "specularPalette", "startColumn", "sticker", "stickerPack", "stiffnessMultiplier",
+    "string", "sunBleachEnd", "sunBleachScreen", "sunBleachStart", "surfaceIndex", "texData", "texDistances", "tileAmount",
+    "timeMultiplier", "tintInfos", "tintPaletteRow", "tintRow", "topOffset", "ttName", "typeData", "tyreSize", "useAnisotropy", "useColor",
+    "useEmissive", "useFlakes", "useIntensity", "useSpecularColor", "vehicleSpec", "vehicleType", "wearPresets", "wheelDetailScale", "wheelHash",
+    "wheelId", "wheelInfo", "windowTint"];
 
 pub const DERIVED: &[&str] = &[
     // texture parameters of the minigame pack's water and interior shaders (joaat search, 2026-11-23)
@@ -343,6 +374,19 @@ mod tests {
         assert_eq!(lookup(0x5bdc_13e3, Ctx::Field).as_deref(), Some("colour"));
         assert_eq!(lookup(0x49a0_1a86, Ctx::Field).as_deref(), Some("ParentName"));
         assert_eq!(lookup(0x817e_d7a4, Ctx::Field).as_deref(), Some("valueHash"));
+        // vehicle material library fields
+        assert_eq!(joaat_exact("metalLow"), 0xf763_652d);
+        assert_eq!(lookup(0xf763_652d, Ctx::Field).as_deref(), Some("metalLow"));
+        assert_eq!(joaat_exact("metalHigh"), 0x09dd_33c1);
+        assert_eq!(lookup(0x09dd_33c1, Ctx::Field).as_deref(), Some("metalHigh"));
+        assert_eq!(joaat_exact("albedoMultiply"), 0x4b19_d0cb);
+        assert_eq!(lookup(0x4b19_d0cb, Ctx::Field).as_deref(), Some("albedoMultiply"));
+        assert_eq!(joaat_exact("detailTintStrength0"), 0xfcb9_94fa);
+        assert_eq!(lookup(0xfcb9_94fa, Ctx::Field).as_deref(), Some("detailTintStrength0"));
+        assert_eq!(joaat_exact("albedoSelection"), 0x9bdd_4c51);
+        assert_eq!(lookup(0x9bdd_4c51, Ctx::Field).as_deref(), Some("albedoSelection"));
+        assert_eq!(joaat_exact("albedoPage"), 0x0971_4f5c);
+        assert_eq!(lookup(0x0971_4f5c, Ctx::Field).as_deref(), Some("albedoPage"));
         // derived names resolve without a dictionary file
         assert_eq!(lookup(0xc8e8_c282, Ctx::Param).as_deref(), Some("diffusetex"));
     }
