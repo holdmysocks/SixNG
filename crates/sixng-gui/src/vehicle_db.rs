@@ -64,6 +64,8 @@ struct Info {
 struct Cfg {
     #[serde(default)]
     rim_ratio: Option<f32>,
+    #[serde(default)]
+    parts_key: Option<String>,
     colour: Option<Colour>,
     rim: Option<String>,
     tyre: Option<String>,
@@ -98,6 +100,8 @@ pub struct Config {
     pub caliper: Option<String>,
     /// Rim radius / tyre radius of the configuration's wheel fitment record.
     pub rim_ratio: Option<f32>,
+    /// Key of the configuration's part list (names its part colours in an export).
+    pub parts_key: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -240,6 +244,7 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
             .into_iter()
             .map(|c| Config {
                 rim_ratio: c.rim_ratio,
+                parts_key: c.parts_key,
                 colour: c.colour.and_then(|c| hex(&c.srgb_if_linear)),
                 rim: c.rim,
                 tyre: c.tyre,

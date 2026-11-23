@@ -34,7 +34,7 @@ const OWNER: u32 = 0xfb1f_80ff;
 /// `handlingId` (case-sensitive joaat).
 const HANDLING_ID: u32 = 0xec41_bd9c;
 /// Layout version of vehicles.json; the model viewer rebuilds older files.
-pub const FORMAT: u32 = 7;
+pub const FORMAT: u32 = 8;
 /// A mod part or kit of one vehicle (in that vehicle's own pack resource):
 /// `name` joaat of the part model's name, or of a kit's name (the names of
 /// its left and right models without the side word:
@@ -245,6 +245,7 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
             let rim_ratio = fits.as_ref().and_then(|t| parts.iter().find_map(|p| t.rim_ratio.get(&format!("{p:08x}"))));
             e["configurations"].as_array_mut().unwrap().push(json!({
                 "rim_ratio": rim_ratio,
+                "parts_key": crate::vehcolour::config_key(&parts),
                 "colour": colour, "rim": rims.first(), "tyre": tyres.first(), "rims": rims, "tyres": tyres,
                 "parts": parts.iter().zip(&pn).map(|(p, n)| n.clone().map(Value::String).unwrap_or(json!(format!("{p:08x}")))).collect::<Vec<_>>(),
             }));
@@ -344,7 +345,7 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("vehicles.json");
     std::fs::write(&path, serde_json::to_vec_pretty(&json!({
-        "note": "Per vehicle model: model_info (vehicles.meta-like; wheelScale / wheelScaleRear are not understood: they are not the rim radius (0.219 on comet7, whose rim is 0.82 x a 0.35 m tyre). A wheel's size, width and position are in the model's export (model.json wheel_mounts, from the collision discs), and the rim's share of it in the configuration's rim_ratio), configurations (body colour ARGB + the part models incl. rim and tyre; rim_ratio = rim radius / tyre radius from the configuration's wheel fitment record, slot 39d5e253, where it has one), palettes (ARGB paint-colour lists; colours repeat, so repetition reads as the draw weight), part_groups (weighted part choices). steering_lock is fSteeringLock of the model's handling record (radians, the largest angle of the steered wheels; from the PSO files in data.rpf, joined by handlingId). display_name and make are the game's own text for the model's name hash and its vehicleMakeName (from the first text table in data.rpf that has them: English). Names resolve where known; others are joaat hex.",
+        "note": "Per vehicle model: model_info (vehicles.meta-like; wheelScale / wheelScaleRear are not understood: they are not the rim radius (0.219 on comet7, whose rim is 0.82 x a 0.35 m tyre). A wheel's size, width and position are in the model's export (model.json wheel_mounts, from the collision discs), and the rim's share of it in the configuration's rim_ratio), configurations (body colour ARGB + the part models incl. rim and tyre; parts_key = a key of the part list that a vehicle export's model.json part_colours.configs uses to name the part colours of this configuration; rim_ratio = rim radius / tyre radius from the configuration's wheel fitment record, slot 39d5e253, where it has one), palettes (ARGB paint-colour lists; colours repeat, so repetition reads as the draw weight), part_groups (weighted part choices). steering_lock is fSteeringLock of the model's handling record (radians, the largest angle of the steered wheels; from the PSO files in data.rpf, joined by handlingId). display_name and make are the game's own text for the model's name hash and its vehicleMakeName (from the first text table in data.rpf that has them: English). Names resolve where known; others are joaat hex.",
         "format": FORMAT,
         "sources": sources,
         "vehicles": list,

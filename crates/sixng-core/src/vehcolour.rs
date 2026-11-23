@@ -50,9 +50,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// Version of what an export writes for part colours (model.json
 /// `part_colours_version`); the model viewer exports older vehicles again.
-pub const EXPORT_VERSION: u32 = 4;
+pub const EXPORT_VERSION: u32 = 5;
 /// Layout version of `<work>/index/vehicle_parts.json`.
-pub const FORMAT: u32 = 5;
+pub const FORMAT: u32 = 7;
 
 const PART_SET: u32 = 0xf142_44fd;
 const SET_COLOURS: u32 = 0x7847_6477;
@@ -100,6 +100,11 @@ const FLAG_SURFACE: u32 = 0x7a84_e7bf;
 const ASSIGN: u32 = 0xb943_08f5;
 const ASSIGN_CHANNEL: u32 = 0xca20_65a9;
 const ASSIGN_COLOUR: u32 = 0x2c89_a8d2;
+/// A modifier that lists parts to choose one from (`bf340aab`): paint
+/// finishes, trims, wheels. Which one the game picks is not decoded; the
+/// first is taken.
+const OPTION_LIST: u32 = 0xf5e9_d7df;
+const OPTION_PARTS: u32 = 0xbf34_0aab;
 /// The channel body panels are bound to (bonnet, boot, bumpers, doors, at
 /// priority 1 over a default); no record assigns it a colour, so it is taken
 /// as the body paint.
@@ -158,6 +163,22 @@ pub struct Tables {
     /// radius, for the wheel fitment records.
     #[serde(default)]
     pub rim_ratio: HashMap<String, f32>,
+    /// Model (8 hex digits) -> configuration key (`config_key` of its part
+    /// list) -> the part set that configuration gives.
+    #[serde(default)]
+    pub config_sets: HashMap<String, HashMap<String, String>>,
+}
+
+/// A key for a configuration: FNV-1a of its part list (the name hashes in
+/// order), 16 hex digits. vehicles.json writes it as `parts_key`.
+pub fn config_key(parts: &[u32]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for p in parts {
+        for b in p.to_le_bytes() {
+            h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("{h:016x}")
 }
 
 fn get<'v>(v: &'v Value, h: u32) -> Option<&'v Value> {
@@ -192,6 +213,8 @@ struct Library {
     binds: HashMap<u32, (u32, u32, i64, bool, bool)>,
     /// modifier name -> (channel, colour record, surface record)
     assigns: HashMap<u32, (u32, u32, u32)>,
+    /// modifier name -> the parts of an option list (`f5e9d7df.bf340aab`)
+    options: HashMap<u32, Vec<u32>>,
     id: Option<String>,
 }
 
@@ -207,7 +230,12 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
             }
             let m = &m;
             let dump = |h: u32| m.objects(h).into_iter().filter_map(|o| m.object(h, o, 0)).collect::<Vec<_>>();
-            let mut l = Library { colours: HashMap::new(), surfaces: HashMap::new(), rough: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), id: Some(e.id.clone()) };
+            let mut l = Library { colours: HashMap::new(), surfaces: HashMap::new(), rough: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), options: HashMap::new(), id: Some(e.id.clone()) };
+            for o in dump(OPTION_LIST) {
+                if let Some(n) = num(&o, NAME) {
+                    l.options.insert(n as u32, get(&o, OPTION_PARTS).and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()).unwrap_or_default());
+                }
+            }
             let ids = |v: &Value, h: u32| get(v, h).and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u8)).collect::<Vec<u8>>()).unwrap_or_default();
             let flag = |v: &Value, h: u32| get(v, h).and_then(|x| x.as_bool()).unwrap_or(false);
             // group part ids are a byte array: pool reference, then count (u16)
@@ -373,21 +401,36 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
             let key = format!("{owner:08x}");
             let Some(set) = t.models.get(&key).cloned() else { continue };
             let Some(base) = t.sets.get(&set).cloned() else { continue };
-            // (result, how many configurations give it), in first-seen order
-            let mut results: Vec<(Vec<Part>, usize)> = Vec::new();
+            // (result, the configurations that give it), in first-seen order
+            let mut results: Vec<(Vec<Part>, Vec<String>)> = Vec::new();
             for (_, parts) in configs.iter().filter(|c| c.0 == owner) {
                 let mut out = base.clone();
                 apply_config(&lib, own, parts, &mut out);
+                let ck = config_key(parts);
                 match results.iter_mut().find(|r| r.0 == out) {
-                    Some(r) => r.1 += 1,
-                    None => results.push((out, 1)),
+                    Some(r) => r.1.push(ck),
+                    None => results.push((out, vec![ck])),
                 }
             }
-            let best = results.iter().map(|r| r.1).max().unwrap_or(0);
-            if let Some((out, _)) = results.into_iter().find(|r| r.1 == best).filter(|r| r.0 != base) {
-                let name = format!("{set}+{key}");
-                t.sets.insert(name.clone(), out);
-                t.models.insert(key, name);
+            let most = results.iter().map(|r| r.1.len()).max().unwrap_or(0);
+            let best = results.iter().position(|r| r.1.len() == most);
+            for (ri, (out, keys)) in results.into_iter().enumerate() {
+                // each distinct result is a set of its own; the most common one is the model's
+                let name = if out == base {
+                    set.clone()
+                } else if Some(ri) == best {
+                    format!("{set}+{key}")
+                } else {
+                    format!("{set}+{key}#{ri}")
+                };
+                t.sets.entry(name.clone()).or_insert(out);
+                let by_config = t.config_sets.entry(key.clone()).or_default();
+                for k in keys {
+                    by_config.insert(k, name.clone());
+                }
+                if Some(ri) == best {
+                    t.models.insert(key.clone(), name);
+                }
             }
         }
     }
@@ -396,10 +439,23 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
 
 /// Apply the colour and surface modifiers of a configuration's parts to a
 /// part set; returns the number of part ids changed. Bindings are applied in
-/// priority order (as listed within a priority). Parts that only list other
-/// parts (option lists) are not followed.
+/// priority order (as listed within a priority). Of an option list the
+/// first part is followed (which one the game picks is not decoded).
 fn apply_config(lib: &Library, own: &HashMap<u32, Vec<u32>>, parts: &[u32], set: &mut [Part]) -> usize {
-    let mods: Vec<u32> = parts.iter().filter_map(|p| own.get(p).or_else(|| lib.mods.get(p))).flatten().copied().collect();
+    // a part's modifiers, with the first part of each option list followed
+    fn collect(lib: &Library, own: &HashMap<u32, Vec<u32>>, part: u32, depth: u32, out: &mut Vec<u32>) {
+        let Some(list) = own.get(&part).or_else(|| lib.mods.get(&part)) else { return };
+        for &m in list {
+            out.push(m);
+            if let Some(first) = lib.options.get(&m).and_then(|o| o.first()).filter(|_| depth < 3) {
+                collect(lib, own, *first, depth + 1, out);
+            }
+        }
+    }
+    let mut mods: Vec<u32> = Vec::new();
+    for &p in parts {
+        collect(lib, own, p, 0, &mut mods);
+    }
     let local: HashMap<u32, &Vec<u8>> = mods.iter().filter_map(|m| lib.group_defs.get(m)).map(|(g, ids)| (*g, ids)).collect();
     let channel: HashMap<u32, (u32, u32)> = mods.iter().filter_map(|m| lib.assigns.get(m)).map(|&(ch, c, s)| (ch, (c, s))).collect();
     let mut binds: Vec<&(u32, u32, i64, bool, bool)> = mods.iter().filter_map(|m| lib.binds.get(m)).collect();
@@ -478,12 +534,18 @@ impl Tables {
 /// fixed material counts as metal when its palette row is bright and
 /// neutral (chrome, polished aluminium) and its surface is smooth.
 pub fn vertex_colours(parts: &[Part], palette: &[[u8; 4]], ids: impl Iterator<Item = u8>) -> Vec<[u8; 4]> {
+    let look = look_table(parts, palette);
+    ids.map(|i| look[i as usize]).collect()
+}
+
+/// The colour of each of the 256 part ids (see `vertex_colours`).
+pub fn look_table(parts: &[Part], palette: &[[u8; 4]]) -> Vec<[u8; 4]> {
     let lin = |v: u8| {
         let c = v as f32 / 255.0;
         let l = if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
         (l * 255.0 + 0.5) as u8
     };
-    let look: Vec<[u8; 4]> = (0..256)
+    (0..256)
         .map(|i| {
             let Some(p) = parts.get(i) else { return [255; 4] };
             let mid = ((p.rough[0] + p.rough[1]) * 0.5).clamp(0.0, 1.0);
@@ -494,8 +556,33 @@ pub fn vertex_colours(parts: &[Part], palette: &[[u8; 4]], ids: impl Iterator<It
             let metal = fixed && lo >= 190 && hi - lo <= 24 && mid <= 0.55;
             [lin(rgb[0]), lin(rgb[1]), lin(rgb[2]), if p.is_primary() { 254 } else if metal { rough + 101 } else { rough }]
         })
-        .collect();
-    ids.map(|i| look[i as usize]).collect()
+        .collect()
+}
+
+impl Tables {
+    /// What model.json records so a viewer can recolour a vehicle for a
+    /// chosen configuration: `looks` (each distinct result as 256 x RGBA,
+    /// 2,048 hex digits, encoded like GLB COLOR_0), `configs` (configuration
+    /// key -> index into looks) and `default` (the look in the GLB). Null
+    /// for models without configurations (mod parts).
+    pub fn looks_json(&self, model: &str, palette: &[[u8; 4]]) -> Value {
+        let m = model.to_ascii_lowercase();
+        let base = m.strip_suffix("_hi").or_else(|| m.strip_suffix("_mid")).unwrap_or(&m);
+        let key = format!("{:08x}", meta7a::joaat(base));
+        let (Some(by_config), Some(default)) = (self.config_sets.get(&key), self.models.get(&key)) else { return Value::Null };
+        let mut names: Vec<&String> = by_config.values().collect();
+        names.push(default);
+        names.sort();
+        names.dedup();
+        let hex = |n: &String| self.sets.get(n).map(|p| look_table(p, palette).iter().flat_map(|c| c.iter().map(|b| format!("{b:02x}"))).collect::<String>());
+        let looks: Vec<Value> = names.iter().map(|n| hex(n).map_or(Value::Null, Value::String)).collect();
+        let index = |n: &String| names.iter().position(|x| *x == n);
+        serde_json::json!({
+            "looks": looks,
+            "configs": by_config.iter().filter_map(|(k, n)| Some((k.clone(), Value::from(index(n)?)))).collect::<serde_json::Map<String, Value>>(),
+            "default": index(default),
+        })
+    }
 }
 
 /// The colour of a palette row: the mean of its middle quarter (what picks

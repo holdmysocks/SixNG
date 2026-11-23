@@ -994,7 +994,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
             }
             fs::write(dir.join("sys.bin"), &r.sys)?;
             item.files.push(rel(&o.out, &dir.join("sys.bin")));
-            let BuiltDrawable { lod_groups, part_groups, materials: mats, joints, mesh_meta, shader_tex, head } = build_drawable(a, e, &r, &info, &dir, requested_member.is_some(), o, &mut item);
+            let BuiltDrawable { lod_groups, part_groups, materials: mats, joints, mesh_meta, shader_tex, part_looks, head } = build_drawable(a, e, &r, &info, &dir, requested_member.is_some(), o, &mut item);
             let all = || lod_groups.iter().flatten().chain(part_groups.iter()).flat_map(|g| &g.prims);
             let ntris: usize = all().map(|p| p.indices.len() / 3).sum();
             let nverts: usize = all().map(|p| p.positions.len()).sum();
@@ -1101,7 +1101,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 "wheel_mounts_version": 3,
                 "part_colours_version": crate::vehcolour::EXPORT_VERSION,
                 "part_colours": shader_tex.iter().any(|st| st.vehicle_palette.is_some()).then(|| match shader_tex.iter().find_map(|st| st.vehicle_parts.as_ref()) {
-                    Some(set) => serde_json::json!({"status": "applied", "part_set": set, "note": "each vertex of the two-layer vehicle materials takes the colour of its part id (GLB COLOR_0; see the materials' classification.parts_note)"}),
+                    Some(set) => serde_json::json!({"status": "applied", "part_set": set, "looks": part_looks["looks"], "configs": part_looks["configs"], "default": part_looks["default"], "looks_note": "looks: the part colours each distinct configuration result gives, 256 x RGBA per look as hex (encoded like GLB COLOR_0, indexed by part id = _COLOR0 alpha); configs: a configuration's parts_key (vehicles.json) -> look; default: the look baked into the GLB", "note": "each vertex of the two-layer vehicle materials takes the colour of its part id (GLB COLOR_0; see the materials' classification.parts_note)"}),
                     None => serde_json::json!({"status": "no part set found for this model: the two-layer materials keep their stand-in colours"}),
                 }),
                 "roof_animation": roof_info,
@@ -1190,6 +1190,8 @@ pub(crate) struct BuiltDrawable {
     /// model.json `meshes` records.
     pub mesh_meta: Vec<serde_json::Value>,
     shader_tex: Vec<ShaderTextures>,
+    /// Vehicles: the part colours of each configuration (`vehcolour::Tables::looks_json`).
+    part_looks: serde_json::Value,
     /// Head skin shaders and the model.json record, for heads.
     head: Option<(Vec<crate::drawable::Shader>, serde_json::Value)>,
 }
@@ -1205,6 +1207,10 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
     // set that colours each part id.
     let part_tables = shader_tex.iter().any(|st| st.vehicle_palette.is_some()).then(crate::names::work_dir).flatten().and_then(|w| crate::vehcolour::tables(&game_root(a), &w).ok());
     let part_set: Option<(String, Vec<crate::vehcolour::Part>)> = part_tables.as_ref().zip(e.name.as_deref()).and_then(|(t, n)| t.for_model(n)).map(|(k, v)| (k.to_string(), v.to_vec()));
+    let part_looks = match (&part_tables, e.name.as_deref(), shader_tex.iter().find_map(|st| st.vehicle_palette.as_ref())) {
+        (Some(t), Some(n), Some(pal)) => t.looks_json(n, pal),
+        _ => serde_json::Value::Null,
+    };
     let slice = |i: usize| {
         let b = &info.buffers[i];
         let end = (b.gfx_off + b.bytes).min(r.gfx.len() as u64) as usize;
@@ -1376,7 +1382,7 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             x
         },
     }).collect();
-    BuiltDrawable { lod_groups, part_groups, materials: mats, joints: skin.joints, mesh_meta, shader_tex, head }
+    BuiltDrawable { lod_groups, part_groups, materials: mats, joints: skin.joints, mesh_meta, shader_tex, part_looks, head }
 }
 
 /// Joint list of a drawable's GLB skin, and for ped clothing the joint

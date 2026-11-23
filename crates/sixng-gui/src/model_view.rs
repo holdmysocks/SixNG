@@ -160,6 +160,12 @@ pub struct ModelView {
     steer_wheel: Option<(usize, Vec3)>,
     /// How hot the brake discs glow, 0 (cold) to 1.
     pub brake_heat: f32,
+    /// The chosen configuration's key (its part colours), and what the
+    /// loaded model's vertices currently show: (model file, look index).
+    part_look_want: Option<String>,
+    /// Automation: the configuration to choose when a vehicle's data is applied (0-based).
+    pub cfg_request: Option<usize>,
+    part_look_done: Option<(PathBuf, usize)>,
     /// Vehicle lamps that are on.
     pub lamps: Lamps,
     /// The loaded model has lamp bones.
@@ -405,6 +411,9 @@ impl ModelView {
             steer_lock_known: false,
             steer_wheel: None,
             brake_heat: 0.0,
+            part_look_want: None,
+            cfg_request: None,
+            part_look_done: None,
             lamps: Lamps::default(),
             has_lamps: false,
             bonnet_open: 0.0,
@@ -1170,7 +1179,7 @@ impl ModelView {
                 && self.discs().iter().all(|d| d.is_none());
             self.veh_cfg = None;
             if !v.configs.is_empty() {
-                self.apply_config(v, 0);
+                self.apply_config(v, self.cfg_request.filter(|i| *i < v.configs.len()).unwrap_or(0));
             } else {
                 // no configuration names a rim or tyre: plain ones of a kind
                 // that suits the stored tyre size, not those of the vehicle
@@ -1317,6 +1326,7 @@ impl ModelView {
         if self.rim_auto {
             self.rim_ratio = c.rim_ratio.unwrap_or(0.0);
         }
+        self.part_look_want = c.parts_key.clone();
         if let Some(r) = &c.rim {
             self.wheel_rim = format!("{r}_hi");
         }
@@ -1489,7 +1499,43 @@ impl ModelView {
             .unwrap_or_default()
     }
 
+    /// Recolour the vehicle's parts for the chosen configuration. An export
+    /// lists the part colours of each distinct configuration result
+    /// (model.json `part_colours.looks`); the vertices' part ids are in their
+    /// raw vertex colour alpha.
+    fn sync_part_look(&mut self, rs: &egui_wgpu::RenderState) {
+        let Some(l) = self.loaded.as_mut() else { return };
+        let pc = &l.info["part_colours"];
+        let default = pc["default"].as_u64();
+        let Some(idx) = self.part_look_want.as_ref().and_then(|k| pc["configs"][k.as_str()].as_u64()).or(default) else { return };
+        let idx = idx as usize;
+        // a freshly loaded model shows the default look
+        let shown = match &self.part_look_done {
+            Some((p, i)) if *p == l.model.path => Some(*i),
+            _ => default.map(|d| d as usize),
+        };
+        if shown == Some(idx) {
+            self.part_look_done = Some((l.model.path.clone(), idx));
+            return;
+        }
+        let Some(hex) = pc["looks"][idx].as_str().filter(|h| h.len() == 2048) else { return };
+        let look: Vec<[u8; 4]> = (0..256).map(|i| std::array::from_fn(|k| u8::from_str_radix(&hex[i * 8 + k * 2..i * 8 + k * 2 + 2], 16).unwrap_or(255))).collect();
+        let parts: Vec<bool> = l.model.materials.iter().map(|m| m.parts).collect();
+        for m in l.model.meshes.iter_mut().filter(|m| m.material.is_some_and(|k| parts.get(k).copied().unwrap_or(false))) {
+            for v in m.verts.iter_mut() {
+                v.tint = look[v.col[3] as usize];
+            }
+        }
+        self.part_look_done = Some((l.model.path.clone(), idx));
+        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+        let mut g = ren.upload(rs, &l.model, &[]);
+        ren.ensure_edges(rs, &mut g, &l.model);
+        self.gpu = Some(g);
+        self.apply_paint(rs);
+    }
+
     fn update_wheels(&mut self, rs: &egui_wgpu::RenderState, ctx: &egui::Context) {
+        self.sync_part_look(rs);
         // the roof clip of the loaded convertible, read once per model file
         if let Some(l) = &self.loaded {
             if self.roof_anim.0 != l.model.path {

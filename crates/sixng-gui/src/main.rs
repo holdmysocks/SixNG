@@ -1629,6 +1629,7 @@ impl App {
         m.clip_pos_all = c.f("clips").unwrap_or(0.0);
         m.bonnet_open = c.f("bonnet").unwrap_or(0.0);
         m.steer = c.f("steer").unwrap_or(0.0);
+        m.cfg_request = c.u("config").map(|v| v as usize);
         m.brake_heat = c.f("brake-glow").unwrap_or(0.0);
         m.lamps = c.get("lights").map(model_view::Lamps::parse).unwrap_or_default();
         m.boot_open = c.f("boot").unwrap_or(0.0);
