@@ -397,6 +397,61 @@ pub fn mip_linear(r: &Resource, t: &TexInfo, m: u32) -> Result<(Fmt, Vec<u8>, u3
     Ok((fmt, lin, mw, mh))
 }
 
+/// Expand a little-endian RGB565 endpoint, replicating the high bits into the
+/// low ones as the BC1 specification describes.
+fn rgb565(v: u16) -> (u8, u8, u8) {
+    (
+        ((v >> 8) & 0xF8) as u8 | (v >> 13) as u8,
+        ((v >> 3) & 0xFC) as u8 | ((v >> 9) & 0x03) as u8,
+        (v << 3) as u8 | ((v >> 2) & 0x07) as u8,
+    )
+}
+
+/// BC2 and BC3 always use four colours. texture2ddecoder decodes their colour
+/// half with the BC1 block decoder, which switches to three colours when
+/// `c0 <= c1`; replace only those blocks' index-2 and index-3 RGB. Alpha is
+/// already correct and is preserved.
+fn repair_bc23_colour(data: &[u8], w: usize, h: usize, img: &mut [u32]) {
+    let (bw, bh) = (w.div_ceil(4), h.div_ceil(4));
+    let mix = |a: u8, b: u8, wa: u16, wb: u16| ((a as u16 * wa + b as u16 * wb) / 3) as u8;
+    for by in 0..bh {
+        for bx in 0..bw {
+            let off = (by * bw + bx) * 16;
+            let block = &data[off + 8..off + 16];
+            let c0 = u16::from_le_bytes([block[0], block[1]]);
+            let c1 = u16::from_le_bytes([block[2], block[3]]);
+            if c0 > c1 {
+                continue;
+            }
+            let (r0, g0, b0) = rgb565(c0);
+            let (r1, g1, b1) = rgb565(c1);
+            let indices = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+            for y in 0..4 {
+                let py = by * 4 + y;
+                if py >= h {
+                    break;
+                }
+                for x in 0..4 {
+                    let px = bx * 4 + x;
+                    if px >= w {
+                        break;
+                    }
+                    let (wa, wb) = match (indices >> (2 * (y * 4 + x))) & 3 {
+                        2 => (2, 1),
+                        3 => (1, 2),
+                        _ => continue,
+                    };
+                    let rgb = (mix(r0, r1, wa, wb) as u32) << 16
+                        | (mix(g0, g1, wa, wb) as u32) << 8
+                        | mix(b0, b1, wa, wb) as u32;
+                    let pixel = &mut img[py * w + px];
+                    *pixel = (*pixel & 0xFF00_0000) | rgb;
+                }
+            }
+        }
+    }
+}
+
 /// Decode linear mip0 to RGBA8.
 pub fn to_rgba(fmt: Fmt, data: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
     use texture2ddecoder as td;
@@ -412,9 +467,21 @@ pub fn to_rgba(fmt: Fmt, data: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
         data
     };
     let r = match fmt {
-        Fmt::Bc1 => td::decode_bc1(data, wu, hu, &mut img),
-        Fmt::Bc2 => td::decode_bc2(data, wu, hu, &mut img),
-        Fmt::Bc3 => td::decode_bc3(data, wu, hu, &mut img),
+        Fmt::Bc1 => td::decode_bc1a(data, wu, hu, &mut img),
+        Fmt::Bc2 => {
+            let r = td::decode_bc2(data, wu, hu, &mut img);
+            if r.is_ok() {
+                repair_bc23_colour(data, wu, hu, &mut img);
+            }
+            r
+        }
+        Fmt::Bc3 => {
+            let r = td::decode_bc3(data, wu, hu, &mut img);
+            if r.is_ok() {
+                repair_bc23_colour(data, wu, hu, &mut img);
+            }
+            r
+        }
         Fmt::Bc4 => td::decode_bc4(data, wu, hu, &mut img),
         Fmt::Bc5 => td::decode_bc5(data, wu, hu, &mut img),
         Fmt::Bc6u => crate::bc6h::decode_image(data, wu, hu, &mut img, false),
@@ -551,6 +618,163 @@ mod alpha_tests {
     fn r8_preview_stays_opaque_grey() {
         let rgba = to_rgba(Fmt::from_dxgi(61), &[0, 128, 255], 3, 1).unwrap();
         assert_eq!(rgba, [0, 0, 0, 255, 128, 128, 128, 255, 255, 255, 255, 255]);
+    }
+}
+
+#[cfg(test)]
+mod bc_colour_tests {
+    use super::{Fmt, to_rgba};
+
+    /// BC1 colour block: two RGB565 endpoints and sixteen 2-bit indices.
+    fn bc1_block(c0: u16, c1: u16, indices: u32) -> [u8; 8] {
+        let mut block = [0u8; 8];
+        block[0..2].copy_from_slice(&c0.to_le_bytes());
+        block[2..4].copy_from_slice(&c1.to_le_bytes());
+        block[4..8].copy_from_slice(&indices.to_le_bytes());
+        block
+    }
+
+    fn bc2_block(alpha: [u8; 16], colour: [u8; 8]) -> [u8; 16] {
+        let mut block = [0u8; 16];
+        for (i, nibble) in alpha.iter().enumerate() {
+            block[i / 2] |= nibble << (4 * (i % 2));
+        }
+        block[8..16].copy_from_slice(&colour);
+        block
+    }
+
+    /// BC3 alpha block: two endpoints and sixteen 3-bit indices.
+    fn bc3_alpha(a0: u8, a1: u8, indices: [u8; 16]) -> [u8; 8] {
+        let mut block = [0u8; 8];
+        block[0] = a0;
+        block[1] = a1;
+        let mut packed = 0u64;
+        for (i, index) in indices.iter().enumerate() {
+            packed |= (*index as u64) << (3 * i);
+        }
+        block[2..8].copy_from_slice(&packed.to_le_bytes()[..6]);
+        block
+    }
+
+    fn bc3_block(alpha: [u8; 8], colour: [u8; 8]) -> [u8; 16] {
+        let mut block = [0u8; 16];
+        block[..8].copy_from_slice(&alpha);
+        block[8..16].copy_from_slice(&colour);
+        block
+    }
+
+    fn px(rgba: &[u8], i: usize) -> [u8; 4] {
+        rgba[i * 4..i * 4 + 4].try_into().unwrap()
+    }
+
+    #[test]
+    fn bc1_three_colour_is_transparent() {
+        // c0 <= c1: index 3 is transparent black, index 2 is the midpoint.
+        let rgba = to_rgba(Fmt::Bc1, &bc1_block(0x0000, 0xFFFF, 0xFFFF_FFFF), 4, 4).unwrap();
+        assert_eq!(px(&rgba, 0), [0, 0, 0, 0]);
+        let rgba = to_rgba(Fmt::Bc1, &bc1_block(0x0000, 0xFFFF, 0xAAAA_AAAA), 4, 4).unwrap();
+        assert_eq!(px(&rgba, 0), [127, 127, 127, 255]);
+    }
+
+    #[test]
+    fn bc1_four_colour_is_opaque() {
+        let rgba = to_rgba(Fmt::Bc1, &bc1_block(0xFFFF, 0x0000, 0xAAAA_AAAA), 4, 4).unwrap();
+        assert_eq!(px(&rgba, 0), [170, 170, 170, 255]);
+        let rgba = to_rgba(Fmt::Bc1, &bc1_block(0xFFFF, 0x0000, 0xFFFF_FFFF), 4, 4).unwrap();
+        assert_eq!(px(&rgba, 0), [85, 85, 85, 255]);
+    }
+
+    #[test]
+    fn bc2_always_uses_four_colours() {
+        // Ascending palette: index 3 and index 2 are the 1/3 and 2/3 mixes.
+        let block = bc2_block([0; 16], bc1_block(0x0000, 0xFFFF, 0xFFFF_FFFF));
+        let rgba = to_rgba(Fmt::Bc2, &block, 4, 4).unwrap();
+        assert_eq!(px(&rgba, 0), [170, 170, 170, 0]);
+        let block = bc2_block([0; 16], bc1_block(0x0000, 0xFFFF, 0xAAAA_AAAA));
+        let rgba = to_rgba(Fmt::Bc2, &block, 4, 4).unwrap();
+        assert_eq!(px(&rgba, 0), [85, 85, 85, 0]);
+
+        // Equal palette: every entry is c0.
+        let block = bc2_block([0xF; 16], bc1_block(0x1234, 0x1234, 0xFFFF_FFFF));
+        let rgba = to_rgba(Fmt::Bc2, &block, 4, 4).unwrap();
+        assert_eq!(px(&rgba, 0), [16, 69, 165, 255]);
+
+        // Alpha nibbles are replicated and preserved.
+        let block = bc2_block(std::array::from_fn(|i| i as u8), bc1_block(0x0000, 0xFFFF, 0));
+        let rgba = to_rgba(Fmt::Bc2, &block, 4, 4).unwrap();
+        let alpha = [px(&rgba, 0)[3], px(&rgba, 1)[3], px(&rgba, 8)[3], px(&rgba, 15)[3]];
+        assert_eq!(alpha, [0, 17, 136, 255]);
+    }
+
+    #[test]
+    fn bc3_always_uses_four_colours() {
+        let block = bc3_block(
+            bc3_alpha(0, 255, [0; 16]),
+            bc1_block(0x0000, 0xFFFF, 0xFFFF_FFFF),
+        );
+        let rgba = to_rgba(Fmt::Bc3, &block, 4, 4).unwrap();
+        assert_eq!(px(&rgba, 0), [170, 170, 170, 0]);
+        let block = bc3_block(
+            bc3_alpha(0, 255, [0; 16]),
+            bc1_block(0x0000, 0xFFFF, 0xAAAA_AAAA),
+        );
+        let rgba = to_rgba(Fmt::Bc3, &block, 4, 4).unwrap();
+        assert_eq!(px(&rgba, 0), [85, 85, 85, 0]);
+
+        let block = bc3_block(
+            bc3_alpha(255, 255, [1; 16]),
+            bc1_block(0x1234, 0x1234, 0xFFFF_FFFF),
+        );
+        let rgba = to_rgba(Fmt::Bc3, &block, 4, 4).unwrap();
+        assert_eq!(px(&rgba, 0), [16, 69, 165, 255]);
+    }
+
+    #[test]
+    fn bc3_alpha_interpolation_is_preserved() {
+        // a0 < a1: six interpolated values, then 0 and 255.
+        let block = bc3_block(
+            bc3_alpha(0, 255, std::array::from_fn(|i| (i % 8) as u8)),
+            bc1_block(0x0000, 0xFFFF, 0),
+        );
+        let rgba = to_rgba(Fmt::Bc3, &block, 4, 4).unwrap();
+        let alpha: Vec<u8> = (0..8).map(|i| px(&rgba, i)[3]).collect();
+        assert_eq!(alpha, [0, 255, 51, 102, 153, 204, 0, 255]);
+
+        // a0 > a1: seven interpolated values between the endpoints.
+        let block = bc3_block(
+            bc3_alpha(255, 0, std::array::from_fn(|i| (i % 8) as u8)),
+            bc1_block(0x0000, 0xFFFF, 0),
+        );
+        let rgba = to_rgba(Fmt::Bc3, &block, 4, 4).unwrap();
+        let alpha: Vec<u8> = (0..8).map(|i| px(&rgba, i)[3]).collect();
+        assert_eq!(alpha, [255, 0, 218, 182, 145, 109, 72, 36]);
+    }
+
+    #[test]
+    fn bc_colour_clips_partial_blocks() {
+        let rgba = to_rgba(Fmt::Bc1, &bc1_block(0xFFFF, 0x0000, 0), 2, 3).unwrap();
+        assert_eq!(rgba.len(), 2 * 3 * 4);
+        for i in 0..6 {
+            assert_eq!(px(&rgba, i), [255, 255, 255, 255]);
+        }
+        let ascending = bc1_block(0, 0xFFFF, 0xAAAA_AAAA);
+        let other = bc1_block(0, 0xFFFF, 0xFFFF_FFFF);
+        for (fmt, first, second, a0, a1) in [
+            (Fmt::Bc2, bc2_block([1; 16], ascending), bc2_block([14; 16], other), 17, 238),
+            (Fmt::Bc3, bc3_block(bc3_alpha(37, 0, [0; 16]), ascending),
+                bc3_block(bc3_alpha(211, 0, [0; 16]), other), 37, 211),
+        ] {
+            let mut data = first.to_vec();
+            data.extend_from_slice(&second);
+            let rgba = to_rgba(fmt, &data, 5, 3).unwrap();
+            assert_eq!(rgba.len(), 5 * 3 * 4);
+            for y in 0..3 {
+                for x in 0..5 {
+                    let expected = if x < 4 { [85, 85, 85, a0] } else { [170, 170, 170, a1] };
+                    assert_eq!(px(&rgba, y * 5 + x), expected);
+                }
+            }
+        }
     }
 }
 

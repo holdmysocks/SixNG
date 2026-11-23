@@ -406,7 +406,7 @@ pub fn run(a: &crate::game::ArchiveInfo, all: &[Entry], out: &std::path::Path, b
     progress("matched", 3, 4);
     if build {
         let todo: Vec<usize> = (0..v.len()).filter(|&i| v[i].head.is_none() && v[i].lod == 0 && perms.contains_key(&(v[i].class.clone(), v[i].vertices)) && (only.is_empty() || only.contains(&off_of(&v[i].id)))).collect();
-        let eo = crate::export::ExportOptions { out: out.to_path_buf(), png: true, dds: false, raw: false, force: false, skip_embedded_textures: false, body_shape: Vec::new(), head_skin: 0, paint: None };
+        let eo = crate::export::ExportOptions { out: out.to_path_buf(), png: true, dds: false, raw: false, force: false, skip_embedded_textures: false, body_shape: Vec::new(), head_skin: 0, paint: None, tex_remap: Default::default() };
         let glb_of = |e: &Entry, n: usize| -> Result<std::path::PathBuf> {
             crate::export::export_entry(a, e, &eo)?;
             // (an earlier export is kept and not listed again: look in its folder)

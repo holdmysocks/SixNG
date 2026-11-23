@@ -153,6 +153,7 @@ impl OutArgs {
                     std::process::exit(2);
                 }
             }),
+            tex_remap: Default::default(),
         }
     }
 }
@@ -544,7 +545,7 @@ enum Cmd {
         #[arg(default_value = "levels")]
         archive: String,
     },
-    /// Ped wardrobe variations (packs.rpf meta resources with struct f795e8ba, one per ped model): per variation its parts (slot, name, drawable), as JSON. Drawables are found through the item's textures, so run `texture-users` first. A variation is a clothing set or a head set (head, eyes, teeth); a full look is one of each. `parts` per variation is ready for `outfit <name> --parts`.
+    /// Ped wardrobe variations (packs.rpf meta resources with struct f795e8ba, one per ped model): per variation its parts (slot, name, drawable), as JSON. Drawables are found through the item's textures, so run `texture-users` first. A variation is a clothing set or a head set (head, eyes, teeth); a full look is one of each. `parts` and `tex_remap` per variation are ready for `outfit <name> --parts … --tex-remap …` (the remap carries the variation's own skin / dirt / blood textures).
     PedVariations {
         /// Resource offsets (hex) or entry ids, e.g. 2b21010
         #[arg(required = true)]
@@ -664,6 +665,11 @@ enum Cmd {
         /// Face variant for the head, as for extract.
         #[arg(long, default_value_t = 0)]
         head_skin: usize,
+        /// Texture replacements, `old=new` 64-bit store hashes (hex), comma
+        /// separated: a ped variation's skin / dirt / blood overrides, as
+        /// `ped-variations` lists them (`tex_remap`).
+        #[arg(long, value_delimiter = ',')]
+        tex_remap: Vec<String>,
     },
     /// Characters and animals that `outfit` can assemble: named characters
     /// (outfit prefixes such as cs_ali, sc_slow_demon) and animal roots
@@ -896,7 +902,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 out.print(&json!({"ok": true, "results": v}));
             }
         }
-        Cmd::Outfit { character, out: glb, archive, parts, add, list, clip, anim_only, tex, body_shape, head_skin } => {
+        Cmd::Outfit { character, out: glb, archive, parts, add, list, clip, anim_only, tex, body_shape, head_skin, tex_remap } => {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
             let prefix = character.to_ascii_lowercase();
@@ -966,7 +972,13 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             let clip_refs: Vec<(&sixng_core::anim::ClipDictionary, &sixng_core::anim::Clip)> = picks.iter().map(|&(di, ci)| (&dicts[di], &dicts[di].clips[ci])).collect();
             let t = Instant::now();
-            let mut r = sixng_core::outfit::export_outfit(&a, &sel, &prefix, &glb, &oa.opts(), &clip_refs, *anim_only)?;
+            let mut eo = oa.opts();
+            for kv in tex_remap {
+                let (k, v) = kv.split_once('=').ok_or_else(|| anyhow!("--tex-remap wants old=new, got {kv:?}"))?;
+                let hex = |s: &str| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).map_err(|_| anyhow!("--tex-remap: bad hash {s:?}"));
+                eo.tex_remap.insert(hex(k)?, hex(v)?);
+            }
+            let mut r = sixng_core::outfit::export_outfit(&a, &sel, &prefix, &glb, &eo, &clip_refs, *anim_only)?;
             r["seconds"] = t.elapsed().as_secs_f64().into();
             out.print(&json!({"ok": true, "result": r}));
         }
@@ -1639,7 +1651,8 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     .map(|v| {
                         let mut d: Vec<&str> = v.parts.iter().filter_map(|p| p.drawable.as_deref()).collect();
                         d.dedup();
-                        json!({"id": v.id, "scale": v.scale, "parts": d.iter().map(|n| format!("^{n}$")).collect::<Vec<_>>().join(","), "items": v.parts})
+                        let remap: Vec<String> = v.parts.iter().flat_map(|p| p.tex_remap.iter().map(|(a, b)| format!("{a}={b}"))).collect();
+                        json!({"id": v.id, "scale": v.scale, "tags": v.tags, "parts": d.iter().map(|n| format!("^{n}$")).collect::<Vec<_>>().join(","), "tex_remap": remap.join(","), "items": v.parts})
                     })
                     .collect();
                 res.insert(e.id.clone(), json!(vs));
