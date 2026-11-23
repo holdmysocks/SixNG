@@ -185,6 +185,9 @@ pub struct Hair {
     fur_pick: [String; 2],
     /// Colour each strand from the skin under its root (automatic fur).
     pub skin_colour: bool,
+    /// Draw the chosen grooms (the guide strands); off hides them without
+    /// dropping the choice.
+    pub show: bool,
     skin: SkinColours,
 }
 
@@ -208,6 +211,7 @@ impl Default for Hair {
             fur_note: String::new(),
             fur_pick: [String::new(), String::new()],
             skin_colour: true,
+            show: true,
             skin: Default::default(),
         }
     }
@@ -1406,7 +1410,9 @@ impl ModelView {
         if show_wheels {
             models.extend(self.wheels.iter());
         }
-        models.extend(self.hair.gpu.iter());
+        if self.hair.show {
+            models.extend(self.hair.gpu.iter());
+        }
         ren.decal_bias = self.decal_bias;
         let tid = ren.render(rs, px, &self.cam, &self.look, &models, &under, &top);
         ui.painter().image(
@@ -1708,6 +1714,11 @@ impl ModelView {
         // Grooms go on characters: rigged models that are not vehicles (or
         // nothing loaded), and wherever some are already picked.
         if (caps.joints && !caps.mounts) || self.loaded.is_none() || !self.hair.selected.is_empty() {
+            // on the panel itself, not inside the collapsed section
+            if !self.hair.selected.is_empty() {
+                let label = if self.hair.fur.is_some() { "fur guide strands" } else { "hair guide strands" };
+                ui.checkbox(&mut self.hair.show, label).on_hover_text("Show the strand grooms. These are the guide strands the game grows its hair and fur from, drawn as ribbons; the full coat is not decoded.");
+            }
             self.hair_ui(ui);
             ui.separator();
         }
@@ -2287,6 +2298,8 @@ fn export_load(
         .is_ok_and(|j| {
             // by shader hash: exports from before shader names were recovered have no names
             ["99ad6fc9", "389206d1", "03b27476", "5a693bbe", "29648098"].iter().any(|h| j.contains(h)) && !j.contains("\"stand_in\"")
+                // and from before interior and trim stopped taking the body colour
+                || j.contains("\"car_paint\"") && !j.contains("\"paint_rule\"")
         });
     // Cached animal parts from before part skins (eyes, tint-mask coats).
     let stale_animal = e.name.as_deref().is_some_and(|n| sixng_core::partskin::animal_root(n).is_some())

@@ -1568,6 +1568,7 @@ impl App {
         }
         m.look.wire = c.has("wire");
         m.look.tint = !c.has("no-tint");
+        m.hair.show = !c.has("no-fur");
         m.show_skeleton = c.has("skeleton");
         m.show_normals = c.has("normals");
         m.decal_bias = !c.has("no-decal-bias");

@@ -644,17 +644,33 @@ fn octa_decode(w: u32) -> [f32; 3] {
 }
 
 /// Decode the meshlet index buffer into a triangle list (vertex indices).
-/// Layout: a 12-byte header (u16 meshlet count, u16 ?, u16 triangle count,
-/// u16 0, u16 remap count, u16 0); then 16-byte meshlet descriptors from
-/// 0x0C (u32 ?, u16 remap start, u16 triangle start, ...); then one u32 per
-/// triangle (7 bits per local index, meshlet number from bit 21); then the
-/// u16 remap list (local -> vertex index).
+/// Layout: a 12-byte header (u16 meshlet count, u16 ?, u32 triangle count,
+/// u32 remap count); then 16-byte meshlet descriptors from 0x0C (u32 ?,
+/// u16 remap start, u16 triangle start, ...); then one u32 per triangle
+/// (7 bits per local index, meshlet number from bit 21); then the u16 remap
+/// list (local -> vertex index). The two counts are 32-bit: a motorcycle
+/// body has 70,057 triangles and 69,901 remap entries. The descriptor's
+/// remap start stays 16-bit and wraps there, so it is unwrapped along the
+/// (ascending) meshlet order.
 pub fn decode_meshlets(ib: &[u8], vertex_count: usize) -> (Vec<u32>, usize) {
     let u16at = |o: usize| ib.get(o..o + 2).map(|x| u16::from_le_bytes([x[0], x[1]]) as usize);
-    let (Some(n), Some(ntri), Some(nremap)) = (u16at(0), u16at(4), u16at(8)) else { return (vec![], 0) };
+    let u32at = |o: usize| ib.get(o..o + 4).map(|x| u32::from_le_bytes(x.try_into().unwrap()) as usize);
+    let (Some(n), Some(ntri), Some(nremap)) = (u16at(0), u32at(4), u32at(8)) else { return (vec![], 0) };
     let tri0 = 0x0c + 16 * n;
+    let ntri = ntri.min(ib.len().saturating_sub(tri0) / 4);
     let rem0 = tri0 + 4 * ntri;
-    let starts: Vec<usize> = (0..n).map(|k| u16at(0x10 + 16 * k).unwrap_or(0)).collect();
+    let mut wrap = 0;
+    let mut prev = 0;
+    let starts: Vec<usize> = (0..n)
+        .map(|k| {
+            let s = u16at(0x10 + 16 * k).unwrap_or(0);
+            if s < prev {
+                wrap += 0x1_0000;
+            }
+            prev = s;
+            s + wrap
+        })
+        .collect();
     let nremap = nremap.min(ib.len().saturating_sub(rem0) / 2);
     let mut idx = Vec::with_capacity(ntri * 3);
     let mut dropped = 0;
@@ -1496,5 +1512,29 @@ mod dictionary_tests {
         r.sys[0x428..0x42a].copy_from_slice(&64u16.to_le_bytes());
         assert!(dictionary_members(&r).is_empty());
         assert!(dictionary_members(&Resource { sys: vec![], gfx: vec![], gfx_base: 0 }).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod meshlet_tests {
+    use super::*;
+
+    #[test]
+    fn meshlets_with_32_bit_counts() {
+        // two meshlets; the second one's remap start (65,636) wraps in its
+        // u16 field, and the remap count does not fit 16 bits
+        let nremap: u32 = 65_639;
+        let mut ib = vec![0u8; 0x0c + 32];
+        ib[0..2].copy_from_slice(&2u16.to_le_bytes());
+        ib[4..8].copy_from_slice(&1u32.to_le_bytes());
+        ib[8..12].copy_from_slice(&nremap.to_le_bytes());
+        ib[0x10..0x12].copy_from_slice(&65_000u16.to_le_bytes());
+        ib[0x20..0x22].copy_from_slice(&100u16.to_le_bytes());
+        // one triangle in meshlet 1: local indices 0, 1, 2
+        ib.extend_from_slice(&((1u32 << 21) | (2 << 14) | (1 << 7)).to_le_bytes());
+        let mut remap = vec![0u16; nremap as usize];
+        remap[65_636..].copy_from_slice(&[5, 6, 7]);
+        ib.extend(remap.iter().flat_map(|v| v.to_le_bytes()));
+        assert_eq!(decode_meshlets(&ib, 10), (vec![5, 6, 7], 0));
     }
 }

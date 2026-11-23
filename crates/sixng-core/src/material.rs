@@ -205,6 +205,8 @@ pub fn gltf_fields(c: &Value, has_base: bool) -> Value {
     let stand = match c["stand_in"].as_str() {
         Some("rubber") => Some((0.0, 0.85, [0.02, 0.02, 0.022, 1.0])),
         Some("chrome") => Some((1.0, 0.12, [0.9, 0.9, 0.9, 1.0])),
+        // interior plastics, fabric, mechanical parts: colours not decoded
+        Some("trim") => Some((0.0, 0.6, [0.11, 0.11, 0.115, 1.0])),
         _ => None,
     };
     if let Some((metal, rough, colour)) = stand {
@@ -611,6 +613,9 @@ mod paint_tests {
         assert!(gltf_fields(&tyre, true)["pbrMetallicRoughness"]["baseColorFactor"].is_null());
         assert_eq!(classify("5a693bbe", &opaque)["class"], "emissive");
         assert_eq!(classify("4aa38282", &opaque)["stand_in"], Value::Null);
+        let trim = gltf_fields(&json!({"class": "opaque", "alpha_mode": "OPAQUE", "stand_in": "trim"}), false);
+        assert_eq!(trim["pbrMetallicRoughness"]["metallicFactor"], 0.0);
+        assert_eq!(trim["pbrMetallicRoughness"]["baseColorFactor"][3], 1.0);
     }
 
     #[test]

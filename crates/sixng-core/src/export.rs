@@ -313,6 +313,14 @@ const NORMAL_PARAMS: &[&str] = &["84c69350", "58b6e707", "1e77bf4c"];
 /// two-layer vehicle shaders). Its lookup is not decoded, and as the only
 /// sRGB texture of a tyre or trim material it must not become the base colour.
 const VEHICLE_PALETTE: &str = "19df25d7";
+/// `lyr0diffusetex`, `lyr1diffusetex`: a layer's detail map (linear: grey
+/// detail in R and G around 0.5, a wear mask in B), not a colour.
+const LAYER_DETAIL: [&str; 2] = ["346394ea", "7d4f12e2"];
+/// Vehicle bones whose meshes are not body panels (substring of the bone
+/// name): interior, lamps, mechanical parts.
+const NOT_BODY_BONES: [&str; 22] = [
+    "interior", "steering", "doorcard", "seat", "sunvisor", "dash", "pedal", "handbrake", "gear", "headrest", "brake", "gas", "clutch", "winder", "light", "siren", "indicator", "lamp", "engine", "exhaust", "suspension", "axle",
+];
 /// `emissivetex`: the lit parts of a lamp or panel.
 const EMISSIVE_PARAM: &str = "8e0d63ee";
 
@@ -331,6 +339,10 @@ struct ShaderTextures {
     base_alpha: Option<[u8; 2]>,
     /// The model's tint palette (sRGB RGBA8), indexed by vertex colour blue.
     tint_palette: Option<Vec<[u8; 4]>>,
+    /// Vehicles: most of the bones this shader's meshes hang on are
+    /// interior, lamp or mechanical bones (`NOT_BODY_BONES`), so it is not
+    /// body paint. Set once the meshes are decoded.
+    not_body: bool,
 }
 
 /// Shader slot of the per-model tint palette.
@@ -412,7 +424,32 @@ fn classify_shader(s: &crate::drawable::Shader, st: &ShaderTextures) -> serde_js
         c["tint_mask"] = true.into();
         c["tint_mask_note"] = "the colour texture is a tint mask (R, B: patch masks; G: shading), coloured in game through a tint palette that is not decoded: show G as grey".into();
     }
+    // The two-layer vehicle shaders cover the whole car (body panels,
+    // interior, mechanical parts). What colours each part is not decoded:
+    // vertex colour alpha is a part id (0-255) into the material palette
+    // (slot 19df25d7), whose stored texture is a placeholder the game
+    // replaces. Two usable differences: plain body panels bind no layer
+    // detail texture (`lyr0diffusetex` / `lyr1diffusetex` are engine
+    // defaults) where interior and mechanical materials do, and body
+    // panels hang on body bones (bodyshell, doors, wings, bonnet) where
+    // seats, the steering wheel and lamp housings hang on their own. Only
+    // untextured materials on body bones are taken as body paint; the rest
+    // gets a neutral stand-in.
+    if c["class"] == "car_paint" {
+        let textured = st.entries.iter().any(|e| LAYER_DETAIL.iter().any(|h| e["param_hash"] == *h) && e["status"].as_str().is_some_and(|x| x.starts_with("ok")));
+        c["paint_rule"] = "body paint only where neither layer has a detail texture (lyr0diffusetex, lyr1diffusetex) and the meshes hang on body bones; an inference, the per-part colours are not decoded".into();
+        if textured || st.not_body {
+            c["class"] = "opaque".into();
+            c["stand_in"] = "trim".into();
+            c["family"] = if textured { "vehicle interior, trim and mechanical parts (two-layer shader with a layer detail texture)" } else { "vehicle interior, lamp housings and mechanical parts (two-layer shader on interior, lamp or mechanical bones)" }.into();
+        }
+    }
     c
+}
+
+/// Shaders drawn with the runtime body colour (see `classify_shader`).
+fn is_paint(s: &crate::drawable::Shader, st: &ShaderTextures) -> bool {
+    classify_shader(s, st)["class"] == "car_paint"
 }
 
 /// Resolve each shader's texture references in the ttpf stores, write the
@@ -865,7 +902,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     let c = classify_shader(s, st);
                     let mut m = serde_json::json!({
                         "shader": s.index, "shader_name_hash": s.name_hash, "shader_name": crate::names::shader(&s.name_hash), "classification": c,
-                        "base_color": if crate::material::is_paint(&s.name_hash) { None } else { st.base.clone() }, "normal": st.normal, "normal_green": "directx (+Y down); invert G for glTF/OpenGL",
+                        "base_color": if is_paint(s, st) { None } else { st.base.clone() }, "normal": st.normal, "normal_green": "directx (+Y down); invert G for glTF/OpenGL",
                         "textures": st.entries,
                     });
                     if let Some(fb) = &st.fallback {
@@ -1058,14 +1095,24 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         let prims = rest.into_iter().filter_map(|gi| prims_of(gi, None, &mut mesh_meta)).collect();
         lod_groups[0].push(crate::gltf::NodeGroup { name: "unassigned".into(), prims });
     }
+    // Vehicles: shaders whose meshes hang mostly on interior, lamp or
+    // mechanical bones are not body paint (see `classify_shader`).
+    let mut shader_tex = shader_tex;
+    for (si, st) in shader_tex.iter_mut().enumerate() {
+        let mut bones: Vec<&str> = mesh_meta.iter().filter(|m| m["shader_index"] == si).flat_map(|m| m["bones"].as_array().into_iter().flatten()).filter_map(|b| b.as_str()).collect();
+        bones.sort();
+        bones.dedup();
+        let off = bones.iter().filter(|b| NOT_BODY_BONES.iter().any(|k| b.contains(k))).count();
+        st.not_body = !bones.is_empty() && off * 10 >= bones.len() * 7;
+    }
     let mats: Vec<crate::gltf::Material> = info.shaders.iter().zip(shader_tex.iter()).enumerate().map(|(si, (s, st))| crate::gltf::Material {
         name: format!("shader{:02}_{}", s.index, s.name_hash),
         // Paint: the colour slot is the engine-default white; any sRGB
         // fallback (decal layer, masks) would be wrong as albedo.
-        base_color_uri: if crate::material::is_paint(&s.name_hash) { None } else { st.base.clone() },
+        base_color_uri: if is_paint(s, st) { None } else { st.base.clone() },
         normal_uri: st.normal.clone(),
         gltf: {
-            let mut g = crate::material::gltf_fields(&classify_shader(s, st), st.base.is_some() && !crate::material::is_paint(&s.name_hash));
+            let mut g = crate::material::gltf_fields(&classify_shader(s, st), st.base.is_some() && !is_paint(s, st));
             // Lamps, neon, screens: the emissive shaders (`standard_emissive`,
             // `standard_emissive_layer` …, by recovered name) sit in any
             // render bucket; their colour map is what lights up.
@@ -1078,10 +1125,10 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             if let (false, Some(u)) = (g["emissiveFactor"].is_null(), &st.emissive) {
                 g["emissiveTexture"] = serde_json::json!({"uri": u});
             }
-            if let (Some(p), true) = (o.paint, crate::material::is_paint(&s.name_hash)) {
+            if let (Some(p), true) = (o.paint, is_paint(s, st)) {
                 g["pbrMetallicRoughness"]["baseColorFactor"] = serde_json::json!([p[0], p[1], p[2], 1.0]);
             }
-            if let (Some(f), false) = (st.base_factor, crate::material::is_paint(&s.name_hash)) {
+            if let (Some(f), false) = (st.base_factor, is_paint(s, st)) {
                 if g["pbrMetallicRoughness"].is_null() {
                     g["pbrMetallicRoughness"] = serde_json::json!({});
                 }
