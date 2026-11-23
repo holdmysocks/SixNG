@@ -1,0 +1,65 @@
+[workspace]
+
+[package]
+name = "metal-rust-ffi"
+version = "1.0.0"
+edition = "2024"
+license-file = "../../LICENSE"
+rust-version = "1.91"
+repository = "https://github.com/gamesir-labs/Metal-Rust"
+description = "Audited Objective-C interoperability boundary for metal-rust"
+readme = "README.md"
+build = "build.rs"
+keywords = ["apple", "ffi", "metal", "metal4", "graphics"]
+categories = ["api-bindings", "graphics"]
+include = ["/src/**", "/build.rs", "/Cargo.toml", "/README.md", "/LICENSE"]
+publish = ["crates-io"]
+
+[dependencies]
+block2 = "0.6.2"
+dispatch2 = { version = "=0.3.1", default-features = false, features = ["std", "block2"] }
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "block2",
+  "NSData",
+  "NSDate",
+  "NSError",
+  "NSBundle",
+  "NSObject",
+  "NSRange",
+  "NSString",
+  "NSThread",
+  "NSProcessInfo",
+  "NSNotification",
+  "NSOperation",
+  "NSURL",
+] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "CGColorSpace",
+] }
+objc2-metal = { version = "0.3.2", features = ["std"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "CALayer",
+  "CAMetalLayer",
+  "objc2-core-foundation",
+  "objc2-core-graphics",
+  "objc2-metal",
+] }
+
+[build-dependencies]
+cc = "1"
+
+[lints.rust]
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "deny"
+pedantic = "allow"
+
+[package.metadata.docs.rs]
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]

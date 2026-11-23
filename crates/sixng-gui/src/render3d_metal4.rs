@@ -22,6 +22,35 @@ use std::collections::HashMap;
 
 pub const MAP_TEXTURE_ID: u64 = 0x5349_584e_4701;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemporalUpscaleMode {
+    Off,
+    Scale150,
+    Scale200,
+}
+
+impl TemporalUpscaleMode {
+    pub fn scale(self) -> f32 {
+        match self {
+            Self::Off => 1.0,
+            Self::Scale150 => 1.5,
+            Self::Scale200 => 2.0,
+        }
+    }
+}
+
+fn halton(index: u32, base: u32) -> f32 {
+    let mut result = 0.0;
+    let mut f = 1.0 / base as f32;
+    let mut i = index;
+    while i > 0 {
+        result += f * (i % base) as f32;
+        i /= base;
+        f /= base as f32;
+    }
+    result
+}
+
 const MESH_SHADER: &str = r#"
     #include <metal_stdlib>
     using namespace metal;
@@ -40,6 +69,8 @@ const MESH_SHADER: &str = r#"
         float4 misc;
         float4 misc2;
         float4 misc3;
+        float4x4 prev_view_proj;
+        float4 jitter;
     };
 
     struct Vertex {
@@ -113,7 +144,9 @@ const MESH_SHADER: &str = r#"
         const float4x4 model = instance.transform * skin;
         const float4 world = model * float4(vtx.pos.xyz, 1.0);
         Varying output;
-        output.position = frame.view_proj * world;
+        const float4 clip = frame.view_proj * world;
+        output.position = clip;
+        output.position.xy += frame.jitter.xy * clip.w;
         output.world = world.xyz;
         output.normal = (model * float4(vtx.nrm.xyz, 0.0)).xyz;
         output.tangent = float4((model * float4(vtx.tan.xyz, 0.0)).xyz, vtx.tan.w);
@@ -124,15 +157,15 @@ const MESH_SHADER: &str = r#"
         return output;
     }
 
-    fragment float4 mesh_fragment(
-        Varying input [[stage_in]],
-        constant Frame& frame [[buffer(0)]],
-        constant Material& material [[buffer(3)]],
-        texture2d<float> base_texture [[texture(0)]],
-        texture2d<float> normal_texture [[texture(1)]],
-        texture2d<float> packed_texture [[texture(2)]],
-        texture2d<float> emissive_texture [[texture(3)]],
-        sampler material_sampler [[sampler(0)]]
+    float4 mesh_fragment_impl(
+        Varying input,
+        constant Frame& frame,
+        constant Material& material,
+        texture2d<float> base_texture,
+        texture2d<float> normal_texture,
+        texture2d<float> packed_texture,
+        texture2d<float> emissive_texture,
+        sampler material_sampler
     ) {
         float4 base = material.base;
         if ((material.flags.x & 1u) != 0u) {
@@ -215,6 +248,46 @@ const MESH_SHADER: &str = r#"
             alpha = 1.0;
         }
         return float4(color, alpha);
+    }
+
+    struct MeshFragmentOutput {
+        float4 color [[color(0)]];
+        float2 motion [[color(1)]];
+    };
+
+    fragment float4 mesh_fragment(
+        Varying input [[stage_in]],
+        constant Frame& frame [[buffer(0)]],
+        constant Material& material [[buffer(3)]],
+        texture2d<float> base_texture [[texture(0)]],
+        texture2d<float> normal_texture [[texture(1)]],
+        texture2d<float> packed_texture [[texture(2)]],
+        texture2d<float> emissive_texture [[texture(3)]],
+        sampler material_sampler [[sampler(0)]]
+    ) {
+        return mesh_fragment_impl(input, frame, material, base_texture, normal_texture,
+                                  packed_texture, emissive_texture, material_sampler);
+    }
+
+    fragment MeshFragmentOutput temporal_mesh_fragment(
+        Varying input [[stage_in]],
+        constant Frame& frame [[buffer(0)]],
+        constant Material& material [[buffer(3)]],
+        texture2d<float> base_texture [[texture(0)]],
+        texture2d<float> normal_texture [[texture(1)]],
+        texture2d<float> packed_texture [[texture(2)]],
+        texture2d<float> emissive_texture [[texture(3)]],
+        sampler material_sampler [[sampler(0)]]
+    ) {
+        MeshFragmentOutput output;
+        output.color = mesh_fragment_impl(input, frame, material, base_texture, normal_texture,
+                                          packed_texture, emissive_texture, material_sampler);
+        float4 current_clip = frame.view_proj * float4(input.world, 1.0);
+        float4 previous_clip = frame.prev_view_proj * float4(input.world, 1.0);
+        float2 current_ndc = current_clip.xy / current_clip.w;
+        float2 previous_ndc = previous_clip.xy / previous_clip.w;
+        output.motion = previous_ndc - current_ndc;
+        return output;
     }
 
     vertex LineVarying line_vertex(
@@ -342,6 +415,34 @@ fn create_mesh_pipeline(
     )?)
 }
 
+fn create_temporal_mesh_pipeline(
+    compiler: &metal_rust::metal4::Compiler,
+    library: &Library,
+) -> anyhow::Result<metal_rust::metal::RenderPipelineState> {
+    let vertex = function_descriptor(library, "mesh_vertex")?;
+    let fragment = function_descriptor(library, "temporal_mesh_fragment")?;
+    let descriptor = RenderPipelineDescriptor::new()?;
+    descriptor.set_vertex_function_descriptor(Some(&vertex))?;
+    descriptor.set_fragment_function_descriptor(Some(&fragment))?;
+    let color = RenderPipelineColorAttachmentDescriptor::new()?;
+    color.set_pixel_format(PixelFormat::RGBA16_FLOAT)?;
+    descriptor
+        .color_attachments()?
+        .context("MTL4 temporal mesh pipeline has no color attachment array")?
+        .set_attachment(0, &color)?;
+    let motion = RenderPipelineColorAttachmentDescriptor::new()?;
+    motion.set_pixel_format(PixelFormat::RG16_FLOAT)?;
+    descriptor
+        .color_attachments()?
+        .context("MTL4 temporal mesh pipeline has no motion attachment array")?
+        .set_attachment(1, &motion)?;
+    Ok(compiler.new_render_pipeline(
+        RenderPipelineBuildDescriptor::Render(&descriptor),
+        None,
+        None,
+    )?)
+}
+
 fn create_line_pipeline(
     compiler: &metal_rust::metal4::Compiler,
     library: &Library,
@@ -397,7 +498,13 @@ fn material_image_indices(material: &glb::Material) -> [Option<usize>; 4] {
     ]
 }
 
-fn frame_uniform(camera: &Camera, look: &Look, aspect: f32) -> FrameU {
+fn frame_uniform(
+    camera: &Camera,
+    look: &Look,
+    aspect: f32,
+    prev_view_projection: Mat4,
+    jitter: [f32; 2],
+) -> FrameU {
     let view_projection = camera.proj(aspect) * camera.view();
     let rgba = |color: [f32; 3]| [color[0], color[1], color[2], 1.0];
     FrameU {
@@ -429,6 +536,8 @@ fn frame_uniform(camera: &Camera, look: &Look, aspect: f32) -> FrameU {
             look.paint2nd[2],
         ],
         misc3: [look.tint as u32 as f32, 0.0, 0.0, 0.0],
+        prev_view_proj: prev_view_projection.to_cols_array_2d(),
+        jitter: [jitter[0], jitter[1], 0.0, 0.0],
     }
 }
 
@@ -467,7 +576,10 @@ fn bind_mesh(
 
 struct Target {
     size: [u32; 2],
+    display_size: [u32; 2],
     color: Texture,
+    motion: Texture,
+    upscale: Option<Texture>,
     depth: Texture,
 }
 
@@ -476,6 +588,7 @@ pub struct Renderer3D4 {
     queue: CommandQueue,
     residency: ResidencySet,
     pipeline: metal_rust::metal::RenderPipelineState,
+    temporal_pipeline: metal_rust::metal::RenderPipelineState,
     line_pipeline: metal_rust::metal::RenderPipelineState,
     depth_state: metal_rust::metal::DepthStencilState,
     blend_depth_state: metal_rust::metal::DepthStencilState,
@@ -488,15 +601,33 @@ pub struct Renderer3D4 {
     target: Option<Target>,
     readback: Option<metal_rust::metal::Buffer>,
     pub draws: u32,
+    temporal_mode: TemporalUpscaleMode,
+    temporal_frame: u32,
+    prev_view_projection: Mat4,
+    temporal_scaler: Option<metal_rust::metal4_fx::TemporalScaler>,
+    compiler: metal_rust::metal4::Compiler,
 }
 
 impl Renderer3D4 {
+    pub fn set_temporal_upscale_mode(&mut self, mode: TemporalUpscaleMode) {
+        if self.temporal_mode != mode {
+            self.temporal_mode = mode;
+            self.temporal_frame = 0;
+            self.prev_view_projection = Mat4::IDENTITY;
+        }
+    }
+
+    pub fn temporal_upscale_mode(&self) -> TemporalUpscaleMode {
+        self.temporal_mode
+    }
+
     pub fn new(device: &Device, queue: &CommandQueue) -> anyhow::Result<Self> {
         let compiler = device.new_mtl4_compiler(&CompilerDescriptor::new()?)?;
         let library_descriptor = LibraryDescriptor::new()?;
         library_descriptor.set_source(MESH_SHADER)?;
         let library = compiler.new_library(&library_descriptor)?;
         let pipeline = create_mesh_pipeline(&compiler, &library)?;
+        let temporal_pipeline = create_temporal_mesh_pipeline(&compiler, &library)?;
         let line_pipeline = create_line_pipeline(&compiler, &library)?;
 
         let depth_descriptor = DepthStencilDescriptor::new()?;
@@ -556,6 +687,7 @@ impl Renderer3D4 {
             queue: queue.clone(),
             residency,
             pipeline,
+            temporal_pipeline,
             line_pipeline,
             depth_state,
             blend_depth_state,
@@ -568,6 +700,11 @@ impl Renderer3D4 {
             target: None,
             readback: None,
             draws: 0,
+            temporal_mode: TemporalUpscaleMode::Off,
+            temporal_frame: 0,
+            prev_view_projection: Mat4::IDENTITY,
+            temporal_scaler: None,
+            compiler,
         })
     }
 
@@ -948,7 +1085,9 @@ impl Renderer3D4 {
     }
 
     pub fn output_texture(&self) -> Option<Texture> {
-        self.target.as_ref().map(|target| target.color.clone())
+        self.target.as_ref().and_then(|target| {
+            target.upscale.clone().or_else(|| Some(target.color.clone()))
+        })
     }
 
     pub fn render(
@@ -960,9 +1099,31 @@ impl Renderer3D4 {
         lines: &[LineV],
         lines_on_top: &[LineV],
     ) -> anyhow::Result<egui::TextureId> {
-        self.ensure_target(size)?;
-        let aspect = size[0] as f32 / size[1] as f32;
-        let frame = frame_uniform(camera, look, aspect);
+        let scale = self.temporal_mode.scale();
+        let render_size = if self.temporal_mode == TemporalUpscaleMode::Off {
+            size
+        } else {
+            [
+                ((size[0] as f32 / scale).ceil() as u32).max(1),
+                ((size[1] as f32 / scale).ceil() as u32).max(1),
+            ]
+        };
+        self.ensure_target(render_size)?;
+        let aspect = render_size[0] as f32 / render_size[1] as f32;
+        let view_projection = camera.proj(aspect) * camera.view();
+        let prev = if self.temporal_frame == 0 {
+            view_projection
+        } else {
+            self.prev_view_projection
+        };
+        let phase_count = (8.0 * scale * scale).ceil() as u32;
+        let index = self.temporal_frame % phase_count.max(1) + 1;
+        let jitter = [halton(index, 2) - 0.5, halton(index, 3) - 0.5];
+        let clip_jitter = [
+            2.0 * jitter[0] / render_size[0] as f32,
+            -2.0 * jitter[1] / render_size[1] as f32,
+        ];
+        let frame = frame_uniform(camera, look, aspect, prev, clip_jitter);
         self.frame_buffer.write(0, bytemuck::bytes_of(&frame))?;
         let mut line_vertices = Vec::with_capacity(lines.len() + lines_on_top.len());
         line_vertices.extend_from_slice(lines);
@@ -988,6 +1149,10 @@ impl Renderer3D4 {
                 1.0,
             ),
         )?;
+        if self.temporal_mode != TemporalUpscaleMode::Off {
+            pass.set_color_attachment(1, &target.motion, ClearColor::new(0.0, 0.0, 0.0, 1.0))?;
+        }
+        pass.set_color_attachment(1, &target.motion, ClearColor::new(0.0, 0.0, 0.0, 1.0))?;
         let depth_attachment = RenderPassDepthAttachmentDescriptor::new()?;
         depth_attachment.set_texture(Some(&target.depth))?;
         depth_attachment.set_load_action(LoadAction::LoadActionClear)?;
@@ -1004,7 +1169,11 @@ impl Renderer3D4 {
         let mut draw_count = 0u32;
         {
             let encoder = command_buffer.render_encoder(&pass, None)?;
-            encoder.set_render_pipeline_state(&self.pipeline)?;
+            encoder.set_render_pipeline_state(if self.temporal_mode == TemporalUpscaleMode::Off {
+                &self.pipeline
+            } else {
+                &self.temporal_pipeline
+            })?;
             encoder.set_depth_stencil_state(Some(&self.depth_state))?;
             encoder.set_argument_table(
                 Some(&self.argument_table),
@@ -1099,10 +1268,29 @@ impl Renderer3D4 {
             }
             encoder.end()?;
         }
+        if let (Some(scaler), Some(upscale)) =
+            (self.temporal_scaler.as_ref(), target.upscale.as_ref())
+        {
+            scaler.set_color_texture(Some(&target.color))?;
+            scaler.set_depth_texture(Some(&target.depth))?;
+            scaler.set_motion_texture(Some(&target.motion))?;
+            scaler.set_output_texture(Some(upscale))?;
+            scaler.set_depth_reversed(true)?;
+            scaler.set_reset(self.temporal_frame == 0)?;
+            scaler.set_jitter_offset_x(jitter[0])?;
+            scaler.set_jitter_offset_y(jitter[1])?;
+            scaler.set_motion_vector_scale_x(render_size[0] as f32 * 0.5)?;
+            scaler.set_motion_vector_scale_y(render_size[1] as f32 * 0.5)?;
+            scaler.set_input_content_width(render_size[0] as usize)?;
+            scaler.set_input_content_height(render_size[1] as usize)?;
+            scaler.encode_to_command_buffer(&mut command_buffer)?;
+        }
         self.queue
             .submit(vec![command_buffer.end()?], None)?
             .wait()?;
         self.draws = draw_count;
+        self.prev_view_projection = view_projection;
+        self.temporal_frame = self.temporal_frame.wrapping_add(1);
         Ok(egui::TextureId::User(MAP_TEXTURE_ID))
     }
 
@@ -1187,22 +1375,54 @@ impl Renderer3D4 {
         if size.contains(&0) {
             bail!("MTL4 render target dimensions must be non-zero");
         }
+        let display_size = if self.temporal_mode == TemporalUpscaleMode::Off {
+            size
+        } else {
+            [
+                (size[0] as f32 * self.temporal_mode.scale()).ceil() as u32,
+                (size[1] as f32 * self.temporal_mode.scale()).ceil() as u32,
+            ]
+        };
         if self
             .target
             .as_ref()
-            .is_some_and(|target| target.size == size)
+            .is_some_and(|target| target.size == size && target.display_size == display_size)
         {
             return Ok(());
         }
 
         let descriptor = TextureDescriptor::new_2d(
-            PixelFormat::RGBA8_UNORM_SRGB,
+            if self.temporal_mode == TemporalUpscaleMode::Off {
+                PixelFormat::RGBA8_UNORM_SRGB
+            } else {
+                PixelFormat::RGBA16_FLOAT
+            },
             size[0] as usize,
             size[1] as usize,
             ResourceOptions::PRIVATE,
             TextureUsage::RENDER_TARGET.union(TextureUsage::SHADER_READ),
         )?;
         let color = self.device.new_texture(&descriptor)?;
+        let motion_descriptor = TextureDescriptor::new_2d(
+            PixelFormat::RG16_FLOAT,
+            size[0] as usize,
+            size[1] as usize,
+            ResourceOptions::PRIVATE,
+            TextureUsage::RENDER_TARGET.union(TextureUsage::SHADER_READ),
+        )?;
+        let motion = self.device.new_texture(&motion_descriptor)?;
+        let upscale = if self.temporal_mode == TemporalUpscaleMode::Off {
+            None
+        } else {
+            let output_descriptor = TextureDescriptor::new_2d(
+                PixelFormat::RGBA16_FLOAT,
+                display_size[0] as usize,
+                display_size[1] as usize,
+                ResourceOptions::PRIVATE,
+                TextureUsage::RENDER_TARGET.union(TextureUsage::SHADER_READ).union(TextureUsage::SHADER_WRITE),
+            )?;
+            Some(self.device.new_texture(&output_descriptor)?)
+        };
         let depth_descriptor = TextureDescriptor::new_2d(
             PixelFormat::DEPTH32_FLOAT,
             size[0] as usize,
@@ -1211,16 +1431,56 @@ impl Renderer3D4 {
             TextureUsage::RENDER_TARGET,
         )?;
         let depth = self.device.new_texture(&depth_descriptor)?;
-        self.residency
-            .add_allocations(&[ResidencyAllocation::Texture(&color)])?;
+        let mut allocations = vec![ResidencyAllocation::Texture(&color), ResidencyAllocation::Texture(&motion)];
+        if let Some(upscale) = &upscale {
+            allocations.push(ResidencyAllocation::Texture(upscale));
+        }
+        self.residency.add_allocations(&allocations)?;
         self.residency.commit()?;
 
         if let Some(old) = self.target.take() {
-            self.residency
-                .remove_allocations(&[ResidencyAllocation::Texture(&old.color)])?;
+            let mut removals = vec![ResidencyAllocation::Texture(&old.color), ResidencyAllocation::Texture(&old.motion)];
+            if let Some(upscale) = &old.upscale {
+                removals.push(ResidencyAllocation::Texture(upscale));
+            }
+            self.residency.remove_allocations(&removals)?;
             self.residency.commit()?;
         }
-        self.target = Some(Target { size, color, depth });
+        self.target = Some(Target { size, display_size, color, motion, upscale, depth });
+        if self.temporal_mode != TemporalUpscaleMode::Off {
+            let Ok(descriptor) = metal_rust::metal_fx::TemporalScalerDescriptor::new() else {
+                self.temporal_mode = TemporalUpscaleMode::Off;
+                self.temporal_scaler = None;
+                if let Some(target) = self.target.as_mut() {
+                    target.upscale = None;
+                    target.display_size = target.size;
+                }
+                return Ok(());
+            };
+            descriptor.configure(
+                PixelFormat::RGBA16_FLOAT,
+                PixelFormat::DEPTH32_FLOAT,
+                PixelFormat::RG16_FLOAT,
+                PixelFormat::RGBA16_FLOAT,
+                size[0] as usize,
+                size[1] as usize,
+                display_size[0] as usize,
+                display_size[1] as usize,
+            )?;
+            match descriptor.new_mtl4_scaler(&self.device, &self.compiler) {
+                Ok(scaler) => self.temporal_scaler = Some(scaler),
+                Err(_) => {
+                    self.temporal_mode = TemporalUpscaleMode::Off;
+                    self.temporal_scaler = None;
+                    if let Some(target) = self.target.as_mut() {
+                        target.upscale = None;
+                        target.display_size = target.size;
+                    }
+                }
+            }
+        } else {
+            self.temporal_scaler = None;
+        }
         Ok(())
     }
 
@@ -1402,6 +1662,29 @@ mod tests {
         assert!(pixels
             .chunks_exact(4)
             .all(|pixel| pixel == [255, 255, 255, 255]));
+        Ok(())
+    }
+
+    #[test]
+    fn mtl4_temporal_target_and_scaler_when_available() -> anyhow::Result<()> {
+        let Some(device) = Device::system_default() else {
+            return Ok(());
+        };
+        if !device.supports_family(GPUFamily::GPUFamilyMetal4)? {
+            return Ok(());
+        }
+        let queue = device.new_mtl4_command_queue()?;
+        let mut renderer = Renderer3D4::new(&device, &queue)?;
+        renderer.set_temporal_upscale_mode(TemporalUpscaleMode::Scale200);
+        renderer.ensure_target([16, 12])?;
+        let target = renderer.target.as_ref().context("MTL4 temporal target missing")?;
+        if renderer.temporal_scaler.is_some() {
+            assert_eq!(target.display_size, [32, 24]);
+            assert!(target.upscale.is_some());
+        } else {
+            assert_eq!(renderer.temporal_upscale_mode(), TemporalUpscaleMode::Off);
+            assert_eq!(target.display_size, target.size);
+        }
         Ok(())
     }
 

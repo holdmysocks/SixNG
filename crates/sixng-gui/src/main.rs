@@ -831,6 +831,22 @@ impl App {
                 ui.selectable_value(&mut self.tab, Tab::Browser, "📦 Archives")
                     .on_hover_text("Advanced: browse raw archive entries");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+                    if let Some(renderer) = metal4_renderer.as_deref_mut() {
+                        let mut mode = renderer.temporal_upscale_mode();
+                        egui::ComboBox::from_id_salt("metalfx-temporal-mode")
+                            .selected_text(match mode {
+                                render3d_metal4::TemporalUpscaleMode::Off => "MetalFX Off",
+                                render3d_metal4::TemporalUpscaleMode::Scale150 => "MetalFX 1.5x",
+                                render3d_metal4::TemporalUpscaleMode::Scale200 => "MetalFX 2x",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut mode, render3d_metal4::TemporalUpscaleMode::Off, "Off");
+                                ui.selectable_value(&mut mode, render3d_metal4::TemporalUpscaleMode::Scale150, "1.5x");
+                                ui.selectable_value(&mut mode, render3d_metal4::TemporalUpscaleMode::Scale200, "2x");
+                            });
+                        renderer.set_temporal_upscale_mode(mode);
+                    }
                     if ui.button("🔍 Search  Ctrl+K").clicked() {
                         self.palette.open = true;
                     }

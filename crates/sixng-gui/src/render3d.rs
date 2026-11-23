@@ -34,6 +34,8 @@ pub struct FrameU {
     pub misc2: [f32; 4],
     /// x: tint palette on (1) / off (0)
     pub misc3: [f32; 4],
+    pub prev_view_proj: [[f32; 4]; 4],
+    pub jitter: [f32; 4],
 }
 
 #[repr(C)]
@@ -1695,6 +1697,8 @@ impl Renderer3D {
                 self.map_glass as u32 as f32,
                 0.0,
             ],
+            prev_view_proj: vp.to_cols_array_2d(),
+            jitter: [0.0, 0.0, 0.0, 0.0],
         }
     }
 

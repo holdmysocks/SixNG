@@ -1,0 +1,48 @@
+[package]
+name = "metal-rust"
+version = "1.0.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.91"
+repository = "https://github.com/gamesir-labs/Metal-Rust"
+description = "Safe Rust interfaces for Apple Metal"
+readme = "README.md"
+keywords = ["apple", "gpu", "metal", "metal4", "graphics"]
+categories = ["api-bindings", "graphics"]
+include = [
+    "/src/**/*.rs",
+    "/tests/**",
+    "/api/**",
+    "/docs/**",
+    "/scripts/check-api-coverage.py",
+    "/scripts/check-safety.py",
+    "/scripts/generate_api_coverage.py",
+    "/scripts/generate_api_inventory.py",
+    "/scripts/generate_alias_types.py",
+    "/scripts/generate_facade_types.py",
+    "/scripts/generate_object_types.py",
+    "/scripts/generate_struct_types.py",
+    "/scripts/generate_value_types.py",
+    "/Cargo.toml",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+]
+publish = ["crates-io"]
+
+[dependencies]
+metal-rust-ffi = { version = "=1.0.0", path = "../metal-rust-ffi" }
+
+[dev-dependencies]
+static_assertions = "1.1.0"
+
+[package.metadata.docs.rs]
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = "deny"
+pedantic = "allow"

@@ -15,6 +15,8 @@ struct Frame {
     misc: vec4<f32>,      // x wetness, y emissive boost, z time, w ambient
     misc2: vec4<f32>,     // x fog density, yzw secondary paint colour
     misc3: vec4<f32>,     // x tint palette on (1) / off (0)
+    prev_view_proj: mat4x4<f32>,
+    jitter: vec4<f32>,
 };
 
 struct Mat {

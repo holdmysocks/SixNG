@@ -2131,7 +2131,6 @@ dependencies = [
 [[package]]
 name = "metal-rust"
 version = "1.0.0"
-source = "git+https://github.com/maple-quartz18/Metal-Rust.git?rev=618787057460de02dfe130f13d1c9aaa376aebd9#618787057460de02dfe130f13d1c9aaa376aebd9"
 dependencies = [
  "metal-rust-ffi",
 ]
@@ -2139,7 +2138,6 @@ dependencies = [
 [[package]]
 name = "metal-rust-ffi"
 version = "1.0.0"
-source = "git+https://github.com/maple-quartz18/Metal-Rust.git?rev=618787057460de02dfe130f13d1c9aaa376aebd9#618787057460de02dfe130f13d1c9aaa376aebd9"
 dependencies = [
  "block2 0.6.2",
  "cc",
