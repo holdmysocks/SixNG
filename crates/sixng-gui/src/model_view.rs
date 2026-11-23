@@ -5105,8 +5105,7 @@ struct GearPart {
 ///   the bone, a leg on the centre line folds forwards and a side leg
 ///   inwards;
 /// - a door that does not hang on a leg turns about its longer horizontal
-///   side until it lies level: towards the nearest leg when it hangs
-///   straight down, the way it already leans otherwise;
+///   side, towards the nearest leg's bone, until it lies level;
 /// - wheel bones and brace or strut bones that hang from the body instead
 ///   of a leg bone go up with the leg they belong to, as one piece.
 fn find_gear(model: &glb::Model) -> Vec<GearPart> {
@@ -5204,10 +5203,11 @@ fn find_gear(model: &glb::Model) -> Vec<GearPart> {
         // where the door hangs from its hinge, seen along the hinge
         let hang = (c - p) - hinge * (c - p).dot(hinge);
         let hang = hang.normalize_or(Vec3::NEG_Y);
-        // a door hanging down swings towards the leg; one that already
-        // leans well to a side closes that way, by the angle it has left
-        let lean = hang.dot(across);
-        let side = if lean.abs() > 0.35 { lean } else { (leg.1 - c).dot(across) };
+        // the bay is on the leg's side of the hinge: the door swings that
+        // way until it lies level, by whatever angle that takes (a quarter
+        // turn for a door hanging straight down, most of a half turn for
+        // one modelled swung right out, as on lazer's main bays)
+        let side = (leg.1 - p).dot(across);
         let want = across * if side >= 0.0 { 1.0 } else { -1.0 };
         let axis = local(i, hang.cross(want));
         let angle = hang.dot(want).clamp(-1.0, 1.0).acos();
