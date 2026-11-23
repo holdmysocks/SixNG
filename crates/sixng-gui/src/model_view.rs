@@ -1939,17 +1939,27 @@ impl ModelView {
     fn gear_at(&self, bone: &str) -> Mat4 {
         let Some(l) = self.loaded.as_ref().filter(|_| self.gear_up > 0.0 && !self.gear.is_empty()) else { return Mat4::IDENTITY };
         let js = &l.model.joints;
-        let mut k = js.iter().position(|j| j.name.eq_ignore_ascii_case(bone));
-        let mut depth = 0;
+        let turn = |g: &GearPart| {
+            let to_model = Mat4::from_cols_array(&js[g.joint].ibm).inverse();
+            let (pivot, axis) = g.follow.unwrap_or_else(|| (to_model.w_axis.truncate(), to_model.transform_vector3(g.axis).normalize_or_zero()));
+            Mat4::from_translation(pivot) * Mat4::from_quat(Quat::from_axis_angle(axis, g.angle * self.gear_up.clamp(0.0, 1.0))) * Mat4::from_translation(-pivot)
+        };
+        let start = js.iter().position(|j| j.name.eq_ignore_ascii_case(bone));
+        let (mut k, mut depth) = (start, 0);
         while let Some(i) = k.filter(|_| depth < 64) {
             if let Some(g) = self.gear.iter().find(|g| g.joint == i && !g.door) {
-                let to_model = Mat4::from_cols_array(&js[i].ibm).inverse();
-                let pivot = to_model.w_axis.truncate();
-                let axis = to_model.transform_vector3(g.axis).normalize_or_zero();
-                return Mat4::from_translation(pivot) * Mat4::from_quat(Quat::from_axis_angle(axis, g.angle * self.gear_up.clamp(0.0, 1.0))) * Mat4::from_translation(-pivot);
+                return turn(g);
             }
             k = js[i].parent.filter(|p| *p != i);
             depth += 1;
+        }
+        // a wheel bone outside the leg's bones: the leg whose mesh it sits in
+        if let Some(i) = start {
+            let p = Mat4::from_cols_array(&js[i].ibm).inverse().w_axis.truncate();
+            let pad = Vec3::splat(0.25);
+            if let Some(g) = self.gear.iter().find(|g| !g.door && p.cmpge(g.bbox[0] - pad).all() && p.cmple(g.bbox[1] + pad).all()) {
+                return turn(g);
+            }
         }
         Mat4::IDENTITY
     }
@@ -2461,7 +2471,14 @@ impl ModelView {
             for p in &self.gear {
                 let a = p.angle * if p.door { late * late * (3.0 - 2.0 * late) } else { t };
                 if a != 0.0 {
-                    let m = Mat4::from_quat(Quat::from_axis_angle(p.axis, a));
+                    let m = match p.follow {
+                        // the leg's turn in model space, brought into this joint's own
+                        Some((pivot, axis)) => {
+                            let g = Mat4::from_cols_array(&js[p.joint].ibm).inverse();
+                            g.inverse() * Mat4::from_translation(pivot) * Mat4::from_quat(Quat::from_axis_angle(axis, a)) * Mat4::from_translation(-pivot) * g
+                        }
+                        None => Mat4::from_quat(Quat::from_axis_angle(p.axis, a)),
+                    };
                     let m = swing.get(&p.joint).map_or(m, |s| *s * m);
                     swing.insert(p.joint, m);
                 }
@@ -5058,6 +5075,12 @@ struct GearPart {
     axis: Vec3,
     angle: f32,
     door: bool,
+    /// a leg's mesh in model space (bind pose): what is fitted inside it
+    /// and hangs on no leg bone goes up with it
+    bbox: [Vec3; 2],
+    /// a wheel bone outside the leg's bones that sits in a leg's mesh: the
+    /// leg's pivot and axis in model space, which it turns about instead
+    follow: Option<(Vec3, Vec3)>,
 }
 
 /// The retractable landing gear of an aircraft: only models with gear door
@@ -5071,9 +5094,9 @@ struct GearPart {
 ///   larger part; where the doors lie within 0.3 of the leg's length of
 ///   the bone, a leg on the centre line folds forwards and a side leg
 ///   inwards;
-/// - a door that does not hang on a leg turns a quarter turn about its
-///   longer horizontal side so that its lower edge swings towards the
-///   nearest leg.
+/// - a door that does not hang on a leg turns about its longer horizontal
+///   side until it lies level: towards the nearest leg when it hangs
+///   straight down, the way it already leans otherwise.
 fn find_gear(model: &glb::Model) -> Vec<GearPart> {
     let kind = |n: &str| -> Option<bool> {
         let n = n.to_ascii_lowercase();
@@ -5140,7 +5163,8 @@ fn find_gear(model: &glb::Model) -> Vec<GearPart> {
         let down = (c - p).normalize_or(Vec3::NEG_Y);
         let axis = local(i, down.cross(dir));
         if axis != Vec3::ZERO {
-            out.push(GearPart { joint: i, axis, angle: quarter, door: false });
+            let b = boxes[&i];
+            out.push(GearPart { joint: i, axis, angle: quarter, door: false, bbox: [b.0, b.1], follow: None });
         }
     }
     for &(i, p, c, e) in &doors {
@@ -5165,16 +5189,39 @@ fn find_gear(model: &glb::Model) -> Vec<GearPart> {
         // towards the leg across that side
         let hinge = if e.z >= e.x { Vec3::Z } else { Vec3::X };
         let across = if hinge == Vec3::Z { Vec3::X } else { Vec3::Z };
-        let side = (leg.1 - c).dot(across);
+        // where the door hangs from its hinge, seen along the hinge
+        let hang = (c - p) - hinge * (c - p).dot(hinge);
+        let hang = hang.normalize_or(Vec3::NEG_Y);
+        // a door hanging down swings towards the leg; one that already
+        // leans well to a side closes that way, by the angle it has left
+        let lean = hang.dot(across);
+        let side = if lean.abs() > 0.35 { lean } else { (leg.1 - c).dot(across) };
         let want = across * if side >= 0.0 { 1.0 } else { -1.0 };
-        let down = (c - p).normalize_or(Vec3::NEG_Y);
-        let axis = local(i, down.cross(want));
-        if axis != Vec3::ZERO {
-            out.push(GearPart { joint: i, axis, angle: quarter, door: true });
+        let axis = local(i, hang.cross(want));
+        let angle = hang.dot(want).clamp(-1.0, 1.0).acos();
+        if axis != Vec3::ZERO && angle > 0.02 {
+            out.push(GearPart { joint: i, axis, angle, door: true, bbox: NOWHERE, follow: None });
         }
     }
+    // wheel bones that hang on no leg bone but sit in a leg's mesh
+    let pad = Vec3::splat(0.25);
+    let mut followers = Vec::new();
+    for (i, j) in model.joints.iter().enumerate() {
+        if !is_wheel_bone(&j.name.to_ascii_lowercase()) || owner[i].is_some_and(|o| kinds[o] == Some(false)) {
+            continue;
+        }
+        let p = pivot(i);
+        if let Some(g) = out.iter().find(|g| !g.door && p.cmpge(g.bbox[0] - pad).all() && p.cmple(g.bbox[1] + pad).all()) {
+            let to_model = Mat4::from_cols_array(&model.joints[g.joint].ibm).inverse();
+            followers.push(GearPart { joint: i, axis: Vec3::ZERO, angle: g.angle, door: false, bbox: NOWHERE, follow: Some((to_model.w_axis.truncate(), to_model.transform_vector3(g.axis).normalize_or_zero())) });
+        }
+    }
+    out.extend(followers);
     out
 }
+
+/// A box nothing lies in.
+const NOWHERE: [Vec3; 2] = [Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)];
 
 /// What an aircraft bone does in the viewer.
 #[derive(Clone, Copy, PartialEq, Debug)]
