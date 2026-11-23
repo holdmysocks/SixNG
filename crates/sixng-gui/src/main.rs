@@ -1635,6 +1635,7 @@ impl App {
         m.brake_heat = c.f("brake-glow").unwrap_or(0.0);
         m.windows_down = c.f("windows").unwrap_or(0.0);
         m.rotor_speed = c.f("rotor").unwrap_or(0.0).clamp(0.0, 1.0);
+        m.gear_up = c.f("gear-up").unwrap_or(0.0).clamp(0.0, 1.0);
         m.flaps = c.f("flaps").unwrap_or(0.0).to_radians();
         m.ailerons = c.f("ailerons").unwrap_or(0.0).to_radians();
         m.elevators = c.f("elevators").unwrap_or(0.0).to_radians();
