@@ -19,8 +19,192 @@ use metal_rust::metal4::{
     RenderPipelineDescriptor, TextureOriginSelection, TextureRegionSelection,
 };
 use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+#[cfg(test)]
+use std::io::{Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 
 pub const MAP_TEXTURE_ID: u64 = 0x5349_584e_4701;
+const GPU_TEXTURE_CACHE_DIR: &str = "metal_io_textures_v1";
+const GPU_TEXTURE_CACHE_CAP: u64 = 2 * 1024 * 1024 * 1024;
+const GPU_TEXTURE_CACHE_MAGIC: &[u8; 8] = b"SXMTLIO1";
+const GPU_TEXTURE_CACHE_FIXED_HEADER: usize = 36;
+static TEXTURE_CACHE_WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static TEXTURE_CACHE_WRITERS_ACTIVE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static TEXTURE_CACHE_MISS_LOGS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static LAST_TEXTURE_CACHE_WRITE: std::sync::Mutex<
+    Option<std::sync::mpsc::Receiver<anyhow::Result<Option<PathBuf>>>>,
+> = std::sync::Mutex::new(None);
+
+struct CacheImage {
+    path: PathBuf,
+    key: String,
+    srgb: bool,
+    mips: Vec<(usize, usize, usize, usize)>,
+    payload: Vec<u8>,
+}
+
+fn cache_path(dir: &Path, key: &str) -> PathBuf {
+    dir.join(format!("{:016x}.rgba", cache_key(key)))
+}
+
+fn texture_identity(
+    key: &str,
+    source_version: &str,
+    srgb: bool,
+    mips: &[(usize, usize, usize, usize)],
+    payload: &[u8],
+) -> String {
+    let mut layout_hash = 0xcbf29ce484222325u64;
+    for &(offset, width, height, length) in mips {
+        for byte in (offset as u64)
+            .to_le_bytes()
+            .into_iter()
+            .chain((width as u64).to_le_bytes())
+            .chain((height as u64).to_le_bytes())
+            .chain((length as u64).to_le_bytes())
+        {
+            layout_hash ^= byte as u64;
+            layout_hash = layout_hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    format!(
+        "{key}|source={source_version}|srgb={}|layout={layout_hash:016x}|rgba={:08x}",
+        srgb as u8,
+        crc32(payload)
+    )
+}
+
+fn texture_identity_for(
+    image: &glb::Image,
+    mips: &[(usize, usize, usize, usize)],
+    payload: &[u8],
+) -> String {
+    texture_identity(
+        &image.key,
+        env!("CARGO_PKG_VERSION"),
+        image.srgb,
+        mips,
+        payload,
+    )
+}
+
+fn cache_key(key: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in key.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn write_texture_cache_entry(dir: &Path, image: &CacheImage) -> anyhow::Result<Option<PathBuf>> {
+    let _guard = TEXTURE_CACHE_WRITER.lock().unwrap();
+    let path = if image.path.is_absolute() {
+        image.path.clone()
+    } else {
+        dir.join(&image.path)
+    };
+    if path.exists() {
+        return Ok(None);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mip_count = u32::try_from(image.mips.len()).context("too many texture mips")?;
+    let mut header = Vec::with_capacity(GPU_TEXTURE_CACHE_FIXED_HEADER + image.mips.len() * 24);
+    header.extend_from_slice(GPU_TEXTURE_CACHE_MAGIC);
+    header.extend_from_slice(&1u32.to_le_bytes());
+    header.extend_from_slice(&(image.srgb as u32).to_le_bytes());
+    header.extend_from_slice(&mip_count.to_le_bytes());
+    header.extend_from_slice(&(image.payload.len() as u64).to_le_bytes());
+    header.extend_from_slice(&crc32(&image.payload).to_le_bytes());
+    header.extend_from_slice(&crc32(image.key.as_bytes()).to_le_bytes());
+    for &(offset, width, height, length) in &image.mips {
+        header.extend_from_slice(&(offset as u64).to_le_bytes());
+        header.extend_from_slice(&(width as u32).to_le_bytes());
+        header.extend_from_slice(&(height as u32).to_le_bytes());
+        header.extend_from_slice(&(length as u64).to_le_bytes());
+    }
+
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(&header)?;
+        file.write_all(&image.payload)?;
+        file.sync_all()?;
+        fs::rename(&temp, &path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result.map(|()| Some(path))
+}
+
+fn trim_texture_cache_entries(
+    mut entries: Vec<(Option<std::time::SystemTime>, PathBuf, u64)>,
+    cap: u64,
+    protected: Option<(&Path, u64)>,
+) -> anyhow::Result<()> {
+    let mut total = entries
+        .iter()
+        .fold(0u64, |sum, entry| sum.saturating_add(entry.2));
+    entries.sort_by_key(|entry| entry.0);
+    for (_, path, size) in entries {
+        if total <= cap {
+            break;
+        }
+        if protected.is_some_and(|(protected, _)| path == protected) {
+            continue;
+        }
+        match fs::remove_file(path) {
+            Ok(()) => total = total.saturating_sub(size),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                total = total.saturating_sub(size);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn trim_texture_cache_dir(
+    dir: &Path,
+    cap: u64,
+    protected: Option<(&Path, u64)>,
+) -> anyhow::Result<()> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_file() && entry.path().extension().is_some_and(|ext| ext == "rgba") {
+            entries.push((metadata.modified().ok(), entry.path(), metadata.len()));
+        }
+    }
+    trim_texture_cache_entries(entries, cap, protected)
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    crc32_update(!0u32, bytes) ^ !0u32
+}
+
+fn crc32_update(mut crc: u32, bytes: &[u8]) -> u32 {
+    for byte in bytes {
+        crc ^= *byte as u32;
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb88320 & (0u32.wrapping_sub(crc & 1)));
+        }
+    }
+    crc
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TemporalUpscaleMode {
@@ -321,6 +505,119 @@ struct Vertex4 {
     tint: [f32; 4],
 }
 
+#[cfg(test)]
+mod texture_cache_tests {
+    use super::*;
+
+    fn test_dir() -> PathBuf {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("sixng-metal-io-cache-{nonce}-{id}"))
+    }
+
+    fn sample_image(key: &str, payload: Vec<u8>) -> CacheImage {
+        CacheImage {
+            path: PathBuf::from(format!("{:016x}.rgba", cache_key(key))),
+            key: key.into(),
+            srgb: true,
+            mips: vec![(0, 2, 2, 16), (16, 1, 1, 4)],
+            payload,
+        }
+    }
+
+    #[test]
+    fn gpu_cache_header_round_trips_and_rejects_corruption() {
+        let dir = test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let image = sample_image("texture-key", (0u8..20).collect());
+        let path = write_texture_cache_entry(&dir, &image).unwrap().unwrap();
+        let (payload_offset, payload_len) =
+            Renderer3D4::cache_matches(&path, &image.key, image.srgb, &image.mips).unwrap();
+        assert_eq!(
+            payload_offset as usize,
+            GPU_TEXTURE_CACHE_FIXED_HEADER + 24 * 2
+        );
+        assert_eq!(payload_len, image.payload.len());
+        assert!(write_texture_cache_entry(&dir, &image).unwrap().is_none());
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.last_mut().map(|byte| *byte ^= 0xff);
+        fs::write(&path, bytes).unwrap();
+        assert!(Renderer3D4::cache_matches(&path, &image.key, image.srgb, &image.mips).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn gpu_cache_rejects_layout_and_color_space_changes() {
+        let dir = test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let image = sample_image("texture-layout", (0u8..20).collect());
+        let path = write_texture_cache_entry(&dir, &image).unwrap().unwrap();
+        assert!(Renderer3D4::cache_matches(&path, &image.key, false, &image.mips).is_err());
+        assert!(
+            Renderer3D4::cache_matches(&path, &image.key, image.srgb, &[(0, 1, 1, 4)]).is_err()
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn gpu_cache_trimming_preserves_the_current_entry() {
+        let now = std::time::SystemTime::now();
+        let old = PathBuf::from("/tmp/sixng-old-cache-entry");
+        let protected = PathBuf::from("/tmp/sixng-new-cache-entry");
+        assert!(trim_texture_cache_entries(
+            vec![(Some(now), old, 100), (Some(now), protected.clone(), 100)],
+            100,
+            Some((&protected, 100)),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn gpu_cache_trim_ignores_writer_temporary_files() {
+        let dir = test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let completed = dir.join("completed.rgba");
+        let temporary = dir.join("completed.rgba.tmp-123");
+        fs::write(&completed, [1u8; 16]).unwrap();
+        fs::write(&temporary, [2u8; 16]).unwrap();
+        trim_texture_cache_dir(&dir, 0, None).unwrap();
+        assert!(!completed.exists());
+        assert!(temporary.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn gpu_cache_trim_counts_protected_entry_in_total() {
+        let dir = test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let oldest = dir.join("oldest.rgba");
+        let retained = dir.join("retained.rgba");
+        let protected = dir.join("protected.rgba");
+        fs::write(&oldest, [1u8; 100]).unwrap();
+        fs::write(&retained, [2u8; 100]).unwrap();
+        fs::write(&protected, [3u8; 100]).unwrap();
+        let now = std::time::SystemTime::now();
+        trim_texture_cache_entries(
+            vec![
+                (Some(now - std::time::Duration::from_secs(2)), oldest.clone(), 100),
+                (Some(now - std::time::Duration::from_secs(1)), retained.clone(), 100),
+                (Some(now), protected.clone(), 100),
+            ],
+            200,
+            Some((&protected, 100)),
+        )
+        .unwrap();
+        assert!(!oldest.exists());
+        assert!(retained.exists());
+        assert!(protected.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Material4 {
@@ -371,7 +668,7 @@ const MATERIAL_STRIDE: usize = 256;
 
 struct PendingTextureUpload {
     texture: Texture,
-    staging: metal_rust::metal::Buffer,
+    staging: Option<metal_rust::metal::Buffer>,
     mips: Vec<(usize, usize, usize, usize)>,
 }
 
@@ -587,7 +884,10 @@ struct Target {
 pub struct Renderer3D4 {
     device: Device,
     queue: CommandQueue,
+    io_queue: Option<metal_rust::metal::IoCommandQueue>,
     residency: ResidencySet,
+    texture_cache_dir: Option<PathBuf>,
+    validated_texture_caches: HashMap<PathBuf, (u64, std::time::SystemTime, u64, usize)>,
     pipeline: metal_rust::metal::RenderPipelineState,
     temporal_pipeline: metal_rust::metal::RenderPipelineState,
     line_pipeline: metal_rust::metal::RenderPipelineState,
@@ -602,6 +902,8 @@ pub struct Renderer3D4 {
     target: Option<Target>,
     readback: Option<metal_rust::metal::Buffer>,
     pub draws: u32,
+    #[cfg(test)]
+    last_texture_cache_hits: usize,
     temporal_mode: TemporalUpscaleMode,
     temporal_frame: u32,
     prev_view_projection: Mat4,
@@ -623,6 +925,20 @@ impl Renderer3D4 {
     }
 
     pub fn new(device: &Device, queue: &CommandQueue) -> anyhow::Result<Self> {
+        let io_queue = (|| -> anyhow::Result<_> {
+            let descriptor = metal_rust::metal::IOCommandQueueDescriptor::new()?;
+            descriptor.set_type(
+                metal_rust::metal::IOCommandQueueType::IOCommandQueueTypeSerial,
+            )?;
+            descriptor.set_max_command_buffer_count(8)?;
+            descriptor.set_max_commands_in_flight(8)?;
+            Ok(device.new_io_command_queue(&descriptor)?)
+        })()
+        .map(Some)
+        .unwrap_or_else(|error| {
+            eprintln!("[metal-io] texture cache disabled during renderer startup: {error:#}");
+            None
+        });
         let compiler = device.new_mtl4_compiler(&CompilerDescriptor::new()?)?;
         let library_descriptor = LibraryDescriptor::new()?;
         library_descriptor.set_source(MESH_SHADER)?;
@@ -686,7 +1002,10 @@ impl Renderer3D4 {
         Ok(Self {
             device: device.clone(),
             queue: queue.clone(),
+            io_queue,
             residency,
+            texture_cache_dir: None,
+            validated_texture_caches: HashMap::new(),
             pipeline,
             temporal_pipeline,
             line_pipeline,
@@ -701,6 +1020,8 @@ impl Renderer3D4 {
             target: None,
             readback: None,
             draws: 0,
+            #[cfg(test)]
+            last_texture_cache_hits: 0,
             temporal_mode: TemporalUpscaleMode::Off,
             temporal_frame: 0,
             prev_view_projection: Mat4::IDENTITY,
@@ -709,11 +1030,298 @@ impl Renderer3D4 {
         })
     }
 
+    pub fn set_texture_cache_dir(&mut self, cache_dir: impl AsRef<Path>) -> anyhow::Result<()> {
+        if self.io_queue.is_none() {
+            bail!("Metal I/O command queue is unavailable");
+        }
+        let dir = cache_dir.as_ref().join(GPU_TEXTURE_CACHE_DIR);
+        fs::create_dir_all(&dir)?;
+        trim_texture_cache_dir(&dir, GPU_TEXTURE_CACHE_CAP, None)?;
+        self.texture_cache_dir = Some(dir);
+        Ok(())
+    }
+
+    fn cache_matches(
+        path: &Path,
+        key: &str,
+        srgb: bool,
+        mips: &[(usize, usize, usize, usize)],
+    ) -> anyhow::Result<(u64, usize)> {
+        let mut file = File::open(path)?;
+        let mut fixed = [0u8; GPU_TEXTURE_CACHE_FIXED_HEADER];
+        file.read_exact(&mut fixed)?;
+        anyhow::ensure!(
+            &fixed[..8] == GPU_TEXTURE_CACHE_MAGIC,
+            "cache magic/version mismatch"
+        );
+        anyhow::ensure!(
+            u32::from_le_bytes(fixed[8..12].try_into()?) == 1,
+            "cache format version mismatch"
+        );
+        anyhow::ensure!(
+            u32::from_le_bytes(fixed[12..16].try_into()?) == srgb as u32,
+            "cache color space mismatch"
+        );
+        anyhow::ensure!(
+            u32::from_le_bytes(fixed[16..20].try_into()?) as usize == mips.len(),
+            "cache mip count mismatch"
+        );
+        let payload_len = u64::from_le_bytes(fixed[20..28].try_into()?);
+        anyhow::ensure!(
+            u32::from_le_bytes(fixed[32..36].try_into()?) == crc32(key.as_bytes()),
+            "cache image key mismatch"
+        );
+        let expected_crc = u32::from_le_bytes(fixed[28..32].try_into()?);
+        let metadata_len = GPU_TEXTURE_CACHE_FIXED_HEADER as u64 + (mips.len() as u64) * 24;
+        let expected_file_len = metadata_len
+            .checked_add(payload_len)
+            .context("cache size overflow")?;
+        anyhow::ensure!(
+            file.metadata()?.len() == expected_file_len,
+            "cache file length mismatch"
+        );
+
+        for &(offset, width, height, length) in mips {
+            let mut entry = [0u8; 24];
+            file.read_exact(&mut entry)?;
+            anyhow::ensure!(
+                u64::from_le_bytes(entry[0..8].try_into()?) == offset as u64
+                    && u32::from_le_bytes(entry[8..12].try_into()?) as usize == width
+                    && u32::from_le_bytes(entry[12..16].try_into()?) as usize == height
+                    && u64::from_le_bytes(entry[16..24].try_into()?) == length as u64,
+                "cache mip layout mismatch"
+            );
+        }
+
+        let mut remaining = payload_len;
+        let mut chunk = [0u8; 1024 * 1024];
+        let mut checksum = !0u32;
+        while remaining > 0 {
+            let count = remaining.min(chunk.len() as u64) as usize;
+            file.read_exact(&mut chunk[..count])?;
+            checksum = crc32_update(checksum, &chunk[..count]);
+            remaining -= count as u64;
+        }
+        anyhow::ensure!(
+            checksum ^ !0u32 == expected_crc,
+            "cache payload checksum mismatch"
+        );
+        Ok((metadata_len, usize::try_from(payload_len)?))
+    }
+
+    fn queue_texture_cache_write(
+        &self,
+        image: &glb::Image,
+        payload: &[u8],
+        mips: &[(usize, usize, usize, usize)],
+    ) {
+        let Some(dir) = self.texture_cache_dir.clone() else {
+            return;
+        };
+        if TEXTURE_CACHE_WRITERS_ACTIVE
+            .try_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |active| (active < 2).then_some(active + 1),
+            )
+            .is_err()
+        {
+            return;
+        }
+        if payload.len() as u64 + GPU_TEXTURE_CACHE_FIXED_HEADER as u64 + (mips.len() as u64) * 24
+            > GPU_TEXTURE_CACHE_CAP
+        {
+            TEXTURE_CACHE_WRITERS_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::Release);
+            return;
+        }
+        let identity = texture_identity_for(image, mips, payload);
+        let image = CacheImage {
+            path: cache_path(Path::new(""), &identity),
+            key: identity,
+            srgb: image.srgb,
+            mips: mips.to_vec(),
+            payload: payload.to_vec(),
+        };
+        let entry_size =
+            GPU_TEXTURE_CACHE_FIXED_HEADER as u64 + (mips.len() as u64) * 24 + payload.len() as u64;
+        #[cfg(test)]
+        let (test_tx, test_rx) = std::sync::mpsc::channel();
+        #[cfg(test)]
+        {
+            *LAST_TEXTURE_CACHE_WRITE.lock().unwrap() = Some(test_rx);
+        }
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(|| -> Result<Option<PathBuf>, String> {
+                match write_texture_cache_entry(&dir, &image) {
+                    Ok(Some(written_path)) => {
+                        trim_texture_cache_dir(
+                            &dir,
+                            GPU_TEXTURE_CACHE_CAP,
+                            Some((&written_path, entry_size)),
+                        )
+                        .map_err(|error| format!("{error:#}"))?;
+                        Ok(Some(written_path))
+                    }
+                    Ok(None) => Ok(None),
+                    Err(error) => Err(format!("{error:#}")),
+                }
+            });
+            if result.is_err() {
+                eprintln!("[metal-io] texture cache writer panicked");
+            } else if let Ok(Err(error)) = &result {
+                eprintln!("[metal-io] texture cache write failed: {error}");
+            }
+            #[cfg(test)]
+            {
+                let write_result = match &result {
+                    Ok(Ok(Some(written_path))) if written_path.is_file() => {
+                        Ok(Some(written_path.clone()))
+                    }
+                    Ok(Ok(None)) => Ok(None),
+                    Ok(Ok(Some(written_path))) => Err(anyhow::anyhow!(
+                        "writer returned missing cache file {}",
+                        written_path.display()
+                    )),
+                    Ok(Err(error)) => Err(anyhow::anyhow!(error.clone())),
+                    Err(_) => Err(anyhow::anyhow!("texture cache writer panicked")),
+                };
+                let _ = test_tx.send(write_result);
+            }
+            TEXTURE_CACHE_WRITERS_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        });
+    }
+
+    fn load_texture_from_cache(
+        &self,
+        path: &Path,
+        identity: &str,
+        texture: &Texture,
+        srgb: bool,
+        mips: &[(usize, usize, usize, usize)],
+    ) -> anyhow::Result<()> {
+        let io_queue = self
+            .io_queue
+            .as_ref()
+            .context("Metal I/O command queue is unavailable")?;
+        let (payload_offset, payload_len) = Self::cache_matches(path, identity, srgb, mips)?;
+        #[cfg(not(test))]
+        let _ = payload_len;
+        let handle = self.device.new_io_file_handle(path, None)?;
+        #[cfg(test)]
+        let io_buffer = {
+            let io_buffer = self
+                .device
+                .new_buffer(payload_len, ResourceOptions::SHARED)?;
+            let mut buffer_command = io_queue.command_buffer()?;
+            buffer_command.load_buffer(
+                &io_buffer,
+                0,
+                payload_len,
+                &handle,
+                payload_offset as usize,
+            )?;
+            let started = std::time::Instant::now();
+            buffer_command.commit().wait()?;
+            eprintln!(
+                "[metal-io test] cache file-to-buffer load+wait {:.3} ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+            io_buffer
+        };
+        let mut command = io_queue.command_buffer()?;
+        command.set_label(Some("SixNG GPU texture cache load"));
+        for (level, &(offset, width, height, _)) in mips.iter().enumerate() {
+            command.load_texture(
+                texture,
+                0,
+                level,
+                metal_rust::metal::Size::new(width, height, 1),
+                width * 4,
+                width * height * 4,
+                metal_rust::metal::Origin::new(0, 0, 0),
+                &handle,
+                usize::try_from(payload_offset + offset as u64)?,
+            )?;
+        }
+        #[cfg(test)]
+        let started = std::time::Instant::now();
+        command.commit().wait()?;
+        #[cfg(test)]
+        eprintln!(
+            "[metal-io test] texture command load+wait {:.3} ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        #[cfg(test)]
+        {
+            let mut expected = Vec::with_capacity(payload_len);
+            let mut file = File::open(path)?;
+            file.seek(SeekFrom::Start(payload_offset))?;
+            file.take(payload_len as u64).read_to_end(&mut expected)?;
+            anyhow::ensure!(io_buffer.read(0, payload_len)? == expected);
+        }
+        Ok(())
+    }
+
+    fn validate_texture_cache_entry(
+        &mut self,
+        path: &Path,
+        identity: &str,
+        srgb: bool,
+        mips: &[(usize, usize, usize, usize)],
+    ) -> anyhow::Result<(u64, usize)> {
+        let metadata = fs::metadata(path)?;
+        let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if let Some(&(cached_len, cached_modified, payload_offset, payload_len)) =
+            self.validated_texture_caches.get(path)
+        {
+            if cached_len == metadata.len() && cached_modified == modified {
+                return Ok((payload_offset, payload_len));
+            }
+            self.validated_texture_caches.remove(path);
+        }
+        let (payload_offset, payload_len) = Self::cache_matches(path, identity, srgb, mips)?;
+        self.validated_texture_caches.insert(
+            path.to_path_buf(),
+            (metadata.len(), modified, payload_offset, payload_len),
+        );
+        Ok((payload_offset, payload_len))
+    }
+
+    fn sync_texture_cache_residency(
+        &self,
+        texture_cache: &HashMap<String, Texture>,
+        model: &glb::Model,
+    ) -> anyhow::Result<()> {
+        let mut allocations = Vec::new();
+        let mut seen = HashMap::new();
+        for image in &model.images {
+            let Some(texture) = texture_cache.get(&image.key) else {
+                continue;
+            };
+            if seen.insert(image.key.as_str(), ()).is_none()
+                && !self
+                    .residency
+                    .contains_allocation(ResidencyAllocation::Texture(texture))?
+            {
+                allocations.push(ResidencyAllocation::Texture(texture));
+            }
+        }
+        if !allocations.is_empty() {
+            self.residency.add_allocations(&allocations)?;
+            self.residency.commit()?;
+        }
+        Ok(())
+    }
+
     pub fn upload_shared(
         &mut self,
         model: &glb::Model,
         texture_cache: &mut HashMap<String, Texture>,
     ) -> anyhow::Result<GpuModel4> {
+        #[cfg(test)]
+        {
+            self.last_texture_cache_hits = 0;
+        }
         let mut textures = Vec::new();
         let mut image_texture_indices = vec![None; model.images.len()];
         let mut new_cache_entries = Vec::new();
@@ -748,6 +1356,7 @@ impl Renderer3D4 {
                 image_texture_indices[image_index] = Some(local_index);
             }
         }
+        self.sync_texture_cache_residency(texture_cache, model)?;
 
         let default_material = glb::Material {
             name: "default".into(),
@@ -888,7 +1497,9 @@ impl Renderer3D4 {
             allocations.push(ResidencyAllocation::Buffer(buffer));
         }
         for pending in &pending_textures {
-            allocations.push(ResidencyAllocation::Buffer(&pending.staging));
+            if let Some(staging) = &pending.staging {
+                allocations.push(ResidencyAllocation::Buffer(staging));
+            }
             allocations.push(ResidencyAllocation::Texture(&pending.texture));
         }
         self.residency.add_allocations(&allocations)?;
@@ -910,27 +1521,29 @@ impl Renderer3D4 {
                     encoder.copy_buffer(staging, 0..index_bytes.len(), &index_buffer, 0)?;
                 }
                 for pending in &pending_textures {
-                    for &(offset, width, height, byte_length) in &pending.mips {
-                        encoder.copy_buffer_to_texture(
-                            &pending.staging,
-                            BufferImageLayout {
-                                offset,
-                                bytes_per_row: width * 4,
-                                bytes_per_image: byte_length,
-                            },
-                            metal_rust::metal::Size::new(width, height, 1),
-                            &pending.texture,
-                            TextureOriginSelection {
-                                slice: 0,
-                                level: pending
-                                    .mips
-                                    .iter()
-                                    .position(|entry| entry.0 == offset)
-                                    .context("MTL4 mip upload offset was lost")?,
-                                origin: metal_rust::metal::Origin::new(0, 0, 0),
-                            },
-                            None,
-                        )?;
+                    if let Some(staging) = &pending.staging {
+                        for &(offset, width, height, byte_length) in &pending.mips {
+                            encoder.copy_buffer_to_texture(
+                                staging,
+                                BufferImageLayout {
+                                    offset,
+                                    bytes_per_row: width * 4,
+                                    bytes_per_image: byte_length,
+                                },
+                                metal_rust::metal::Size::new(width, height, 1),
+                                &pending.texture,
+                                TextureOriginSelection {
+                                    slice: 0,
+                                    level: pending
+                                        .mips
+                                        .iter()
+                                        .position(|entry| entry.0 == offset)
+                                        .context("MTL4 mip upload offset was lost")?,
+                                    origin: metal_rust::metal::Origin::new(0, 0, 0),
+                                },
+                                None,
+                            )?;
+                        }
                     }
                 }
                 encoder.end()?;
@@ -948,7 +1561,9 @@ impl Renderer3D4 {
             staging_allocations.push(ResidencyAllocation::Buffer(buffer));
         }
         for pending in &pending_textures {
-            staging_allocations.push(ResidencyAllocation::Buffer(&pending.staging));
+            if let Some(staging) = &pending.staging {
+                staging_allocations.push(ResidencyAllocation::Buffer(staging));
+            }
         }
         for (key, texture) in new_cache_entries {
             texture_cache.insert(key, texture);
@@ -978,7 +1593,7 @@ impl Renderer3D4 {
         })
     }
 
-    fn new_texture_upload(&self, image: &glb::Image) -> anyhow::Result<PendingTextureUpload> {
+    fn new_texture_upload(&mut self, image: &glb::Image) -> anyhow::Result<PendingTextureUpload> {
         let (base_width, base_height, _) = image
             .mips
             .first()
@@ -1020,12 +1635,60 @@ impl Renderer3D4 {
             bytes.extend_from_slice(pixels);
             mips.push((offset, *width as usize, *height as usize, expected));
         }
+        if let Some(dir) = self.texture_cache_dir.clone() {
+            let identity = texture_identity_for(image, &mips, &bytes);
+            let path = cache_path(&dir, &identity);
+            match self.validate_texture_cache_entry(&path, &identity, image.srgb, &mips) {
+                Ok(_) => {
+                    match self
+                        .load_texture_from_cache(&path, &identity, &texture, image.srgb, &mips)
+                    {
+                        Ok(()) => {
+                            let _ = OpenOptions::new()
+                                .write(true)
+                                .open(&path)
+                                .and_then(|file| file.set_modified(std::time::SystemTime::now()));
+                            #[cfg(test)]
+                            {
+                                self.last_texture_cache_hits += 1;
+                            }
+                            return Ok(PendingTextureUpload {
+                                texture,
+                                staging: None,
+                                mips,
+                            });
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[metal-io] cache load failed for {}: {error:#}; using staging upload",
+                                image.key
+                            );
+                            self.validated_texture_caches.remove(&path);
+                            let _ = fs::remove_file(&path);
+                        }
+                    }
+                }
+                Err(_) => {
+                    let logged =
+                        TEXTURE_CACHE_MISS_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if logged < 8 {
+                        eprintln!(
+                            "[metal-io] GPU texture cache miss or invalid entry for {}; using staging upload",
+                            image.key
+                        );
+                    }
+                    self.validated_texture_caches.remove(&path);
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+        self.queue_texture_cache_write(image, &bytes, &mips);
         let staging = self
             .device
             .new_buffer_with_bytes(&bytes, ResourceOptions::SHARED)?;
         Ok(PendingTextureUpload {
             texture,
-            staging,
+            staging: Some(staging),
             mips,
         })
     }
@@ -1612,6 +2275,62 @@ impl Renderer3D4 {
             .wait()?;
         Ok(buffer.read(0, byte_length)?)
     }
+
+    #[cfg(test)]
+    fn read_texture_for_test(
+        &mut self,
+        texture: &Texture,
+        width: usize,
+        height: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        let byte_length = width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .context("texture test readback size overflow")?;
+        let readback = self
+            .device
+            .new_buffer(byte_length, ResourceOptions::SHARED)?;
+        let texture_was_resident = self
+            .residency
+            .contains_allocation(ResidencyAllocation::Texture(texture))?;
+        let mut allocations = vec![ResidencyAllocation::Buffer(&readback)];
+        if !texture_was_resident {
+            allocations.push(ResidencyAllocation::Texture(texture));
+        }
+        self.residency.add_allocations(&allocations)?;
+        self.residency.commit()?;
+
+        let allocator = self.device.new_mtl4_command_allocator()?;
+        let mut command = self
+            .device
+            .new_mtl4_command_buffer()?
+            .begin(&allocator, None)?;
+        command.use_residency_set(&self.residency)?;
+        {
+            let encoder = command.compute_encoder()?;
+            encoder.copy_texture_to_buffer(
+                texture,
+                TextureRegionSelection {
+                    slice: 0,
+                    level: 0,
+                    region: metal_rust::metal::Region::new_2d(0, 0, width, height),
+                },
+                &readback,
+                BufferImageLayout {
+                    offset: 0,
+                    bytes_per_row: width * 4,
+                    bytes_per_image: byte_length,
+                },
+                None,
+            )?;
+            encoder.end()?;
+        }
+        self.queue.submit(vec![command.end()?], None)?.wait()?;
+        let bytes = readback.read(0, byte_length)?;
+        self.residency.remove_allocations(&allocations)?;
+        self.residency.commit()?;
+        Ok(bytes)
+    }
 }
 
 #[cfg(test)]
@@ -1673,6 +2392,86 @@ mod tests {
         }
     }
     use metal_rust::metal::GPUFamily;
+
+    #[test]
+    fn mtl4_texture_cache_hit_round_trips_when_available() -> anyhow::Result<()> {
+        let Some(device) = Device::system_default() else {
+            return Ok(());
+        };
+        if !device.supports_family(GPUFamily::GPUFamilyMetal4)? {
+            return Ok(());
+        }
+        let queue = device.new_mtl4_command_queue()?;
+        let mut renderer = Renderer3D4::new(&device, &queue)?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let cache_root = std::env::temp_dir().join(format!("sixng-metal-io-hit-{nonce}"));
+        renderer.set_texture_cache_dir(&cache_root)?;
+        let model = triangle_model();
+        let expected = model.images[0].mips[0].2.clone();
+        let mut texture_cache = HashMap::new();
+
+        let mut first = renderer.upload_shared(&model, &mut texture_cache)?;
+        let writer = LAST_TEXTURE_CACHE_WRITE
+            .lock()
+            .unwrap()
+            .take()
+            .context("cache writer completion receiver was not registered")?;
+        let _ = writer
+            .recv_timeout(std::time::Duration::from_secs(10))?
+            .context("cache writer failed")?
+            .context("staging upload did not create a cache entry")?;
+        renderer.release_model(&first)?;
+        for texture in &first.textures {
+            renderer.release_texture(texture)?;
+        }
+        first.textures.clear();
+        texture_cache.clear();
+
+        let mut second = renderer.upload_shared(&model, &mut texture_cache)?;
+        assert_eq!(
+            renderer.last_texture_cache_hits, 1,
+            "second upload did not use the Metal I/O texture cache"
+        );
+        let pixels = renderer.read_texture_for_test(
+            second
+                .textures
+                .first()
+                .context("cached texture missing from uploaded model")?,
+            1,
+            1,
+        )?;
+        assert_eq!(pixels, expected);
+        renderer.release_model(&second)?;
+        for texture in &second.textures {
+            renderer.release_texture(texture)?;
+        }
+        second.textures.clear();
+        texture_cache.clear();
+
+        let mut third = renderer.upload_shared(&model, &mut texture_cache)?;
+        assert_eq!(
+            renderer.last_texture_cache_hits, 1,
+            "memoized cache validation did not preserve the payload offset"
+        );
+        let pixels = renderer.read_texture_for_test(
+            third
+                .textures
+                .first()
+                .context("cached texture missing from repeated upload")?,
+            1,
+            1,
+        )?;
+        assert_eq!(pixels, expected);
+        renderer.release_model(&third)?;
+        for texture in &third.textures {
+            renderer.release_texture(texture)?;
+        }
+        third.textures.clear();
+        std::fs::remove_dir_all(cache_root)?;
+        Ok(())
+    }
 
     #[test]
     fn mtl4_clear_and_readback_round_trip_when_available() -> anyhow::Result<()> {

@@ -1287,6 +1287,19 @@ impl metal4_app::UiApp for App {
     fn ui(&mut self, ui: &mut egui::Ui, renderer: &mut render3d_metal4::Renderer3D4) {
         self.ui_inner(ui, None, Some(renderer));
     }
+
+    fn configure_renderer(
+        &mut self,
+        renderer: &mut render3d_metal4::Renderer3D4,
+    ) -> anyhow::Result<()> {
+        if let Err(error) = renderer.set_texture_cache_dir(&self.work) {
+            eprintln!(
+                "[metal-io] texture cache disabled because {} could not be initialized: {error:#}",
+                self.work
+            );
+        }
+        Ok(())
+    }
 }
 
 impl App {

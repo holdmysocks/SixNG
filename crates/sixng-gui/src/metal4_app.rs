@@ -1,6 +1,12 @@
 pub trait UiApp {
     fn logic(&mut self, ctx: &eframe::egui::Context);
     fn ui(&mut self, ui: &mut eframe::egui::Ui, renderer: &mut crate::render3d_metal4::Renderer3D4);
+    fn configure_renderer(
+        &mut self,
+        _renderer: &mut crate::render3d_metal4::Renderer3D4,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -275,13 +281,20 @@ mod macos {
             egui_ctx.set_request_repaint_callback(move |info| {
                 let _ = proxy.send_event(UserEvent::Repaint(info.delay));
             });
-            let renderer = match Renderer::new(&window) {
+            let mut renderer = match Renderer::new(&window) {
                 Ok(renderer) => renderer,
                 Err(error) => {
                     self.fail(event_loop, error);
                     return;
                 }
             };
+            if let Err(error) = self.sixng.configure_renderer(&mut renderer.scene) {
+                self.fail(
+                    event_loop,
+                    error.context("failed to configure the Metal 4 renderer"),
+                );
+                return;
+            }
             self.window_id = Some(window.id());
             self.window = Some(window.clone());
             self.renderer = Some(renderer);
