@@ -796,10 +796,10 @@ pub fn decode_mesh(blob: &[u8], h: &MeshBlobHeader, ib: &[u8]) -> Mesh {
     if std::env::var_os("SIXNG_DEBUG_SKIN").is_some() {
         eprintln!("skin: v={v} stream8 fmt={:?} width={jw} max={:?}", stream(8).map(|s| s.1), joints.as_ref().map(|j| j.iter().flatten().max().copied()));
     }
-    // Undo the axis rotation of the position quantiser. The header's u32 at
-    // +0x6C (2 = identity, 1 / 0 = rotated) predicts it in most cases but not
-    // all, so pick the cyclic order whose faces best agree with the stored
-    // (model-space) normals, preferring the header's choice on near-ties.
+    // Undo the axis rotation of the position quantiser: the header's u32 at
+    // +0x6C says which order was used (2 = identity, 1 / 0 = rotated, see
+    // below). Only when it holds another value is the order picked by how
+    // well the faces agree with the stored (model-space) normals.
     // Cables: float positions, slot 2 = unit direction along the wire, UV0.x
     // = +-1 = which side the shader pushes the vertex to. Each vertex pair
     // shares a position, so the stored ribbons have zero width. Widen them
@@ -859,7 +859,17 @@ pub fn decode_mesh(blob: &[u8], h: &MeshBlobHeader, ib: &[u8]) -> Mesh {
     // hold z, y, x: a swap), 1 = y (z, x, y), 2 = z (identity). Checked on
     // dn_14_structure_03_b: the hinted order scores ~1.0 against the normals
     // on every geometry.
+    //
+    // The header is taken at its word. An earlier rule switched to another
+    // order when its faces agreed more than 0.05 better with the normals;
+    // over 36,305 sampled meshes that switched 114, and all 7 that could be
+    // checked another way (against the model's other LODs, its bounds or
+    // matching parts) were right before the switch: a handcuffs chain of
+    // 52,586 triangles, one ped head of 55, helicopter rotor-blade pieces.
+    // The switches came from meshes with few usable normals (often 1-20
+    // scored triangles) or normals that fit no order (best score 0.5-0.7).
     let hinted = match mode { 1 => 1, 0 => 4, _ => 0 };
+    let known = h.float_positions || mode <= 2;
     let mut axis_order = orders[hinted];
     if let Some(n) = &normals {
         let score = |o: &[usize; 3]| -> f32 {
@@ -885,9 +895,10 @@ pub fn decode_mesh(blob: &[u8], h: &MeshBlobHeader, ib: &[u8]) -> Mesh {
         if std::env::var_os("SIXNG_DEBUG_AXIS").is_some() {
             eprintln!("axis: v={v} mode={mode} scores={:?}", orders.iter().map(|o| (score(o) * 1000.0).round() / 1000.0).collect::<Vec<_>>());
         }
-        let (bi, bs) = orders.iter().enumerate().map(|(i, o)| (i, score(o))).fold((hinted, sh), |a, b| if b.1 > a.1 + 0.05 { b } else { a });
-        let _ = bs;
-        axis_order = orders[bi];
+        if !known {
+            let (bi, _) = orders.iter().enumerate().map(|(i, o)| (i, score(o))).fold((hinted, sh), |a, b| if b.1 > a.1 + 0.05 { b } else { a });
+            axis_order = orders[bi];
+        }
     }
     if axis_order != [0, 1, 2] {
         for p in positions.iter_mut() {
