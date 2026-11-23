@@ -127,6 +127,18 @@ impl HairLinks {
         let has = |l: &&Link| !l.grooms.is_empty();
         fit.and_then(|f| v.iter().filter(has).find(|l| l.fit == f)).or_else(|| v.iter().find(has))
     }
+
+    /// The grooms of a link that no other asset claims with a higher
+    /// confidence. Placements are each asset's own best, so two neighbours
+    /// in the archive can both claim the piece between them; it goes to the
+    /// stronger claim. Pieces an asset lists as shared with others stay.
+    pub fn uncontested(&self, link: &Link) -> Vec<u64> {
+        link.grooms
+            .iter()
+            .copied()
+            .filter(|g| link.shared.contains(g) || !self.links.values().flatten().any(|o| o.confidence > link.confidence && o.placeholder != link.placeholder && o.grooms.contains(g) && !o.shared.contains(g)))
+            .collect()
+    }
 }
 
 /// The table (built on first use, then cached in the work directory).

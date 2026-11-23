@@ -98,6 +98,8 @@ pub struct LookInfo {
     pub body_shape: Option<String>,
     /// Strand-hair assets of the outfit shown: (slot, placeholder name, asset GUID).
     pub strands: Vec<(String, String, String)>,
+    /// Their stored tints by slot: palette name hash and row of tint 0.
+    pub strand_tints: Vec<(String, u32, u8)>,
     /// What the viewer did or could not do (skin tone source, unresolved items).
     pub notes: Vec<String>,
     /// Strand hair found for the outfit's hair assets (`hairlink`).
@@ -115,6 +117,14 @@ pub struct HairPick {
     /// and starts hidden.
     pub confidence: f32,
     pub grooms: Vec<u64>,
+    /// Pieces left out because their strand roots do not lie on this head.
+    pub off_head: usize,
+    /// Shown when the character loads: confidence of 50 % or more, or 20 %
+    /// or more with every piece rooted on this head.
+    pub shown: bool,
+    /// Stored colour (sRGB): row tint 0 of `ped_tint_hair`, when the item
+    /// names that palette.
+    pub colour: Option<[u8; 3]>,
 }
 
 /// Colouring of one loaded part of an outfit.
@@ -165,6 +175,8 @@ pub struct Automation {
     /// `--find-hair`: fit grooms to the model and show the run with the
     /// most strands (tests "Find grooms on this model").
     pub find_hair: bool,
+    /// `--hair-width MM` for a character's own hair.
+    pub hair_width: Option<f32>,
 }
 
 /// Shared-wheel scale per unit of the car's wheelScale. Every shared rim
@@ -657,6 +669,10 @@ impl ModelView {
                         let k = g.points_per_strand.max(1);
                         let one = lin.map(|c| (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
                         let cols: Vec<[u8; 3]> = (0..g.strands).map(|s| if skin.is_empty() { one } else { nearest(g.points[s * k], &skin) }).collect();
+                        // Long hair has many points per strand: keep one groom
+                        // under about 1.5 million ribbon vertices (a vertex
+                        // buffer may not exceed 256 MiB).
+                        let share = share.min(375_000.0 / (g.stored_strands() * k).max(1) as f32);
                         let coat = g.coat(share);
                         drawn += coat.guides.len();
                         // fewer strands than stored: wider ones, for the same cover
@@ -678,7 +694,9 @@ impl ModelView {
                         g.ribbon_glb_coloured(&format!("groom_{off:x}"), hw, &cols, serde_json::json!({}))
                     };
                     std::fs::write(&p, glb_bytes)?;
-                    out.push(glb::load(&p, &dir)?);
+                    let mut gm = glb::load(&p, &dir)?;
+                    gm.materials.iter_mut().for_each(|x| x.mr = Some([0.0, 0.85]));
+                    out.push(gm);
                 }
                 *note.lock().unwrap() = if coat_on && stored > 0 { format!("coat: {drawn} of the {stored} stored strands drawn") } else { String::new() };
                 Ok(out)
@@ -1048,8 +1066,14 @@ impl ModelView {
             for h in &look.hair {
                 let mut on = !h.grooms.is_empty() && h.grooms.iter().all(|g| self.hair.selected.contains(g));
                 let name = h.placeholder.trim_end_matches("_full");
-                let text = format!("{}: {name} ({:.0} %)", h.slot, h.confidence * 100.0);
-                if ui.checkbox(&mut on, text).on_hover_text("The strand grooms placed for this hair asset. Nothing in the game files links a hair asset to its strand files; they are placed by name words, archive order, piece counts and where the strand roots lie. The percentage is that model's probability of this placement: under 50 % it is a guess and starts hidden.").changed() {
+                let mut text = format!("{}: {name} ({:.0} %)", h.slot, h.confidence * 100.0);
+                if h.off_head > 0 {
+                    text += &format!(", {} piece(s) not on this head left out", h.off_head);
+                }
+                if h.colour.is_some() {
+                    text += ", stored colour";
+                }
+                if ui.checkbox(&mut on, text).on_hover_text("The strand grooms placed for this hair asset. Nothing in the game files links a hair asset to its strand files; they are placed by name words, archive order, piece counts and where the strand roots lie. The percentage is that model's probability of this placement. Shown at the start: 50 % or more, or 20 % or more when every piece is rooted on this head (a probable style, not a certain one). Pieces whose strand roots do not lie on this head are left out.").changed() {
                     self.hair.selected.retain(|g| !h.grooms.contains(g));
                     if on {
                         self.hair.selected.extend(h.grooms.iter().copied());
@@ -1059,7 +1083,7 @@ impl ModelView {
             ui.horizontal(|ui| {
                 ui.label("colour");
                 ui.color_edit_button_rgb(&mut self.hair.colour);
-                ui.label(egui::RichText::new("(the hair colour of an outfit is not decoded: pick one)").weak().small());
+                ui.label(egui::RichText::new("(stored for items that name the hair palette; most leave it to the game, so pick one)").weak().small());
             });
         }
         let unplaced: Vec<&str> = look.strands.iter().filter(|s| !look.hair.iter().any(|h| h.slot == s.0)).map(|s| s.1.as_str()).collect();
@@ -1291,10 +1315,19 @@ impl ModelView {
                     let key = format!("{}#{}", look.model, look.current);
                     if self.hair.look_key != key {
                         self.hair.look_key = key;
-                        self.hair.selected = look.hair.iter().filter(|h| h.confidence >= 0.5).flat_map(|h| h.grooms.iter().copied()).collect();
+                        self.hair.selected = look.hair.iter().filter(|h| h.shown).flat_map(|h| h.grooms.iter().copied()).collect();
+                        if let Some(c) = look.hair.iter().find(|h| h.slot == "hair").or(look.hair.first()).and_then(|h| h.colour) {
+                            self.hair.colour = c.map(|x| x as f32 / 255.0);
+                        }
                         if !look.hair.is_empty() {
                             self.hair.full_coat = true;
                             self.hair.skin_colour = false;
+                            // hair strands are thinner than a pixel at
+                            // viewing distance: wider ribbons read as hair
+                            self.hair.density = 1.0;
+                            if self.hair.width_mm == 1.0 {
+                                self.hair.width_mm = self.auto.hair_width.unwrap_or(6.0);
+                            }
                             if self.hair.colour == Hair::default().colour {
                                 self.hair.colour = [0.09, 0.06, 0.045];
                             }
@@ -3962,6 +3995,9 @@ fn load_query_sel(
                         if p.strands {
                             if oi == k {
                                 info.strands.push((p.slot.clone(), p.drawable.clone(), p.guid.clone().unwrap_or_default()));
+                                if let Some((pal, t)) = p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t))) {
+                                    info.strand_tints.push((p.slot.clone(), pal, t.rows[0]));
+                                }
                             }
                             continue;
                         }
@@ -3984,7 +4020,8 @@ fn load_query_sel(
                     Ok(t) => {
                         for (slot, _, guid) in &info.strands {
                             let Some(l) = u64::from_str_radix(guid, 16).ok().and_then(|g| t.resolve(g, look.fit.as_deref())) else { continue };
-                            info.hair.push(HairPick { slot: slot.clone(), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: l.grooms.clone() });
+                            let colour = info.strand_tints.iter().find(|t| t.0 == *slot && t.1 == 0x1e64_f584).and_then(|t| Some(sixng_core::pedtint::palettes(&ws.game).ok()?.get(&t.1)?.sample(t.2, 128)));
+                            info.hair.push(HairPick { slot: slot.clone(), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: t.uncontested(l), off_head: 0, shown: l.confidence >= 0.5, colour });
                         }
                     }
                     Err(e) => info.notes.push(format!("Strand hair: {e}")),
@@ -4005,11 +4042,36 @@ fn load_query_sel(
         if parts.is_empty() {
             return Err(anyhow::anyhow!("no parts of {prefix} selected"));
         }
-        let (model, first, names, errs, _, _, _, notes) = load_parts(&a, &parts, cache, lod, None, &fx, &ws.game);
+        let (model, first, names, errs, skin, _, _, notes) = load_parts(&a, &parts, cache, lod, None, &fx, &ws.game);
         let model = model
             .ok_or_else(|| anyhow::anyhow!("no part of {prefix} loaded: {}", errs.join("; ")))?;
         if let Some(l) = &mut look_info {
             l.notes.extend(notes);
+            // Strand roots must lie on this character: pieces that do not
+            // (another head shape, a neighbour's piece) are left out. Only in
+            // the neutral body shape, where the skin is where the grooms expect it.
+            if *BODY_SHAPE.lock().unwrap() == (0.0, 0.0) && !l.hair.is_empty() {
+                const CELL: f32 = 0.012;
+                let key = |p: &[f32; 3]| ((p[0] / CELL).floor() as i32, (p[1] / CELL).floor() as i32, (p[2] / CELL).floor() as i32);
+                let cells: std::collections::HashSet<(i32, i32, i32)> = skin.iter().filter(|(n, _)| n.contains("_head_") || n.starts_with("head_") || n.starts_with("hand_") || n.starts_with("feet_")).flat_map(|(_, pts)| pts.iter().map(key)).collect();
+                if !cells.is_empty() {
+                    for h in &mut l.hair {
+                        let all = h.grooms.len();
+                        h.grooms.retain(|&off| {
+                            let Ok(g) = sixng_core::groom::load(&a, &ix.entries, off) else { return true };
+                            let k = g.points_per_strand.max(1);
+                            let n = g.strands.max(1);
+                            let on = (0..g.strands).filter(|&s| g.points.get(s * k).is_some_and(|r| {
+                                let c = key(r);
+                                (-1..=1).any(|x| (-1..=1).any(|y| (-1..=1).any(|z| cells.contains(&(c.0 + x, c.1 + y, c.2 + z)))))
+                            })).count();
+                            on * 10 >= n * 8
+                        });
+                        h.off_head = all - h.grooms.len();
+                        h.shown = !h.grooms.is_empty() && (h.confidence >= 0.5 || (h.confidence >= 0.2 && h.off_head == 0));
+                    }
+                }
+            }
         }
         let info = serde_json::json!({ "assembled_from": names, "ids": parts.iter().map(|e| e.id.clone()).collect::<Vec<_>>(), "errors": errs, "outfit_list": look_err.map(|e| format!("not used: {e}")) });
         return Ok(Loaded {
