@@ -33,10 +33,18 @@
 //! (see the constants). Body panels are bound to one channel that nothing
 //! assigns; it is taken as the body paint.
 //!
-//! Not decoded: what picks the column of a palette row (the middle of the
-//! row is used), the other modifier kinds (dirt, liveries, decal layers,
-//! option lists), which configuration a spawned vehicle uses, the second
-//! layer's colour, metalness.
+//! What the paint shader does with these was read from its machine code
+//! (the G-buffer pixel shader of `standard_vehicle_2lyr`): the position
+//! along a palette row is the green channel of `lyr0diffusetex` (plus a
+//! small detail term), the palette is only read where the part's own colour
+//! is zero (paints carry their colour and never read their row), and
+//! metalness and roughness are low / high pairs of the part's surface
+//! blended by the red and green channels of `lyr0materialatex`.
+//!
+//! Not decoded: the palette is sampled as a 2D array with a slice per part
+//! (one slice is read here), the other modifier kinds (dirt, liveries, decal layers,
+//! option lists), which configuration a spawned vehicle uses, the wear
+//! layers.
 
 use crate::meta7a::{self, Meta};
 use crate::resource::Resource;
@@ -50,9 +58,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// Version of what an export writes for part colours (model.json
 /// `part_colours_version`); the model viewer exports older vehicles again.
-pub const EXPORT_VERSION: u32 = 5;
+pub const EXPORT_VERSION: u32 = 6;
 /// Layout version of `<work>/index/vehicle_parts.json`.
-pub const FORMAT: u32 = 7;
+pub const FORMAT: u32 = 8;
 
 const PART_SET: u32 = 0xf142_44fd;
 const SET_COLOURS: u32 = 0x7847_6477;
@@ -70,6 +78,12 @@ const SURFACE_ROUGH: u32 = 0x2cc7_2f7c;
 const ROUGH: u32 = 0x307f_162c;
 const ROUGH_LOW: u32 = 0xe4be_3b70;
 const ROUGH_HIGH: u32 = 0x26e5_d460;
+/// Metalness low and high of a `307f162c` record. The paint shader blends a
+/// low / high pair by the red channel of the layer's material texture and
+/// the roughness pair by its green channel; these two fields are 0 on
+/// plastics, rubber, leather and paint and 0.7 to 1.0 on chrome and alloy.
+const METAL_LOW: u32 = 0xf763_652d;
+const METAL_HIGH: u32 = 0x09dd_33c1;
 const NAME: u32 = 0xe6e1_7f14;
 /// A configuration's part list (`51019114.e89b8540`).
 const CONFIG_PARTS: u32 = 0xe89b_8540;
@@ -138,6 +152,10 @@ pub struct Part {
     pub rgb: [u8; 3],
     /// `roughnessLow`, `roughnessHigh` of the surface's first layer.
     pub rough: [f32; 2],
+    /// Metalness low and high of the surface's first layer (`307f162c`
+    /// fields `f763652d`, `09dd33c1`).
+    #[serde(default)]
+    pub metal: [f32; 2],
 }
 
 impl Part {
@@ -202,6 +220,8 @@ struct Library {
     /// surface name -> roughness record name
     surfaces: HashMap<u32, u32>,
     rough: HashMap<u32, [f32; 2]>,
+    /// roughness record name -> metalness low, high
+    metal: HashMap<u32, [f32; 2]>,
     rim_ratio: HashMap<String, f32>,
     /// configuration part name -> its modifier record names
     mods: HashMap<u32, Vec<u32>>,
@@ -230,7 +250,7 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
             }
             let m = &m;
             let dump = |h: u32| m.objects(h).into_iter().filter_map(|o| m.object(h, o, 0)).collect::<Vec<_>>();
-            let mut l = Library { colours: HashMap::new(), surfaces: HashMap::new(), rough: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), options: HashMap::new(), id: Some(e.id.clone()) };
+            let mut l = Library { colours: HashMap::new(), surfaces: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), options: HashMap::new(), id: Some(e.id.clone()) };
             for o in dump(OPTION_LIST) {
                 if let Some(n) = num(&o, NAME) {
                     l.options.insert(n as u32, get(&o, OPTION_PARTS).and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()).unwrap_or_default());
@@ -297,6 +317,8 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
                 let f = |h| get(&s, h).and_then(|x| x.as_f64()).unwrap_or(0.5) as f32;
                 if let Some(n) = num(&s, NAME) {
                     l.rough.insert(n as u32, [f(ROUGH_LOW), f(ROUGH_HIGH)]);
+                    let g = |h| get(&s, h).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+                    l.metal.insert(n as u32, [g(METAL_LOW), g(METAL_HIGH)]);
                 }
             }
             Some(l)
@@ -336,8 +358,10 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
                         let colour = num(c, ENTRY_COLOUR).unwrap_or(0) as u32;
                         let surface = num(s, ENTRY_SURFACE).unwrap_or(0) as u32;
                         let (mode, row, rgb) = lib.colours.get(&colour).copied().unwrap_or((-1, -1, [0; 3]));
-                        let rough = lib.surfaces.get(&surface).and_then(|r| lib.rough.get(r)).copied().unwrap_or([0.5, 0.5]);
-                        Part { colour, surface, row, mode, rgb, rough }
+                        let rec = lib.surfaces.get(&surface);
+                        let rough = rec.and_then(|r| lib.rough.get(r)).copied().unwrap_or([0.5, 0.5]);
+                        let metal = rec.and_then(|r| lib.metal.get(r)).copied().unwrap_or([0.0, 0.0]);
+                        Part { colour, surface, row, mode, rgb, rough, metal }
                     })
                     .collect();
                 sets.push((name.to_string(), parts));
@@ -473,8 +497,8 @@ fn apply_config(lib: &Library, own: &HashMap<u32, Vec<u32>>, parts: &[u32], set:
                 }
             }
             if surface && s != 0 {
-                if let Some(r) = lib.surfaces.get(&s).and_then(|r| lib.rough.get(r)) {
-                    (p.surface, p.rough) = (s, *r);
+                if let Some((r, rec)) = lib.surfaces.get(&s).and_then(|rec| lib.rough.get(rec).map(|r| (r, rec))) {
+                    (p.surface, p.rough, p.metal) = (s, *r, lib.metal.get(rec).copied().unwrap_or([0.0, 0.0]));
                 }
             }
             changed[i as usize] |= *p != before;
@@ -529,17 +553,15 @@ impl Tables {
 /// `palette` the 128 x 256 material palette (sRGB RGBA8).
 ///
 /// Alpha: 254 = primary body paint (a viewer may swap in a paint colour);
-/// 0-100 = the middle of the surface's roughness range x 100; 101-201 = the
-/// same + 101 on a part taken as bare metal. Metalness is not decoded: a
-/// fixed material counts as metal when its palette row is bright and
-/// neutral (chrome, polished aluminium) and its surface is smooth.
-pub fn vertex_colours(parts: &[Part], palette: &[[u8; 4]], ids: impl Iterator<Item = u8>) -> Vec<[u8; 4]> {
-    let look = look_table(parts, palette);
+/// otherwise `surface_code` (metalness and roughness of the part's surface).
+pub fn vertex_colours(parts: &[Part], palette: &[[u8; 4]], u: f32, ids: impl Iterator<Item = u8>) -> Vec<[u8; 4]> {
+    let look = look_table(parts, palette, u);
     ids.map(|i| look[i as usize]).collect()
 }
 
-/// The colour of each of the 256 part ids (see `vertex_colours`).
-pub fn look_table(parts: &[Part], palette: &[[u8; 4]]) -> Vec<[u8; 4]> {
+/// The colour of each of the 256 part ids (see `vertex_colours`). `u` is
+/// the position along a palette row, 0 to 1.
+pub fn look_table(parts: &[Part], palette: &[[u8; 4]], u: f32) -> Vec<[u8; 4]> {
     let lin = |v: u8| {
         let c = v as f32 / 255.0;
         let l = if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
@@ -548,15 +570,21 @@ pub fn look_table(parts: &[Part], palette: &[[u8; 4]]) -> Vec<[u8; 4]> {
     (0..256)
         .map(|i| {
             let Some(p) = parts.get(i) else { return [255; 4] };
-            let mid = ((p.rough[0] + p.rough[1]) * 0.5).clamp(0.0, 1.0);
-            let rough = (mid * 100.0 + 0.5) as u8;
             let fixed = !p.is_paint() && p.row >= 0;
-            let rgb = if fixed { ramp(palette, p.row as usize) } else { p.rgb };
-            let (lo, hi) = (rgb.iter().min().copied().unwrap_or(0), rgb.iter().max().copied().unwrap_or(0));
-            let metal = fixed && lo >= 190 && hi - lo <= 24 && mid <= 0.55;
-            [lin(rgb[0]), lin(rgb[1]), lin(rgb[2]), if p.is_primary() { 254 } else if metal { rough + 101 } else { rough }]
+            let rgb = if fixed { ramp(palette, p.row as usize, u) } else { p.rgb };
+            [lin(rgb[0]), lin(rgb[1]), lin(rgb[2]), if p.is_primary() { 254 } else { surface_code(p) }]
         })
         .collect()
+}
+
+/// A part's surface as the alpha of its vertex colour: metalness in four
+/// steps x 50 + roughness in 50 steps (0 to 199), each the middle of the
+/// surface's low / high pair.
+pub fn surface_code(p: &Part) -> u8 {
+    let mid = |v: [f32; 2]| ((v[0] + v[1]) * 0.5).clamp(0.0, 1.0);
+    let metal = (mid(p.metal) * 3.0 + 0.5) as u8;
+    let rough = (mid(p.rough) * 49.0 + 0.5) as u8;
+    metal * 50 + rough
 }
 
 impl Tables {
@@ -565,7 +593,7 @@ impl Tables {
     /// 2,048 hex digits, encoded like GLB COLOR_0), `configs` (configuration
     /// key -> index into looks) and `default` (the look in the GLB). Null
     /// for models without configurations (mod parts).
-    pub fn looks_json(&self, model: &str, palette: &[[u8; 4]]) -> Value {
+    pub fn looks_json(&self, model: &str, palette: &[[u8; 4]], u: f32) -> Value {
         let m = model.to_ascii_lowercase();
         let base = m.strip_suffix("_hi").or_else(|| m.strip_suffix("_mid")).unwrap_or(&m);
         let key = format!("{:08x}", meta7a::joaat(base));
@@ -574,7 +602,7 @@ impl Tables {
         names.push(default);
         names.sort();
         names.dedup();
-        let hex = |n: &String| self.sets.get(n).map(|p| look_table(p, palette).iter().flat_map(|c| c.iter().map(|b| format!("{b:02x}"))).collect::<String>());
+        let hex = |n: &String| self.sets.get(n).map(|p| look_table(p, palette, u).iter().flat_map(|c| c.iter().map(|b| format!("{b:02x}"))).collect::<String>());
         let looks: Vec<Value> = names.iter().map(|n| hex(n).map_or(Value::Null, Value::String)).collect();
         let index = |n: &String| names.iter().position(|x| *x == n);
         serde_json::json!({
@@ -585,12 +613,16 @@ impl Tables {
     }
 }
 
-/// The colour of a palette row: the mean of its middle quarter (what picks
-/// the column in game is not decoded).
-pub fn ramp(palette: &[[u8; 4]], row: usize) -> [u8; 3] {
+/// The colour of a palette row at position `u` (0 to 1): the mean of the
+/// 17 columns around it. In the paint shader the position is the green
+/// channel of the layer's detail texture (`lyr0diffusetex`), which is a
+/// gradient-position map, not a colour; an export uses that texture's mean
+/// green for all of a model's parts.
+pub fn ramp(palette: &[[u8; 4]], row: usize, u: f32) -> [u8; 3] {
     const W: usize = 128;
     let mut s = [0u32; 3];
-    let cols = W * 3 / 8..W * 5 / 8;
+    let c = (u.clamp(0.0, 1.0) * (W - 1) as f32 + 0.5) as usize;
+    let cols = c.saturating_sub(8)..(c + 9).min(W);
     let n = cols.len() as u32;
     for x in cols {
         let Some(p) = palette.get(row * W + x) else { return [128; 3] };
@@ -614,19 +646,22 @@ mod tests {
         let mut parts = vec![Part { mode: 3, row: 5, rough: [0.2, 0.4], ..Default::default() }; 256];
         parts[1] = Part { colour: PRIMARY_PAINT, mode: 1, row: 1, rgb: [255, 0, 0], ..Default::default() };
         parts[2] = Part { colour: 7, mode: 1, row: 2, rgb: [0, 255, 0], rough: [1.0, 1.0], ..Default::default() };
-        let c = vertex_colours(&parts, &pal, [0u8, 1, 2].into_iter());
-        assert_eq!(ramp(&pal, 5), [200, 100, 50]);
-        // fixed material: the palette row (linear), alpha = roughness 0.3 x 100
-        assert_eq!(c[0][3], 30);
+        let c = vertex_colours(&parts, &pal, 0.5, [0u8, 1, 2].into_iter());
+        assert_eq!(ramp(&pal, 5, 0.5), [200, 100, 50]);
+        // fixed material: the palette row (linear), alpha = roughness 0.3 in 50 steps
+        assert_eq!(c[0][3], 15);
         assert!(c[0][0] > c[0][1] && c[0][1] > c[0][2]);
         // primary paint is marked, other paints keep their own colour
         assert_eq!(c[1], [255, 0, 0, 254]);
-        assert_eq!(c[2], [0, 255, 0, 100]);
-        // a bright neutral row on a smooth surface reads as metal
+        assert_eq!(c[2], [0, 255, 0, 49]);
+        // metalness comes from the surface: 0.9 to 1.0 is the top step
+        parts[0].metal = [0.9, 1.0];
+        assert_eq!(vertex_colours(&parts, &pal, 0.5, [0u8].into_iter())[0][3], 165);
+        // the position along the row picks the column
         for x in 0..128 {
-            pal[5 * 128 + x] = [240, 240, 244, 255];
+            pal[5 * 128 + x] = [x as u8 * 2, 0, 0, 255];
         }
-        assert_eq!(vertex_colours(&parts, &pal, [0u8].into_iter())[0][3], 131);
+        assert!(ramp(&pal, 5, 0.1)[0] < ramp(&pal, 5, 0.9)[0]);
     }
 
     #[test]

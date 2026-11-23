@@ -64,7 +64,7 @@ pub struct Material {
     /// (shading) is shown as grey.
     pub tint_mask: bool,
     /// Vehicle parts coloured per vertex (COLOR_0; alpha 254 = the primary
-    /// body paint, 0-100 = roughness x 100, 101-201 = the same on metal).
+    /// body paint, other values = metalness in four steps x 50 + roughness in 50 steps).
     pub parts: bool,
     pub slots: Vec<Slot>,
     /// worst slot status: ok / lowmip / flat

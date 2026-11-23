@@ -1339,10 +1339,7 @@ impl Uploader {
                 0x100 | (q(m) << 16) | (q(r) << 24)
             }) | if mt.tint_mask { 0x200 } else { 0 } | if mt.parts { 0x400 } else { 0 }
                 // bit 11: a lamp's emissive mesh (standard_vehicle_emissive_animated_bones)
-                | if mt.name.ends_with("29648098") { 0x800 } else { 0 }
-                // bit 12: a fitted rim or tyre coloured from the vehicle's part
-                // colours keeps its stand-in metal and roughness
-                | if mt.parts && (mt.name.ends_with("c5cdbdd2") || mt.name.ends_with("99ad6fc9")) { 0x1000 } else { 0 };
+                | if mt.name.ends_with("29648098") { 0x800 } else { 0 };
             let u = MatU {
                 base,
                 flags: [has, class_id(&mt.class), alpha, gap | mr],

@@ -474,7 +474,7 @@ fn classify_shader(s: &crate::drawable::Shader, st: &ShaderTextures) -> serde_js
             c["stand_in"] = "parts".into();
             c["family"] = "vehicle body, interior and mechanical parts (two-layer shader), coloured per part id".into();
             c["part_set"] = set.clone().into();
-            c["parts_note"] = "GLB COLOR_0 holds each vertex's colour (linear): the vehicle's part set names a colour record per part id (vertex colour alpha, kept in _COLOR0); fixed materials take the middle of their row of the material palette, paints the record's own colour. COLOR_0 alpha 254 marks the primary body paint (the stored default is a dark grey; a configuration's body colour replaces it), 0-100 is the surface's mean roughness x 100 and 101-201 the same + 101 on parts taken as bare metal (an inference: a bright neutral palette row on a smooth surface). Not decoded: the column of the palette row, per-configuration colour and trim choices, the second layer, metalness".into();
+            c["parts_note"] = "GLB COLOR_0 holds each vertex's colour (linear): the vehicle's part set names a colour record per part id (vertex colour alpha, kept in _COLOR0); fixed materials take the middle of their row of the material palette, paints the record's own colour. COLOR_0 alpha 254 marks the primary body paint (the stored default is a dark grey; a configuration's body colour replaces it), other values are metalness in four steps x 50 + roughness in 50 steps, from the part's surface record (the middle of its low / high pairs). The position along a palette row is the mean green of the model's layer detail textures (in game it is that texture's green channel per pixel). Not decoded: the palette's array slices, the wear layers, dirt and liveries".into();
         }
     } else if c["class"] == "car_paint" {
         let textured = st.entries.iter().any(|e| LAYER_DETAIL.iter().any(|h| e["param_hash"] == *h) && e["status"].as_str().is_some_and(|x| x.starts_with("ok")));
@@ -1207,8 +1207,21 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
     // set that colours each part id.
     let part_tables = shader_tex.iter().any(|st| st.vehicle_palette.is_some()).then(crate::names::work_dir).flatten().and_then(|w| crate::vehcolour::tables(&game_root(a), &w).ok());
     let part_set: Option<(String, Vec<crate::vehcolour::Part>)> = part_tables.as_ref().zip(e.name.as_deref()).and_then(|(t, n)| t.for_model(n)).map(|(k, v)| (k.to_string(), v.to_vec()));
+    // The position along a palette row is the green channel of the layer
+    // detail texture; one value per model: the mean green of the detail
+    // textures its materials bind (0.5 when none decoded).
+    let ramp_u = {
+        let g: Vec<f64> = shader_tex
+            .iter()
+            .filter(|st| st.vehicle_palette.is_some())
+            .flat_map(|st| st.entries.iter())
+            .filter(|e| e["param_hash"] == LAYER_DETAIL[0] && e["status"].as_str().is_some_and(|x| x.starts_with("ok")) && e["width"].as_u64().is_some_and(|w| w >= 32))
+            .filter_map(|e| e["mean_rgba"][1].as_f64())
+            .collect();
+        if g.is_empty() { 0.5 } else { (g.iter().sum::<f64>() / g.len() as f64 / 255.0) as f32 }
+    };
     let part_looks = match (&part_tables, e.name.as_deref(), shader_tex.iter().find_map(|st| st.vehicle_palette.as_ref())) {
-        (Some(t), Some(n), Some(pal)) => t.looks_json(n, pal),
+        (Some(t), Some(n), Some(pal)) => t.looks_json(n, pal, ramp_u),
         _ => serde_json::Value::Null,
     };
     let slice = |i: usize| {
@@ -1282,7 +1295,7 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         }
         // Vehicles: the colour of each part id from the vehicle's part set.
         if let (Some((_, parts)), Some(pal), Some(c)) = (&part_set, material.and_then(|s| shader_tex.get(s)).and_then(|st| st.vehicle_palette.as_ref()), &m.colors) {
-            tint = Some(crate::vehcolour::vertex_colours(parts, pal, c.iter().map(|c| c[3])));
+            tint = Some(crate::vehcolour::vertex_colours(parts, pal, ramp_u, c.iter().map(|c| c[3])));
             if let Some(mm) = mesh_meta.last_mut() {
                 mm["part_colours_applied"] = true.into();
             }
