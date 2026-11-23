@@ -446,18 +446,19 @@ again**).
     the skin triangles that lie right under a garment (top, jacket,
     trousers, dress, shoes, gloves) are hidden, so skin does not show
     through it.
-  - 282 of the 318 named characters resolve. By model name: 116. Through
-    their head (the outfit list has them under another model name; the
-    wardrobe that names their head is theirs): 161. Through the ped model
-    table's character name (`cs_lucia` -> the one model named "lucia",
-    `player_story000_00`; `cs_jason` -> `player_story000_01`; with the
-    character's own head when it has one): 3. From their own parts, when
-    they have a full set of clothes (`cs_ghost`): 2. By head shape, only
-    when one head stands far out (at most 0.6 of the median distance;
-    `u_m_m_deal_dook` -> `cs_dook`): 1; looser shape matches linked
-    unrelated people and are not used. The rest are heads on their own
-    (crowd heads `hc_*`) and the `sc_*` creatures, shown as before. The
-    panel says which way a character was found. `sixng ped-look "^"` lists every character
+  - 280 of the 318 named characters resolve (`sixng ped-look "^"`). Most
+    by model name (116) or through their head: the outfit list has them
+    under another model name, and the wardrobe that names their head is
+    theirs. A few through the ped model table's character name
+    (`cs_lucia` -> the one model named "lucia", `player_story000_00`;
+    `cs_jason` -> `player_story000_01`; with the character's own head
+    when it has one), from their own parts when they have a full set of
+    clothes (`cs_ghost`), or by head shape when one head stands far out
+    (at most 0.6 of the median distance; `u_m_m_deal_dook` -> `cs_dook`);
+    looser shape matches linked unrelated people and are not used. The
+    rest are heads on their own (crowd heads `hc_*`) and the `sc_*`
+    creatures, shown as before. The panel says which way a character was
+    found. `sixng ped-look "^"` lists every character
     with what its default outfit has. `sixng outfit <name> --look N`
     exports outfit N as one rigged GLB (parts, the face, stored tints;
     not the viewer's skin tone, colour words or hidden skin).
