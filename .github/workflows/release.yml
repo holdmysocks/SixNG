@@ -78,6 +78,8 @@ jobs:
           mkdir -p "dist/$dir"
           if [ "$RUNNER_OS" = macOS ]; then
             scripts/macos-app.sh --universal --prebuilt "dist/$dir"
+            # keep the CLI at the same path as on the other systems
+            ln -s SixNG.app/Contents/MacOS/sixng "dist/$dir/sixng"
           else
             set -- ${{ matrix.targets }}
             for b in sixng sixng-gui; do
@@ -96,11 +98,7 @@ jobs:
           for n, v, l in rows:
               print(f"{n} {v}: {l}")
           ' > "dist/$dir/RUST_DEPENDENCIES.txt"
-          if [ "$RUNNER_OS" = macOS ]; then
-            ./"dist/$dir/SixNG.app/Contents/MacOS/sixng" --version
-          else
-            ./"dist/$dir/sixng" --version
-          fi
+          ./"dist/$dir/sixng" --version
       - name: Check binaries for build paths
         shell: bash
         run: |
