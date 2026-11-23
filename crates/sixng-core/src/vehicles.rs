@@ -34,7 +34,7 @@ const OWNER: u32 = 0xfb1f_80ff;
 /// `handlingId` (case-sensitive joaat).
 const HANDLING_ID: u32 = 0xec41_bd9c;
 /// Layout version of vehicles.json; the model viewer rebuilds older files.
-pub const FORMAT: u32 = 4;
+pub const FORMAT: u32 = 5;
 /// A mod part or kit of one vehicle (in that vehicle's own pack resource):
 /// `name` joaat of the part model's name, or of a kit's name (the names of
 /// its left and right models without the side word:
@@ -160,6 +160,8 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
         })
         .collect();
     let name = |h: u32| names.get(&h).cloned();
+    // rim radius / tyre radius of the wheel fitment records (in the library)
+    let fits = crate::names::work_dir().and_then(|w| crate::vehcolour::tables(&crate::export::game_root(a), &w).ok());
     let mut models: BTreeMap<u32, Value> = BTreeMap::new();
     let mut sources = Vec::new();
     let (mut n_cfg, mut n_pal, mut n_rim) = (0, 0, 0);
@@ -208,7 +210,9 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
             n_cfg += 1;
             let colour = get(&c, COLOUR).and_then(|x| x.as_u64()).map(|x| argb(x as u32));
             let e = models.entry(h).or_insert_with(|| json!({"model": name(h), "model_hash": format!("{h:08x}"), "model_info": null, "configurations": [], "palettes": [], "part_groups": []}));
+            let rim_ratio = fits.as_ref().and_then(|t| parts.iter().find_map(|p| t.rim_ratio.get(&format!("{p:08x}"))));
             e["configurations"].as_array_mut().unwrap().push(json!({
+                "rim_ratio": rim_ratio,
                 "colour": colour, "rim": rims.first(), "tyre": tyres.first(), "rims": rims, "tyres": tyres,
                 "parts": parts.iter().zip(&pn).map(|(p, n)| n.clone().map(Value::String).unwrap_or(json!(format!("{p:08x}")))).collect::<Vec<_>>(),
             }));
@@ -273,7 +277,7 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("vehicles.json");
     std::fs::write(&path, serde_json::to_vec_pretty(&json!({
-        "note": "Per vehicle model: model_info (vehicles.meta-like; wheelScale / wheelScaleRear read as the rim radius in metres (0.217 on a BMX, 0.25 / 0.22 on a dirt bike); the shared rim_* models have radius 0.5, so the model viewer scales rim and tyre by wheelScale / 0.5. The game shapes the tyre through the wheel model's own bones, which is not decoded), configurations (body colour ARGB + the part models incl. rim and tyre), palettes (ARGB paint-colour lists; colours repeat, so repetition reads as the draw weight), part_groups (weighted part choices). Names resolve where known; others are joaat hex.",
+        "note": "Per vehicle model: model_info (vehicles.meta-like; wheelScale / wheelScaleRear read as the rim radius in metres (0.217 on a BMX, 0.25 / 0.22 on a dirt bike); the shared rim_* models have radius 0.5, so the model viewer scales rim and tyre by wheelScale / 0.5. The game shapes the tyre through the wheel model's own bones, which is not decoded), configurations (body colour ARGB + the part models incl. rim and tyre; rim_ratio = rim radius / tyre radius from the configuration's wheel fitment record, slot 39d5e253, where it has one), palettes (ARGB paint-colour lists; colours repeat, so repetition reads as the draw weight), part_groups (weighted part choices). Names resolve where known; others are joaat hex.",
         "format": FORMAT,
         "sources": sources,
         "vehicles": list,

@@ -26,10 +26,17 @@
 //! colours `4ce375e6` of the library start with GTA IV's car colour list
 //! (37,37,39 / 101,106,121 / 88,89,90 ...) only when read that way.
 //!
+//! A configuration's part list names records in the library (`0caef606`),
+//! each with a list of modifier records. Three kinds are applied here, for
+//! a model's first configuration: group definitions, bindings of a group to
+//! a channel, and assignments of a colour and surface record to a channel
+//! (see the constants). Body panels are bound to one channel that nothing
+//! assigns; it is taken as the body paint.
+//!
 //! Not decoded: what picks the column of a palette row (the middle of the
-//! row is used), the per-configuration modifier records that reassign
-//! colours and surfaces to groups of part ids (interior colour choices,
-//! trim options), the second layer's colour, metalness.
+//! row is used), the other modifier kinds (dirt, liveries, decal layers,
+//! option lists), which configuration a spawned vehicle uses, the second
+//! layer's colour, metalness.
 
 use crate::meta7a::{self, Meta};
 use crate::resource::Resource;
@@ -43,9 +50,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// Version of what an export writes for part colours (model.json
 /// `part_colours_version`); the model viewer exports older vehicles again.
-pub const EXPORT_VERSION: u32 = 2;
+pub const EXPORT_VERSION: u32 = 3;
 /// Layout version of `<work>/index/vehicle_parts.json`.
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 4;
 
 const PART_SET: u32 = 0xf142_44fd;
 const SET_COLOURS: u32 = 0x7847_6477;
@@ -64,6 +71,47 @@ const ROUGH: u32 = 0x307f_162c;
 const ROUGH_LOW: u32 = 0xe4be_3b70;
 const ROUGH_HIGH: u32 = 0x26e5_d460;
 const NAME: u32 = 0xe6e1_7f14;
+/// A configuration's part list (`51019114.e89b8540`).
+const CONFIG_PARTS: u32 = 0xe89b_8540;
+/// A library record a configuration's part list names (`0caef606`): slot
+/// `37a6f9ef` and a list `61e1e572` of modifier record names.
+const MOD: u32 = 0x0cae_f606;
+const MOD_SLOT: u32 = 0x37a6_f9ef;
+const MOD_LIST: u32 = 0x61e1_e572;
+/// A named group of part ids in the library: `3acbce85` is a byte array of
+/// part ids.
+const GROUP: u32 = 0x0006_39e9;
+const GROUP_IDS: u32 = 0x3acb_ce85;
+/// A modifier that defines a group for one configuration part: `662d9b79`
+/// group name, `e9bf9f2d` part ids.
+const GROUP_DEF: u32 = 0x6225_734f;
+const DEF_GROUP: u32 = 0x662d_9b79;
+const DEF_IDS: u32 = 0xe9bf_9f2d;
+/// A modifier that binds a group to a channel: `662d9b79` group, `178cc382`
+/// channel, `1470edc0` priority, flags `c8d27281` (colour) and `7a84e7bf`
+/// (surface).
+const BIND: u32 = 0x501f_f112;
+const BIND_CHANNEL: u32 = 0x178c_c382;
+const PRIORITY: u32 = 0x1470_edc0;
+const FLAG_COLOUR: u32 = 0xc8d2_7281;
+const FLAG_SURFACE: u32 = 0x7a84_e7bf;
+/// A modifier that gives a channel its look: `ca2065a9` channel, `2c89a8d2`
+/// colour record, `7a84e7bf` surface record.
+const ASSIGN: u32 = 0xb943_08f5;
+const ASSIGN_CHANNEL: u32 = 0xca20_65a9;
+const ASSIGN_COLOUR: u32 = 0x2c89_a8d2;
+/// The channel body panels are bound to (bonnet, boot, bumpers, doors, at
+/// priority 1 over a default); no record assigns it a colour, so it is taken
+/// as the body paint.
+const PAINT_CHANNEL: u32 = 0x7ed7_6b9f;
+/// The slot of the wheel fitment record.
+const SLOT_WHEEL_FIT: u32 = 0x39d5_e253;
+/// A wheel fitment modifier: `3d37e0df` = rim radius / tyre radius (0.82 on
+/// a sports car, 0.74 on a saloon, 0.65 on a truck); with `0341ff8f` set
+/// the values are offsets added by other slots, which are not applied.
+const WHEEL_FIT: u32 = 0x9a17_2293;
+const FIT_RIM: u32 = 0x3d37_e0df;
+const FIT_RELATIVE: u32 = 0x0341_ff8f;
 const OWNER: u32 = 0xfb1f_80ff;
 /// The colour record of the primary body paint (its stored colour is a
 /// dark grey default; a configuration's body colour replaces it).
@@ -106,6 +154,10 @@ pub struct Tables {
     /// joaat of a mod part model name -> part set name.
     pub elements: HashMap<String, String>,
     pub library: Option<String>,
+    /// Name of a configuration part (8 hex digits) -> rim radius / tyre
+    /// radius, for the wheel fitment records.
+    #[serde(default)]
+    pub rim_ratio: HashMap<String, f32>,
 }
 
 fn get<'v>(v: &'v Value, h: u32) -> Option<&'v Value> {
@@ -129,6 +181,17 @@ struct Library {
     /// surface name -> roughness record name
     surfaces: HashMap<u32, u32>,
     rough: HashMap<u32, [f32; 2]>,
+    rim_ratio: HashMap<String, f32>,
+    /// configuration part name -> its modifier record names
+    mods: HashMap<u32, Vec<u32>>,
+    /// group name -> part ids
+    groups: HashMap<u32, Vec<u8>>,
+    /// modifier name -> (group, part ids)
+    group_defs: HashMap<u32, (u32, Vec<u8>)>,
+    /// modifier name -> (group, channel, priority, colour, surface)
+    binds: HashMap<u32, (u32, u32, i64, bool, bool)>,
+    /// modifier name -> (channel, colour record, surface record)
+    assigns: HashMap<u32, (u32, u32, u32)>,
     id: Option<String>,
 }
 
@@ -144,7 +207,54 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
             }
             let m = &m;
             let dump = |h: u32| m.objects(h).into_iter().filter_map(|o| m.object(h, o, 0)).collect::<Vec<_>>();
-            let mut l = Library { colours: HashMap::new(), surfaces: HashMap::new(), rough: HashMap::new(), id: Some(e.id.clone()) };
+            let mut l = Library { colours: HashMap::new(), surfaces: HashMap::new(), rough: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), id: Some(e.id.clone()) };
+            let ids = |v: &Value, h: u32| get(v, h).and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u8)).collect::<Vec<u8>>()).unwrap_or_default();
+            let flag = |v: &Value, h: u32| get(v, h).and_then(|x| x.as_bool()).unwrap_or(false);
+            // group part ids are a byte array: pool reference, then count (u16)
+            if let Some(off) = m.structs.get(&GROUP).and_then(|s| s.members.iter().find(|x| x.hash == GROUP_IDS)).map(|x| x.off as usize) {
+                let name_off = m.structs[&GROUP].members.iter().find(|x| x.hash == NAME).map_or(0, |x| x.off as usize);
+                for o in m.objects(GROUP) {
+                    let n = r.u16(o + off + 8) as usize;
+                    if let Some((_, p)) = m.ptr(r.u64(o + off)).filter(|_| n > 0) {
+                        if let Some(b) = r.sys.get(p..p + n) {
+                            l.groups.insert(r.u32(o + name_off), b.to_vec());
+                        }
+                    }
+                }
+            }
+            for g in dump(GROUP_DEF) {
+                if let (Some(n), Some(gr)) = (num(&g, NAME), num(&g, DEF_GROUP)) {
+                    l.group_defs.insert(n as u32, (gr as u32, ids(&g, DEF_IDS)));
+                }
+            }
+            for b in dump(BIND) {
+                if let (Some(n), Some(gr), Some(ch)) = (num(&b, NAME), num(&b, DEF_GROUP), num(&b, BIND_CHANNEL)) {
+                    l.binds.insert(n as u32, (gr as u32, ch as u32, num(&b, PRIORITY).unwrap_or(0), flag(&b, FLAG_COLOUR), flag(&b, FLAG_SURFACE)));
+                }
+            }
+            for a in dump(ASSIGN) {
+                if let (Some(n), Some(ch)) = (num(&a, NAME), num(&a, ASSIGN_CHANNEL)) {
+                    l.assigns.insert(n as u32, (ch as u32, num(&a, ASSIGN_COLOUR).unwrap_or(0) as u32, num(&a, FLAG_SURFACE).unwrap_or(0) as u32));
+                }
+            }
+            let fits: HashMap<u32, f32> = dump(WHEEL_FIT)
+                .iter()
+                .filter(|f| get(f, FIT_RELATIVE).and_then(|x| x.as_bool()) != Some(true))
+                .filter_map(|f| Some((num(f, NAME)? as u32, get(f, FIT_RIM)?.as_f64()? as f32)))
+                .filter(|(_, r)| *r > 0.2 && *r < 1.0)
+                .collect();
+            for p in dump(MOD) {
+                let list = get(&p, MOD_LIST).and_then(|x| x.as_array()).cloned().unwrap_or_default();
+                if let Some(n) = num(&p, NAME) {
+                    l.mods.insert(n as u32, list.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect());
+                }
+                if num(&p, MOD_SLOT) != Some(SLOT_WHEEL_FIT as i64) {
+                    continue;
+                }
+                if let (Some(n), Some(r)) = (num(&p, NAME), list.iter().filter_map(|x| fits.get(&(x.as_u64()? as u32))).next()) {
+                    l.rim_ratio.insert(format!("{:08x}", n as u32), *r);
+                }
+            }
             for c in dump(COLOUR_REC) {
                 let (Some(n), Some(col)) = (num(&c, NAME), num(&c, COLOUR)) else { continue };
                 let col = col as u32;
@@ -172,7 +282,7 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
     let lib = library(game_root, work)?;
     let (path, es) = metas(game_root, work, "packs.rpf")?;
     // (sets, model links, element links) per resource
-    type Found = (Vec<(String, Vec<Part>)>, Vec<(u32, Vec<String>)>, Vec<(u32, Vec<String>)>);
+    type Found = (Vec<(String, Vec<Part>)>, Vec<(u32, Vec<String>)>, Vec<(u32, Vec<String>)>, Vec<(u32, Vec<u32>)>, HashMap<u32, Vec<u32>>);
     let found: Vec<Found> = es
         .par_iter()
         .filter_map(|e| {
@@ -210,16 +320,37 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
             let links = |h: u32, key: u32| m.objects(h).into_iter().filter_map(|o| m.object(h, o, 0)).filter_map(|v| Some((num(&v, key)? as u32, u64s(&v)))).collect::<Vec<_>>();
             let single = m.objects(crate::vehicles::MODEL_INFO).len() == 1;
             let (models, elements) = if single { (links(crate::vehicles::VARIATION, OWNER), links(crate::vehicles::MOD_ELEMENT, NAME)) } else { (Vec::new(), Vec::new()) };
-            Some((sets, models, elements))
+            // the first configuration of each model: its part list
+            let mut configs: Vec<(u32, Vec<u32>)> = Vec::new();
+            if single {
+                for c in m.objects(crate::vehicles::CONFIG).into_iter().filter_map(|o| m.object(crate::vehicles::CONFIG, o, 0)) {
+                    let Some(owner) = num(&c, OWNER) else { continue };
+                    if configs.iter().all(|x| x.0 != owner as u32) {
+                        configs.push((owner as u32, get(&c, CONFIG_PARTS).and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()).unwrap_or_default()));
+                    }
+                }
+            }
+            // the vehicle's own part records (its body and mod part
+            // elements): their modifier lists name the library's group
+            // definitions for this vehicle
+            let mut own: HashMap<u32, Vec<u32>> = HashMap::new();
+            if single {
+                for p in m.objects(MOD).into_iter().filter_map(|o| m.object(MOD, o, 0)) {
+                    if let Some(n) = num(&p, NAME) {
+                        own.insert(n as u32, get(&p, MOD_LIST).and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()).unwrap_or_default());
+                    }
+                }
+            }
+            Some((sets, models, elements, configs, own))
         })
         .collect();
-    let mut t = Tables { format: FORMAT, library: lib.id, ..Default::default() };
-    for (sets, _, _) in &found {
+    let mut t = Tables { format: FORMAT, library: lib.id.clone(), rim_ratio: lib.rim_ratio.clone(), ..Default::default() };
+    for (sets, _, _, _, _) in &found {
         for (n, p) in sets {
             t.sets.insert(n.clone(), p.clone());
         }
     }
-    for (_, models, elements) in &found {
+    for (_, models, elements, _, _) in &found {
         for (h, c) in models {
             if let Some(s) = c.iter().find(|s| t.sets.contains_key(*s)) {
                 t.models.entry(format!("{h:08x}")).or_insert_with(|| s.clone());
@@ -231,7 +362,56 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
             }
         }
     }
+    // A model's first configuration reassigns colours and surfaces to
+    // groups of part ids: the model gets its own copy of the set with
+    // those applied.
+    for (_, _, _, configs, own) in &found {
+        for (owner, parts) in configs {
+            let key = format!("{owner:08x}");
+            let Some(set) = t.models.get(&key).cloned() else { continue };
+            let Some(base) = t.sets.get(&set) else { continue };
+            let mut out = base.clone();
+            if apply_config(&lib, own, parts, &mut out) > 0 {
+                let name = format!("{set}+{key}");
+                t.sets.insert(name.clone(), out);
+                t.models.insert(key, name);
+            }
+        }
+    }
     Ok(t)
+}
+
+/// Apply the colour and surface modifiers of a configuration's parts to a
+/// part set; returns the number of part ids changed. Bindings are applied in
+/// priority order (as listed within a priority). Parts that only list other
+/// parts (option lists) are not followed.
+fn apply_config(lib: &Library, own: &HashMap<u32, Vec<u32>>, parts: &[u32], set: &mut [Part]) -> usize {
+    let mods: Vec<u32> = parts.iter().filter_map(|p| own.get(p).or_else(|| lib.mods.get(p))).flatten().copied().collect();
+    let local: HashMap<u32, &Vec<u8>> = mods.iter().filter_map(|m| lib.group_defs.get(m)).map(|(g, ids)| (*g, ids)).collect();
+    let channel: HashMap<u32, (u32, u32)> = mods.iter().filter_map(|m| lib.assigns.get(m)).map(|&(ch, c, s)| (ch, (c, s))).collect();
+    let mut binds: Vec<&(u32, u32, i64, bool, bool)> = mods.iter().filter_map(|m| lib.binds.get(m)).collect();
+    binds.sort_by_key(|b| b.2);
+    let mut changed = vec![false; set.len()];
+    for &&(group, ch, _, colour, surface) in &binds {
+        let Some(ids) = local.get(&group).copied().or_else(|| lib.groups.get(&group)) else { continue };
+        let (c, s) = if ch == PAINT_CHANNEL { (PRIMARY_PAINT, 0) } else { channel.get(&ch).copied().unwrap_or((0, 0)) };
+        for &i in ids {
+            let Some(p) = set.get_mut(i as usize) else { continue };
+            let before = *p;
+            if colour && c != 0 {
+                if let Some(&(mode, row, rgb)) = lib.colours.get(&c) {
+                    (p.colour, p.mode, p.row, p.rgb) = (c, mode, row, rgb);
+                }
+            }
+            if surface && s != 0 {
+                if let Some(r) = lib.surfaces.get(&s).and_then(|r| lib.rough.get(r)) {
+                    (p.surface, p.rough) = (s, *r);
+                }
+            }
+            changed[i as usize] |= *p != before;
+        }
+    }
+    changed.iter().filter(|c| **c).count()
 }
 
 fn cache_path(work: &Path) -> std::path::PathBuf {
