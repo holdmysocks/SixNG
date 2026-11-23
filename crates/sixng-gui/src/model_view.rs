@@ -159,6 +159,9 @@ pub struct ModelView {
 }
 
 type GroomList = Result<Vec<sixng_core::groom::GroomInfo>, String>;
+/// Most strands an animal's interpolated coat is drawn with (a cat's short
+/// body coat stores about 365,000). Fewer strands are drawn wider.
+const COAT_STRANDS: usize = 90_000;
 /// Skin samples: position (RAGE model space) and linear colour.
 pub type SkinColours = Arc<Vec<([f32; 3], [u8; 3])>>;
 
@@ -188,6 +191,13 @@ pub struct Hair {
     /// Draw the chosen grooms (the guide strands); off hides them without
     /// dropping the choice.
     pub show: bool,
+    /// Automatic fur: grow the coat between the guides from the stored
+    /// per-triangle strand counts, instead of drawing the guides alone.
+    pub full_coat: bool,
+    /// Share of the strand budget (`COAT_STRANDS`) to draw, 0.05-1.
+    pub density: f32,
+    /// What the last coat build drew (strands drawn / stored).
+    coat_note: Arc<Mutex<String>>,
     skin: SkinColours,
 }
 
@@ -212,6 +222,9 @@ impl Default for Hair {
             fur_pick: [String::new(), String::new()],
             skin_colour: true,
             show: true,
+            full_coat: true,
+            density: 1.0,
+            coat_note: Arc::new(Mutex::new(String::new())),
             skin: Default::default(),
         }
     }
@@ -219,7 +232,7 @@ impl Default for Hair {
 
 impl Hair {
     fn want_key(&self) -> String {
-        format!("{:?}|{}|{:?}|{}", self.selected, self.width_mm, self.colour, self.skin_colour && !self.skin.is_empty())
+        format!("{:?}|{}|{:?}|{}|{}|{}", self.selected, self.width_mm, self.colour, self.skin_colour && !self.skin.is_empty(), self.full_coat, self.density)
     }
     pub fn settled(&self) -> bool {
         !self.loading && !self.listing && self.key == self.want_key()
@@ -398,18 +411,40 @@ impl ModelView {
             self.hair.colour,
         );
         let skin = if self.hair.skin_colour { self.hair.skin.clone() } else { Default::default() };
+        // the coat: automatic fur (coloured from the skin) and hand-picked
+        // grooms (one colour)
+        let coat_on = self.hair.full_coat;
+        let (density, width_scale) = (self.hair.density.clamp(0.05, 1.0), self.hair.width_mm / 3.0);
+        let note = self.hair.coat_note.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<Vec<glb::Model>> {
                 let (a, ix) = index_for(&ws, "packs", &idx)?;
                 std::fs::create_dir_all(&dir)?;
+                let grooms: Vec<(u64, sixng_core::groom::Groom)> = sel.iter().map(|&off| sixng_core::groom::load(&a, &ix.entries, off).map(|g| (off, g))).collect::<anyhow::Result<_>>()?;
+                let stored: usize = grooms.iter().map(|g| g.1.stored_strands()).sum();
+                let share = density * (COAT_STRANDS as f32 / stored.max(1) as f32).min(1.0);
+                let mut drawn = 0;
                 let mut out = Vec::new();
-                for off in sel {
-                    let g = sixng_core::groom::load(&a, &ix.entries, off)?;
+                for (off, g) in grooms {
                     // linear colour from the sRGB picker value
                     let lin = rgb.map(|c| c.powf(2.2));
                     let p = dir.join(format!("{off:x}.glb"));
-                    let glb_bytes = if skin.is_empty() {
+                    let nearest = |r: [f32; 3], skin: &[([f32; 3], [u8; 3])]| {
+                        let d = |p: &[f32; 3]| (p[0] - r[0]).powi(2) + (p[1] - r[1]).powi(2) + (p[2] - r[2]).powi(2);
+                        skin.iter().min_by(|a, b| d(&a.0).total_cmp(&d(&b.0))).map_or([255; 3], |x| x.1)
+                    };
+                    let glb_bytes = if coat_on && g.stored_strands() > 0 {
+                        let k = g.points_per_strand.max(1);
+                        let one = lin.map(|c| (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+                        let cols: Vec<[u8; 3]> = (0..g.strands).map(|s| if skin.is_empty() { one } else { nearest(g.points[s * k], &skin) }).collect();
+                        let coat = g.coat(share);
+                        drawn += coat.guides.len();
+                        // fewer strands than stored: wider ones, for the same cover
+                        let base = if g.width > 0.0 { g.width } else { 0.0003 };
+                        let w = (base / share.max(1e-3)).clamp(base, 0.004) * width_scale;
+                        g.coat_glb(&format!("coat_{off:x}"), &coat, w, &cols, serde_json::json!({}))
+                    } else if skin.is_empty() {
                         g.ribbon_glb(&format!("groom_{off:x}"), hw, lin, serde_json::json!({}))
                     } else {
                         // each strand takes the colour of the nearest skin sample to its root
@@ -426,6 +461,7 @@ impl ModelView {
                     std::fs::write(&p, glb_bytes)?;
                     out.push(glb::load(&p, &dir)?);
                 }
+                *note.lock().unwrap() = if coat_on && stored > 0 { format!("coat: {drawn} of the {stored} stored strands drawn") } else { String::new() };
                 Ok(out)
             })()
             .map_err(|e| format!("hair: {e:#}"));
@@ -519,6 +555,12 @@ impl ModelView {
             ui.horizontal(|ui| {
                 ui.add(egui::Slider::new(&mut self.hair.width_mm, 0.2..=5.0).text("width (mm)"));
                 ui.color_edit_button_rgb(&mut self.hair.colour);
+                {
+                    ui.checkbox(&mut self.hair.full_coat, "full coat").on_hover_text("Grow the coat between the guide strands: each root triangle gets the strand count the groom stores for it, blended from its three guides. Placement, clumping and curl are not the game's (not decoded), and the strands drawn are capped and widened to match.");
+                    if self.hair.full_coat {
+                        ui.add(egui::Slider::new(&mut self.hair.density, 0.05..=1.0).text("density"));
+                    }
+                }
                 if !self.hair.skin.is_empty() {
                     ui.checkbox(&mut self.hair.skin_colour, "colour from the skin").on_hover_text("Each strand takes the colour of the skin texture under its root. A display choice: the game colours fur with its own textures and tints.");
                 }
@@ -532,7 +574,8 @@ impl ModelView {
                     ui.label("loading grooms …");
                 });
             } else if !self.hair.status.is_empty() {
-                ui.label(egui::RichText::new(&self.hair.status).weak());
+                let note = self.hair.coat_note.lock().unwrap().clone();
+                ui.label(egui::RichText::new(if note.is_empty() { self.hair.status.clone() } else { format!("{} · {note}", self.hair.status) }).weak());
             }
         });
     }
@@ -2020,12 +2063,13 @@ fn load_parts(
     cache: &Path,
     lod: usize,
     mut model: Option<glb::Model>,
-) -> (Option<glb::Model>, Vec<PathBuf>, Vec<String>, Vec<String>, Vec<(String, Vec<[f32; 3]>)>, Vec<([f32; 3], [u8; 3])>) {
+) -> (Option<glb::Model>, Vec<PathBuf>, Vec<String>, Vec<String>, Vec<(String, Vec<[f32; 3]>)>, Vec<([f32; 3], [u8; 3])>, Vec<bool>) {
     let mut first = Vec::new();
     let mut names = Vec::new();
     let mut errs = Vec::new();
     let mut skin = Vec::new();
     let mut colours = Vec::new();
+    let mut mask = Vec::new();
     let mut fresh = true;
     for e in parts {
         match export_load(a, e, cache, lod) {
@@ -2046,7 +2090,7 @@ fn load_parts(
                 skin.push((e.name.clone().unwrap_or_default(), pts.into_iter().step_by(step).collect()));
                 // skin colour at the vertices of the body and head (not eyes or teeth)
                 if e.name.as_deref().is_some_and(|n| n.contains("_body_") || n.contains("_head_")) {
-                    colours.extend(skin_colours(&m));
+                    colours.extend(skin_colours(&m, &mut mask));
                 }
                 match &mut model {
                     Some(into) if fresh => {
@@ -2064,12 +2108,46 @@ fn load_parts(
             Err(err) => errs.push(format!("{}: {err:#}", e.id)),
         }
     }
-    (model, first, names, errs, skin, colours)
+    (model, first, names, errs, skin, colours, mask)
+}
+
+/// Tint-mask coats (grey: only the mask's shading is known) next to
+/// painted parts of the same animal: colour them with the painted parts'
+/// mean colour, so a deer's body matches its head. A stand-in, not the
+/// game's tint. Returns whether it was applied.
+fn tint_masks_from_painted(model: &mut glb::Model, colours: &mut [([f32; 3], [u8; 3])], mask: &[bool]) -> bool {
+    let mean = |want: bool| {
+        let (mut s, mut n) = ([0f64; 3], 0usize);
+        for (c, m) in colours.iter().zip(mask) {
+            if *m == want {
+                for k in 0..3 {
+                    s[k] += c.1[k] as f64;
+                }
+                n += 1;
+            }
+        }
+        (n >= 200).then(|| s.map(|x| (x / n as f64 / 255.0) as f32))
+    };
+    let (Some(painted), Some(grey)) = (mean(false), mean(true)) else { return false };
+    let f: [f32; 3] = std::array::from_fn(|k| (painted[k] / grey[k].max(1e-3)).clamp(0.05, 6.0));
+    for m in model.materials.iter_mut().filter(|m| m.tint_mask) {
+        for k in 0..3 {
+            m.base_factor[k] *= f[k];
+        }
+    }
+    for (c, m) in colours.iter_mut().zip(mask) {
+        if *m {
+            for k in 0..3 {
+                c.1[k] = (c.1[k] as f32 * f[k]).min(255.0) as u8;
+            }
+        }
+    }
+    true
 }
 
 /// Linear colour of the base texture at each vertex of a part (every
 /// vertex up to 20,000, then every n-th), with its RAGE-space position.
-fn skin_colours(m: &glb::Model) -> Vec<([f32; 3], [u8; 3])> {
+fn skin_colours(m: &glb::Model, mask: &mut Vec<bool>) -> Vec<([f32; 3], [u8; 3])> {
     let lin = |v: u8| {
         let c = v as f32 / 255.0;
         if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
@@ -2092,6 +2170,7 @@ fn skin_colours(m: &glb::Model) -> Vec<([f32; 3], [u8; 3])> {
                 }
             }
             out.push(([v.pos[0], -v.pos[2], v.pos[1]], c.map(|x| (x.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)));
+            mask.push(mat.tint_mask);
         }
     }
     out
@@ -2168,7 +2247,7 @@ fn load_query_sel(
         if parts.is_empty() {
             return Err(anyhow::anyhow!("no parts of {prefix} selected"));
         }
-        let (model, first, names, errs, _, _) = load_parts(&a, &parts, cache, lod, None);
+        let (model, first, names, errs, _, _, _) = load_parts(&a, &parts, cache, lod, None);
         let model = model
             .ok_or_else(|| anyhow::anyhow!("no part of {prefix} loaded: {}", errs.join("; ")))?;
         let info = serde_json::json!({ "assembled_from": names, "ids": parts.iter().map(|e| e.id.clone()).collect::<Vec<_>>(), "errors": errs });
@@ -2222,8 +2301,9 @@ fn load_query_sel(
     if crate::assemble::is_animal(name) && e.rtype.as_deref() == Some("ft") {
         let opts = crate::assemble::animal_options(&ix, name);
         let (selected, parts) = pick(&ix, &opts, &sel);
-        let (m, _, names, _, skin, colours) = load_parts(&a, &parts, cache, level, Some(model));
-        let model = m.expect("root model passed in");
+        let (m, _, names, _, skin, mut colours, mask) = load_parts(&a, &parts, cache, level, Some(model));
+        let mut model = m.expect("root model passed in");
+        let borrowed = tint_masks_from_painted(&mut model, &mut colours, &mask);
         // fur: the grooms of this animal's fur variants (cached per animal)
         let fur = match sixng_core::names::work_dir() {
             Some(work) if !skin.is_empty() => Some(sixng_core::furlink::for_animal(&work, &a, &ix.entries, name, &skin).map_err(|e| {
@@ -2235,6 +2315,9 @@ fn load_query_sel(
         let mut info = info;
         if let Some(o) = info.as_object_mut() {
             o.insert("assembled_from".into(), serde_json::json!(names));
+            if borrowed {
+                o.insert("tint_mask_colour".into(), "tint-mask coats take the mean colour of this animal's painted parts (a stand-in: the game's tint palette is not decoded)".into());
+            }
         }
         let source = if names.is_empty() {
             format!("{} {}", e.id, name)

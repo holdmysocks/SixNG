@@ -44,6 +44,31 @@ pub struct Groom {
     pub root_box: [[f32; 3]; 2],
     /// Second box (None when empty); equal across one groom's LODs.
     pub group_box: Option<[[f32; 3]; 2]>,
+    /// B6, one entry per root triangle (same order as `roots`): c0 = strands
+    /// the game grows in the triangle, c1 = strands in clumps (inferred),
+    /// c2 = clumps, c3 unknown. Empty when the section is absent. The sum
+    /// of c0 equals system +0xD0 on most densest LODs; lower LODs saturate
+    /// at 255.
+    pub tri_counts: Vec<[u8; 4]>,
+    /// System +0xF0 (f16): strand width in metres (0.2-0.5 mm; inferred),
+    /// 0 when not stored.
+    pub width: f32,
+    /// System +0x110: 16 width steps from root to tip (/ 255; inferred).
+    pub taper: [u8; 16],
+}
+
+/// Strands interpolated between the guides (`Groom::coat`).
+pub struct Coat {
+    /// Points per strand.
+    pub k: usize,
+    /// n x k points, strand-major (RAGE space).
+    pub points: Vec<[f32; 3]>,
+    /// Per strand: its three guide strands and their weights.
+    pub guides: Vec<([u32; 3], [f32; 3])>,
+    /// Per strand: unit normal of its root triangle.
+    pub normals: Vec<[f32; 3]>,
+    /// Strands the groom stores for the whole piece (sum of c0 + c1).
+    pub stored: usize,
 }
 
 /// Cheap test on the system page alone.
@@ -93,13 +118,19 @@ pub fn parse(r: &Resource) -> Result<Groom> {
         w.push(h(3));
     }
     let mut roots = Vec::with_capacity(t);
+    let mut tri_counts = Vec::new();
     if t > 0 && b4 > 0 {
         let tri = g.get(b4..b4 + t * 6).ok_or_else(|| anyhow!("root triangles outside the buffer"))?;
-        for c in tri.chunks_exact(6) {
+        let b6 = b(6);
+        let counts = if b6 > 0 { g.get(b6..b6 + t * 4) } else { None };
+        for (n, c) in tri.chunks_exact(6).enumerate() {
             let i = |j: usize| u16::from_le_bytes([c[2 * j], c[2 * j + 1]]) as u32;
             let v = [i(0), i(1), i(2)];
             if v.iter().all(|&x| (x as usize) < s) {
                 roots.push(v);
+                if let Some(q) = counts {
+                    tri_counts.push([q[4 * n], q[4 * n + 1], q[4 * n + 2], q[4 * n + 3]]);
+                }
             }
         }
     }
@@ -120,7 +151,9 @@ pub fn parse(r: &Resource) -> Result<Groom> {
     let root_box = [v3(r, 0x30), v3(r, 0x40)];
     let gb = [v3(r, 0x50), v3(r, 0x60)];
     let group_box = (gb[0][0] <= gb[1][0] && gb[0][0].is_finite() && gb[1][0].is_finite() && gb[0][0].abs() < 1e30).then_some(gb);
-    Ok(Groom { strands: s, points_per_strand: k, points, w, roots, lengths, root_uv, bones, root_box, group_box })
+    let width = Some(f16(r.u16(0xF0))).filter(|w| w.is_finite() && *w > 0.0 && *w < 0.01).unwrap_or(0.0);
+    let taper: [u8; 16] = r.sys.get(0x110..0x120).and_then(|b| b.try_into().ok()).unwrap_or([255; 16]);
+    Ok(Groom { strands: s, points_per_strand: k, points, w, roots, lengths, root_uv, bones, root_box, group_box, tri_counts, width, taper })
 }
 
 impl Groom {
@@ -200,6 +233,115 @@ impl Groom {
             normal_uri: None,
             gltf: serde_json::json!({"doubleSided": true, "pbrMetallicRoughness": {"baseColorFactor": [rgb[0], rgb[1], rgb[2], 1.0], "metallicFactor": 0.0, "roughnessFactor": 0.55}}),
             extras: serde_json::json!({"note": "display ribbons; colour chosen, not from the data"}),
+        };
+        crate::gltf::mesh_glb(name, &[crate::gltf::NodeGroup { name: name.to_string(), prims: vec![prim] }], &[mat], &[], extras)
+    }
+
+    /// Strands the groom stores for the piece: the sum of c0 + c1 over the
+    /// root triangles (0 without B6).
+    pub fn stored_strands(&self) -> usize {
+        self.tri_counts.iter().map(|c| c[0] as usize + c[1] as usize).sum()
+    }
+
+    /// The coat the game grows from the guides, as far as it is decoded:
+    /// in every root triangle, `share` of its stored strand count (c0 + c1)
+    /// at random points, each strand blended from the triangle's three
+    /// guides by its barycentric weights. The placement rule, clumping,
+    /// curl and noise of the game's own interpolation are not decoded, so
+    /// this coat is smoother and more even. Same strands for the same
+    /// groom and share (fixed seed). Empty without B6.
+    pub fn coat(&self, share: f32) -> Coat {
+        let k = self.points_per_strand;
+        let mut c = Coat { k, points: Vec::new(), guides: Vec::new(), normals: Vec::new(), stored: self.stored_strands() };
+        // xorshift, seeded from the groom
+        let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ ((self.strands as u64) << 32) ^ self.roots.len() as u64;
+        let mut rnd = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+        for (t, n) in self.roots.iter().zip(&self.tri_counts) {
+            let want = (n[0] as f32 + n[1] as f32) * share.clamp(0.0, 1.0);
+            // stochastic rounding keeps triangles with a small count
+            let count = want.floor() as usize + (rnd() < want.fract()) as usize;
+            if count == 0 {
+                continue;
+            }
+            let g = t.map(|i| i as usize * k);
+            let (p0, p1, p2) = (self.points[g[0]], self.points[g[1]], self.points[g[2]]);
+            let (e1, e2) = (sub(p1, p0), sub(p2, p0));
+            let nr = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+            let l = (nr[0] * nr[0] + nr[1] * nr[1] + nr[2] * nr[2]).sqrt();
+            let nr = if l > 1e-12 { [nr[0] / l, nr[1] / l, nr[2] / l] } else { [0.0, 0.0, 1.0] };
+            for _ in 0..count {
+                let (mut u, mut v) = (rnd(), rnd());
+                if u + v > 1.0 {
+                    u = 1.0 - u;
+                    v = 1.0 - v;
+                }
+                let w = [1.0 - u - v, u, v];
+                for j in 0..k {
+                    let (a, b, d) = (self.points[g[0] + j], self.points[g[1] + j], self.points[g[2] + j]);
+                    c.points.push([a[0] * w[0] + b[0] * w[1] + d[0] * w[2], a[1] * w[0] + b[1] * w[1] + d[1] * w[2], a[2] * w[0] + b[2] * w[1] + d[2] * w[2]]);
+                }
+                c.guides.push((*t, w));
+                c.normals.push(nr);
+            }
+        }
+        c
+    }
+
+    /// GLB of a coat: one flat ribbon per strand, lying in the skin's
+    /// tangent plane, `width` metres wide at the root and tapered by the
+    /// stored 16 steps. `guide_rgb` (linear, one per guide strand) colours
+    /// each strand by its barycentric weights (COLOR_0 on a white
+    /// material); strands are white where it is short.
+    pub fn coat_glb(&self, name: &str, coat: &Coat, width: f32, guide_rgb: &[[u8; 3]], extras: serde_json::Value) -> Vec<u8> {
+        let k = coat.k;
+        let n = coat.guides.len();
+        let (mut pos, mut nrm, mut tint, mut idx) = (Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k.saturating_sub(1) * 6));
+        let flat_taper = self.taper.iter().all(|&b| b == 0);
+        for s in 0..n {
+            let (g, w) = coat.guides[s];
+            let mut c = [255u8; 4];
+            if let (Some(a), Some(b), Some(d)) = (guide_rgb.get(g[0] as usize), guide_rgb.get(g[1] as usize), guide_rgb.get(g[2] as usize)) {
+                for q in 0..3 {
+                    c[q] = (a[q] as f32 * w[0] + b[q] as f32 * w[1] + d[q] as f32 * w[2] + 0.5) as u8;
+                }
+            }
+            let nr = coat.normals[s];
+            let base = pos.len() as u32;
+            for j in 0..k {
+                let p = coat.points[s * k + j];
+                let (a, b) = (coat.points[s * k + j.saturating_sub(1)], coat.points[s * k + (j + 1).min(k - 1)]);
+                let t = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                // across the strand, in the skin's plane
+                let mut side = [t[1] * nr[2] - t[2] * nr[1], t[2] * nr[0] - t[0] * nr[2], t[0] * nr[1] - t[1] * nr[0]];
+                let l = (side[0] * side[0] + side[1] * side[1] + side[2] * side[2]).sqrt();
+                side = if l > 1e-12 { [side[0] / l, side[1] / l, side[2] / l] } else { [1.0, 0.0, 0.0] };
+                let f = j as f32 / (k.max(2) - 1) as f32;
+                let tap = if flat_taper { 1.0 - 0.6 * f } else { (self.taper[((f * 15.0) as usize).min(15)] as f32 / 255.0).max(0.15) };
+                let r = width * 0.5 * tap;
+                for sg in [-1.0f32, 1.0] {
+                    pos.push([p[0] + side[0] * r * sg, p[1] + side[1] * r * sg, p[2] + side[2] * r * sg]);
+                    nrm.push(nr);
+                    tint.push(c);
+                }
+            }
+            for j in 0..k.saturating_sub(1) as u32 {
+                let v0 = base + j * 2;
+                idx.extend_from_slice(&[v0, v0 + 1, v0 + 3, v0, v0 + 3, v0 + 2]);
+            }
+        }
+        let prim = crate::gltf::TriPrim { name: name.to_string(), positions: pos, normals: Some(nrm), tangents: None, uvs: vec![], colors: None, tint: Some(tint), indices: idx, material: Some(0), joints: None, weights: None, joints1: None, weights1: None };
+        let mat = crate::gltf::Material {
+            name: "fur".into(),
+            base_color_uri: None,
+            normal_uri: None,
+            gltf: serde_json::json!({"doubleSided": true, "pbrMetallicRoughness": {"baseColorFactor": [1.0, 1.0, 1.0, 1.0], "metallicFactor": 0.0, "roughnessFactor": 0.85}}),
+            extras: serde_json::json!({"note": "interpolated coat: the stored per-triangle strand counts, strands blended from the three guides; placement, clumping and curl are not the game's. COLOR_0 = skin colour under the root (a display choice)"}),
         };
         crate::gltf::mesh_glb(name, &[crate::gltf::NodeGroup { name: name.to_string(), prims: vec![prim] }], &[mat], &[], extras)
     }
@@ -462,8 +604,32 @@ mod tests {
     }
     #[test]
     fn segments() {
-        let g = Groom { strands: 2, points_per_strand: 3, points: vec![[0.0; 3]; 6], w: vec![0.0; 6], roots: vec![[0, 1, 1]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None };
+        let g = Groom { strands: 2, points_per_strand: 3, points: vec![[0.0; 3]; 6], w: vec![0.0; 6], roots: vec![[0, 1, 1]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0, taper: [255; 16] };
         assert_eq!(g.segments(), vec![0, 1, 1, 2, 3, 4, 4, 5]);
         assert_eq!(g.root_indices(), vec![0, 3, 3]);
     }
+    #[test]
+    fn coat_from_strand_counts() {
+        // one root triangle of three 2-point guides, 40 + 10 stored strands
+        let pts = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.1], [1.0, 0.0, 0.0], [1.0, 0.0, 0.1], [0.0, 1.0, 0.0], [0.0, 1.0, 0.1]];
+        let g = Groom { strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![[40, 10, 1, 0]], width: 0.0003, taper: [255; 16] };
+        assert_eq!(g.stored_strands(), 50);
+        let c = g.coat(1.0);
+        assert_eq!((c.guides.len(), c.points.len(), c.stored), (50, 100, 50));
+        // every root lies inside the triangle and every strand keeps the guides' shape
+        for s in 0..50 {
+            let (r, tip) = (c.points[2 * s], c.points[2 * s + 1]);
+            assert!(r[0] >= 0.0 && r[1] >= 0.0 && r[0] + r[1] <= 1.0 + 1e-5 && r[2].abs() < 1e-6);
+            assert!((tip[2] - 0.1).abs() < 1e-6 && (tip[0] - r[0]).abs() < 1e-6);
+            assert_eq!(c.normals[s], [0.0, 0.0, 1.0]);
+        }
+        // same strands again; a quarter of them at share 0.25
+        assert_eq!(g.coat(1.0).points, c.points);
+        let q = g.coat(0.25).guides.len();
+        assert!((12..=13).contains(&q), "{q}");
+        // 50 strands x 2 points x 2 vertices; coloured from the guides
+        let glb = g.coat_glb("t", &c, 0.001, &[[255, 0, 0], [255, 0, 0], [255, 0, 0]], serde_json::json!({}));
+        assert_eq!(&glb[0..4], b"glTF");
+    }
+
 }
