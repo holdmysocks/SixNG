@@ -2044,12 +2044,19 @@ fn export_load(
     // Cached exports from before tint palettes were applied: export again.
     let stale_tint = std::fs::read_to_string(dir.join("model.json"))
         .is_ok_and(|j| j.contains("\"tintpalettetex\"") && !j.contains("\"tint_applied\""));
+    // Cached vehicle exports from before lamp lenses, reflectors, tyres and
+    // lamps got their classes (classification.stand_in dates the export).
+    let stale_vehicle = std::fs::read_to_string(dir.join("model.json"))
+        .is_ok_and(|j| {
+            // by shader hash: exports from before shader names were recovered have no names
+            ["99ad6fc9", "389206d1", "03b27476", "5a693bbe", "29648098"].iter().any(|h| j.contains(h)) && !j.contains("\"stand_in\"")
+        });
     let opts = ExportOptions {
         out: cache.to_path_buf(),
         png: true,
         dds: false,
         raw: false,
-        force: head || stale_tint,
+        force: head || stale_tint || stale_vehicle,
         skip_embedded_textures: false,
         body_shape: Vec::new(),
         head_skin: HEAD_SKIN.load(std::sync::atomic::Ordering::Relaxed),

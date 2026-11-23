@@ -15,11 +15,13 @@ const FAMILIES: &[(&str, &str, &str)] = &[
     // vehicles
     ("4aa38282", "car_paint", "vehicle body (paint is a runtime colour; colour slot = engine-default white)"),
     ("476ac73a", "car_paint", "vehicle body variant"),
-    ("03b27476", "car_paint", "vehicle body variant"),
+    ("03b27476", "opaque", "vehicle lamp reflectors (standard_vehicle_2lyr_reflector)"),
     ("4d2b05e7", "car_paint", "vehicle body variant"),
     ("c5cdbdd2", "car_paint", "vehicle body variant"),
-    ("389206d1", "opaque", "vehicle parts (bumpers, trim)"),
-    ("29648098", "opaque", "vehicle parts"),
+    ("389206d1", "glass", "vehicle lamp lenses and clear covers (standard_vehicle_alpha; opacity in the colour alpha)"),
+    ("29648098", "emissive", "vehicle lamps (standard_vehicle_emissive_animated_bones)"),
+    ("5a693bbe", "emissive", "vehicle lamps and lit panels (standard_vehicle_emissive_layer)"),
+    ("99ad6fc9", "opaque", "vehicle tyre (standard_vehicle_2lyr_tyre_inst)"),
     ("fa9cc069", "window", "vehicle windows"),
     ("4dc0ac6a", "window", "vehicle windows (helicopters, boats)"),
     ("bd71bdbf", "window", "vehicle windows, untextured (mid LOD)"),
@@ -84,6 +86,8 @@ pub const SLOTS: &[(&str, &str)] = &[
     ("b9f4bdac", "vehicle grime"),
     ("84d22f74", "vehicle scratches"),
     ("fb03ae36", "vehicle mask pack (green-dominant)"),
+    ("19df25d7", "vehicle material palette (128x256 RGBA8 colour bands, one texture shared by the two-layer vehicle shaders; how it is indexed is not decoded, so it is never a base colour)"),
+    ("8e0d63ee", "emissive map (emissivetex: the lit parts of a lamp or panel)"),
     ("2c8d7182", "tint palette (embedded in the model: rows of RGBA8 colours, picked per instance by the placement tint row)"),
 ];
 
@@ -104,9 +108,22 @@ pub fn classify(name_hash: &str, flags: &[u8]) -> Value {
         _ => "unknown",
     };
     let fam = FAMILIES.iter().find(|f| f.0 == name_hash);
-    let class = fam.map(|f| f.1).unwrap_or(bucket);
-    // Known opaque families keep OPAQUE even when the bucket says alpha
-    // (vehicle parts 389206d1 sit in the alpha bucket, likely for lenses).
+    // Emissive has no bucket bit: vehicle shaders outside the table are
+    // emissive by their recovered name (`standard_vehicle_emissive…`). Map
+    // shaders named `…emissive…` keep their bucket class here (the glTF
+    // export lights them by name).
+    let name = crate::names::shader(name_hash);
+    let named_emissive = fam.is_none() && name.as_deref().is_some_and(|n| n.starts_with("standard_vehicle") && n.contains("emissive"));
+    let class = fam.map(|f| f.1).unwrap_or(if named_emissive { "emissive" } else { bucket });
+    // Parts whose colour is not in a texture (it comes from the vehicle
+    // material palette, not decoded): a stand-in surface for converters.
+    let stand_in = match (name_hash, name.as_deref()) {
+        ("99ad6fc9", _) => Some("rubber"),
+        (_, Some(n)) if n.starts_with("standard_vehicle") && n.contains("tyre") => Some("rubber"),
+        ("03b27476", _) => Some("chrome"),
+        _ => None,
+    };
+    // Known opaque families keep OPAQUE even when the bucket says alpha.
     let alpha_mode = match (class, bucket) {
         ("opaque" | "car_paint", "cutout") => "MASK",
         ("opaque" | "car_paint" | "terrain_multilayer", _) => "OPAQUE",
@@ -135,7 +152,8 @@ pub fn classify(name_hash: &str, flags: &[u8]) -> Value {
         "alpha_mode": alpha_mode,
         "instanced_or_batch_lod": b1 & 0x80 != 0,
         "family": fam.map(|f| f.2),
-        "source": if fam.is_some() { "known shader family + record flags" } else { "record flags (+0x38 byte 4)" },
+        "stand_in": stand_in,
+        "source": if fam.is_some() { "known shader family + record flags" } else if named_emissive { "shader name (emissive) + record flags" } else { "record flags (+0x38 byte 4)" },
         "record_flags": flags.iter().map(|x| format!("{x:02x}")).collect::<String>(),
     })
 }
@@ -182,6 +200,18 @@ pub fn gltf_fields(c: &Value, has_base: bool) -> Value {
         }
         "water" => m["pbrMetallicRoughness"] = json!({"metallicFactor": 0.0, "roughnessFactor": 0.05, "baseColorFactor": [0.1, 0.2, 0.25, 0.6]}),
         _ => {}
+    }
+    // Stand-ins (linear): tyre rubber, lamp-reflector chrome.
+    let stand = match c["stand_in"].as_str() {
+        Some("rubber") => Some((0.0, 0.85, [0.02, 0.02, 0.022, 1.0])),
+        Some("chrome") => Some((1.0, 0.12, [0.9, 0.9, 0.9, 1.0])),
+        _ => None,
+    };
+    if let Some((metal, rough, colour)) = stand {
+        m["pbrMetallicRoughness"] = json!({"metallicFactor": metal, "roughnessFactor": rough});
+        if !has_base {
+            m["pbrMetallicRoughness"]["baseColorFactor"] = json!(colour);
+        }
     }
     m
 }
@@ -562,6 +592,25 @@ mod paint_tests {
         assert_eq!(l["layers"][1]["weight"], "1 - COLOR0.a");
         assert_eq!(layers("b217b263", &entries).unwrap()["layers"][1]["weight"], "COLOR0.a");
         assert_eq!(layers("b217b263", &entries).unwrap()["overlay"]["uv_set"], "TEXCOORD_2");
+    }
+
+    #[test]
+    fn vehicle_classes() {
+        let alpha = [0, 0, 0, 0, 2, 0, 0, 0];
+        let opaque = [0, 0, 0, 0, 1, 0, 0, 0];
+        // lamp lenses blend; reflectors are chrome, not paint; tyres rubber
+        let lens = classify("389206d1", &alpha);
+        assert_eq!((lens["class"].as_str(), lens["alpha_mode"].as_str()), (Some("glass"), Some("BLEND")));
+        let refl = classify("03b27476", &opaque);
+        assert_eq!((refl["class"].as_str(), refl["stand_in"].as_str()), (Some("opaque"), Some("chrome")));
+        assert!(!is_paint("03b27476") && is_paint("4aa38282"));
+        let tyre = classify("99ad6fc9", &opaque);
+        assert_eq!(tyre["stand_in"], "rubber");
+        let g = gltf_fields(&tyre, false);
+        assert_eq!(g["pbrMetallicRoughness"]["baseColorFactor"][0], 0.02);
+        assert!(gltf_fields(&tyre, true)["pbrMetallicRoughness"]["baseColorFactor"].is_null());
+        assert_eq!(classify("5a693bbe", &opaque)["class"], "emissive");
+        assert_eq!(classify("4aa38282", &opaque)["stand_in"], Value::Null);
     }
 
     #[test]

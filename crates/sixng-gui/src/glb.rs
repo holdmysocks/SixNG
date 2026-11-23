@@ -57,6 +57,9 @@ pub struct Material {
     pub normal: Option<usize>,
     pub packed: Option<usize>,
     pub emissive: Option<usize>,
+    /// Metallic and roughness factors of a stand-in surface (tyre rubber,
+    /// lamp-reflector chrome); None = the viewer's defaults.
+    pub mr: Option<[f32; 2]>,
     pub slots: Vec<Slot>,
     /// worst slot status: ok / lowmip / flat
     pub gap: String,
@@ -642,7 +645,16 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             .and_then(|p| add_img(p, false, &mut images));
         let mut slots = Vec::new();
         let mut packed = None;
-        let mut emissive = None;
+        // The export names the emissive map when the shader has its own.
+        let mut emissive = if class == "emissive" {
+            uri_of(&m["emissiveTexture"]).and_then(|p| add_img(p, true, &mut images))
+        } else {
+            None
+        };
+        let pbr = &m["pbrMetallicRoughness"];
+        let mr = ex["classification"]["stand_in"].as_str().and_then(|_| {
+            Some([pbr["metallicFactor"].as_f64()? as f32, pbr["roughnessFactor"].as_f64()? as f32])
+        });
         for t in ex["textures"].as_array().cloned().unwrap_or_default() {
             let role = slot_role(&t);
             let (status, mip) = slot_status(&t);
@@ -712,6 +724,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             normal,
             packed,
             emissive,
+            mr,
             slots,
             gap: gap.into(),
             shader_hash: ex["shader_name_hash"].as_str().unwrap_or("").into(),

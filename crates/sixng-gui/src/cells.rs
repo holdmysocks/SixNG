@@ -674,6 +674,7 @@ mod tests {
             normal: None,
             packed: None,
             emissive: None,
+            mr: None,
             slots: vec![],
             gap: "ok".into(),
             shader_hash: String::new(),

@@ -309,11 +309,19 @@ pub fn game_root(a: &ArchiveInfo) -> PathBuf {
 const ALBEDO_PARAMS: &[&str] = &["c8e8c282"];
 /// Parameter hashes whose texture is a tangent-space normal map.
 const NORMAL_PARAMS: &[&str] = &["84c69350", "58b6e707", "1e77bf4c"];
+/// The vehicle material palette (128x256 sRGB colour bands shared by the
+/// two-layer vehicle shaders). Its lookup is not decoded, and as the only
+/// sRGB texture of a tyre or trim material it must not become the base colour.
+const VEHICLE_PALETTE: &str = "19df25d7";
+/// `emissivetex`: the lit parts of a lamp or panel.
+const EMISSIVE_PARAM: &str = "8e0d63ee";
 
 #[derive(Default)]
 struct ShaderTextures {
     base: Option<String>,
     normal: Option<String>,
+    /// The `emissivetex` map, when the shader has one that decodes.
+    emissive: Option<String>,
     entries: Vec<serde_json::Value>,
     /// Flat base colour (0..1) when the base-colour texture is BCPack-only.
     base_factor: Option<[f32; 4]>,
@@ -356,6 +364,8 @@ fn unresolved_role(param_hash: &str) -> &'static str {
     let sr = crate::material::slot_role(param_hash).unwrap_or("");
     if param_hash == TINT_PALETTE {
         "tint palette"
+    } else if param_hash == VEHICLE_PALETTE {
+        "palette"
     } else if ALBEDO_PARAMS.contains(&param_hash) {
         "base_color"
     } else if NORMAL_PARAMS.contains(&param_hash) || sr.starts_with("normal") {
@@ -471,6 +481,8 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                     "base_color"
                 } else if NORMAL_PARAMS.contains(&t.param_hash.as_str()) || tx.dxgi_format == 83 {
                     "normal"
+                } else if t.param_hash == VEHICLE_PALETTE {
+                    "palette"
                 } else if srgb {
                     "colour (sRGB)"
                 } else {
@@ -500,6 +512,9 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                         e["mean_rgba"] = serde_json::json!(stt.mean_rgba.map(|x| x.round()));
                         if stt.normal_like {
                             e["looks_like_normal_map"] = true.into();
+                        }
+                        if t.param_hash == EMISSIVE_PARAM && st.emissive.is_none() && !stt.normal_like {
+                            st.emissive = Some(u.clone());
                         }
                         match role {
                             _ if stt.normal_like => {
@@ -1040,6 +1055,11 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             if g["emissiveFactor"].is_null() && crate::names::shader(&s.name_hash).is_some_and(|n| n.contains("emissive")) {
                 g["emissiveFactor"] = serde_json::json!([1.0, 1.0, 1.0]);
                 g["emissiveTexture"] = serde_json::json!("base");
+            }
+            // A shader with its own emissive map lights only what that map
+            // shows (lamp bulbs, not the whole lamp unit).
+            if let (false, Some(u)) = (g["emissiveFactor"].is_null(), &st.emissive) {
+                g["emissiveTexture"] = serde_json::json!({"uri": u});
             }
             if let (Some(p), true) = (o.paint, crate::material::is_paint(&s.name_hash)) {
                 g["pbrMetallicRoughness"]["baseColorFactor"] = serde_json::json!([p[0], p[1], p[2], 1.0]);

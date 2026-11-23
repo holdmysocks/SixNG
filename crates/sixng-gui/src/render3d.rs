@@ -1289,6 +1289,7 @@ impl Uploader {
             normal: None,
             packed: None,
             emissive: None,
+            mr: None,
             slots: vec![],
             gap: "ok".into(),
             shader_hash: String::new(),
@@ -1326,9 +1327,15 @@ impl Uploader {
                 .copied()
                 .flatten()
                 .unwrap_or(mt.base_factor);
+            // w: gap in bits 0-1; a stand-in surface adds bit 8 and its
+            // metallic / roughness factors in bits 16-23 / 24-31
+            let mr = mt.mr.map_or(0, |[m, r]| {
+                let q = |x: f32| (x.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+                0x100 | (q(m) << 16) | (q(r) << 24)
+            });
             let u = MatU {
                 base,
-                flags: [has, class_id(&mt.class), alpha, gap],
+                flags: [has, class_id(&mt.class), alpha, gap | mr],
             };
             let o = k * MAT_STRIDE as usize;
             mat_bytes[o..o + std::mem::size_of::<MatU>()].copy_from_slice(bytemuck::bytes_of(&u));

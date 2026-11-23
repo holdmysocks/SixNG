@@ -361,12 +361,20 @@ pub fn mesh_glb_with(name: &str, groups: &[NodeGroup], materials: &[Material], s
                     }
                 }
             }
-            // "emissiveTexture": "base" = light with the base-colour texture
-            if mat["emissiveTexture"] == "base" {
+            // "emissiveTexture": "base" = light with the base-colour texture;
+            // {"uri": …} = the material's own emissive map. With neither
+            // texture nothing lights up (a flat white glow would be wrong).
+            if let Some(uri) = mat["emissiveTexture"]["uri"].as_str().map(|u| u.to_string()) {
+                images.push(json!({"uri": uri}));
+                textures.push(json!({"source": images.len() - 1}));
+                mat["emissiveTexture"] = json!({"index": textures.len() - 1});
+            } else if mat["emissiveTexture"] == "base" {
                 match mat["pbrMetallicRoughness"]["baseColorTexture"].get("index").cloned() {
                     Some(i) => mat["emissiveTexture"] = json!({"index": i}),
                     None => {
-                        mat.as_object_mut().unwrap().remove("emissiveTexture");
+                        let o = mat.as_object_mut().unwrap();
+                        o.remove("emissiveTexture");
+                        o.remove("emissiveFactor");
                     }
                 }
             }

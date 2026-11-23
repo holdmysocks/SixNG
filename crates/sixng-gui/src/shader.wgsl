@@ -19,7 +19,7 @@ struct Frame {
 
 struct Mat {
     base: vec4<f32>,
-    flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap (0 ok 1 low 2 flat)
+    flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31
 };
 
 @group(0) @binding(0) var<uniform> F: Frame;
@@ -95,6 +95,10 @@ fn mesh_vertex(v: VIn) -> VOut {
     o.uv1 = v.uv1;
     o.col = v.col;
     o.extra = v.extra;
+    // w: -1 on a mirrored instance (right-hand wheels): its triangles wind
+    // the other way, so front_facing is reversed there
+    let det = determinant(mat3x3<f32>(m[0].xyz, m[1].xyz, m[2].xyz));
+    o.extra.w = select(1.0, -1.0, det < 0.0);
     o.tint = v.tint;
     return o;
 }
@@ -143,7 +147,7 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
         discard;
     }
     var n = normalize(i.nrm);
-    if (!ff) { n = -n; }
+    if (ff == (i.extra.w < 0.0)) { n = -n; }
     let tl = length(i.tan.xyz);
     if ((has & 2u) != 0u && tl > 0.1) {
         let t = normalize(i.tan.xyz - n * dot(n, i.tan.xyz) / tl * tl);
@@ -156,6 +160,11 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     var rough = 0.75;
     var metal = 0.0;
     var ao = 1.0;
+    if ((M.flags.w & 256u) != 0u) {
+        // stand-in surface (tyre rubber, lamp-reflector chrome)
+        metal = f32((M.flags.w >> 16u) & 255u) / 255.0;
+        rough = clamp(f32(M.flags.w >> 24u) / 255.0, 0.04, 1.0);
+    }
     if ((has & 4u) != 0u && F.mode.y < 3u) {
         let p = textureSample(t_pk, samp, i.uv0);
         if (F.mode.y == 0u) { rough = p.r; metal = p.g; ao = p.b; }
@@ -247,7 +256,7 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     }
     else if (mode == 5u) {
         let shade = 0.35 + 0.65 * ndl + 0.25 * (n.y * 0.5 + 0.5);
-        col = gap_tint(M.flags.w) * shade * 0.6;
+        col = gap_tint(M.flags.w & 3u) * shade * 0.6;
     }
     else if (mode == 6u) { col = i.col.rgb; }
     else if (mode == 7u) {
