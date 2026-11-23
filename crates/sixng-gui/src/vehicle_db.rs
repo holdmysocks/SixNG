@@ -25,6 +25,23 @@ struct Veh {
     configurations: Vec<Cfg>,
     #[serde(default)]
     palettes: Vec<Vec<Colour>>,
+    #[serde(default)]
+    mods: Vec<ModRec>,
+}
+
+#[derive(Deserialize)]
+struct ModRec {
+    name: String,
+    slot: String,
+    #[serde(default)]
+    elements: Vec<ElemRec>,
+}
+
+#[derive(Deserialize)]
+struct ElemRec {
+    bone: String,
+    #[serde(default)]
+    hides: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +97,30 @@ pub struct Vehicle {
     /// stored lists repeat colours (e.g. 400 entries, 10 distinct), so they
     /// read as weighted draw tables.
     pub palettes: Vec<Vec<([f32; 3], f32)>>,
+    /// Mod parts and kits that have models.
+    pub mods: Vec<Mod>,
+}
+
+/// A mod part or kit: joaat of its name and slot, and per model the joaat
+/// of the bone it is modelled around and of the stock bones it replaces.
+#[derive(Clone)]
+pub struct Mod {
+    pub name: u32,
+    pub slot: u32,
+    pub elements: Vec<(u32, Vec<u32>)>,
+}
+
+/// The vehicle table, read once per process (model loading uses it off the
+/// UI thread).
+pub fn shared(game: &str, work: &str) -> anyhow::Result<Arc<HashMap<String, Vehicle>>> {
+    static DB: std::sync::OnceLock<Mutex<Option<Arc<HashMap<String, Vehicle>>>>> = std::sync::OnceLock::new();
+    let mut g = DB.get_or_init(|| Mutex::new(None)).lock().unwrap();
+    if let Some(d) = &*g {
+        return Ok(d.clone());
+    }
+    let d = Arc::new(load(game, work, &VehicleDb::path(work))?);
+    *g = Some(d.clone());
+    Ok(d)
 }
 
 pub enum State {
@@ -133,7 +174,8 @@ impl VehicleDb {
             ctx.clone(),
         );
         std::thread::spawn(move || {
-            let r = load(&game, &work, &path);
+            let _ = &path;
+            let r = shared(&game, &work).map(|d| (*d).clone());
             *slot.lock().unwrap() = match r {
                 Ok(m) => State::Ready(Arc::new(m)),
                 Err(e) => State::Failed(format!("{e:#}")),
@@ -215,6 +257,14 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
                 wheel_scale_rear: wr,
                 configs,
                 palettes,
+                mods: v
+                    .mods
+                    .iter()
+                    .map(|m| {
+                        let h = |s: &str| u32::from_str_radix(s, 16).unwrap_or(0);
+                        Mod { name: h(&m.name), slot: h(&m.slot), elements: m.elements.iter().map(|e| (h(&e.bone), e.hides.iter().map(|x| h(x)).collect())).collect() }
+                    })
+                    .collect(),
             },
         );
     }
@@ -229,6 +279,8 @@ pub fn find<'a>(db: &'a HashMap<String, Vehicle>, key: &str) -> Option<&'a Vehic
 
 /// Model name of a loaded source string (`packs.rpf@… phoenix_hi` -> `phoenix`).
 pub fn model_key(source: &str) -> String {
+    // a model shown with mod parts ends in " (+3 parts)"
+    let source = source.split(" (+").next().unwrap_or(source);
     let n = source
         .split_whitespace()
         .last()

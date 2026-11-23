@@ -34,7 +34,24 @@ const OWNER: u32 = 0xfb1f_80ff;
 /// `handlingId` (case-sensitive joaat).
 const HANDLING_ID: u32 = 0xec41_bd9c;
 /// Layout version of vehicles.json; the model viewer rebuilds older files.
-pub const FORMAT: u32 = 2;
+pub const FORMAT: u32 = 3;
+/// A mod part or kit of one vehicle (in that vehicle's own pack resource):
+/// `name` joaat of the part model's name, or of a kit's name (the names of
+/// its left and right models without the side word:
+/// `comet7_exhaust_histr_19` for `comet7_exhaust_histr_lr_19` and `_rr_19`),
+/// `37a6f9ef` its slot (joaat of `bonnet`, `bumper_f`, `spoiler`, `exhaust`
+/// ...), `elements` the names of its element records.
+pub const MOD: u32 = 0x0cae_f606;
+/// One model of a mod part: `name`, `079baba7` whose low u32 is joaat of the
+/// bone it is modelled around (`chassis` = the car's own space, `boot`,
+/// `bumper_f`, `mod_spoiler_attach` ...), `2b490ab7` the stock bones it
+/// replaces.
+pub const MOD_ELEMENT: u32 = 0x77f2_b89e;
+const NAME: u32 = 0xe6e1_7f14;
+const ELEMENTS: u32 = 0x7e5d_1612;
+const MOD_SLOT: u32 = 0x37a6_f9ef;
+const ELEMENT_BONE: u32 = 0x079b_aba7;
+const ELEMENT_HIDES: u32 = 0x2b49_0ab7;
 const COLOUR: u32 = 0x5bdc_13e3;
 const PARTS: u32 = 0xe89b_8540;
 const PALETTE: u32 = 0x8c86_6829;
@@ -59,6 +76,35 @@ fn argb(c: u32) -> Value {
 
 fn get<'v>(v: &'v Value, h: u32) -> Option<&'v Value> {
     v.get(meta7a::field_name(h))
+}
+
+/// The mod parts of a vehicle pack that have models: `{name, slot,
+/// elements: [{bone, hides}]}`, all joaat hashes as 8 hex digits. Records
+/// without elements (colours, liveries, wheel choices) are left out.
+fn mod_parts(mods: &[Value], elements: &[Value]) -> Vec<Value> {
+    let hex = |h: u32| format!("{h:08x}");
+    let by_name: HashMap<u32, &Value> = elements.iter().filter_map(|e| Some((get(e, NAME)?.as_u64()? as u32, e))).collect();
+    mods.iter()
+        .filter_map(|m| {
+            let els: Vec<Value> = u32s(get(m, ELEMENTS))
+                .iter()
+                .filter_map(|n| by_name.get(n))
+                .map(|e| {
+                    // a u64 written as 16 hex digits; the bone is its low half
+                    let bone = get(e, ELEMENT_BONE).and_then(|x| x.as_str()).and_then(|s| u32::from_str_radix(s.get(8..16)?, 16).ok()).unwrap_or(0);
+                    json!({"bone": hex(bone), "hides": u32s(get(e, ELEMENT_HIDES)).into_iter().map(hex).collect::<Vec<_>>()})
+                })
+                .collect();
+            if els.is_empty() {
+                return None;
+            }
+            Some(json!({
+                "name": hex(get(m, NAME)?.as_u64()? as u32),
+                "slot": hex(get(m, MOD_SLOT).and_then(|x| x.as_u64()).unwrap_or(0) as u32),
+                "elements": els,
+            }))
+        })
+        .collect()
 }
 
 fn u32s(v: Option<&Value>) -> Vec<u32> {
@@ -93,7 +139,7 @@ pub fn build(ws: &crate::export::Workspace, out: &std::path::Path) -> Result<Val
 /// Write `<out>/vehicles/vehicles.json`. `names`: joaat -> model name.
 pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, out: &std::path::Path) -> Result<Value> {
     // The resource(s) with model-info records.
-    let found: Vec<(String, Vec<Value>, Vec<Value>, Vec<Value>)> = metas
+    let found: Vec<(String, Vec<Value>, Vec<Value>, Vec<Value>, Vec<Value>)> = metas
         .par_iter()
         .filter_map(|e| {
             let r = Resource::load_sys(&a.path, e).ok()?;
@@ -102,7 +148,11 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
                 return None;
             }
             let dump = |h: u32| m.objects(h).iter().filter_map(|&o| m.object(h, o, 0)).collect::<Vec<_>>();
-            Some((e.id.clone(), dump(MODEL_INFO), dump(CONFIG), dump(VARIATION)))
+            // mod parts carry no owner: taken only from a vehicle's own pack
+            // (one model info), where they are that vehicle's
+            let infos = dump(MODEL_INFO);
+            let mods = if infos.len() == 1 { mod_parts(&dump(MOD), &dump(MOD_ELEMENT)) } else { Vec::new() };
+            Some((e.id.clone(), infos, dump(CONFIG), dump(VARIATION), mods))
         })
         .collect();
     let name = |h: u32| names.get(&h).cloned();
@@ -113,8 +163,13 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
     // distinct row once per model.
     let mut seen: std::collections::HashSet<(u32, String)> = std::collections::HashSet::new();
     let mut by_handling: Vec<(u32, Value)> = Vec::new();
-    for (id, infos, cfgs, vars) in found {
+    let mut mods_of: Vec<(u32, Vec<Value>)> = Vec::new();
+    for (id, infos, cfgs, vars, mods) in found {
         sources.push(id);
+        if let Some(mi) = infos.first().filter(|_| !mods.is_empty()) {
+            let h = get(mi, HANDLING_ID).and_then(|x| x.as_u64()).filter(|&h| h != 0).or_else(|| get(mi, GAME_NAME).and_then(|x| x.as_u64())).unwrap_or(0) as u32;
+            mods_of.push((h, mods));
+        }
         for mut mi in infos {
             let h = get(&mi, GAME_NAME).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
             if let Some(o) = mi.as_object_mut() {
@@ -200,6 +255,11 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
                 m["model_info"] = mi;
                 m["model_info_via"] = "handlingId".into();
             }
+        }
+    }
+    for (h, mods) in mods_of {
+        if let Some(m) = models.get_mut(&h) {
+            m["mods"] = json!(mods);
         }
     }
     let list: Vec<&Value> = models.values().collect();

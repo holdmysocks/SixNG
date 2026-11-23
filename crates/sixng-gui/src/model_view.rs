@@ -2948,6 +2948,85 @@ fn load_query_sel(
             });
         }
     }
+    // vehicles: mod parts (bonnets, bumpers, spoilers, exhausts ...) are
+    // separate models; the vehicle data says which bone each is modelled
+    // around and which stock bones it replaces. None is on by default.
+    let mut veh_opts = Vec::new();
+    if e.rtype.as_deref() == Some("ft") && info["wheel_mounts"].as_array().is_some_and(|w| !w.is_empty()) {
+        let db = sixng_core::names::work_dir().and_then(|w| crate::vehicle_db::shared(&export::game_root(&a).to_string_lossy(), &w.to_string_lossy()).ok());
+        if let Some(v) = db.as_ref().and_then(|db| crate::vehicle_db::find(db, &crate::vehicle_db::model_key(name))) {
+            let (opts, kits) = vehicle_part_options(&ix, name, v);
+            let chosen: Vec<u64> = sel.clone().unwrap_or_default().into_iter().filter(|o| kits.contains_key(o)).collect();
+            if !chosen.is_empty() {
+                let joaat = |s: &str| sixng_core::meta7a::joaat(&s.to_ascii_lowercase());
+                let mut model = model;
+                // stock pieces the chosen parts replace
+                let hidden: std::collections::HashSet<u32> = chosen.iter().flat_map(|o| kits[o].iter().flat_map(|k| k.2.iter().copied())).collect();
+                let gone: Vec<bool> = model.joints.iter().map(|j| hidden.contains(&joaat(&j.name))).collect();
+                if gone.iter().any(|g| *g) {
+                    for me in model.meshes.iter_mut().filter(|m| m.skinned) {
+                        let keep: Vec<u32> = me.indices.chunks_exact(3).filter(|t| !t.iter().all(|&i| gone.get(me.verts[i as usize].joints[0] as usize).copied().unwrap_or(false))).flatten().copied().collect();
+                        me.indices = keep;
+                    }
+                }
+                let bind: HashMap<u32, sixng_core::weapon::Mat> = info["drawable"]["skeleton"]
+                    .as_array()
+                    .map(|b| b.iter().filter_map(|b| Some((joaat(b["name"].as_str()?), serde_json::from_value(b["bind_matrix"].clone()).ok()?))).collect())
+                    .unwrap_or_default();
+                let (mut names, mut errs) = (Vec::new(), Vec::new());
+                for o in &chosen {
+                    for (off, bone, _) in &kits[o] {
+                        let Some(pe) = ix.entries.iter().find(|x| x.off == *off) else { continue };
+                        let pn = pe.name.clone().unwrap_or_default();
+                        match export_load(&a, pe, cache, level) {
+                            Ok((mut m, _, _)) => {
+                                // the part is modelled around its bone: put it at the bone's bind pose
+                                let t = bind.get(bone).copied().unwrap_or(sixng_core::weapon::IDENTITY);
+                                let c = Mat4::from_cols_array(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+                                transform_model(&mut m, c * Mat4::from_cols_array(&t) * c.inverse());
+                                let first = model.meshes.len();
+                                glb::merge(&mut model, m);
+                                // and follows that bone (an opened bonnet takes its replacement with it)
+                                if let Some(j) = model.joints.iter().position(|j| joaat(&j.name) == *bone) {
+                                    for me in &mut model.meshes[first..] {
+                                        me.skinned = true;
+                                        for v in &mut me.verts {
+                                            v.joints = [j as u16, 0, 0, 0];
+                                            v.weights = [255, 0, 0, 0];
+                                        }
+                                    }
+                                }
+                                names.push(pn);
+                            }
+                            Err(err) => errs.push(format!("{pn}: {err:#}")),
+                        }
+                    }
+                }
+                let mut info = info;
+                if let Some(o) = info.as_object_mut() {
+                    o.insert("assembled_from".into(), serde_json::json!(names));
+                    o.insert("assembly_note".into(), "mod parts are placed at the bind pose of the bone the vehicle data names for them, and the stock pieces on the bones they replace are left out".into());
+                    if !errs.is_empty() {
+                        o.insert("part_errors".into(), serde_json::json!(errs));
+                    }
+                }
+                return Ok(Loaded {
+                    model,
+                    lods: lods.into_iter().skip(lod).take(1).collect(),
+                    lod: 0,
+                    out_root: cache.to_path_buf(),
+                    source: format!("{} {} (+{} parts)", e.id, name, names.len()),
+                    info,
+                    parts: opts,
+                    selected: chosen,
+                    base: String::new(),
+                    fur: None,
+                    fur_skin: Default::default(),
+                });
+            }
+            veh_opts = opts;
+        }
+    }
     Ok(Loaded {
         model,
         lods,
@@ -2955,7 +3034,7 @@ fn load_query_sel(
         out_root: cache.to_path_buf(),
         source: format!("{} {}", e.id, name).trim().to_string(),
         info,
-        parts: Vec::new(),
+        parts: veh_opts,
         selected: Vec::new(),
         base: String::new(),
         fur: None,
@@ -3122,6 +3201,93 @@ fn is_wheel_bone(n: &str) -> bool {
     let r = r.strip_suffix("_inr").unwrap_or(r);
     let b = r.as_bytes();
     b.len() >= 2 && matches!(b[0], b'l' | b'r') && matches!(b[1], b'f' | b'm' | b'r') && b[2..].iter().all(|c| c.is_ascii_digit())
+}
+
+/// The mod parts of a vehicle for the Parts panel, and per option (keyed by
+/// its `off`) the models it stands for: (entry offset, joaat of the attach
+/// bone, joaat of the stock bones it replaces).
+///
+/// A part record is named after its model (`comet7_bonnet_01`) or, for a
+/// left / right pair, after the models' names without the side word
+/// (`comet7_exhaust_histr_19` for `…_lr_19` and `…_rr_19`). Models are taken
+/// at the vehicle's own LOD suffix. Options in the same slot replace each
+/// other.
+#[allow(clippy::type_complexity)]
+fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db::Vehicle) -> (Vec<crate::assemble::PartOpt>, HashMap<u64, Vec<(u64, u32, Vec<u32>)>>) {
+    let joaat = sixng_core::meta7a::joaat;
+    let vl = vehicle.to_ascii_lowercase();
+    let suffix = ["_hi", "_mid"].into_iter().find(|s| vl.ends_with(s)).unwrap_or("");
+    // model stem -> the largest copy at this LOD level
+    let mut stems: HashMap<String, &sixng_core::scan::Entry> = HashMap::new();
+    for e in &ix.entries {
+        let Some(n) = e.name.as_deref() else { continue };
+        let n = n.to_ascii_lowercase();
+        let stem = match suffix {
+            "" if n.ends_with("_hi") || n.ends_with("_mid") => continue,
+            "" => n,
+            s => match n.strip_suffix(s) {
+                Some(b) => b.to_string(),
+                None => continue,
+            },
+        };
+        match stems.get(&stem) {
+            Some(x) if x.usize >= e.usize => {}
+            _ => {
+                stems.insert(stem, e);
+            }
+        }
+    }
+    // name hash -> models: a model's own name, and kit names without the side word
+    let mut by_hash: HashMap<u32, Vec<(&String, &sixng_core::scan::Entry)>> = HashMap::new();
+    for (stem, e) in &stems {
+        by_hash.entry(joaat(stem)).or_default().push((stem, e));
+        for side in ["_l_", "_r_", "_lr_", "_rr_", "_lf_", "_rf_"] {
+            if stem.contains(side) {
+                by_hash.entry(joaat(&stem.replacen(side, "_", 1))).or_default().push((stem, e));
+            }
+        }
+    }
+    const SLOTS: [&str; 24] = [
+        "bonnet", "boot", "bumper_f", "bumper_r", "exhaust", "spoiler", "splitter", "diffuser", "towing", "roof", "chassis", "skirt", "skirts", "grille", "wing", "cage", "seats", "intake", "plate", "canards", "interior", "engine", "suspension", "lights",
+    ];
+    let slot_name: HashMap<u32, &str> = SLOTS.iter().map(|s| (joaat(s), *s)).collect();
+    let mut opts = Vec::new();
+    let mut kits = HashMap::new();
+    for m in &v.mods {
+        let Some(models) = by_hash.get(&m.name) else { continue };
+        // a name that is both a model and a kit: the model itself
+        let mut ms: Vec<&(&String, &sixng_core::scan::Entry)> = models.iter().filter(|x| joaat(x.0) == m.name).collect();
+        if ms.is_empty() {
+            ms = models.iter().collect();
+        }
+        ms.sort_by(|a, b| a.0.cmp(b.0));
+        ms.dedup_by(|a, b| a.0 == b.0);
+        if ms.is_empty() || m.elements.is_empty() {
+            continue;
+        }
+        let first = ms[0].1;
+        if kits.contains_key(&first.off) {
+            continue;
+        }
+        // elements and models pair up in order (left before right in both)
+        let list: Vec<(u64, u32, Vec<u32>)> = ms.iter().enumerate().map(|(k, x)| {
+            let el = m.elements.get(k).or(m.elements.last()).unwrap();
+            (x.1.off, el.0, el.1.clone())
+        }).collect();
+        let part = ms[0].0.strip_prefix(&format!("{}_", crate::vehicle_db::model_key(vehicle))).unwrap_or(ms[0].0).to_string();
+        let label = if ms.len() > 1 { format!("{} (+{})", part.replace('_', " "), ms.len() - 1) } else { part.replace('_', " ") };
+        opts.push(crate::assemble::PartOpt {
+            off: first.off,
+            id: first.id.clone(),
+            name: ms[0].0.to_string(),
+            group: slot_name.get(&m.slot).map(|s| s.to_string()).unwrap_or_else(|| format!("slot {:08x}", m.slot)),
+            label,
+            default: false,
+        });
+        kits.insert(first.off, list);
+    }
+    opts.sort_by(|a, b| a.group.cmp(&b.group).then(a.label.cmp(&b.label)));
+    (opts, kits)
 }
 
 /// Move a model's geometry by a rigid transform (weapon parts onto their
