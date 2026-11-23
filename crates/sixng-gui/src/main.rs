@@ -207,7 +207,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_title("SixNG Extractor")
             .with_icon(app_icon()),
         renderer: eframe::Renderer::Wgpu,
-        wgpu_options: wgpu_options(cli.has("no-vsync")),
+        wgpu_options: wgpu_options(cli.has("no-vsync"), cli.get("gpu").map(|s| s.to_string())),
         ..Default::default()
     };
     eframe::run_native(
@@ -220,7 +220,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Default wgpu setup plus BC texture compression where the adapter has it
 /// (the 3D map stores its textures block-compressed).
-fn wgpu_options(no_vsync: bool) -> eframe::egui_wgpu::WgpuConfiguration {
+/// `gpu`: use the adapter whose name contains this text (`--gpu radeon`, to
+/// keep the viewer off the card something else is using); the first adapter
+/// that matches is taken, and the default choice when none does.
+fn wgpu_options(no_vsync: bool, gpu: Option<String>) -> eframe::egui_wgpu::WgpuConfiguration {
     use eframe::egui_wgpu::{wgpu, WgpuConfiguration, WgpuSetup};
     let mut o = WgpuConfiguration::default();
     if no_vsync {
@@ -237,6 +240,22 @@ fn wgpu_options(no_vsync: bool) -> eframe::egui_wgpu::WgpuConfiguration {
             d.memory_hints = wgpu::MemoryHints::MemoryUsage;
             d
         });
+        if let Some(want) = gpu {
+            let want = want.to_lowercase();
+            c.native_adapter_selector = Some(std::sync::Arc::new(move |adapters, _surface| {
+                for a in adapters {
+                    eprintln!("gpu: {} ({:?})", a.get_info().name, a.get_info().backend);
+                }
+                let pick = adapters.iter().find(|a| a.get_info().name.to_lowercase().contains(&want)).or_else(|| adapters.first());
+                match pick {
+                    Some(a) => {
+                        eprintln!("gpu: using {}", a.get_info().name);
+                        Ok(a.clone())
+                    }
+                    None => Err("no graphics adapter".to_string()),
+                }
+            }));
+        }
     }
     o
 }
