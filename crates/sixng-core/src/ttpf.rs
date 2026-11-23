@@ -566,12 +566,20 @@ fn stats(rgba: &[u8], w: u32, h: u32) -> PngStats {
     PngStats { width: w, height: h, mean_rgba: m, normal_like, mip: 0, alpha_range: Some([amin, amax]), mips: None }
 }
 
+/// True the first time `p` is passed in this run. With `--force`, a shared
+/// file is rewritten once per run, not once per model that uses it.
+pub fn first_write_this_run(p: &Path) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> = std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default).lock().map(|mut s| s.insert(p.to_path_buf())).unwrap_or(true)
+}
+
 /// Decode mip 0 of a texture to `<dir>/<hash>.png` (plus a `.json` with
-/// its stats) unless it exists. Returns the file path and the stats.
-pub fn write_png(store: &Ttpf, t: &TtpfTex, dir: &Path) -> Result<(PathBuf, PngStats)> {
+/// its stats) unless it exists. With `force`, an existing file is decoded
+/// again (once per run). Returns the file path and the stats.
+pub fn write_png(store: &Ttpf, t: &TtpfTex, dir: &Path, force: bool) -> Result<(PathBuf, PngStats)> {
     let p = dir.join(format!("{:016x}.png", t.hash));
     let js = dir.join(format!("{:016x}.json", t.hash));
-    if p.exists() {
+    if p.exists() && !(force && first_write_this_run(&p)) {
         // stats written before alpha_range existed are refreshed below, and so
         // are lower-mip PNGs whose top mips now decode (BC1 BCPack) or old BC5
         // PNGs written before tangent-space Z reconstruction (mean B = 0).

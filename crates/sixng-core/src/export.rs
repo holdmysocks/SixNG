@@ -617,7 +617,7 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                                     e["status"] = "ok (embedded in the model)".into();
                                     if o.png {
                                         let p = model_dir.join("textures").join(format!("{}.png", t.hash64));
-                                        let w = p.exists() || fs::create_dir_all(model_dir.join("textures")).map_err(anyhow::Error::from).and_then(|_| texture::save_png(&p, &rgba, et.width, et.height)).is_ok();
+                                        let w = (p.exists() && !(o.force && crate::ttpf::first_write_this_run(&p))) || fs::create_dir_all(model_dir.join("textures")).map_err(anyhow::Error::from).and_then(|_| texture::save_png(&p, &rgba, et.width, et.height)).is_ok();
                                         if w {
                                             e["png"] = rel(&o.out, &p).into();
                                         }
@@ -668,7 +668,7 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                 // Tiny sRGB textures (4x4 defaults such as a black dirt map) are
                 // never a usable base colour.
                 let first_srgb = role == "colour (sRGB)" && srgb_fallback.is_none() && tx.width >= 32 && tx.height >= 32;
-                match crate::ttpf::write_png(store, tx, &tdir) {
+                match crate::ttpf::write_png(store, tx, &tdir, o.force) {
                     Ok((p, stt)) => {
                         let u = uri_of(&p);
                         e["png"] = rel(&o.out, &p).into();

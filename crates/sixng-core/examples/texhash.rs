@@ -6,7 +6,7 @@ fn main() -> anyhow::Result<()> {
     for h in &a[3..] {
         let Ok(k) = u64::from_str_radix(h, 16) else { continue };
         match set.get(k) {
-            Some((store, t)) => match sixng_core::ttpf::write_png(store, t, std::path::Path::new(&a[2])) {
+            Some((store, t)) => match sixng_core::ttpf::write_png(store, t, std::path::Path::new(&a[2]), false) {
                 Ok((p, st)) => println!("{h} {} {}x{} fmt {} mean {:?} -> {}", store.label(), t.width, t.height, t.dxgi_format, st.mean_rgba.map(|x| x.round()), p.display()),
                 Err(e) => println!("{h} {} not decoded: {e}", store.label()),
             },

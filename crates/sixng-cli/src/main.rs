@@ -101,7 +101,7 @@ struct OutArgs {
     /// Also dump decompressed resource bytes.
     #[arg(long)]
     raw: bool,
-    /// Re-export items whose outputs already exist.
+    /// Re-export items whose outputs already exist, shared textures included.
     #[arg(long)]
     force: bool,
     /// Don't export textures embedded in models.
