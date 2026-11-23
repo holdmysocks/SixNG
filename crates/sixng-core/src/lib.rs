@@ -14,6 +14,7 @@ pub mod headskin;
 pub mod batches;
 pub mod drawable;
 pub mod export;
+pub mod furlink;
 pub mod game;
 pub mod gltf;
 pub mod groom;
