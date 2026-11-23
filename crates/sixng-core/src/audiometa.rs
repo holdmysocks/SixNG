@@ -261,7 +261,13 @@ pub fn parse_with(b: &[u8], streams: Option<&std::collections::HashSet<u32>>) ->
         for o in objects.iter_mut() {
             let d = &b[8 + o.offset as usize..8 + (o.offset + o.size) as usize];
             let mut body_at = None;
-            if !NO_HEADER.contains(&o.class) {
+            if o.class >= 50 && d.len() >= 5 {
+                // game objects: the class byte, then 4 bytes of 2-bit flags
+                // (0xaa: all unset) instead of the sound header
+                o.header = Some([("flags".to_string(), serde_json::json!(format!("{:08x}", u32at(d, 1))))].into_iter().collect());
+                o.body = Some(d[5..].iter().map(|x| format!("{x:02x}")).collect());
+                body_at = Some(5);
+            } else if !NO_HEADER.contains(&o.class) {
                 if let Some((h, end)) = sound_header(d) {
                     o.header = Some(h);
                     o.body = Some(d[end..].iter().map(|x| format!("{x:02x}")).collect());
@@ -285,6 +291,10 @@ pub fn parse_with(b: &[u8], streams: Option<&std::collections::HashSet<u32>>) ->
                     20 | 27 | 29 | 30 | 31 | 36 | 40 | 48 => &[0],
                     41 => &[0, 6, 12],
                     46 => &[9],
+                    // game objects that point at sounds
+                    56 => &[6, 10],
+                    61 | 62 | 64 => &[0],
+                    68 => &[14],
                     _ => &[],
                 };
                 let mut kids: Vec<u32> = Vec::new();
@@ -302,7 +312,18 @@ pub fn parse_with(b: &[u8], streams: Option<&std::collections::HashSet<u32>>) ->
                         }));
                     }
                 }
-                if o.class == 24 {
+                let u16at = |p: usize| body.get(p..p + 2).map(|x| u16::from_le_bytes([x[0], x[1]]) as usize);
+                if o.class == 51 {
+                    // u16 count, then that many refs
+                    if let Some(n) = u16at(0).filter(|&n| 2 + 4 * n == body.len()) {
+                        kids = (0..n).filter_map(|i| at(2 + 4 * i)).collect();
+                    }
+                } else if o.class == 52 {
+                    // u16, u16 count, then (ref, ref or none) pairs
+                    if let Some(n) = u16at(2).filter(|&n| 4 + 8 * n == body.len()) {
+                        kids = (0..2 * n).filter_map(|i| at(4 + 4 * i)).collect();
+                    }
+                } else if o.class == 24 {
                     // a count byte, then that many refs, at the end of the body
                     if let Some(n) = (1..=64usize).find(|&n| body.len() > 4 * n && body[body.len() - 4 * n - 1] as usize == n) {
                         let s = body.len() - 4 * n;
