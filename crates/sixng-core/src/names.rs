@@ -65,7 +65,12 @@ pub const DERIVED_EXACT: &[&str] = &["fMass", "fInitialDragCoeff", "fDriveBiasFr
     "string", "sunBleachEnd", "sunBleachScreen", "sunBleachStart", "surfaceIndex", "texData", "texDistances", "tileAmount",
     "timeMultiplier", "tintInfos", "tintPaletteRow", "tintRow", "topOffset", "ttName", "typeData", "tyreSize", "useAnisotropy", "useColor",
     "useEmissive", "useFlakes", "useIntensity", "useSpecularColor", "vehicleSpec", "vehicleType", "wearPresets", "wheelDetailScale", "wheelHash",
-    "wheelId", "wheelInfo", "windowTint"];
+    "wheelId", "wheelInfo", "windowTint",
+    // ped wardrobe meta fields (kit f795e8ba, kit state 37e52277, asset
+    // 147fdab5, kit set a9d57751): case-sensitive joaat search over one- and
+    // two-word PascalCase names against 26 field hashes, 2026-11-23
+    "KitName", "TemplateName", "Palette", "Tint0", "Tint1", "Tint2", "GarmentPreset", "PropertyTags", "Asset", "KitLayer", "ToStateNames",
+    "Drawable", "Albedo", "Material", "AssetName", "IncludedKits"];
 
 pub const DERIVED: &[&str] = &[
     // texture parameters of the minigame pack's water and interior shaders (joaat search, 2026-11-23)
@@ -91,7 +96,13 @@ pub const DERIVED: &[&str] = &[
     "wrinkleocclusionmask",
     // per-layer sets: the same suffix matches every layer's hash
     "lyr0materialatex", "lyr1materialatex", "lyr2materialatex", "lyr3materialatex", "lyr0materialbtex", "lyr1materialbtex", "lyr2materialbtex",
-    "lyr3materialbtex", "lyr2controltex", "lyr3controltex", "surfacedetailtexture0", "surfacedetailtexture1", "surfacedetailtexture2",
+    "lyr3materialbtex", "lyr2controltex", "lyr3controltex", "surfacedetailtexture0", "surfacedetailtexture1", "surfacedetailtexture2",    // ped wardrobe property tags: keys whose values fit the name (kittype =
+    // groom, hairlength = l01..l09, slodstyle = generic / generic_lob), the
+    // audio group, and hair style values. Lower-case joaat search, 2026-11-23
+    "kittype", "hairlength", "slodstyle", "ethnicity", "dirtdefinition", "bodyshapeprimary", "goretype", "decorationpresets",
+    "weatheringcategories", "outfitpedtype", "noasset", "audio_lower", "audio_accessories", "audio_hands", "audio_head", "audio_face",
+    "audio_shoe", "audiofabric", "has_hair", "groom", "bob", "lob", "bun", "topknot", "cornrows", "generic_lob", "l01", "l05", "l06", "l07",
+    "l08", "l09",
 ];
 
 /// Where a hash is looked up: decides which name wins when two names share
@@ -387,6 +398,19 @@ mod tests {
         assert_eq!(lookup(0x9bdd_4c51, Ctx::Field).as_deref(), Some("albedoSelection"));
         assert_eq!(joaat_exact("albedoPage"), 0x0971_4f5c);
         assert_eq!(lookup(0x0971_4f5c, Ctx::Field).as_deref(), Some("albedoPage"));
+        // ped wardrobe fields and property tag keys
+        assert_eq!(joaat_exact("KitName"), 0x6512_1749);
+        assert_eq!(lookup(0x6512_1749, Ctx::Field).as_deref(), Some("KitName"));
+        assert_eq!(lookup(0x5ecf_9331, Ctx::Field).as_deref(), Some("Palette"));
+        assert_eq!(lookup(0xc4d7_5d79, Ctx::Field).as_deref(), Some("Tint0"));
+        assert_eq!(lookup(0xab5d_2a85, Ctx::Field).as_deref(), Some("Tint2"));
+        assert_eq!(lookup(0x12f8_5293, Ctx::Field).as_deref(), Some("PropertyTags"));
+        assert_eq!(lookup(0x41ac_f8eb, Ctx::Field).as_deref(), Some("Drawable"));
+        assert_eq!(lookup(0xfb5b_b20d, Ctx::Field).as_deref(), Some("IncludedKits"));
+        assert_eq!(lookup(0x2d49_7cdb, Ctx::Field).as_deref(), Some("kittype"));
+        assert_eq!(lookup(0xd35f_809f, Ctx::Field).as_deref(), Some("hairlength"));
+        assert_eq!(lookup(0x6004_f281, Ctx::Field).as_deref(), Some("l08"));
+        assert_eq!(lookup(0xdf32_4ad0, Ctx::Field).as_deref(), Some("cornrows"));
         // derived names resolve without a dictionary file
         assert_eq!(lookup(0xc8e8_c282, Ctx::Param).as_deref(), Some("diffusetex"));
     }
