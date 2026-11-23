@@ -34,7 +34,7 @@ const OWNER: u32 = 0xfb1f_80ff;
 /// `handlingId` (case-sensitive joaat).
 const HANDLING_ID: u32 = 0xec41_bd9c;
 /// Layout version of vehicles.json; the model viewer rebuilds older files.
-pub const FORMAT: u32 = 6;
+pub const FORMAT: u32 = 7;
 /// A mod part or kit of one vehicle (in that vehicle's own pack resource):
 /// `name` joaat of the part model's name, or of a kit's name (the names of
 /// its left and right models without the side word:
@@ -320,6 +320,23 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
             m["make"] = json!(mk);
         }
     }
+    // The steering lock from the handling records (PSO files in data.rpf),
+    // joined by handlingId.
+    let locks = crate::names::work_dir()
+        .and_then(|w| crate::scan::load_index(&crate::scan::index_path(&w.join("index"), "data.rpf")).ok())
+        .map(|ix| {
+            let sel: Vec<&Entry> = ix.entries.iter().filter(|e| e.kind == crate::classify::Kind::Pso).collect();
+            crate::pso::steering_locks(&crate::export::game_root(a).join("data.rpf"), &sel)
+        })
+        .unwrap_or_default();
+    let mut n_lock = 0;
+    for (h, m) in models.iter_mut() {
+        let hid = get(&m["model_info"], HANDLING_ID).and_then(|x| x.as_u64()).filter(|x| *x != 0).map_or(*h, |x| x as u32);
+        if let Some(l) = crate::pso::steering_lock(&locks, hid) {
+            n_lock += 1;
+            m["steering_lock"] = json!(l);
+        }
+    }
     let list: Vec<&Value> = models.values().collect();
     let with_info = list.iter().filter(|m| !m["model_info"].is_null()).count();
     let named = list.iter().filter(|m| !m["model"].is_null()).count();
@@ -327,10 +344,10 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("vehicles.json");
     std::fs::write(&path, serde_json::to_vec_pretty(&json!({
-        "note": "Per vehicle model: model_info (vehicles.meta-like; wheelScale / wheelScaleRear are not understood: they are not the rim radius (0.219 on comet7, whose rim is 0.82 x a 0.35 m tyre). A wheel's size, width and position are in the model's export (model.json wheel_mounts, from the collision discs), and the rim's share of it in the configuration's rim_ratio), configurations (body colour ARGB + the part models incl. rim and tyre; rim_ratio = rim radius / tyre radius from the configuration's wheel fitment record, slot 39d5e253, where it has one), palettes (ARGB paint-colour lists; colours repeat, so repetition reads as the draw weight), part_groups (weighted part choices). display_name and make are the game's own text for the model's name hash and its vehicleMakeName (from the first text table in data.rpf that has them: English). Names resolve where known; others are joaat hex.",
+        "note": "Per vehicle model: model_info (vehicles.meta-like; wheelScale / wheelScaleRear are not understood: they are not the rim radius (0.219 on comet7, whose rim is 0.82 x a 0.35 m tyre). A wheel's size, width and position are in the model's export (model.json wheel_mounts, from the collision discs), and the rim's share of it in the configuration's rim_ratio), configurations (body colour ARGB + the part models incl. rim and tyre; rim_ratio = rim radius / tyre radius from the configuration's wheel fitment record, slot 39d5e253, where it has one), palettes (ARGB paint-colour lists; colours repeat, so repetition reads as the draw weight), part_groups (weighted part choices). steering_lock is fSteeringLock of the model's handling record (radians, the largest angle of the steered wheels; from the PSO files in data.rpf, joined by handlingId). display_name and make are the game's own text for the model's name hash and its vehicleMakeName (from the first text table in data.rpf that has them: English). Names resolve where known; others are joaat hex.",
         "format": FORMAT,
         "sources": sources,
         "vehicles": list,
     }))?)?;
-    Ok(json!({"models": list.len(), "named": named, "with_model_info": with_info, "configurations": n_cfg, "configurations_with_rim": n_rim, "palettes": n_pal, "display_names": n_named, "file": path}))
+    Ok(json!({"models": list.len(), "named": named, "with_model_info": with_info, "configurations": n_cfg, "configurations_with_rim": n_rim, "palettes": n_pal, "display_names": n_named, "steering_locks": n_lock, "file": path}))
 }

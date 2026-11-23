@@ -17,6 +17,8 @@ struct File {
 #[derive(Deserialize)]
 struct Veh {
     #[serde(default)]
+    steering_lock: Option<f32>,
+    #[serde(default)]
     display_name: Option<String>,
     #[serde(default)]
     make: Option<String>,
@@ -104,6 +106,8 @@ pub struct Vehicle {
     pub wheel_scale_rear: Option<f32>,
     /// `steerWheelMult` of the model info.
     pub steer_wheel_mult: Option<f32>,
+    /// `fSteeringLock` of the handling record (radians).
+    pub steer_lock: Option<f32>,
     /// The game's own name for the model, with its make ("Bravado '19 Buffalo").
     pub display: Option<String>,
     pub configs: Vec<Config>,
@@ -275,6 +279,7 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
                 wheel_scale: ws,
                 wheel_scale_rear: wr,
                 steer_wheel_mult: sm,
+                steer_lock: v.steering_lock,
                 display,
                 configs,
                 palettes,

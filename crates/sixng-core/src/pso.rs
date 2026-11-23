@@ -199,6 +199,60 @@ fn component_label(c: &serde_json::Value) -> Option<&'static str> {
     })
 }
 
+/// `fSteeringLock` (case-sensitive joaat).
+const STEERING_LOCK: u32 = 0xd9cd_734b;
+
+/// The steering lock (radians, the largest angle of the steered wheels) of
+/// every handling record in the PSO files of `entries`: handling name hash
+/// -> (lock where the record has one, base record's name hash). A record
+/// without a lock takes its base's (`steering_lock`).
+pub fn steering_locks(archive: &std::path::Path, entries: &[&crate::scan::Entry]) -> HashMap<u32, (Option<f32>, u32)> {
+    use rayon::prelude::*;
+    let (hn, hb, lock) = (crate::meta7a::field_name(HANDLING_NAME), crate::meta7a::field_name(HANDLING_BASE), crate::meta7a::field_name(STEERING_LOCK));
+    fn find(v: &serde_json::Value, key: &str) -> Option<f64> {
+        match v {
+            serde_json::Value::Object(o) => o.get(key).and_then(|x| x.as_f64()).or_else(|| o.values().find_map(|x| find(x, key))),
+            serde_json::Value::Array(a) => a.iter().find_map(|x| find(x, key)),
+            _ => None,
+        }
+    }
+    entries
+        .par_iter()
+        .filter_map(|e| {
+            let p = parse(&crate::scan::read_entry(archive, e).ok()?)?;
+            let m = p.meta();
+            let mut v = Vec::new();
+            for (&h, sd) in &p.structs {
+                let has = |x: u32| sd.members.iter().any(|mm| mm.hash == x);
+                if !(has(HANDLING_NAME) && has(HANDLING_COMPONENTS)) {
+                    continue;
+                }
+                for o in m.objects(h) {
+                    let Some(ob) = m.object(h, o, 0) else { continue };
+                    let n = ob.get(&hn).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                    let b = ob.get(&hb).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                    v.push((n, (find(&ob, &lock).map(|x| x as f32), b)));
+                }
+            }
+            Some(v)
+        })
+        .flatten()
+        .collect()
+}
+
+/// The steering lock of a handling name, following base records.
+pub fn steering_lock(locks: &HashMap<u32, (Option<f32>, u32)>, name: u32) -> Option<f32> {
+    let mut n = name;
+    for _ in 0..8 {
+        let &(l, base) = locks.get(&n)?;
+        if l.is_some() {
+            return l;
+        }
+        n = base;
+    }
+    None
+}
+
 /// Vehicle handling (`sixng handling`): every PSO object with a handling
 /// name and a component list, from every PSO in `entries`, with the name
 /// resolved through `names` (joaat -> name). Writes `<out>/pso/handling.json`.

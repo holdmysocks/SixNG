@@ -152,6 +152,10 @@ pub struct ModelView {
     pub steer: f32,
     /// `steerWheelMult` of the loaded vehicle (1 when it has none).
     steer_mult: f32,
+    /// The loaded vehicle's steering lock in radians (`fSteeringLock`), or
+    /// a default of 35 degrees with `steer_lock_known` false.
+    steer_lock: f32,
+    steer_lock_known: bool,
     /// The steering wheel's joint and the axis it turns about (joint space).
     steer_wheel: Option<(usize, Vec3)>,
     /// Vehicle lamps that are on.
@@ -395,6 +399,8 @@ impl ModelView {
             clip_pos_all: 0.0,
             steer: 0.0,
             steer_mult: 1.0,
+            steer_lock: 35f32.to_radians(),
+            steer_lock_known: false,
             steer_wheel: None,
             lamps: Lamps::default(),
             has_lamps: false,
@@ -1288,6 +1294,10 @@ impl ModelView {
 
     fn apply_scale(&mut self, v: &crate::vehicle_db::Vehicle) {
         self.steer_mult = v.steer_wheel_mult.filter(|m| *m > 0.0).unwrap_or(1.0);
+        let lock = v.steer_lock.filter(|l| *l > 0.01 && *l < 1.6);
+        self.steer_lock_known = lock.is_some();
+        self.steer_lock = lock.unwrap_or(35f32.to_radians());
+        self.steer = self.steer.clamp(-self.steer_lock, self.steer_lock);
         if self.wheel_auto {
             if let Some(f) = v.wheel_scale {
                 self.wheel_scale = f * WHEEL_FACTOR;
@@ -2374,8 +2384,10 @@ impl ModelView {
                 if let Some(l) = self.loaded.as_ref().filter(|l| l.model.joints.iter().any(|j| is_steer_bone(&j.name))) {
                     let _ = l;
                     let mut deg = self.steer.to_degrees();
-                    ui.add(egui::Slider::new(&mut deg, -40.0..=40.0).text("steering (degrees)")).on_hover_text(format!(
-                        "Turns the wheel_turn bones (front wheels, a motorcycle's fork) about the vertical and what is fitted to them. The steering wheel turns {STEERING_RATIO:.0} x steerWheelMult ({:.2}) as far. No steering lock was found in the game's data, so the range is fixed; both wheels take the same angle; a fork turns about the vertical, not its own rake.",
+                    let lock = self.steer_lock.to_degrees();
+                    ui.add(egui::Slider::new(&mut deg, -lock..=lock).text("steering (degrees)")).on_hover_text(format!(
+                        "Turns the wheel_turn bones (front wheels, a motorcycle's fork) about the vertical and what is fitted to them, up to the vehicle's steering lock: {}. The steering wheel turns {STEERING_RATIO:.0} x steerWheelMult ({:.2}) as far (an estimate). Both wheels take the same angle; a fork turns about the vertical, not its own rake.",
+                        if self.steer_lock_known { format!("{lock:.1} degrees (fSteeringLock of its handling record)") } else { format!("{lock:.0} degrees (a default: no handling record was found for this model)") },
                         self.steer_mult
                     ));
                     self.steer = deg.to_radians();
