@@ -168,7 +168,8 @@ pub struct ModelView {
     /// Bounding boxes of the loaded wheel models (rim, tyre).
     wheel_boxes: Vec<[[f32; 3]; 2]>,
     /// Width factor per wheel mount (two-wheelers), and what it was made for.
-    wheel_xs: (String, Vec<f32>),
+    /// and the arch-fit factor on the whole wheel: [width, fit].
+    wheel_xs: (String, Vec<[f32; 2]>),
     pub veh_cfg: Option<usize>,
     wheel_pending: Arc<Mutex<Option<Result<Vec<Loaded>, String>>>>,
     wheel_key: String,
@@ -1088,6 +1089,10 @@ impl ModelView {
             if !v.configs.is_empty() {
                 self.apply_config(v, 0);
             } else {
+                // no configuration names a rim or tyre: plain ones, not
+                // those of the vehicle opened before
+                self.wheel_rim = "rim_muscle_001_hi".into();
+                self.wheel_tyre = "tyre_car_001_hi".into();
                 self.apply_scale(v);
             }
         }
@@ -1232,12 +1237,30 @@ impl ModelView {
             .map(|a| {
                 a.iter()
                     .filter_map(|m| {
-                        let p: [f32; 3] = serde_json::from_value(m["pivot"].clone()).ok()?;
+                        // the stored wheel disc's centre where there is one
+                        let p: [f32; 3] = serde_json::from_value(m["centre"].clone())
+                            .ok()
+                            .or_else(|| serde_json::from_value(m["pivot"].clone()).ok())?;
                         Some((
                             m["bone"].as_str()?.to_string(),
                             Vec3::new(p[0], p[2], -p[1]),
                         ))
                     })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Stored wheel size per mount (tyre radius, half width in metres), from
+    /// the fragment's collision discs.
+    fn discs(&self) -> Vec<Option<[f32; 2]>> {
+        let Some(l) = &self.loaded else { return vec![] };
+        l.info["wheel_mounts"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|m| m["bone"].is_string() && (m["pivot"].is_array() || m["centre"].is_array()))
+                    .map(|m| Some([m["radius"].as_f64()? as f32, m["half_width"].as_f64()? as f32]))
                     .collect()
             })
             .unwrap_or_default()
@@ -1319,22 +1342,64 @@ impl ModelView {
         // scale a tyre is as wide as a car's. Narrow the wheel to fit between
         // the fork legs or the swingarm (an estimate).
         let xs_key = format!(
-            "{}|{}|{}|{}|{}",
+            "{}|{:?}|{}|{}|{}|{}|{}",
+            self.wheel_auto,
+            // the loaded wheel models' sizes: they arrive after the key's
+            // names change, and the fit depends on them
+            self.wheel_boxes,
             self.loaded.as_ref().map(|l| l.source.as_str()).unwrap_or(""),
             self.wheel_scale,
             self.wheel_scale_rear,
             self.wheel_key,
-            self.wheel_boxes.len()
+            self.wheel_loading
         );
         if self.wheel_xs.0 != xs_key {
+            let discs = self.discs();
+            let tyre = tyre_size(&self.wheel_boxes);
             let v = match &self.loaded {
-                Some(l) => mounts
-                    .iter()
-                    .map(|(bone, p)| {
-                        let sc = if is_rear(bone) { self.wheel_scale_rear } else { self.wheel_scale };
-                        fork_fit(&l.model, *p, sc, &self.wheel_boxes)
-                    })
-                    .collect(),
+                // The vehicle stores each wheel's radius and width (its
+                // collision discs): size the wheel to them.
+                Some(_) if self.wheel_auto && tyre.is_some() && discs.len() == mounts.len() && discs.iter().any(|d| d.is_some()) => {
+                    let (tr, tw) = tyre.unwrap();
+                    let any = discs.iter().flatten().next().copied().unwrap();
+                    mounts
+                        .iter()
+                        .zip(&discs)
+                        .map(|((bone, _), d)| {
+                            // a wheel without a disc takes the size of one that has
+                            let [r, hw] = d.unwrap_or(any);
+                            let base = if is_rear(bone) { self.wheel_scale_rear } else { self.wheel_scale };
+                            let sc = r / tr;
+                            [(2.0 * hw / (tw * sc)).clamp(0.05, 2.0), sc / base.max(1e-4)]
+                        })
+                        .collect()
+                }
+                Some(l) => {
+                    let scale = |bone: &str| if is_rear(bone) { self.wheel_scale_rear } else { self.wheel_scale };
+                    // Sized from wheelScale, a wheel is as big as its arch on
+                    // about half the cars: shrink it to clear the arch (the
+                    // same on both sides of an axle).
+                    let mut fit: Vec<f32> = mounts
+                        .iter()
+                        .map(|(bone, p)| if self.wheel_auto { arch_fit(&l.model, *p, scale(bone), &self.wheel_boxes) } else { 1.0 })
+                        .collect();
+                    // one size per axle, and one for the car where front and
+                    // rear wheelScale are the same: the tightest arch decides
+                    let same = self.wheel_scale == self.wheel_scale_rear;
+                    for rear in [false, true] {
+                        let m = mounts.iter().zip(&fit).filter(|(b, _)| same || is_rear(&b.0) == rear).map(|(_, f)| *f).fold(f32::MAX, f32::min);
+                        for (b, f) in mounts.iter().zip(fit.iter_mut()) {
+                            if m < f32::MAX && (same || is_rear(&b.0) == rear) {
+                                *f = m;
+                            }
+                        }
+                    }
+                    mounts
+                        .iter()
+                        .zip(&fit)
+                        .map(|((bone, p), f)| [fork_fit(&l.model, *p, scale(bone) * f, &self.wheel_boxes), *f])
+                        .collect()
+                }
                 None => vec![],
             };
             self.wheel_xs = (xs_key, v);
@@ -1355,16 +1420,18 @@ impl ModelView {
                 };
                 let spin = Mat4::from_quat(Quat::from_rotation_x(self.wheel_spin));
                 let rear = is_rear(bone);
-                let sc = if rear {
-                    self.wheel_scale_rear
-                } else {
-                    self.wheel_scale
-                };
+                let [width, fit] = xs.get(mi).copied().unwrap_or([1.0, 1.0]);
+                let sc = fit
+                    * if rear {
+                        self.wheel_scale_rear
+                    } else {
+                        self.wheel_scale
+                    };
                 render3d::Instance::new(
                     Mat4::from_translation(*p)
                         * spin
                         * mirror
-                        * Mat4::from_scale(Vec3::new(sc * xs.get(mi).copied().unwrap_or(1.0), sc, sc)),
+                        * Mat4::from_scale(Vec3::new(sc * width, sc, sc)),
                     false,
                 )
             })
@@ -1985,7 +2052,7 @@ impl ModelView {
                             egui::TextEdit::singleline(&mut self.wheel_tyre).desired_width(140.0),
                         );
                     });
-                    ui.checkbox(&mut self.wheel_auto, "size from the car's wheelScale").on_hover_text(format!("scale = {WHEEL_FACTOR:.0} x wheelScale (front / rear): wheelScale is the rim radius in metres and the shared rims have radius 0.5. The tyre is scaled with the rim; on two-wheelers the width is narrowed to fit the fork (an estimate, no width is stored)."));
+                    ui.checkbox(&mut self.wheel_auto, "size the wheels from the vehicle's data").on_hover_text(format!("scale = {WHEEL_FACTOR:.0} x wheelScale (front / rear): wheelScale is the rim radius in metres and the shared rims have radius 0.5. The tyre is scaled with the rim; used only where the vehicle stores no wheel size. Most do: each wheel has a collision disc with the tyre's radius and width, and the wheel is sized and placed to it. Without one, the wheel is sized to fill its arch and narrowed to fit the fork (estimates)."));
                     ui.add_enabled_ui(!self.wheel_auto, |ui| {
                         ui.add(
                             egui::Slider::new(&mut self.wheel_scale, 0.1..=1.2)
@@ -2609,6 +2676,65 @@ fn is_rear(bone: &str) -> bool {
     bone.strip_prefix("wheel_").map(|s| s.chars().nth(1) == Some('r')).unwrap_or(false)
 }
 
+/// Outer radius and width of the tyre among the wheel models (the one with
+/// the largest radius), at unit scale.
+fn tyre_size(boxes: &[[[f32; 3]; 2]]) -> Option<(f32, f32)> {
+    let radius = |b: &[[f32; 3]; 2]| b[0][1].abs().max(b[1][1].abs()).max(b[0][2].abs()).max(b[1][2].abs());
+    let t = boxes.iter().max_by(|a, b| radius(a).total_cmp(&radius(b)))?;
+    Some((radius(t), t[1][0] - t[0][0]))
+}
+
+/// Factor that fits a wheel to its arch: the arch radius is the nearest body
+/// vertex (on a bodyshell, wing, arch liner, bumper, mudguard or chassis
+/// bone) above the axle within 12 cm of the wheel's plane, and the tyre is
+/// made to reach 93 % of it, smaller or larger than wheelScale gives (0.6 to
+/// 1.5 times). 1.0 where no arch is found. An estimate: over 213 vehicles
+/// 2 x wheelScale puts the tyre at a median 0.96 of the arch radius (0.83 to
+/// 1.42), too big on ordinary cars and too small on sports cars, so no single
+/// factor on wheelScale fits them all.
+fn arch_fit(model: &glb::Model, p: Vec3, scale: f32, boxes: &[[[f32; 3]; 2]]) -> f32 {
+    let Some((r, _)) = tyre_size(boxes) else { return 1.0 };
+    let r = r * scale;
+    if r <= 0.0 {
+        return 1.0;
+    }
+    let body: Vec<bool> = model
+        .joints
+        .iter()
+        .map(|j| {
+            let n = j.name.to_lowercase();
+            !n.contains("dummy") && ["bodyshell", "wing_", "archliner", "bumper_", "mudguard", "chassis"].iter().any(|k| n.contains(k))
+        })
+        .collect();
+    let mut arch = f32::MAX;
+    for m in &model.meshes {
+        if !m.skinned {
+            continue;
+        }
+        for v in &m.verts {
+            if !body.get(v.joints[0] as usize).copied().unwrap_or(false) {
+                continue;
+            }
+            if (v.pos[0] - p.x).abs() > 0.12 || v.pos[1] < p.y + 0.02 {
+                continue;
+            }
+            let d = ((v.pos[1] - p.y).powi(2) + (v.pos[2] - p.z).powi(2)).sqrt();
+            if d > 0.15 {
+                arch = arch.min(d);
+            }
+        }
+    }
+    if arch == f32::MAX {
+        return 1.0;
+    }
+    let f = 0.93 * arch / r;
+    // nothing that far from the tyre is its arch (open wheels, high bodies)
+    if f > 1.5 {
+        return 1.0;
+    }
+    f.max(0.6)
+}
+
 /// Width factor of a shared wheel on a two-wheeler (mount on the centre
 /// line): the widest the tyre can be and still pass between the body parts
 /// beside it (fork legs, swingarm, stays), measured in the band between half
@@ -2619,10 +2745,8 @@ fn fork_fit(model: &glb::Model, p: Vec3, scale: f32, boxes: &[[[f32; 3]; 2]]) ->
     if p.x.abs() > 0.05 || boxes.is_empty() {
         return 1.0;
     }
-    // the tyre is the wheel model with the largest radius
-    let radius = |b: &[[f32; 3]; 2]| b[0][1].abs().max(b[1][1].abs()).max(b[0][2].abs()).max(b[1][2].abs());
-    let Some(tyre) = boxes.iter().max_by(|a, b| radius(a).total_cmp(&radius(b))) else { return 1.0 };
-    let (r, w) = (radius(tyre) * scale, (tyre[1][0] - tyre[0][0]) * scale);
+    let Some((r, w)) = tyre_size(boxes) else { return 1.0 };
+    let (r, w) = (r * scale, w * scale);
     if r <= 0.0 || w <= 0.0 {
         return 1.0;
     }
@@ -2682,6 +2806,8 @@ fn export_load(
                 // and from before the 4 x u16 joint stream (0x4A) was read: body and
                 // trim meshes that did not follow their bones
                 || j.contains("\"skinned\"") && !j.contains("\"joint_format\"")
+                // and from before the wheels' collision discs were read
+                || (j.contains("\"bone\": \"wheel_") || j.contains("\"bone\":\"wheel_")) && !j.contains("\"wheel_discs\"")
         });
     // Cached animal parts from before part skins (eyes, tint-mask coats).
     let stale_animal = e.name.as_deref().is_some_and(|n| sixng_core::partskin::animal_root(n).is_some())
