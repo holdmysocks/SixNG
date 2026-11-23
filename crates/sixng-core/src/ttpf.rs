@@ -26,8 +26,10 @@
 //!       ...              other tables (u32 list, n x 32-byte digests)
 //! descriptor:
 //!       u32 d0: bits 0-13 width-1, bits 14-27 height-1, bits 28-31 mip count-1
-//!       u32 d1: bits 0-2 flags, bits 3-9 DXGI format, bits 10-19 array size-1,
-//!              bits 20-23 ?, bits 24-27 tile mode
+//!              (see `TtpfTex::mips` for the exceptions)
+//!       u32 d1: bits 0-2 flags, bits 3-9 DXGI format, bits 10-19 array size-1
+//!              (depth-1 on 3D textures), bits 20-23 resource kind (2 = 2D,
+//!              4 = cube, 6 = 3D, 10 = 2D array), bits 24-27 tile mode
 //!              (0 = SW_64KB_D, 1/2/3 = SW_4KB_S, see `gfx10`; 9-12 = SW_4KB_S
 //!              cube maps stored as tile mode - 8 copies, see
 //!              `gfx10::Layout::with_cube_copies`)
@@ -68,11 +70,6 @@ pub struct TtpfTex {
     /// field does not fit (see `Ttpf::open`); `mips()` prefers it.
     #[serde(skip)]
     pub mips_fixed: Option<u32>,
-    /// 2-byte SW_4KB_S array stored at twice its size: each 4 KiB block
-    /// holds 32x32 elements in a different order, with 1 KiB unused after
-    /// every 1 KiB (see `gfx10::untile_split_2b`). Set by `fix_mip_counts`.
-    #[serde(skip)]
-    pub split_2b: bool,
 }
 
 pub struct Ttpf {
@@ -132,7 +129,7 @@ fn fix_mip_counts(textures: &mut [TtpfTex], end: Option<u64>) {
     }
     for (i, gap, at_end) in spans {
         let t = &textures[i];
-        if gap == t.size || t.tile_mode() > 3 {
+        if gap == t.size || t.tile_mode() > 3 || t.is_3d() {
             continue;
         }
         let fmt = crate::texture::Fmt::from_dxgi(t.dxgi_format);
@@ -146,14 +143,6 @@ fn fix_mip_counts(textures: &mut [TtpfTex], end: Option<u64>) {
             let m = *m;
             let t = &mut textures[i];
             t.mips_fixed = Some(m);
-            t.size = gap;
-        } else if fits.len() != 1 && fmt.bytes_per_elem() == 2 && sw == crate::gfx10::Swizzle::S4K && t.slices() > 1 && gap == crate::gfx10::split_2b_slice_size(t.width, t.height) as u64 * t.slices() as u64 {
-            // One mip, every other KiB unused (one R16F array). The span also
-            // fits 4-9 mips, but those would put mip 0 (stored last) on the
-            // unused KiBs, and the image comes out smooth this way.
-            let t = &mut textures[i];
-            t.mips_fixed = Some(1);
-            t.split_2b = true;
             t.size = gap;
         }
     }
@@ -214,7 +203,6 @@ impl Ttpf {
                 loc,
                 cube_base: None,
                 mips_fixed: None,
-                split_2b: false,
             });
         }
         for t in textures.iter_mut() {
@@ -398,17 +386,37 @@ impl TtpfSet {
 
 impl TtpfTex {
     /// Mip count: d0 bits 28-31 + 1 (UI textures have 1-2, a 1024 map
-    /// texture 7, i.e. down to 16 px). On cube maps (tile modes 9-12) the
-    /// field is the count itself: "2" cubes store one mip per face.
+    /// texture 7, i.e. down to 16 px), with two exceptions measured on the
+    /// install:
+    /// * cube maps (tile modes 9-12) need the tile mode too: the count is
+    ///   field + copies - 1 (copies = tile mode - 8). On every cube the data
+    ///   runs to exactly that mip and the tail slot after it is empty; e.g. a
+    ///   64x64 BC7 cube with field 6 and 2 copies holds 7 mips, down to 1x1.
+    /// * tile mode 1 with field 1 is one mip: the store spacing says 1 on all
+    ///   4071 of these where it can tell (never 2), and the small ones whose
+    ///   whole chain fits one block (16x8 RGBA8, ...) hold their data at
+    ///   offset 0, where a single mip starts (see `gfx10`).
     pub fn mips(&self) -> u32 {
         if let Some(m) = self.mips_fixed {
             return m;
         }
-        if (9..=12).contains(&self.tile_mode()) {
-            (self.d0 >> 28).max(1)
-        } else {
-            (self.d0 >> 28) + 1
+        let field = self.d0 >> 28;
+        match self.tile_mode() {
+            9..=12 => {
+                let full = 32 - self.width.max(self.height).leading_zeros();
+                (field + self.tile_mode() - 9).clamp(1, full)
+            }
+            1 if field == 1 => 1,
+            _ => field + 1,
         }
+    }
+    /// Resource kind (d1 bits 20-23): 2 = 2D, 4 = cube, 6 = 3D, 10 = 2D array.
+    pub fn kind(&self) -> u32 {
+        (self.d1 >> 20) & 0xF
+    }
+    /// A 3D (volume) texture; `slices()` is its depth.
+    pub fn is_3d(&self) -> bool {
+        self.kind() == 6
     }
     /// A `TexInfo` describing this texture, with `data_off` = 0 relative to
     /// the bytes returned by `Ttpf::data`.
@@ -417,7 +425,7 @@ impl TtpfTex {
             name: name.to_string(),
             width: self.width,
             height: self.height,
-            depth: 1,
+            depth: if self.is_3d() { self.slices() } else { 1 },
             mips: self.mips(),
             dxgi_format: self.dxgi_format,
             format: crate::texture::dxgi_name(self.dxgi_format),
@@ -451,7 +459,7 @@ pub fn decode_rgba_slice(t: &TtpfTex, data: &[u8], m: u32, sl: u32) -> Result<(V
     if sl >= l.slices {
         return Err(anyhow!("slice {sl} out of range ({} slices)", l.slices));
     }
-    let lin = if t.split_2b { crate::gfx10::untile_split_2b(data, t.width, t.height, sl) } else { l.untile_slice(data, m as usize, sl) };
+    let lin = l.untile_slice(data, m as usize, sl);
     Ok((tx::to_rgba(fmt, &lin, mw, mh)?, mw, mh))
 }
 
@@ -469,19 +477,27 @@ impl TtpfTex {
             _ => None,
         }
     }
-    /// Mip-chain layout (`None` for unsupported tile modes or element sizes:
-    /// 1-, 2-, 4-, 8- and 16-byte elements are mapped).
     /// Array size (d1 bits 10-19, plus 1). 1 for almost all textures; 6 on
-    /// cube maps; 2-64 on a few texture arrays.
+    /// cube maps; 2-64 on a few texture arrays; the depth of a 3D texture.
     pub fn slices(&self) -> u32 {
         ((self.d1 >> 10) & 0x3FF) + 1
     }
+    /// Mip-chain layout (`None` for unsupported tile modes or element sizes:
+    /// 1-, 2-, 4-, 8- and 16-byte elements are mapped for 2D textures; 3D
+    /// textures only with one mip, `SW_4KB_S` and 2- or 8-byte elements, the
+    /// only kinds measured on the install).
     pub fn layout(&self) -> Option<crate::gfx10::Layout> {
         let fmt = crate::texture::Fmt::from_dxgi(self.dxgi_format);
         if fmt == crate::texture::Fmt::Unknown {
             return None;
         }
         let bd = fmt.block_dim();
+        if self.is_3d() {
+            if self.mips() != 1 || bd != 1 {
+                return None;
+            }
+            return crate::gfx10::Layout::new_3d(self.swizzle()?, self.width, self.height, self.slices(), fmt.bytes_per_elem());
+        }
         let l = crate::gfx10::Layout::new(self.swizzle()?, self.width.div_ceil(bd), self.height.div_ceil(bd), self.mips(), fmt.bytes_per_elem())?;
         match self.tile_mode() {
             9..=12 => l.with_cube_copies(self.slices(), self.tile_mode() - 8, self.cube_base),
@@ -593,7 +609,7 @@ mod tests {
     use super::*;
 
     fn tex(d0: u32, d1: u32, virt: u64) -> TtpfTex {
-        let mut t = TtpfTex { hash: virt, width: (d0 & 0x3FFF) + 1, height: ((d0 >> 14) & 0x3FFF) + 1, dxgi_format: (d1 >> 3) & 0x7F, virt, size: 0, d0, d1, loc: 0, cube_base: None, mips_fixed: None, split_2b: false };
+        let mut t = TtpfTex { hash: virt, width: (d0 & 0x3FFF) + 1, height: ((d0 >> 14) & 0x3FFF) + 1, dxgi_format: (d1 >> 3) & 0x7F, virt, size: 0, d0, d1, loc: 0, cube_base: None, mips_fixed: None };
         t.size = t.layout().map(|l| l.total).unwrap_or(0);
         t
     }
@@ -627,5 +643,66 @@ mod tests {
         assert_eq!(decode_bc1(&chunk, 512).map(|b| b.len()), Some(512 * 8));
         // a wrong block count does not converge
         assert_eq!(decode_bc1(&chunk, 1024), None);
+    }
+
+    /// d0 / d1 of a synthetic descriptor.
+    fn desc(w: u32, h: u32, field: u32, fmt: u32, slices: u32, kind: u32, tile: u32) -> (u32, u32) {
+        ((w - 1) | (h - 1) << 14 | field << 28, fmt << 3 | (slices - 1) << 10 | kind << 20 | tile << 24)
+    }
+
+    #[test]
+    fn cube_mip_count_uses_copies() {
+        // 64x64 BC7 cube, field 6, 2 copies: 7 mips, down to 1x1.
+        let (d0, d1) = desc(64, 64, 6, 98, 6, 4, 10);
+        let t = tex(d0, d1, 0x1000);
+        assert_eq!(t.mips(), 7);
+        let l = t.layout().unwrap();
+        assert_eq!((l.mips.len(), l.mips[6].w, l.mips[6].h), (7, 1, 1));
+        // one copy: the field is the count
+        let (d0, d1) = desc(32, 32, 6, 98, 6, 4, 9);
+        assert_eq!(tex(d0, d1, 0x1000).mips(), 6);
+        // 128x128, field 2, 3 copies: 4 mips
+        let (d0, d1) = desc(128, 128, 2, 98, 6, 4, 11);
+        assert_eq!(tex(d0, d1, 0x1000).mips(), 4);
+    }
+
+    #[test]
+    fn small_single_mip_decodes_from_offset_0() {
+        // 16x8 RGBA8, tile mode 1, mip field 1: one mip at offset 0.
+        let (d0, d1) = desc(16, 8, 1, 28, 1, 2, 1);
+        let t = tex(d0, d1, 0x1000);
+        assert_eq!(t.mips(), 1);
+        let l = t.layout().unwrap();
+        let mut data = vec![0u8; l.total as usize];
+        for y in 0..8 {
+            for x in 0..16 {
+                let a = l.addr(0, 0, x, y) as usize;
+                data[a..a + 4].copy_from_slice(&[x as u8 * 16, y as u8 * 32, 7, 255]);
+            }
+        }
+        // the mip covers 256-byte blocks 0 and 2 of the 4 KiB block, as stored
+        assert!(data[256..512].iter().chain(&data[768..]).all(|&b| b == 0));
+        let (rgba, w, h) = decode_rgba(&t, &data, 0).unwrap();
+        assert_eq!((w, h), (16, 8));
+        assert_eq!(&rgba[(5 * 16 + 9) * 4..][..4], &[144, 160, 7, 255]);
+        // other tile modes keep field + 1
+        let (d0, d1) = desc(16, 8, 1, 28, 1, 2, 2);
+        assert_eq!(tex(d0, d1, 0x1000).mips(), 2);
+    }
+
+    #[test]
+    fn volumes_use_the_3d_layout() {
+        // 32x64x32 R16G16B16A16_FLOAT, one mip: 3D, 524288 bytes
+        let (d0, d1) = desc(32, 64, 1, 10, 32, 6, 1);
+        let t = tex(d0, d1, 0x1000);
+        assert!(t.is_3d());
+        let l = t.layout().unwrap();
+        assert_eq!((l.block_d, l.slices, t.size), (8, 32, 524288));
+        assert_eq!(t.tex_info("").depth, 32);
+        // element sizes not measured on a volume, and multi-mip volumes, are rejected
+        let (d0, d1) = desc(32, 32, 1, 28, 32, 6, 1);
+        assert!(tex(d0, d1, 0x1000).layout().is_none());
+        let (d0, d1) = desc(32, 32, 2, 10, 32, 6, 1);
+        assert!(tex(d0, d1, 0x1000).layout().is_none());
     }
 }
