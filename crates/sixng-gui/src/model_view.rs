@@ -160,6 +160,12 @@ pub struct ModelView {
     steer_wheel: Option<(usize, Vec3)>,
     /// How hot the brake discs glow, 0 (cold) to 1.
     pub brake_heat: f32,
+    /// How far the side windows are rolled down, 0 (up) to 1.
+    pub windows_down: f32,
+    /// The window movers of the loaded model: joint index, the downward
+    /// direction along the glass and a point on its bottom edge, both in
+    /// the joint's own space.
+    window_movers: Vec<(usize, Vec3, Vec3)>,
     /// The chosen configuration's key (its part colours), and what the
     /// loaded model's vertices currently show: (model file, look index).
     part_look_want: Option<String>,
@@ -416,6 +422,8 @@ impl ModelView {
             steer_lock_known: false,
             steer_wheel: None,
             brake_heat: 0.0,
+            windows_down: 0.0,
+            window_movers: Vec::new(),
             part_look_want: None,
             cfg_request: None,
             part_look_done: None,
@@ -1568,6 +1576,7 @@ impl ModelView {
                 self.clips = all;
                 self.hinges = find_hinges(&l.model);
                 self.steer_wheel = find_steering_wheel(&l.model);
+                self.window_movers = find_window_movers(&l.model);
                 self.has_lamps = l.model.joints.iter().any(|j| self.lamps.kind(&j.name).is_some());
             }
         }
@@ -1858,6 +1867,21 @@ impl ModelView {
         // steering: the wheel_turn bones turn about the vertical, the
         // steering wheel about its own axis
         let mut swing = swing;
+        // side windows: each mover slides its glass down into the door
+        if self.windows_down > 0.0 {
+            for (i, d, p) in &self.window_movers {
+                // The glass is drawn down to its bottom edge instead of
+                // being moved: x' = x - t d (d . (x - p)). A straight slide
+                // along the glass's plane would leave the door (the glass
+                // leans in at the top), and the path it takes inside the
+                // door is not known.
+                let t = self.windows_down.clamp(0.0, 0.985);
+                let a = glam::Mat3::IDENTITY - glam::Mat3::from_cols(*d * d.x, *d * d.y, *d * d.z) * t;
+                let slide = Mat4::from_translation(*d * (t * d.dot(*p))) * Mat4::from_mat3(a);
+                let m = swing.get(i).map_or(slide, |m| *m * slide);
+                swing.insert(*i, m);
+            }
+        }
         if self.steer != 0.0 {
             for (i, j) in js.iter().enumerate() {
                 if is_steer_bone(&j.name) {
@@ -2491,6 +2515,9 @@ impl ModelView {
                         self.steer_mult
                     ));
                     self.steer = deg.to_radians();
+                }
+                if !self.window_movers.is_empty() {
+                    ui.add(egui::Slider::new(&mut self.windows_down, 0.0..=1.0).text("windows down")).on_hover_text("Lowers each side window by its mover bone (window_lf_mover ...): the glass is drawn down to its bottom edge, so its top edge drops to the sill. The bones are the game's; the path the game moves the glass along inside the door is not read from the files, so the glass is shortened instead of slid.");
                 }
                 if !self.brakes.is_empty() {
                     ui.add(egui::Slider::new(&mut self.brake_heat, 0.0..=1.0).text("brake glow")).on_hover_text("Makes the brake discs glow as if hot, from dull red to orange. A viewer effect on the fitted disc models: how the game heats and lights its discs is not read from the files.");
@@ -3395,6 +3422,45 @@ fn rim_factor(boxes: &[[[f32; 3]; 2]], ratio: f32) -> f32 {
         (Some(&rim), Some(&tyre)) if r.len() >= 2 && ratio > 0.0 && rim > 0.0 && tyre > rim => (ratio * tyre / rim).clamp(0.5, 0.97 * tyre / rim),
         _ => 1.0,
     }
+}
+
+/// The movers of the side windows (`window_lf_mover` with the glass on its
+/// child `window_lf`): joint index, the downward direction along the glass
+/// and a point on the glass's bottom edge, in the mover's own space. The
+/// plane of the glass is taken from its triangles.
+fn find_window_movers(model: &glb::Model) -> Vec<(usize, Vec3, Vec3)> {
+    let mut out = Vec::new();
+    for (mi, mover) in model.joints.iter().enumerate() {
+        let name = mover.name.to_ascii_lowercase();
+        let Some(glass_name) = name.strip_suffix("_mover").filter(|n| n.starts_with("window_")) else { continue };
+        let Some(gi) = model.joints.iter().position(|j| j.name.eq_ignore_ascii_case(glass_name)) else { continue };
+        let (mut normal, mut pts) = (Vec3::ZERO, Vec::new());
+        for m in &model.meshes {
+            let on = |i: u32| m.verts.get(i as usize).is_some_and(|v| (0..4).any(|k| v.joints[k] as usize == gi && v.weights[k] > 127));
+            // the plane from the glass triangles themselves (area-weighted
+            // face normals; both faces of the glass count the same way)
+            for t in m.indices.chunks_exact(3).filter(|t| t.iter().all(|&i| on(i))) {
+                let [a, b, c] = [t[0], t[1], t[2]].map(|i| Vec3::from(m.verts[i as usize].pos));
+                let n = (b - a).cross(c - a);
+                normal += if n.dot(normal) < 0.0 { -n } else { n };
+                pts.extend([a, b, c]);
+            }
+        }
+        if pts.len() < 8 || normal.length() < 1e-3 {
+            continue;
+        }
+        let normal = normal.normalize();
+        // straight down, kept in the plane of the glass
+        let down = (Vec3::NEG_Y - normal * Vec3::NEG_Y.dot(normal)).normalize_or_zero();
+        if down == Vec3::ZERO {
+            continue;
+        }
+        // the lowest point of the glass (furthest along `down`)
+        let Some(bottom) = pts.iter().copied().max_by(|a, b| a.dot(down).total_cmp(&b.dot(down))) else { continue };
+        let ibm = Mat4::from_cols_array(&mover.ibm);
+        out.push((mi, ibm.transform_vector3(down).normalize_or_zero(), ibm.transform_point3(bottom)));
+    }
+    out
 }
 
 /// Steering wheel turn per unit of road wheel angle, before the vehicle's
