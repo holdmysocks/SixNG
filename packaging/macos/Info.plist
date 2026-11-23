@@ -7,7 +7,7 @@
 	<key>CFBundleExecutable</key>
 	<string>sixng-gui</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.holdmysocks.sixng</string>
+	<string>io.github.sixng</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
