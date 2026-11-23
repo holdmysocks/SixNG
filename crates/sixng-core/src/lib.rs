@@ -29,6 +29,7 @@ pub mod texture;
 pub mod ttpf;
 pub mod bc3pack;
 pub mod bc45pack;
+pub mod bc6h;
 pub mod bc6pack;
 pub mod bc7pack;
 pub mod gaps;

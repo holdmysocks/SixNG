@@ -411,8 +411,8 @@ pub fn to_rgba(fmt: Fmt, data: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
         Fmt::Bc3 => td::decode_bc3(data, wu, hu, &mut img),
         Fmt::Bc4 => td::decode_bc4(data, wu, hu, &mut img),
         Fmt::Bc5 => td::decode_bc5(data, wu, hu, &mut img),
-        Fmt::Bc6u => td::decode_bc6(data, wu, hu, &mut img, false),
-        Fmt::Bc6s => td::decode_bc6(data, wu, hu, &mut img, true),
+        Fmt::Bc6u => crate::bc6h::decode_image(data, wu, hu, &mut img, false),
+        Fmt::Bc6s => crate::bc6h::decode_image(data, wu, hu, &mut img, true),
         Fmt::Bc7 => td::decode_bc7(data, wu, hu, &mut img),
         Fmt::Rgba8 | Fmt::Bgra8 | Fmt::R8 | Fmt::Rg8 | Fmt::R16f | Fmt::Rgba16 | Fmt::Rgba16f => {
             let bpe = fmt.bytes_per_elem() as usize;
@@ -517,7 +517,7 @@ fn save_dds_n(path: &Path, t: &TexInfo, fmt: Fmt, data: &[u8], nmips: u32, mip0_
 }
 
 /// IEEE half float to f32 (NaN becomes 0).
-fn f16(h: u16) -> f32 {
+pub(crate) fn f16(h: u16) -> f32 {
     let s = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
     let e = ((h >> 10) & 0x1F) as i32;
     let m = (h & 0x3FF) as f32;
