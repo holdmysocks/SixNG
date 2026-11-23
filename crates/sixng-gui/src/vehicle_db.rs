@@ -16,6 +16,10 @@ struct File {
 
 #[derive(Deserialize)]
 struct Veh {
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    make: Option<String>,
     model: Option<String>,
     #[serde(default)]
     model_hash: Option<String>,
@@ -96,6 +100,8 @@ pub struct Config {
 pub struct Vehicle {
     pub wheel_scale: Option<f32>,
     pub wheel_scale_rear: Option<f32>,
+    /// The game's own name for the model, with its make ("Bravado '19 Buffalo").
+    pub display: Option<String>,
     pub configs: Vec<Config>,
     /// Paint palettes as (colour, share 0..1), most frequent first. The
     /// stored lists repeat colours (e.g. 400 entries, 10 distinct), so they
@@ -251,6 +257,10 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
                     .collect()
             })
             .collect();
+        let display = v.display_name.as_ref().map(|n| match &v.make {
+            Some(mk) if !n.to_lowercase().starts_with(&mk.to_lowercase()) => format!("{mk} {n}"),
+            _ => n.clone(),
+        });
         let (ws, wr) = v
             .model_info
             .map(|i| (i.wheel_scale, i.wheel_scale_rear))
@@ -260,6 +270,7 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
             Vehicle {
                 wheel_scale: ws,
                 wheel_scale_rear: wr,
+                display,
                 configs,
                 palettes,
                 mods: v

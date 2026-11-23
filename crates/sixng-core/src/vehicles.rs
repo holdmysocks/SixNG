@@ -34,7 +34,7 @@ const OWNER: u32 = 0xfb1f_80ff;
 /// `handlingId` (case-sensitive joaat).
 const HANDLING_ID: u32 = 0xec41_bd9c;
 /// Layout version of vehicles.json; the model viewer rebuilds older files.
-pub const FORMAT: u32 = 5;
+pub const FORMAT: u32 = 6;
 /// A mod part or kit of one vehicle (in that vehicle's own pack resource):
 /// `name` joaat of the part model's name, or of a kit's name (the names of
 /// its left and right models without the side word:
@@ -130,6 +130,38 @@ pub fn model_names(ws: &crate::export::Workspace) -> HashMap<u32, String> {
         }
     }
     names
+}
+
+/// Strings of the text tables in data.rpf for the given label hashes: for
+/// each hash the string of the first table (in file order) that has it. The
+/// tables come one set per language and the first set is English.
+fn display_names(game_root: &std::path::Path, work: &std::path::Path, want: &[u32]) -> HashMap<u32, String> {
+    let Ok(ix) = crate::scan::load_index(&crate::scan::index_path(&work.join("index"), "data.rpf")) else { return HashMap::new() };
+    let path = game_root.join("data.rpf");
+    let mut tables: Vec<(u64, Vec<(u32, String)>)> = ix
+        .entries
+        .par_iter()
+        .filter(|e| e.sub == "7a" && e.usize <= 64 << 20)
+        .filter_map(|e| {
+            let b = crate::scan::read_entry(&path, e).ok()?;
+            if !crate::text::is_text_table(&b) {
+                return None;
+            }
+            let t = crate::text::parse(&b).ok()?;
+            let hits: Vec<(u32, String)> = want.iter().filter_map(|h| t.get(h).map(|s| (*h, crate::text::plain(s)))).collect();
+            (!hits.is_empty()).then_some((e.off, hits))
+        })
+        .collect();
+    tables.sort_by_key(|t| t.0);
+    let mut out = HashMap::new();
+    for (_, hits) in tables {
+        for (h, s) in hits {
+            if !s.trim().is_empty() {
+                out.entry(h).or_insert(s);
+            }
+        }
+    }
+    out
 }
 
 /// `sixng vehicles packs --out <out>` in one call.
@@ -270,6 +302,24 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
             m["mods"] = json!(mods);
         }
     }
+    // The game's own names: the text tables in data.rpf hold a string under
+    // the model's name hash (`gameName`) and one under `vehicleMakeName`.
+    // vehicleMakeName (case-sensitive joaat)
+    let make_field = meta7a::field_name(0x3db8df3e);
+    let mut want: Vec<u32> = models.keys().copied().collect();
+    want.extend(models.values().filter_map(|m| m["model_info"][&make_field].as_u64().map(|x| x as u32)).filter(|h| *h != 0));
+    let text = crate::names::work_dir().map(|w| display_names(&crate::export::game_root(a), &w, &want)).unwrap_or_default();
+    let mut n_named = 0;
+    for (h, m) in models.iter_mut() {
+        let make = m["model_info"][&make_field].as_u64().and_then(|x| text.get(&(x as u32)));
+        if let Some(n) = text.get(h) {
+            n_named += 1;
+            m["display_name"] = json!(n);
+        }
+        if let Some(mk) = make {
+            m["make"] = json!(mk);
+        }
+    }
     let list: Vec<&Value> = models.values().collect();
     let with_info = list.iter().filter(|m| !m["model_info"].is_null()).count();
     let named = list.iter().filter(|m| !m["model"].is_null()).count();
@@ -277,10 +327,10 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("vehicles.json");
     std::fs::write(&path, serde_json::to_vec_pretty(&json!({
-        "note": "Per vehicle model: model_info (vehicles.meta-like; wheelScale / wheelScaleRear read as the rim radius in metres (0.217 on a BMX, 0.25 / 0.22 on a dirt bike); the shared rim_* models have radius 0.5, so the model viewer scales rim and tyre by wheelScale / 0.5. The game shapes the tyre through the wheel model's own bones, which is not decoded), configurations (body colour ARGB + the part models incl. rim and tyre; rim_ratio = rim radius / tyre radius from the configuration's wheel fitment record, slot 39d5e253, where it has one), palettes (ARGB paint-colour lists; colours repeat, so repetition reads as the draw weight), part_groups (weighted part choices). Names resolve where known; others are joaat hex.",
+        "note": "Per vehicle model: model_info (vehicles.meta-like; wheelScale / wheelScaleRear read as the rim radius in metres (0.217 on a BMX, 0.25 / 0.22 on a dirt bike); the shared rim_* models have radius 0.5, so the model viewer scales rim and tyre by wheelScale / 0.5. The game shapes the tyre through the wheel model's own bones, which is not decoded), configurations (body colour ARGB + the part models incl. rim and tyre; rim_ratio = rim radius / tyre radius from the configuration's wheel fitment record, slot 39d5e253, where it has one), palettes (ARGB paint-colour lists; colours repeat, so repetition reads as the draw weight), part_groups (weighted part choices). display_name and make are the game's own text for the model's name hash and its vehicleMakeName (from the first text table in data.rpf that has them: English). Names resolve where known; others are joaat hex.",
         "format": FORMAT,
         "sources": sources,
         "vehicles": list,
     }))?)?;
-    Ok(json!({"models": list.len(), "named": named, "with_model_info": with_info, "configurations": n_cfg, "configurations_with_rim": n_rim, "palettes": n_pal, "file": path}))
+    Ok(json!({"models": list.len(), "named": named, "with_model_info": with_info, "configurations": n_cfg, "configurations_with_rim": n_rim, "palettes": n_pal, "display_names": n_named, "file": path}))
 }

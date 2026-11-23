@@ -116,6 +116,8 @@ fn categorise(name: Option<&str>, rtype: &str, vehicle_re: &regex::Regex) -> Cat
 struct Saved {
     recents: Vec<String>,
     favourites: Vec<String>,
+    #[serde(default)]
+    raw_names: bool,
 }
 
 pub struct ModelPicker {
@@ -129,6 +131,10 @@ pub struct ModelPicker {
     pub search: String,
     pub favs_only: bool,
     pub hide_variants: bool,
+    /// Show the models' own names instead of friendly ones.
+    pub raw_names: bool,
+    /// The game's display names: lower-case model name -> name.
+    friendly: Option<Arc<HashMap<String, String>>>,
     filtered: Vec<u32>,
     dirty: bool,
     /// Index into `filtered` of the current model.
@@ -161,6 +167,8 @@ impl ModelPicker {
             search: String::new(),
             favs_only: false,
             hide_variants: true,
+            raw_names: saved.raw_names,
+            friendly: None,
             filtered: Vec::new(),
             dirty: true,
             cursor: None,
@@ -224,6 +232,7 @@ impl ModelPicker {
         let s = Saved {
             recents: self.recents.clone(),
             favourites: self.favourites.clone(),
+            raw_names: self.raw_names,
         };
         if let Ok(b) = serde_json::to_vec_pretty(&s) {
             let _ = std::fs::write(&self.settings, b);
@@ -433,9 +442,10 @@ impl ModelPicker {
             .enumerate()
             .filter(|(_, it)| self.cat == Cat::All || it.cat == self.cat)
             .filter(|(_, it)| {
+                let friendly = if terms.is_empty() { None } else { self.game_name(it).map(|n| n.to_lowercase()) };
                 terms
                     .iter()
-                    .all(|t| it.lname.contains(t.as_str()) || it.id.contains(t.as_str()))
+                    .all(|t| it.lname.contains(t.as_str()) || it.id.contains(t.as_str()) || friendly.as_ref().is_some_and(|f| f.contains(t.as_str())))
             })
             .filter(|(_, it)| !self.favs_only || self.favourites.contains(&it.id))
             .filter(|(_, it)| !self.hide_variants || !it.variant)
@@ -465,8 +475,45 @@ impl ModelPicker {
 
     fn name_of(&self, id: &str) -> String {
         match (&self.items, self.by_id.get(id)) {
-            (Some(items), Some(&i)) => items[i as usize].name.clone(),
+            (Some(items), Some(&i)) => self.shown(&items[i as usize]),
             _ => id.to_string(),
+        }
+    }
+
+    /// Hand over the game's display names (lower-case model name -> name).
+    pub fn set_friendly(&mut self, names: Arc<HashMap<String, String>>) {
+        self.friendly = Some(names);
+        self.dirty = true;
+    }
+
+    pub fn has_friendly(&self) -> bool {
+        self.friendly.is_some()
+    }
+
+    /// The game's own name of a vehicle model (`buffalo6_hi` and `buffalo6`
+    /// -> "Bravado '19 Buffalo").
+    fn game_name(&self, it: &Item) -> Option<&str> {
+        if it.cat != Cat::Vehicles {
+            return None;
+        }
+        let f = self.friendly.as_ref()?;
+        let base = it.lname.strip_suffix("_hi").unwrap_or(&it.lname);
+        f.get(base).map(|s| s.as_str())
+    }
+
+    /// The name a model is listed under: the game's own name where it has
+    /// one, else the model name tidied up; the model name itself with
+    /// "raw names" on.
+    pub fn shown(&self, it: &Item) -> String {
+        if self.raw_names {
+            return it.name.clone();
+        }
+        match self.game_name(it) {
+            // the standard-detail copy of a vehicle is told apart from its _hi model
+            Some(n) if it.lname.ends_with("_hi") => n.to_string(),
+            Some(n) => format!("{n} (standard detail)"),
+            None if it.cat == Cat::Vehicles && !it.lname.ends_with("_hi") => format!("{} (standard detail)", tidy_name(&it.name)),
+            None => tidy_name(&it.name),
         }
     }
 
@@ -624,6 +671,13 @@ impl ModelPicker {
                 self.dirty = true;
             }
             if ui
+                .checkbox(&mut self.raw_names, "raw names")
+                .on_hover_text("List models under their own names (buffalo6_hi) instead of friendly ones (Bravado '19 Buffalo). Friendly names are the game's own text for vehicles and the tidied model name for everything else; search finds both, and the hover text always has the model name and id.")
+                .changed()
+            {
+                self.save();
+            }
+            if ui
                 .checkbox(&mut self.hide_variants, "hide LOD copies")
                 .on_hover_text("Hide _lod, _slod, batch-LOD and _mid copies")
                 .changed()
@@ -690,8 +744,9 @@ impl ModelPicker {
                     }
                     let sel = current == Some(it.id.as_str()) || self.cursor == Some(r);
                     let tag = if it.rtype == "ft" { "frag" } else { "draw" };
-                    let resp = ui.selectable_label(sel, &it.name).on_hover_text(format!(
-                        "{}\n{} · {:.1} MB",
+                    let resp = ui.selectable_label(sel, self.shown(it)).on_hover_text(format!(
+                        "{}\n{}\n{} · {:.1} MB",
+                        it.name,
                         it.id,
                         tag,
                         it.bytes as f64 / 1e6
@@ -716,6 +771,13 @@ impl ModelPicker {
         }
         open
     }
+}
+
+/// A model name made readable: underscores become spaces and the `_hi`
+/// suffix goes (`prop_bench_01a` -> "prop bench 01a").
+pub fn tidy_name(n: &str) -> String {
+    let n = n.strip_suffix("_hi").or_else(|| n.strip_suffix("_HI")).unwrap_or(n);
+    n.replace('_', " ")
 }
 
 /// Split fragment "vehicles" into vehicles and their parts. A vehicle is a

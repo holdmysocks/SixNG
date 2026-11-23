@@ -1158,7 +1158,16 @@ impl ModelView {
                 self.apply_scale(v);
             }
         }
-        ui.heading(format!("Vehicle: {key}"));
+        match &v.display {
+            // the game's own name, with the model name kept beside it
+            Some(d) => {
+                ui.heading(format!("Vehicle: {d}"));
+                ui.label(format!("model {key}")).on_hover_text("The game's text for this model's name and make (vehicles.json display_name and make). The model name and id stay as they are in the files.");
+            }
+            None => {
+                ui.heading(format!("Vehicle: {key}"));
+            }
+        }
         let ws = |x: Option<f32>| x.map(|x| format!("{x:.4}")).unwrap_or_else(|| "?".into());
         ui.label(format!(
             "wheelScale {} / rear {}",
@@ -1950,6 +1959,12 @@ impl ModelView {
         ui.separator();
 
         if self.show_picker {
+            // the game's display names for the list, once the vehicle data is read
+            if !self.picker.has_friendly() {
+                if let Some(db) = self.vehicles.get(&self.game, &self.work, &ctx) {
+                    self.picker.set_friendly(Arc::new(db.iter().filter_map(|(k, v)| v.display.clone().map(|d| (k.clone(), d))).collect()));
+                }
+            }
             let ws = Workspace::new(&self.game, &self.work);
             let idx = self.indexes.clone();
             let current = if self.query.contains('@') {
