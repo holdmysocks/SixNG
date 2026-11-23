@@ -265,6 +265,9 @@ pub struct ModelView {
     veh_lights: Option<Arc<crate::vehicle_db::Lights>>,
     cfg_patterns: Vec<String>,
     siren_dirty: bool,
+    /// Per joint of the loaded model: the colour of its lamp's light set
+    /// (largest channel 1), where the vehicle data has one.
+    lamp_rgb: Vec<Option<[f32; 3]>>,
     /// Bonnet and boot opening (radians at the hinge).
     pub bonnet_open: f32,
     pub boot_open: f32,
@@ -531,6 +534,7 @@ impl ModelView {
             veh_lights: None,
             cfg_patterns: Vec::new(),
             siren_dirty: false,
+            lamp_rgb: Vec::new(),
             bonnet_open: 0.0,
             boot_open: 0.0,
             hinges: HashMap::new(),
@@ -2488,6 +2492,10 @@ impl ModelView {
                 (Some(l), Some(v)) => find_sirens(&l.model, v, &self.cfg_patterns),
                 _ => Vec::new(),
             };
+            self.lamp_rgb = match (&self.loaded, &self.veh_lights) {
+                (Some(l), Some(v)) => l.model.joints.iter().map(|j| lamp_colour(v, &j.name)).collect(),
+                _ => Vec::new(),
+            };
             if self.sirens.is_empty() {
                 self.siren_sound.want = 0;
             }
@@ -2499,8 +2507,14 @@ impl ModelView {
         if (self.has_lamps || !self.sirens.is_empty()) && cfg!(not(target_os = "macos")) {
             let t = ctx.input(|i| i.time);
             if let Some(l) = &self.loaded {
-                for (j, m) in l.model.joints.iter().zip(skin.iter_mut()) {
-                    if let Some(c) = self.lamps.light(&j.name, t) {
+                for (i, (j, m)) in l.model.joints.iter().zip(skin.iter_mut()).enumerate() {
+                    if let Some(mut c) = self.lamps.light(&j.name, t) {
+                        // the lamp's own colour from the vehicle data, at
+                        // the brightness of its kind
+                        if let Some(rgb) = self.lamp_rgb.get(i).copied().flatten() {
+                            let k = c[0].max(c[1]).max(c[2]);
+                            c = [rgb[0] * k, rgb[1] * k, rgb[2] * k];
+                        }
                         m.x_axis.w = c[0];
                         m.y_axis.w = c[1];
                         m.z_axis.w = c[2];
@@ -2866,7 +2880,7 @@ impl ModelView {
                             }
                         })
                         .response
-                        .on_hover_text("The vehicle's light patterns that reach its siren and strobe bones. Read from the game's files: which lamps a pattern uses, each lamp's phase offset in the cycle and its flash type number, the pattern's speed, and the lamp's light archetype name. Not read: what a flash type looks like over time (0 is shown as off, 1 as steady, 6 as an even blink, every other number as a double flash), the length of the cycle (shown as one second at speed 1) and the colours behind the archetype names (red and amber by name, everything else white). Patterns marked 'pack' are in the vehicle's light pack without a part of this configuration linking them.");
+                        .on_hover_text("The vehicle's light patterns that reach its siren and strobe bones. Read from the game's files: which lamps a pattern uses, each lamp's phase offset in the cycle and its flash type number, the pattern's speed, and the lamp's light archetype name. Not read: what a flash type looks like over time (0 is shown as off, 1 as steady, 6 as an even blink, every other number as a double flash), the length of the cycle (shown as one second at speed 1) and how bright each lamp is (all the same here). A lamp's colour is its light set's in the game's light archetypes (the stored bytes taken as linear); many siren lamps are white lights behind a coloured lens. Patterns marked 'pack' are in the vehicle's light pack without a part of this configuration linking them.");
                 }
                 if !self.sirens.is_empty() {
                     let s = &mut self.siren_sound;
@@ -4603,6 +4617,10 @@ fn find_sirens(model: &glb::Model, lights: &crate::vehicle_db::Lights, linked: &
         by_hash.entry(h).or_default().push((i, k));
     }
     let colour = |bone: u32| -> [f32; 3] {
+        if let Some((c, _)) = lights.lamp_lights.get(&bone) {
+            let m = c[0].max(c[1]).max(c[2]).max(1e-3);
+            return [c[0] / m * 1.5, c[1] / m * 1.5, c[2] / m * 1.5];
+        }
         let a = lights.archetypes.get(&bone).map(|s| s.as_str()).unwrap_or("");
         if a.contains("red") {
             [1.6, 0.04, 0.02]
@@ -4639,6 +4657,15 @@ fn find_sirens(model: &glb::Model, lights: &crate::vehicle_db::Lights, linked: &
     // linked first, flashing before steady
     out.sort_by_key(|(l, s)| (!*l, s.label.starts_with("steady")));
     out.into_iter().map(|x| x.1).collect()
+}
+
+/// The colour of a lamp bone's light set (largest channel 1); a lens bone
+/// (`<lamp>_glass`) takes its lamp's.
+fn lamp_colour(lights: &crate::vehicle_db::Lights, joint: &str) -> Option<[f32; 3]> {
+    let n = joint.to_ascii_lowercase();
+    let (c, _) = lights.lamp_lights.get(&sixng_core::meta7a::joaat(n.strip_suffix("_glass").unwrap_or(&n)))?;
+    let m = c[0].max(c[1]).max(c[2]);
+    (m > 1e-3).then(|| [c[0] / m, c[1] / m, c[2] / m])
 }
 
 /// Brightness 0..1 of a flash type at `phase` (in cycles; the lamp's offset
@@ -4704,7 +4731,8 @@ impl Lamps {
 
     /// Light of a lamp bone at time `t` (seconds): linear colour x
     /// intensity, None when it is off. Indicators blink at 1.5 Hz. The
-    /// colours are fixed per kind (white, red, amber), not read from the files.
+    /// colours here are fixed per kind (white, red, amber); the caller swaps
+    /// in the lamp's own colour where the vehicle data has one.
     pub fn light(&self, bone: &str, t: f64) -> Option<[f32; 3]> {
         let blink = (t * 1.5).fract() < 0.5;
         let (on, c) = match self.kind(bone)? {

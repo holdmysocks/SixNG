@@ -70,6 +70,8 @@ struct LightsRec {
     pack: Vec<String>,
     #[serde(default)]
     archetypes: HashMap<String, String>,
+    #[serde(default)]
+    lamp_lights: HashMap<String, (String, f32)>,
 }
 
 #[derive(Deserialize)]
@@ -106,6 +108,9 @@ pub struct Lights {
     pub pack: Vec<String>,
     /// lamp bone name hash -> light archetype name (or its hash)
     pub archetypes: HashMap<u32, String>,
+    /// lamp bone name hash -> the colour of its light set (the stored bytes
+    /// / 255, taken as linear) and its intensity
+    pub lamp_lights: HashMap<u32, ([f32; 3], f32)>,
 }
 
 #[derive(Deserialize)]
@@ -353,6 +358,12 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
                         patterns: l.patterns.into_iter().map(|(name, p)| LightPattern { name, slot: p.slot, speed: p.speed, lamps: p.lamps.into_iter().map(|x| (hex(&x.bone), x.steps)).collect() }).collect(),
                         pack: l.pack,
                         archetypes: l.archetypes.into_iter().map(|(k, v)| (hex(&k), v)).collect(),
+                        lamp_lights: l
+                            .lamp_lights
+                            .into_iter()
+                            .filter(|(_, (c, _))| c.len() == 6)
+                            .map(|(k, (c, i))| (hex(&k), (std::array::from_fn(|n| u8::from_str_radix(&c[n * 2..n * 2 + 2], 16).unwrap_or(255) as f32 / 255.0), i)))
+                            .collect(),
                     })
                 }),
                 display,
