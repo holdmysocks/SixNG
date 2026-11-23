@@ -513,7 +513,10 @@ impl ModelPicker {
             Some(n) if it.lname.ends_with("_hi") => n.to_string(),
             Some(n) => format!("{n} (standard detail)"),
             None if it.cat == Cat::Vehicles && !it.lname.ends_with("_hi") => format!("{} (standard detail)", tidy_name(&it.name)),
-            None => tidy_name(&it.name),
+            None => {
+                let f = self.friendly.as_deref();
+                derived_name(&it.lname, it.cat, &|v| f.and_then(|f| f.get(v)).cloned())
+            }
         }
     }
 
@@ -773,6 +776,77 @@ impl ModelPicker {
     }
 }
 
+/// Kinds of weapon by the second word of a weapon model's name (`w_pi_…`).
+const WEAPON_KINDS: &[(&str, &str)] = &[
+    ("pi", "Pistol"), ("rv", "Revolver"), ("smg", "SMG"), ("ar", "Assault rifle"), ("sg", "Shotgun"), ("sr", "Sniper rifle"), ("mg", "Machine gun"),
+    ("lr", "Launcher"), ("me", "Melee"), ("ex", "Explosive"), ("at", "Attachment"), ("ammo", "Ammo"), ("kit", "Kit"), ("preset", "Preset"), ("sports", "Sports"),
+];
+
+/// A readable name made from a model's own name where the game has no text
+/// for it (`name` in lower case; `vehicle` gives a vehicle model's display
+/// name):
+/// - a vehicle part takes its vehicle's name: `buffalo6_spoiler_03` ->
+///   "Bravado '19 Buffalo · spoiler 03";
+/// - a weapon is "<kind>: <Name> <NN>" from `w_<kind>_<name>_<NN>`, and a
+///   weapon part adds " · <slot> <NN>": `w_pi_duke_01_barrel_02` ->
+///   "Pistol: Duke 01 · barrel 02";
+/// - wheels read "Rim: …" / "Tyre: …";
+/// - a detail suffix becomes words: `_mid` -> "(mid detail)", `_lod` and
+///   `_slod2` -> "(LOD)"; `_hi` is dropped.
+/// Everything else is the name with underscores as spaces. These are
+/// derived, not the game's own names.
+pub fn derived_name(name: &str, cat: Cat, vehicle: &dyn Fn(&str) -> Option<String>) -> String {
+    let (base, detail) = if let Some(b) = name.strip_suffix("_hi") {
+        (b, "")
+    } else if let Some(b) = name.strip_suffix("_mid") {
+        (b, " (mid detail)")
+    } else if let Some(i) = name.rfind("_lod").or_else(|| name.rfind("_slod")).filter(|i| name[*i + 1..].trim_start_matches("slod").trim_start_matches("lod").chars().all(|c| c.is_ascii_digit())) {
+        (&name[..i], " (LOD)")
+    } else {
+        (name, "")
+    };
+    let words = |s: &str| s.replace('_', " ");
+    let cap = |s: &str| {
+        let mut c = s.chars();
+        c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+    };
+    let body = match cat {
+        Cat::VehicleParts | Cat::Vehicles => {
+            // the longest leading part of the name that is a vehicle with a display name
+            let cut = base.match_indices('_').map(|(i, _)| i).rev().find_map(|i| vehicle(&base[..i]).map(|d| (d, &base[i + 1..])));
+            match cut {
+                Some((d, rest)) => format!("{d} · {}", words(rest)),
+                None => words(base),
+            }
+        }
+        Cat::Weapons | Cat::WeaponParts if base.starts_with("w_") => {
+            let mut p = base[2..].splitn(2, '_');
+            let (kind, rest) = (p.next().unwrap_or(""), p.next().unwrap_or(""));
+            match WEAPON_KINDS.iter().find(|k| k.0 == kind) {
+                Some((_, label)) if !rest.is_empty() => {
+                    // the weapon's own name ends at its first number; a part's slot follows
+                    let toks: Vec<&str> = rest.split('_').collect();
+                    let end = toks.iter().position(|t| t.chars().all(|c| c.is_ascii_digit())).map_or(toks.len(), |i| i + 1);
+                    let own = cap(&toks[..end].join(" "));
+                    if end < toks.len() {
+                        format!("{label}: {own} · {}", toks[end..].join(" "))
+                    } else {
+                        format!("{label}: {own}")
+                    }
+                }
+                _ => words(base),
+            }
+        }
+        Cat::Wheels => match base.split_once('_') {
+            Some(("rim", r)) => format!("Rim: {}", words(r)),
+            Some(("tyre", r)) => format!("Tyre: {}", words(r)),
+            _ => words(base),
+        },
+        _ => words(base),
+    };
+    format!("{body}{detail}")
+}
+
 /// A model name made readable: underscores become spaces and the `_hi`
 /// suffix goes (`prop_bench_01a` -> "prop bench 01a").
 pub fn tidy_name(n: &str) -> String {
@@ -812,5 +886,24 @@ fn refine_vehicles(v: &mut [Item]) {
         if !vehicles.contains(stem) {
             it.cat = Cat::VehicleParts;
         }
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    #[test]
+    fn derived_names() {
+        let veh = |v: &str| (v == "buffalo6").then(|| "Bravado '19 Buffalo".to_string());
+        assert_eq!(derived_name("buffalo6_spoiler_03_hi", Cat::VehicleParts, &veh), "Bravado '19 Buffalo · spoiler 03");
+        assert_eq!(derived_name("comet7_spoiler_histr_37", Cat::VehicleParts, &veh), "comet7 spoiler histr 37");
+        assert_eq!(derived_name("w_pi_duke_01_hi", Cat::Weapons, &veh), "Pistol: Duke 01");
+        assert_eq!(derived_name("w_pi_duke_01_barrel_02", Cat::WeaponParts, &veh), "Pistol: Duke 01 · barrel 02");
+        assert_eq!(derived_name("w_xx_thing", Cat::Weapons, &veh), "w xx thing");
+        assert_eq!(derived_name("rim_uni_10_sports_003_hi", Cat::Wheels, &veh), "Rim: uni 10 sports 003");
+        assert_eq!(derived_name("prop_am_bench_01a_mid", Cat::Props, &veh), "prop am bench 01a (mid detail)");
+        assert_eq!(derived_name("lo_rvr_bridge_slod2", Cat::Buildings, &veh), "lo rvr bridge (LOD)");
+        assert_eq!(derived_name("veg_tree_slodge", Cat::Vegetation, &veh), "veg tree slodge");
     }
 }
