@@ -278,6 +278,11 @@ pub struct ExportOptions {
     /// dirt, blood) from `ped-variations`.
     #[serde(default)]
     pub tex_remap: std::collections::HashMap<u64, u64>,
+    /// Ped clothing tints by drawable name (`outfit --tint`, from
+    /// `ped-variations`): palette name hash and the rows of tint 0, 1, 2.
+    /// Parts without one are shaded grey (`pedtint`).
+    #[serde(default)]
+    pub ped_tints: std::collections::HashMap<String, (u32, [u8; 3])>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -350,6 +355,8 @@ struct ShaderTextures {
     base_alpha: Option<[u8; 2]>,
     /// The model's tint palette (sRGB RGBA8), indexed by vertex colour blue.
     tint_palette: Option<Vec<[u8; 4]>>,
+    /// Ped clothing colour baked from the shade map (`bake_ped_tint`).
+    ped_tint: Option<serde_json::Value>,
     /// Vehicles: most of the bones this shader's meshes hang on are
     /// interior, lamp or mechanical bones (`NOT_BODY_BONES`), so it is not
     /// body paint. Set once the meshes are decoded.
@@ -479,7 +486,7 @@ fn is_paint(s: &crate::drawable::Shader, st: &ShaderTextures) -> bool {
 
 /// Resolve each shader's texture references in the ttpf stores, write the
 /// decodable ones as shared PNGs, and pick base-colour and normal maps.
-fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resource, embedded: &[texture::TexInfo], model_dir: &Path, o: &ExportOptions) -> Vec<ShaderTextures> {
+fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resource, embedded: &[texture::TexInfo], model_dir: &Path, o: &ExportOptions, part: Option<&str>) -> Vec<ShaderTextures> {
     let set = crate::ttpf::global(&game_root(a));
     // Textures embedded in the model itself (tint palettes), by store key.
     let emb: std::collections::HashMap<u64, &texture::TexInfo> = embedded.iter().filter_map(|t| texture::embedded_hash(r, t).map(|h| (h, t))).collect();
@@ -637,6 +644,12 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
             if st.normal.is_none() {
                 st.normal = normal_fallback;
             }
+            if st.base.is_none() && o.png {
+                if let Some((p, rec)) = bake_ped_tint(&st, part, o, &tdir, &game_root(a)) {
+                    st.base = Some(uri_of(&p));
+                    st.ped_tint = Some(rec);
+                }
+            }
             st
         })
         .collect();
@@ -697,6 +710,61 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
         }
     }
     out
+}
+
+/// Ped clothing without a colour texture: colour its shade map (slot
+/// `739e3d0d`: R = 255, G = shade, alpha about 127) through the part's tint
+/// palette row (`ExportOptions::ped_tints`, tint 0), or as grey when the
+/// part has no tint. Writes `<shade>_tint_<palette>_<row>.png` or
+/// `<shade>_shade.png` next to the store textures; returns its path and the
+/// model.json record.
+fn bake_ped_tint(st: &ShaderTextures, part: Option<&str>, o: &ExportOptions, tdir: &Path, game: &Path) -> Option<(PathBuf, serde_json::Value)> {
+    let e = st.entries.iter().find(|e| e["param_hash"] == crate::pedtint::SHADE_PARAM && e["status"].as_str().is_some_and(|x| x.starts_with("ok")))?;
+    let m: [f64; 4] = serde_json::from_value(e["mean_rgba"].clone()).ok()?;
+    if m[0] < 240.0 || !(96.0..=160.0).contains(&m[3]) {
+        return None;
+    }
+    let shade = o.out.join(e["png"].as_str()?);
+    let stem = shade.file_stem()?.to_string_lossy().to_string();
+    let tint = part.and_then(|p| o.ped_tints.get(p)).copied();
+    let pals = tint.map(|_| crate::pedtint::palettes(game));
+    let pal = match (tint, &pals) {
+        (Some((h, r)), Some(Ok(ps))) if r[0] != 255 => ps.get(&h).map(|p| (p, r[0])),
+        _ => None,
+    };
+    let p = tdir.join(match (tint, pal) {
+        (Some((h, r)), Some(_)) => format!("{stem}_tint_{h:08x}_{:02x}.png", r[0]),
+        _ => format!("{stem}_shade.png"),
+    });
+    if !p.exists() {
+        let img = image::open(&shade).ok()?.to_rgba8();
+        let (w, h) = img.dimensions();
+        let tmp = p.with_extension(format!("{:?}.tmp.png", std::thread::current().id()).replace(['(', ')'], ""));
+        texture::save_png(&tmp, &crate::pedtint::bake(img.as_raw(), pal), w, h).ok()?;
+        fs::rename(&tmp, &p).ok()?;
+    }
+    let mut rec = serde_json::json!({"shade_texture": e["png"], "png": rel(&o.out, &p)});
+    match (tint, pal) {
+        (Some((h, r)), Some((pl, _))) => {
+            rec["palette"] = format!("{h:08x}").into();
+            rec["palette_name"] = crate::pedtint::palette_name(h).into();
+            rec["rows"] = serde_json::json!(r);
+            rec["mid_colour"] = serde_json::json!(pl.sample(r[0], 128));
+            rec["applied"] = "base colour = palette row tint 0 at the shade map's G (texel 2 + G * 53 / 255); tint 1 and 2 (rows[1], rows[2]) are not applied: how the R and B channels select them is not decoded".into();
+        }
+        (Some((h, r)), None) => {
+            rec["palette"] = format!("{h:08x}").into();
+            rec["rows"] = serde_json::json!(r);
+            rec["applied"] = match &pals {
+                Some(Err(err)) => format!("grey shade only: palettes not loaded ({err})"),
+                _ if r[0] == 255 => "grey shade only: tint 0 is off (255)".to_string(),
+                _ => "grey shade only: this palette is not in textures.rpf's ped tint dictionary".to_string(),
+            }
+            .into();
+        }
+        _ => rec["applied"] = "grey shade only: no tint for this part (outfit --tint, from ped-variations); in game the colour comes from a tint palette".into(),
+    }
+    Some((p, rec))
 }
 
 fn rel(out: &Path, p: &Path) -> String {
@@ -1018,7 +1086,7 @@ pub(crate) struct BuiltDrawable {
 /// (`drawable::select_member`), so geometries outside its models are left out.
 pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &crate::drawable::DrawableInfo, dir: &Path, member: bool, o: &ExportOptions, item: &mut ExportedItem) -> BuiltDrawable {
     let head = head_skin_shaders(a, e, &info.shaders, o, item).or_else(|| part_skin_shaders(a, e, &info.shaders, item));
-    let shader_tex = link_textures(a, head.as_ref().map_or(&info.shaders[..], |h| &h.0[..]), r, &info.embedded_textures, dir, o);
+    let shader_tex = link_textures(a, head.as_ref().map_or(&info.shaders[..], |h| &h.0[..]), r, &info.embedded_textures, dir, o, e.name.as_deref());
     let slice = |i: usize| {
         let b = &info.buffers[i];
         let end = (b.gfx_off + b.bytes).min(r.gfx.len() as u64) as usize;
@@ -1171,6 +1239,9 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         },
         extras: {
             let mut x = serde_json::json!({"shader_name_hash": s.name_hash, "shader_name": crate::names::shader(&s.name_hash), "classification": classify_shader(s, st), "textures": st.entries, "texture_fallback": st.fallback});
+            if let Some(t) = &st.ped_tint {
+                x["ped_tint"] = t.clone();
+            }
             if let Some(l) = crate::material::multilayer(s, &st.entries, || material_uv_fit(&lod_groups, si)) {
                 x["multilayer"] = l;
             }
@@ -2803,7 +2874,7 @@ mod dictionary_tests {
         let a = ArchiveInfo { id: "levels.rpf".into(), path: work.join("levels.rpf"), size: archive.len() as u64, container: "rpf9".into() };
         fs::write(&a.path, archive).unwrap();
         let o = ExportOptions { out: work.join("out"), png: false, dds: false, raw: false,
-            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default() };
+            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default() };
         let dir = o.out.join("models/levels").join(export_base_name(&e));
         fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("model.json");

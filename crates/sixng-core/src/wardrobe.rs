@@ -48,6 +48,35 @@ pub struct Part {
     /// (`AM_Dirtdefinition_BloodEffect`) …
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub tags: BTreeMap<String, Vec<String>>,
+    /// Clothing colour (`pedtint`): the palette and tint rows the item or a
+    /// parent sets; none when no item of the chain stores one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tint: Option<PartTint>,
+}
+
+/// A part's tint, for `outfit --tint <drawable>=<spec>`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PartTint {
+    /// `<palette hex>:<row 0>.<row 1>.<row 2>`.
+    pub spec: String,
+    pub palette: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub palette_name: Option<&'static str>,
+    /// Rows of tint 0, 1, 2 (255 = off); the export applies tint 0.
+    pub rows: [u8; 3],
+    /// The item of the chain that set the bytes.
+    pub from_item: String,
+    /// That item names no palette, so the default one is used.
+    pub default_palette: bool,
+}
+
+/// The tint of an item chain (item first, then parents).
+pub fn chain_tint(chain: &[&Value]) -> Option<PartTint> {
+    let f = crate::meta7a::field_name;
+    let u = |c: &Value, h: u32| c[f(h)].as_u64().unwrap_or(0);
+    let items: Vec<crate::pedtint::ChainItem> = chain.iter().map(|c| (u(c, 0x6512_1749) as u32, u(c, 0x5ecf_9331) as u32, [0xc4d7_5d79, 0xf4fb_3dec, 0xab5d_2a85].map(|h| u(c, h).min(255) as u8))).collect();
+    let t = crate::pedtint::resolve(&items)?;
+    Some(PartTint { spec: t.spec(), palette: format!("{:08x}", t.palette), palette_name: crate::pedtint::palette_name(t.palette), rows: t.rows, from_item: format!("{:08x}", t.item), default_palette: t.default_palette })
 }
 
 /// Resolve a tag map (`12f85293`) into `out`: key hex -> resolved values.
@@ -193,7 +222,8 @@ pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers,
             }
             let mut tg = BTreeMap::new();
             chain.iter().rev().for_each(|c| tag_words(c, pre, &mut tg));
-            parts.push(Part { item: format!("{:08x}", it[f(0x6512_1749)].as_u64().unwrap_or(0)), category, name: name.map(|p| p.0.clone()), drawable, tex_remap, tags: tg });
+            let tint = chain_tint(&chain);
+            parts.push(Part { item: format!("{:08x}", it[f(0x6512_1749)].as_u64().unwrap_or(0)), category, name: name.map(|p| p.0.clone()), drawable, tex_remap, tags: tg, tint });
         }
         let mut tags = BTreeMap::new();
         tag_words(&v, pre, &mut tags);
@@ -204,6 +234,16 @@ pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chain_tint_reads_the_item_fields() {
+        let f = crate::meta7a::field_name;
+        let item = |id: u64, pal: u64, t: [u64; 3]| serde_json::json!({f(0x6512_1749): id, f(0x5ecf_9331): pal, f(0xc4d7_5d79): t[0], f(0xf4fb_3dec): t[1], f(0xab5d_2a85): t[2]});
+        let (leaf, base) = (item(0xaf83_57ac, 0, [255; 3]), item(0x3274_9a86, 0xa7c8_d8e0, [0, 156, 6]));
+        let t = super::chain_tint(&[&leaf, &base]).unwrap();
+        assert_eq!((t.spec.as_str(), t.palette_name, t.from_item.as_str(), t.default_palette), ("a7c8d8e0:0.156.6", Some("ped_tint_generic_clean"), "32749a86", false));
+        assert!(super::chain_tint(&[&leaf]).is_none());
+    }
+
     #[test]
     fn pick_prefers_most_textures_then_full() {
         let c = [("top_fr1_000_cull_00".to_string(), 3), ("top_fr1_000_full".to_string(), 3), ("brows_mi1_000_full".to_string(), 1)].into_iter().collect();

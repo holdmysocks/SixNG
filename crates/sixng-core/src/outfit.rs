@@ -573,7 +573,7 @@ mod tests {
         let parts = outfit_parts(&ix, "player_story000_00");
         assert!(parts.len() >= 5, "{} parts", parts.len());
         let out = std::env::temp_dir().join("sixng_outfit_real").join("outfit.glb");
-        let o = ExportOptions { out: out.parent().unwrap().into(), png: false, dds: false, raw: false, force: true, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default() };
+        let o = ExportOptions { out: out.parent().unwrap().into(), png: false, dds: false, raw: false, force: true, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default() };
         let r = export_outfit(&a, &parts, "player_story000_00", &out, &o, &[(&d, clip)], false).unwrap();
         println!("{}", serde_json::to_string_pretty(&r).unwrap());
         assert_eq!(r["unresolved_influences"], 0);

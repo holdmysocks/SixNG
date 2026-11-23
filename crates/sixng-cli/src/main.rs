@@ -153,7 +153,7 @@ impl OutArgs {
                     std::process::exit(2);
                 }
             }),
-            tex_remap: Default::default(),
+            tex_remap: Default::default(), ped_tints: Default::default(),
         }
     }
 }
@@ -545,7 +545,7 @@ enum Cmd {
         #[arg(default_value = "levels")]
         archive: String,
     },
-    /// Ped wardrobe variations (packs.rpf meta resources with struct f795e8ba, one per ped model): per variation its parts (slot, name, drawable), as JSON. Drawables are found through the item's textures, so run `texture-users` first. A variation is a clothing set or a head set (head, eyes, teeth); a full look is one of each. `parts` and `tex_remap` per variation are ready for `outfit <name> --parts … --tex-remap …` (the remap carries the item textures that differ from the drawable's own). `listed` is the model's variation list entry (model hash, outfit type, body scale): the clothing sets the game picks from; head sets are not listed and pair with any of them. `dirt` holds the variation's dirt or blood preset from common.rpf (colour, dirt-mask channels, cloth and skin strengths), which the game applies at run time and the export does not.
+    /// Ped wardrobe variations (packs.rpf meta resources with struct f795e8ba, one per ped model): per variation its parts (slot, name, drawable), as JSON. Drawables are found through the item's textures, so run `texture-users` first. A variation is a clothing set or a head set (head, eyes, teeth); a full look is one of each. `parts`, `tex_remap` and `tints` per variation are ready for `outfit <name> --parts … --tex-remap … --tint …` (the remap carries the item textures that differ from the drawable's own; `tints` the clothing colour each part's item stores: tint palette and rows, also per item as `tint`; parts whose items store none are left out). `listed` is the model's variation list entry (model hash, outfit type, body scale): the clothing sets the game picks from; head sets are not listed and pair with any of them. `dirt` holds the variation's dirt or blood preset from common.rpf (colour, dirt-mask channels, cloth and skin strengths), which the game applies at run time and the export does not.
     PedVariations {
         /// Resource offsets (hex) or entry ids, e.g. 2b21010
         #[arg(required = true)]
@@ -670,6 +670,12 @@ enum Cmd {
         /// `ped-variations` lists them (`tex_remap`).
         #[arg(long, value_delimiter = ',')]
         tex_remap: Vec<String>,
+        /// Clothing colours, `<drawable>=<palette hex>:<row0>.<row1>.<row2>`,
+        /// comma separated, as `ped-variations` lists them (`tints`): the
+        /// part's shade map is coloured through that tint palette row
+        /// (tint 0). Parts without one are shaded grey.
+        #[arg(long, value_delimiter = ',')]
+        tint: Vec<String>,
     },
     /// Characters and animals that `outfit` can assemble: named characters
     /// (outfit prefixes such as cs_ali, sc_slow_demon) and animal roots
@@ -902,7 +908,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 out.print(&json!({"ok": true, "results": v}));
             }
         }
-        Cmd::Outfit { character, out: glb, archive, parts, add, list, clip, anim_only, tex, body_shape, head_skin, tex_remap } => {
+        Cmd::Outfit { character, out: glb, archive, parts, add, list, clip, anim_only, tex, body_shape, head_skin, tex_remap, tint } => {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
             let prefix = character.to_ascii_lowercase();
@@ -977,6 +983,10 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 let (k, v) = kv.split_once('=').ok_or_else(|| anyhow!("--tex-remap wants old=new, got {kv:?}"))?;
                 let hex = |s: &str| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).map_err(|_| anyhow!("--tex-remap: bad hash {s:?}"));
                 eo.tex_remap.insert(hex(k)?, hex(v)?);
+            }
+            for t in tint {
+                let (name, pal, rows) = sixng_core::pedtint::parse_spec(t).map_err(|e| anyhow!(e))?;
+                eo.ped_tints.insert(name, (pal, rows));
             }
             let mut r = sixng_core::outfit::export_outfit(&a, &sel, &prefix, &glb, &eo, &clip_refs, *anim_only)?;
             r["seconds"] = t.elapsed().as_secs_f64().into();
@@ -1677,9 +1687,11 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                         let mut d: Vec<&str> = v.parts.iter().filter_map(|p| p.drawable.as_deref()).collect();
                         d.dedup();
                         let remap: Vec<String> = v.parts.iter().flat_map(|p| p.tex_remap.iter().map(|(a, b)| format!("{a}={b}"))).collect();
+                        let mut tints: Vec<String> = v.parts.iter().filter_map(|p| Some(format!("{}={}", p.drawable.as_deref()?, p.tint.as_ref()?.spec))).collect();
+                        tints.dedup();
                         let dv: serde_json::Map<String, serde_json::Value> = v.parts.iter().flat_map(|p| p.tags.values().flatten()).filter_map(|w| dirt.get(w).map(|d| (w.clone(), d.clone()))).collect();
                         let listed = u32::from_str_radix(&v.id, 16).ok().and_then(|i| lists.get(&i)).map(|&(m, c, s)| json!({"model": format!("{m:08x}"), "outfit_type": format!("{c:08x}"), "scale": s}));
-                        json!({"id": v.id, "scale": v.scale, "listed": listed, "tags": v.tags, "parts": d.iter().map(|n| format!("^{n}$")).collect::<Vec<_>>().join(","), "tex_remap": remap.join(","), "dirt": dv, "items": v.parts})
+                        json!({"id": v.id, "scale": v.scale, "listed": listed, "tags": v.tags, "parts": d.iter().map(|n| format!("^{n}$")).collect::<Vec<_>>().join(","), "tex_remap": remap.join(","), "tints": tints.join(","), "dirt": dv, "items": v.parts})
                     })
                     .collect();
                 res.insert(e.id.clone(), json!(vs));
