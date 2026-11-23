@@ -27,7 +27,9 @@ use std::path::{Path, PathBuf};
 pub const DERIVED_EXACT: &[&str] = &["fMass", "fInitialDragCoeff", "fDriveBiasFront", "fDriveBiasRear", "fBrakeForce", "fHandBrakeForce", "fSteeringLock", "fLowSpeedTractionLossMult", "fSuspensionCompDamp", "fSuspensionReboundDamp", "fSuspensionUpperLimit", "fSuspensionLowerLimit", "fSuspensionRaise", "fAntiRollBarForce", "fCollisionDamageMult", "fWeaponDamageMult", "fDeformationDamageMult", "fEngineDamageMult", "fPetrolTankVolume", "fOilVolume", "fPetrolConsumptionRate", "fStoppieBalancePoint", "fWheelieBalancePoint", "fBackEndPopUpBuildingImpulseMult", "fBackEndPopUpCarImpulseMult", "fBackEndPopUpMaxDeltaSpeed", "fSideSlipMult", "fPitchMult", "fYawMult", "fRollMult", "fLiftMult", "fMoveRes", "fThrust", "fThrustFallOff", "fWeaponDamageScaledToVehHealthMult", "fWheelMass", "fGearRatios", "fFinalDriveRatio", "Wheels", "Lights", "Sirens", "modelName", "metallic", "colors", "Color", "Name", "Type", "Key", "Item", "Flags", "Value", "Data", "Items", "Index", "Entries", "Count", "dirtLevelMax", "gameName", "buoyancySphereOffset", "minSeatHeight", "envEffScaleMin", "NmBraceOverrideSet", "layout", "type", "frequency", "plateType", "audioNameHash", "animConvRoofWindowsAffected", "vehicleMakeName", "damageMapScale", "bumpersNeedToCollideWithMap", "AllowJoyriding", "maxNum", "pretendOccupantsScale", "animConvRoofName", "animConvRoofDictName", "explosionInfo", "wheelScaleRear", "dirtLevelMin", "vehicleClass", "swankness", "needsRopeTexture", "ptfxAssetName", "wheelScale", "vfxInfoName", "visibleSpawnDistScale", "wheelType", "rewards", "envEffScaleMin2", "doorsWithCollisionWhenClosed", "defaultBodyHealth", "envEffScaleMax", "lodDistances", "txdName", "AllowSundayDriving", "driveableDoors", "HDTextureDist", "envEffScaleMax2", "steerWheelMult", "buoyancySphereSizeScale", "weaponForceMult", "pOverrideRagdollThreshold", "identicalModelSpawnDistance", "maxNumOfSameColor", "handlingId", "damageOffsetScale",
     // map, light, vehicle, handling and material fields resolved against the
     // hashes in the format notes
-    "timeFlags", "lightType", "handling", "slots", "options", "probability", "ParentName", "HandlingData", "StateName"];
+    "timeFlags", "lightType", "handling", "slots", "options", "probability", "ParentName", "HandlingData", "StateName",
+    // script-doc fields (01393259 element / attribute) and the head-skin States list; joaat of the name, 2026-11-23
+    "valueHash", "contentType", "childIndex", "States"];
 
 pub const DERIVED: &[&str] = &[
     // texture parameters of the minigame pack's water and interior shaders (joaat search, 2026-11-23)
@@ -323,7 +325,12 @@ mod tests {
         assert_eq!(joaat_exact("ParentName"), 0x49a0_1a86);
         assert_eq!(joaat_exact("HandlingData"), 0x41c8_dec7);
         assert_eq!(joaat_exact("StateName"), 0x3ead_dcd7);
+        assert_eq!(joaat_exact("valueHash"), 0x817e_d7a4);
+        assert_eq!(joaat_exact("contentType"), 0x2a8e_416f);
+        assert_eq!(joaat_exact("childIndex"), 0x0129_6aed);
+        assert_eq!(joaat_exact("States"), 0xebac_f18c);
         assert_eq!(lookup(0x49a0_1a86, Ctx::Field).as_deref(), Some("ParentName"));
+        assert_eq!(lookup(0x817e_d7a4, Ctx::Field).as_deref(), Some("valueHash"));
         // derived names resolve without a dictionary file
         assert_eq!(lookup(0xc8e8_c282, Ctx::Param).as_deref(), Some("diffusetex"));
     }

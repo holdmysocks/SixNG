@@ -62,7 +62,7 @@ const FAMILIES: &[(&str, &str, &str)] = &[
     ("b217b263", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
     // other
     ("255417c3", "cutout", "vegetation"),
-    ("e05f1a42", "decal", "road signs"),
+    ("e05f1a42", "decal", "road signs (distance_map)"),
     ("89a1cf72", "opaque", "ped head / skin"),
     ("379efcef", "opaque", "ped eyes"),
 ];
