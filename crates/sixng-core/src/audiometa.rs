@@ -94,6 +94,11 @@ pub struct Object {
     /// Sound files: the bytes after the header (hex), when the header decodes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// Decoded class fields where the layout is known (class 16: three name
+    /// hashes, the slot bit count and mask, a value and the child slots,
+    /// which are all empty (0xff) in the files: filled at run time).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fields: Option<serde_json::Value>,
 }
 
 /// Classes of the sound files that have no sound header.
@@ -243,7 +248,7 @@ pub fn parse_with(b: &[u8], streams: Option<&std::collections::HashSet<u32>>) ->
         .iter()
         .map(|&(h, o)| {
             let next = offs.iter().find(|&&x| x > o).copied().unwrap_or(data_len);
-            Object { hash: format!("{h:08x}"), offset: o, size: next - o, class: b[8 + o as usize], wave: None, children: Vec::new(), refs: Vec::new(), streams: Vec::new(), header: None, body: None }
+            Object { hash: format!("{h:08x}"), offset: o, size: next - o, class: b[8 + o as usize], wave: None, children: Vec::new(), refs: Vec::new(), streams: Vec::new(), header: None, body: None, fields: None }
         })
         .collect();
     let mut objects = objects;
@@ -283,6 +288,20 @@ pub fn parse_with(b: &[u8], streams: Option<&std::collections::HashSet<u32>>) ->
                     _ => &[],
                 };
                 let mut kids: Vec<u32> = Vec::new();
+                if o.class == 16 && body.len() >= 23 {
+                    let c = body.len().checked_sub(1).and_then(|_| (0..=40usize).find(|&c| body.len() >= c + 2 && body[body.len() - c - 1] as usize == c && body[body.len() - c - 2] == 2));
+                    if let Some(c) = c {
+                        let h = |p: usize| format!("{:08x}", u32at(body, p));
+                        o.fields = Some(serde_json::json!({
+                            "k": body[1],
+                            "hashes": [h(2), h(6), h(10)],
+                            "bits": body[14],
+                            "mask": h(15),
+                            "value": u32at(body, 19),
+                            "slots": body[body.len() - c..].iter().map(|&x| if x == 0xff { serde_json::Value::Null } else { serde_json::json!(x) }).collect::<Vec<_>>(),
+                        }));
+                    }
+                }
                 if o.class == 24 {
                     // a count byte, then that many refs, at the end of the body
                     if let Some(n) = (1..=64usize).find(|&n| body.len() > 4 * n && body[body.len() - 4 * n - 1] as usize == n) {
