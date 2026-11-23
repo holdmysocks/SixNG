@@ -88,6 +88,61 @@ pub struct Loaded {
     pub look: Option<LookInfo>,
 }
 
+/// A character's pose: angles in degrees on the main bones of the shared
+/// skeleton. Zero everywhere is the stored pose (arms out).
+#[derive(Clone, Copy, Default, PartialEq)]
+pub struct PedPose {
+    /// Per arm (left, right): raise (+ up, - down), swing (+ forward).
+    pub arm: [[f32; 2]; 2],
+    pub elbow: [f32; 2],
+    /// Per leg (left, right): lift (+ forward), spread (+ outward).
+    pub leg: [[f32; 2]; 2],
+    pub knee: [f32; 2],
+    /// Bend forward, twist to the left, lean to the left.
+    pub spine: [f32; 3],
+    /// Nod down, turn to the left, tilt to the left.
+    pub head: [f32; 3],
+}
+
+impl PedPose {
+    pub const PRESETS: &'static [&'static str] = &["rest", "arms down", "walk", "sit", "wave"];
+
+    pub fn preset(name: &str) -> Option<PedPose> {
+        // the stored pose already holds the arms about 35 degrees down and a little forward
+        let down = [-52.0, -12.0];
+        Some(match name {
+            "rest" => PedPose::default(),
+            "arms down" | "down" => PedPose { arm: [down, down], elbow: [8.0, 8.0], ..Default::default() },
+            "walk" => PedPose { arm: [[-52.0, 16.0], [-52.0, -36.0]], elbow: [22.0, 12.0], leg: [[-18.0, 0.0], [26.0, 0.0]], knee: [28.0, 8.0], spine: [3.0, 0.0, 0.0], ..Default::default() },
+            "sit" => PedPose { arm: [[-48.0, 6.0], [-48.0, 6.0]], elbow: [48.0, 48.0], leg: [[86.0, 6.0], [86.0, 6.0]], knee: [88.0, 88.0], ..Default::default() },
+            "wave" => PedPose { arm: [down, [38.0, 10.0]], elbow: [8.0, 96.0], head: [0.0, -8.0, 0.0], ..Default::default() },
+            _ => return None,
+        })
+    }
+
+    /// Bone name and rotation in model axes (x to the character's left, y up,
+    /// z forward; degrees about x, y, z) for every bone the pose turns.
+    fn bones(&self) -> Vec<(String, [f32; 3])> {
+        let mut v = Vec::new();
+        for (i, s) in ["L", "R"].iter().enumerate() {
+            // the left arm points along +x, the right along -x
+            let sg = if i == 0 { 1.0 } else { -1.0 };
+            v.push((format!("SKEL_{s}_UpperArm"), [0.0, -sg * self.arm[i][1], sg * self.arm[i][0]]));
+            v.push((format!("SKEL_{s}_Forearm"), [0.0, -sg * self.elbow[i], 0.0]));
+            v.push((format!("SKEL_{s}_Thigh"), [-self.leg[i][0], 0.0, sg * self.leg[i][1]]));
+            v.push((format!("SKEL_{s}_Calf"), [self.knee[i], 0.0, 0.0]));
+        }
+        for b in ["SKEL_Spine1", "SKEL_Spine2", "SKEL_Spine3", "SKEL_Spine4"] {
+            v.push((b.to_string(), [self.spine[0] / 4.0, self.spine[1] / 4.0, -self.spine[2] / 4.0]));
+        }
+        for b in ["SKEL_Neck1", "SKEL_Head"] {
+            v.push((b.to_string(), [self.head[0] / 2.0, self.head[1] / 2.0, -self.head[2] / 2.0]));
+        }
+        v.retain(|x| x.1 != [0.0; 3]);
+        v
+    }
+}
+
 /// A character's outfits, for the Parts panel.
 #[derive(Clone, Default)]
 pub struct LookInfo {
@@ -309,6 +364,11 @@ pub struct ModelView {
     last_shot: Option<String>,
     pub zoom_after_load: Option<f32>,
     keep_cam_once: bool,
+    /// Head bone matrix the hair models were last placed with, and how many.
+    hair_head: Option<Mat4>,
+    hair_head_n: usize,
+    /// Pose of the character shown (degrees), see `PedPose`.
+    pub ped_pose: PedPose,
     /// Body shape of the character shown (`BODY_SHAPE` when it was loaded).
     body_shape_shown: (f32, f32),
     pub wheels_on: bool,
@@ -579,6 +639,9 @@ impl ModelView {
             last_shot: None,
             zoom_after_load: None,
             keep_cam_once: false,
+            hair_head: None,
+            hair_head_n: 0,
+            ped_pose: PedPose::default(),
             body_shape_shown: (0.0, 0.0),
             wheels_on: true,
             wheel_rim: "rim_muscle_001_hi".into(),
@@ -1103,6 +1166,47 @@ impl ModelView {
             self.body_shape_shown = shape;
             reload = reload.or_else(|| Some(self.query.clone()));
         }
+        egui::CollapsingHeader::new("Pose").default_open(true).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for name in PedPose::PRESETS {
+                    if ui.button(*name).clicked() {
+                        self.ped_pose = PedPose::preset(name).unwrap_or_default();
+                    }
+                }
+            });
+            let p = &mut self.ped_pose;
+            let pair = |ui: &mut egui::Ui, label: &str, a: &mut f32, b: &mut f32, lo: f32, hi: f32| {
+                ui.label(label);
+                ui.add(egui::DragValue::new(a).range(lo..=hi).speed(1.0).suffix("°").prefix("L "));
+                ui.add(egui::DragValue::new(b).range(lo..=hi).speed(1.0).suffix("°").prefix("R "));
+                ui.end_row();
+            };
+            egui::Grid::new("pose_grid").num_columns(3).show(ui, |ui| {
+                let [al, ar] = &mut p.arm;
+                pair(ui, "arm raise", &mut al[0], &mut ar[0], -90.0, 90.0);
+                pair(ui, "arm swing", &mut al[1], &mut ar[1], -90.0, 120.0);
+                let [el, er] = &mut p.elbow;
+                pair(ui, "elbow", el, er, 0.0, 140.0);
+                let [ll, lr] = &mut p.leg;
+                pair(ui, "leg lift", &mut ll[0], &mut lr[0], -45.0, 110.0);
+                pair(ui, "leg spread", &mut ll[1], &mut lr[1], -20.0, 60.0);
+                let [kl, kr] = &mut p.knee;
+                pair(ui, "knee", kl, kr, 0.0, 140.0);
+            });
+            ui.horizontal(|ui| {
+                ui.label("spine");
+                ui.add(egui::DragValue::new(&mut p.spine[0]).range(-40.0..=80.0).suffix("°").prefix("bend "));
+                ui.add(egui::DragValue::new(&mut p.spine[1]).range(-60.0..=60.0).suffix("°").prefix("twist "));
+                ui.add(egui::DragValue::new(&mut p.spine[2]).range(-40.0..=40.0).suffix("°").prefix("lean "));
+            });
+            ui.horizontal(|ui| {
+                ui.label("head");
+                ui.add(egui::DragValue::new(&mut p.head[0]).range(-50.0..=60.0).suffix("°").prefix("nod "));
+                ui.add(egui::DragValue::new(&mut p.head[1]).range(-80.0..=80.0).suffix("°").prefix("turn "));
+                ui.add(egui::DragValue::new(&mut p.head[2]).range(-40.0..=40.0).suffix("°").prefix("tilt "));
+            });
+            ui.label(egui::RichText::new("Angles on the main bones of the shared skeleton; zero is the stored pose. Drag a value or type it.").weak().small());
+        });
         for n in &look.notes {
             ui.label(egui::RichText::new(n).weak().small());
         }
@@ -2232,6 +2336,18 @@ impl ModelView {
                 swing.insert(p.joint, m);
             }
         }
+        // characters: the pose turns its bones about the model's axes
+        if l.look.is_some() && self.ped_pose != PedPose::default() {
+            for (name, deg) in self.ped_pose.bones() {
+                let Some(i) = js.iter().position(|j| j.name == name) else { continue };
+                // the bone's bind orientation in model space
+                let (_, qw, _) = Mat4::from_cols_array(&js[i].ibm).inverse().to_scale_rotation_translation();
+                let r = Quat::from_rotation_y(deg[1].to_radians()) * Quat::from_rotation_z(deg[2].to_radians()) * Quat::from_rotation_x(deg[0].to_radians());
+                let turn = Mat4::from_quat(qw.inverse() * r * qw);
+                let m = swing.get(&i).map_or(turn, |m| *m * turn);
+                swing.insert(i, m);
+            }
+        }
         let mut global: Vec<Option<Mat4>> = vec![None; js.len()];
         fn g(
             i: usize,
@@ -2607,6 +2723,17 @@ impl ModelView {
         }
         self.update_hair(rs, &ctx);
         let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+        // a character's hair, brows and beard ride on the head bone
+        if let Some(l) = self.loaded.as_ref().filter(|l| l.look.is_some()) {
+            let head = l.model.joints.iter().position(|j| j.name == "SKEL_Head").and_then(|i| skin.get(i)).copied().unwrap_or(Mat4::IDENTITY);
+            if self.hair_head != Some(head) || self.hair.gpu.len() != self.hair_head_n {
+                for g in self.hair.gpu.iter_mut() {
+                    ren.set_instances(rs, g, &[crate::render3d::Instance::new(head, false)]);
+                }
+                self.hair_head = Some(head);
+                self.hair_head_n = self.hair.gpu.len();
+            }
+        }
         let mut models: Vec<&GpuModel> = self.gpu.iter().collect();
         if show_wheels {
             models.extend(self.wheels.iter());
@@ -3371,6 +3498,9 @@ fn load_parts(
     let mut skin_meshes: Vec<std::ops::Range<usize>> = Vec::new();
     let mut cover_meshes: Vec<std::ops::Range<usize>> = Vec::new();
     let mut heel_meshes: Vec<std::ops::Range<usize>> = Vec::new();
+    // per outfit part: its meshes, its joint list and the joint an attached
+    // accessory was moved onto
+    let mut rig_parts: Vec<(std::ops::Range<usize>, Vec<glb::Joint>, Option<usize>)> = Vec::new();
     let mut under_meshes: Vec<std::ops::Range<usize>> = Vec::new();
     let mut outer_meshes: Vec<std::ops::Range<usize>> = Vec::new();
     // Body shape: the skin and head are posed by the game's rig; clothes
@@ -3409,9 +3539,10 @@ fn load_parts(
                 if first.is_empty() {
                     first = lods;
                 }
+                let mut attached = None;
                 if let Some(f) = f {
                     if !f.skeletal {
-                        place_attached(&mut m);
+                        attached = place_attached(&mut m);
                         if let Some(w) = &wrap {
                             w.apply(&mut m);
                         }
@@ -3453,6 +3584,9 @@ fn load_parts(
                 }
                 if f.is_some_and(|f| f.covers) {
                     cover_meshes.push(mesh0..mesh0 + m.meshes.len());
+                }
+                if f.is_some() {
+                    rig_parts.push((mesh0..mesh0 + m.meshes.len(), m.joints.iter().map(|j| glb::Joint { name: j.name.clone(), parent: j.parent, local: j.local, ibm: j.ibm }).collect(), attached));
                 }
                 match f.map_or(0, |f| f.layer) {
                     1 => under_meshes.push(mesh0..mesh0 + m.meshes.len()),
@@ -3510,6 +3644,11 @@ fn load_parts(
             notes.push(format!("Layers: {hidden} triangles of the clothes worn under the jacket are hidden where the jacket covers them, so they do not show through it."));
         }
     }
+    if let (Some(m), false) = (&mut model, rig_parts.is_empty()) {
+        if rig_character(m, &rig_parts, &skin_meshes) {
+            notes.push("Rig: every part is bound to the shared skeleton, so the Pose controls move the body with its clothes. A part's own helper bones follow the body bone they hang from (the game drives them with data that is not decoded), and the first four of a vertex's eight bone weights are used, so joints bend more simply than in the game.".to_string());
+        }
+    }
     if coloured > 0 {
         notes.push(format!("Clothing colours: {coloured} part(s) coloured from the outfit data: the item's stored colour, else row tint 0 of its tint palette (for the generic palette only when it agrees with the item's colour tag), else the colour tag itself (one of 18 words such as navy or khaki, shown in a plain shade of ours). Second and third tints are not applied."));
     }
@@ -3562,10 +3701,10 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path) -> bool {
 /// same in the bind pose, so the part sits on the body in the merged model.
 /// The left one is taken when there are two. Parts modelled in place (their
 /// vertices are near the bones that move them) are left alone.
-fn place_attached(m: &mut glb::Model) {
+fn place_attached(m: &mut glb::Model) -> Option<usize> {
     use glam::{Mat4, Vec3};
     if m.joints.is_empty() || m.meshes.iter().any(|me| !me.skinned) {
-        return;
+        return None;
     }
     let mut used = vec![false; m.joints.len()];
     for v in m.meshes.iter().flat_map(|me| &me.verts) {
@@ -3580,11 +3719,11 @@ fn place_attached(m: &mut glb::Model) {
     let bind = |i: usize| Mat4::from_cols_array(&m.joints[i].ibm).inverse();
     let pos = |i: usize| bind(i).transform_point3(Vec3::ZERO);
     let prefix = |i: usize| m.joints[i].name.split('_').next().unwrap_or("").to_string();
-    let Some(first) = used.iter().position(|u| *u) else { return };
+    let first = used.iter().position(|u| *u)?;
     let pre = prefix(first);
     // every used bone belongs to the accessory (same name prefix)
     if pre.is_empty() || ["SKEL", "BM", "MH", "RB", "PH", "GM", "SEC", "FACIAL"].contains(&pre.as_str()) || (0..used.len()).any(|i| used[i] && prefix(i) != pre) {
-        return;
+        return None;
     }
     // its root: the topmost ancestor with that prefix
     let mut root = first;
@@ -3603,14 +3742,14 @@ fn place_attached(m: &mut glb::Model) {
     };
     let mut attach: Vec<usize> = (0..used.len()).filter(|&i| !used[i] && prefix(i) == pre && !under_root(i)).collect();
     attach.sort_by_key(|&i| (!m.joints[i].name.contains("_L_"), i));
-    let Some(&at) = attach.first() else { return };
+    let &at = attach.first()?;
     let c = (Vec3::from(m.bbox[0]) + Vec3::from(m.bbox[1])) * 0.5;
     if (c - pos(root)).length() > 0.25 || (pos(at) - pos(root)).length() < 0.3 {
-        return;
+        return None;
     }
     let t = bind(at) * bind(root).inverse();
     if !t.is_finite() {
-        return;
+        return None;
     }
     let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
     for me in &mut m.meshes {
@@ -3630,6 +3769,136 @@ fn place_attached(m: &mut glb::Model) {
     if lo.x <= hi.x {
         m.bbox = [lo.to_array(), hi.to_array()];
     }
+    Some(at)
+}
+
+/// Bind every part of an outfit to one skeleton, so the renderer can pose
+/// the whole character. The parts' joint lists all start with the shared
+/// ped skeleton; that prefix becomes the model's skeleton, in its bind pose
+/// (the vertices already hold the body shape). A vertex on a part's own
+/// helper bone goes to the nearest ancestor in the shared skeleton, and an
+/// attached accessory to the bone it was moved onto. Returns whether a
+/// skeleton was found.
+fn rig_character(m: &mut glb::Model, parts: &[(std::ops::Range<usize>, Vec<glb::Joint>, Option<usize>)], skin: &[std::ops::Range<usize>]) -> bool {
+    use glam::Mat4;
+    // the shared skeleton: the shortest full-size joint list, where the
+    // other parts' lists begin with the same names
+    let Some(n) = parts.iter().map(|p| p.1.len()).filter(|&n| n >= 400).min() else { return false };
+    let Some(canon) = parts.iter().find(|p| p.1.len() == n).map(|p| &p.1) else { return false };
+    let mut joints: Vec<glb::Joint> = canon.iter().map(|j| glb::Joint { name: j.name.clone(), parent: j.parent.filter(|&p| p < n), local: j.local, ibm: j.ibm }).collect();
+    // bind pose: local = inverse(parent bind) * bind
+    let bind: Vec<Mat4> = joints.iter().map(|j| Mat4::from_cols_array(&j.ibm).inverse()).collect();
+    for i in 0..n {
+        let local = match joints[i].parent {
+            Some(p) => bind[p].inverse() * bind[i],
+            None => bind[i],
+        };
+        if local.is_finite() {
+            joints[i].local = local.to_cols_array();
+        }
+    }
+    // vertices that hang mostly on a part's own helper bones: (mesh, vertex)
+    let mut helper: Vec<(usize, usize)> = Vec::new();
+    for (range, pj, attached) in parts {
+        let same = pj.len() >= n && (0..n).all(|i| pj[i].name == joints[i].name);
+        if !same {
+            continue;
+        }
+        // joint of this part -> joint of the shared skeleton
+        let up = |mut j: usize| -> u16 {
+            let mut guard = 0;
+            while j >= n && guard < 64 {
+                match pj.get(j).and_then(|x| x.parent) {
+                    Some(p) if p != j => j = p,
+                    _ => return 0,
+                }
+                guard += 1;
+            }
+            j.min(n - 1) as u16
+        };
+        let fixed = attached.map(|a| up(a));
+        for mi in range.clone() {
+            let Some(me) = m.meshes.get_mut(mi) else { continue };
+            for (vi, v) in me.verts.iter_mut().enumerate() {
+                if let Some(a) = fixed {
+                    v.joints = [a, 0, 0, 0];
+                    v.weights = [255, 0, 0, 0];
+                    continue;
+                }
+                let tot: u32 = v.weights.iter().map(|w| *w as u32).sum();
+                if tot == 0 {
+                    // an unskinned vertex stays with the root
+                    v.joints = [0; 4];
+                    v.weights = [255, 0, 0, 0];
+                    continue;
+                }
+                let own: u32 = (0..4).filter(|&k| v.joints[k] as usize >= n).map(|k| v.weights[k] as u32).sum();
+                if own * 2 >= tot {
+                    helper.push((mi, vi));
+                }
+                let mut w: [u32; 4] = std::array::from_fn(|k| v.weights[k] as u32 * 255 / tot);
+                let rest = 255 - w.iter().sum::<u32>();
+                w[0] += rest;
+                for k in 0..4 {
+                    v.joints[k] = if w[k] > 0 { up(v.joints[k] as usize) } else { 0 };
+                    v.weights[k] = w[k] as u8;
+                }
+            }
+            me.skinned = true;
+        }
+    }
+    // Clothing on helper bones takes the bone weights of the nearest skin
+    // vertex (the helper bones are moved by game data that is not decoded,
+    // and the bone they hang from is often the torso, which would leave a
+    // sleeve behind when the arm moves).
+    const CELL: f32 = 0.03;
+    let key = |p: [f32; 3]| ((p[0] / CELL).floor() as i32, (p[1] / CELL).floor() as i32, (p[2] / CELL).floor() as i32);
+    let mut grid: HashMap<(i32, i32, i32), Vec<([f32; 3], [u16; 4], [u8; 4])>> = HashMap::new();
+    let in_skin = |mi: usize| skin.iter().any(|r| r.contains(&mi));
+    for mi in skin.iter().cloned().flatten() {
+        let Some(me) = m.meshes.get(mi).filter(|me| me.skinned) else { continue };
+        for v in &me.verts {
+            grid.entry(key(v.pos)).or_default().push((v.pos, v.joints, v.weights));
+        }
+    }
+    if !grid.is_empty() {
+        for (mi, vi) in helper {
+            if in_skin(mi) {
+                continue;
+            }
+            let Some(v) = m.meshes.get_mut(mi).and_then(|me| me.verts.get_mut(vi)) else { continue };
+            let k = key(v.pos);
+            let mut best: Option<(f32, [u16; 4], [u8; 4])> = None;
+            for r in 1..=5i32 {
+                for x in -r..=r {
+                    for y in -r..=r {
+                        for z in -r..=r {
+                            // only the new shell of cells
+                            if x.abs().max(y.abs()).max(z.abs()) != r && r > 1 {
+                                continue;
+                            }
+                            for (p, j, w) in grid.get(&(k.0 + x, k.1 + y, k.2 + z)).into_iter().flatten() {
+                                let d = (p[0] - v.pos[0]).powi(2) + (p[1] - v.pos[1]).powi(2) + (p[2] - v.pos[2]).powi(2);
+                                if best.is_none_or(|b| d < b.0) {
+                                    best = Some((d, *j, *w));
+                                }
+                            }
+                        }
+                    }
+                }
+                // a hit within the shells searched so far is the nearest
+                if best.is_some_and(|b| b.0.sqrt() <= (r - 1).max(1) as f32 * CELL) {
+                    break;
+                }
+            }
+            if let Some((_, j, w)) = best {
+                v.joints = j;
+                v.weights = w;
+            }
+        }
+    }
+    m.joints = joints;
+    true
 }
 
 /// Hide the skin triangles that lie right under a garment: a skin vertex is

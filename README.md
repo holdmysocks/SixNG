@@ -480,6 +480,19 @@ again**).
   palette (a few hundred, mostly named characters); the others leave the
   colour to the game, so the viewer starts dark and has a colour picker.
   Hats do not flatten the hair.
+- **Pose** (Character panel; `--pose rest|down|walk|sit|wave` for
+  screenshots): every part of a character is bound to the shared ped
+  skeleton, and the panel turns its main bones: arms (raise, swing),
+  elbows, legs (lift, spread), knees, spine (bend, twist, lean) and head
+  (nod, turn, tilt), with five presets. Zero is the stored pose (arms
+  out). Limits: a part's own helper bones are moved in the game by data
+  that is not decoded, so clothing on them takes the bone weights of the
+  nearest skin vertex; the first four of a vertex's eight bone weights are
+  used; twist and muscle helper bones follow their parent rigidly, so
+  shoulders, elbows and knees bend more simply than in the game. Hair,
+  brows and beards ride on the head bone as one piece (no strand
+  simulation). The game's own animation clips are not played on
+  characters in the viewer yet (`sixng outfit --clip` exports them).
 - **Body sliders** (weight −1…1, muscle 0…1; `--body <w>,<m>` for
   screenshots): the skin and head are posed with the game's body-shape rig
   on the shared skeleton. Clothes and accessories follow the skin under

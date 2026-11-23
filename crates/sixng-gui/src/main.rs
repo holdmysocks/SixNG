@@ -1621,6 +1621,10 @@ impl App {
         m.hair.show = !c.has("no-fur");
         m.auto.find_hair = c.has("find-hair");
         m.auto.hair_width = c.f("hair-width");
+        // --pose rest|down|walk|sit|wave: a character's pose
+        if let Some(p) = c.get("pose").and_then(|n| model_view::PedPose::preset(&n.replace('-', " "))) {
+            m.ped_pose = p;
+        }
         m.show_skeleton = c.has("skeleton");
         m.show_normals = c.has("normals");
         m.decal_bias = !c.has("no-decal-bias");
