@@ -1625,6 +1625,22 @@ impl App {
         if let Some(p) = c.get("pose").and_then(|n| model_view::PedPose::preset(&n.replace('-', " "))) {
             m.ped_pose = p;
         }
+        // --anim <dictionary>/<clip> [--anim-pos 0..1]: a game clip on a character, held at a position
+        if let Some(a) = c.get("anim") {
+            m.ped_clip.want = a.to_string();
+            m.ped_clip.pos = c.f("anim-pos").unwrap_or(0.0).clamp(0.0, 1.0);
+        }
+        // --pose-head nod,turn,tilt and --pose-spine bend,twist,lean (degrees), on top of the preset
+        let three = |k: &str| -> Option<[f32; 3]> {
+            let v: Vec<f32> = c.get(k)?.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            (v.len() == 3).then(|| [v[0], v[1], v[2]])
+        };
+        if let Some(v) = three("pose-head") {
+            m.ped_pose.head = v;
+        }
+        if let Some(v) = three("pose-spine") {
+            m.ped_pose.spine = v;
+        }
         m.show_skeleton = c.has("skeleton");
         m.show_normals = c.has("normals");
         m.decal_bias = !c.has("no-decal-bias");

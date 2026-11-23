@@ -491,8 +491,17 @@ again**).
   used; twist and muscle helper bones follow their parent rigidly, so
   shoulders, elbows and knees bend more simply than in the game. Hair,
   brows and beards ride on the head bone as one piece (no strand
-  simulation). The game's own animation clips are not played on
-  characters in the viewer yet (`sixng outfit --clip` exports them).
+  simulation). `--pose-head nod,turn,tilt` and `--pose-spine
+  bend,twist,lean` add to a preset for screenshots.
+- **Animation** (Character panel; `--anim <dictionary>/<clip>
+  [--anim-pos 0..1]`): a clip of `anim.rpf` played on the character's
+  skeleton, with play / pause and a position slider. **Walk** loads a walk
+  clip of the game for the body type. Bone tracks are matched to the
+  shared skeleton by name hash, so the clip also drives the twist and
+  muscle helper bones the Pose controls leave alone. The clip's movement
+  over the ground is left out (it plays in place), float tracks (facial
+  and other controls) are not applied, and the Pose angles are added on
+  top. `sixng clips --name <regex>` lists dictionaries.
 - **Body sliders** (weight −1…1, muscle 0…1; `--body <w>,<m>` for
   screenshots): the skin and head are posed with the game's body-shape rig
   on the shared skeleton. Clothes and accessories follow the skin under

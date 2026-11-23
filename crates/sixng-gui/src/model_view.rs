@@ -88,6 +88,23 @@ pub struct Loaded {
     pub look: Option<LookInfo>,
 }
 
+/// A game animation clip on the character's skeleton.
+#[derive(Default)]
+pub struct PedClip {
+    /// `<dictionary>/<clip>` typed or passed with `--anim`.
+    pub want: String,
+    /// What `anim` was loaded from, with the model it was mapped to.
+    loaded_key: String,
+    pub anim: Option<glb::Anim>,
+    /// Position 0..1 and whether it advances.
+    pub pos: f32,
+    pub playing: bool,
+    pub status: String,
+    loading: bool,
+    pending: Arc<Mutex<Option<(String, Result<(glb::Anim, String), String>)>>>,
+    last: Option<std::time::Instant>,
+}
+
 /// A character's pose: angles in degrees on the main bones of the shared
 /// skeleton. Zero everywhere is the stored pose (arms out).
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -370,6 +387,9 @@ pub struct ModelView {
     /// Head bone matrix the hair models were last placed with, and how many.
     hair_head: Option<Mat4>,
     hair_head_n: usize,
+    /// Animation clip for the character shown (`anim.rpf`): what is asked
+    /// for (`<dictionary>/<clip>`), what is loaded, and the playback state.
+    pub ped_clip: PedClip,
     /// Pose of the character shown (degrees), see `PedPose`.
     pub ped_pose: PedPose,
     /// Body shape of the character shown (`BODY_SHAPE` when it was loaded).
@@ -646,6 +666,7 @@ impl ModelView {
             keep_cam_once: false,
             hair_head: None,
             hair_head_n: 0,
+            ped_clip: PedClip::default(),
             ped_pose: PedPose::default(),
             body_shape_shown: (0.0, 0.0),
             wheels_on: true,
@@ -1044,7 +1065,7 @@ impl ModelView {
 
     /// Car extras settled: vehicle data applied and the fitted wheels loaded.
     fn idle_for_shot(&self) -> bool {
-        if !self.hair.settled() || self.auto.then.is_some() || self.auto.find_hair || self.hair.fitting {
+        if !self.hair.settled() || self.auto.then.is_some() || self.auto.find_hair || self.hair.fitting || self.ped_clip.loading || (!self.ped_clip.want.trim().is_empty() && self.ped_clip.anim.is_none() && self.ped_clip.status.starts_with("loading")) {
             return false;
         }
         let Some(l) = self
@@ -1072,6 +1093,70 @@ impl ModelView {
 
     pub fn cache_dir(&self) -> PathBuf {
         Path::new(&self.work).join(crate::GUI_CACHE)
+    }
+
+    /// Load the clip asked for (on a worker thread) and advance playback.
+    fn update_ped_clip(&mut self, ctx: &egui::Context) {
+        if let Some((key, r)) = self.ped_clip.pending.lock().unwrap().take() {
+            self.ped_clip.loading = false;
+            self.ped_clip.loaded_key = key;
+            match r {
+                Ok((a, note)) => {
+                    self.ped_clip.status = note;
+                    self.ped_clip.anim = Some(a);
+                }
+                Err(e) => {
+                    self.ped_clip.status = e;
+                    self.ped_clip.anim = None;
+                }
+            }
+        }
+        let Some(l) = self.loaded.as_ref().filter(|l| l.look.is_some() && !l.model.joints.is_empty()) else { return };
+        let want = self.ped_clip.want.trim().to_string();
+        let key = format!("{want}#{}#{}", l.model.joints.len(), l.model.joints[0].name);
+        if want.is_empty() {
+            self.ped_clip.anim = None;
+            self.ped_clip.loaded_key.clear();
+        } else if !self.ped_clip.loading && self.ped_clip.loaded_key != key {
+            self.ped_clip.loading = true;
+            self.ped_clip.status = format!("loading {want} …");
+            let names: Vec<String> = l.model.joints.iter().map(|j| j.name.clone()).collect();
+            let (game, work, slot, ctx2) = (PathBuf::from(&self.game), PathBuf::from(&self.work), self.ped_clip.pending.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let r = (|| -> anyhow::Result<(glb::Anim, String)> {
+                    let (dq, cq) = want.rsplit_once('/').ok_or_else(|| anyhow::anyhow!("write it as <dictionary>/<clip> (`sixng clips --name walk` lists dictionaries)"))?;
+                    let (_, d) = sixng_core::anim::load_dictionary(&game, &work, dq)?;
+                    let c = d.clip(cq).ok_or_else(|| anyhow::anyhow!("no clip {cq:?} in {}; it has: {}", d.name, d.clips.iter().map(|c| c.short_name()).collect::<Vec<_>>().join(", ")))?;
+                    let joints: Vec<sixng_core::gltf::Joint> = names.iter().map(|n| sixng_core::gltf::Joint { name: n.clone(), parent: None, bind: [0.0; 16], pose: None }).collect();
+                    let (ch, stats) = sixng_core::outfit::clip_channels(&d, c, &joints);
+                    // RAGE (Z-up) values to the viewer's Y-up, as the GLB export does
+                    let channels: Vec<glb::AnimChannel> = ch
+                        .into_iter()
+                        .map(|c| {
+                            let (path, f): (u8, fn([f32; 4]) -> [f32; 4]) = match c.path {
+                                sixng_core::gltf::AnimPath::Translation => (0, |v| [v[0], v[2], -v[1], 0.0]),
+                                sixng_core::gltf::AnimPath::Rotation => (1, |v| [v[0], v[2], -v[1], v[3]]),
+                                sixng_core::gltf::AnimPath::Scale => (2, |v| [v[0], v[2], v[1], 0.0]),
+                            };
+                            glb::AnimChannel { joint: c.joint, path, times: c.times, values: c.values.into_iter().map(f).collect() }
+                        })
+                        .collect();
+                    let duration = channels.iter().filter_map(|c| c.times.last().copied()).fold(c.duration, f32::max).max(1e-3);
+                    let note = format!("{} bone tracks of {} on this skeleton, {:.2} s. The clip's own movement over the ground is left out (it plays in place).", stats["bone_tracks_on_joints"], stats["bone_tracks"], duration);
+                    Ok((glb::Anim { name: want.clone(), duration, channels }, note))
+                })()
+                .map_err(|e| format!("{e:#}"));
+                *slot.lock().unwrap() = Some((key, r));
+                ctx2.request_repaint();
+            });
+        }
+        // playback
+        let now = std::time::Instant::now();
+        let dt = self.ped_clip.last.replace(now).map_or(0.0, |t| (now - t).as_secs_f32()).min(0.1);
+        if let (true, Some(a)) = (self.ped_clip.playing, &self.ped_clip.anim) {
+            self.ped_clip.pos = (self.ped_clip.pos + dt / a.duration).fract();
+            ctx.request_repaint();
+        }
     }
 
     /// Body shape for characters (weight, muscle), before a model is opened.
@@ -1211,6 +1296,33 @@ impl ModelView {
                 ui.add(egui::DragValue::new(&mut p.head[2]).range(-40.0..=40.0).suffix("°").prefix("tilt "));
             });
             ui.label(egui::RichText::new("Angles on the main bones of the shared skeleton; zero is the stored pose. Drag a value or type it.").weak().small());
+        });
+        egui::CollapsingHeader::new("Animation").default_open(true).show(ui, |ui| {
+            let female = look.model.is_empty() || l.parts.iter().any(|p| l.selected.contains(&p.off) && p.name.contains("_fr1_"));
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.ped_clip.want).hint_text("<dictionary>/<clip>").desired_width(250.0));
+                if ui.button("Walk").on_hover_text("A walk clip of the game for this body type").clicked() {
+                    self.ped_clip.want = format!("gameplay@locomotion@{}_character@{}@normal@standing@walk@stance_neutral/move", if female { "female" } else { "male" }, if female { "kat" } else { "raul" });
+                    self.ped_clip.playing = true;
+                    self.ped_pose = PedPose::default();
+                }
+                if ui.button("None").clicked() {
+                    self.ped_clip.want.clear();
+                    self.ped_clip.playing = false;
+                }
+            });
+            if self.ped_clip.anim.is_some() {
+                ui.horizontal(|ui| {
+                    if ui.button(if self.ped_clip.playing { "⏸" } else { "▶" }).clicked() {
+                        self.ped_clip.playing = !self.ped_clip.playing;
+                    }
+                    ui.add(egui::Slider::new(&mut self.ped_clip.pos, 0.0..=1.0).show_value(false));
+                });
+            }
+            if !self.ped_clip.status.is_empty() {
+                ui.label(egui::RichText::new(&self.ped_clip.status).weak().small());
+            }
+            ui.label(egui::RichText::new("A clip of anim.rpf on this skeleton (`sixng clips --name <regex>` lists them). The Pose angles are added on top.").weak().small());
         });
         for n in &look.notes {
             ui.label(egui::RichText::new(n).weak().small());
@@ -2273,6 +2385,10 @@ impl ModelView {
             }
             playing.extend(self.clips.iter().zip(&self.clip_pos).filter(|(_, p)| **p > 0.0).map(|(a, p)| (a, *p)));
         }
+        // a character's animation clip
+        if let (true, Some(a)) = (l.look.is_some(), &self.ped_clip.anim) {
+            playing.push((a, self.ped_clip.pos));
+        }
         let js: &[glb::Joint] = match playing.is_empty() {
             false => {
                 let mut v: Vec<glb::Joint> = l.model.joints.iter().map(|j| glb::Joint { name: j.name.clone(), parent: j.parent, local: j.local, ibm: j.ibm }).collect();
@@ -2696,6 +2812,7 @@ impl ModelView {
             self.rotor_angle = (self.rotor_angle + ctx.input(|i| i.stable_dt).min(0.1) * rate) % std::f32::consts::TAU;
             ctx.request_repaint();
         }
+        self.update_ped_clip(&ctx);
         let (globals, mut skin) = self.joint_mats();
         // Lit lamps: the light of each lamp bone rides in the bottom row of
         // its joint matrix (see the shader). Not on the Metal renderer.
