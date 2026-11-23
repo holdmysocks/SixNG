@@ -298,8 +298,15 @@ pub fn characters(ix: &ArchiveIndex) -> Vec<CharacterInfo> {
         }
     }
     let mut out = Vec::new();
+    // A prefix without a head whose parts belong to a longer-named character
+    // (`cs_andres_beardgoatee_…` beside `cs_andres_deleon_head_…`) is not a
+    // character of its own.
+    let headed: Vec<&String> = prefixes.keys().filter(|p| outfit_options(ix, p).iter().any(|o| o.group == "head")).collect();
     for p in prefixes.keys() {
         let o = outfit_options(ix, p);
+        if !o.iter().any(|x| x.group == "head") && headed.iter().any(|h| h.starts_with(&format!("{p}_"))) {
+            continue;
+        }
         if !o.is_empty() {
             out.push(CharacterInfo { name: p.clone(), kind: "character", parts: o.len(), default_parts: o.iter().filter(|x| x.default).count() });
         }

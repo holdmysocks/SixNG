@@ -1444,7 +1444,13 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
             return Some((sh, rec));
         }
     }
-    if !crate::headskin::is_head(name) || shaders.iter().any(|s| !s.textures.is_empty()) {
+    // A head needs a face when no shader has a colour texture that is in a
+    // store: heads that bind nothing, and heads that name a face texture the
+    // install does not have.
+    let set = crate::ttpf::global(&game_root(a));
+    let stored = |t: &crate::drawable::TexRef| u64::from_str_radix(&t.hash64, 16).is_ok_and(|h| set.get(h).is_some());
+    let has_albedo = |s: &crate::drawable::Shader| s.textures.iter().any(|t| ALBEDO_PARAMS.contains(&t.param_hash.as_str()) && stored(t));
+    if !crate::headskin::is_head(name) || shaders.iter().any(has_albedo) {
         return None;
     }
     let t = match crate::headskin::get(&game_root(a)) {
@@ -1454,7 +1460,6 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
             return None;
         }
     };
-    let set = crate::ttpf::global(&game_root(a));
     let Some(c) = t.choose(name, o.head_skin, |h| set.get(h).is_some()) else {
         item.warnings.push("head skin: no face texture found".into());
         return None;
@@ -1464,9 +1469,14 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
         .iter()
         .map(|s| {
             let mut s = s.clone();
-            s.textures.push(tex(ALBEDO_PARAMS[0], c.skin.albedo));
-            if c.skin.normal != 0 {
-                s.textures.push(tex("1e77bf4c", c.skin.normal));
+            // only the skin shaders: those that name a colour texture slot, or nothing at all
+            if s.textures.is_empty() || s.textures.iter().any(|t| ALBEDO_PARAMS.contains(&t.param_hash.as_str())) {
+                s.textures.retain(|t| !ALBEDO_PARAMS.contains(&t.param_hash.as_str()));
+                s.textures.push(tex(ALBEDO_PARAMS[0], c.skin.albedo));
+                if c.skin.normal != 0 && !s.textures.iter().any(|t| t.param_hash == "1e77bf4c" && stored(t)) {
+                    s.textures.retain(|t| t.param_hash != "1e77bf4c");
+                    s.textures.push(tex("1e77bf4c", c.skin.normal));
+                }
             }
             s
         })

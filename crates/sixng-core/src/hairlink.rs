@@ -128,6 +128,14 @@ impl HairLinks {
         fit.and_then(|f| v.iter().filter(has).find(|l| l.fit == f)).or_else(|| v.iter().find(has))
     }
 
+    /// The placement made under a placeholder drawable (`cs_lucia_hairbob_…
+    /// _full`), for a character whose hair is known only by its own
+    /// placeholder: the most probable one that has grooms.
+    pub fn by_placeholder(&self, name: &str) -> Option<&Link> {
+        let n = name.trim_end_matches("_full");
+        self.links.values().flatten().filter(|l| !l.grooms.is_empty() && l.placeholder.trim_end_matches("_full") == n).max_by(|a, b| a.confidence.total_cmp(&b.confidence))
+    }
+
     /// The grooms of a link that no other asset claims with a higher
     /// confidence. Placements are each asset's own best, so two neighbours
     /// in the archive can both claim the piece between them; it goes to the

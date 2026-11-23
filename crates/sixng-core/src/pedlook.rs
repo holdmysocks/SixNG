@@ -372,7 +372,50 @@ fn look_uncached(game_root: &Path, a: &ArchiveInfo, ix: &ArchiveIndex, model: &s
             Err(e) => last_err = Some(e),
         }
     }
-    out.ok_or_else(|| last_err.unwrap_or_else(|| format!("{model} is not in the game's outfit list, and no wardrobe names its head")))
+    if let Some(l) = out {
+        return Ok(l);
+    }
+    // no outfit data at all (cutscene-only models): its own parts
+    own_look(a, ix, model).ok_or_else(|| last_err.unwrap_or_else(|| format!("{model} is not in the game's outfit list, and no wardrobe names its head")))
+}
+
+/// A look made of a character's own drawables, for models the outfit data
+/// does not cover (`cs_lucia`, `cs_ghost`): one part per slot as
+/// `outfit::outfit_options` picks them, its own hair placeholders, and the
+/// whole skin meshes of the head's fit when it has clothes of its own but no
+/// body. None for a head on its own (crowd heads): no data says what goes
+/// under it.
+fn own_look(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Option<Look> {
+    let opts = crate::outfit::outfit_options(ix, model);
+    let names: HashSet<String> = ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| e.name.as_ref().map(|n| n.to_ascii_lowercase())).collect();
+    let exists = |n: &str| names.contains(n);
+    let mut parts: Vec<LookPart> = Vec::new();
+    let plain = |slot: String, drawable: String, found_by: &'static str| LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: String::new(), guid: None, tint: None, colour: None, colour_tag: None, tex_remap: vec![], skins: vec![], found_by };
+    for o in opts.iter().filter(|o| o.default || is_strand_word(item_word(&o.name))) {
+        let slot = slot_of(&o.name);
+        // one hair, one beard …: the first of each
+        if slot == "eyecaps" || parts.iter().any(|p| p.slot == slot && p.strands) {
+            continue;
+        }
+        parts.push(plain(slot, o.name.clone(), "own"));
+    }
+    let head = parts.iter().find(|p| p.slot == "head")?;
+    let fit = head.drawable.split('_').find(|t| crate::outfit::is_fit(t)).map(str::to_string);
+    let has = |s: &str| parts.iter().any(|p| p.slot == s);
+    // enough clothes of its own to stand on a bare body
+    let clothed = has("full") || ((has("top") || has("outer")) && has("bottom"));
+    if !clothed {
+        return None;
+    }
+    for (slot, w) in [("body upper", "hand"), ("body lower", "feet")] {
+        if !parts.iter().any(|p| p.slot == slot) {
+            if let Some(n) = fit.as_deref().and_then(|f| whole_body(w, f, &exists)) {
+                parts.push(plain(slot.to_string(), n, "default"));
+            }
+        }
+    }
+    let main: Vec<String> = parts.iter().filter(|p| ["full", "outer", "top", "bottom"].contains(&p.slot.as_str())).map(|p| pretty(item_word(&p.drawable))).collect();
+    Some(Look { model: model.to_string(), resource: format!("{} (own parts: the outfit data does not cover this model)", a.id), fit, outfits: vec![Outfit { id: String::new(), outfit_type: String::new(), scale: 0.0, label: format!("own parts: {}", main.join(", ")), body_shape: None, parts, unresolved: vec![] }] })
 }
 
 /// The outfits of one model row. `own_head`: keep only the outfits whose
