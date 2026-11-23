@@ -2512,6 +2512,8 @@ fn export_load(
             ["99ad6fc9", "389206d1", "03b27476", "5a693bbe", "29648098"].iter().any(|h| j.contains(h)) && !j.contains("\"stand_in\"")
                 // and from before interior and trim stopped taking the body colour
                 || j.contains("\"car_paint\"") && !j.contains("\"paint_rule\"")
+                // and from before wiper masks, water stencils and runtime screen overlays were left out
+                || (j.contains("bd71bdbf") || j.contains("fc34f08b") || j.contains("a800afccf01aa36b")) && !j.contains("\"hidden\"")
         });
     // Cached animal parts from before part skins (eyes, tint-mask coats).
     let stale_animal = e.name.as_deref().is_some_and(|n| sixng_core::partskin::animal_root(n).is_some())

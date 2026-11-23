@@ -24,7 +24,7 @@ const FAMILIES: &[(&str, &str, &str)] = &[
     ("99ad6fc9", "opaque", "vehicle tyre (standard_vehicle_2lyr_tyre_inst)"),
     ("fa9cc069", "window", "vehicle windows"),
     ("4dc0ac6a", "window", "vehicle windows (helicopters, boats)"),
-    ("bd71bdbf", "window", "vehicle windows, untextured (mid LOD)"),
+    ("bd71bdbf", "window", "windscreen wiper sweep mask (windshield_wipermask): a fan over the glass that marks where the wipers clear rain; not a visible surface"),
     ("921b19e5", "decal", "vehicle livery / sign decal"),
     // glass
     ("298c4c0f", "glass", "exterior window panes"),
@@ -121,6 +121,11 @@ pub fn classify(name_hash: &str, flags: &[u8]) -> Value {
         ("99ad6fc9", _) => Some("rubber"),
         (_, Some(n)) if n.starts_with("standard_vehicle") && n.contains("tyre") => Some("rubber"),
         ("03b27476", _) => Some("chrome"),
+        // wiper sweep mask: drawn by the game only into its rain mask
+        ("bd71bdbf", _) => Some("hidden"),
+        // vehicle_water_stencil: a lid over a boat's hull opening that the
+        // game draws only into the stencil buffer, to keep water out
+        ("fc34f08b", _) => Some("hidden"),
         _ => None,
     };
     // Known opaque families keep OPAQUE even when the bucket says alpha.
@@ -214,6 +219,11 @@ pub fn gltf_fields(c: &Value, has_base: bool) -> Value {
         if !has_base {
             m["pbrMetallicRoughness"]["baseColorFactor"] = json!(colour);
         }
+    }
+    // Not a visible surface (wiper sweep mask, runtime screen overlay):
+    // a cutout with alpha 0, which every glTF viewer discards.
+    if c["stand_in"] == "hidden" {
+        m = json!({"alphaMode": "MASK", "alphaCutoff": 0.5, "pbrMetallicRoughness": {"baseColorFactor": [0.0, 0.0, 0.0, 0.0], "metallicFactor": 0.0, "roughnessFactor": 1.0}});
     }
     m
 }
@@ -613,6 +623,13 @@ mod paint_tests {
         assert!(gltf_fields(&tyre, true)["pbrMetallicRoughness"]["baseColorFactor"].is_null());
         assert_eq!(classify("5a693bbe", &opaque)["class"], "emissive");
         assert_eq!(classify("4aa38282", &opaque)["stand_in"], Value::Null);
+        let mask = classify("bd71bdbf", &alpha);
+        assert_eq!(mask["stand_in"], "hidden");
+        let g = gltf_fields(&mask, false);
+        assert_eq!(g["alphaMode"], "MASK");
+        assert_eq!(g["pbrMetallicRoughness"]["baseColorFactor"][3], 0.0);
+        assert!(g["emissiveFactor"].is_null());
+        assert_eq!(classify("fc34f08b", &opaque)["stand_in"], "hidden");
         let trim = gltf_fields(&json!({"class": "opaque", "alpha_mode": "OPAQUE", "stand_in": "trim"}), false);
         assert_eq!(trim["pbrMetallicRoughness"]["metallicFactor"], 0.0);
         assert_eq!(trim["pbrMetallicRoughness"]["baseColorFactor"][3], 1.0);
