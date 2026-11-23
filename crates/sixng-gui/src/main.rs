@@ -1609,6 +1609,7 @@ impl App {
         m.roof_fold = c.f("roof").unwrap_or(0.0);
         m.clip_pos_all = c.f("clips").unwrap_or(0.0);
         m.bonnet_open = c.f("bonnet").unwrap_or(0.0);
+        m.steer = c.f("steer").unwrap_or(0.0);
         m.lamps = c.get("lights").map(model_view::Lamps::parse).unwrap_or_default();
         m.boot_open = c.f("boot").unwrap_or(0.0);
         if let Some(v) = c.f("yaw") {

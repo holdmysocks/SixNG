@@ -50,6 +50,8 @@ struct Info {
     wheel_scale: Option<f32>,
     #[serde(rename = "wheelScaleRear")]
     wheel_scale_rear: Option<f32>,
+    #[serde(rename = "steerWheelMult")]
+    steer_wheel_mult: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -96,6 +98,8 @@ pub struct Config {
 pub struct Vehicle {
     pub wheel_scale: Option<f32>,
     pub wheel_scale_rear: Option<f32>,
+    /// `steerWheelMult` of the model info.
+    pub steer_wheel_mult: Option<f32>,
     pub configs: Vec<Config>,
     /// Paint palettes as (colour, share 0..1), most frequent first. The
     /// stored lists repeat colours (e.g. 400 entries, 10 distinct), so they
@@ -251,15 +255,16 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
                     .collect()
             })
             .collect();
-        let (ws, wr) = v
+        let (ws, wr, sm) = v
             .model_info
-            .map(|i| (i.wheel_scale, i.wheel_scale_rear))
-            .unwrap_or((None, None));
+            .map(|i| (i.wheel_scale, i.wheel_scale_rear, i.steer_wheel_mult))
+            .unwrap_or((None, None, None));
         m.insert(
             name.to_ascii_lowercase(),
             Vehicle {
                 wheel_scale: ws,
                 wheel_scale_rear: wr,
+                steer_wheel_mult: sm,
                 configs,
                 palettes,
                 mods: v
