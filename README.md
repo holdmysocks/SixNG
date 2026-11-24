@@ -629,7 +629,16 @@ again**).
   ground is seen to pass; **in place** leaves it out. On the female walk
   clip (6.65 m in 3.7 s) each planted foot stays within 1 cm on the
   ground while it is down. Float tracks (facial and other controls) are
-  not applied, and the Pose angles are added on top. `sixng clips --name <regex>` lists dictionaries.
+  not applied, and the Pose angles are added on top. `sixng clips --name <regex>` lists dictionaries. **Animals** have the same Animation section: it lists the clip
+  dictionaries of the animal's species (`gameplay@creatures@…@cat@normal@walk@slow`;
+  the list comes from `sixng clips`), and a dictionary alone plays its
+  `move` or `idle` clip. For this an animal's parts are bound to its
+  skeleton by bone name, parts without bones (eyes, teeth, tongue) ride
+  on the nearest bone, and each fur vertex takes the bone weights of the
+  nearest skin vertex, so the fur moves with the body (the fur's own
+  bone weights are not decoded). Of 39 animal dictionaries sampled, 31
+  hold animation data that decodes; the others list clips whose
+  animation is stored elsewhere (the plain cat walk is one) and say so.
 - **Body sliders** (weight −1…1, muscle 0…1; `--body <w>,<m>` for
   screenshots): the skin and head are posed with the game's body-shape rig
   on the shared skeleton. Clothes and accessories follow the skin under
