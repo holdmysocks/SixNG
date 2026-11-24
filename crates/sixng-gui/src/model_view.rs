@@ -374,6 +374,8 @@ pub struct ModelView {
     /// 128) and the look whose rows the model's part materials carry.
     part_palette: Option<(PathBuf, Arc<Vec<u8>>)>,
     part_ramp_done: Option<(PathBuf, usize)>,
+    /// Stickers the user placed on the loaded vehicle (custom liveries).
+    pub livery: crate::livery::State,
     /// The part colours the uploaded wheels were coloured with.
     wheel_look: Option<Arc<Vec<[u8; 4]>>>,
     /// Vehicle lamps that are on.
@@ -685,6 +687,7 @@ impl ModelView {
             random_parts_seed: 0,
             part_palette: None,
             part_ramp_done: None,
+            livery: Default::default(),
             part_look_table: None,
             wheel_look: None,
             lamps: Lamps::default(),
@@ -2397,6 +2400,19 @@ impl ModelView {
         self.apply_paint(rs);
     }
 
+    /// Keep the loaded vehicle's stickers (custom liveries) on the GPU.
+    fn sync_livery(&mut self, rs: &egui_wgpu::RenderState) {
+        let cache = self.cache_dir();
+        let (Some(l), Some(g)) = (&self.loaded, self.gpu.as_mut()) else { return };
+        if !l.info["part_colours"].is_object() && !l.info["wheel_mounts"].as_array().is_some_and(|a| !a.is_empty()) {
+            return;
+        }
+        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+        let parts: Vec<String> = l.info["assembled_from"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
+        let key = crate::livery::vehicle_key(&crate::vehicle_db::model_key(&l.source));
+        self.livery.sync(rs, ren, g, &l.model, &key, &parts, Path::new(&self.game), Path::new(&self.work), &cache);
+    }
+
     fn update_wheels(&mut self, rs: &egui_wgpu::RenderState, ctx: &egui::Context) {
         // --fit-parts: the given part choice, once the vehicle and its
         // configuration's parts are in
@@ -3170,6 +3186,7 @@ impl ModelView {
         let px = [(rect.width() * ppp) as u32, (rect.height() * ppp) as u32];
         self.size = px;
         self.update_wheels(rs, &ctx);
+        self.sync_livery(rs);
         if self.rotor_speed > 0.0 && self.air.iter().any(|p| p.kind == AirKind::Spin) {
             // slow enough to see the blades below half speed; the blurred
             // set turns slowly, as a blur does
