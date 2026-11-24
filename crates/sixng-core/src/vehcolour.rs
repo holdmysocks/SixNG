@@ -60,9 +60,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// Version of what an export writes for part colours (model.json
 /// `part_colours_version`); the model viewer exports older vehicles again.
-pub const EXPORT_VERSION: u32 = 17;
+pub const EXPORT_VERSION: u32 = 20;
 /// Layout version of `<work>/index/vehicle_parts.json`.
-pub const FORMAT: u32 = 16;
+pub const FORMAT: u32 = 18;
 
 const PART_SET: u32 = 0xf142_44fd;
 const SET_COLOURS: u32 = 0x7847_6477;
@@ -77,6 +77,9 @@ const COLOUR_MODE: u32 = 0xadb5_2ec3;
 const COLOUR_ROW: u32 = 0xc831_3558;
 const SURFACE: u32 = 0x9e4d_e959;
 const SURFACE_ROUGH: u32 = 0x2cc7_2f7c;
+/// A surface's second layer: its colour record and its `307f162c` record.
+const SURFACE_WEAR_COLOUR: u32 = 0x5cff_e5e0;
+const SURFACE_WEAR_ROUGH: u32 = 0x1747_70cc;
 const ROUGH: u32 = 0x307f_162c;
 const ROUGH_LOW: u32 = 0xe4be_3b70;
 const ROUGH_HIGH: u32 = 0x26e5_d460;
@@ -94,6 +97,9 @@ const CONFIG_PARTS: u32 = 0xe89b_8540;
 const MOD: u32 = 0x0cae_f606;
 const MOD_SLOT: u32 = 0x37a6_f9ef;
 const MOD_LIST: u32 = 0x61e1_e572;
+/// A part's elements (names of `77f2b89e` records) and an element's model.
+const MOD_ELEMENTS: u32 = 0x7e5d_1612;
+const ELEMENT_MODEL: u32 = 0x8605_bf0e;
 /// A named group of part ids in the library: `3acbce85` is a byte array of
 /// part ids.
 const GROUP: u32 = 0x0006_39e9;
@@ -158,6 +164,17 @@ pub struct Part {
     /// fields `f763652d`, `09dd33c1`).
     #[serde(default)]
     pub metal: [f32; 2],
+    /// The surface's second layer, which shows where the first is worn:
+    /// its palette row (slice x 256 + row; the surface's `5cffe5e0` names a
+    /// colour record), None when that record has no row.
+    #[serde(default)]
+    pub wear_row: Option<u16>,
+    /// Roughness and metalness, low and high, of the second layer (the
+    /// surface's `174770cc` names a `307f162c` record).
+    #[serde(default)]
+    pub wear_rough: [f32; 2],
+    #[serde(default)]
+    pub wear_metal: [f32; 2],
 }
 
 impl Part {
@@ -192,6 +209,14 @@ pub struct Tables {
     /// the vehicle's part set (a pickup's bed, bumpers, bonnets ...).
     #[serde(default)]
     pub part_owner: HashMap<String, String>,
+    /// Model of a library part (joaat of its name, 8 hex digits: a truck
+    /// bed or box, a light bar ...) -> the part set of a configuration that
+    /// names the part. Such a model is fitted to several vehicles and its
+    /// vertices carry part ids of whichever one it is on; on its own it
+    /// takes the set of the first configuration found (vehicles in order
+    /// of their name hash).
+    #[serde(default)]
+    pub shared_parts: HashMap<String, String>,
 }
 
 /// A key for a configuration: FNV-1a of its part list (the name hashes in
@@ -226,6 +251,8 @@ struct Library {
     colours: HashMap<u32, (i8, i16, [u8; 3])>,
     /// surface name -> roughness record name
     surfaces: HashMap<u32, u32>,
+    /// surface name -> (colour record, roughness record) of its second layer
+    wear: HashMap<u32, (u32, u32)>,
     rough: HashMap<u32, [f32; 2]>,
     /// roughness record name -> metalness low, high
     metal: HashMap<u32, [f32; 2]>,
@@ -242,7 +269,18 @@ struct Library {
     assigns: HashMap<u32, (u32, u32, u32)>,
     /// modifier name -> the parts of an option list (`f5e9d7df.bf340aab`)
     options: HashMap<u32, Vec<u32>>,
+    /// configuration part name -> the models of its elements (joaat)
+    part_models: HashMap<u32, Vec<u32>>,
     id: Option<String>,
+}
+
+impl Library {
+    /// The second layer of a surface: palette row, roughness, metalness.
+    fn wear_of(&self, surface: u32) -> (Option<u16>, [f32; 2], [f32; 2]) {
+        let Some(&(c, r)) = self.wear.get(&surface) else { return (None, [0.5, 0.5], [0.0, 0.0]) };
+        let row = self.colours.get(&c).filter(|(mode, row, _)| (0..8).contains(mode) && *row >= 0).map(|(mode, row, _)| *mode as u16 * 256 + (*row as u16 & 255));
+        (row, self.rough.get(&r).copied().unwrap_or([0.5, 0.5]), self.metal.get(&r).copied().unwrap_or([0.0, 0.0]))
+    }
 }
 
 fn library(game_root: &Path, work: &Path) -> Result<Library> {
@@ -257,7 +295,7 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
             }
             let m = &m;
             let dump = |h: u32| m.objects(h).into_iter().filter_map(|o| m.object(h, o, 0)).collect::<Vec<_>>();
-            let mut l = Library { colours: HashMap::new(), surfaces: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), options: HashMap::new(), id: Some(e.id.clone()) };
+            let mut l = Library { colours: HashMap::new(), surfaces: HashMap::new(), wear: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), options: HashMap::new(), part_models: HashMap::new(), id: Some(e.id.clone()) };
             for o in dump(OPTION_LIST) {
                 if let Some(n) = num(&o, NAME) {
                     l.options.insert(n as u32, get(&o, OPTION_PARTS).and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()).unwrap_or_default());
@@ -298,10 +336,24 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
                 .filter_map(|f| Some((num(f, NAME)? as u32, get(f, FIT_RIM)?.as_f64()? as f32)))
                 .filter(|(_, r)| *r > 0.2 && *r < 1.0)
                 .collect();
+            // an element's model: a 64-bit value whose low half is the
+            // joaat of the model's name (16 hex digits), or that number
+            let models: HashMap<u32, u32> = dump(crate::vehicles::MOD_ELEMENT)
+                .iter()
+                .filter_map(|e| {
+                    let m = get(e, ELEMENT_MODEL)?;
+                    let m = m.as_str().and_then(|s| u32::from_str_radix(s.get(8..16)?, 16).ok()).or_else(|| m.as_u64().map(|v| v as u32))?;
+                    Some((num(e, NAME)? as u32, m))
+                })
+                .collect();
             for p in dump(MOD) {
                 let list = get(&p, MOD_LIST).and_then(|x| x.as_array()).cloned().unwrap_or_default();
                 if let Some(n) = num(&p, NAME) {
                     l.mods.insert(n as u32, list.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect());
+                    let of: Vec<u32> = get(&p, MOD_ELEMENTS).and_then(|x| x.as_array()).into_iter().flatten().filter_map(|x| models.get(&(x.as_u64()? as u32)).copied()).filter(|m| *m != 0).collect();
+                    if !of.is_empty() {
+                        l.part_models.insert(n as u32, of);
+                    }
                 }
                 if num(&p, MOD_SLOT) != Some(SLOT_WHEEL_FIT as i64) {
                     continue;
@@ -318,6 +370,9 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
             for s in dump(SURFACE) {
                 if let (Some(n), Some(r)) = (num(&s, NAME), num(&s, SURFACE_ROUGH)) {
                     l.surfaces.insert(n as u32, r as u32);
+                }
+                if let (Some(n), Some(c), Some(r)) = (num(&s, NAME), num(&s, SURFACE_WEAR_COLOUR), num(&s, SURFACE_WEAR_ROUGH)) {
+                    l.wear.insert(n as u32, (c as u32, r as u32));
                 }
             }
             for s in dump(ROUGH) {
@@ -368,7 +423,8 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
                         let rec = lib.surfaces.get(&surface);
                         let rough = rec.and_then(|r| lib.rough.get(r)).copied().unwrap_or([0.5, 0.5]);
                         let metal = rec.and_then(|r| lib.metal.get(r)).copied().unwrap_or([0.0, 0.0]);
-                        Part { colour, surface, row, mode, rgb, rough, metal }
+                        let (wear_row, wear_rough, wear_metal) = lib.wear_of(surface);
+                        Part { colour, surface, row, mode, rgb, rough, metal, wear_row, wear_rough, wear_metal }
                     })
                     .collect();
                 sets.push((name.to_string(), parts));
@@ -505,6 +561,20 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
             }
         }
     }
+    // The models of the library parts a configuration names: the same ids
+    // mean the same piece in every vehicle's set (a box body, a flatbed
+    // deck, a tipper's paint), and the configuration that fits the part
+    // recolours them, so a shared model takes the set of the vehicle and
+    // configuration it is on. For the model on its own: the first found.
+    for (owner, (configs, _)) in by_owner.iter().filter(|(o, _)| **o != 0) {
+        let Some(by_config) = t.config_sets.get(&format!("{owner:08x}")) else { continue };
+        for parts in configs {
+            let Some(set) = by_config.get(&config_key(parts)) else { continue };
+            for m in parts.iter().filter_map(|p| lib.part_models.get(p)).flatten() {
+                t.shared_parts.entry(format!("{m:08x}")).or_insert_with(|| set.clone());
+            }
+        }
+    }
     Ok(t)
 }
 
@@ -546,6 +616,7 @@ fn apply_config(lib: &Library, own: &HashMap<u32, Vec<u32>>, parts: &[u32], set:
             if surface && s != 0 {
                 if let Some((r, rec)) = lib.surfaces.get(&s).and_then(|rec| lib.rough.get(rec).map(|r| (r, rec))) {
                     (p.surface, p.rough, p.metal) = (s, *r, lib.metal.get(rec).copied().unwrap_or([0.0, 0.0]));
+                    (p.wear_row, p.wear_rough, p.wear_metal) = lib.wear_of(s);
                 }
             }
             changed[i as usize] |= *p != before;
@@ -584,15 +655,25 @@ pub fn tables(game_root: &Path, work: &Path) -> Result<Arc<Tables>> {
 }
 
 impl Tables {
-    /// The part set of a model: a vehicle (`comet7`, `comet7_hi`) or one of
-    /// its mod part models.
+    /// The part set of a model: a vehicle (`comet7`, `comet7_hi`), one of
+    /// its mod part models, or a library part's model (`shared_parts`).
     pub fn for_model(&self, model: &str) -> Option<(&str, &[Part])> {
         let m = model.to_ascii_lowercase();
         let base = m.strip_suffix("_hi").or_else(|| m.strip_suffix("_mid")).unwrap_or(&m);
         let key = |s: &str| format!("{:08x}", meta7a::joaat(s));
         let owned = || self.part_owner.get(&format!("{:016x}", meta7a::asset_id(base))).and_then(|v| self.models.get(v));
-        let set = self.elements.get(&key(&m)).or_else(|| self.elements.get(&key(base))).or_else(|| self.models.get(&key(base))).or_else(owned)?;
+        let set = self.elements.get(&key(&m)).or_else(|| self.elements.get(&key(base))).or_else(|| self.models.get(&key(base))).or_else(owned).or_else(|| self.shared_parts.get(&key(base)))?;
         self.sets.get_key_value(set).map(|(k, v)| (k.as_str(), v.as_slice()))
+    }
+
+    /// Whether a model's part set is only that of one of the vehicles it
+    /// can be fitted to (a library part's model).
+    pub fn is_shared(&self, model: &str) -> bool {
+        let m = model.to_ascii_lowercase();
+        let base = m.strip_suffix("_hi").or_else(|| m.strip_suffix("_mid")).unwrap_or(&m);
+        let key = |s: &str| format!("{:08x}", meta7a::joaat(s));
+        let own = self.elements.contains_key(&key(&m)) || self.elements.contains_key(&key(base)) || self.models.contains_key(&key(base)) || self.part_owner.contains_key(&format!("{:016x}", meta7a::asset_id(base)));
+        !own && self.shared_parts.contains_key(&key(base))
     }
 }
 
@@ -670,13 +751,43 @@ impl Tables {
         names.dedup();
         let hex = |n: &String| self.sets.get(n).map(|p| look_table(p, palette, u, mat).iter().flat_map(|c| c.iter().map(|b| format!("{b:02x}"))).collect::<String>());
         let looks: Vec<Value> = names.iter().map(|n| hex(n).map_or(Value::Null, Value::String)).collect();
+        let rows: Vec<Value> = names.iter().map(|n| self.sets.get(*n).map_or(Value::Null, |p| Value::String(row_table(p)))).collect();
+        let wear: Vec<Value> = names.iter().map(|n| self.sets.get(*n).map_or(Value::Null, |p| Value::String(wear_table(p, mat)))).collect();
         let index = |n: &String| names.iter().position(|x| *x == n);
         serde_json::json!({
             "looks": looks,
+            "rows": rows,
+            "wear": wear,
             "configs": by_config.iter().filter_map(|(k, n)| Some((k.clone(), Value::from(index(n)?)))).collect::<serde_json::Map<String, Value>>(),
             "default": index(default),
         })
     }
+}
+
+/// The palette row of each of the 256 part ids, 4 hex digits each: slice x
+/// 256 + row for a part that reads its colour from the material palette,
+/// `ffff` for one with a colour of its own (see `look_table`).
+pub fn row_table(parts: &[Part]) -> String {
+    (0..256)
+        .map(|i| match parts.get(i) {
+            Some(p) if p.rgb == [0; 3] && p.row >= 0 && (0..8).contains(&p.mode) => format!("{:04x}", p.mode as usize * 256 + (p.row as usize & 255)),
+            _ => "ffff".to_string(),
+        })
+        .collect()
+}
+
+/// The second layer of each of the 256 part ids, 8 hex digits each: palette
+/// row (4 digits: slice x 256 + row, `ffff` = none), roughness and metalness
+/// (2 digits each, 0 to 255), blended between low and high like the first
+/// layer's (`mat`, see `look_table`).
+pub fn wear_table(parts: &[Part], mat: [f32; 2]) -> String {
+    let at = |v: [f32; 2], t: f32| ((v[0] + (v[1] - v[0]) * t.clamp(0.0, 1.0)).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    (0..256)
+        .map(|i| match parts.get(i) {
+            Some(p) => format!("{:04x}{:02x}{:02x}", p.wear_row.unwrap_or(0xffff), at(p.wear_rough, mat[1]), at(p.wear_metal, mat[0])),
+            None => "ffff0000".to_string(),
+        })
+        .collect()
 }
 
 /// The colour of a row of a palette slice at position `u` (0 to 1): the

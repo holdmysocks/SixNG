@@ -202,6 +202,73 @@ pub fn in_region(min: [f32; 3], max: [f32; 3]) -> bool {
     }
 }
 
+/// `materials.json`, written beside a model: per material its shader, its
+/// textures by slot and its parameter values, keyed by name where the name
+/// is known and by hash where it is not. The same facts as model.json's
+/// `materials` and `drawable.shaders`, laid out to be read.
+fn readable_materials(model: &str, shaders: &[crate::drawable::Shader], mats: &serde_json::Value) -> serde_json::Value {
+    // one key per slot or parameter: its name, else its hash; a second use of a name gets its hash appended
+    fn key(map: &serde_json::Map<String, serde_json::Value>, name: Option<String>, hash: &str) -> String {
+        match name {
+            Some(n) if !map.contains_key(&n) => n,
+            Some(n) => format!("{n} ({hash})"),
+            None => hash.to_string(),
+        }
+    }
+    let list: Vec<serde_json::Value> = shaders
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let m = &mats[i];
+            let mut textures = serde_json::Map::new();
+            for t in m["textures"].as_array().into_iter().flatten() {
+                let hash = t["param_hash"].as_str().unwrap_or("");
+                let mut rec = serde_json::Map::new();
+                for (to, from) in [("file", "png"), ("role", "role_guess"), ("status", "status"), ("width", "width"), ("height", "height"), ("format", "format"), ("texture_hash", "hash64")] {
+                    if !t[from].is_null() {
+                        rec.insert(to.to_string(), t[from].clone());
+                    }
+                }
+                rec.insert("slot_hash".to_string(), hash.into());
+                let k = key(&textures, t["param_name"].as_str().map(str::to_string), hash);
+                textures.insert(k, rec.into());
+            }
+            let (mut values, mut unread) = (serde_json::Map::new(), Vec::new());
+            for c in &s.constants {
+                match c.values {
+                    Some(v) => {
+                        let k = key(&values, crate::names::param(&c.hash), &c.hash);
+                        values.insert(k, serde_json::json!(v));
+                    }
+                    None => unread.push(crate::names::param(&c.hash).unwrap_or_else(|| c.hash.clone())),
+                }
+            }
+            let mut out = serde_json::json!({
+                "index": i,
+                "shader": crate::names::shader(&s.name_hash).unwrap_or_else(|| s.name_hash.clone()),
+                "shader_hash": s.name_hash,
+                "class": m["classification"]["class"],
+                "base_color": m["base_color"],
+                "normal": m["normal"],
+                "textures": textures,
+                "parameters": values,
+                "parameters_not_read": unread,
+            });
+            for k in ["paint", "multilayer", "texture_fallback"] {
+                if !m[k].is_null() {
+                    out[k] = m[k].clone();
+                }
+            }
+            out
+        })
+        .collect();
+    serde_json::json!({
+        "model": model,
+        "note": "One record per material, in the order of the GLB's materials. shader and the keys of textures and parameters are names where the name is known, else the 8-digit hash (joaat of the lower-case name). A texture's file is relative to the export folder; base_color and normal are the paths the GLB uses, relative to this folder. role is a guess from the slot and the format. A parameter's value is the four floats the material stores for it (a scalar uses the first, a colour the first three); what each parameter does is not decoded, and the names are the game's own. parameters_not_read are parameters the shader lists whose values lie outside the material's constant block. Normal maps are DirectX style (green = +v down). model.json holds the same data with the full technical record.",
+        "materials": list,
+    })
+}
+
 /// Coordinate-system note written into every model.json / GLB.
 pub const COORDS: &str = "units: metres (1 unit = 1 m). Source data is RAGE Z-up right-handed. model.glb and points.glb are glTF Y-up: glb(x, y, z) = rage(x, z, -y) (positions and normals); UVs as stored (top-left origin). Blender's glTF importer converts back to Z-up.";
 
@@ -1222,7 +1289,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 "wheel_mounts_version": 3,
                 "part_colours_version": crate::vehcolour::EXPORT_VERSION,
                 "part_colours": shader_tex.iter().any(|st| st.vehicle_palette.is_some()).then(|| match shader_tex.iter().find_map(|st| st.vehicle_parts.as_ref()) {
-                    Some(set) => serde_json::json!({"status": "applied", "part_set": set, "looks": part_looks["looks"], "configs": part_looks["configs"], "default": part_looks["default"], "paint_finish": part_looks["paint_finish"], "paint_finish_note": "the body paint's finish: metalness and roughness of the surfaces of the primary-paint parts (COLOR_0 alpha 254), averaged over their vertices of every LOD; null when the model has none", "looks_note": "looks: the part colours each distinct configuration result gives, 256 x RGBA per look as hex (encoded like GLB COLOR_0, indexed by part id = _COLOR0 alpha); configs: a configuration's parts_key (vehicles.json) -> look; default: the look baked into the GLB", "note": "each vertex of the two-layer vehicle materials takes the colour of its part id (GLB COLOR_0; see the materials' classification.parts_note)"}),
+                    Some(set) => serde_json::json!({"status": "applied", "part_set": set, "shared_part": part_looks["shared"], "shared_part_note": "true for a library part's model (a truck bed or box, a light bar ...), which several vehicles fit: its part ids mean the same piece in every vehicle's part set, and it takes the colours of the vehicle and configuration it is on. This export uses the set of the first configuration found that names the part (the vehicle is the 8 hex digits after + in part_set).", "looks": part_looks["looks"], "rows": part_looks["rows"], "wear": part_looks["wear"], "wear_note": "per look, the second layer of each part id's surface (256 x 8 hex digits: palette row as in rows, then roughness and metalness, 0 to 255). Every surface record names a second colour and material (rust brown under paint, grey under bare metal, mostly rough and not metallic). It is not applied to the GLB. Where and how much the game shows it is not decoded; the blue channel of the layer detail texture looks like an edge wear mask.", "palette": part_looks["rows"].is_array().then_some("vehicle_palette.png"), "rows_note": "per look, the palette row of each part id (256 x 4 hex digits: slice x 256 + row; ffff = the part has a colour of its own, the one in looks). palette is the material palette beside this file, 128 columns wide, its slices one below the other (256 rows each). The game reads a part's row at the column the green channel of the material's layer detail texture (lyr0diffusetex) gives per pixel; looks and COLOR_0 hold the row at that texture's mean green instead.", "configs": part_looks["configs"], "default": part_looks["default"], "paint_finish": part_looks["paint_finish"], "paint_finish_note": "the body paint's finish: metalness and roughness of the surfaces of the primary-paint parts (COLOR_0 alpha 254), averaged over their vertices of every LOD; null when the model has none", "looks_note": "looks: the part colours each distinct configuration result gives, 256 x RGBA per look as hex (encoded like GLB COLOR_0, indexed by part id = _COLOR0 alpha); configs: a configuration's parts_key (vehicles.json) -> look; default: the look baked into the GLB", "note": "each vertex of the two-layer vehicle materials takes the colour of its part id (GLB COLOR_0; see the materials' classification.parts_note)"}),
                     None => serde_json::json!({"status": "no part set found for this model: the two-layer materials keep their stand-in colours"}),
                 }),
                 "roof_animation": roof_info,
@@ -1268,6 +1335,9 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
             }
             fs::write(&marker, serde_json::to_vec_pretty(&j)?)?;
             item.files.push(rel(&o.out, &marker));
+            let mats = dir.join("materials.json");
+            fs::write(&mats, serde_json::to_vec_pretty(&readable_materials(&base_name, &info.shaders, &j["materials"]))?)?;
+            item.files.push(rel(&o.out, &mats));
         }
         _ => {
             let dir = o.out.join("raw").join(&astem);
@@ -1375,6 +1445,19 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         (Some(t), Some(n), Some(pal)) => t.looks_json(n, pal, ramp_u, mat_blend),
         _ => serde_json::Value::Null,
     };
+    // a library part's model (a truck bed or box, a light bar): its part
+    // set is that of one vehicle it can be fitted to
+    // The material palette, every slice one below the other (128 wide, 256
+    // rows a slice): a part without a colour of its own reads its row of
+    // the slice its colour record names, at the column the layer detail
+    // texture's green gives per pixel.
+    if let Some(pal) = shader_tex.iter().find_map(|st| st.vehicle_palette.as_ref()).filter(|p| !p.is_empty() && p.len() % (128 * 256) == 0) {
+        let bytes: Vec<u8> = pal.iter().flatten().copied().collect();
+        let _ = image::save_buffer(dir.join("vehicle_palette.png"), &bytes, 128, (pal.len() / 128) as u32, image::ColorType::Rgba8);
+    }
+    if part_looks.is_null() && part_tables.as_ref().zip(e.name.as_deref()).is_some_and(|(t, n)| t.is_shared(n)) {
+        part_looks = serde_json::json!({"shared": true});
+    }
     // vertices per part id, for the body paint's finish
     let part_id_counts = std::cell::RefCell::new([0u64; 256]);
     let slice = |i: usize| {
@@ -3173,6 +3256,27 @@ fn lod_exports(groups: &[Vec<crate::gltf::NodeGroup>]) -> Vec<(usize, String)> {
 #[cfg(test)]
 mod dictionary_tests {
     use super::*;
+
+    #[test]
+    fn material_file_names_what_is_known() {
+        let shaders: Vec<crate::drawable::Shader> = serde_json::from_value(serde_json::json!([{
+            "index": 0, "record_off": 0, "name_hash": "0badf00d", "param_hashes": [], "textures": [],
+            "constants": [
+                {"hash": "11111111", "desc": "00400003", "offset": 0, "values": [1.0, 0.5, 0.0, 0.0]},
+                {"hash": "22222222", "desc": "01001003", "offset": 16, "values": null}
+            ]
+        }])).unwrap();
+        let mats = serde_json::json!([{"classification": {"class": "opaque"}, "base_color": "a.png", "normal": null,
+            "textures": [{"param_hash": "33333333", "param_name": "diffusetex", "png": "a.png", "role_guess": "colour (sRGB)", "hash64": "00"},
+                         {"param_hash": "44444444", "param_name": null, "status": "missing"}]}]);
+        let j = readable_materials("m", &shaders, &mats);
+        let m = &j["materials"][0];
+        assert_eq!(m["shader"], "0badf00d");
+        assert_eq!(m["textures"]["diffusetex"]["file"], "a.png");
+        assert_eq!(m["textures"]["44444444"]["status"], "missing");
+        assert_eq!(m["parameters"]["11111111"], serde_json::json!([1.0, 0.5, 0.0, 0.0]));
+        assert_eq!(m["parameters_not_read"], serde_json::json!(["22222222"]));
+    }
 
     #[test]
     fn name_gap_rejects_same_dictionary_and_empty_spans() {

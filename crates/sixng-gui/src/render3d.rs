@@ -88,6 +88,8 @@ pub struct Look {
     pub finish: u32,
     /// The vehicle's own paint finish (metalness, roughness), for finish 4.
     pub stored_finish: [f32; 2],
+    /// How much of the second layer of vehicle part surfaces shows (0 to 1).
+    pub wear: f32,
     pub slot: u32,
     pub paint: [f32; 3],
     pub paint2nd: [f32; 3],
@@ -119,6 +121,7 @@ impl Default for Look {
             rma_order: 3,
             finish: 0,
             stored_finish: [0.0, 0.12],
+            wear: 0.0,
             slot: 0,
             paint: [0.55, 0.02, 0.02],
             paint2nd: [0.6, 0.6, 0.62],
@@ -1302,6 +1305,8 @@ impl Uploader {
             tint_mask: false,
             ped_shade: false,
             detail: None,
+            ramp_u: None,
+            ramp: None,
             parts: false,
             occlusion_only: false,
             slots: vec![],
@@ -1358,7 +1363,14 @@ impl Uploader {
             let u = MatU {
                 base,
                 flags: [has, class_id(&mt.class), alpha, gap | mr],
-                tile: mt.detail.map_or([0.0; 4], |d| [d.scale, d.rot, d.mean, 1.0]),
+                // w: 1 = fabric detail tile, 2 = vehicle part ramps (the
+                // palette column map in the tile slot, the rows in the
+                // emissive slot)
+                tile: match (mt.detail, mt.ramp_u.zip(mt.ramp).filter(|_| mt.emissive.is_none())) {
+                    (Some(d), _) => [d.scale, d.rot, d.mean, 1.0],
+                    (None, Some(_)) => [0.0, 0.0, 0.0, 2.0],
+                    _ => [0.0; 4],
+                },
             };
             let o = k * MAT_STRIDE as usize;
             mat_bytes[o..o + std::mem::size_of::<MatU>()].copy_from_slice(bytemuck::bytes_of(&u));
@@ -1388,11 +1400,11 @@ impl Uploader {
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
-                        resource: wgpu::BindingResource::TextureView(view(mt.emissive)),
+                        resource: wgpu::BindingResource::TextureView(view(mt.emissive.or(mt.ramp.filter(|_| mt.ramp_u.is_some() && mt.detail.is_none())))),
                     },
                     wgpu::BindGroupEntry {
                         binding: 5,
-                        resource: wgpu::BindingResource::TextureView(view(mt.detail.map(|d| d.image))),
+                        resource: wgpu::BindingResource::TextureView(view(mt.detail.map(|d| d.image).or(mt.ramp_u.filter(|_| mt.ramp.is_some() && mt.emissive.is_none())))),
                     },
                 ],
             });
@@ -1723,7 +1735,8 @@ impl Renderer3D {
                 look.stored_finish[0],
             ],
             prev_view_proj: vp.to_cols_array_2d(),
-            jitter: [0.0, 0.0, 0.0, 0.0],
+            // w: vehicle wear (0 to 1)
+            jitter: [0.0, 0.0, 0.0, look.wear],
         }
     }
 

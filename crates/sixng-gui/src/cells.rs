@@ -678,6 +678,8 @@ mod tests {
             tint_mask: false,
             ped_shade: false,
             detail: None,
+            ramp_u: None,
+            ramp: None,
             parts: false,
             occlusion_only: false,
             slots: vec![],

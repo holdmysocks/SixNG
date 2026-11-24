@@ -358,6 +358,10 @@ pub struct ModelView {
     /// The part colours on show (256 x RGBA, by part id), for the fitted
     /// wheels: a rim's and a tyre's vertices carry part ids of the vehicle.
     part_look_table: Option<Arc<Vec<[u8; 4]>>>,
+    /// The material palette of the loaded vehicle (its file, RGBA rows of
+    /// 128) and the look whose rows the model's part materials carry.
+    part_palette: Option<(PathBuf, Arc<Vec<u8>>)>,
+    part_ramp_done: Option<(PathBuf, usize)>,
     /// The part colours the uploaded wheels were coloured with.
     wheel_look: Option<Arc<Vec<[u8; 4]>>>,
     /// Vehicle lamps that are on.
@@ -659,6 +663,8 @@ impl ModelView {
             part_look_want: None,
             cfg_request: None,
             part_look_done: None,
+            part_palette: None,
+            part_ramp_done: None,
             part_look_table: None,
             wheel_look: None,
             lamps: Lamps::default(),
@@ -1469,11 +1475,11 @@ impl ModelView {
                     ui.end_row();
                 }
             });
-        // weapon finishes: the family's variant presets per part type
+        // weapon finishes: the variant presets of the weapon's finish mods, per part type
         let mut finish: Vec<(String, Option<String>)> = Vec::new();
         let mut finish_changed = false;
         if let Some(fs) = l.info["weapon_finishes"].as_array().filter(|a| !a.is_empty()) {
-            ui.label(egui::RichText::new("Finishes (the family's colour variants of a part type; their names are not recovered, so each is labelled by its colours)").weak());
+            ui.label(egui::RichText::new("Finishes (the colour variants a weapon's finish mods offer for this part; their names are not recovered, so each is labelled by its colours)").weak());
             let squares = |ui: &mut egui::Ui, o: &serde_json::Value| {
                 for c in o["colours"].as_array().into_iter().flatten().filter_map(|c| u32::from_str_radix(c.as_str()?, 16).ok()) {
                     ui.label(egui::RichText::new("\u{25a0}").color(egui::Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)));
@@ -1705,6 +1711,9 @@ impl ModelView {
                 }
                 self.loaded = Some(l);
                 self.frames_since_load = 0;
+                // the new meshes carry the colours of their files
+                self.part_look_done = None;
+                self.part_ramp_done = None;
                 self.apply_paint(rs);
             }
             Err(e) => {
@@ -2217,16 +2226,81 @@ impl ModelView {
         };
         let idx = idx as usize;
         let decode = |hex: &str| -> Arc<Vec<[u8; 4]>> { Arc::new((0..256).map(|i| std::array::from_fn(|k| u8::from_str_radix(&hex[i * 8 + k * 2..i * 8 + k * 2 + 2], 16).unwrap_or(255))).collect()) };
-        // a freshly loaded model shows the default look
+        // a freshly loaded model shows the default look, but a fitted
+        // library part (a truck bed or box) comes with the colours of
+        // another vehicle and is coloured again
         let shown = match &self.part_look_done {
             Some((p, i)) if *p == l.model.path => Some(*i),
-            _ => default.map(|d| d as usize),
+            _ if l.selected.is_empty() => default.map(|d| d as usize),
+            _ => None,
         };
         let Some(hex) = pc["looks"][idx].as_str().filter(|h| h.len() == 2048) else {
             self.part_look_table = None;
             return;
         };
-        if shown == Some(idx) {
+        // The palette rows of this look as an image for the part materials:
+        // row = part id, 128 columns (a part with a colour of its own gets
+        // that colour in every column).
+        let ramp_key = (l.model.path.clone(), idx);
+        let mut ramp_new = false;
+        if self.part_ramp_done.as_ref() != Some(&ramp_key) {
+            let file = l.model.path.parent().map(|d| d.join(pc["palette"].as_str().unwrap_or("vehicle_palette.png")));
+            if let Some(f) = file.filter(|_| pc["rows"][idx].as_str().is_some_and(|r| r.len() == 1024)) {
+                if self.part_palette.as_ref().is_none_or(|(p, _)| *p != f) {
+                    self.part_palette = image::open(&f).ok().map(|i| i.to_rgba8()).filter(|i| i.width() == 128).map(|i| (f.clone(), Arc::new(i.into_raw())));
+                }
+                if let (Some((_, pal)), Some(rows)) = (&self.part_palette, pc["rows"][idx].as_str()) {
+                    let look = decode(hex);
+                    let srgb = |v: u8| {
+                        let c = v as f32 / 255.0;
+                        ((if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }) * 255.0 + 0.5) as u8
+                    };
+                    // rows 256..: the surface's second layer (colour, alpha =
+                    // roughness); its metalness is the alpha of rows 0..256
+                    let wear = pc["wear"][idx].as_str().filter(|w| w.len() == 2048);
+                    let mut px = vec![255u8; 128 * 512 * 4];
+                    for id in 0..256 {
+                        let w = wear.map(|w| &w[id * 8..id * 8 + 8]);
+                        let byte = |k: usize| w.and_then(|w| u8::from_str_radix(&w[k..k + 2], 16).ok());
+                        let wrow = w.and_then(|w| usize::from_str_radix(&w[..4], 16).ok()).filter(|r| *r != 0xffff);
+                        let (first, second) = px.split_at_mut(256 * 512);
+                        let out2 = &mut second[id * 512..id * 512 + 512];
+                        if let Some(src) = wrow.and_then(|r| pal.get(r * 512..r * 512 + 512)) {
+                            out2.copy_from_slice(src);
+                        } else {
+                            out2.chunks_exact_mut(4).for_each(|c| c.copy_from_slice(&[srgb(look[id][0]), srgb(look[id][1]), srgb(look[id][2]), 255]));
+                        }
+                        out2.chunks_exact_mut(4).for_each(|c| c[3] = byte(4).unwrap_or(128));
+                        let metal1 = byte(6).unwrap_or(0);
+                        let px = first;
+                        let row = usize::from_str_radix(&rows[id * 4..id * 4 + 4], 16).unwrap_or(0xffff);
+                        let out = &mut px[id * 512..id * 512 + 512];
+                        match pal.get(row * 512..row * 512 + 512).filter(|_| row != 0xffff) {
+                            Some(src) => out.copy_from_slice(src),
+                            None => out.chunks_exact_mut(4).for_each(|c| c.copy_from_slice(&[srgb(look[id][0]), srgb(look[id][1]), srgb(look[id][2]), 255])),
+                        }
+                        out.chunks_exact_mut(4).for_each(|c| c[3] = metal1);
+                    }
+                    let im = glb::Image { key: "part ramp".into(), mips: vec![(128, 512, px)], srgb: true, bc: None };
+                    let at = match l.model.images.iter().position(|i| i.key == "part ramp") {
+                        Some(i) => {
+                            l.model.images[i] = im;
+                            i
+                        }
+                        None => {
+                            l.model.images.push(im);
+                            l.model.images.len() - 1
+                        }
+                    };
+                    for m in l.model.materials.iter_mut().filter(|m| m.parts && m.ramp_u.is_some()) {
+                        m.ramp = Some(at);
+                    }
+                    ramp_new = true;
+                }
+            }
+            self.part_ramp_done = Some(ramp_key);
+        }
+        if shown == Some(idx) && !ramp_new {
             if self.part_look_done.as_ref() != Some(&(l.model.path.clone(), idx)) || self.part_look_table.is_none() {
                 self.part_look_table = Some(decode(hex));
             }
@@ -3301,6 +3375,10 @@ impl ModelView {
         ui.add(egui::Slider::new(&mut self.look.wet, 0.0..=1.0).text("wet"));
         ui.separator();
         self.vehicle_ui(ui);
+        if self.part_ramp_done.is_some() && self.loaded.as_ref().is_some_and(|l| l.model.materials.iter().any(|m| m.ramp.is_some())) {
+            ui.add(egui::Slider::new(&mut self.look.wear, 0.0..=1.0).text("wear"))
+                .on_hover_text("Shows the second layer of the vehicle's surfaces (rust under paint, grey under bare metal), which the game's files give for every surface. Where it shows is taken from the blue channel of the parts' detail texture; how much the game shows is not known, so the amount is yours to set.");
+        }
         if caps.paint {
             ui.heading("Car paint");
             ui.horizontal(|ui| {
@@ -5264,7 +5342,7 @@ fn load_query_sel(
                 o.insert("parts_without_mount".into(), serde_json::json!(loose));
                 if !finishes.is_empty() {
                     o.insert("weapon_finishes".into(), serde_json::json!(finishes));
-                    o.insert("weapon_finishes_note".into(), "finishes are the weapon family's variant presets for a part type (frame, slide, grip, barrel …); which one the game gives a weapon is not decoded, so the part's own preset is the default. Variant names are not recovered.".into());
+                    o.insert("weapon_finishes_note".into(), "finishes are the variant presets that the finish mods of a weapon list for the part type of this component (frame, slide, grip, barrel …). No finish mod is a weapon's default mod, so the default is the part's own preset. Variant names are not recovered.".into());
                 }
                 if !coloured.is_empty() {
                     o.insert("weapon_presets".into(), serde_json::json!(coloured));
