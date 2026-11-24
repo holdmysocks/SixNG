@@ -544,7 +544,14 @@ again**).
   The panel also shows the colours of the game's hair palette as
   swatches to click (`--hair-colour r,g,b`), and lists the character's
   other hair styles (its own placeholders that have grooms placed) to
-  tick (`--hair-style TEXT`). `player_story000_00`'s default ponytails
+  tick (`--hair-style TEXT`). Under a hat the scalp hair is pressed in: strand
+  points beyond the hat's lining are pulled to 3 mm under it, and an
+  opening the hat encloses (over a cap's strap) counts as closed. This
+  is a stand-in, not the game's method: of the 6,886 outfits with a hat
+  and hair, 6,840 ask for the plain hair state, and no stored rule
+  says how the game keeps it under the hat. Hair items do have other
+  states (`hathairalt`, `maskhairalt`, `hairhidden`), each with its own
+  hair asset; an outfit that asks for one gets it. `player_story000_00`'s default ponytails
   have no groom files in any archive of the install (packs, the story
   packs and the other packs were scanned), so that character starts
   without hair; four other styles of hers are offered, at low confidence

@@ -5125,7 +5125,7 @@ fn load_query_sel(
                 }
                 let head: Vec<[f32; 3]> = skin.iter().filter(|(n, _)| is_head(n)).flat_map(|(_, p)| p.iter().copied()).collect();
                 l.hat = Some(Arc::new(sixng_core::groom::Shell::new([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, top - 0.10], &hat, &head)));
-                l.notes.push("Hat: the scalp hair is pressed under the hat's lining (strand points beyond it are pulled in to 3 mm under it), so the hair does not come through the hat; an opening the hat encloses (over a cap's strap) counts as closed. A display rule: how the game shapes hair under a hat is not in the data read so far.".to_string());
+                l.notes.push("Hat: the scalp hair is pressed under the hat's lining (strand points beyond it are pulled in to 3 mm under it), so the hair does not come through the hat; an opening the hat encloses (over a cap's strap) counts as closed. A stand-in, not the game's method: the outfit asks for the plain hair, and no stored rule says how the game keeps it under the hat.".to_string());
             }
             // Strand roots must lie on this character: pieces that do not
             // (another head shape, a neighbour's piece) are left out. Only in
