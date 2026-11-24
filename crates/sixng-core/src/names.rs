@@ -13,6 +13,13 @@
 //! * `shaders`: NUL-terminated identifiers in `shaders.rpf` (technique,
 //!   sampler, texture and variable names);
 //! * `derived`: the built-in list.
+//!
+//! Optionally, `sixng names --namehash <dictionary.json>` imports a
+//! [gta6-namehash](https://github.com/tarekmania/gta6-namehash) dictionary
+//! (joaat of names from public GTA V lists, no game files) into
+//! `<work>/names/namehash.json`. Its names are candidates: a lookup uses one
+//! only when no source above names the hash, and `--lookup` lists them with
+//! source `namehash`.
 use crate::meta7a::joaat;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -155,6 +162,13 @@ fn order(ctx: Ctx) -> [&'static str; 3] {
 struct Loaded {
     map: HashMap<u32, Vec<(String, String)>>,
     exact: HashMap<u32, Vec<(String, String)>>,
+    /// Imported gta6-namehash names, used only when `map` / `exact` have none.
+    public_map: HashMap<u32, Vec<(String, String)>>,
+    public_exact: HashMap<u32, Vec<(String, String)>>,
+}
+
+fn by_hash(src: BTreeMap<String, Vec<(String, String)>>) -> HashMap<u32, Vec<(String, String)>> {
+    src.into_iter().filter_map(|(h, v)| u32::from_str_radix(&h, 16).ok().map(|h| (h, v))).collect()
 }
 
 /// joaat without lower-casing.
@@ -186,6 +200,51 @@ pub fn work_dir() -> Option<PathBuf> {
 
 pub fn dict_path(work: &Path) -> PathBuf {
     work.join("names").join("names.json")
+}
+
+pub fn namehash_path(work: &Path) -> PathBuf {
+    work.join("names").join("namehash.json")
+}
+
+/// A gta6-namehash `dictionary.json` (hash -> names) as a [`Dict`] with
+/// source `namehash`. Each name is re-hashed: it goes to `names` when the
+/// joaat of its lower-case form is the key and to `exact` when the joaat of
+/// its spelling is; names that match neither are dropped.
+pub fn from_namehash(raw: &BTreeMap<String, Vec<String>>) -> Dict {
+    let mut d = Dict { version: 1, names: BTreeMap::new(), exact: BTreeMap::new() };
+    for (k, names) in raw {
+        let Ok(h) = u32::from_str_radix(k, 16) else { continue };
+        let key = format!("{h:08x}");
+        // the lower-case spelling first, as in `build`
+        let mut names: Vec<&String> = names.iter().collect();
+        names.sort_by_key(|n| (n.bytes().any(|c| c.is_ascii_uppercase()), n.as_str()));
+        for n in names {
+            if joaat(n) == h {
+                let e = d.names.entry(key.clone()).or_default();
+                if !e.iter().any(|(x, _)| x.eq_ignore_ascii_case(n)) {
+                    e.push((n.clone(), "namehash".into()));
+                }
+            }
+            if n.bytes().any(|c| c.is_ascii_uppercase()) && joaat_exact(n) == h {
+                d.exact.entry(key.clone()).or_default().push((n.clone(), "namehash".into()));
+            }
+        }
+    }
+    d
+}
+
+/// Import a gta6-namehash `dictionary.json` into `<work>/names/namehash.json`.
+pub fn import_namehash(src: &Path, work: &Path) -> Result<serde_json::Value> {
+    let b = std::fs::read(src).with_context(|| format!("reading {}", src.display()))?;
+    let raw: BTreeMap<String, Vec<String>> = serde_json::from_slice(&b).context("not a gta6-namehash dictionary.json (hash -> list of names)")?;
+    let d = from_namehash(&raw);
+    let p = namehash_path(work);
+    std::fs::create_dir_all(p.parent().unwrap())?;
+    let tmp = p.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&d)?)?;
+    std::fs::rename(&tmp, &p)?;
+    reload();
+    Ok(serde_json::json!({"out": p, "hashes_in_file": raw.len(), "hashes": d.names.len(), "case_sensitive_hashes": d.exact.len()}))
 }
 
 /// Drop the loaded dictionary so the next lookup reads `names.json` again
@@ -222,15 +281,24 @@ fn loaded() -> std::sync::Arc<Loaded> {
                 v.push((n.to_string(), "derived".into()));
             }
         }
-        Loaded { map, exact }
+        let p = WORK.get().and_then(|w| std::fs::read(namehash_path(w)).ok()).and_then(|b| serde_json::from_slice::<Dict>(&b).ok()).unwrap_or_default();
+        Loaded { map, exact, public_map: by_hash(p.names), public_exact: by_hash(p.exact) }
     });
     *DICT.write().unwrap() = Some(l.clone());
     l
 }
 
-/// The best name for a hash in a context, if any.
+/// The best name for a hash in a context, if any. Imported gta6-namehash
+/// names come last.
 pub fn lookup(h: u32, ctx: Ctx) -> Option<String> {
     let l = loaded();
+    own(&l, h, ctx).or_else(|| {
+        let exact = if ctx == Ctx::Field { l.public_exact.get(&h) } else { None };
+        exact.or_else(|| l.public_map.get(&h)).and_then(|v| v.first()).map(|(n, _)| n.clone())
+    })
+}
+
+fn own(l: &Loaded, h: u32, ctx: Ctx) -> Option<String> {
     if ctx == Ctx::Field {
         if let Some(v) = l.exact.get(&h) {
             for src in order(ctx) {
@@ -267,6 +335,10 @@ pub fn all(h: u32) -> Vec<(String, String)> {
     let l = loaded();
     let mut v = l.map.get(&h).cloned().unwrap_or_default();
     for (n, s) in l.exact.get(&h).cloned().unwrap_or_default() {
+        v.push((n, format!("{s} (case-sensitive)")));
+    }
+    v.extend(l.public_map.get(&h).cloned().unwrap_or_default());
+    for (n, s) in l.public_exact.get(&h).cloned().unwrap_or_default() {
         v.push((n, format!("{s} (case-sensitive)")));
     }
     v
@@ -373,6 +445,30 @@ pub fn build(game: &Path, index_dir: &Path, work: &Path) -> Result<serde_json::V
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn namehash_import() {
+        let raw: BTreeMap<String, Vec<String>> = [
+            ("c897af02", vec!["Features"]),
+            ("61e1e572", vec!["Features", "features"]),
+            ("079baba7", vec!["attachBone"]),
+            ("12345678", vec!["nomatch"]),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.into_iter().map(String::from).collect()))
+        .collect();
+        let d = from_namehash(&raw);
+        // case-sensitive match only
+        assert_eq!(d.exact["c897af02"], vec![("Features".to_string(), "namehash".to_string())]);
+        assert!(!d.names.contains_key("c897af02"));
+        // lower-case match, one entry per lower-case spelling
+        assert_eq!(d.names["61e1e572"], vec![("features".to_string(), "namehash".to_string())]);
+        assert!(!d.exact.contains_key("61e1e572"));
+        // camelCase field name
+        assert_eq!(joaat_exact("attachBone"), 0x079b_aba7);
+        assert_eq!(d.exact["079baba7"][0].0, "attachBone");
+        // names whose hash is not the key are dropped
+        assert!(!d.names.contains_key("12345678") && !d.exact.contains_key("12345678"));
+    }
     #[test]
     fn known_hashes() {
         // shader and parameter names: joaat of the lower-case name
