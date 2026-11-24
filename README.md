@@ -532,10 +532,15 @@ again**).
     with the same asset GUID resolved to (`found_by: asset id`; the table
     is built once, a few minutes, as `<work>/index/asset_drawables.json`).
     Game-wide 68.5 % of the shoe items resolve by their own textures and
-    half of the rest share a GUID with one that does. Of the 292
-    characters, 225 now open with head, body, clothes and shoes, 47
-    dressed without shoes and 20 without a dressed outfit; the shoe
-    models of the 47 are found under no texture or GUID. `sixng ped-look "^"` lists every character
+    half of the rest share a GUID with one that does. One-piece swimwear
+    and bodysuits count as a one-piece garment and the sports base layers
+    as a top or a bottom, so such an outfit is dressed (and hides the
+    skin under it). Of the 292 characters, 225 now open with head, body,
+    clothes and shoes, 50 dressed without shoes and 17 without a top and
+    a bottom; most of the 17 are stored that way (shirtless in shorts,
+    costumes), and a garment whose model is found under no texture and
+    no GUID is listed in the panel as not found instead of being left
+    out silently. `sixng ped-look "^"` lists every character
     with what its default outfit has. `sixng outfit <name> --look N`
     exports outfit N as one rigged GLB (parts, the face, stored tints;
     not the viewer's skin tone, colour words or hidden skin).
