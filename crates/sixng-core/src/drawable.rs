@@ -1113,9 +1113,29 @@ pub struct ShaderConst {
     /// Number of floats of the value (0 in data written before this field existed).
     #[serde(default)]
     pub count: u8,
+    /// The value's type from the shader archive's tables (`float`, `int`,
+    /// `bool`, `float4` ...), filled in by the exporter where the effect
+    /// and the parameter are found there. The drawable itself does not
+    /// store it.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub ty: Option<String>,
 }
 
 impl ShaderConst {
+    /// The value as JSON: a scalar as one number, a vector as its own
+    /// components; an integer type (`int`, `int3` ...) as the integers its
+    /// bits hold, a type that is not identified (`type_xx`) as unsigned
+    /// integers, since it is not a float.
+    pub fn json(&self) -> Option<serde_json::Value> {
+        let v = self.components()?;
+        let one = |x: f32| match self.ty.as_deref() {
+            Some(t) if t.starts_with("int") => serde_json::json!(x.to_bits() as i32),
+            Some(t) if t.starts_with("type_") => serde_json::json!(x.to_bits()),
+            _ => serde_json::json!(x),
+        };
+        Some(if v.len() == 1 { one(v[0]) } else { v.iter().map(|&x| one(x)).collect() })
+    }
+
     /// The value's own components (all four where the count is not recorded).
     pub fn components(&self) -> Option<&[f32]> {
         self.values.as_ref().map(|v| match self.count {
@@ -1205,7 +1225,7 @@ fn constants(r: &Resource, s: usize, pt: usize, entries: &[(u32, u32)]) -> Vec<S
             let (buffer, offset, count) = (d as u8, ((d >> 8) & 0x3fff) as usize, (d >> 22) as usize);
             let base = ids.iter().position(|&i| i == buffer).and_then(|k| bases[k]);
             let values = base.filter(|&b| (1..=4).contains(&count) && b + offset + 4 * count <= end_of(b)).map(|b| std::array::from_fn(|k| if k < count { r.f32(b + offset + 4 * k) } else { 0.0 }));
-            ShaderConst { hash: format!("{h:08x}"), desc: format!("{d:08x}"), offset, values, buffer, count: count.min(255) as u8 }
+            ShaderConst { hash: format!("{h:08x}"), desc: format!("{d:08x}"), offset, values, buffer, count: count.min(255) as u8, ty: None }
         })
         .collect()
 }
@@ -1245,6 +1265,12 @@ mod constant_tests {
         // no block: nothing is read
         let c = constants(&Resource { sys: vec![0; 0x500], gfx: vec![], gfx_base: 0 }, 0x100, 0x400, &[(1, desc(1, 0, 3))]);
         assert!(c[0].values.is_none());
+        // typed output: an int shows the integer in its bits, a float stays a float, a vector keeps its components
+        let k = |ty: Option<&str>, count: u8, v: [f32; 4]| ShaderConst { hash: String::new(), desc: String::new(), offset: 0, values: Some(v), buffer: 3, count, ty: ty.map(str::to_string) };
+        assert_eq!(k(Some("int"), 1, [f32::from_bits(0x12b1), 0.0, 0.0, 0.0]).json(), Some(serde_json::json!(0x12b1)));
+        assert_eq!(k(Some("int3"), 3, [f32::from_bits(0xffff_ffff), f32::from_bits(2), 0.0, 0.0]).json(), Some(serde_json::json!([-1, 2, 0])));
+        assert_eq!(k(Some("type_05"), 1, [f32::from_bits(0xe4e4_e4e4), 0.0, 0.0, 0.0]).json(), Some(serde_json::json!(0xe4e4_e4e4u32)));
+        assert_eq!((k(Some("float"), 1, [0.5, 0.0, 0.0, 0.0]).json(), k(None, 2, [0.5, 1.5, 0.0, 0.0]).json()), (Some(serde_json::json!(0.5)), Some(serde_json::json!([0.5, 1.5]))));
     }
 }
 
