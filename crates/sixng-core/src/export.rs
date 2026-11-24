@@ -1310,7 +1310,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 "wheel_mounts_version": 3,
                 "part_colours_version": crate::vehcolour::EXPORT_VERSION,
                 "part_colours": shader_tex.iter().any(|st| st.vehicle_palette.is_some()).then(|| match shader_tex.iter().find_map(|st| st.vehicle_parts.as_ref()) {
-                    Some(set) => serde_json::json!({"status": "applied", "part_set": set, "shared_part": part_looks["shared"], "shared_part_note": "true for a library part's model (a truck bed or box, a light bar ...), which several vehicles fit: its part ids mean the same piece in every vehicle's part set, and it takes the colours of the vehicle and configuration it is on. This export uses the set of the first configuration found that names the part (the vehicle is the 8 hex digits after + in part_set).", "looks": part_looks["looks"], "rows": part_looks["rows"], "wear": part_looks["wear"], "wear_note": "per look, the second layer of each part id's surface (256 x 8 hex digits: palette row as in rows, then roughness and metalness, 0 to 255). Every surface record names a second colour and material (rust brown under paint, grey under bare metal, mostly rough and not metallic). It is not applied to the GLB. Where and how much the game shows it is not decoded; the blue channel of the layer detail texture looks like an edge wear mask.", "palette": part_looks["rows"].is_array().then_some("vehicle_palette.png"), "rows_note": "per look, the palette row of each part id (256 x 4 hex digits: slice x 256 + row; ffff = the part has a colour of its own, the one in looks). palette is the material palette beside this file, 128 columns wide, its slices one below the other (256 rows each). The game reads a part's row at the column the green channel of the material's layer detail texture (lyr0diffusetex) gives per pixel; looks and COLOR_0 hold the row at that texture's mean green instead.", "configs": part_looks["configs"], "default": part_looks["default"], "paint_finish": part_looks["paint_finish"], "paint_finish_note": "the body paint's finish: metalness and roughness of the surfaces of the primary-paint parts (COLOR_0 alpha 254), averaged over their vertices of every LOD; null when the model has none", "looks_note": "looks: the part colours each distinct configuration result gives, 256 x RGBA per look as hex (encoded like GLB COLOR_0, indexed by part id = _COLOR0 alpha); configs: a configuration's parts_key (vehicles.json) -> look; default: the look baked into the GLB", "note": "each vertex of the two-layer vehicle materials takes the colour of its part id (GLB COLOR_0; see the materials' classification.parts_note)"}),
+                    Some(set) => serde_json::json!({"status": "applied", "part_set": set, "shared_part": part_looks["shared"], "shared_part_note": "true for a library part's model (a truck bed or box, a light bar ...), which several vehicles fit: its part ids mean the same piece in every vehicle's part set, and it takes the colours of the vehicle and configuration it is on. This export uses the set of the first configuration found that names the part (the vehicle is the 8 hex digits after + in part_set).", "looks": part_looks["looks"], "part_patches": part_looks["part_patches"], "part_patches_note": "what fitting one more of the vehicle's own parts changes (part name -> ids and their look entries, 8 hex digits each, encoded like looks): a body kit's part rebinds the part ids of its panels, mostly to the body paint (alpha 254). Computed on top of the default look.", "rows": part_looks["rows"], "wear": part_looks["wear"], "wear_note": "per look, the second layer of each part id's surface (256 x 8 hex digits: palette row as in rows, then roughness and metalness, 0 to 255). Every surface record names a second colour and material (rust brown under paint, grey under bare metal, mostly rough and not metallic). It is not applied to the GLB. Where and how much the game shows it is not decoded; the blue channel of the layer detail texture looks like an edge wear mask.", "palette": part_looks["rows"].is_array().then_some("vehicle_palette.png"), "rows_note": "per look, the palette row of each part id (256 x 4 hex digits: slice x 256 + row; ffff = the part has a colour of its own, the one in looks). palette is the material palette beside this file, 128 columns wide, its slices one below the other (256 rows each). The game reads a part's row at the column the green channel of the material's layer detail texture (lyr0diffusetex) gives per pixel; looks and COLOR_0 hold the row at that texture's mean green instead.", "configs": part_looks["configs"], "default": part_looks["default"], "paint_finish": part_looks["paint_finish"], "paint_finish_note": "the body paint's finish: metalness and roughness of the surfaces of the primary-paint parts (COLOR_0 alpha 254), averaged over their vertices of every LOD; null when the model has none", "looks_note": "looks: the part colours each distinct configuration result gives, 256 x RGBA per look as hex (encoded like GLB COLOR_0, indexed by part id = _COLOR0 alpha); configs: a configuration's parts_key (vehicles.json) -> look; default: the look baked into the GLB", "note": "each vertex of the two-layer vehicle materials takes the colour of its part id (GLB COLOR_0; see the materials' classification.parts_note)"}),
                     None => serde_json::json!({"status": "no part set found for this model: the two-layer materials keep their stand-in colours"}),
                 }),
                 "roof_animation": roof_info,
@@ -1328,7 +1328,8 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     if let Some(fb) = &st.fallback {
                         m["texture_fallback"] = fb.clone();
                     }
-                    if let Some(l) = crate::material::multilayer(s, &st.entries, || material_uv_fit(&lod_groups, si)) {
+                    if let Some(mut l) = crate::material::multilayer(s, &st.entries, || material_uv_fit(&lod_groups, si)) {
+                        crate::material::four_layer_vertex_weights(&mut l, material_colours1(&lod_groups, si));
                         m["multilayer"] = l;
                     }
                     if m["classification"]["class"] == "car_paint" {
@@ -1387,6 +1388,13 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
 
 /// A drawable's meshes, materials and skin, ready for `gltf::mesh_glb`.
 /// Measured UV mapping of one material over the first populated LOD.
+/// The second colour stream of every vertex of a material, in the first
+/// populated LOD.
+fn material_colours1(lod_groups: &[Vec<crate::gltf::NodeGroup>], shader: usize) -> impl Iterator<Item = [u8; 4]> + '_ {
+    let lod = lod_groups.iter().find(|g| g.iter().any(|n| !n.prims.is_empty()));
+    lod.into_iter().flatten().flat_map(|n| &n.prims).filter(move |p| p.material == Some(shader)).filter_map(|p| p.colors1.as_ref()).flatten().copied()
+}
+
 fn material_uv_fit(lod_groups: &[Vec<crate::gltf::NodeGroup>], shader: usize) -> serde_json::Value {
     let lod = lod_groups.iter().find(|g| g.iter().any(|n| !n.prims.is_empty()));
     crate::material::uv_fit(lod.into_iter().flatten().flat_map(|n| &n.prims).filter(|p| p.material == Some(shader)))
@@ -1684,7 +1692,8 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             if let Some(w) = &st.weapon_preset {
                 x["weapon_preset"] = w.clone();
             }
-            if let Some(l) = crate::material::multilayer(s, &st.entries, || material_uv_fit(&lod_groups, si)) {
+            if let Some(mut l) = crate::material::multilayer(s, &st.entries, || material_uv_fit(&lod_groups, si)) {
+                        crate::material::four_layer_vertex_weights(&mut l, material_colours1(&lod_groups, si));
                 x["multilayer"] = l;
             }
             x
