@@ -531,7 +531,7 @@ impl Groom {
     /// game's strand shader reads from its parameter ramp at that point of
     /// the strand: TEXCOORD_0 = (g0, fill of the unlit side), TEXCOORD_1 =
     /// (profile scale, 1). Without it both are left out.
-    pub fn coat_glb_ramped(&self, name: &str, coat: &Coat, width: f32, colour: &dyn Fn(usize, f32) -> [u8; 4], params: Option<&dyn Fn(usize, f32) -> [f32; 3]>, extras: serde_json::Value) -> Vec<u8> {
+    pub fn coat_glb_ramped(&self, name: &str, coat: &Coat, width: f32, colour: &dyn Fn(usize, f32) -> [u8; 4], params: Option<&dyn Fn(usize, f32) -> [f32; 4]>, extras: serde_json::Value) -> Vec<u8> {
         let k = coat.k;
         let n = coat.guides.len();
         let (mut uv0, mut uv1): (Vec<[f32; 2]>, Vec<[f32; 2]>) = (Vec::new(), Vec::new());
@@ -556,7 +556,8 @@ impl Groom {
                 let tap = if flat_taper { 1.0 - 0.6 * f } else { (self.taper[((f * 15.0) as usize).min(15)] as f32 / 255.0).max(0.15) };
                 let c = colour(s, f);
                 let pv = params.map(|p| p(s, f));
-                let r = width * 0.5 * tap;
+                // with parameters: their own width at this point (metres), in place of the groom's width and taper
+                let r = pv.map_or(width * 0.5 * tap, |v| v[3] * 0.5);
                 for sg in [-1.0f32, 1.0] {
                     pos.push([p[0] + side[0] * r * sg, p[1] + side[1] * r * sg, p[2] + side[2] * r * sg]);
                     nrm.push(nr);
