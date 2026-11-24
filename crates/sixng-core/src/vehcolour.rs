@@ -60,9 +60,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// Version of what an export writes for part colours (model.json
 /// `part_colours_version`); the model viewer exports older vehicles again.
-pub const EXPORT_VERSION: u32 = 11;
+pub const EXPORT_VERSION: u32 = 16;
 /// Layout version of `<work>/index/vehicle_parts.json`.
-pub const FORMAT: u32 = 10;
+pub const FORMAT: u32 = 16;
 
 const PART_SET: u32 = 0xf142_44fd;
 const SET_COLOURS: u32 = 0x7847_6477;
@@ -187,6 +187,11 @@ pub struct Tables {
     /// list) -> the part set that configuration gives.
     #[serde(default)]
     pub config_sets: HashMap<String, HashMap<String, String>>,
+    /// Asset id of a mod part's model (`meta7a::asset_id`, 16 hex digits)
+    /// -> its vehicle (8 hex digits): the part's vertices carry part ids of
+    /// the vehicle's part set (a pickup's bed, bumpers, bonnets ...).
+    #[serde(default)]
+    pub part_owner: HashMap<String, String>,
 }
 
 /// A key for a configuration: FNV-1a of its part list (the name hashes in
@@ -437,6 +442,25 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
             }
         }
     }
+    // A single vehicle's pack: the models of its elements belong to the
+    // vehicle. The chassis part has an element for the vehicle's own model,
+    // whose asset id is the name of the vehicle's part set, which says
+    // whose pack it is. Every 64-bit
+    // value of an element is kept; only a model's asset id is looked up.
+    // (a variation set without an owner is filed under 0: not a vehicle)
+    let mut vehicles: Vec<(&String, &String)> = t.models.iter().filter(|(v, _)| v.as_str() != "00000000").collect();
+    vehicles.sort();
+    let mut by_asset: HashMap<&str, &String> = HashMap::new();
+    for (v, set) in vehicles {
+        by_asset.entry(set.split('+').next().unwrap_or(set)).or_insert(v);
+    }
+    for (_, _, elements, _, _) in &found {
+        let Some(owner) = elements.iter().flat_map(|(_, c)| c.iter()).find_map(|a| by_asset.get(a.as_str())) else { continue };
+        for a in elements.iter().flat_map(|(_, c)| c.iter()) {
+            t.part_owner.entry(a.clone()).or_insert_with(|| (*owner).clone());
+        }
+
+    }
     // A configuration reassigns colours and surfaces to groups of part
     // ids. Configurations of one model differ (comet7's first one leaves the
     // rear deck unpainted, 15 of its other 16 paint it), so the model gets
@@ -566,7 +590,8 @@ impl Tables {
         let m = model.to_ascii_lowercase();
         let base = m.strip_suffix("_hi").or_else(|| m.strip_suffix("_mid")).unwrap_or(&m);
         let key = |s: &str| format!("{:08x}", meta7a::joaat(s));
-        let set = self.elements.get(&key(&m)).or_else(|| self.elements.get(&key(base))).or_else(|| self.models.get(&key(base)))?;
+        let owned = || self.part_owner.get(&format!("{:016x}", meta7a::asset_id(base))).and_then(|v| self.models.get(v));
+        let set = self.elements.get(&key(&m)).or_else(|| self.elements.get(&key(base))).or_else(|| self.models.get(&key(base))).or_else(owned)?;
         self.sets.get_key_value(set).map(|(k, v)| (k.as_str(), v.as_slice()))
     }
 }
