@@ -2238,16 +2238,33 @@ impl ModelView {
                         let c = v as f32 / 255.0;
                         ((if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }) * 255.0 + 0.5) as u8
                     };
-                    let mut px = vec![255u8; 128 * 256 * 4];
+                    // rows 256..: the surface's second layer (colour, alpha =
+                    // roughness); its metalness is the alpha of rows 0..256
+                    let wear = pc["wear"][idx].as_str().filter(|w| w.len() == 2048);
+                    let mut px = vec![255u8; 128 * 512 * 4];
                     for id in 0..256 {
+                        let w = wear.map(|w| &w[id * 8..id * 8 + 8]);
+                        let byte = |k: usize| w.and_then(|w| u8::from_str_radix(&w[k..k + 2], 16).ok());
+                        let wrow = w.and_then(|w| usize::from_str_radix(&w[..4], 16).ok()).filter(|r| *r != 0xffff);
+                        let (first, second) = px.split_at_mut(256 * 512);
+                        let out2 = &mut second[id * 512..id * 512 + 512];
+                        if let Some(src) = wrow.and_then(|r| pal.get(r * 512..r * 512 + 512)) {
+                            out2.copy_from_slice(src);
+                        } else {
+                            out2.chunks_exact_mut(4).for_each(|c| c.copy_from_slice(&[srgb(look[id][0]), srgb(look[id][1]), srgb(look[id][2]), 255]));
+                        }
+                        out2.chunks_exact_mut(4).for_each(|c| c[3] = byte(4).unwrap_or(128));
+                        let metal1 = byte(6).unwrap_or(0);
+                        let px = first;
                         let row = usize::from_str_radix(&rows[id * 4..id * 4 + 4], 16).unwrap_or(0xffff);
                         let out = &mut px[id * 512..id * 512 + 512];
                         match pal.get(row * 512..row * 512 + 512).filter(|_| row != 0xffff) {
                             Some(src) => out.copy_from_slice(src),
                             None => out.chunks_exact_mut(4).for_each(|c| c.copy_from_slice(&[srgb(look[id][0]), srgb(look[id][1]), srgb(look[id][2]), 255])),
                         }
+                        out.chunks_exact_mut(4).for_each(|c| c[3] = metal1);
                     }
-                    let im = glb::Image { key: "part ramp".into(), mips: vec![(128, 256, px)], srgb: true, bc: None };
+                    let im = glb::Image { key: "part ramp".into(), mips: vec![(128, 512, px)], srgb: true, bc: None };
                     let at = match l.model.images.iter().position(|i| i.key == "part ramp") {
                         Some(i) => {
                             l.model.images[i] = im;
@@ -3341,6 +3358,10 @@ impl ModelView {
         ui.add(egui::Slider::new(&mut self.look.wet, 0.0..=1.0).text("wet"));
         ui.separator();
         self.vehicle_ui(ui);
+        if self.part_ramp_done.is_some() && self.loaded.as_ref().is_some_and(|l| l.model.materials.iter().any(|m| m.ramp.is_some())) {
+            ui.add(egui::Slider::new(&mut self.look.wear, 0.0..=1.0).text("wear"))
+                .on_hover_text("Shows the second layer of the vehicle's surfaces (rust under paint, grey under bare metal), which the game's files give for every surface. Where it shows is taken from the blue channel of the parts' detail texture; how much the game shows is not known, so the amount is yours to set.");
+        }
         if caps.paint {
             ui.heading("Car paint");
             ui.horizontal(|ui| {
