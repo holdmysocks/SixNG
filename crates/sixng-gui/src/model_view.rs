@@ -271,6 +271,9 @@ pub struct Automation {
     /// `--find-hair`: fit grooms to the model and show the run with the
     /// most strands (tests "Find grooms on this model").
     pub find_hair: bool,
+    /// `--export-hair`: export the shown grooms once they are loaded
+    /// (tests the Hair panel's export button).
+    pub export_hair: bool,
     /// `--hair-style TEXT`: also show the character's hair entries whose
     /// placeholder name contains this.
     pub hair_style: Option<String>,
@@ -510,6 +513,12 @@ pub struct Hair {
     /// The hat worn and the grooms it presses down (the scalp hair).
     hat: Option<Arc<sixng_core::groom::Shell>>,
     under_hat: Vec<u64>,
+    /// Export of the shown grooms: write the full strand set, a run in
+    /// progress, its result and where the last one went.
+    pub export_full: bool,
+    exporting: bool,
+    export_done: Arc<Mutex<Option<String>>>,
+    export_status: String,
     pub width_mm: f32,
     pub colour: [f32; 3],
     pending: Arc<Mutex<Option<Result<Vec<glb::Model>, String>>>>,
@@ -553,6 +562,10 @@ impl Default for Hair {
             selected: Vec::new(),
             hat: None,
             under_hat: Vec::new(),
+            export_full: true,
+            exporting: false,
+            export_done: Arc::new(Mutex::new(None)),
+            export_status: String::new(),
             width_mm: 1.0,
             colour: [0.10, 0.06, 0.035],
             pending: Arc::new(Mutex::new(None)),
@@ -581,7 +594,7 @@ impl Hair {
         format!("{:?}|{}|{:?}|{}|{}|{}|{:?}", self.selected, self.width_mm, self.colour, self.skin_colour && !self.skin.is_empty(), self.full_coat, self.density, self.hat.as_ref().map(|h| h.id))
     }
     pub fn settled(&self) -> bool {
-        !self.loading && !self.listing && self.key == self.want_key()
+        !self.loading && !self.listing && !self.exporting && self.key == self.want_key()
     }
 
     /// Show the grooms of the chosen body and head variants.
@@ -791,6 +804,16 @@ impl ModelView {
     /// Load the chosen grooms when the choice, width or colour changed, and
     /// upload finished loads.
     fn update_hair(&mut self, rs: &egui_wgpu::RenderState, ctx: &egui::Context) {
+        if let Some(r) = self.hair.export_done.lock().unwrap().take() {
+            self.hair.exporting = false;
+            eprintln!("[hair] {r}");
+            self.hair.export_status = r;
+        }
+        // `--export-hair`: once the hair of the model is shown
+        if self.auto.export_hair && !self.hair.selected.is_empty() && !self.hair.loading && !self.hair.exporting && self.hair.key == self.hair.want_key() {
+            self.auto.export_hair = false;
+            self.start_hair_export(ctx);
+        }
         if let Some(r) = self.hair.catalog.lock().unwrap().take() {
             self.hair.listing = false;
             self.hair.list = Some(r);
@@ -1020,8 +1043,32 @@ impl ModelView {
 
     /// Hair and fur panel: browse the grooms by region and bone, add them
     /// to the view, set width and colour.
+    /// Write the shown grooms to `<work>/out/hair/<model>/grooms/packs` on a worker
+    /// thread (the "Export shown grooms" button, `--export-hair`).
+    fn start_hair_export(&mut self, ctx: &egui::Context) {
+        self.hair.exporting = true;
+        self.hair.export_status.clear();
+        let ws = Workspace::new(&self.game, &self.work);
+        let (idx, sel, slot, ctx) = (self.indexes.clone(), self.hair.selected.clone(), self.hair.export_done.clone(), ctx.clone());
+        let full = self.hair.export_full.then_some(self.hair.density.clamp(0.05, 1.0));
+        // a folder per model, so an earlier `sixng grooms` export and its index stay as they are
+        let model: String = self.loaded.as_ref().map_or("grooms", |l| l.source.split_whitespace().next().unwrap_or("").rsplit([':', '#', '/']).find(|s| !s.is_empty() && !s.starts_with("look=")).unwrap_or("grooms")).chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
+        let out = Path::new(&self.work).join("out").join("hair").join(model);
+        std::thread::spawn(move || {
+            let r = (|| -> anyhow::Result<String> {
+                let (a, ix) = index_for(&ws, "packs", &idx)?;
+                let (written, errors) = sixng_core::groom::export_grooms(&a, &ix.entries, &sel, &out, false, None, full, sixng_core::export::no_progress())?;
+                let dir = out.join("grooms").join("packs");
+                Ok(format!("{written} groom(s) written to {}{}{}", dir.display(), if full.is_some() { " with the full strand set and a growth.json each" } else { " (guide strands)" }, if errors > 0 { format!("; {errors} failed") } else { String::new() }))
+            })()
+            .unwrap_or_else(|e| format!("export failed: {e:#}"));
+            *slot.lock().unwrap() = Some(r);
+            ctx.request_repaint();
+        });
+    }
+
     fn hair_ui(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Hair and fur (grooms)").default_open(!self.hair.selected.is_empty() || self.auto.find_hair).show(ui, |ui| {
+        egui::CollapsingHeader::new("Hair and fur (grooms)").default_open(!self.hair.selected.is_empty() || self.auto.find_hair || self.auto.export_hair).show(ui, |ui| {
             ui.label(egui::RichText::new("Strand grooms from packs.rpf. Animals get their fur automatically (worked out from the order of the files and a fit to the skin, not from a stored link); for characters pick grooms here. Shown as ribbons; width and colour are display choices.").weak());
             self.hair_fit_ui(ui);
             if let Some(l) = self.hair.fur.clone() {
@@ -1050,6 +1097,24 @@ impl ModelView {
                 ui.label(egui::RichText::new(format!("{} of {} groom pieces in this run fit the skin; {:.0} % of the pieces with a known count sit on their own slot{with}.", l.fitting, l.block, l.agreement * 100.0)).weak().small());
             } else if !self.hair.fur_note.is_empty() {
                 ui.label(egui::RichText::new(format!("No automatic fur: {}", self.hair.fur_note)).weak().small());
+            }
+            // export of the grooms shown (a character's hair, an animal's fur, or the ones ticked below)
+            if !self.hair.selected.is_empty() {
+                ui.horizontal(|ui| {
+                    let n = self.hair.selected.len();
+                    if ui.add_enabled(!self.hair.exporting, egui::Button::new(format!("Export {n} shown groom(s)"))).on_hover_text("Writes each shown groom as a GLB of line strips (strand width as _WIDTH), in model space so it sits on the exported model, to <work>/out/hair/<model>/grooms/packs/<offset>.glb. Same as `sixng grooms --only ...`.").clicked() {
+                        let ctx = ui.ctx().clone();
+                        self.start_hair_export(&ctx);
+                    }
+                    ui.checkbox(&mut self.hair.export_full, "full strands").on_hover_text("Write the strands the groom stores per root triangle, grown between its guides, instead of the guide strands alone (same as `sixng grooms --full`; the density slider below sets the share). The game's own clumping, curl and noise are not decoded, so the result is smoother than in game.");
+                    if self.hair.exporting {
+                        ui.spinner();
+                        ui.label("exporting (the first run reads the groom list, about a minute) …");
+                    }
+                });
+                if !self.hair.export_status.is_empty() {
+                    ui.label(egui::RichText::new(&self.hair.export_status).weak().small());
+                }
             }
             let Some(list) = &self.hair.list else {
                 if self.hair.listing {
@@ -1131,7 +1196,7 @@ impl ModelView {
 
     /// Car extras settled: vehicle data applied and the fitted wheels loaded.
     fn idle_for_shot(&self) -> bool {
-        if self.parts_request.is_some() || self.fit_parts_once.is_some() || self.random_parts_once || !self.hair.settled() || self.auto.then.is_some() || self.auto.find_hair || self.hair.fitting || self.ped_clip.loading || (!self.ped_clip.want.trim().is_empty() && self.ped_clip.anim.is_none() && self.ped_clip.status.starts_with("loading")) {
+        if self.parts_request.is_some() || self.fit_parts_once.is_some() || self.random_parts_once || !self.hair.settled() || self.auto.then.is_some() || self.auto.find_hair || self.auto.export_hair || self.hair.fitting || self.ped_clip.loading || (!self.ped_clip.want.trim().is_empty() && self.ped_clip.anim.is_none() && self.ped_clip.status.starts_with("loading")) {
             return false;
         }
         let Some(l) = self
@@ -2322,7 +2387,27 @@ impl ModelView {
             return;
         };
         let idx = idx as usize;
-        let decode = |hex: &str| -> Arc<Vec<[u8; 4]>> { Arc::new((0..256).map(|i| std::array::from_fn(|k| u8::from_str_radix(&hex[i * 8 + k * 2..i * 8 + k * 2 + 2], 16).unwrap_or(255))).collect()) };
+        // What the fitted parts change in the look (a body kit's part
+        // rebinds the ids of its panels, mostly to the body paint): part id
+        // and its new entry.
+        let mut patched: Vec<(usize, [u8; 4])> = Vec::new();
+        for part in l.info["fitted_parts"].as_array().into_iter().flatten().filter_map(|p| p.as_str()) {
+            let d = &pc["part_patches"][part];
+            let rgba = d["rgba"].as_str().unwrap_or("");
+            for (k, id) in d["ids"].as_array().into_iter().flatten().filter_map(|x| x.as_u64()).enumerate() {
+                if let Some(h) = rgba.get(k * 8..k * 8 + 8) {
+                    patched.push((id as usize & 255, std::array::from_fn(|c| u8::from_str_radix(&h[c * 2..c * 2 + 2], 16).unwrap_or(255))));
+                }
+            }
+        }
+        let patched = &patched;
+        let decode = |hex: &str| -> Arc<Vec<[u8; 4]>> {
+            let mut t: Vec<[u8; 4]> = (0..256).map(|i| std::array::from_fn(|k| u8::from_str_radix(&hex[i * 8 + k * 2..i * 8 + k * 2 + 2], 16).unwrap_or(255))).collect();
+            for (id, e) in patched {
+                t[*id] = *e;
+            }
+            Arc::new(t)
+        };
         // a freshly loaded model shows the default look, but a fitted
         // library part (a truck bed or box) comes with the colours of
         // another vehicle and is coloured again
@@ -2370,7 +2455,8 @@ impl ModelView {
                         out2.chunks_exact_mut(4).for_each(|c| c[3] = byte(4).unwrap_or(128));
                         let metal1 = byte(6).unwrap_or(0);
                         let px = first;
-                        let row = usize::from_str_radix(&rows[id * 4..id * 4 + 4], 16).unwrap_or(0xffff);
+                        // a part id a fitted part recolours has that colour, not its old row
+                        let row = if patched.iter().any(|p| p.0 == id) { 0xffff } else { usize::from_str_radix(&rows[id * 4..id * 4 + 4], 16).unwrap_or(0xffff) };
                         let out = &mut px[id * 512..id * 512 + 512];
                         match pal.get(row * 512..row * 512 + 512).filter(|_| row != 0xffff) {
                             Some(src) => out.copy_from_slice(src),
@@ -3399,7 +3485,7 @@ impl ModelView {
             // then showed the car without wheels); 180 s is the last resort.
             let busy = self.wheel_loading || self.brake_loading || matches!(&*self.vehicles.state.lock().unwrap(), crate::vehicle_db::State::Loading(_));
             let ready = (self.gpu.is_some() && !self.loading && self.frames_since_load >= 3 && settled)
-                || (!self.loading && !self.hair.fitting && !self.auto.find_hair && self.hair.settled() && self.auto.frames > 600 && (!busy || ctx.input(|i| i.time) > 180.0));
+                || (!self.loading && !self.hair.fitting && !self.auto.find_hair && !self.auto.export_hair && self.hair.settled() && self.auto.frames > 600 && (!busy || ctx.input(|i| i.time) > 180.0));
             if ready {
                 if let Some((w, h, px)) = ren.read_back(rs) {
                     match render3d::save_png(&path, w, h, &px) {
@@ -5636,6 +5722,8 @@ fn load_query_sel(
                 }
                 info["wheel_fit_applied"] = serde_json::json!({"out": out, "width": wide});
             }
+            // the part names fitted: their colour changes are applied with the look
+            info["fitted_parts"] = serde_json::json!(fitted.iter().map(|p| format!("{p:08x}")).collect::<Vec<_>>());
             let stock: Vec<(u64, u32, Vec<u32>)> = v
                 .switches
                 .iter()

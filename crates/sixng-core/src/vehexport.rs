@@ -266,13 +266,28 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
     let joint_of: HashMap<u32, usize> = joints.iter().enumerate().map(|(i, j)| (joaat(&j.name.to_ascii_lowercase()), i)).collect();
     let mut bind: HashMap<u32, Mat> = joints.iter().map(|j| (joaat(&j.name.to_ascii_lowercase()), j.bind)).collect();
     // the look of this configuration: the colour of each part id
-    let look: Option<Vec<[u8; 4]>> = cfg["parts_key"]
+    let mut look: Option<Vec<[u8; 4]>> = cfg["parts_key"]
         .as_str()
         .and_then(|k| piece.part_looks["configs"][k].as_u64())
         .or(piece.part_looks["default"].as_u64())
         .and_then(|i| piece.part_looks["looks"][i as usize].as_str())
         .filter(|h| h.len() == 2048)
         .map(|h| (0..256).map(|i| std::array::from_fn(|k| u8::from_str_radix(&h[i * 8 + k * 2..i * 8 + k * 2 + 2], 16).unwrap_or(255))).collect());
+    // parts fitted on top of the configuration change the look (a body
+    // kit's panels take the body paint)
+    if let Some(l) = look.as_mut() {
+        for (part, d) in piece.part_looks["part_patches"].as_object().into_iter().flatten() {
+            if !u32::from_str_radix(part, 16).is_ok_and(|p| fitted.contains(&p)) {
+                continue;
+            }
+            let rgba = d["rgba"].as_str().unwrap_or("");
+            for (k, id) in d["ids"].as_array().into_iter().flatten().filter_map(|x| x.as_u64()).enumerate() {
+                if let (Some(h), Some(e)) = (rgba.get(k * 8..k * 8 + 8), l.get_mut(id as usize)) {
+                    *e = std::array::from_fn(|c| u8::from_str_radix(&h[c * 2..c * 2 + 2], 16).unwrap_or(255));
+                }
+            }
+        }
+    }
     let paint_bytes = paint.map(|p| p.map(|c| (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8));
     let recolour = |prims: &mut [TriPrim], parts: &[bool]| {
         for p in prims.iter_mut().filter(|p| p.material.is_some_and(|m| parts.get(m).copied().unwrap_or(false))) {
