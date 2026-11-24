@@ -452,7 +452,7 @@ mod tests {
 
     #[test]
     fn mirror_turns_triangles() {
-        let mut p = vec![TriPrim { name: "t".into(), positions: vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], normals: Some(vec![[1.0, 0.0, 0.0]; 3]), tangents: None, uvs: vec![], colors: None, tint: None, indices: vec![0, 1, 2], material: None, joints: None, weights: None, joints1: None, weights1: None }];
+        let mut p = vec![TriPrim { name: "t".into(), positions: vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], normals: Some(vec![[1.0, 0.0, 0.0]; 3]), tangents: None, uvs: vec![], colors: None, colors1: None, tint: None, indices: vec![0, 1, 2], material: None, joints: None, weights: None, joints1: None, weights1: None }];
         let m: Mat = [-2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 5.0, 0.0, 0.0, 1.0];
         transform(&mut p, &m, true);
         assert_eq!(p[0].positions[0], [3.0, 0.0, 0.0]);
