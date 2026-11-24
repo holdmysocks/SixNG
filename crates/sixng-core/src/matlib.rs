@@ -45,10 +45,26 @@
 //! preset's own entry wins; without one the sub-material's base material
 //! supplies it.
 //!
-//! The other colour parameters are tints of further layers: `tintmasktint`
-//! (8 entries, with the `tintmaskmap` textures, 5 entries, as their masks),
+//! Tint-mask layers (read from the clothing pixel shader and the block
+//! builder; [`Library::layers`]): over the base colour the shader lays up
+//! to four layers per sub-material. Layer L has a mask texture
+//! `tintmaskmap[L]` (red channel), sampled on the tiling UV set through
+//! its own transform (`tintmaskscale[2L, 2L+1]`, `tintmaskrotation[L]`,
+//! `tintmasktranslation[2L, 2L+1]`), an opacity `tintmaskopacity[L]`, a
+//! flag word `tintmaskflags[L]` (bit 2 inverts the mask) and a colour
+//! `tintmasktint[L]` that is expanded to gradient stops like the base
+//! colour. In order L = 0..3:
+//!
+//! ```text
+//! m = invert ? 1 - mask : mask
+//! t = m * opacity * tint.alpha
+//! colour = lerp(colour, gradient(tint, g), t)        // g: the tile's grey value
+//! ```
+//!
+//! `tintmasktint[4 + L]` is layer L's colour in the second colour set
+//! (the one built on `tiletint[2..3]`). The other colour parameters are
 //! `tintablepatterntint`, `stitchtint` (3, per preset), `dirttint`,
-//! `sheencolor`, `engravingcolor`.
+//! `sheencolor`, `engravingcolor`; their composition is not decoded.
 //!
 //! Not decoded: the remaining parameter names, the defaults of parameters
 //! a record leaves out (loaded by the game from a separate file that was
@@ -99,6 +115,24 @@ pub struct Library {
     pub presets: HashMap<u32, Record>,
     pub tiles: HashMap<u32, Record>,
     pub profiles: HashMap<u32, Record>,
+}
+
+/// One tint-mask layer of a sub-material (see the module notes).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Layer {
+    pub layer: u8,
+    /// `tintmaskmap` texture hash (hex); the mask is its red channel.
+    pub mask_map: String,
+    /// `tintmasktint[layer]` and `[4 + layer]`, sRGB RGBA.
+    pub tint: Option<[u8; 4]>,
+    pub tint2: Option<[u8; 4]>,
+    pub opacity: f32,
+    pub flags: u32,
+    /// Bit 2 of the flags: the mask is used as 1 - mask.
+    pub invert: bool,
+    pub scale: [Option<f32>; 2],
+    pub rotation: Option<f32>,
+    pub translation: [Option<f32>; 2],
 }
 
 /// The tiling surface of one sub-material.
@@ -182,6 +216,39 @@ impl Library {
         let own = p.colours.iter().find(|c| c.0 == COLOUR && c.1 == index && c.2 as usize == sub);
         let c = own.or_else(|| self.base.get(p.bases.get(sub)?)?.colours.iter().find(|c| c.0 == COLOUR && c.1 == index))?;
         Some(rgba(c.3))
+    }
+
+    /// The tint-mask layers of sub-material `sub` of a preset that have a
+    /// mask texture and a non-zero opacity. Each value is the preset's
+    /// entry for the sub-material, else its base material's.
+    pub fn layers(&self, preset: u32, sub: usize) -> Vec<Layer> {
+        let j = crate::meta7a::joaat;
+        let Some(p) = self.presets.get(&preset) else { return Vec::new() };
+        let base = p.bases.get(sub).and_then(|b| self.base.get(b));
+        fn pick<T: Copy>(own: &[Param<T>], base: Option<&[Param<T>]>, name: u32, index: u8, sub: usize) -> Option<T> {
+            own.iter().find(|x| x.0 == name && x.1 == index && x.2 as usize == sub).or_else(|| base?.iter().find(|x| x.0 == name && x.1 == index)).map(|x| x.3)
+        }
+        let f = |n: &str, i: u8| pick(&p.floats, base.map(|b| &b.floats[..]), j(n), i, sub);
+        let c = |i: u8| pick(&p.colours, base.map(|b| &b.colours[..]), j("tintmasktint"), i, sub).map(rgba);
+        (0..4u8)
+            .filter_map(|l| {
+                let mask = pick(&p.textures, base.map(|b| &b.textures[..]), j("tintmaskmap"), l, sub).filter(|&h| h != 0)?;
+                let opacity = f("tintmaskopacity", l).filter(|&o| o > 0.0)?;
+                let flags = pick(&p.ints, base.map(|b| &b.ints[..]), j("tintmaskflags"), l, sub).unwrap_or(0) as u32;
+                Some(Layer {
+                    layer: l,
+                    mask_map: format!("{mask:016x}"),
+                    tint: c(l),
+                    tint2: c(4 + l),
+                    opacity,
+                    flags,
+                    invert: flags & 4 != 0,
+                    scale: [f("tintmaskscale", 2 * l), f("tintmaskscale", 2 * l + 1)],
+                    rotation: f("tintmaskrotation", l),
+                    translation: [f("tintmasktranslation", 2 * l), f("tintmasktranslation", 2 * l + 1)],
+                })
+            })
+            .collect()
     }
 
     /// The tiling surface of sub-material `sub` of a preset.
@@ -387,6 +454,23 @@ mod tests {
         let t1 = lib.tile(0x22, 1).unwrap();
         assert_eq!((t1.tile.as_str(), t1.material_map.as_str(), t1.scale, t1.rotation), ("00000034", "00000000000000bb", Some(50.0), None));
         assert_eq!(lib.tile(0x22, 2), None);
+        // tint-mask layers: the base material has layer 1 (mask, opacity, tint); the preset overrides its opacity and tint for sub-material 0 and inverts it
+        let b = lib.base.get_mut(&0x11).unwrap();
+        b.textures.push((j("tintmaskmap"), 1, 255, 0xcc));
+        b.textures.push((j("tintmaskmap"), 2, 255, 0xdd)); // no opacity: not a layer
+        b.floats.push((j("tintmaskopacity"), 1, 255, 0.5));
+        b.floats.push((j("tintmaskscale"), 2, 255, 4.0));
+        b.colours.push((j("tintmasktint"), 1, 255, 0xff00_00ff));
+        let p = lib.presets.get_mut(&0x22).unwrap();
+        p.floats.push((j("tintmaskopacity"), 1, 0, 1.0));
+        p.colours.push((j("tintmasktint"), 5, 0, 0xff00_ff00));
+        p.ints.push((j("tintmaskflags"), 1, 0, 12));
+        let l0 = lib.layers(0x22, 0);
+        assert_eq!(l0.len(), 1);
+        assert_eq!((l0[0].layer, l0[0].mask_map.as_str(), l0[0].opacity, l0[0].invert, l0[0].tint, l0[0].tint2, l0[0].scale), (1, "00000000000000cc", 1.0, true, Some([255, 0, 0, 255]), Some([0, 255, 0, 255]), [Some(4.0), None]));
+        let l1 = lib.layers(0x22, 1);
+        assert_eq!((l1[0].opacity, l1[0].invert, l1[0].tint2), (0.5, false, None));
+        assert!(lib.layers(0x22, 2).is_empty());
         let p = &lib.presets[&0x22];
         assert_eq!((p.floats[0], p.textures[0], p.bases[1]), ((0x01ae_45d3, 255, 0, 336.5), (0xd2b5_98e5, 2, 3, 0x6d81_fbf3_df27_4f6d), 0x11));
         assert_eq!(lib.colour(0x22, 0, 0), Some([0x1d, 0x55, 0xa2, 0x80]));
