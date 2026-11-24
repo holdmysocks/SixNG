@@ -158,7 +158,10 @@ struct Piece {
 
 /// Export `vehicle` (a record of `vehicles.json`) with the parts of its
 /// configuration `config` to `out` (a .glb path; textures go beside it).
-pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value, config: usize, wheels: bool, out: &Path, o: &ExportOptions) -> Result<Value> {
+/// `with` adds parts to the configuration's (a part in the same slot is
+/// replaced), `without` takes parts off.
+#[allow(clippy::too_many_arguments)]
+pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value, config: usize, with: &[u32], without: &[u32], wheels: bool, out: &Path, o: &ExportOptions) -> Result<Value> {
     let model = vehicle["model"].as_str().ok_or_else(|| anyhow!("the vehicle record has no model name"))?.to_ascii_lowercase();
     let configs = vehicle["configurations"].as_array().cloned().unwrap_or_default();
     let cfg = configs.get(config).ok_or_else(|| anyhow!("{model} has {} configurations; --config {config} is out of range", configs.len()))?;
@@ -185,7 +188,17 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
     };
 
     // the configuration's parts, and what they fit
-    let part_names: Vec<String> = cfg["parts"].as_array().into_iter().flatten().filter_map(|p| p.as_str().map(|s| s.to_string())).collect();
+    let mut part_names: Vec<String> = cfg["parts"].as_array().into_iter().flatten().filter_map(|p| p.as_str().map(|s| s.to_string())).collect();
+    // the user's own choice of parts on top of the configuration's
+    if !with.is_empty() || !without.is_empty() {
+        let slot_of: HashMap<u32, &str> = vehicle["mods"].as_array().into_iter().flatten().filter_map(|m| Some((hex32(&m["name"])?, m["slot"].as_str()?))).collect();
+        let taken: HashSet<&str> = with.iter().filter_map(|p| slot_of.get(p).copied()).filter(|s| *s != SLOT_CHASSIS).collect();
+        part_names.retain(|p| {
+            let h = part_hash(p);
+            !without.contains(&h) && !with.contains(&h) && !slot_of.get(&h).is_some_and(|s| taken.contains(s))
+        });
+        part_names.extend(with.iter().map(|p| format!("{p:08x}")));
+    }
     let fitted: HashSet<u32> = part_names.iter().map(|p| part_hash(p)).collect();
     let mods: HashMap<u32, &Value> = vehicle["mods"].as_array().into_iter().flatten().filter_map(|m| Some((hex32(&m["name"])?, m))).collect();
     let keys: HashSet<u32> = vehicle["part_keys"]
@@ -203,7 +216,8 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
         match resolve(e) {
             // brake discs, drums and calipers are modelled around a unit
             // disc for the wheels; they are not fitted
-            Some(en) if en.name.as_deref().is_some_and(|n| ["brakedisc_", "drumbrake_", "caliper_", "rim_", "tyre_"].iter().any(|w| n.to_ascii_lowercase().starts_with(w))) => unresolved.push(format!("{what}: {} belongs on the wheels and is not fitted", en.name.clone().unwrap_or_default())),
+            Some(en) if en.name.as_deref().is_some_and(|n| ["brakedisc_", "drumbrake_", "caliper_"].iter().any(|w| n.to_ascii_lowercase().starts_with(w))) => unresolved.push(format!("{what}: {} is a brake model; which wheels it goes on is not known, so it is not fitted", en.name.clone().unwrap_or_default())),
+            Some(en) if en.name.as_deref().is_some_and(|n| ["rim_", "tyre_"].iter().any(|w| n.to_ascii_lowercase().starts_with(w))) => {}
             Some(en) if en.off != base.off => fit.push((en, hex32(&e["bone"]).unwrap_or(0), hides, body, what)),
             Some(_) => {}
             None => unresolved.push(format!("{what}: model {} not found", e["model"].as_str().unwrap_or("?"))),
@@ -388,6 +402,44 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
         }
         // both scaled by the tyre's radius (the largest model radius)
         let unit = built.iter().map(|b| b.2).fold(0.0f32, f32::max);
+        // The configuration's rim size (rim radius / tyre radius): all bones
+        // of a wheel model sit on the hub, so the rim and the tyre's bead
+        // are scaled about the axle and the tread (`tread_profile` bones)
+        // keeps the tyre's radius.
+        let rim_r = built.iter().map(|b| b.2).fold(f32::MAX, f32::min);
+        let ratio = cfg["rim_ratio"].as_f64().unwrap_or(0.0) as f32;
+        let rim_factor = if built.len() >= 2 && ratio > 0.0 && rim_r > 0.0 && unit > rim_r { (ratio * unit / rim_r).clamp(0.5, 0.97 * unit / rim_r) } else { 1.0 };
+        if rim_factor != 1.0 {
+            for (p, _, _) in built.iter_mut() {
+                let tread: Vec<bool> = p.joints.iter().map(|j| j.name.to_ascii_lowercase().contains("tread_profile")).collect();
+                for prim in &mut p.prims {
+                    for i in 0..prim.positions.len() {
+                        let wt: f32 = match (&prim.joints, &prim.weights) {
+                            (Some(j), Some(w)) => (0..4).filter(|&q| tread.get(j[i][q] as usize).copied().unwrap_or(false)).map(|q| w[i][q] as f32 / 255.0).sum(),
+                            _ => 0.0,
+                        };
+                        let f = rim_factor * (1.0 - wt) + wt;
+                        prim.positions[i][1] *= f;
+                        prim.positions[i][2] *= f;
+                    }
+                }
+            }
+        }
+        // Brake discs (or drums) and calipers: modelled around a disc of
+        // radius 0.5, scaled to the wheel's stored brake disc (the largest
+        // of the clearly smaller collision discs on its axle line).
+        // One disc and one caliper, the first of each the configuration
+        // names by model (as the viewer does); a drum only where it names
+        // no disc. Brake models that come through a part are left out.
+        let brake_models: Vec<&Entry> = [named("brakedisc_").or_else(|| named("drumbrake_")), named("caliper_")].into_iter().flatten().collect();
+        let mut brakes: Vec<(Piece, std::result::Result<Vec<crate::gltf::Material>, usize>)> = Vec::new();
+        for e in &brake_models {
+            match build(e) {
+                Ok((p, mats)) => brakes.push((p, Ok(mats))),
+                Err(err) => warnings.push(format!("{}: {err:#}", e.name.clone().unwrap_or_default())),
+            }
+        }
+        let mut braked = 0;
         for (bone, pivot) in &pivots {
             // the wheel's collision disc: the largest on this axle line
             let near: Vec<&crate::bounds::WheelDisc> = discs.iter().filter(|d| (d.centre[0] - pivot[0]).abs() < 0.15 && (d.centre[1] - pivot[1]).abs() < 0.03 && (d.centre[2] - pivot[2]).abs() < 0.03).collect();
@@ -414,9 +466,23 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
                 let at = push(format!("{}@{bone}", p.name), &p.id, "wheel", prims, std::mem::replace(mats, Err(0)), &mut groups, &mut materials, &mut reports);
                 *mats = Err(at);
             }
+            if let Some(b) = near.iter().filter(|x| x.radius < 0.75 * d.radius).max_by(|a, b| a.radius.total_cmp(&b.radius)) {
+                let sb = b.radius / 0.5;
+                let bx = b.centre[0] + fit_out[axle].copysign(b.centre[0]);
+                let mb: Mat = [if right { -sb } else { sb }, 0.0, 0.0, 0.0, 0.0, sb, 0.0, 0.0, 0.0, 0.0, sb, 0.0, bx, b.centre[1], b.centre[2], 1.0];
+                for (p, mats) in brakes.iter_mut() {
+                    let mut prims = p.prims.clone();
+                    transform(&mut prims, &mb, right);
+                    pin(&mut prims, joint_of.get(&joaat(&bone.to_ascii_lowercase())).copied());
+                    recolour(&mut prims, &p.parts_materials);
+                    let at = push(format!("{}@{bone}", p.name), &p.id, "brake", prims, std::mem::replace(mats, Err(0)), &mut groups, &mut materials, &mut reports);
+                    *mats = Err(at);
+                }
+                braked += 1;
+            }
             placed += 1;
         }
-        wheel_report = json!({"moved_out": fit_out, "widened": fit_wide, "models": models.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), "wheels": placed, "note": "rim and tyre scaled alike to the collision disc's radius; the configuration's rim_ratio is not applied"});
+        wheel_report = json!({"moved_out": fit_out, "widened": fit_wide, "models": models.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), "wheels": placed, "rim_ratio": ratio, "rim_factor": rim_factor, "brake_models": brake_models.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), "wheels_with_brakes": braked, "note": "the wheel is scaled to the collision disc's radius; rim and bead are scaled about the axle by rim_factor so that the rim has the configuration's rim_ratio of the tyre's radius (1 = the models' own share). Brakes are scaled to the wheel's stored brake disc."});
     }
     if groups.iter().all(|g| g.prims.is_empty()) {
         bail!("nothing to export for {model}");
@@ -430,6 +496,40 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
         "part_colours": if look.is_some() { "the configuration's" } else { "as exported (the vehicle has no part colours per configuration)" },
         "paint": paint, "wheels": wheel_report, "not_fitted": skipped, "left_out": unresolved, "warnings": warnings,
     }))
+}
+
+/// The parts of a vehicle that have models, for `sixng vehicle
+/// --list-parts`: part name, slot, whether it is a library part, how many
+/// of the vehicle's configurations name it and its models.
+pub fn list_parts(ix: &ArchiveIndex, vehicle: &Value) -> Value {
+    let stems = stems(ix);
+    let by_asset: HashMap<u64, &String> = stems.keys().map(|s| (asset_id(s), s)).collect();
+    let by_hash: HashMap<u32, &String> = stems.keys().map(|s| (joaat(s), s)).collect();
+    let mut used: HashMap<u32, usize> = HashMap::new();
+    for c in vehicle["configurations"].as_array().into_iter().flatten() {
+        for p in c["parts"].as_array().into_iter().flatten().filter_map(|p| p.as_str()) {
+            *used.entry(part_hash(p)).or_default() += 1;
+        }
+    }
+    let mut out: Vec<Value> = vehicle["mods"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|m| {
+            let models: Vec<Value> = m["elements"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|e| {
+                    let by_a = e["asset"].as_str().and_then(|s| u64::from_str_radix(s, 16).ok()).and_then(|x| by_asset.get(&x));
+                    by_a.or_else(|| hex32(&e["model"]).and_then(|h| by_hash.get(&h))).map_or(Value::Null, |s| json!(s))
+                })
+                .collect();
+            json!({"part": m["name"], "slot": m["slot"], "shared": m["shared"] == true, "configurations": hex32(&m["name"]).and_then(|h| used.get(&h)).copied().unwrap_or(0), "models": models})
+        })
+        .collect();
+    out.sort_by(|a, b| a["slot"].as_str().cmp(&b["slot"].as_str()).then(a["part"].as_str().cmp(&b["part"].as_str())));
+    json!(out)
 }
 
 #[cfg(test)]
