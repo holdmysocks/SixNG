@@ -890,6 +890,15 @@ in the Model viewer, open a material and click **view** on a slot to jump
 here. From the command line: `--texture <hash>` (or `--tab textures`)
 with `--window-screenshot out.png --exit`.
 
+For a texture no model binds, **Used by** turns to the wardrobe data.
+Ped skin (a head's face, the body's normal, detail and mask maps, the
+eyes' colour) has no texture in its drawables: wardrobe items name
+them. The panel then lists the heads the items name and the named
+characters whose wardrobe has the texture (click one to open it), and
+counts the wardrobes of models without a name in the index. The table is
+built from the `packs` index the first time it is needed (about a minute)
+and kept in `<work>/index/wardrobe_textures.json`.
+
 **Used by**, on the right, lists the materials that use the selected
 texture, most-used first: each with its shader, its other texture slots
 (a base colour leads to its normal map, packed roughness/metal and so on;

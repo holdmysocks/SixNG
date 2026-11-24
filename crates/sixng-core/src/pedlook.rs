@@ -206,6 +206,87 @@ pub fn models(game_root: &Path) -> Result<&'static Models, String> {
     .map_err(|e| e.clone())
 }
 
+/// Textures the wardrobe data names: store hash -> (wardrobe resource, head
+/// drawable hash or 0). Ped skin has no texture bound in its drawables: a
+/// head's face, the body's normal, detail and mask maps and the eyes'
+/// colour are named only by wardrobe items (`States` -> `Asset`), so the
+/// texture-users index, built from model materials, does not know them.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct WardrobeTextures {
+    version: u32,
+    pub by_texture: HashMap<u64, Vec<(u64, u32)>>,
+}
+
+/// The wardrobe texture table (built from the packs.rpf index on first use,
+/// about a minute, then cached as `<work>/index/wardrobe_textures.json`).
+pub fn wardrobe_textures(game_root: &Path) -> Result<&'static WardrobeTextures, String> {
+    static T: OnceLock<Result<WardrobeTextures, String>> = OnceLock::new();
+    T.get_or_init(|| {
+        let work = crate::names::work_dir().ok_or("no work directory")?;
+        let cache = work.join("index").join("wardrobe_textures.json");
+        let ixp = crate::scan::index_path(&work.join("index"), "packs.rpf");
+        let stamp = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        if let Ok(b) = std::fs::read(&cache) {
+            if let Ok(t) = serde_json::from_slice::<WardrobeTextures>(&b) {
+                if t.version == 2 && stamp(&cache) >= stamp(&ixp) {
+                    return Ok(t);
+                }
+            }
+        }
+        let ix = crate::scan::load_index(&ixp).map_err(|e| format!("packs.rpf index ({}): {e}; index packs.rpf first", ixp.display()))?;
+        let packs = game_root.join("packs.rpf");
+        fn hashes(v: &serde_json::Value, out: &mut Vec<u64>) {
+            match v {
+                serde_json::Value::Array(a) => a.iter().for_each(|x| hashes(x, out)),
+                serde_json::Value::Object(m) => m.values().for_each(|x| hashes(x, out)),
+                serde_json::Value::String(s) if s.len() == 16 => out.extend(u64::from_str_radix(s, 16).ok().filter(|&h| h != 0)),
+                _ => {}
+            }
+        }
+        let found: Vec<(u64, u64, u32)> = ix
+            .entries
+            .par_iter()
+            .filter(|e| e.sub == "7a")
+            .flat_map_iter(|e| {
+                let mut v = Vec::new();
+                let Ok(r) = Resource::load_meta(&packs, e) else { return v };
+                let Some(m) = Meta::parse(&r) else { return v };
+                if m.objects(VARIATION).is_empty() {
+                    return v;
+                }
+                let f = crate::meta7a::field_name;
+                for o in m.objects(0xf795_e8ba) {
+                    let Some(p) = m.object(0xf795_e8ba, o, 4) else { continue };
+                    let head = p[f(0x12f8_5293)].as_array().into_iter().flatten().filter(|t| t["Key"].as_u64() == Some(0x4bfd_27dd)).find_map(|t| t["Item"].as_array()?.first()?.as_u64()).unwrap_or(0) as u32;
+                    let mut hs = Vec::new();
+                    hashes(&p[f(0xebac_f18c)], &mut hs);
+                    hs.sort();
+                    hs.dedup();
+                    v.extend(hs.into_iter().map(|h| (h, e.off, head)));
+                }
+                v
+            })
+            .collect();
+        let mut by_texture: HashMap<u64, Vec<(u64, u32)>> = HashMap::new();
+        for (h, off, head) in found {
+            let v = by_texture.entry(h).or_default();
+            if !v.contains(&(off, head)) {
+                v.push((off, head));
+            }
+        }
+        if by_texture.is_empty() {
+            return Err("no wardrobe textures found in packs.rpf".into());
+        }
+        let t = WardrobeTextures { version: 2, by_texture };
+        if let Ok(b) = serde_json::to_vec(&t) {
+            let _ = std::fs::write(&cache, b);
+        }
+        Ok(t)
+    })
+    .as_ref()
+    .map_err(|e| e.clone())
+}
+
 /// Whether the outfit list has this model (a character prefix such as
 /// `cs_ali`); false when the table is not available.
 pub fn has_model(game_root: &Path, model: &str) -> bool {
