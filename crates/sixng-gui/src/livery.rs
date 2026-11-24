@@ -19,10 +19,8 @@
 //!
 //! The game's own liveries (brands) are not drawn: the rule that turns a
 //! brand's layout numbers into a place on the panel is not decoded.
-
-// The editor panel that uses the picking, fitting and saving parts follows
-// in the next change.
-#![allow(dead_code)]
+//!
+//! The panel that edits the placements is in `livery_ui`.
 
 use crate::glb;
 use eframe::egui_wgpu::{self, wgpu};
@@ -112,11 +110,14 @@ pub struct Sticker {
     /// ov): written for reference, recomputed from the model on load.
     #[serde(default)]
     pub shader_uv: Option<[f32; 6]>,
+    /// Not placed by hand yet: it is fitted again when its zones change.
+    #[serde(skip)]
+    pub fresh: bool,
 }
 
 impl Sticker {
     pub fn new(picture: Picture) -> Sticker {
-        Sticker { name: String::new(), picture, model: String::new(), zones: Vec::new(), uv_set: 1, centre: [0.5, 0.5], size: [1.0, 1.0], rotation: 0.0, mirror: false, mask: false, colours: white3(), opacity: 1.0, visible: true, shader_uv: None }
+        Sticker { name: String::new(), picture, model: String::new(), zones: Vec::new(), uv_set: 1, centre: [0.5, 0.5], size: [1.0, 1.0], rotation: 0.0, mirror: false, mask: false, colours: white3(), opacity: 1.0, visible: true, shader_uv: None, fresh: true }
     }
 }
 
@@ -173,6 +174,11 @@ pub struct Zone {
     pub dv: [Vec3; 2],
     /// Area that has a usable UV mapping in the set.
     pub uv_area: [f32; 2],
+    /// Area-weighted sums of the triangles' UV centres and of their
+    /// squares: where the bulk of the zone lies in UV space (a few faces
+    /// unwrapped elsewhere stretch the box, not these).
+    pub uv_sum: [Vec2; 2],
+    pub uv_sq: [Vec2; 2],
 }
 
 impl Zone {
@@ -216,7 +222,7 @@ impl Zones {
             for t in me.indices.chunks_exact(3) {
                 let v = [&me.verts[t[0] as usize], &me.verts[t[1] as usize], &me.verts[t[2] as usize]];
                 let key = (v[0].zone[1], v[0].zone[0]);
-                if v[1].zone[0] != key.1 || v[2].zone[0] != key.1 {
+                if v[0].zone[2] == 0 || v[1].zone[0] != key.1 || v[2].zone[0] != key.1 {
                     continue;
                 }
                 let p = v.map(|v| Vec3::from(v.pos));
@@ -246,6 +252,11 @@ impl Zones {
                     z.du[set] += (e1 * d2.y - e2 * d1.y) / det * area;
                     z.dv[set] += (e2 * d1.x - e1 * d2.x) / det * area;
                     z.uv_area[set] += area;
+                    let c = (uv[0] + uv[1] + uv[2]) / 3.0;
+                    // a triangle's own spread about its centre: (sum of squared corner offsets) / 12
+                    let own = ((uv[0] - c) * (uv[0] - c) + (uv[1] - c) * (uv[1] - c) + (uv[2] - c) * (uv[2] - c)) / 12.0;
+                    z.uv_sum[set] += c * area;
+                    z.uv_sq[set] += (c * c + own) * area;
                 }
             }
         }
@@ -266,11 +277,26 @@ impl Zones {
     pub fn set(&self, slot: u8, zones: &[u8], uv_set: usize) -> Option<ZoneSet> {
         let mut s = ZoneSet { uv_lo: Vec2::splat(f32::MAX), uv_hi: Vec2::splat(f32::MIN), ..Default::default() };
         let mut w = 0.0;
-        for z in zones.iter().filter_map(|z| self.zones.get(&(slot, *z))) {
+        // The UV box a sticker is fitted to is that of the zones that fill
+        // their own box (panels). A zone that is a thin frame around other
+        // things (a wall's rails) has a box far larger than itself and
+        // would put the middle somewhere off the panels.
+        let fill = |z: &Zone| {
+            let e = z.uv_hi[uv_set] - z.uv_lo[uv_set];
+            z.uv_area[uv_set] / (e.x * z.du[uv_set].length() * e.y * z.dv[uv_set].length()).max(1e-9)
+        };
+        let chosen: Vec<&Zone> = zones.iter().filter_map(|z| self.zones.get(&(slot, *z))).filter(|z| z.uv_area[uv_set] > 0.0).collect();
+        let solid = chosen.iter().any(|z| fill(z) >= 0.3);
+        let (mut sum, mut sq) = (Vec2::ZERO, Vec2::ZERO);
+        for z in chosen {
             let a = z.uv_area[uv_set];
-            if a <= 0.0 {
+            if solid && fill(z) < 0.3 {
+                s.normal += z.normal;
+                s.area += z.area;
                 continue;
             }
+            sum += z.uv_sum[uv_set];
+            sq += z.uv_sq[uv_set];
             s.normal += z.normal;
             s.du += z.du[uv_set] * a;
             s.dv += z.dv[uv_set] * a;
@@ -285,6 +311,12 @@ impl Zones {
         s.du /= w;
         s.dv /= w;
         s.normal = s.normal.normalize_or_zero();
+        // the box of the bulk: mean +- sqrt(3) standard deviations (exactly
+        // the box of an evenly filled rectangle), inside the full box
+        let mean = sum / w;
+        let half = ((sq / w - mean * mean).max(Vec2::ZERO)).powf(0.5) * 3f32.sqrt();
+        s.fit_lo = (mean - half).max(s.uv_lo);
+        s.fit_hi = (mean + half).min(s.uv_hi);
         Some(s)
     }
 }
@@ -298,6 +330,10 @@ pub struct ZoneSet {
     pub dv: Vec3,
     pub uv_lo: Vec2,
     pub uv_hi: Vec2,
+    /// The UV box of the bulk of the zones (see `Zone::uv_sum`): what a
+    /// sticker is fitted to and measured from.
+    pub fit_lo: Vec2,
+    pub fit_hi: Vec2,
     pub area: f32,
 }
 
@@ -337,18 +373,52 @@ impl ZoneSet {
         [a, b, c, e, ou, ov]
     }
 
-    /// A first placement: in the middle of the zones' UV box, as large as
-    /// fits in 80 % of it, with the picture's proportions (`aspect` = width
+    /// The middle of the zones (of the box of their bulk).
+    fn middle(&self) -> Vec2 {
+        (self.fit_lo + self.fit_hi) * 0.5
+    }
+
+    /// A place in the UV set as metres across and down the panel from the
+    /// middle of the zones.
+    pub fn to_panel(&self, c: Vec2) -> Vec2 {
+        let (right, down) = self.axes();
+        let d = c - self.middle();
+        let w = self.du * d.x + self.dv * d.y;
+        Vec2::new(right.dot(w), down.dot(w))
+    }
+
+    /// The reverse of `to_panel`.
+    pub fn from_panel(&self, p: Vec2) -> Vec2 {
+        let (right, down) = self.axes();
+        let (a, b, c, d) = (right.dot(self.du), right.dot(self.dv), down.dot(self.du), down.dot(self.dv));
+        let det = a * d - b * c;
+        if det.abs() < 1e-9 {
+            return self.middle();
+        }
+        self.middle() + Vec2::new(p.x * d - p.y * b, p.y * a - p.x * c) / det
+    }
+
+    /// Half the zones' UV box measured on the panel, metres (the larger
+    /// side): how far from the middle a sticker can sensibly go.
+    pub fn reach(&self) -> f32 {
+        let p = self.to_panel(self.fit_hi);
+        let q = self.to_panel(Vec2::new(self.fit_hi.x, self.fit_lo.y));
+        p.abs().max(q.abs()).max_element()
+    }
+
+    /// A first placement: in the middle of the zones, as large as fits in
+    /// 80 % of the box of their bulk, with the picture's proportions (`aspect` = width
     /// / height).
     pub fn fit(&self, aspect: f32) -> ([f32; 2], [f32; 2]) {
-        let c = (self.uv_lo + self.uv_hi) * 0.5;
-        // the UV box's extent along the panel's right and down, metres
-        let (right, down) = self.axes();
-        let ext = self.uv_hi - self.uv_lo;
-        let (ru, rv) = (right.dot(self.du) * ext.x, right.dot(self.dv) * ext.y);
-        let (du, dv) = (down.dot(self.du) * ext.x, down.dot(self.dv) * ext.y);
-        let bw = ru.abs().max(rv.abs()).max(0.05);
-        let bh = du.abs().max(dv.abs()).max(0.05);
+        let c = self.middle();
+        // the UV box measured on the panel: its corners across and down, metres
+        let (mut lo, mut hi) = (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN));
+        for q in [self.fit_lo, self.fit_hi, Vec2::new(self.fit_lo.x, self.fit_hi.y), Vec2::new(self.fit_hi.x, self.fit_lo.y)] {
+            let p = self.to_panel(q);
+            lo = lo.min(p);
+            hi = hi.max(p);
+        }
+        let (bw, bh) = ((hi.x - lo.x).max(0.05), (hi.y - lo.y).max(0.05));
         let aspect = aspect.clamp(0.05, 20.0);
         let w = (bw * 0.8).min(bh * 0.8 * aspect);
         ([c.x, c.y], [w, w / aspect])
@@ -391,8 +461,10 @@ fn zone_bits(zones: &[u8]) -> [u32; 8] {
 /// What is highlighted on the model besides the stickers.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Highlight {
-    /// Index of the sticker whose zones and outline are shown.
+    /// Index of the sticker whose outline is shown.
     pub selected: Option<usize>,
+    /// Also tint the zones it lies on (while zones are being chosen).
+    pub tint: bool,
     /// A zone under the pointer.
     pub hover: Option<(u8, u8)>,
 }
@@ -421,7 +493,10 @@ pub fn records(l: &mut Livery, zones: &Zones, layer_of: &dyn Fn(&Picture) -> Opt
             flags |= 2;
         }
         if selected {
-            flags |= 4 | 8;
+            flags |= 8;
+            if hl.tint {
+                flags |= 4;
+            }
         }
         out.push(Record {
             zones: zone_bits(&s.zones),
@@ -522,6 +597,8 @@ pub struct State {
     pub dirty: bool,
     pub highlight: Highlight,
     pub status: String,
+    /// The Liveries panel.
+    pub ed: crate::livery_ui::Editor,
 }
 
 impl State {
@@ -532,6 +609,13 @@ impl State {
 
     fn layer(&mut self, p: &Picture, game: &Path, cache: &Path) -> Result<std::sync::Arc<Layer>, String> {
         self.layers.entry(p.key()).or_insert_with(|| read_layer(p, game, cache).map(std::sync::Arc::new).map_err(|e| format!("{e:#}"))).clone()
+    }
+
+    /// A picture at 128 x 128 (stretched like its layer), for previews.
+    pub fn layer_small(&mut self, p: &Picture, game: &Path, cache: &Path) -> Option<(Vec<u8>, usize)> {
+        let l = self.layer(p, game, cache).ok()?;
+        let k = l.mips.iter().position(|m| m.len() == 128 * 128 * 4)?;
+        Some((l.mips[k].clone(), 128))
     }
 
     /// Why a picture is not shown, if it could not be read.
@@ -551,7 +635,9 @@ impl State {
     }
 
     pub fn unsaved(&self) -> bool {
-        self.livery.stickers != self.saved.stickers
+        // `fresh` is not saved, so it does not count
+        let plain = |l: &Livery| l.stickers.iter().map(|s| Sticker { fresh: false, ..s.clone() }).collect::<Vec<_>>();
+        plain(&self.livery) != plain(&self.saved)
     }
 
     /// Bring the GPU in line with the placements. Called every frame with
@@ -654,10 +740,27 @@ pub struct Hit {
     pub uv: [Vec2; 2],
 }
 
-/// The nearest triangle of the model a ray hits (bind pose).
-pub fn pick(m: &glb::Model, origin: Vec3, dir: Vec3) -> Option<Hit> {
+/// Whether a ray passes through a box (slab test).
+fn ray_box(origin: Vec3, dir: Vec3, b: &[Vec3; 2]) -> bool {
+    let inv = dir.recip();
+    let t0 = (b[0] - origin) * inv;
+    let t1 = (b[1] - origin) * inv;
+    let near = t0.min(t1).max_element();
+    let far = t0.max(t1).min_element();
+    far >= near.max(0.0)
+}
+
+/// The nearest triangle with sticker zones a ray hits (bind pose). `boxes`: the
+/// meshes' bounding boxes, when the caller keeps them (meshes the ray
+/// misses are skipped).
+pub fn pick(m: &glb::Model, origin: Vec3, dir: Vec3, boxes: Option<&[[Vec3; 2]]>) -> Option<Hit> {
     let mut best: Option<Hit> = None;
-    for me in &m.meshes {
+    for (mi, me) in m.meshes.iter().enumerate() {
+        // a mesh without the zone stream carries no stickers: the ray
+        // passes through it (bolts and trim in front of a wall)
+        if me.verts.first().is_none_or(|v| v.zone[2] == 0) || boxes.and_then(|b| b.get(mi)).is_some_and(|b| !ray_box(origin, dir, b)) {
+            continue;
+        }
         for t in me.indices.chunks_exact(3) {
             let v = [&me.verts[t[0] as usize], &me.verts[t[1] as usize], &me.verts[t[2] as usize]];
             let p0 = Vec3::from(v[0].pos);
@@ -703,7 +806,7 @@ mod tests {
         // V down
         let v = |x: f32, y: f32| {
             let u = (x + 2.0) / 4.0;
-            glb::Vertex { pos: [x, y, 0.0], nrm: [0.0, 0.0, 1.0], uv0: [u, 1.0 - y / 2.0], uv1: [if flip_u { 1.0 - u } else { u }, 1.0 - y / 2.0], zone: [zone, 0, 0, 0], ..Default::default() }
+            glb::Vertex { pos: [x, y, 0.0], nrm: [0.0, 0.0, 1.0], uv0: [u, 1.0 - y / 2.0], uv1: [if flip_u { 1.0 - u } else { u }, 1.0 - y / 2.0], zone: [zone, 0, 1, 0], ..Default::default() }
         };
         let mesh = glb::Mesh { name: String::new(), verts: vec![v(-2.0, 0.0), v(2.0, 0.0), v(2.0, 2.0), v(-2.0, 2.0)], indices: vec![0, 1, 2, 0, 2, 3], material: None, skinned: false, has_tangents: false, uv_sets: 2, centre: [0.0; 3] };
         glb::Model { path: PathBuf::new(), meshes: vec![mesh], materials: Vec::new(), joints: Vec::new(), images: Vec::new(), bbox: [[0.0; 3]; 2], triangles: 2, vertices: 4, extras: serde_json::Value::Null }
@@ -749,10 +852,28 @@ mod tests {
     #[test]
     fn a_ray_finds_the_zone_and_uv() {
         let m = quad(9, false);
-        let h = pick(&m, Vec3::new(1.0, 0.5, 5.0), Vec3::new(0.0, 0.0, -1.0)).unwrap();
+        let h = pick(&m, Vec3::new(1.0, 0.5, 5.0), Vec3::new(0.0, 0.0, -1.0), None).unwrap();
+        let boxes = [[Vec3::new(-2.0, 0.0, 0.0), Vec3::new(2.0, 2.0, 0.0)]];
+        assert!(pick(&m, Vec3::new(1.0, 0.5, 5.0), Vec3::new(0.0, 0.0, -1.0), Some(&boxes)).is_some());
         assert_eq!((h.slot, h.zone), (0, 9));
         assert!((h.uv[0].x - 0.75).abs() < 1e-4 && (h.uv[0].y - 0.75).abs() < 1e-4);
-        assert!(pick(&m, Vec3::new(5.0, 0.5, 5.0), Vec3::new(0.0, 0.0, -1.0)).is_none());
+        assert!(pick(&m, Vec3::new(5.0, 0.5, 5.0), Vec3::new(0.0, 0.0, -1.0), None).is_none());
+        assert!(pick(&m, Vec3::new(5.0, 0.5, 5.0), Vec3::new(0.0, 0.0, -1.0), Some(&boxes)).is_none());
+    }
+
+    #[test]
+    fn panel_metres_and_uv_convert_both_ways() {
+        for flip in [false, true] {
+            let z = Zones::of(&quad(7, flip), &[]);
+            let set = z.set(0, &[7], 1).unwrap();
+            // 1 m to the right of the middle and 0.5 m down
+            let uv = set.from_panel(Vec2::new(1.0, 0.5));
+            let u = if flip { 0.25 } else { 0.75 };
+            assert!((uv.x - u).abs() < 1e-4 && (uv.y - 0.75).abs() < 1e-4, "{uv:?}");
+            let back = set.to_panel(uv);
+            assert!((back.x - 1.0).abs() < 1e-4 && (back.y - 0.5).abs() < 1e-4);
+            assert!((set.reach() - 2.0).abs() < 1e-4);
+        }
     }
 
     #[test]
@@ -760,6 +881,8 @@ mod tests {
         let mut s = Sticker::new(Picture::Game("00112233445566aa".into()));
         s.zones = vec![169, 170];
         s.model = "truckbeds_box_01_hi".into();
+        // not saved: a sticker read from a file counts as placed by hand
+        s.fresh = false;
         let l = Livery { format: 1, vehicle: "benson_hi".into(), stickers: vec![s] };
         let back: Livery = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
         assert_eq!(l, back);
