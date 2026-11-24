@@ -202,6 +202,73 @@ pub fn in_region(min: [f32; 3], max: [f32; 3]) -> bool {
     }
 }
 
+/// `materials.json`, written beside a model: per material its shader, its
+/// textures by slot and its parameter values, keyed by name where the name
+/// is known and by hash where it is not. The same facts as model.json's
+/// `materials` and `drawable.shaders`, laid out to be read.
+fn readable_materials(model: &str, shaders: &[crate::drawable::Shader], mats: &serde_json::Value) -> serde_json::Value {
+    // one key per slot or parameter: its name, else its hash; a second use of a name gets its hash appended
+    fn key(map: &serde_json::Map<String, serde_json::Value>, name: Option<String>, hash: &str) -> String {
+        match name {
+            Some(n) if !map.contains_key(&n) => n,
+            Some(n) => format!("{n} ({hash})"),
+            None => hash.to_string(),
+        }
+    }
+    let list: Vec<serde_json::Value> = shaders
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let m = &mats[i];
+            let mut textures = serde_json::Map::new();
+            for t in m["textures"].as_array().into_iter().flatten() {
+                let hash = t["param_hash"].as_str().unwrap_or("");
+                let mut rec = serde_json::Map::new();
+                for (to, from) in [("file", "png"), ("role", "role_guess"), ("status", "status"), ("width", "width"), ("height", "height"), ("format", "format"), ("texture_hash", "hash64")] {
+                    if !t[from].is_null() {
+                        rec.insert(to.to_string(), t[from].clone());
+                    }
+                }
+                rec.insert("slot_hash".to_string(), hash.into());
+                let k = key(&textures, t["param_name"].as_str().map(str::to_string), hash);
+                textures.insert(k, rec.into());
+            }
+            let (mut values, mut unread) = (serde_json::Map::new(), Vec::new());
+            for c in &s.constants {
+                match c.values {
+                    Some(v) => {
+                        let k = key(&values, crate::names::param(&c.hash), &c.hash);
+                        values.insert(k, serde_json::json!(v));
+                    }
+                    None => unread.push(crate::names::param(&c.hash).unwrap_or_else(|| c.hash.clone())),
+                }
+            }
+            let mut out = serde_json::json!({
+                "index": i,
+                "shader": crate::names::shader(&s.name_hash).unwrap_or_else(|| s.name_hash.clone()),
+                "shader_hash": s.name_hash,
+                "class": m["classification"]["class"],
+                "base_color": m["base_color"],
+                "normal": m["normal"],
+                "textures": textures,
+                "parameters": values,
+                "parameters_not_read": unread,
+            });
+            for k in ["paint", "multilayer", "texture_fallback"] {
+                if !m[k].is_null() {
+                    out[k] = m[k].clone();
+                }
+            }
+            out
+        })
+        .collect();
+    serde_json::json!({
+        "model": model,
+        "note": "One record per material, in the order of the GLB's materials. shader and the keys of textures and parameters are names where the name is known, else the 8-digit hash (joaat of the lower-case name). A texture's file is relative to the export folder; base_color and normal are the paths the GLB uses, relative to this folder. role is a guess from the slot and the format. A parameter's value is the four floats the material stores for it (a scalar uses the first, a colour the first three); what each parameter does is not decoded, and the names are the game's own. parameters_not_read are parameters the shader lists whose values lie outside the material's constant block. Normal maps are DirectX style (green = +v down). model.json holds the same data with the full technical record.",
+        "materials": list,
+    })
+}
+
 /// Coordinate-system note written into every model.json / GLB.
 pub const COORDS: &str = "units: metres (1 unit = 1 m). Source data is RAGE Z-up right-handed. model.glb and points.glb are glTF Y-up: glb(x, y, z) = rage(x, z, -y) (positions and normals); UVs as stored (top-left origin). Blender's glTF importer converts back to Z-up.";
 
@@ -1268,6 +1335,9 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
             }
             fs::write(&marker, serde_json::to_vec_pretty(&j)?)?;
             item.files.push(rel(&o.out, &marker));
+            let mats = dir.join("materials.json");
+            fs::write(&mats, serde_json::to_vec_pretty(&readable_materials(&base_name, &info.shaders, &j["materials"]))?)?;
+            item.files.push(rel(&o.out, &mats));
         }
         _ => {
             let dir = o.out.join("raw").join(&astem);
@@ -3186,6 +3256,27 @@ fn lod_exports(groups: &[Vec<crate::gltf::NodeGroup>]) -> Vec<(usize, String)> {
 #[cfg(test)]
 mod dictionary_tests {
     use super::*;
+
+    #[test]
+    fn material_file_names_what_is_known() {
+        let shaders: Vec<crate::drawable::Shader> = serde_json::from_value(serde_json::json!([{
+            "index": 0, "record_off": 0, "name_hash": "0badf00d", "param_hashes": [], "textures": [],
+            "constants": [
+                {"hash": "11111111", "desc": "00400003", "offset": 0, "values": [1.0, 0.5, 0.0, 0.0]},
+                {"hash": "22222222", "desc": "01001003", "offset": 16, "values": null}
+            ]
+        }])).unwrap();
+        let mats = serde_json::json!([{"classification": {"class": "opaque"}, "base_color": "a.png", "normal": null,
+            "textures": [{"param_hash": "33333333", "param_name": "diffusetex", "png": "a.png", "role_guess": "colour (sRGB)", "hash64": "00"},
+                         {"param_hash": "44444444", "param_name": null, "status": "missing"}]}]);
+        let j = readable_materials("m", &shaders, &mats);
+        let m = &j["materials"][0];
+        assert_eq!(m["shader"], "0badf00d");
+        assert_eq!(m["textures"]["diffusetex"]["file"], "a.png");
+        assert_eq!(m["textures"]["44444444"]["status"], "missing");
+        assert_eq!(m["parameters"]["11111111"], serde_json::json!([1.0, 0.5, 0.0, 0.0]));
+        assert_eq!(m["parameters_not_read"], serde_json::json!(["22222222"]));
+    }
 
     #[test]
     fn name_gap_rejects_same_dictionary_and_empty_spans() {
