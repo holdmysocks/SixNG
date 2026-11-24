@@ -167,7 +167,9 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
     let mut o = o.clone();
     o.out = dir.clone();
     // the configuration's colour is the primary paint
-    let paint = cfg["colour"]["argb"].as_str().and_then(|c| crate::material::parse_paint(c));
+    // (the stored colour is linear: its bytes are the paint as it is, and
+    // `srgb_if_linear` in vehicles.json is how it looks on screen)
+    let paint = cfg["colour"]["argb"].as_str().filter(|c| c.len() == 8).and_then(|c| u32::from_str_radix(c, 16).ok()).map(|v| [(v >> 16) & 255, (v >> 8) & 255, v & 255].map(|c| c as f32 / 255.0));
     if o.paint.is_none() {
         o.paint = paint;
     }
