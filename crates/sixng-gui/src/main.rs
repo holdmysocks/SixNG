@@ -42,6 +42,7 @@ mod model_picker;
 mod model_view;
 mod pages;
 mod render3d;
+mod scenes_view;
 mod siren_sound;
 #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
 mod render3d_metal4;
@@ -297,6 +298,7 @@ enum Tab {
     Map3D,
     Textures,
     Audio,
+    Scenes,
 }
 
 #[derive(Default)]
@@ -355,6 +357,7 @@ struct App {
     /// Job id of a `texture-users` job (the Textures tab reloads its index when it ends).
     texture_users_job: Option<u32>,
     audio: audio_view::AudioView,
+    scenes: scenes_view::ScenesView,
     shot: Option<(PathBuf, u32, bool)>,
     map3d_start: Option<[f32; 3]>,
     bake: bakejob::BakeJob,
@@ -452,6 +455,7 @@ impl App {
             textures: texture_view::TextureView::new(&game, &work),
             texture_users_job: None,
             audio: audio_view::AudioView::new(&game, &work),
+            scenes: scenes_view::ScenesView::new(&game, &work),
             shot: None,
             map3d_start: None,
             bake: bakejob::BakeJob::default(),
@@ -858,6 +862,7 @@ impl App {
                 ui.selectable_value(&mut self.tab, Tab::Map3D, "🌆 Map 3D");
                 ui.selectable_value(&mut self.tab, Tab::Textures, "🖼 Textures");
                 ui.selectable_value(&mut self.tab, Tab::Audio, "🔊 Audio");
+                ui.selectable_value(&mut self.tab, Tab::Scenes, "🎬 Scenes");
                 ui.separator();
                 let n = self.jobs.active_count();
                 let jl = if n > 0 {
@@ -938,6 +943,10 @@ impl App {
                         self.tab = Tab::Jobs;
                     }
                     Some(library::Action::OpenJobs) => self.tab = Tab::Jobs,
+                    Some(library::Action::OpenScenes(m)) => {
+                        self.scenes.filter_character(&m);
+                        self.tab = Tab::Scenes;
+                    }
                     None => {}
                 }
                 return;
@@ -961,6 +970,18 @@ impl App {
             if let Some(h) = self.model.view_texture.take() {
                 self.textures.show_hash(h);
                 self.tab = Tab::Textures;
+            }
+            if let Some(m) = self.model.open_scenes.take() {
+                self.scenes.filter_character(&m);
+                self.tab = Tab::Scenes;
+            }
+            return;
+        }
+        if self.tab == Tab::Scenes {
+            let mut act = None;
+            egui::CentralPanel::default().show(ui, |ui| act = self.scenes.ui(ui));
+            if let Some(scenes_view::Action::Play { model, clip }) = act {
+                self.play_scene_clip(&model, &clip, &ctx);
             }
             return;
         }
@@ -1394,6 +1415,7 @@ impl App {
                 Tab::Model => self.model.idle(),
                 Tab::Textures => self.textures.idle(),
                 Tab::Audio => self.audio.idle(),
+                Tab::Scenes => self.scenes.idle(),
                 _ if self.setup.open => true,
                 Tab::Library => self.library.idle() && self.model.picker.loaded(),
                 Tab::Status => self.status.sizes.lock().unwrap().is_some(),
@@ -1408,6 +1430,20 @@ impl App {
             self.shot = Some((path, frames + 1, exit));
         }
         ctx.request_repaint();
+    }
+
+    /// A cast member's scene clip from the Scenes tab: open the character
+    /// (unless it is open) and play the clip from the start.
+    fn play_scene_clip(&mut self, model: &str, clip: &str, ctx: &egui::Context) {
+        let id = format!("packs.rpf#outfit:{model}");
+        let open = self.model.loaded.as_ref().is_some_and(|l| l.base.split("#look=").next() == Some(id.as_str()));
+        if !open {
+            self.model.open(&id, 0, ctx);
+        }
+        self.model.ped_clip.want = clip.to_string();
+        self.model.ped_clip.pos = 0.0;
+        self.model.ped_clip.playing = true;
+        self.tab = Tab::Model;
     }
 
     /// A model picked on the map: its Library item page when the model is
@@ -1441,6 +1477,7 @@ impl App {
             Some("settings") => Some(Tab::Settings),
             Some("archives") => Some(Tab::Browser),
             Some("audio") => Some(Tab::Audio),
+            Some("scenes") => Some(Tab::Scenes),
             _ => None,
         };
         if let Some(t) = page {
@@ -1456,6 +1493,13 @@ impl App {
             }
             if let Some(id) = c.get("item") {
                 self.library.show_item(id);
+            }
+            // --tab scenes [--scene <name words>] [--cast <words>]
+            if let Some(q) = c.get("scene") {
+                self.scenes.select_scene(q);
+            }
+            if let Some(q) = c.get("cast") {
+                self.scenes.cast_q = q.to_string();
             }
             if c.has("palette") {
                 self.palette.open = true;
