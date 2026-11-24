@@ -5002,14 +5002,22 @@ fn load_query_sel(
                         me.indices = keep;
                     }
                 }
-                let bind: HashMap<u32, sixng_core::weapon::Mat> = info["drawable"]["skeleton"]
-                    .as_array()
-                    .map(|b| b.iter().filter_map(|b| Some((joaat(b["name"].as_str()?), serde_json::from_value(b["bind_matrix"].clone()).ok()?))).collect())
-                    .unwrap_or_default();
+                let binds = |info: &serde_json::Value| -> HashMap<u32, sixng_core::weapon::Mat> {
+                    info["drawable"]["skeleton"]
+                        .as_array()
+                        .map(|b| b.iter().filter_map(|b| Some((joaat(b["name"].as_str()?), serde_json::from_value(b["bind_matrix"].clone()).ok()?))).collect())
+                        .unwrap_or_default()
+                };
+                let mut bind = binds(&info);
                 let (mut names, mut errs) = (Vec::new(), Vec::new());
-                for o in &chosen {
+                // bodies first: the parts that mount on a bed's bones (its
+                // rear bumper, its tailgate) need the bed in place
+                let is_body = |o: &u64| opts.iter().any(|x| x.off == *o && x.group.starts_with("body ("));
+                let mut order: Vec<&u64> = chosen.iter().filter(|o| is_body(o)).collect();
+                order.extend(chosen.iter().filter(|o| !is_body(o)));
+                for o in order {
                     // the pickup bed is attached by name: it may sit at the origin
-                    let by_name = opts.iter().any(|x| x.off == *o && x.group.starts_with("body ("));
+                    let by_name = is_body(o);
                     for (off, bone, _) in &kits[o] {
                         // A part lists a model per mounting bone (side
                         // guards in short, mid and long for the chassis
@@ -5021,9 +5029,18 @@ fn load_query_sel(
                         let Some(pe) = ix.entries.iter().find(|x| x.off == *off) else { continue };
                         let pn = pe.name.clone().unwrap_or_default();
                         match export_load(&a, pe, cache, level) {
-                            Ok((mut m, _, _)) => {
+                            Ok((mut m, _, part_info)) => {
                                 // the part is modelled around its bone: put it at the bone's bind pose
                                 let t = bind.get(bone).copied().unwrap_or(sixng_core::weapon::IDENTITY);
+                                // A body brings bones of its own (the bed's
+                                // bumper_r, boot ...). A part on a bone of
+                                // that name belongs on the body's, not on
+                                // the chassis's bone of the same name.
+                                if by_name {
+                                    for (h, b) in binds(&part_info) {
+                                        bind.insert(h, (Mat4::from_cols_array(&t) * Mat4::from_cols_array(&b)).to_cols_array());
+                                    }
+                                }
                                 let c = Mat4::from_cols_array(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
                                 transform_model(&mut m, c * Mat4::from_cols_array(&t) * c.inverse());
                                 let first = model.meshes.len();
