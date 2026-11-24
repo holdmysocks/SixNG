@@ -918,7 +918,7 @@ enum Cmd {
         /// Regex on the name.
         #[arg(long)]
         name: Option<String>,
-        /// "character" or "animal".
+        /// "character", "animal" or "model" (only the game's ped model list).
         #[arg(long)]
         kind: Option<String>,
         /// Archive holding the parts.
@@ -1428,11 +1428,21 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
             let re = name.as_deref().map(|n| regex::RegexBuilder::new(n).case_insensitive(true).build()).transpose()?;
-            let v: Vec<_> = sixng_core::outfit::characters(&ix)
-                .into_iter()
-                .filter(|c| re.as_ref().is_none_or(|r| r.is_match(&c.name)) && kind.as_deref().is_none_or(|k| k == c.kind))
-                .collect();
-            out.print(&json!({"ok": true, "archive": a.id, "count": v.len(), "characters": v}));
+            let all = sixng_core::outfit::characters(&ix);
+            let listed: std::collections::HashSet<String> = all.iter().map(|c| c.name.clone()).collect();
+            let v: Vec<_> = all.into_iter().filter(|c| re.as_ref().is_none_or(|r| r.is_match(&c.name)) && kind.as_deref().is_none_or(|k| k == c.kind)).collect();
+            // every model of the game's outfit list, named where a name is known
+            let (models, models_note) = match sixng_core::pedlook::listed_models(&ws.game) {
+                Ok(m) => (
+                    m.into_iter()
+                        .filter(|m| re.as_ref().is_none_or(|r| r.is_match(&m.name)) && kind.as_deref().is_none_or(|k| k == "model"))
+                        .map(|m| json!({"name": m.name, "hash": m.hash, "named": m.named, "outfits": m.outfits, "listed_as_character": listed.contains(&m.name)}))
+                        .collect::<Vec<_>>(),
+                    None,
+                ),
+                Err(e) => (Vec::new(), Some(e)),
+            };
+            out.print(&json!({"ok": true, "archive": a.id, "count": v.len(), "characters": v, "models_count": models.len(), "models_named": models.iter().filter(|m| m["named"] == true).count(), "models": models, "models_note": models_note}));
         }
         Cmd::Clips { dict, name, limit } => {
             let re = name.as_deref().map(|n| regex::RegexBuilder::new(n).case_insensitive(true).build()).transpose()?;

@@ -206,6 +206,210 @@ pub fn models(game_root: &Path) -> Result<&'static Models, String> {
     .map_err(|e| e.clone())
 }
 
+/// Names for the models of the outfit list. The list stores only
+/// joaat(model name), so a name is known only when a candidate hashes to a
+/// listed model. Candidates come from the packs.rpf index (every name and
+/// every `_` prefix of one: `cs_ali_head_…` gives `cs_ali`), from the name
+/// dictionary, and from the game's text tables (capitalised words and runs
+/// of two or three, lower-cased and joined with `_`, behind the ped model
+/// prefixes: "Phil Cassidy" gives `cs_phil_cassidy`). A text or dictionary
+/// candidate counts only with a ped model prefix; with about 13 million
+/// candidates against 2,713 models, around eight names are expected to be
+/// chance hits.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ModelNames {
+    version: u32,
+    /// joaat(model name) -> name
+    pub names: BTreeMap<u32, String>,
+}
+
+const NAMES_VERSION: u32 = 1;
+
+/// A name shaped like a ped model's: `cs_…`, `ig_…`, `player_…`,
+/// `a_f_y_…` (kind, sex, age) or an animal root.
+pub fn is_model_name(n: &str) -> bool {
+    let b = n.as_bytes();
+    ["cs_", "csb_", "hc_", "ig_", "mp_", "player_"].iter().any(|p| n.starts_with(p))
+        || (b.len() > 6 && b[1] == b'_' && b[3] == b'_' && b[5] == b'_' && b"agsu".contains(&b[0]) && b"fm".contains(&b[2]) && b"ymo".contains(&b[4]))
+        || crate::outfit::is_animal(n)
+}
+
+/// Name stems a line of text may hold: its capitalised words and runs of
+/// two or three of them, lower-cased and joined with `_` ("Phil Cassidy" ->
+/// `phil`, `cassidy`, `phil_cassidy`).
+pub fn text_name_stems(s: &str, out: &mut HashSet<String>) {
+    let mut run: Vec<String> = Vec::new();
+    let mut flush = |run: &mut Vec<String>| {
+        for i in 0..run.len() {
+            for k in 1..=3.min(run.len() - i) {
+                out.insert(run[i..i + k].join("_"));
+            }
+        }
+        run.clear();
+    };
+    for piece in s.split(' ') {
+        let w: String = piece.chars().filter(|c| *c != '\'').collect();
+        let core = w.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        let ok = core.len() > 1 && core.len() < 24 && core.chars().next().is_some_and(|c| c.is_ascii_uppercase()) && core.chars().all(|c| c.is_ascii_alphanumeric());
+        if ok {
+            run.push(core.to_ascii_lowercase());
+        }
+        // punctuation after the word, or a word that is no name, ends the run
+        if !ok || w.ends_with(|c: char| !c.is_ascii_alphanumeric()) {
+            flush(&mut run);
+        }
+    }
+    flush(&mut run);
+}
+
+fn build_names(game_root: &Path, work: &Path, t: &Models, ix: &ArchiveIndex) -> ModelNames {
+    let mut names: BTreeMap<u32, String> = BTreeMap::new();
+    let keys = &t.by_model;
+    // names and name prefixes of the index
+    let mut seen: HashSet<&str> = HashSet::new();
+    for e in &ix.entries {
+        let Some(n) = e.name.as_deref() else { continue };
+        if !seen.insert(n) {
+            continue;
+        }
+        let n = n.to_ascii_lowercase();
+        let cuts = n.match_indices('_').map(|(i, _)| i).skip(1).chain(std::iter::once(n.len()));
+        for c in cuts {
+            let p = &n[..c];
+            // `hc_cs_x` and `hc_x` parts belong to the models `cs_x` and `x`
+            for cand in [Some(p), p.strip_prefix("hc_"), p.strip_prefix("hc_cs_")].into_iter().flatten() {
+                for cand in [cand.to_string(), format!("cs_{cand}")] {
+                    let h = joaat(&cand);
+                    if keys.contains_key(&h) && cand.contains('_') {
+                        names.entry(h).or_insert(cand);
+                    }
+                }
+            }
+        }
+    }
+    // the name dictionary
+    for &h in keys.keys() {
+        if !names.contains_key(&h) {
+            if let Some((n, _)) = crate::names::all(h).into_iter().find(|(n, _)| is_model_name(&n.to_ascii_lowercase())) {
+                names.insert(h, n.to_ascii_lowercase());
+            }
+        }
+    }
+    // the text tables of data.rpf, when it is indexed
+    let ixp = crate::scan::index_path(&work.join("index"), "data.rpf");
+    if let Ok(dix) = crate::scan::load_index(&ixp) {
+        let path = game_root.join("data.rpf");
+        let a = ArchiveInfo { id: "data.rpf".into(), size: std::fs::metadata(&path).map_or(0, |m| m.len()), container: "rpf9".into(), path };
+        if let Ok((tables, _)) = crate::text::read_all(&a, &dix.entries, &[], crate::export::no_progress()) {
+            let stems: HashSet<String> = tables
+                .par_iter()
+                .map(|t| {
+                    let mut s = HashSet::new();
+                    t.strings.values().for_each(|x| text_name_stems(&crate::text::plain(x), &mut s));
+                    s
+                })
+                .reduce(HashSet::new, |mut a, b| {
+                    a.extend(b);
+                    a
+                });
+            let mut prefixes: Vec<String> = ["cs_", "hc_cs_", "hc_", "ig_", "csb_"].iter().map(|s| s.to_string()).collect();
+            for k in "agsu".chars() {
+                for s in "fm".chars() {
+                    for age in "ymo".chars() {
+                        prefixes.push(format!("{k}_{s}_{age}_"));
+                    }
+                }
+            }
+            let found: Vec<(u32, String)> = stems
+                .par_iter()
+                .flat_map_iter(|stem| {
+                    let mut v = Vec::new();
+                    for p in &prefixes {
+                        for suffix in ["", "_00", "_01", "_02"] {
+                            let cand = format!("{p}{stem}{suffix}");
+                            let h = joaat(&cand);
+                            if keys.contains_key(&h) {
+                                v.push((h, cand));
+                            }
+                        }
+                    }
+                    v
+                })
+                .collect();
+            let mut found = found;
+            found.sort();
+            for (h, n) in found {
+                names.entry(h).or_insert(n);
+            }
+        }
+    }
+    ModelNames { version: NAMES_VERSION, names }
+}
+
+/// The model name table (built on first use, about twenty seconds when
+/// data.rpf is indexed, then cached as `<work>/index/ped_model_names.json`).
+pub fn model_names(game_root: &Path) -> Result<&'static ModelNames, String> {
+    static T: OnceLock<Result<ModelNames, String>> = OnceLock::new();
+    T.get_or_init(|| {
+        let t = models(game_root)?;
+        let work = crate::names::work_dir().ok_or("no work directory")?;
+        let cache = work.join("index").join("ped_model_names.json");
+        let ixp = crate::scan::index_path(&work.join("index"), "packs.rpf");
+        let dxp = crate::scan::index_path(&work.join("index"), "data.rpf");
+        let stamp = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        if let Ok(b) = std::fs::read(&cache) {
+            if let Ok(n) = serde_json::from_slice::<ModelNames>(&b) {
+                if n.version == NAMES_VERSION && stamp(&cache) >= stamp(&ixp) && stamp(&cache) >= stamp(&dxp) {
+                    return Ok(n);
+                }
+            }
+        }
+        let ix = crate::scan::load_index(&ixp).map_err(|e| format!("packs.rpf index ({}): {e}; index packs.rpf first", ixp.display()))?;
+        let n = build_names(game_root, &work, t, &ix);
+        if let Ok(b) = serde_json::to_vec(&n) {
+            let _ = std::fs::write(&cache, b);
+        }
+        Ok(n)
+    })
+    .as_ref()
+    .map_err(|e| e.clone())
+}
+
+/// One model of the outfit list, for listing.
+#[derive(Clone, Debug, Serialize)]
+pub struct ListedModel {
+    /// The model's name, or `ped_0x<hash>` when no name is known; `look`
+    /// and `outfit:` take either.
+    pub name: String,
+    pub hash: String,
+    pub named: bool,
+    pub outfits: usize,
+}
+
+/// Every model of the outfit list, named where a name is known, sorted by
+/// name (the unnamed ones last).
+pub fn listed_models(game_root: &Path) -> Result<Vec<ListedModel>, String> {
+    let t = models(game_root)?;
+    let n = model_names(game_root)?;
+    let mut v: Vec<ListedModel> = t
+        .by_model
+        .iter()
+        .map(|(h, row)| {
+            let name = n.names.get(h);
+            ListedModel { name: name.cloned().unwrap_or_else(|| format!("ped_0x{h:08x}")), hash: format!("{h:08x}"), named: name.is_some(), outfits: row.outfits.len() }
+        })
+        .collect();
+    v.sort_by(|a, b| (!a.named, &a.name).cmp(&(!b.named, &b.name)));
+    Ok(v)
+}
+
+/// The model hash a name stands for: `ped_0x<hash>` / `0x<hash>` as
+/// written, else joaat of the name.
+pub fn model_hash(model: &str) -> u32 {
+    let m = model.strip_prefix("ped_").unwrap_or(model);
+    m.strip_prefix("0x").filter(|x| x.len() <= 8).and_then(|x| u32::from_str_radix(x, 16).ok()).unwrap_or_else(|| joaat(model))
+}
+
 /// Textures the wardrobe data names: store hash -> (wardrobe resource, head
 /// drawable hash or 0). Ped skin has no texture bound in its drawables: a
 /// head's face, the body's normal, detail and mask maps and the eyes'
@@ -604,7 +808,7 @@ fn dressed_first(mut l: Look) -> Look {
 
 fn look_uncached(game_root: &Path, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Result<Look, String> {
     let t = models(game_root)?;
-    if let Some(row) = t.by_model.get(&joaat(model)) {
+    if let Some(row) = t.by_model.get(&model_hash(model)) {
         return look_row(a, ix, model, row, false);
     }
     // listed under another model name: the models whose wardrobe names this
@@ -966,6 +1170,22 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_names_from_text_and_hashes() {
+        let mut s = HashSet::new();
+        text_name_stems("Talk to Phil Cassidy. Then meet Mandy at the bar", &mut s);
+        for want in ["phil", "cassidy", "phil_cassidy", "mandy", "talk", "then"] {
+            assert!(s.contains(want), "{want}");
+        }
+        // a sentence end and a lower-case word both end a run
+        assert!(!s.contains("cassidy_then") && !s.contains("mandy_at"));
+        assert!(is_model_name("cs_mandy") && is_model_name("a_f_o_beach_00") && is_model_name("crb_eagle_bald_m_00"));
+        assert!(!is_model_name("contact") && !is_model_name("a_x_o_beach"));
+        assert_eq!(model_hash("ped_0x7fd5440d"), 0x7fd5_440d);
+        assert_eq!(model_hash("0x0007f78b"), 0x7f78b);
+        assert_eq!(model_hash("cs_mandy"), joaat("cs_mandy"));
+    }
 
     #[test]
     fn swimwear_and_garment_categories() {
