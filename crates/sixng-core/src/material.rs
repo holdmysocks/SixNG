@@ -457,48 +457,38 @@ fn four_layer_detail_uv(fit: &Value) -> Value {
     json!({"uv": "position", "scale": 0.125, "section_tile": false, "why": "not a section tile and no planar detail UV: tile from position, one repeat per 8 m"})
 }
 
-/// Constants of a 4-layer ground material. Vec4s whose component k follows
-/// layer k's texture (seam test: equal across a material border whenever
-/// that layer's texture is equal there) are split per layer; their meaning
-/// is not known, so they keep their hash (and name when one resolved).
+/// Constants of a 4-layer ground material: the float4 constants are per
+/// layer (component k belongs to layer k, as the shader code uses them),
+/// the others belong to the material. Keys are names where the name is
+/// known, with the hash.
 pub fn four_layer_params(consts: &[crate::drawable::ShaderConst]) -> Value {
-    // per-layer vec4s (component k = layer k) with the seam agreement found
-    const PER_LAYER: &[(&str, &str)] = &[
-        ("c35e27af", "equal across seams 100 % for the same texture (44 % otherwise); values 0.65-2.0, 1.0 on 108 of 137 layers: a per-texture factor (tiling or intensity, not decided: no correlation with texture brightness or feature size, |r| <= 0.12, and the baked low-detail maps show no detail repeat to measure). As a tiling factor, values where 64 x value is not whole (1.2, 1.3, 1.325, 1.4, 1.6, 0.65) would leave a seam at every 512 m section border, since TEXCOORD_0 restarts there"),
-        ("627ce8ae", "99 % / 71 %; values 1 or 2"),
-        ("781f7100", "98 % / 10 %; values 0.35-0.75"),
-        ("9a4a3781", "92 % / 14 %; values 0-0.175 on some sections, mostly 0.5 or 1.0 on others (parallax or height depth?)"),
-        ("f354f896", "85 % / 13 %; values about 1-16"),
-        ("9ede7c13", "83 % / 23 %; values about 1-14"),
-        ("b25b6656", "100 % / 86 %; mostly 1.0"),
-        ("30bf5bed", "mostly 0.5"),
-    ];
-    let name = |h: &str| crate::names::param(h);
+    let key = |h: &str| match crate::names::param(h) {
+        Some(n) => format!("{n} ({h})"),
+        None => h.to_string(),
+    };
     let mut layers: Vec<serde_json::Map<String, Value>> = vec![serde_json::Map::new(); 4];
-    let mut per_layer_notes = serde_json::Map::new();
     let mut other = serde_json::Map::new();
     for c in consts {
-        let Some(v) = c.values else { continue };
-        if v.iter().any(|x| !x.is_finite() || x.abs() > 1e6) {
-            continue; // the block's first words are not constants (pointer-like)
-        }
-        if let Some((_, note)) = PER_LAYER.iter().find(|(h, _)| *h == c.hash) {
+        let Some(v) = c.components().filter(|v| v.iter().all(|x| x.is_finite())) else { continue };
+        if v.len() == 4 && !UV_TRANSFORMS.contains(&c.hash.as_str()) {
             for (k, l) in layers.iter_mut().enumerate() {
-                l.insert(c.hash.clone(), json!(v[k]));
+                l.insert(key(&c.hash), json!(v[k]));
             }
-            per_layer_notes.insert(c.hash.clone(), json!(note));
-        } else if v.iter().any(|x| *x != 0.0) {
-            let key = match name(&c.hash) { Some(n) => format!("{n} ({})", c.hash), None => c.hash.clone() };
-            other.insert(key, json!(v));
+        } else {
+            other.insert(key(&c.hash), if v.len() == 1 { json!(v[0]) } else { json!(v) });
         }
     }
     json!({
         "per_layer": layers,
-        "per_layer_notes": per_layer_notes,
         "material": other,
-        "note": "Constant block values (vec4, float offset from the parameter table). Names: joaat dictionary hits only (blendsoftness, tintintensity, tintblendamount, bumpiness …); the rest are hashes. Meanings are not decoded.",
+        "uv_transforms": {"4344d2cc": "scale (xy) and offset (zw) of the first UV set", "9ecaaa1e": "scale and offset of the second UV set", "724bed95": "listed per layer: 1 = the layer uses the first UV set, else the second", "source": "shader code (one deferred pixel program of standard_uber_4lyr)"},
+        "note": "Constant values from the material's constant buffers (see drawable.shaders[].constants: buffer, byte offset, component count). float4 constants are split per layer; what most of them do is not decoded. Values exported before 2026-11-24 were read from wrong offsets and should be discarded.",
     })
 }
+
+/// float4 constants of the four-layer shaders that are a UV scale and
+/// offset, not per-layer values.
+const UV_TRANSFORMS: [&str; 2] = ["4344d2cc", "9ecaaa1e"];
 
 /// The 17-slot 4-layer ground shaders (`standard_uber_4lyr_dpm_dm_hbb`
 /// 61e09df7, `…_pxm_hbb_fixuv1` b21f1ba5, `…_spx_dm_hbb` 360e396b,
@@ -562,6 +552,11 @@ mod paint_tests {
         assert_eq!(l["layers"][3]["colour"]["param"], 13);
         assert_eq!(l["layers"][3]["colour"]["status"], "no texture bound");
         assert_eq!(l["weights"]["texture"]["png"], "t2.png");
+        // constants: float4s per layer, the UV transforms and scalars with the material
+        let k = |hash: &str, count: u8, v: [f32; 4]| crate::drawable::ShaderConst { hash: hash.into(), desc: String::new(), offset: 0, values: Some(v), buffer: 7, count };
+        let p = four_layer_params(&[k("4344d2cc", 4, [128.0, 128.0, 0.0, 0.0]), k("0f0f0f0f", 4, [1.0, 0.7, 0.2, 1.0]), k("0e0e0e0e", 1, [3.0, 0.0, 0.0, 0.0])]);
+        assert_eq!((p["per_layer"][1]["0f0f0f0f"].as_f64().map(|x| (x * 10.0).round()), p["per_layer"][0].as_object().map(|o| o.len())), (Some(7.0), Some(1)));
+        assert_eq!((p["material"]["4344d2cc"][0].as_f64(), p["material"]["0e0e0e0e"].as_f64()), (Some(128.0), Some(3.0)));
         assert_eq!(l["macro"]["tint"]["png"], "t16.png");
         assert!(layers("b21f1ba5", &entries).unwrap()["detail_uv"]["alt_uv_set"].is_null());
         assert_eq!(layers("27e5c49d", &entries).unwrap()["detail_uv"]["alt_uv_set"], "TEXCOORD_2");
