@@ -1672,6 +1672,7 @@ impl App {
         m.look.tint = !c.has("no-tint");
         m.hair.show = !c.has("no-fur");
         m.auto.find_hair = c.has("find-hair");
+        m.auto.export_hair = c.has("export-hair");
         m.auto.hair_width = c.f("hair-width");
         m.auto.hair_style = c.get("hair-style").map(str::to_string);
         // --hair-colour r,g,b (0..255): a character's hair colour
