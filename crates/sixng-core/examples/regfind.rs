@@ -27,6 +27,11 @@ fn main() -> anyhow::Result<()> {
                             continue;
                         }
                         *types.entry(item.get("2d4958cf").and_then(|t| t.as_i64()).unwrap_or(-1)).or_default() += 1;
+                        if std::env::var_os("DUMP").is_some() {
+                            // every record: GUID, type and the word list (property e3da9c8b)
+                            let words: Vec<String> = item.get("e6657b17").and_then(|p| p.as_array()).into_iter().flatten().filter(|p| p.get("Key").and_then(|k| k.as_u64()) == Some(0xe3da_9c8b)).flat_map(|p| p.get("Item").and_then(|i| i.as_array()).into_iter().flatten()).filter_map(|x| x.as_u64().map(|x| format!("{x:08x}"))).collect();
+                            hits.push(format!("{key}	{}	{}", item.get("2d4958cf").and_then(|t| t.as_i64()).unwrap_or(-1), words.join(" ")));
+                        }
                         if want.iter().any(|w| key.eq_ignore_ascii_case(w)) {
                             hits.push(format!("{} in {}: {}", key, e.id, item));
                         }
