@@ -501,9 +501,14 @@ impl ModelPicker {
     }
 
     fn name_of(&self, id: &str) -> String {
-        match (&self.items, self.by_id.get(id)) {
-            (Some(items), Some(&i)) => self.shown(&items[i as usize]),
-            _ => id.to_string(),
+        // a recents entry may carry a choice on top of the entry id (`…#finish=…`)
+        let (base, extra) = crate::library::query_parts(id);
+        match (&self.items, self.by_id.get(base)) {
+            (Some(items), Some(&i)) => {
+                let n = self.shown(&items[i as usize]);
+                extra.map_or(n.clone(), |x| format!("{n} ({x})"))
+            }
+            _ => base.to_string(),
         }
     }
 
