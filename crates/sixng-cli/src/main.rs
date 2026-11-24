@@ -2049,21 +2049,14 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
         Cmd::Heightmap { archive, map, preview, check, out: po } => {
             use sixng_core::heightmap as hm;
             let a = ws.resolve(archive)?;
-            let ix = ws.load_index(&a)?;
-            let mut maps = Vec::new();
-            for e in ix.entries.iter().filter(|e| e.kind == Kind::Bin && e.usize >= 0x2C) {
-                let b = sixng_core::scan::read_entry(&a.path, e)?;
-                if hm::is_heightmap(&b) {
-                    maps.push((e.id.clone(), hm::decode(&b)?));
-                }
-            }
+            let maps = hm::load_all(&ws, archive)?;
             if maps.is_empty() {
                 anyhow::bail!("no MHIU height map in {}", a.id);
             }
             let pick = match map {
                 Some(i) if *i < maps.len() => *i,
                 Some(i) => anyhow::bail!("--map {i}: only {} height maps", maps.len()),
-                None => (0..maps.len()).max_by_key(|&i| maps[i].1.stored).unwrap(),
+                None => hm::best(&maps).unwrap(),
             };
             let desc = |id: &str, m: &hm::HeightMap| {
                 json!({

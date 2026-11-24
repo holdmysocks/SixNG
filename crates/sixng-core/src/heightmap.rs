@@ -128,6 +128,24 @@ impl HeightMap {
         }
         Some(self.z(self.samples[r as usize * self.width + c as usize]))
     }
+    /// Bilinear height at world (x, y) and whether any of the four samples
+    /// is land (above the fill value); `None` outside the box.
+    pub fn sample(&self, x: f32, y: f32) -> Option<(f32, bool)> {
+        let [cx, cy] = self.cell();
+        let fx = (x - self.min[0]) / cx - 0.5;
+        let fy = (y - self.min[1]) / cy - 0.5;
+        if fx < -0.5 || fy < -0.5 || fx > self.width as f32 - 0.5 || fy > self.height as f32 - 0.5 {
+            return None;
+        }
+        let (c0, r0) = (fx.floor().max(0.0) as usize, fy.floor().max(0.0) as usize);
+        let (c1, r1) = ((c0 + 1).min(self.width - 1), (r0 + 1).min(self.height - 1));
+        let (tx, ty) = ((fx - c0 as f32).clamp(0.0, 1.0), (fy - r0 as f32).clamp(0.0, 1.0));
+        let s = |c: usize, r: usize| self.samples[r * self.width + c];
+        let q = [s(c0, r0), s(c1, r0), s(c0, r1), s(c1, r1)];
+        let z = |v: u8| self.z(v);
+        let h = (z(q[0]) * (1.0 - tx) + z(q[1]) * tx) * (1.0 - ty) + (z(q[2]) * (1.0 - tx) + z(q[3]) * tx) * ty;
+        Some((h, q.iter().any(|&v| v > self.fill)))
+    }
     /// Samples flipped to image order (row 0 = north), widened to 16 bits
     /// (`v * 257`, so 0..65535 spans min_z..max_z).
     pub fn gray16_north_up(&self) -> Vec<u16> {
@@ -168,6 +186,27 @@ impl HeightMap {
         }
         out
     }
+}
+
+/// Every height map in an indexed archive (normally `common`), in archive
+/// order, with its entry id.
+pub fn load_all(ws: &crate::export::Workspace, archive: &str) -> Result<Vec<(String, HeightMap)>> {
+    let a = ws.resolve(archive)?;
+    let ix = ws.load_index(&a)?;
+    let mut maps = Vec::new();
+    for e in ix.entries.iter().filter(|e| e.kind == crate::classify::Kind::Bin && e.usize >= HEADER as u64) {
+        let b = crate::scan::read_entry(&a.path, e)?;
+        if is_heightmap(&b) {
+            maps.push((e.id.clone(), decode(&b)?));
+        }
+    }
+    Ok(maps)
+}
+
+/// Index of the copy with the most stored samples (the one that covers the
+/// most land and agrees best with the collision).
+pub fn best(maps: &[(String, HeightMap)]) -> Option<usize> {
+    (0..maps.len()).max_by_key(|&i| maps[i].1.stored)
 }
 
 /// Writes the height map as a 16-bit greyscale PNG, north up.
@@ -221,6 +260,11 @@ mod tests {
         assert_eq!(m.at(15.0, 5.0), Some(100.0));
         assert_eq!(m.at(35.0, 15.0), Some(200.0));
         assert_eq!(m.gray16_north_up()[3], 200 * 257);
+        // centre of sample (1, 0) and halfway to (2, 0)
+        assert_eq!(m.sample(15.0, 5.0), Some((100.0, true)));
+        assert_eq!(m.sample(20.0, 5.0), Some((100.5, true)));
+        assert_eq!(m.sample(5.0, 15.0), Some((23.0, false)));
+        assert_eq!(m.sample(-1.0, 5.0), None);
     }
 
     #[test]
