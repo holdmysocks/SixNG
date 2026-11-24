@@ -60,6 +60,8 @@ mod macos {
         residency: ResidencySet,
         size: PhysicalSize<u32>,
         has_presented: bool,
+        frame_presentation:
+            crate::frame_presentation_mtl4::FramePresentationMtl4,
     }
 
     impl Renderer {
@@ -75,7 +77,7 @@ mod macos {
             let layer = Layer::with_device(&device)?;
             layer.set_pixel_format(PixelFormat::BGRA8_UNORM_SRGB);
             layer.set_framebuffer_only(true);
-            layer.set_maximum_drawable_count(2)?;
+            layer.set_maximum_drawable_count(3)?;
             layer.set_display_sync_enabled(true);
             let handle = window.window_handle()?.as_raw();
             let RawWindowHandle::AppKit(appkit) = handle else {
@@ -109,6 +111,10 @@ mod macos {
             queue.add_residency_set(&residency)?;
             let painter = super::super::metal4_egui::Painter::new(&device)?;
             let scene = crate::render3d_metal4::Renderer3D4::new(&device, &queue)?;
+            let mut frame_presentation =
+                crate::frame_presentation_mtl4::FramePresentationMtl4::new();
+            frame_presentation.resize(&device, size)?;
+            frame_presentation.start()?;
 
             Ok(Self {
                 device,
@@ -119,6 +125,7 @@ mod macos {
                 residency,
                 size,
                 has_presented: false,
+                frame_presentation,
             })
         }
 
@@ -127,6 +134,8 @@ mod macos {
             if size.width > 0 && size.height > 0 {
                 self.layer
                     .set_drawable_size(size.width as f64, size.height as f64)?;
+                self.frame_presentation.resize(&self.device, size)?;
+                self.frame_presentation.reset();
             }
             Ok(())
         }
@@ -137,21 +146,51 @@ mod macos {
             mut output: egui::FullOutput,
         ) -> anyhow::Result<()> {
             let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
-            if let Some(texture) = self.scene.output_texture() {
-                self.painter.register_external_texture(
-                    egui::TextureId::User(crate::render3d_metal4::MAP_TEXTURE_ID),
-                    &texture,
+            if self.scene.frame_generation_mode()
+                == crate::render3d_metal4::FrameGenerationMode::Interpolate120
+            {
+                let texture = if self.frame_presentation.phase()
+                    == crate::frame_presentation_mtl4::FramePhase::Real
+                {
+                    self.scene.real_output_texture()
+                } else {
+                    self.scene
+                        .interpolated_output_texture()
+                        .or_else(|| self.scene.real_output_texture())
+                };
+                if let Some(texture) = texture {
+                    self.painter.register_external_texture(
+                        egui::TextureId::User(crate::render3d_metal4::MAP_TEXTURE_ID),
+                        &texture,
+                    )?;
+                }
+                self.painter.render(
+                    &self.layer,
+                    &self.queue,
+                    &self.residency,
+                    [self.size.width, self.size.height],
+                    output.pixels_per_point,
+                    &primitives,
+                    &mut output.textures_delta,
+                )?;
+                self.frame_presentation.advance();
+            } else {
+                if let Some(texture) = self.scene.output_texture() {
+                    self.painter.register_external_texture(
+                        egui::TextureId::User(crate::render3d_metal4::MAP_TEXTURE_ID),
+                        &texture,
+                    )?;
+                }
+                self.painter.render(
+                    &self.layer,
+                    &self.queue,
+                    &self.residency,
+                    [self.size.width, self.size.height],
+                    output.pixels_per_point,
+                    &primitives,
+                    &mut output.textures_delta,
                 )?;
             }
-            self.painter.render(
-                &self.layer,
-                &self.queue,
-                &self.residency,
-                [self.size.width, self.size.height],
-                output.pixels_per_point,
-                &primitives,
-                &mut output.textures_delta,
-            )?;
             if !self.has_presented {
                 println!(
                     "Presented an MTL4 egui frame on {} ({}x{})",
@@ -212,6 +251,10 @@ mod macos {
             let Some(renderer) = self.renderer.as_mut() else {
                 return;
             };
+            renderer.scene.set_frame_generation_real_slot(
+                renderer.frame_presentation.phase()
+                    == crate::frame_presentation_mtl4::FramePhase::Real,
+            );
             let mut output = self.egui_ctx.run_ui(input, |ui| {
                 self.sixng.logic(ui.ctx());
                 self.sixng.ui(ui, &mut renderer.scene);
@@ -243,6 +286,22 @@ mod macos {
             state.handle_platform_output(window, platform_output);
             if let Err(error) = renderer.render(&self.egui_ctx, output) {
                 self.fail(event_loop, error);
+                return;
+            }
+            if renderer.scene.frame_generation_mode()
+                == crate::render3d_metal4::FrameGenerationMode::Interpolate120
+            {
+                let interval = renderer.frame_presentation.pacing_interval();
+                self.repaint_at = Some(renderer.frame_presentation.schedule(interval));
+                let (real, interpolated) = renderer.frame_presentation.counts();
+                if (real + interpolated).is_multiple_of(120) {
+                    eprintln!(
+                        "[frame-generation] presented real={real} interpolated={interpolated}"
+                    );
+                }
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    self.repaint_at.expect("120fps repaint deadline was set"),
+                ));
             }
         }
     }
