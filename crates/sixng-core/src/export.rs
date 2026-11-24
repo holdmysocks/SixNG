@@ -830,10 +830,12 @@ fn bake_ped_tint(st: &ShaderTextures, part: Option<&str>, o: &ExportOptions, tdi
         return None;
     }
     // The fabric's own shading (seams, folds) is the green channel of the
-    // garment's packed map (`speculartex`, slot c6f46e79). The green of the
-    // small map that marks ped clothing (`speculartex2`) is a grime pattern
-    // in the garment's layout: used as the shade it mottles every garment.
-    // It stays the fallback for garments without a packed map.
+    // garment's packed map (`speculartex`, slot c6f46e79): the clothing
+    // shader overlays it on the base colour (and adds B as linear light,
+    // which is not applied here). The small map that marks ped clothing
+    // (`speculartex2`) never enters the colour in the shader: its green
+    // modulates gloss, and used as the shade it mottles every garment. It
+    // stays the fallback for garments without a packed map.
     let packed = st.entries.iter().find(|x| x["param_hash"] == "c6f46e79" && x["status"].as_str().is_some_and(|s| s.starts_with("ok")) && x["png"].is_string());
     let (src, source) = match packed {
         Some(x) => (x, "speculartex.g"),

@@ -437,10 +437,19 @@ again**).
     the neck.
   - **Fabric shading.** The colour is shaded by the green channel of the
     garment's own packed map (`speculartex`: seams and folds, mid grey on
-    plain cloth). The green of the small map every garment also binds
-    (`speculartex2`) is a grime pattern in the garment's layout, which the
-    game brings in with its dirt presets; used as the shade (as before
-    2026-11-24) it mottled every garment. Dirt is not shown.
+    plain cloth). From the clothing pixel shader (`ped_standard_muv`, read
+    by the shader research): `speculartex` G is overlaid on the base
+    colour and B is added as linear light, both neutral at 0.5, and R
+    masks a second colour set; `speculartex2` (the small map every
+    garment also binds) never enters the colour: its G modulates gloss
+    and its R is the amount of a wear overlay. Used as the shade (as
+    before 2026-11-24) its G mottled every garment. The viewer applies G
+    only, as a multiply about mid grey: the shader's pivots, powers and
+    strengths are per-material numbers that were not found, and B is left
+    out. In the game the base colour is a three-stop gradient over a fine
+    tiling fabric texture named only in a run-time parameter block, with
+    up to eight sub-materials picked by `materialid` or a per-vertex id;
+    the viewer shows one flat colour per garment instead.
   - **Clothing colours.** An item's stored colour is used when it has one;
     else row tint 0 of its tint palette (for `ped_tint_generic_clean`
     only when the row is the colour the item's colour tag names, because
