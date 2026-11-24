@@ -34,7 +34,7 @@ const OWNER: u32 = 0xfb1f_80ff;
 /// `handlingId` (case-sensitive joaat).
 const HANDLING_ID: u32 = 0xec41_bd9c;
 /// Layout version of vehicles.json; the model viewer rebuilds older files.
-pub const FORMAT: u32 = 15;
+pub const FORMAT: u32 = 16;
 /// A mod part or kit of one vehicle (in that vehicle's own pack resource):
 /// `name` joaat of the part model's name, or of a kit's name (the names of
 /// its left and right models without the side word:
@@ -429,7 +429,7 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
     // they are records of the library, named in a configuration's part
     // list like any other part. Each vehicle gets the ones its
     // configurations use.
-    let library_parts: Vec<(Vec<Value>, HashMap<u32, Vec<u32>>, FitSource)> = crate::names::work_dir()
+    let library_parts: Vec<(Vec<Value>, HashMap<u32, Vec<u32>>, FitSource, Vec<Value>, HashMap<u32, u32>)> = crate::names::work_dir()
         .and_then(|w| crate::scan::load_index(&crate::scan::index_path(&w.join("index"), "data.rpf")).ok())
         .map(|ix| {
             let path = crate::export::game_root(a).join("data.rpf");
@@ -444,7 +444,7 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
                     }
                     let dump = |h: u32| m.objects(h).iter().filter_map(|&o| m.object(h, o, 0)).collect::<Vec<_>>();
                     let mods = dump(MOD);
-                    Some((mod_parts(&mods, &dump(MOD_ELEMENT)), part_keys(&mods, &key_mods(&dump(KEY_MOD))), fit_source(&mods, &dump(WHEEL_FIT))))
+                    Some((mod_parts(&mods, &dump(MOD_ELEMENT)), part_keys(&mods, &key_mods(&dump(KEY_MOD))), fit_source(&mods, &dump(WHEEL_FIT)), switches_json(&dump(SWITCH), &dump(MOD_ELEMENT), &mods), key_mods(&dump(KEY_MOD))))
                 })
                 .collect()
         })
@@ -457,6 +457,20 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
         let (lists, recs) = &l.2;
         library_fit.0.extend(lists.iter().map(|(k, v)| (*k, v.clone())));
         library_fit.1.extend(recs.iter().map(|(k, v)| (*k, v.clone())));
+    }
+    // the switches of the library's parts (a truck's side guards come in
+    // lengths and heights, of which the keys of the bed and of the truck's
+    // own parts pick one), by the part they belong to
+    // the library's key modifiers: a pack's own part can name one (a
+    // truck's wheelbase key)
+    let library_key_mods: HashMap<u32, u32> = library_parts.iter().flat_map(|l| l.4.iter().map(|(k, v)| (*k, *v))).collect();
+    // each pack's own modifier lists
+    let own_lists: HashMap<u32, HashMap<u32, Vec<u32>>> = fits_of.iter().map(|(h, f)| (*h, f.0.clone())).collect();
+    let mut library_switches: HashMap<u32, Vec<Value>> = HashMap::new();
+    for s in library_parts.iter().flat_map(|l| l.3.iter()) {
+        if let Some(p) = s["part"].as_str().and_then(|p| u32::from_str_radix(p, 16).ok()) {
+            library_switches.entry(p).or_default().push(s.clone());
+        }
     }
     let library: HashMap<u32, Value> = library_parts.into_iter().flat_map(|l| l.0).filter_map(|p| Some((u32::from_str_radix(p["name"].as_str()?, 16).ok()?, p))).collect();
     let mut n_shared = 0;
@@ -482,19 +496,74 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
             None => m["mods"] = json!(add),
         }
     }
-    // The chassis part's switches, and the keys of the parts that can be
-    // fitted: the pack's own and the library parts its configurations name.
+    // The switches of the chassis part, of the pack's other parts and of
+    // the library parts its configurations name, and the keys of the parts
+    // that can be fitted.
     let mut n_switches = 0;
-    for (h, (switches, own_keys)) in switches_of {
-        let Some(m) = models.get_mut(&h) else { continue };
-        if switches.is_empty() {
-            continue;
-        }
+    let mut own_switches: HashMap<u32, Switches> = switches_of.into_iter().collect();
+    let hashes: Vec<u32> = models.keys().copied().collect();
+    for h in hashes {
+        let (mut switches, own_keys) = own_switches.remove(&h).unwrap_or_default();
         let mut keys: BTreeMap<String, Vec<String>> = own_keys.iter().map(|(p, k)| (format!("{p:08x}"), k.iter().map(|k| format!("{k:08x}")).collect())).collect();
         for p in parts_of.get(&h).into_iter().flatten() {
             if let Some(k) = library_keys.get(p) {
                 keys.entry(format!("{p:08x}")).or_insert_with(|| k.iter().map(|k| format!("{k:08x}")).collect());
             }
+        }
+        // keys an own part sets through a key modifier of the library
+        for (p, list) in own_lists.get(&h).into_iter().flatten() {
+            for k in list.iter().filter_map(|n| library_key_mods.get(n)) {
+                let e = keys.entry(format!("{p:08x}")).or_default();
+                let k = format!("{k:08x}");
+                if !e.contains(&k) {
+                    e.push(k);
+                }
+            }
+        }
+        // A library part's switch is taken where it is a plain choice of one
+        // element (no default, no option without an element) that this
+        // vehicle's parts can answer: the key (and second key) of an option
+        // is one some part sets. The elements it chooses from then leave the
+        // part's element list, so that the switch shows one of them and not
+        // the part all (a truck's side guards: the bed sets high or low, the
+        // chassis part the wheelbase). Other library switches (number plate
+        // positions, which have defaults, empty options and bones on fitted
+        // bumpers) are left out, and their parts keep fitting every element
+        // as before.
+        let settable: std::collections::HashSet<&str> = keys.values().flatten().map(|k| k.as_str()).collect();
+        let answerable = |s: &Value| {
+            let o = s["options"].as_array().map(|o| o.as_slice()).unwrap_or(&[]);
+            // a plain choice of one element: no default, no empty option
+            s["default"].is_null() && o.iter().all(|o| !o["element"].is_null()) && o.iter().any(|o| o["key"].as_str().is_some_and(|k| settable.contains(k)) && o["also"].as_str().is_none_or(|k| settable.contains(k)))
+        };
+        let mut library_taken: Vec<Value> = Vec::new();
+        for p in parts_of.get(&h).into_iter().flatten() {
+            library_taken.extend(library_switches.get(p).into_iter().flatten().filter(|s| answerable(s)).cloned());
+        }
+        let Some(m) = models.get_mut(&h) else { continue };
+        for part in m.get_mut("mods").and_then(|x| x.as_array_mut()).into_iter().flatten().filter(|p| p.get("shared") == Some(&json!(true))) {
+            let governed: Vec<(String, String)> = library_taken
+                .iter()
+                .filter(|s| s["part"] == part["name"])
+                .flat_map(|s| s["options"].as_array().into_iter().flatten().map(|o| &o["element"]).chain(std::iter::once(&s["default"])))
+                .filter_map(|e| Some((e["model"].as_str()?.to_string(), e["bone"].as_str()?.to_string())))
+                .collect();
+            if governed.is_empty() {
+                continue;
+            }
+            if let Some(els) = part["elements"].as_array_mut() {
+                let before = els.len();
+                els.retain(|e| !governed.iter().any(|g| e["model"].as_str() == Some(&g.0) && e["bone"].as_str() == Some(&g.1)));
+                let n = before - els.len();
+                if n > 0 {
+                    part["switched_elements"] = json!(n);
+                }
+            }
+        }
+        drop(settable);
+        switches.extend(library_taken);
+        if switches.is_empty() {
+            continue;
         }
         n_switches += switches.len();
         m["switches"] = json!(switches);
