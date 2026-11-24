@@ -33,8 +33,10 @@ const GAME_NAME: u32 = 0x120e_5836;
 const OWNER: u32 = 0xfb1f_80ff;
 /// `handlingId` (case-sensitive joaat).
 const HANDLING_ID: u32 = 0xec41_bd9c;
+/// The number plate bones: `plate_f`, `plate_r`, `mod_plate_f`, `mod_plate_r`.
+const PLATE_BONES: [&str; 4] = ["03e3e512", "567b0a43", "a0976fcb", "8e174ab3"];
 /// Layout version of vehicles.json; the model viewer rebuilds older files.
-pub const FORMAT: u32 = 16;
+pub const FORMAT: u32 = 17;
 /// A mod part or kit of one vehicle (in that vehicle's own pack resource):
 /// `name` joaat of the part model's name, or of a kit's name (the names of
 /// its left and right models without the side word:
@@ -194,26 +196,35 @@ fn key_mods(recs: &[Value]) -> HashMap<u32, u32> {
 
 /// The switches of a vehicle pack: `[{name, part, default, options: [{key,
 /// also, element}]}]` with elements as in `mods` (null = nothing shown);
-/// `part` is the part the switch belongs to, null for the chassis part.
+/// `part` is the part the switch belongs to, null for the chassis part. A
+/// switch several parts name (the number plate positions, shared by every
+/// plate part) is given once per part.
 fn switches_json(switches: &[Value], elements: &[Value], mods: &[Value]) -> Vec<Value> {
-    // switch name -> the part whose modifier list names it
-    let mut owner: HashMap<u32, Value> = HashMap::new();
+    // switch name -> the parts whose modifier lists name it
+    let mut owner: HashMap<u32, Vec<Value>> = HashMap::new();
     for m in mods {
         let Some(part) = get(m, NAME).and_then(|x| x.as_u64()) else { continue };
         let chassis = get(m, MOD_SLOT).and_then(|x| x.as_u64()) == Some(SLOT_CHASSIS as u64);
         for s in u32s(get(m, MOD_LIST)) {
-            owner.entry(s).or_insert_with(|| if chassis { Value::Null } else { json!(format!("{part:08x}")) });
+            let p = if chassis { Value::Null } else { json!(format!("{part:08x}")) };
+            let o = owner.entry(s).or_default();
+            if !o.contains(&p) {
+                o.push(p);
+            }
         }
     }
     let by_name: HashMap<u32, &Value> = elements.iter().filter_map(|e| Some((get(e, NAME)?.as_u64()? as u32, e))).collect();
     let el = |n: u32| by_name.get(&n).map(|e| element_json(e)).unwrap_or(Value::Null);
     let num = |v: &Value, h: u32| get(v, h).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    let unowned = [Value::Null];
     switches
         .iter()
-        .map(|s| {
+        .flat_map(|s| {
             let also = |o: &Value| Some(num(o, OPTION_ALSO)).filter(|a| *a != 0).map(|a| format!("{a:08x}"));
             let options: Vec<Value> = get(s, SWITCH_OPTIONS).and_then(|x| x.as_array()).into_iter().flatten().map(|o| json!({"key": format!("{:08x}", num(o, OPTION_KEY)), "also": also(o), "element": el(num(o, OPTION_ELEMENT))})).collect();
-            json!({"name": format!("{:08x}", num(s, NAME)), "part": owner.get(&num(s, NAME)).cloned().unwrap_or(Value::Null), "default": el(num(s, SWITCH_DEFAULT)), "options": options})
+            let default = el(num(s, SWITCH_DEFAULT));
+            let parts = owner.get(&num(s, NAME)).map(|o| o.as_slice()).unwrap_or(&unowned);
+            parts.iter().map(|part| json!({"name": format!("{:08x}", num(s, NAME)), "part": part, "default": default, "options": options})).collect::<Vec<_>>()
         })
         .collect()
 }
@@ -526,15 +537,22 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
         // is one some part sets. The elements it chooses from then leave the
         // part's element list, so that the switch shows one of them and not
         // the part all (a truck's side guards: the bed sets high or low, the
-        // chassis part the wheelbase). Other library switches (number plate
-        // positions, which have defaults, empty options and bones on fitted
-        // bumpers) are left out, and their parts keep fitting every element
-        // as before.
+        // chassis part the wheelbase).
+        // The number plate switches are taken as they are: every element on
+        // one of the four plate bones. The rear one shows the plate on
+        // `plate_r`, on `mod_plate_r` where a fitted part (rear bumper, bed,
+        // boot) sets c623bf2c, and nothing with 68bd62ca; the front one
+        // shows nothing unless a part sets 2aef799d (then `plate_f`, or
+        // `mod_plate_f` where a front bumper sets 7be534e0), and nothing
+        // with 503c4352. Other library switches with a default or an empty
+        // option are left out, and their parts keep fitting every element.
         let settable: std::collections::HashSet<&str> = keys.values().flatten().map(|k| k.as_str()).collect();
         let answerable = |s: &Value| {
             let o = s["options"].as_array().map(|o| o.as_slice()).unwrap_or(&[]);
             // a plain choice of one element: no default, no empty option
-            s["default"].is_null() && o.iter().all(|o| !o["element"].is_null()) && o.iter().any(|o| o["key"].as_str().is_some_and(|k| settable.contains(k)) && o["also"].as_str().is_none_or(|k| settable.contains(k)))
+            let plain = s["default"].is_null() && o.iter().all(|o| !o["element"].is_null()) && o.iter().any(|o| o["key"].as_str().is_some_and(|k| settable.contains(k)) && o["also"].as_str().is_none_or(|k| settable.contains(k)));
+            let mut bones = o.iter().map(|o| &o["element"]).chain(std::iter::once(&s["default"])).filter(|e| !e.is_null()).map(|e| e["bone"].as_str().unwrap_or("")).peekable();
+            plain || (bones.peek().is_some() && bones.all(|b| PLATE_BONES.contains(&b)))
         };
         let mut library_taken: Vec<Value> = Vec::new();
         for p in parts_of.get(&h).into_iter().flatten() {
