@@ -455,6 +455,18 @@ again**).
     tiling fabric texture named only in a run-time parameter block, with
     up to eight sub-materials picked by `materialid` or a per-vertex id;
     the viewer shows one flat colour per garment instead.
+  - **Clothing colours from garment presets.** An item's `GarmentPreset`
+    is a key into the clothing material library of `data.rpf` (`matlib`,
+    `sixng materials`), which holds one base colour per sub-material of
+    the garment. The viewer colours each texel with the colour of its
+    sub-material, read from the garment's `materialid` texture (red x 63,
+    as the clothing shader does); a garment without that texture takes the
+    colour of sub-material 0 (the per-vertex sub-material id is not read).
+    The viewer builds `<work>/index/material_presets.json` itself when it
+    is missing. Not applied: the second colour the game fades towards, the
+    three-stop gradient over a tiling fabric texture (`matlib::stops`),
+    and whatever the tint rows do on items that have a preset. Items
+    without a preset fall back to the rules below.
   - **Clothing colours.** An item's stored colour is used when it has one;
     else row tint 0 of its tint palette (for `ped_tint_generic_clean`
     only when the row is the colour the item's colour tag names, because
@@ -894,6 +906,15 @@ hash, the same `hash64` that `model.json` lists for each material slot:
 in the Model viewer, open a material and click **view** on a slot to jump
 here. From the command line: `--texture <hash>` (or `--tab textures`)
 with `--window-screenshot out.png --exit`.
+
+For a texture no model binds, **Used by** turns to the wardrobe data.
+Ped skin (a head's face, the body's normal, detail and mask maps, the
+eyes' colour) has no texture in its drawables: wardrobe items name
+them. The panel then lists the heads the items name and the named
+characters whose wardrobe has the texture (click one to open it), and
+counts the wardrobes of models without a name in the index. The table is
+built from the `packs` index the first time it is needed (about a minute)
+and kept in `<work>/index/wardrobe_textures.json`.
 
 **Used by**, on the right, lists the materials that use the selected
 texture, most-used first: each with its shader, its other texture slots
