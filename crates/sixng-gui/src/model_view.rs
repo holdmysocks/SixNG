@@ -3907,6 +3907,64 @@ fn sub_material_map(mat: &glb::Material, roots: &[&Path], w: u32, h: u32) -> Opt
     Some(out)
 }
 
+/// The layered-material index (`sixng materials`), loaded or built once.
+fn material_presets(ws: &Workspace) -> Option<&'static sixng_core::matlib::Index> {
+    static PRESETS: std::sync::OnceLock<Option<sixng_core::matlib::Index>> = std::sync::OnceLock::new();
+    PRESETS.get_or_init(|| sixng_core::matlib::Index::load_or_build(ws).ok()).as_ref()
+}
+
+/// Colour the `weapon` materials of a weapon model from its layered-material
+/// preset (the weapon library names one per model): each sub-material's base
+/// colour, the sub-material of a texel from the material's `materialid`
+/// texture, else of a vertex from the green byte of its raw colour stream
+/// (as a vertex tint). Returns the preset used when anything was coloured.
+fn colour_weapon(m: &mut glb::Model, name: &str, presets: &sixng_core::matlib::Index, cache: &Path) -> Option<String> {
+    let preset = presets.weapon_presets(name).first()?.clone();
+    let subs: Vec<Option<[u8; 3]>> = presets.colours(&preset)?.iter().map(|c| c.map(|c| [c[0], c[1], c[2]])).collect();
+    let first = subs.iter().flatten().next().copied()?;
+    let want = format!("{:08x}", sixng_core::meta7a::joaat("materialid"));
+    let lin = |c: u8| {
+        let x = c as f32 / 255.0;
+        if x <= 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) }
+    };
+    let mut done = false;
+    for mi in 0..m.materials.len() {
+        if m.materials[mi].shader_hash != "e68a4a98" {
+            continue;
+        }
+        done = true;
+        let ids = m.materials[mi].slots.iter().find(|s| s.param_hash == want).and_then(|s| s.png.as_ref()).and_then(|png| Some((image::open(cache.join(png)).ok()?.to_luma8(), png.clone())));
+        match ids {
+            Some((img, png)) => {
+                let (w, h) = img.dimensions();
+                let mut px = Vec::with_capacity((w * h * 4) as usize);
+                for p in img.pixels() {
+                    let s = ((p.0[0] as u32 * 63 + 127) / 255).min(7) as usize;
+                    let c = subs.get(s).copied().flatten().unwrap_or(first);
+                    px.extend_from_slice(&[c[0], c[1], c[2], 255]);
+                }
+                m.images.push(glb::Image { key: format!("{png}#weaponpreset{preset}"), mips: glb::mip_chain(w, h, px), srgb: true, bc: None });
+                m.materials[mi].base = Some(m.images.len() - 1);
+                m.materials[mi].base_factor = [1.0, 1.0, 1.0, m.materials[mi].base_factor[3]];
+            }
+            None => {
+                // no `materialid` texture: the sub-material is per vertex, in
+                // the green byte of the raw colour stream (values 4k + 2 on
+                // every weapon part looked at: k = sub-material)
+                m.materials[mi].base_factor = [1.0, 1.0, 1.0, m.materials[mi].base_factor[3]];
+                let b = |c: u8| (lin(c) * 255.0 + 0.5) as u8;
+                for mesh in m.meshes.iter_mut().filter(|x| x.material == Some(mi)) {
+                    for v in &mut mesh.verts {
+                        let c = subs.get((v.col[1] >> 2).min(7) as usize).copied().flatten().unwrap_or(first);
+                        v.tint = [b(c[0]), b(c[1]), b(c[2]), 255];
+                    }
+                }
+            }
+        }
+    }
+    done.then_some(preset)
+}
+
 fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> bool {
     // Garment preset colours: one base colour per sub-material, the
     // sub-material of a texel from the material's `materialid` texture.
@@ -4977,10 +5035,17 @@ fn load_query_sel(
             };
             let mut got = Vec::new();
             let mut errs = Vec::new();
+            let presets = material_presets(ws);
+            let mut coloured = Vec::new();
             for p in &parts {
                 let pn = p.name.clone().unwrap_or_default();
                 match export_load(&a, p, cache, level) {
-                    Ok((m, _, pi)) => got.push((sixng_core::weapon::part_slot(name, &pn).unwrap_or_default(), bones(&pi), m, pn)),
+                    Ok((mut m, _, pi)) => {
+                        if let Some(pr) = presets.and_then(|ix| colour_weapon(&mut m, &pn, ix, cache)) {
+                            coloured.push(format!("{pn}={pr}"));
+                        }
+                        got.push((sixng_core::weapon::part_slot(name, &pn).unwrap_or_default(), bones(&pi), m, pn))
+                    }
                     Err(err) => errs.push(format!("{pn}: {err:#}")),
                 }
             }
@@ -5009,6 +5074,10 @@ fn load_query_sel(
             if let Some(o) = info.as_object_mut() {
                 o.insert("assembled_from".into(), serde_json::json!(names));
                 o.insert("parts_without_mount".into(), serde_json::json!(loose));
+                if !coloured.is_empty() {
+                    o.insert("weapon_presets".into(), serde_json::json!(coloured));
+                    o.insert("weapon_colour_note".into(), "weapon parts take the base colours of their layered-material preset (weapon library of data.rpf), one per sub-material, picked by the part's materialid texture or, without one, per vertex (green byte of the colour stream / 4). The tile texture, the gradient and the tint-mask, dirt and wear layers are not applied.".into());
+                }
                 o.insert("assembly_note".into(), "weapon parts mount on attach-point bones (a part's AAP_<slot> root on the WAP_<slot> bone of the base or of another part). The lowest-numbered variant of each slot is shown: which variant the game gives a weapon by default is not decoded. Parts listed in parts_without_mount found no attach point on this build and are left out.".into());
                 if !errs.is_empty() {
                     o.insert("part_errors".into(), serde_json::json!(errs));
