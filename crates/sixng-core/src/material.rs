@@ -346,6 +346,7 @@ pub fn multilayer(s: &crate::drawable::Shader, entries: &[Value], fit: impl FnOn
         l["params"] = four_layer_params(&s.constants);
         l["detail_uv"]["recommended"] = four_layer_detail_uv(&fit);
         four_layer_uv(&mut l, &s.constants);
+        four_layer_tint(&mut l, &s.constants);
     }
     if !fit.is_null() {
         l["uv_fit"] = fit;
@@ -502,6 +503,63 @@ fn four_layer_uv(l: &mut Value, consts: &[crate::drawable::ShaderConst]) {
     l["detail_uv"]["recommended"] = json!({"uv": l0["uv_set"], "scale": l0["uv_scale"], "offset": l0["uv_offset"], "per_layer": true,
         "why": "the material's own constants, as the shader applies them: see uv_set, uv_scale and uv_offset of each layer (a layer can use the other UV set)"});
     l["confidence"]["detail_uv_scale"] = json!("high (material constants and shader code)");
+}
+
+/// The tint of a 4-layer ground material as the shader computes it, with
+/// this material's switches resolved: `tint_formula`. Read from the base
+/// pixel program of `standard_uber_4lyr`; the most used variant's program
+/// has the same code shape. Does nothing when the material lacks the tint
+/// constants.
+fn four_layer_tint(l: &mut Value, consts: &[crate::drawable::ShaderConst]) {
+    let get = |h: &str| consts.iter().find(|c| c.hash == h).and_then(|c| c.components()).filter(|v| v.iter().all(|x| x.is_finite())).map(<[f32]>::to_vec);
+    let four = |h: &str| get(h).filter(|v| v.len() == 4);
+    let one = |h: &str| get(h).and_then(|v| v.first().copied());
+    // per layer: texture tint mode, texture tint intensity, blend amount, vertex tint mode, vertex tint intensity, mask scale
+    let (Some(mode), Some(ti), Some(blend), Some(vmode), Some(vi), Some(ms)) = (four("8e3fb0aa"), four("db26e4de"), four("1caef69a"), four("b1c84936"), four("81bc5bca"), four("896d1e47")) else { return };
+    // material switches: vertex tint on, vertex tint second form, blend amount scaled by the mask
+    let (Some(von), Some(vform), Some(masked)) = (one("3fb2b8f7"), one("834fb13b"), one("abe2c64d")) else { return };
+    let layers: Vec<Value> = (0..4)
+        .map(|k| {
+            let invert = blend[k] > 0.0 && mode[k] == 0.0;
+            let vertex = if von == 0.0 {
+                "off"
+            } else if vform != 0.0 {
+                "second form"
+            } else if vmode[k] == 1.0 {
+                "multiply"
+            } else {
+                "luminance"
+            };
+            json!({
+                "mask": if invert { "1 - a" } else { "a" }, "mask_scale": ms[k],
+                "vertex_tint": if ms[k] == 0.0 || vi[k] == 0.0 { "off" } else { vertex }, "vertex_tint_intensity": vi[k],
+                "texture_tint": if blend[k] == 0.0 || ti[k] == 0.0 { "off" } else if mode[k] == 1.0 { "multiply" } else { "luminance" },
+                "texture_tint_intensity": ti[k], "texture_tint_amount": if masked != 0.0 { json!(format!("saturate(a x {})", blend[k])) } else { json!(blend[k]) },
+            })
+        })
+        .collect();
+    l["tint_formula"] = json!({
+        "status": "not applied by the exporter",
+        "inputs": {
+            "D": "the layer's colour texture (linear)", "a": "alpha of the layer's data map",
+            "C": "the first vertex colour set (_COLOR0) rgb, decoded from sRGB to linear", "C.a": "alpha of that set", "T": "the section's tint texture (macro.tint) rgb",
+            "lum(x)": "0.2125 x.r + 0.7154 x.g + 0.0721 x.b",
+        },
+        "steps": [
+            "m = saturate(mask x mask_scale)                       (mask: a, or 1 - a where the layer's blend amount is above 0 and its texture tint mode is luminance)",
+            "V = multiply: saturate(C x intensity x D);  luminance: C x intensity x lum(D)",
+            "Dv = mix(D, V, m)                                     (the vertex-tinted colour)",
+            "D1 = Dv when the vertex tint is on, else D",
+            "W = multiply: saturate(T x intensity x D1);  luminance: T x intensity x lum(D1)",
+            "D2 = mix(D1, W, amount)                               (amount: the layer's blend amount, times a when the material scales it by the mask)",
+            "colour = mix(D2, Dv, C.a)                             (the vertex colour's alpha brings the vertex-tinted colour back over the texture tint)"
+        ],
+        "second_form": "where vertex_tint is `second form`: Dv = D + mix(C x intensity x lum(D), saturate(D x C), third vertex colour set's blue) - D, scaled by m as above. One of 203 surveyed materials uses it",
+        "switches": {"vertex tint on (3fb2b8f7)": von, "vertex tint second form (834fb13b)": vform, "blend amount scaled by the mask (abe2c64d)": masked},
+        "per_layer": layers,
+        "source": "shader code: the base pixel program of standard_uber_4lyr, read once; the most used variant's program has the same code shape. On 203 ground materials of 14 tiles, 189 have the switches 1, 0, 1. Medium confidence; not compared with a rendered image",
+        "not_read": "the switch 7a090c2a beside these, and the tint's effect on the normal (tintbump) and roughness (tintroughnessbias)",
+    });
 }
 
 /// Detail-layer UV for a 4-layer material from its measured mapping:
@@ -767,5 +825,31 @@ mod paint_tests {
         let m = gltf_fields(&json!({"class": "emissive", "alpha_mode": "OPAQUE"}), true);
         assert_eq!(m["emissiveTexture"], "base");
         assert_eq!(m["emissiveFactor"], json!([1.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn four_layer_tint_formula() {
+        let k = |hash: &str, v: [f32; 4], count: u8| crate::drawable::ShaderConst { hash: hash.into(), desc: String::new(), offset: 0, values: Some(v), buffer: 7, count, ty: None };
+        let mut consts = vec![
+            k("8e3fb0aa", [0.0, 1.0, 0.0, 0.0], 4), k("db26e4de", [2.0, 3.0, 0.0, 1.0], 4), k("1caef69a", [1.0, 1.0, 1.0, 0.0], 4), k("b1c84936", [1.0, 0.0, 0.0, 0.0], 4),
+            k("81bc5bca", [1.0, 1.5, 1.0, 0.0], 4), k("896d1e47", [1.0, 1.0, 0.0, 1.0], 4), k("3fb2b8f7", [1.0, 0.0, 0.0, 0.0], 1), k("834fb13b", [0.0; 4], 1),
+        ];
+        let mut l = json!({});
+        // a switch is missing: nothing is written
+        four_layer_tint(&mut l, &consts);
+        assert!(l["tint_formula"].is_null());
+        consts.push(k("abe2c64d", [1.0, 0.0, 0.0, 0.0], 1));
+        four_layer_tint(&mut l, &consts);
+        let p = &l["tint_formula"]["per_layer"];
+        // layer 0: luminance texture tint with a blend amount, so the mask is inverted; multiply vertex tint
+        assert_eq!((p[0]["mask"].as_str(), p[0]["vertex_tint"].as_str(), p[0]["texture_tint"].as_str(), p[0]["texture_tint_amount"].as_str()), (Some("1 - a"), Some("multiply"), Some("luminance"), Some("saturate(a x 1)")));
+        // layer 1: multiply texture tint keeps the mask; layer 2: no intensity and no mask scale; layer 3: no blend amount, no vertex intensity
+        assert_eq!((p[1]["mask"].as_str(), p[1]["vertex_tint"].as_str(), p[1]["texture_tint"].as_str()), (Some("a"), Some("luminance"), Some("multiply")));
+        assert_eq!((p[2]["vertex_tint"].as_str(), p[2]["texture_tint"].as_str(), p[3]["vertex_tint"].as_str(), p[3]["texture_tint"].as_str()), (Some("off"), Some("off"), Some("off"), Some("off")));
+        assert_eq!((l["tint_formula"]["steps"].as_array().map(Vec::len), l["tint_formula"]["switches"]["vertex tint on (3fb2b8f7)"].as_f64()), (Some(7), Some(1.0)));
+        // the blend amount as a number when the material does not scale it by the mask
+        consts.last_mut().unwrap().values = Some([0.0; 4]);
+        four_layer_tint(&mut l, &consts);
+        assert_eq!(l["tint_formula"]["per_layer"][0]["texture_tint_amount"].as_f64(), Some(1.0));
     }
 }
