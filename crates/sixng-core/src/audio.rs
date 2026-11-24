@@ -41,8 +41,9 @@
 use crate::export::Progress;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 pub const CH_DATA: u8 = 0x55;
@@ -52,6 +53,8 @@ pub const CH_STREAM_FORMAT: u8 = 0x48;
 pub const CH_PEAK: u8 = 0x36;
 pub const CH_SEEK: u8 = 0xA3;
 pub const CH_MARKERS: u8 = 0xBD;
+const CH_LIP_SYNC: u8 = 0x5C;
+const STREAM_ID_MASK: u32 = 0x1FFF_FFFF;
 
 /// Codec ids (u8 at 0x1C of the 32-byte format chunk).
 pub const CODEC_PCM16: u8 = 0;
@@ -157,9 +160,25 @@ pub struct Bank {
     pub size: u64,
     pub flags: u32,
     pub streams: Vec<Stream>,
+    /// Validated RSC8 names, keyed by stream position within this bank.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    native_stream_names: BTreeMap<usize, String>,
 }
 
 impl Bank {
+    /// Prefer the embedded wave name, falling back to the existing name search.
+    pub fn stream_name<'a>(
+        &'a self,
+        index: usize,
+        heuristic: Option<&'a BTreeMap<u32, String>>,
+    ) -> Option<&'a str> {
+        let stream = self.streams.get(index)?;
+        self.native_stream_names
+            .get(&index)
+            .or_else(|| heuristic.and_then(|names| names.get(&stream.id)))
+            .map(String::as_str)
+    }
+
     /// Total length of the playable streams, in seconds.
     pub fn seconds(&self) -> f64 {
         self.streams.iter().filter(|s| s.layout != "none").map(|s| s.seconds()).sum()
@@ -210,7 +229,7 @@ pub fn parse_header(h: &[u8], off: u64) -> Option<Bank> {
     if flags & 0x0020_0000 != 0 {
         p += 4 * (n + 1);
     }
-    let entries: Vec<(u32, usize)> = (0..n).map(|i| u32le(h, p + 4 * i).map(|v| (v & 0x1FFF_FFFF, (v >> 29) as usize))).collect::<Option<Vec<_>>>()?;
+    let entries: Vec<(u32, usize)> = (0..n).map(|i| u32le(h, p + 4 * i).map(|v| (v & STREAM_ID_MASK, (v >> 29) as usize))).collect::<Option<Vec<_>>>()?;
     p += 4 * n;
     let total: usize = entries.iter().map(|e| e.1).sum();
     if p + 8 * total != hl {
@@ -242,7 +261,60 @@ pub fn parse_header(h: &[u8], off: u64) -> Option<Bank> {
         }
         streams.push(Stream { id, chunks, data: (0, 0), samples: 0, rate: 0, codec: 0, channels: 0, layout: String::new() });
     }
-    Some(Bank { off, size, flags, streams })
+    Some(Bank { off, size, flags, streams, native_stream_names: BTreeMap::new() })
+}
+
+/// Read the wave name from an uncompressed lip-sync clip dictionary.
+fn read_rsc8_name(reader: &mut (impl Read + Seek), offset: u64, size: u32, stream_id: u32) -> Option<String> {
+    const HEADER_SIZE: u64 = 16;
+    const ROOT_END: usize = 0x80;
+    const MAX_NAME_LEN: usize = 1024;
+    if size < ROOT_END as u32 {
+        return None;
+    }
+    let mut root = [0; ROOT_END];
+    reader.seek(SeekFrom::Start(offset)).ok()?;
+    reader.read_exact(&mut root).ok()?;
+    if &root[..4] != b"RSC8"
+        || !matches!(u32le(&root, 4)?, 0x1F41 | 0x0100_1F41)
+        // The size in this header excludes its first three u32 fields.
+        || u32le(&root, 8)? != size - 12
+        || u32le(&root, 12)? != 1
+    {
+        return None;
+    }
+    let hash = u32le(&root, 0x78)?;
+    if hash & STREAM_ID_MASK != stream_id {
+        return None;
+    }
+    // The string at root + 0x38 is inline or uses a system-page pointer.
+    let field = &root[0x48..0x58];
+    let mut pointed = [0; MAX_NAME_LEN + 1];
+    let bytes = if field[15] & 0x80 != 0 {
+        let len = (field[15] & 0x7F) as usize;
+        field[..15].get(..=len)?
+    } else {
+        let pointer = u64::from_le_bytes(field[..8].try_into().ok()?);
+        let relative = pointer.checked_sub(crate::resource::SYS_BASE)?.checked_add(HEADER_SIZE)?;
+        let len = u16le(field, 8)? as usize;
+        let capacity = u16le(field, 10)? as usize;
+        if !(1..=MAX_NAME_LEN).contains(&len)
+            || capacity <= len
+            || u32le(field, 12)? != 1
+            || relative.checked_add(len as u64 + 1)? > u64::from(size)
+        {
+            return None;
+        }
+        reader.seek(SeekFrom::Start(offset.checked_add(relative)?)).ok()?;
+        reader.read_exact(&mut pointed[..=len]).ok()?;
+        &pointed[..=len]
+    };
+    let name = bytes.strip_suffix(&[0])?;
+    if name.is_empty() || !name.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
+        return None;
+    }
+    let name = std::str::from_utf8(name).ok()?;
+    (crate::meta7a::joaat(name) == hash).then(|| name.to_owned())
 }
 
 /// Fill in format fields from the bank bytes (header + small chunks).
@@ -365,7 +437,19 @@ pub fn scan(path: &Path, archive: &str, pr: Progress) -> Result<AudioIndex> {
                 continue;
             }
             read_formats(&mut g, &mut bank)?;
-            for s in bank.streams.iter_mut() {
+            for (index, s) in bank.streams.iter_mut().enumerate() {
+                if let Some(chunk) = s.chunk(CH_LIP_SYNC) {
+                    // The scan window usually already contains the tag.
+                    let start = at + chunk.off as usize;
+                    let name = if let Some(tag) = buf[..avail].get(start..start + chunk.size as usize) {
+                        read_rsc8_name(&mut Cursor::new(tag), 0, chunk.size, s.id)
+                    } else {
+                        read_rsc8_name(&mut g, abs + u64::from(chunk.off), chunk.size, s.id)
+                    };
+                    if let Some(name) = name {
+                        bank.native_stream_names.insert(index, name);
+                    }
+                }
                 s.chunks = Vec::new();
             }
             skip_until = abs + bank.size;
@@ -385,7 +469,7 @@ pub fn scan(path: &Path, archive: &str, pr: Progress) -> Result<AudioIndex> {
         archive: archive.into(),
         archive_size: len,
         banks,
-        note: "Audio banks (ADAT) found by scanning for the magic; offsets are in the archive. Stream ids are 29-bit hashes (names not recovered). layout: blocks = Opus packets in 2 KiB blocks (exported as Ogg Opus or WAV); music = sub-streams (stems), each its own Opus stream, exported one file per sub-stream; music lengths are per sub-stream; pcm16 / pcmf32 = PCM (exported as WAV); xma2 = XMA2 packets (remuxed to RIFF XMA2, .xma); other = another codec id, not decoded (exported raw); none = no data chunk. codec = format chunk byte 0x1C (11 Opus, 0 PCM16, 2 PCM float32, 5 XMA2). Opus sample counts are 48 kHz units over all channels.".into(),
+        note: "Audio banks (ADAT) found by scanning for the magic; offsets are in the archive. Stream ids are 29-bit hashes. Scans retain RSC8 names whose full hash and stream id agree. layout: blocks = Opus packets in 2 KiB blocks (exported as Ogg Opus or WAV); music = sub-streams (stems), each its own Opus stream, exported one file per sub-stream; music lengths are per sub-stream; pcm16 / pcmf32 = PCM (exported as WAV); xma2 = XMA2 packets (remuxed to RIFF XMA2, .xma); other = another codec id, not decoded (exported raw); none = no data chunk. codec = format chunk byte 0x1C (11 Opus, 0 PCM16, 2 PCM float32, 5 XMA2). Opus sample counts are 48 kHz units over all channels.".into(),
     })
 }
 
@@ -846,6 +930,73 @@ mod tests {
     }
     fn stream(layout: &str, samples: u32, rate: u32, channels: u32, size: u32) -> Stream {
         Stream { id: 0x42, chunks: Vec::new(), data: (0, size), samples, rate, codec: 0, channels, layout: layout.into() }
+    }
+    fn rsc8_fixture(size: usize, hash: u32) -> Vec<u8> {
+        let mut tag = vec![0; size];
+        tag[..4].copy_from_slice(b"RSC8");
+        tag[4..8].copy_from_slice(&0x0100_1F41u32.to_le_bytes());
+        tag[8..12].copy_from_slice(&(size as u32 - 12).to_le_bytes());
+        tag[12..16].copy_from_slice(&1u32.to_le_bytes());
+        tag[0x78..0x7C].copy_from_slice(&hash.to_le_bytes());
+        tag
+    }
+
+    #[test]
+    fn rsc8_inline_name_requires_both_hashes() {
+        let name = "Fixture_Wave";
+        let hash = crate::meta7a::joaat(name);
+        let id = hash & STREAM_ID_MASK;
+        let mut tag = rsc8_fixture(0x80, hash);
+        tag[0x48..0x48 + name.len()].copy_from_slice(name.as_bytes());
+        tag[0x57] = 0x80 | name.len() as u8;
+        let read = |tag: &[u8], id| read_rsc8_name(&mut Cursor::new(tag), 0, tag.len() as u32, id);
+        assert_eq!(read(&tag, id).as_deref(), Some(name));
+        assert_eq!(read(&tag, id ^ 1), None); // Full hash matches, stream id does not.
+        tag[0x78..0x7C].copy_from_slice(&(hash ^ (1 << 29)).to_le_bytes());
+        assert_eq!(read(&tag, id), None); // Stream id matches, full hash does not.
+    }
+
+    #[test]
+    fn rsc8_pointed_name_must_fit_the_tag() {
+        let name = "fixture_pointed_wave";
+        let hash = crate::meta7a::joaat(name);
+        let mut tag = rsc8_fixture(0x80 + name.len() + 1, hash);
+        let pointer = crate::resource::SYS_BASE + 0x70;
+        tag[0x48..0x50].copy_from_slice(&pointer.to_le_bytes());
+        tag[0x50..0x52].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        tag[0x52..0x54].copy_from_slice(&(name.len() as u16 + 1).to_le_bytes());
+        tag[0x54..0x58].copy_from_slice(&1u32.to_le_bytes());
+        tag[0x80..0x80 + name.len()].copy_from_slice(name.as_bytes());
+        let read = |tag: &[u8]| read_rsc8_name(&mut Cursor::new(tag), 0, tag.len() as u32, hash & STREAM_ID_MASK);
+        assert_eq!(read(&tag).as_deref(), Some(name));
+        let last = tag.len() - 1;
+        tag[last] = b'x';
+        assert_eq!(read(&tag), None);
+        tag[last] = 0;
+        tag[0x48..0x50].copy_from_slice(&(pointer + 1).to_le_bytes());
+        assert_eq!(read(&tag), None);
+    }
+
+    #[test]
+    fn native_name_takes_precedence_for_its_stream_only() {
+        let mut bank = Bank {
+            off: 0,
+            size: 0,
+            flags: 0,
+            streams: vec![stream("blocks", 1, 1, 1, 1); 2],
+            native_stream_names: BTreeMap::new(),
+        };
+        let guesses = BTreeMap::from([(0x42, "fixture_guess".to_owned())]);
+        let old_index = serde_json::to_string(&bank).unwrap();
+        assert!(!old_index.contains("native_stream_names"));
+        let old_bank: Bank = serde_json::from_str(&old_index).unwrap();
+        assert_eq!(old_bank.stream_name(0, Some(&guesses)), Some("fixture_guess"));
+
+        bank.native_stream_names.insert(1, "fixture_native".to_owned());
+        let bank: Bank = serde_json::from_str(&serde_json::to_string(&bank).unwrap()).unwrap();
+        assert_eq!(bank.stream_name(0, Some(&guesses)), Some("fixture_guess"));
+        assert_eq!(bank.stream_name(1, Some(&guesses)), Some("fixture_native"));
+        assert_eq!(bank.stream_name(1, None), Some("fixture_native"));
     }
     #[test]
     fn index_tuple_layouts() {

@@ -227,7 +227,11 @@ impl AudioView {
                     || self.bank_names.get(&b.off).is_some_and(|n| n.contains(&q))
                     || b.streams
                         .iter()
-                        .any(|s| format!("{:08x}", s.id).contains(&q) || names.and_then(|m| m.get(&s.id)).is_some_and(|n| n.contains(&q)));
+                        .enumerate()
+                        .any(|(i, s)| {
+                            format!("{:08x}", s.id).contains(&q)
+                                || b.stream_name(i, names).is_some_and(|n| n.to_ascii_lowercase().contains(&q))
+                        });
                 playable && hit
             })
             .map(|(i, _)| i)
@@ -531,9 +535,11 @@ impl AudioView {
                     }
                 });
                 let min = self.min_seconds as f64;
-                let streams: Vec<Stream> = b.streams.iter().filter(|s| s.layout != "none" && s.seconds() >= min).cloned().collect();
+                let streams: Vec<_> = b.streams.iter().enumerate()
+                    .filter(|(_, s)| s.layout != "none" && s.seconds() >= min)
+                    .collect();
                 egui::ScrollArea::vertical().id_salt("audio_streams").auto_shrink([false, false]).show(ui, |ui| {
-                    let names = self.stream_names.get(&b.off).cloned().unwrap_or_default();
+                    let names = self.stream_names.get(&b.off).cloned();
                     egui::Grid::new("audio_stream_grid").striped(true).num_columns(7).show(ui, |ui| {
                         ui.strong("Stream id");
                         ui.strong("Name");
@@ -543,10 +549,10 @@ impl AudioView {
                         ui.strong("");
                         ui.strong("Export");
                         ui.end_row();
-                        for s in &streams {
+                        for &(i, s) in &streams {
                             let key = (b.off, s.id);
                             ui.monospace(format!("{:08x}", s.id));
-                            ui.label(names.get(&s.id).map(|n| n.as_str()).unwrap_or(""));
+                            ui.label(b.stream_name(i, names.as_ref()).unwrap_or(""));
                             ui.label(fmt_secs(s.seconds()));
                             ui.label(format!("{} Hz", s.rate)).on_hover_text("Rate field of the stream. Opus always decodes at 48 kHz; this is likely the source rate.");
                             match s.layout.as_str() {
