@@ -32,6 +32,11 @@ pub const RMA_ORDERS: [&str; 4] = [
 pub const FINISHES: [&str; 5] = ["metallic", "matte", "chrome", "gloss", "as stored"];
 /// `standard_vehicle_2lyr_wheel_inst`: the rim material of the shared wheels.
 const RIM_SHADER: &str = "_c5cdbdd2";
+
+/// Whether a material (named `..._<shader hash>`) has a tyre shader.
+fn tyre_material(name: &str) -> bool {
+    name.len() >= 8 && name.get(name.len() - 8..).is_some_and(sixng_core::material::is_tyre_shader)
+}
 /// Default rim colour: a plain alloy (the true per-vehicle colour is not decoded).
 const RIM_ALLOY: [f32; 3] = [0.6, 0.6, 0.62];
 pub const SLOTS: [&str; 4] = ["base colour", "normal", "packed RMA", "emissive"];
@@ -2865,7 +2870,7 @@ impl ModelView {
             // vehicle they are fitted to (vertex colour alpha), coloured
             // from the vehicle's part colours like its own parts.
             for l in self.wheel_src.iter_mut() {
-                let wheel: Vec<bool> = l.model.materials.iter().map(|m| m.name.ends_with(RIM_SHADER) || m.name.ends_with("_99ad6fc9")).collect();
+                let wheel: Vec<bool> = l.model.materials.iter().map(|m| m.name.ends_with(RIM_SHADER) || tyre_material(&m.name)).collect();
                 for (k, m) in l.model.materials.iter_mut().enumerate() {
                     if wheel[k] {
                         m.parts = self.wheel_look.is_some();
@@ -2899,7 +2904,7 @@ impl ModelView {
                     // rims take the rim colour (the game sets it per
                     // vehicle; it is not in the files)
                     for (k, m) in l.model.materials.iter().enumerate() {
-                        if m.name.ends_with(RIM_SHADER) || (m.parts && m.name.ends_with("_99ad6fc9")) {
+                        if m.name.ends_with(RIM_SHADER) || (m.parts && tyre_material(&m.name)) {
                             // with part colours the vertices carry the colour
                             let b = if m.parts { [1.0, 1.0, 1.0, 1.0] } else { [c[0], c[1], c[2], 1.0] };
                             ren.set_material_base(rs, &mut g, k, b);
@@ -7422,6 +7427,9 @@ fn export_load_shaped(
                 || j.contains("\"weapon_parts\"") && !j.contains("\"sub_material_surface\"")
         });
     // Cached ped clothing from before the fabric shade came from the packed map.
+    // Cached tyres whose shader is the `_lod` tyre variant, from before its
+    // placeholder palette (entry 0 pure red) was left unapplied.
+    let stale_tyre = std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| j.contains("b994d670") && j.contains("GLB COLOR_0 = palette entry"));
     let stale_cloth = std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| j.contains("739e3d0d") && !j.contains("shade_source"));
     // Cached animal parts from before part skins (eyes, tint-mask coats).
     let stale_animal = e.name.as_deref().is_some_and(|n| sixng_core::partskin::animal_root(n).is_some())
@@ -7431,7 +7439,7 @@ fn export_load_shaped(
         png: true,
         dds: false,
         raw: false,
-        force: head || shaped || !skins.is_empty() || stale_tint || stale_vehicle || stale_animal || stale_cloth,
+        force: head || shaped || !skins.is_empty() || stale_tint || stale_vehicle || stale_animal || stale_cloth || stale_tyre,
         skip_embedded_textures: false,
         body_shape,
         head_skin: HEAD_SKIN.load(std::sync::atomic::Ordering::Relaxed),

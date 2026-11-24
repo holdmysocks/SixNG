@@ -267,6 +267,14 @@ pub fn parse_paint(s: &str) -> Option<[f32; 3]> {
     Some([lin((v >> 16) & 0xff), lin((v >> 8) & 0xff), lin(v & 0xff)])
 }
 
+/// A tyre shader of the shared `tyre_*` models:
+/// `standard_vehicle_2lyr_tyre_inst` (99ad6fc9), its `_lod` variant
+/// (b994d670, the only material of `tyre_truck_001`), or any other
+/// `standard_vehicle...tyre...` shader by its recovered name.
+pub fn is_tyre_shader(name_hash: &str) -> bool {
+    matches!(name_hash, "99ad6fc9" | "b994d670") || crate::names::shader(name_hash).is_some_and(|n| n.starts_with("standard_vehicle") && n.contains("tyre"))
+}
+
 pub fn is_paint(name_hash: &str) -> bool {
     FAMILIES.iter().any(|f| f.0 == name_hash && f.1 == "car_paint")
 }
@@ -975,6 +983,7 @@ mod paint_tests {
         assert!(!is_paint("03b27476") && is_paint("4aa38282"));
         let tyre = classify("99ad6fc9", &opaque);
         assert_eq!(tyre["stand_in"], "rubber");
+        assert!(is_tyre_shader("99ad6fc9") && is_tyre_shader("b994d670") && !is_tyre_shader("c5cdbdd2"));
         let g = gltf_fields(&tyre, false);
         assert_eq!(g["pbrMetallicRoughness"]["baseColorFactor"][0], 0.02);
         assert!(gltf_fields(&tyre, true)["pbrMetallicRoughness"]["baseColorFactor"].is_null());
