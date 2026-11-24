@@ -140,6 +140,8 @@ pub struct ModelPicker {
     /// Index into `filtered` of the current model.
     pub cursor: Option<usize>,
     scroll_to_cursor: bool,
+    /// Where the list was scrolled to and how tall it was, last frame.
+    list_view: (f32, f32),
     counts: HashMap<Cat, usize>,
     by_id: HashMap<String, u32>,
     recents: Vec<String>,
@@ -173,6 +175,7 @@ impl ModelPicker {
             dirty: true,
             cursor: None,
             scroll_to_cursor: false,
+            list_view: (0.0, 0.0),
             counts: HashMap::new(),
             by_id: HashMap::new(),
             recents: saved.recents,
@@ -727,9 +730,21 @@ impl ModelPicker {
         self.scroll_to_cursor = false;
         let mut sa = egui::ScrollArea::vertical().auto_shrink([false, false]);
         if let Some(c) = scroll_to {
-            sa = sa.vertical_scroll_offset((c as f32 * row_h - 120.0).max(0.0));
+            // Scroll only as far as it takes to keep the row on screen: a
+            // row already in view leaves the list where it is, one above
+            // or below comes in at that edge (with a row to spare).
+            let pitch = row_h + ui.spacing().item_spacing.y;
+            let (off, view) = self.list_view;
+            let (top, bottom) = (c as f32 * pitch, c as f32 * pitch + row_h);
+            if view <= 0.0 {
+                sa = sa.vertical_scroll_offset((top - 120.0).max(0.0));
+            } else if top - pitch < off {
+                sa = sa.vertical_scroll_offset((top - pitch).max(0.0));
+            } else if bottom + pitch > off + view {
+                sa = sa.vertical_scroll_offset((bottom + pitch - view).max(0.0));
+            }
         }
-        sa.show_rows(ui, row_h, self.filtered.len(), |ui, range| {
+        let out = sa.id_salt("picker_list").show_rows(ui, row_h, self.filtered.len(), |ui, range| {
             for r in range {
                 let it = &items[self.filtered[r] as usize];
                 ui.horizontal(|ui| {
@@ -757,10 +772,17 @@ impl ModelPicker {
                     if resp.clicked() {
                         self.cursor = Some(r);
                         open = Some(it.id.clone());
+                        // A clicked row keeps the keyboard focus, and egui
+                        // moves focus with the arrow keys and scrolls to
+                        // the focused widget: the list then jumped about
+                        // while Up / Down also stepped the cursor. The
+                        // arrow keys belong to the cursor alone.
+                        resp.surrender_focus();
                     }
                 });
             }
         });
+        self.list_view = (out.state.offset.y, out.inner_rect.height());
         if let Some(id) = toggle_fav {
             if let Some(p) = self.favourites.iter().position(|f| *f == id) {
                 self.favourites.remove(p);
