@@ -40,6 +40,8 @@ const IDENTITY: Mat = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.
 /// The slot of the part that is always fitted; its elements are the stock
 /// alternatives the switches choose from.
 const SLOT_CHASSIS: &str = "d418625e";
+/// The shaders of the shared rim and tyre models.
+const WHEEL_SHADERS: [&str; 2] = ["c5cdbdd2", "99ad6fc9"];
 /// The slot of a body behind the cab.
 const SLOT_BODY: &str = "1c9dd6fe";
 
@@ -234,7 +236,9 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
         let info = crate::drawable::describe(&r);
         let mut b = crate::export::build_drawable(a, e, &r, &info, &dir, false, &o, &mut item);
         let prims: Vec<TriPrim> = b.lod_groups.drain(..).next().unwrap_or_default().into_iter().flat_map(|g| g.prims).collect();
-        let parts_materials = b.materials.iter().map(|m| m.extras["classification"]["stand_in"] == "parts").collect();
+        // rims and tyres (`c5cdbdd2`, `99ad6fc9`) carry part ids of the
+        // vehicle they are on, like its own parts
+        let parts_materials = b.materials.iter().map(|m| m.extras["classification"]["stand_in"] == "parts" || WHEEL_SHADERS.iter().any(|h| m.name.ends_with(h))).collect();
         let pivots = info.skeleton.iter().filter(|b| crate::export::is_wheel_mount(&b.name)).filter_map(|b| Some((b.name.clone(), b.pivot?))).collect();
         let discs = if info.skeleton.iter().any(|b| b.name.starts_with("wheel_")) { crate::bounds::wheel_discs(&r) } else { Vec::new() };
         Ok((Piece { name: e.name.clone().unwrap_or_else(|| e.id.clone()), prims, joints: std::mem::take(&mut b.joints), part_looks: b.part_looks.take(), parts_materials, discs, pivots, warnings: item.warnings, id: e.id.clone() }, b.materials))
@@ -347,7 +351,13 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
         let mut built: Vec<(Piece, std::result::Result<Vec<crate::gltf::Material>, usize>, f32)> = Vec::new();
         for e in &models {
             match build(e) {
-                Ok((p, mats)) => {
+                Ok((p, mut mats)) => {
+                    // the vertices bring the colour: no stand-in colour on top
+                    if look.is_some() {
+                        for m in mats.iter_mut().filter(|m| WHEEL_SHADERS.iter().any(|h| m.name.ends_with(h))) {
+                            m.gltf["pbrMetallicRoughness"]["baseColorFactor"] = json!([1.0, 1.0, 1.0, 1.0]);
+                        }
+                    }
                     // the radius of the model about its axle (x)
                     let rad = p.prims.iter().flat_map(|p| p.positions.iter()).map(|v| v[1].abs().max(v[2].abs())).fold(0.0f32, f32::max);
                     built.push((p, Ok(mats), rad));
