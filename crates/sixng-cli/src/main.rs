@@ -700,6 +700,23 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
+    /// What each compiled shader program and each effect (a material's
+    /// shader) of shaders.rpf declares: resources (textures, samplers,
+    /// constant buffers and others) with their register index, and the
+    /// members of the constant buffers with their byte offsets, by name
+    /// hash (names where the dictionary has them). Prints a summary and the
+    /// material texture parameters that have no name; with an effect regex,
+    /// the textures (slot in the material's texture list, parameter and
+    /// shader-variable name), constants and programs of each matching
+    /// effect. Reads the game's own reflection tables; no shader code is
+    /// decoded.
+    ShaderBindings {
+        /// Regex on effect names (a material's shader name, e.g. `^standard$`).
+        effect: Option<String>,
+        /// Also list every program of the matching effects with its resources and constant buffers.
+        #[arg(long)]
+        programs: bool,
+    },
     /// Name dictionary for shader, parameter and meta field hashes (joaat of
     /// the lower-case name). Without --lookup: build `<work>/names/names.json`
     /// from the install (common.rpf text/XML and shaders.rpf strings).
@@ -1009,6 +1026,81 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 all.push(do_export_collect(&a, &sel, oa, pr.clone())?);
             }
             out.print(&json!({"ok": true, "category": category, "results": all}));
+        }
+        Cmd::ShaderBindings { effect, programs } => {
+            use sixng_core::names::{lookup, Ctx};
+            use sixng_core::shaderfx::{self, Table, Var};
+            let t = Instant::now();
+            let bytes = std::fs::read(ws.game.join("shaders.rpf"))?;
+            let sh = shaderfx::read(&bytes)?;
+            drop(bytes);
+            let named = |h: u32| json!({"hash": format!("{h:08x}"), "name": lookup(h, Ctx::Param)});
+            let member = |m: &Var| json!({"hash": format!("{:08x}", m.name), "name": lookup(m.name, Ctx::Param), "parameter": (m.alias != m.name && m.alias != 0).then(|| named(m.alias)), "type": m.member_type(), "offset": m.a});
+            let resource = |t: &Table, i: usize, r: &Var| {
+                let mut v = json!({"hash": format!("{:08x}", r.name), "name": t.sampler_name(i).map(str::to_string).or_else(|| lookup(r.name, Ctx::Param)), "kind": r.resource_kind(), "dimension": r.dim, "index": r.index, "flags": format!("{:02x}", r.flags())});
+                if r.is_cbuffer() {
+                    v["size"] = json!(r.c & 0xffff);
+                    v["members"] = t.members_of(i).iter().map(member).collect();
+                }
+                v
+            };
+            // material texture parameters over all effects: parameter hash -> (variable hash, array) -> effects
+            use std::collections::BTreeMap;
+            let mut tex: BTreeMap<u32, BTreeMap<(u32, bool), Vec<&str>>> = BTreeMap::new();
+            for e in &sh.effects {
+                for r in e.table.iter().flat_map(|t| &t.resources) {
+                    if let Some((_, array)) = r.material_texture() {
+                        tex.entry(r.alias).or_default().entry((r.name, array)).or_default().push(&e.name);
+                    }
+                }
+            }
+            let unnamed: Vec<_> = tex
+                .iter()
+                .filter(|(h, _)| lookup(**h, Ctx::Param).is_none())
+                .map(|(h, v)| json!({"parameter": format!("{h:08x}"), "effects": v.values().map(Vec::len).sum::<usize>(), "example_effects": v.values().flatten().take(3).collect::<Vec<_>>(),
+                    "variables": v.iter().map(|((n, array), es)| json!({"hash": format!("{n:08x}"), "name": lookup(*n, Ctx::Param), "array": array, "effects": es.len()})).collect::<Vec<_>>()}))
+                .collect();
+            let re = effect.as_deref().map(regex::Regex::new).transpose()?;
+            let stages = ["vertex_or_mesh", "pixel", "geometry", "section_3", "section_4", "compute"];
+            let effects: Vec<_> = sh
+                .effects
+                .iter()
+                .filter(|e| re.as_ref().is_some_and(|r| r.is_match(&e.name)))
+                .map(|e| {
+                    let progs = |full: bool| -> serde_json::Value {
+                        stages
+                            .iter()
+                            .enumerate()
+                            .filter(|(k, _)| !e.programs[*k].is_empty())
+                            .map(|(k, st)| {
+                                let list: Vec<_> = e.programs[k]
+                                    .iter()
+                                    .filter_map(|&n| sh.programs.get(sh.sections[k].0 + n as usize))
+                                    .map(|p| if full { json!({"name": p.name, "id": format!("{:016x}", p.id), "resources": p.table.resources.iter().enumerate().map(|(i, r)| resource(&p.table, i, r)).collect::<Vec<_>>()}) } else { json!(p.name) })
+                                    .collect();
+                                (st.to_string(), json!(list))
+                            })
+                            .collect::<serde_json::Map<_, _>>()
+                            .into()
+                    };
+                    let mut v = json!({"effect": e.name, "programs": progs(*programs)});
+                    if let Some(t) = &e.table {
+                        let mut textures: Vec<_> = t.resources.iter().filter_map(|r| Some((r.material_texture()?, r))).collect();
+                        textures.sort_by_key(|x| x.0 .0);
+                        v["textures"] = textures.iter().map(|((slot, array), r)| json!({"slot": slot, "array": array, "dimension": r.dim, "parameter": named(r.alias), "variable": named(r.name)})).collect();
+                        v["constants"] = t.resources.iter().enumerate().filter(|(_, r)| r.is_cbuffer() && r.flags() & 0x80 != 0).map(|(i, r)| json!({"buffer": named(r.name), "size": r.c & 0xffff, "members": t.members_of(i).iter().map(member).collect::<Vec<_>>()})).collect();
+                        v["samplers"] = (0..t.resources.len()).filter_map(|i| t.sampler_name(i)).collect();
+                        v["other_resources"] = t.resources.iter().enumerate().filter(|(_, r)| r.material_texture().is_none() && r.kind != 0x23 && !(r.is_cbuffer() && r.flags() & 0x80 != 0)).map(|(i, r)| resource(t, i, r)).collect();
+                    }
+                    v
+                })
+                .collect();
+            out.print(&json!({"ok": true,
+                "programs": {"total": sh.programs.len(), "vertex_or_mesh": sh.sections[0].1, "pixel": sh.sections[1].1, "geometry": sh.sections[2].1, "compute": sh.sections[5].1,
+                    "resources": sh.programs.iter().map(|p| p.table.resources.len()).sum::<usize>(), "constant_buffer_members": sh.programs.iter().map(|p| p.table.members.len()).sum::<usize>()},
+                "effects": {"stated": sh.effects_stated, "read": sh.effects.len(), "with_table": sh.effects.iter().filter(|e| e.table.is_some()).count()},
+                "material_texture_parameters": {"total": tex.len(), "unnamed": unnamed.len(), "unnamed_list": unnamed},
+                "matched_effects": effects, "seconds": t.elapsed().as_secs_f64()}));
         }
         Cmd::Names { lookup } => {
             if lookup.is_empty() {
