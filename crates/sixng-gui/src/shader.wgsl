@@ -322,6 +322,18 @@ fn hair_game(colour: vec3<f32>, t: vec3<f32>, n: vec3<f32>, root: vec3<f32>, v: 
     return max(w * (coloured * colour / max(colour, vec3(0.000001)) + vec3(f * m0.r * nr2 * area)), vec3(0.0));
 }
 
+// The ambient part of the game's hair lighting (read once from the same
+// program, medium confidence): ambient light x base colour x this factor.
+// `o` (0..1) comes from the strand's profile value and a depth the program
+// reads; 1 is the outer hair. The environment reflection it also subtracts
+// and adds is left out (small).
+fn hair_ambient(t: vec3<f32>, v: vec3<f32>, g0: f32, o: f32) -> f32 {
+    let sin_o = clamp(dot(v, t), -1.0, 1.0);
+    let cos_o = sqrt(max(1.0 - sin_o * sin_o, 0.0));
+    let f = textureSampleLevel(t_hair_a, samp_clamp, vec2(clamp(sin_o * sin_o, 0.0, 1.0), 0.5), 0.0).r;
+    return (0.31831 + 0.68169 * exp(-7.21348 * g0 * (1.0 - 0.5 * ((1.0 - f) + cos_o)))) * (0.195 + 0.91 * o);
+}
+
 @fragment
 fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let has = M.flags.x;
@@ -571,9 +583,10 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
             // large-scale light and dark side from the head: the root normal
             let root = normalize(i.nrm);
             let direct_h = hair_game(albedo, tdir, tube, root, v, l, 0.33, 0.6067) * sun;
-            // ambient is the viewer's own: the same sum lit from the root normal's side by the sky
-            let sky_h = (neutral(F.sky_top.rgb, 0.8) + neutral(F.sky_hor.rgb, 0.8) * 0.6) * 0.5 * F.misc.w;
-            let amb_g = hair_game(albedo, tdir, tube, root, v, normalize(root + vec3(0.0, 0.6, 0.0)), 0.33, 0.6067) * sky_h * 3.14159;
+            // ambient: the viewer's sky light at the root normal, with the game's factor
+            let up_h = root.y * 0.5 + 0.5;
+            let sky_h = mix(neutral(F.sky_hor.rgb, 0.8) * 0.6, neutral(F.sky_top.rgb, 0.8), up_h) * F.misc.w;
+            let amb_g = sky_h * albedo * hair_ambient(tdir, v, 0.33, 1.0) + sky_h * 0.012;
             col = direct_h * ao_direct + amb_g * ao;
         }
     }
