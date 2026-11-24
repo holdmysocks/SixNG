@@ -269,6 +269,18 @@ enum Cmd {
         /// Write crossed ribbon meshes of this half-width (mm) instead of lines (render in any viewer).
         #[arg(long)]
         ribbons: Option<f32>,
+        /// Write the full strand set instead of the guide strands alone:
+        /// the strands the groom stores per root triangle, grown between
+        /// its three guides (the game's own clumping, curl and noise are
+        /// not decoded). Also writes <offset>.growth.json with the root
+        /// triangles, their strand counts, the strand width and its taper,
+        /// to rebuild the hair elsewhere. Grooms that store no counts
+        /// keep their guides.
+        #[arg(long)]
+        full: bool,
+        /// With --full: share of the stored strands to write, 0 to 1.
+        #[arg(long, default_value_t = 1.0)]
+        density: f32,
         /// Only these groom offsets (hex, comma-separated).
         #[arg(long, value_delimiter = ',')]
         only: Vec<String>,
@@ -1478,7 +1490,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             out.print(&json!({"ok": true, "archive": a.id, "scanned": sel.len(), "tiles": n, "tiles_with_roads": roads,
                 "seconds": t.elapsed().as_secs_f64(), "index": po.join("navmesh").join(a.id.trim_end_matches(".rpf")).join("index.jsonl")}));
         }
-        Cmd::Grooms { archive, roots, ribbons, only, list, out: po } => {
+        Cmd::Grooms { archive, roots, ribbons, full, density, only, list, out: po } => {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
             let t = Instant::now();
@@ -1494,7 +1506,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 out.print(&json!({"ok": true, "grooms": cat.len(), "chains": cat.iter().filter(|g| g.lod == 0).count(), "chains_by_region": by, "file": dir.join("catalog.json"), "seconds": t.elapsed().as_secs_f64()}));
             } else {
                 let only: Vec<u64> = only.iter().filter_map(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()).collect();
-                let (n, errors) = sixng_core::groom::export_grooms(&a, &ix.entries, &only, po, *roots, ribbons.map(|mm| mm / 1000.0), pr)?;
+                let (n, errors) = sixng_core::groom::export_grooms(&a, &ix.entries, &only, po, *roots, ribbons.map(|mm| mm / 1000.0), full.then_some(density.clamp(0.0, 1.0)), pr)?;
                 out.print(&json!({"ok": true, "archive": a.id, "grooms": n, "errors": errors,
                     "seconds": t.elapsed().as_secs_f64(), "index": po.join("grooms").join(a.id.trim_end_matches(".rpf")).join("index.jsonl")}));
             }
