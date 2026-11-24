@@ -222,7 +222,8 @@ pub struct Config {
     pub colour: Option<[f32; 3]>,
     pub rim: Option<String>,
     pub tyre: Option<String>,
-    /// `brakedisc_*` and `caliper_*` part models of the configuration.
+    /// `brakedisc_*` (or `drumbrake_*`) and `caliper_*` part models the
+    /// configuration names by model: the front axle's.
     pub brake_disc: Option<String>,
     pub caliper: Option<String>,
     /// Rim radius / tyre radius of the configuration's wheel fitment record.
@@ -430,7 +431,7 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
                 colour: c.colour.and_then(|c| hex(&c.srgb_if_linear)).filter(|c| !is_placeholder(*c)),
                 rim: c.rim,
                 tyre: c.tyre,
-                brake_disc: c.parts.iter().find(|p| p.starts_with("brakedisc_")).cloned(),
+                brake_disc: c.parts.iter().find(|p| p.starts_with("brakedisc_")).or_else(|| c.parts.iter().find(|p| p.starts_with("drumbrake_"))).cloned(),
                 caliper: c.parts.iter().find(|p| p.starts_with("caliper_")).cloned(),
             })
             .collect();
