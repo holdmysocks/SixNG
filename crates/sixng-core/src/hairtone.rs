@@ -211,6 +211,73 @@ pub fn ramp(a: [u8; 3], b: [u8; 3], t: f32) -> [f32; 3] {
     })
 }
 
+/// A parameter ramp of the game's hair ramp files (binary XML in the packs
+/// archive; found and parsed by the shader archive work): four numbers and
+/// four curves along the strand. The game bakes one row of its parameter
+/// atlas from it, and the strand shader reads that row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParamRamp {
+    /// First number: about 0.0001 to 0.0003, read as the strand width in metres.
+    pub width: f32,
+    /// Numbers 2, 3, 4: the multipliers of curves B, C and D.
+    pub mul: [f32; 3],
+    /// Curves A, B, C, D: ten (x, y) pairs each.
+    pub curves: [[f32; 20]; 4],
+}
+
+/// A ramp curve at `x` (0 root, 1 tip): its ten points are three cubic
+/// Bezier segments sharing end points, evaluated as y at x. Unused trailing
+/// segments are stored as (1, 1) points.
+pub fn curve(c: &[f32; 20], x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    let p = |i: usize| (c[2 * i], c[2 * i + 1]);
+    let bez = |a: f32, b: f32, d: f32, e: f32, t: f32| {
+        let u = 1.0 - t;
+        u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * d + t * t * t * e
+    };
+    for s in 0..3 {
+        let (p0, p1, p2, p3) = (p(3 * s), p(3 * s + 1), p(3 * s + 2), p(3 * s + 3));
+        if x > p3.0 && s < 2 && p(3 * s + 6).0 > p3.0 {
+            continue;
+        }
+        // x(t) by bisection (the x control points do not always rise)
+        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        for _ in 0..24 {
+            let m = 0.5 * (lo + hi);
+            if bez(p0.0, p1.0, p2.0, p3.0, m) < x {
+                lo = m;
+            } else {
+                hi = m;
+            }
+        }
+        return bez(p0.1, p1.1, p2.1, p3.1, 0.5 * (lo + hi));
+    }
+    c[19]
+}
+
+impl ParamRamp {
+    /// What the strand shader gets at `t` along the strand: the roughness
+    /// value g0 (number 2 x curve B), the fill of the unlit side (number 3 x
+    /// curve C), the profile scale (number 4 x curve D) and the coverage
+    /// (curve A).
+    pub fn at(&self, t: f32) -> [f32; 4] {
+        [self.mul[0] * curve(&self.curves[1], t), self.mul[1] * curve(&self.curves[2], t), self.mul[2] * curve(&self.curves[3], t), curve(&self.curves[0], t)]
+    }
+
+    /// One record of a parsed ramp file as JSON: `fields` 05..08 and `curves`.
+    pub fn from_json(v: &Value) -> Option<ParamRamp> {
+        let f = |k: &str| v["fields"][k].as_f64().map(|x| x as f32);
+        let cs = v["curves"].as_array()?;
+        let mut curves = [[1.0f32; 20]; 4];
+        for (i, c) in cs.iter().take(4).enumerate() {
+            for (j, x) in c.as_array()?.iter().take(20).enumerate() {
+                curves[i][j] = x.as_f64()? as f32;
+            }
+        }
+        Some(ParamRamp { width: f("05")?, mul: [f("06")?, f("07")?, f("08")?], curves })
+    }
+}
+
 /// A value in 0..1 for strand `i`, for presets that name no noise texture.
 pub fn scatter(i: usize) -> f32 {
     let mut x = (i as u32).wrapping_mul(0x9e37_79b9) ^ 0x85eb_ca6b;
@@ -253,6 +320,30 @@ mod tests {
         assert!((p.values[TILING] - 8.283).abs() < 1e-4 && p.values.len() == 3);
         let q = t.get(7).unwrap();
         assert_eq!((q.a, q.texture, q.flag), ([255; 3], 0, true));
+    }
+
+    #[test]
+    fn a_parameter_ramp_is_read_along_the_strand() {
+        // the feral cat's high-gloss ramp, from the game's ramp file
+        let v = serde_json::json!({"fields": {"05": 0.00024, "06": 0.85, "07": 1, "08": 1}, "curves": [
+            [0.0, 0.494, 0.022, 0.556, 0.108, 0.997, 0.2, 0.997, 0.4, 0.997, 0.49, 1.0, 0.69, 1.0, 0.89, 1.0, 0.959, 0.29, 1.0, 0.0],
+            [0.0, 1.0, 0.014, 0.61, 0.195, 0.66, 0.548, 0.595, 1.001, 0.561, 1.016, 0.262, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            [0.0, 0.0, 0.5, 0.0, 1.0, 0.037, 1.0, 0.537, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            [0.0, 1.0, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]]});
+        let r = ParamRamp::from_json(&v).unwrap();
+        assert!((r.width - 0.00024).abs() < 1e-7 && r.mul == [0.85, 1.0, 1.0]);
+        // end points of the curves
+        assert!((curve(&r.curves[0], 0.0) - 0.494).abs() < 1e-3 && curve(&r.curves[0], 1.0).abs() < 2e-3);
+        assert!((curve(&r.curves[1], 0.0) - 1.0).abs() < 1e-3);
+        // the profile curve is flat 1, the coverage is full along the middle
+        assert!((curve(&r.curves[3], 0.37) - 1.0).abs() < 1e-4 && (curve(&r.curves[0], 0.5) - 1.0).abs() < 0.01);
+        // g0 falls from the root towards about 0.5 mid-strand; the fill stays near 0 until the tip
+        let (a, m) = (r.at(0.0), r.at(0.5));
+        assert!((a[0] - 0.85).abs() < 1e-3 && m[0] > 0.45 && m[0] < 0.6, "{a:?} {m:?}");
+        assert!(m[1] < 0.05 && m[2] > 0.99);
+        // a straight line as a curve gives its own x
+        let line: [f32; 20] = [0.0, 0.0, 0.5, 0.5, 0.5, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        assert!((curve(&line, 0.3) - 0.3).abs() < 1e-3);
     }
 
     #[test]

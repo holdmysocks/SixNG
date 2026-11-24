@@ -1037,6 +1037,13 @@ impl ModelView {
         let (hat, under_hat) = (self.hair.hat.clone(), self.hair.under_hat.clone());
         let rig = self.hair.rig.clone();
         let tones = if self.hair.stored_colours { self.hair.tones.clone() } else { HashMap::new() };
+        // research: SIXNG_HAIR_RAMP=<parsed ramp file json>#<record name> gives every strand that
+        // parameter ramp, until the game's ramp files are read and matched to the hair shown
+        let ramp: Option<sixng_core::hairtone::ParamRamp> = std::env::var("SIXNG_HAIR_RAMP").ok().and_then(|s| {
+            let (file, name) = s.rsplit_once('#')?;
+            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(file).ok()?).ok()?;
+            sixng_core::hairtone::ParamRamp::from_json(&v[name])
+        });
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<Vec<glb::Model>> {
@@ -1079,6 +1086,16 @@ impl ModelView {
                         match tones.get(&off) {
                             // a character's hair: each strand's variant picks its ramp, root to tip
                             Some(t) => g.coat_glb_with(&format!("coat_{off:x}"), &coat, w, &|s, f| t.rgb(coat.variants.get(s).copied().unwrap_or(0), f), serde_json::json!({})),
+                            None if ramp.is_some() => {
+                                let r = ramp.as_ref().unwrap();
+                                let blend = |s: usize| {
+                                    let (gd, wt) = coat.guides[s];
+                                    let at = |i: u32| cols.get(i as usize).copied().unwrap_or([255; 3]);
+                                    let (a, b, d) = (at(gd[0]), at(gd[1]), at(gd[2]));
+                                    [0, 1, 2].map(|q| (a[q] as f32 * wt[0] + b[q] as f32 * wt[1] + d[q] as f32 * wt[2] + 0.5) as u8)
+                                };
+                                g.coat_glb_ramped(&format!("coat_{off:x}"), &coat, w, &|s, _| { let c = blend(s); [c[0], c[1], c[2], 255] }, Some(&|_, f| { let v = r.at(f); [v[0], v[1], v[2]] }), serde_json::json!({}))
+                            }
                             None => g.coat_glb(&format!("coat_{off:x}"), &coat, w, &cols, serde_json::json!({})),
                         }
                     } else if let Some(t) = tones.get(&off) {

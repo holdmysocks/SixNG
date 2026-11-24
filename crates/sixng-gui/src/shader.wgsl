@@ -258,7 +258,7 @@ fn hair_light(colour: vec3<f32>, t: vec3<f32>, v: vec3<f32>, l: vec3<f32>, rough
 // of light colour. `t` strand direction, `n` the tube normal (perpendicular
 // to the strand), `v` to the eye, `l` to the light, `g0` and `y` the two
 // per-material values the game bakes (not decoded: fixed here).
-fn hair_game(colour: vec3<f32>, t: vec3<f32>, n: vec3<f32>, root: vec3<f32>, v: vec3<f32>, l: vec3<f32>, g0: f32, y: f32) -> vec3<f32> {
+fn hair_game(colour: vec3<f32>, t: vec3<f32>, n: vec3<f32>, root: vec3<f32>, v: vec3<f32>, l: vec3<f32>, g0: f32, y: f32, e: f32) -> vec3<f32> {
     let c = normalize(cross(n, t));
     // (the view vector here points to the eye; the tables put the surface
     // reflection where light and eye are on the same side of the strand)
@@ -317,9 +317,8 @@ fn hair_game(colour: vec3<f32>, t: vec3<f32>, n: vec3<f32>, root: vec3<f32>, v: 
     // times the azimuth term, which reaches 2 for light from the eye's side;
     // the program also fades this towards 1 by a depth value (not decoded)
     // the fill e of the unlit side is the parameter ramp's blue value times
-    // a distance fade of the light (run-time data); 0.5 is a stand-in. The
-    // last factor is read as 1 - 0.5 e (low confidence)
-    let e = 0.5;
+    // a distance fade of the light (run-time data, taken as 1). The last
+    // factor is read as 1 - 0.5 e (low confidence)
     let w = (clamp(dot(root, l), 0.0, 1.0) * clamp(1.0 + cos_phi, 0.0, 2.0) * (1.0 - e) + e) * (1.0 - 0.5 * e);
     return max(w * (coloured * colour / max(colour, vec3(0.000001)) + vec3(f * m0.r * nr2 * area)), vec3(0.0));
 }
@@ -584,11 +583,18 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
             let tube = normalize(cross(cross(tdir, v), tdir));
             // large-scale light and dark side from the head: the root normal
             let root = normalize(i.nrm);
-            let direct_h = hair_game(albedo, tdir, tube, root, v, l, 0.33, 0.6067) * sun;
+            // the parameter ramp's values at this point of the strand, when the
+            // ribbon carries them (uv1.y = 1); else fixed stand-ins
+            let ramped = i.uv1.y > 0.5;
+            let g0h = select(0.33, clamp(i.uv0.x, 0.0, 1.0), ramped);
+            let eh = select(0.5, clamp(i.uv0.y, 0.0, 1.0), ramped);
+            // profile4 = 15 x (ramp profile x the strand's own profile, taken as 1); y = 0.5 + 0.0266667 profile4
+            let yh = select(0.6067, 0.5 + 0.4 * clamp(i.uv1.x, 0.0, 1.0), ramped);
+            let direct_h = hair_game(albedo, tdir, tube, root, v, l, g0h, yh, eh) * sun;
             // ambient: the viewer's sky light at the root normal, with the game's factor
             let up_h = root.y * 0.5 + 0.5;
             let sky_h = mix(neutral(F.sky_hor.rgb, 0.8) * 0.6, neutral(F.sky_top.rgb, 0.8), up_h) * F.misc.w;
-            let amb_g = sky_h * albedo * hair_ambient(tdir, v, 0.33, 1.0) + sky_h * 0.012;
+            let amb_g = sky_h * albedo * hair_ambient(tdir, v, g0h, 1.0) + sky_h * 0.012;
             col = direct_h * ao_direct + amb_g * ao;
         }
     }

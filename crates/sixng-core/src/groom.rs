@@ -524,8 +524,17 @@ impl Groom {
     /// (0 root, 1 tip) given by `colour`: for hair whose colour changes
     /// from root to tip.
     pub fn coat_glb_with(&self, name: &str, coat: &Coat, width: f32, colour: &dyn Fn(usize, f32) -> [u8; 4], extras: serde_json::Value) -> Vec<u8> {
+        self.coat_glb_ramped(name, coat, width, colour, None, extras)
+    }
+
+    /// `coat_glb_with`, and with `params` each vertex carries what the
+    /// game's strand shader reads from its parameter ramp at that point of
+    /// the strand: TEXCOORD_0 = (g0, fill of the unlit side), TEXCOORD_1 =
+    /// (profile scale, 1). Without it both are left out.
+    pub fn coat_glb_ramped(&self, name: &str, coat: &Coat, width: f32, colour: &dyn Fn(usize, f32) -> [u8; 4], params: Option<&dyn Fn(usize, f32) -> [f32; 3]>, extras: serde_json::Value) -> Vec<u8> {
         let k = coat.k;
         let n = coat.guides.len();
+        let (mut uv0, mut uv1): (Vec<[f32; 2]>, Vec<[f32; 2]>) = (Vec::new(), Vec::new());
         let mut tan: Vec<[f32; 4]> = Vec::with_capacity(coat.guides.len() * coat.k * 2);
         let (mut pos, mut nrm, mut tint, mut idx) = (Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k.saturating_sub(1) * 6));
         let flat_taper = self.taper.iter().all(|&b| b == 0);
@@ -546,11 +555,16 @@ impl Groom {
                 let f = j as f32 / (k.max(2) - 1) as f32;
                 let tap = if flat_taper { 1.0 - 0.6 * f } else { (self.taper[((f * 15.0) as usize).min(15)] as f32 / 255.0).max(0.15) };
                 let c = colour(s, f);
+                let pv = params.map(|p| p(s, f));
                 let r = width * 0.5 * tap;
                 for sg in [-1.0f32, 1.0] {
                     pos.push([p[0] + side[0] * r * sg, p[1] + side[1] * r * sg, p[2] + side[2] * r * sg]);
                     nrm.push(nr);
                     tan.push(dir);
+                    if let Some(pv) = pv {
+                        uv0.push([pv[0], pv[1]]);
+                        uv1.push([pv[2], 1.0]);
+                    }
                     tint.push(c);
                 }
             }
@@ -559,7 +573,7 @@ impl Groom {
                 idx.extend_from_slice(&[v0, v0 + 1, v0 + 3, v0, v0 + 3, v0 + 2]);
             }
         }
-        let prim = crate::gltf::TriPrim { name: name.to_string(), positions: pos, normals: Some(nrm), tangents: Some(tan), uvs: vec![], colors: None, colors1: None, tint: Some(tint), indices: idx, material: Some(0), joints: None, weights: None, joints1: None, weights1: None };
+        let prim = crate::gltf::TriPrim { name: name.to_string(), positions: pos, normals: Some(nrm), tangents: Some(tan), uvs: if uv0.is_empty() { vec![] } else { vec![uv0, uv1] }, colors: None, colors1: None, tint: Some(tint), indices: idx, material: Some(0), joints: None, weights: None, joints1: None, weights1: None };
         let mat = crate::gltf::Material {
             name: "fur".into(),
             base_color_uri: None,
