@@ -481,6 +481,25 @@ pub fn decode_rgba_slice(t: &TtpfTex, data: &[u8], m: u32, sl: u32) -> Result<(V
     Ok((tx::to_rgba(fmt, &lin, mw, mh)?, mw, mh))
 }
 
+/// The unclamped values of slice `sl` of mip `m` of a float-format ttpf
+/// texture: (values, channels, width, height), channels interleaved.
+pub fn decode_float_slice(t: &TtpfTex, data: &[u8], m: u32, sl: u32) -> Result<(Vec<f32>, u32, u32, u32)> {
+    use crate::texture as tx;
+    let ti = t.tex_info("");
+    let fmt = tx::Fmt::from_dxgi(t.dxgi_format);
+    let (mw, mh) = ((t.width >> m).max(1), (t.height >> m).max(1));
+    let l = t.layout().ok_or_else(|| anyhow!("tile mode {} / {} not supported", t.tile_mode(), ti.format))?;
+    if m as usize >= l.mips.len() {
+        return Err(anyhow!("mip {m} out of range"));
+    }
+    if sl >= l.slices {
+        return Err(anyhow!("slice {sl} out of range ({} slices)", l.slices));
+    }
+    let lin = l.untile_slice(data, m as usize, sl);
+    let (v, ch) = tx::to_floats(fmt, &lin, mw, mh).ok_or_else(|| anyhow!("{} is not a float format", ti.format))?;
+    Ok((v, ch, mw, mh))
+}
+
 impl TtpfTex {
     /// Tiling mode (d1 bits 24-27): 0 = SW_64KB_D, 1/2/3 = SW_4KB_S
     /// (Gfx10 swizzle modes; all verified). Other values occur on a few
