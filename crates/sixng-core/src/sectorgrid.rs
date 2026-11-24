@@ -51,12 +51,28 @@
 //! - The levels nest only loosely: a coarse list is not the 60 m list
 //!   scaled down.
 //!
+//! **Map group ids.** All 277 ids are switchable map groups:
+//! - 67 are a map file's group field `65876a4d` (map header `d3593fa6` at
+//!   +0x48).
+//! - 21 more are a map file's own id, field `8bfb6095`, which is unique
+//!   per map file.
+//! - 154 of the other 189, and many of the matched ones, appear in the
+//!   world-state rules (13 PSO files in `levels.rpf`, a few in
+//!   `story000.rpf`): in the `Enable` / `Disable` lists of struct
+//!   `9bc15b47` and in the pairs of struct `2d3d070c` (`93c31523`,
+//!   `e2554b92`). So the rules switch these groups on and off, and the
+//!   grids say which cells each one touches.
+//! - The other 35 ids appear in no meta resource, PSO or binary file of any
+//!   indexed archive. Ids absent from every map header (unmatched ones,
+//!   mostly `Disable` targets and the first half of a pair) carry no
+//!   content we can place.
+//!
 //! File 5 is mostly the dense cells (median 5,056 entities per 512 m cell,
 //! against 254 in file 3's other cells), but no entity or batch count
-//! threshold separates it better than 89 %. Files 4 and 6 hold the same
-//! cells and map groups and differ only in the bundle key. Map groups in
-//! the coarse files have longer streaming extents (median 970 m against
-//! 686 m in file 8).
+//! threshold separates it better than 89 %. Files 4 and 6 are the same file
+//! apart from the 75 bundle keys and the checksum. Map groups in the coarse
+//! files have longer streaming extents (median 970 m against 686 m in file
+//! 8).
 //!
 //! **Bundle key.** Records with the same key are consecutive and number 1
 //! to 63; the index counts 0, 1, … inside it. In the world grid, records
@@ -66,10 +82,13 @@
 //! whether it has 1 or 63 cells (293 entities per cell in single-cell
 //! bundles, 8.7 in the largest). So a key names a bundle of cells packed in
 //! name order up to a size budget. In the other files every record has its
-//! own key, and the same cell has different keys in different files. The
-//! keys match no recovered name, dictionary name or map file name hash. The
-//! archive's entry names live in its encrypted table of contents, which
-//! this project does not read.
+//! own key, and the same cell has different keys in different files. A
+//! bundle is not a set of map files: only 27 % of map files keep their
+//! entities inside one bundle. The keys occur in no other meta resource or
+//! PSO file. They match no recovered name, dictionary name or map file name
+//! hash, and no `joaat(prefix + "<x>_<y>")` for any prefix, tried with 140
+//! spellings of the coordinates. The archive's entry names live in its
+//! encrypted table of contents, which this project does not read.
 use crate::pso;
 use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
