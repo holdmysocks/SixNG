@@ -500,6 +500,18 @@ again**).
     later one's fabric wins. Not applied: colour set B of the layers, the
     layer flags other than invert, the tile normal map, stitches, dirt
     and sheen. `outfit --look` exports do not have the fabric yet.
+    **Stitches** are described, not drawn: a clothing material's record
+    in `model.json` and `materials.json` has a `stitches` block. The
+    game draws stitches from one shared 128 x 128 mask texture (three
+    stitch columns) sampled with the mesh's third UV set
+    (`TEXCOORD_2`): vertices away from a seam rest in an empty gap
+    between the columns, vertices on a seam lie on a column with V
+    running along the seam (measured on six garments). The block gives
+    the mask's texture hash and column positions, how many of the
+    material's vertices lie on each column, and the weight and colour
+    maths read from the shader code. Not decoded: which mask channels
+    are the grey value and the tint masks, the stitch normal map, and
+    which preset supplies a lone model's stitch amount and tints.
     Not applied anywhere: the second colour the game fades towards
     and the tint rows of items that have a preset (over 6,100 items with
     a colour tag, a preset and a tint row, the preset's colour matches the
