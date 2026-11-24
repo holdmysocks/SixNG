@@ -524,6 +524,19 @@ enum Cmd {
         /// Print the vehicle's configurations (colour, part count) and stop.
         #[arg(long)]
         list: bool,
+        /// Print the vehicle's parts that have models (part name, slot,
+        /// models, how many configurations name it) and stop.
+        #[arg(long)]
+        list_parts: bool,
+        /// Parts to fit on top of the configuration's, by part name (8 hex
+        /// digits from --list-parts, comma separated). A part replaces the
+        /// configuration's part in the same slot.
+        #[arg(long, value_delimiter = ',')]
+        with: Vec<String>,
+        /// Parts of the configuration to leave off (8 hex digits, comma
+        /// separated).
+        #[arg(long, value_delimiter = ',')]
+        without: Vec<String>,
         /// A vehicles.json from `sixng vehicles` (default: built now, into
         /// the output folder).
         #[arg(long)]
@@ -1860,7 +1873,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let v = sixng_core::pso::export_handling(&a, &sel, &names, po)?;
             out.print(&json!({"ok": true, "archive": a.id, "stats": v, "seconds": t.elapsed().as_secs_f64()}));
         }
-        Cmd::Vehicle { name, out: glb, config, no_wheels, list, data, archive, tex } => {
+        Cmd::Vehicle { name, out: glb, config, no_wheels, list, list_parts, with, without, data, archive, tex } => {
             let t = Instant::now();
             let dir = glb.as_ref().and_then(|g| g.parent().map(|p| p.to_path_buf())).filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| PathBuf::from("."));
             let file = match data {
@@ -1880,11 +1893,17 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 out.print(&json!({"ok": true, "vehicle": want, "configurations": cfgs}));
                 return Ok(());
             }
-            let Some(glb) = glb else { bail!("give the output file with -o <file.glb>") };
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
+            if *list_parts {
+                out.print(&json!({"ok": true, "vehicle": want, "parts": sixng_core::vehexport::list_parts(&ix, v)}));
+                return Ok(());
+            }
+            let Some(glb) = glb else { bail!("give the output file with -o <file.glb>") };
+            let parts = |l: &[String]| -> Result<Vec<u32>> { l.iter().map(|p| u32::from_str_radix(p.trim(), 16).map_err(|_| anyhow::anyhow!("{p} is not a part name (8 hex digits, see --list-parts)"))).collect() };
+            let (with, without) = (parts(with)?, parts(without)?);
             let oa = OutArgs { out: dir.clone(), tex: tex.clone(), raw: false, force: true, no_embedded_textures: false, dry_run: false, body_shape: None, head_skin: 0, paint: None };
-            let mut r = sixng_core::vehexport::export_vehicle(&a, &ix, v, *config, !*no_wheels, glb, &oa.opts())?;
+            let mut r = sixng_core::vehexport::export_vehicle(&a, &ix, v, *config, &with, &without, !*no_wheels, glb, &oa.opts())?;
             r["seconds"] = t.elapsed().as_secs_f64().into();
             out.print(&json!({"ok": true, "result": r}));
         }
