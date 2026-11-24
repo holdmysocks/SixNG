@@ -432,6 +432,10 @@ pub struct Renderer3D {
     white: wgpu::TextureView,
     dummy_joints: wgpu::Buffer,
     stickers: StickerDefaults,
+    /// The game's four hair lighting tables (1-texel stand-ins until loaded).
+    hair_luts: Vec<wgpu::TextureView>,
+    /// Whether the game's tables were tried (once per renderer).
+    hair_tried: bool,
     pub default_frame_bg: wgpu::BindGroup,
     target: Option<Target>,
     /// Draw calls in the last frame.
@@ -477,6 +481,43 @@ struct StickerDefaults {
     sampler: wgpu::Sampler,
 }
 
+/// Layout entry of one hair lighting table.
+fn hair_entry(binding: u32, view_dimension: wgpu::TextureViewDimension) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension, multisampled: false },
+        count: None,
+    }
+}
+
+/// A float table as a texture (RGBA half floats): 3D when `d3`, else 2D.
+fn hair_texture(device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, d: u32, d3: bool, rgba16: &[u8]) -> wgpu::TextureView {
+    let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: if d3 { d } else { 1 } };
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("hair table"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: if d3 { wgpu::TextureDimension::D3 } else { wgpu::TextureDimension::D2 },
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        rgba16,
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
+        size,
+    );
+    tex.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// 1-texel stand-ins for the hair tables, until the game's are loaded.
+fn hair_blank(device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<wgpu::TextureView> {
+    [true, true, false, true].iter().map(|&d3| hair_texture(device, queue, 1, 1, 1, d3, &[0u8; 8])).collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn frame_bind_group(
     device: &wgpu::Device,
@@ -487,6 +528,7 @@ fn frame_bind_group(
     stickers: &wgpu::Buffer,
     sticker_view: &wgpu::TextureView,
     sticker_sampler: &wgpu::Sampler,
+    hair: &[wgpu::TextureView],
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("frame bg"),
@@ -498,6 +540,10 @@ fn frame_bind_group(
             wgpu::BindGroupEntry { binding: 3, resource: stickers.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(sticker_view) },
             wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(sticker_sampler) },
+            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&hair[0]) },
+            wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&hair[1]) },
+            wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&hair[2]) },
+            wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&hair[3]) },
         ],
     })
 }
@@ -701,6 +747,11 @@ impl Renderer3D {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // the four lookup tables of the game's hair lighting (M, N, A, P)
+                hair_entry(6, wgpu::TextureViewDimension::D3),
+                hair_entry(7, wgpu::TextureViewDimension::D3),
+                hair_entry(8, wgpu::TextureViewDimension::D2),
+                hair_entry(9, wgpu::TextureViewDimension::D3),
             ],
         });
         let tex_entry = |b: u32| wgpu::BindGroupLayoutEntry {
@@ -1033,7 +1084,8 @@ impl Renderer3D {
                 ..Default::default()
             }),
         };
-        let default_frame_bg = frame_bind_group(device, &bgl_frame, &frame_ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler);
+        let hair_luts = hair_blank(device, &rs.queue);
+        let default_frame_bg = frame_bind_group(device, &bgl_frame, &frame_ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &hair_luts);
         std::mem::forget(wt); // the 1x1 white texture lives for the process
                               // map cells
         let bgl_cell = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1153,6 +1205,8 @@ impl Renderer3D {
             white,
             dummy_joints,
             stickers,
+            hair_luts,
+            hair_tried: false,
             default_frame_bg,
             target: None,
             draws: 0,
@@ -1166,6 +1220,35 @@ impl Renderer3D {
     }
 
     /// Upload a CPU model (meshes, materials, textures, skeleton).
+    /// Load the game's hair lighting tables, once. Models uploaded after
+    /// this are lit with them; without the tables (not a float texture
+    /// store, or not found) hair keeps the stand-in fibre model. Returns
+    /// what happened, for the status line.
+    pub fn load_hair_luts(&mut self, rs: &egui_wgpu::RenderState, game: &std::path::Path) -> Option<String> {
+        if self.hair_tried {
+            return None;
+        }
+        self.hair_tried = true;
+        match sixng_core::hairlight::load(game) {
+            Ok(l) if l.len() == 4 => {
+                self.hair_luts = l.iter().enumerate().map(|(i, t)| hair_texture(&rs.device, &rs.queue, t.w, t.h, t.d, i != 2, &t.rgba16())).collect();
+                // models without joints of their own are drawn with the shared frame group
+                self.default_frame_bg = frame_bind_group(&rs.device, &self.bgl_frame, &self.frame_ub, &self.dummy_joints, &self.sampler, &self.stickers.none, &self.stickers.view, &self.stickers.sampler, &self.hair_luts);
+                if std::env::var_os("SIXNG_DEBUG_HAIR").is_some() {
+                    eprintln!("[hair] lighting tables: {:?}", l.iter().map(|t| (t.w, t.h, t.d, t.ch, t.v.iter().cloned().fold(0.0f32, f32::max))).collect::<Vec<_>>());
+                }
+                None
+            }
+            Ok(_) => Some("hair lighting tables: not all four found".into()),
+            Err(e) => Some(format!("hair lighting tables: {e}")),
+        }
+    }
+
+    /// Whether the game's hair lighting tables are loaded.
+    pub fn hair_luts_loaded(&self) -> bool {
+        self.hair_tried && self.hair_luts.len() == 4
+    }
+
     pub fn upload(
         &self,
         rs: &egui_wgpu::RenderState,
@@ -1217,6 +1300,7 @@ impl Renderer3D {
             white: self.white.clone(),
             bgl_cell: self.bgl_cell.clone(),
             stickers: self.stickers.clone(),
+            hair_luts: self.hair_luts.clone(),
         }
     }
 }
@@ -1240,6 +1324,7 @@ pub struct Uploader {
     white: wgpu::TextureView,
     bgl_cell: wgpu::BindGroupLayout,
     stickers: StickerDefaults,
+    hair_luts: Vec<wgpu::TextureView>,
 }
 
 impl Uploader {
@@ -1586,7 +1671,7 @@ impl Uploader {
             .flat_map(|_| Mat4::IDENTITY.to_cols_array())
             .collect();
         queue.write_buffer(&joints_buf, 0, bytemuck::cast_slice(&ident));
-        let frame_bg = frame_bind_group(device, &self.bgl_frame, &self.frame_ub, &joints_buf, &self.sampler, &self.stickers.none, &self.stickers.view, &self.stickers.sampler);
+        let frame_bg = frame_bind_group(device, &self.bgl_frame, &self.frame_ub, &joints_buf, &self.sampler, &self.stickers.none, &self.stickers.view, &self.stickers.sampler, &self.hair_luts);
         let inst = [Instance::new(Mat4::IDENTITY, !m.joints.is_empty())];
         let instances = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("inst"),
@@ -1689,7 +1774,7 @@ impl Renderer3D {
         if n > 0 {
             rs.queue.write_buffer(buf, 0, bytemuck::cast_slice(&recs[..n]));
         }
-        gm.frame_bg = frame_bind_group(&rs.device, &self.bgl_frame, &self.frame_ub, &gm.joints_buf, &self.sampler, buf, pictures.unwrap_or(&self.stickers.view), &self.stickers.sampler);
+        gm.frame_bg = frame_bind_group(&rs.device, &self.bgl_frame, &self.frame_ub, &gm.joints_buf, &self.sampler, buf, pictures.unwrap_or(&self.stickers.view), &self.stickers.sampler, &self.hair_luts);
     }
 
     pub fn set_joints(&self, rs: &egui_wgpu::RenderState, gm: &GpuModel, mats: &[Mat4]) {

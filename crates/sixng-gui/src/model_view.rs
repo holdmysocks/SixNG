@@ -991,6 +991,10 @@ impl ModelView {
             match r {
                 Ok(models) => {
                     let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+                    // strands are lit with the game's hair tables
+                    if let Some(note) = ren.load_hair_luts(rs, std::path::Path::new(&self.game)) {
+                        eprintln!("[hair] {note}");
+                    }
                     self.hair.gpu = models.iter().map(|m| ren.upload(rs, m, &[])).collect();
                     self.hair.status = format!("{} groom(s) shown", models.len());
                     if std::env::var_os("SIXNG_DEBUG_FUR").is_some() {

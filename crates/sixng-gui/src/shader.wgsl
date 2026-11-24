@@ -45,6 +45,12 @@ struct Sticker {
 @group(0) @binding(3) var<storage, read> ST: array<Sticker>;
 @group(0) @binding(4) var t_stick: texture_2d_array<f32>;
 @group(0) @binding(5) var samp_clamp: sampler;
+// the game's hair lighting tables (hairlight): lobes along the strand,
+// lobes around it, reflectance and path length, and the colour factor
+@group(0) @binding(6) var t_hair_m: texture_3d<f32>;
+@group(0) @binding(7) var t_hair_n: texture_3d<f32>;
+@group(0) @binding(8) var t_hair_a: texture_2d<f32>;
+@group(0) @binding(9) var t_hair_p: texture_3d<f32>;
 
 @group(1) @binding(0) var<uniform> M: Mat;
 @group(1) @binding(1) var t_base: texture_2d<f32>;
@@ -243,6 +249,71 @@ fn hair_light(colour: vec3<f32>, t: vec3<f32>, v: vec3<f32>, l: vec3<f32>, rough
     // (in full light the published model adds no tint to this term)
     s += sqrt(colour) * (mix(ndl, kajiya, 0.33) * scatter / 3.14159);
     return max(s, vec3(0.0));
+}
+
+// The light sum of the game's hair lighting program for one light,
+// transcribed from the compiled code (block 02564-027a8 of
+// TL_PS_PBR_MATERIAL_HAIR; read once by hand, medium confidence), with its
+// four lookup tables. Returns the light leaving towards the viewer per unit
+// of light colour. `t` strand direction, `n` the tube normal (perpendicular
+// to the strand), `v` to the eye, `l` to the light, `g0` and `y` the two
+// per-material values the game bakes (not decoded: fixed here).
+fn hair_game(colour: vec3<f32>, t: vec3<f32>, n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, g0: f32, y: f32) -> vec3<f32> {
+    let c = normalize(cross(n, t));
+    // (the view vector here points to the eye; the tables put the surface
+    // reflection where light and eye are on the same side of the strand)
+    let sin_o = clamp(dot(v, t), -1.0, 1.0);
+    let sin_i = clamp(dot(l, t), -1.0, 1.0);
+    let ln = dot(l, n);
+    let lc = dot(l, c);
+    let vn = dot(v, n);
+    let vc = dot(v, c);
+    let cos_phi = clamp((ln * vn + lc * vc) / sqrt(max((vn * vn + vc * vc) * (ln * ln + lc * lc), 0.000001)), -1.0, 1.0);
+    let h = clamp(vc / sqrt(max(0.000001, 1.0 - sin_o * sin_o)), -1.0, 1.0);
+    // reflectance and path length; absorption of the colour
+    let a = textureSampleLevel(t_hair_a, samp_clamp, vec2(clamp(sin_o * sin_o, 0.0, 1.0), 0.25), 0.0);
+    let f = a.r;
+    let lcol = log(max(colour, vec3(0.0000001)));
+    let tt0 = exp(-0.0478501 * lcol * lcol * a.a);
+    let tt = (1.0 - f) * (1.0 - f) * tt0;
+    let trt = (f * tt0) * tt;
+    let res = (f * tt0) * trt / max(vec3(0.0001), vec3(1.0) - f * tt0);
+    let pz = 1.0 - g0;
+    let pc = vec3(
+        textureSampleLevel(t_hair_p, samp_clamp, vec3(colour.r, y, pz), 0.0).r,
+        textureSampleLevel(t_hair_p, samp_clamp, vec3(colour.g, y, pz), 0.0).r,
+        textureSampleLevel(t_hair_p, samp_clamp, vec3(colour.b, y, pz), 0.0).r);
+    // roughness slice: z0 = k g0 + (1 - g0) with k the light's source term;
+    // the table is flat at z = 1, so a distant light takes k = 0
+    let z0 = 1.0 - g0;
+    let zb = 0.375 + 0.25 * z0;
+    let zc = 0.25 + 0.5 * z0;
+    let muv = vec2(0.5 + 0.5 * sin_i, 0.5 + 0.5 * sin_o);
+    let m0 = textureSampleLevel(t_hair_m, samp_clamp, vec3(muv, z0), 0.0);
+    let mb = textureSampleLevel(t_hair_m, samp_clamp, vec3(muv, zb), 0.0);
+    let mc = textureSampleLevel(t_hair_m, samp_clamp, vec3(muv, zc), 0.0);
+    let tphi = 0.5 + 0.5 * cos_phi;
+    let nx = clamp(abs(sin_o) * abs(sin_o) * abs(sin_o), 0.0, 1.0);
+    let n1 = textureSampleLevel(t_hair_n, samp_clamp, vec3(nx, 0.515873 + 0.484127 * tphi, 0.5 + 0.5 * h), 0.0).rgb;
+    let n2 = textureSampleLevel(t_hair_n, samp_clamp, vec3(nx, 0.484127 * tphi, 0.5 + 0.5 * h), 0.0).rgb;
+    let cos_i = sqrt(clamp(1.0 - sin_i * sin_i, 0.0, 1.0));
+    let nr = mix(n1.r, cos_i / 3.14159265, 0.333);
+    let ntrt = mix(n1.b, cos_i, 0.25);
+    let nr2 = mix(n2.r, nr, 0.333);
+    let ng2 = mix(n2.g, n1.g, 0.333);
+    let nb2 = mix(n2.b, ntrt, 0.25);
+    let q = tt * y;
+    let inv2pi = 0.15915494;
+    let s0 = tt * ng2 * m0.g + trt * nb2 * m0.b + res * m0.a * inv2pi;
+    let sc = vec3(f * nr * mc.r) + tt * n1.g * mc.g + trt * ntrt * mc.b + res * mc.a * inv2pi;
+    let sb = q * q * cos_i * inv2pi + (vec3(f * mb.r) + tt * mb.g + trt * mb.b + res * mb.a) * inv2pi;
+    // the program divides by the colour here and multiplies it back later
+    let coloured = pc * (s0 + q * sc + q * q * sb);
+    // the uncoloured surface reflection, with the light's size factor
+    let m = max(0.001, z0 * z0);
+    let aa = 1.001 * (0.1 + m) * (0.1 + m);
+    let area = aa / (aa + 0.25 * (3.0 * (0.1 + m) + 1.0));
+    return max(coloured + vec3(f * m0.r * nr2 * area), vec3(0.0));
 }
 
 @fragment
@@ -485,6 +556,21 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
         let sun = F.sun_col.rgb * F.sun_dir.w * 3.0;
         let amb_h = sqrt(albedo) * 0.5 * (neutral(F.sky_top.rgb, 0.8) + neutral(F.sky_hor.rgb, 0.8) * 0.6) * 0.5 * F.misc.w;
         col = hair_light(albedo, tdir, v, l, 0.33, 0.5) * sun * ao_direct + amb_h * ao;
+        // with the game's tables: its own light sum
+        let dims = textureDimensions(t_hair_m);
+        if (dims.x > 1u) {
+            // the tube normal facing the eye (the game rounds it across the
+            // ribbon; the ribbons here carry no position across)
+            let tube = normalize(cross(cross(tdir, v), tdir));
+            // large-scale light and dark side from the head: the root normal
+            let root = normalize(i.nrm);
+            let w_sun = clamp(dot(root, l) * 0.5 + 0.5, 0.0, 1.0);
+            let direct_h = hair_game(albedo, tdir, tube, v, l, 0.5, 0.7133) * sun * w_sun;
+            // ambient is the viewer's own: the same sum lit from the root normal's side by the sky
+            let sky_h = (neutral(F.sky_top.rgb, 0.8) + neutral(F.sky_hor.rgb, 0.8) * 0.6) * 0.5 * F.misc.w;
+            let amb_g = hair_game(albedo, tdir, tube, v, normalize(root + vec3(0.0, 0.6, 0.0)), 0.5, 0.7133) * sky_h * 3.14159;
+            col = direct_h * ao_direct + amb_g * ao;
+        }
     }
     if (cls == 11u) {
         // baked map tiles (already hill-shaded): soft diffuse, no sky reflection
