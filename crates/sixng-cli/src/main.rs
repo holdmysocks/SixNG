@@ -1402,9 +1402,16 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let mut dicts: Vec<sixng_core::anim::ClipDictionary> = Vec::new();
             let mut picks: Vec<(usize, usize)> = Vec::new();
             // cutscene clips: `cin@<scene>` = this character's own clips in
-            // that scene; `cin@<scene>/<clip>` = one clip of the scene
+            // that scene; `cin@<scene>/<clip>` = one clip of the scene. Their
+            // dictionaries are loaded with the scene's sections joined in.
             let mut wanted: Vec<(String, String)> = Vec::new();
             let mut cat: Option<sixng_core::cutscene::Catalog> = None;
+            let scene_dict = |dicts: &mut Vec<sixng_core::anim::ClipDictionary>, c: &sixng_core::cutscene::Catalog, sd: &sixng_core::cutscene::SceneDict| -> Result<()> {
+                if !dicts.iter().any(|x| x.name == sd.name) {
+                    dicts.push(sixng_core::cutscene::load_dictionary(&ws, c, sd)?);
+                }
+                Ok(())
+            };
             for c in clip {
                 let is_scene = c.starts_with("cin@") || c.starts_with("cine@");
                 if !is_scene {
@@ -1419,27 +1426,32 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 match c.split_once('/') {
                     Some((dq, cq)) => {
                         let sd = c_.dicts.iter().find(|d| d.name.eq_ignore_ascii_case(dq)).ok_or_else(|| anyhow!("no cutscene dictionary {dq:?}"))?;
-                        if sd.streamed.iter().any(|s| s.eq_ignore_ascii_case(cq)) {
-                            bail!("the animation of {cq} in {dq} is streamed in its {} section dictionaries, which are not joined yet", sd.sections);
-                        }
-                        wanted.push((sd.id.clone(), cq.to_string()));
+                        scene_dict(&mut dicts, c_, sd)?;
+                        wanted.push((sd.name.clone(), cq.to_string()));
                     }
                     None => {
                         for (d, cl) in sixng_core::cutscene::model_clips(c_, c, &prefix)? {
                             eprintln!("--clip {c}: {}/{cl}", d.name);
-                            wanted.push((d.id.clone(), cl));
+                            scene_dict(&mut dicts, c_, d)?;
+                            wanted.push((d.name.clone(), cl));
                         }
                     }
                 }
             }
             for (dq, cq) in &wanted {
                 let (dq, cq) = (dq.as_str(), cq.as_str());
-                let (_, d) = sixng_core::anim::load_dictionary(&game, &ws.work, dq)?;
-                let di = match dicts.iter().position(|x| x.name == d.name) {
+                // scene dictionaries are loaded above, by name
+                let di = match dicts.iter().position(|x| x.name == dq) {
                     Some(i) => i,
                     None => {
-                        dicts.push(d);
-                        dicts.len() - 1
+                        let (_, d) = sixng_core::anim::load_dictionary(&game, &ws.work, dq)?;
+                        match dicts.iter().position(|x| x.name == d.name) {
+                            Some(i) => i,
+                            None => {
+                                dicts.push(d);
+                                dicts.len() - 1
+                            }
+                        }
                     }
                 };
                 let d = &dicts[di];
@@ -1531,13 +1543,13 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 }
                 Some(q) => {
                     // scene clip dictionaries by name, from the cutscene catalog
-                    let q = if q.starts_with("cin@") || q.starts_with("cine@") {
+                    let (de, d) = if q.starts_with("cin@") || q.starts_with("cine@") {
                         let c = sixng_core::cutscene::catalog(&ws, sixng_core::cutscene::STORY_ARCHIVE, false, pr.clone())?;
-                        sixng_core::cutscene::dictionary_id(&c, q).map(|s| s.to_string()).unwrap_or_else(|| q.clone())
+                        let sd = c.dicts.iter().find(|d| d.name.eq_ignore_ascii_case(q)).ok_or_else(|| anyhow!("no cutscene dictionary {q:?} (`sixng cutscenes --name <regex>` lists them)"))?;
+                        (sixng_core::anim::DictEntry { name: sd.name.clone(), id: sd.id.clone() }, sixng_core::cutscene::load_dictionary(&ws, &c, sd)?)
                     } else {
-                        q.clone()
+                        sixng_core::anim::load_dictionary(&game, &ws.work, q)?
                     };
-                    let (de, d) = sixng_core::anim::load_dictionary(&game, &ws.work, &q)?;
                     let clips: Vec<_> = d
                         .clips
                         .iter()
@@ -1545,7 +1557,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                         .take(*limit)
                         .map(|c| {
                             let tr = sixng_core::anim::all_tracks(&d, c);
-                            json!({"name": c.short_name(), "hash": format!("{:08x}", c.hash), "type": c.kind, "duration": c.duration, "bindings": c.bindings.len(),
+                            json!({"name": c.short_name(), "hash": format!("{:08x}", c.hash), "type": c.kind, "duration": c.duration, "bindings": c.bindings.len(), "sections": c.sections, "missing_windows": c.pending.len(),
                                 "tracks": tr.len(), "bones": tr.iter().filter(|t| t.0 != 0).map(|t| t.0).collect::<std::collections::BTreeSet<_>>().len()})
                         })
                         .collect();
@@ -1600,6 +1612,9 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 "cameras": sel.iter().map(|s| s.cameras.len()).sum::<usize>(),
                 "unknown": count("unknown"),
                 "streamed_objects": objs().filter(|o| o.streamed).count(),
+                "streamed_windows": sel.iter().map(|s| s.windows_streamed).sum::<usize>(),
+                "streamed_windows_missing": sel.iter().map(|s| s.windows_missing).sum::<usize>(),
+                "scenes_with_missing_windows": sel.iter().filter(|s| s.windows_missing > 0).count(),
                 "set_models": sel.iter().map(|s| s.set_models.len()).sum::<usize>(),
                 "set_models_unresolved": sel.iter().map(|s| s.set_models_unresolved.len()).sum::<usize>(),
             });
