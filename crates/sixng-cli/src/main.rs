@@ -760,7 +760,7 @@ enum Cmd {
         /// Hashes (hex) to look up instead of building.
         #[arg(long, value_delimiter = ',')]
         lookup: Vec<String>,
-        /// Import a gta6-namehash dictionary.json (public GTA V names) into
+        /// Import a name dictionary (JSON: hash -> list of names) into
         /// `<work>/names/namehash.json` instead of building. Its names are
         /// used only for hashes no other source names.
         #[arg(long)]

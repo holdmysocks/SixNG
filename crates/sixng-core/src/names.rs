@@ -14,9 +14,9 @@
 //!   sampler, texture and variable names);
 //! * `derived`: the built-in list.
 //!
-//! Optionally, `sixng names --namehash <dictionary.json>` imports a
-//! [gta6-namehash](https://github.com/tarekmania/gta6-namehash) dictionary
-//! (joaat of names from public GTA V lists, no game files) into
+//! Optionally, `sixng names --namehash <dictionary.json>` imports a name
+//! dictionary (a JSON object of hash -> list of names, such as joaat of names
+//! from public GTA V lists; no game files) into
 //! `<work>/names/namehash.json`. Its names are candidates: a lookup uses one
 //! only when no source above names the hash, and `--lookup` lists them with
 //! source `namehash`.
@@ -162,7 +162,7 @@ fn order(ctx: Ctx) -> [&'static str; 3] {
 struct Loaded {
     map: HashMap<u32, Vec<(String, String)>>,
     exact: HashMap<u32, Vec<(String, String)>>,
-    /// Imported gta6-namehash names, used only when `map` / `exact` have none.
+    /// Imported dictionary names, used only when `map` / `exact` have none.
     public_map: HashMap<u32, Vec<(String, String)>>,
     public_exact: HashMap<u32, Vec<(String, String)>>,
 }
@@ -206,7 +206,7 @@ pub fn namehash_path(work: &Path) -> PathBuf {
     work.join("names").join("namehash.json")
 }
 
-/// A gta6-namehash `dictionary.json` (hash -> names) as a [`Dict`] with
+/// A name dictionary `dictionary.json` (hash -> names) as a [`Dict`] with
 /// source `namehash`. Each name is re-hashed: it goes to `names` when the
 /// joaat of its lower-case form is the key and to `exact` when the joaat of
 /// its spelling is; names that match neither are dropped.
@@ -233,10 +233,10 @@ pub fn from_namehash(raw: &BTreeMap<String, Vec<String>>) -> Dict {
     d
 }
 
-/// Import a gta6-namehash `dictionary.json` into `<work>/names/namehash.json`.
+/// Import a name dictionary `dictionary.json` into `<work>/names/namehash.json`.
 pub fn import_namehash(src: &Path, work: &Path) -> Result<serde_json::Value> {
     let b = std::fs::read(src).with_context(|| format!("reading {}", src.display()))?;
-    let raw: BTreeMap<String, Vec<String>> = serde_json::from_slice(&b).context("not a gta6-namehash dictionary.json (hash -> list of names)")?;
+    let raw: BTreeMap<String, Vec<String>> = serde_json::from_slice(&b).context("not a name dictionary (JSON object of hash -> list of names)")?;
     let d = from_namehash(&raw);
     let p = namehash_path(work);
     std::fs::create_dir_all(p.parent().unwrap())?;
@@ -288,7 +288,7 @@ fn loaded() -> std::sync::Arc<Loaded> {
     l
 }
 
-/// The best name for a hash in a context, if any. Imported gta6-namehash
+/// The best name for a hash in a context, if any. Imported dictionary
 /// names come last.
 pub fn lookup(h: u32, ctx: Ctx) -> Option<String> {
     let l = loaded();

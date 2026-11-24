@@ -171,7 +171,7 @@ exits with code 1.
 # Built from your install into work\names\names.json; exports and the app use it.
 .\target\release\sixng.exe names
 .\target\release\sixng.exe names --lookup bcf03fc1,c8e8c282
-# Optional: names from public GTA V lists (gta6-namehash dictionary.json) for hashes nothing else names
+# Optional: import a name dictionary (JSON: hash -> list of names, e.g. public GTA V names) for hashes nothing else names
 .\target\release\sixng.exe names --namehash dictionary.json
 
 # Describe one entry without writing files
