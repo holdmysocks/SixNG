@@ -1564,7 +1564,8 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                         let colours: Vec<_> = (0..8).map(|s| lib.colour(w, s, 0).map(|c| json!({"srgb": format!("{:02x}{:02x}{:02x}", c[0], c[1], c[2]), "alpha": c[3], "stops_linear": matlib::stops([c[0], c[1], c[2]])}))).collect();
                         let tiles: Vec<_> = (0..8).map(|s| lib.tile(w, s)).collect();
                         let tile_recs: serde_json::Map<String, serde_json::Value> = tiles.iter().flatten().filter_map(|t| Some((t.tile.clone(), rec(lib.tiles.get(&u32::from_str_radix(&t.tile, 16).ok()?)?)))).collect();
-                        shown.insert(format!("{w:08x}"), json!({"library": e.id, "colours": colours, "tiles": tiles, "tile_records": tile_recs, "preset": rec(r), "base_materials": bases}));
+                        let layers: Vec<_> = (0..8).map(|s| lib.layers(w, s)).collect();
+                        shown.insert(format!("{w:08x}"), json!({"library": e.id, "colours": colours, "tiles": tiles, "tint_mask_layers": layers, "tile_records": tile_recs, "preset": rec(r), "base_materials": bases}));
                     }
                 }
                 if let Some(po) = po {

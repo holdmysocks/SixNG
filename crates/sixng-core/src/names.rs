@@ -90,7 +90,7 @@ pub const DERIVED: &[&str] = &[
     "tilenormalmap", "tileoffset", "tilepresetflags", "tilerotation", "tileroughnessmultiplier", "tilescale", "tilesheen", "tiletint", "tintablepatternflags",
     "tintablepatternmap", "tintablepatternopacity", "tintablepatternrotation", "tintablepatternscale", "tintablepatterntint", "tintmaskemissiveintensity",
     "tintmaskflags", "tintmaskheightopacity", "tintmaskmap", "tintmaskmetallic", "tintmaskmetallicopacity", "tintmaskopacity", "tintmaskrotation", "tintmaskroughness",
-    "tintmaskroughnessopacity", "tintmaskscale", "tintmasktint", "translucencymapblendamount", "translucencymultiplier", "translucencyscale", "transmissionprofileflags",
+    "tintmaskroughnessopacity", "tintmaskscale", "tintmasktranslation", "tintmasktint", "translucencymapblendamount", "translucencymultiplier", "translucencyscale", "transmissionprofileflags",
     "transmissionroughness", "windscale",
     // texture parameters of the minigame pack's water and interior shaders (joaat search, 2026-11-23)
     "watersurfacedetailtexture", "surfacedetailnormal0", "surfacedetailnormal1", "surfacedetailnormal2", "surfacedetailiridescence", "interiordiffusemaskmap", "interiorlayerdiffusemap",
