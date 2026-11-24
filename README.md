@@ -452,19 +452,24 @@ again**).
     strengths are per-material numbers that were not found, and B is left
     out. In the game the base colour is a three-stop gradient over a fine
     tiling fabric texture named only in a run-time parameter block, with
-    up to eight sub-materials picked by `materialid` or a per-vertex id;
-    the viewer shows one flat colour per garment instead.
+    up to eight sub-materials picked by `materialid` or a per-vertex id
+    (see the garment presets below).
   - **Clothing colours from garment presets.** An item's `GarmentPreset`
     is a key into the clothing material library of `data.rpf` (`matlib`,
     `sixng materials`), which holds one base colour per sub-material of
     the garment. The viewer colours each texel with the colour of its
     sub-material, read from the garment's `materialid` texture (red x 63,
-    as the clothing shader does); a garment without that texture takes the
-    colour of sub-material 0 (the per-vertex sub-material id is not read).
-    The viewer builds `<work>/index/material_presets.json` itself when it
+    as the clothing shader does); a garment without that texture numbers
+    its parts per vertex (raw vertex colour green = 4 x id + 2, ids 0-7),
+    and each vertex takes its part's colour, so belts, soles and laces get
+    their own. `sixng outfit --look` exports carry the same colours: baked
+    into the base texture, or as GLB `COLOR_0` over a shade-only texture
+    for the per-vertex garments. The viewer builds `<work>/index/material_presets.json` itself when it
     is missing. Not applied: the second colour the game fades towards, the
     three-stop gradient over a tiling fabric texture (`matlib::stops`),
-    and whatever the tint rows do on items that have a preset. Items
+    and the tint rows of items that have a preset (over 6,100 items with
+    a colour tag, a preset and a tint row, the preset's colour matches the
+    tag on 2,970 and the tint row on 390, so the preset leads). Items
     without a preset fall back to the rules below.
   - **Clothing colours.** An item's stored colour is used when it has one;
     else row tint 0 of its tint palette (for `ped_tint_generic_clean`

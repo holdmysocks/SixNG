@@ -3880,7 +3880,7 @@ fn load_parts(
         }
     }
     if coloured > 0 {
-        notes.push(format!("Clothing colours: {coloured} part(s) coloured from the outfit data: the colours of the item's garment preset (one per sub-material, picked by the garment's materialid texture; sub-material 0 where it has none), else the item's stored colour, else row tint 0 of its tint palette (for the generic palette only when it agrees with the item's colour tag), else the colour tag itself (one of 18 words such as navy or khaki, shown in a plain shade of ours). Second and third tints are not applied."));
+        notes.push(format!("Clothing colours: {coloured} part(s) coloured from the outfit data: the colours of the item's garment preset (one per sub-material, picked by the garment's materialid texture, or by the part number in its vertex colour where it has none), else the item's stored colour, else row tint 0 of its tint palette (for the generic palette only when it agrees with the item's colour tag), else the colour tag itself (one of 18 words such as navy or khaki, shown in a plain shade of ours). Second and third tints are not applied."));
     }
     (model, first, names, errs, skin, colours, mask, notes)
 }
@@ -3907,10 +3907,11 @@ fn sub_material_map(mat: &glb::Material, roots: &[&Path], w: u32, h: u32) -> Opt
 }
 
 fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> bool {
-    // Garment preset colours: one base colour per sub-material, the
-    // sub-material of a texel from the material's `materialid` texture.
-    // Without that texture the garment takes the colour of sub-material 0
-    // (the per-vertex sub-material id is not read).
+    // Garment preset colours: one base colour per sub-material. The
+    // sub-material of a texel comes from the material's `materialid`
+    // texture; a material without one marks it per vertex, in the green
+    // byte of the raw vertex colour (values 2, 6, 10 … 30 = 4 x id + 2 on
+    // every garment looked at), and takes the colour as its vertex tint.
     if f.colour.is_none() && f.subs.iter().any(|c| c.is_some()) {
         let first = f.subs.iter().flatten().next().copied().unwrap_or([128; 3]);
         let shaped = cache.join("shaped");
@@ -3927,16 +3928,35 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
                 Some(im) => im.mips.iter().map(|l| (l.0, l.1)).collect(),
                 None => continue,
             };
+            let by_texture = sub_material_map(&m.materials[mi], &[cache, shaped.as_path()], 1, 1).is_some();
             for (level, (w, h)) in dims.into_iter().enumerate() {
-                let ids = sub_material_map(&m.materials[mi], &[cache, shaped.as_path()], w, h);
+                let ids = if by_texture { sub_material_map(&m.materials[mi], &[cache, shaped.as_path()], w, h) } else { None };
                 let px = &mut m.images[i].mips[level].2;
                 for (k, t) in px.chunks_exact_mut(4).enumerate() {
-                    let s = ids.as_ref().map_or(0, |v| v[k] as usize);
-                    let c = f.subs.get(s).copied().flatten().or(f.subs[0]).unwrap_or(first);
                     // the fabric shade is mid grey (about 125) on plain cloth
                     let g = t[1] as f32 / 125.0;
+                    // by vertex: the texture keeps the shade alone, the colour is the vertex tint
+                    let c = match &ids {
+                        Some(v) => f.subs.get(v[k] as usize).copied().flatten().or(f.subs[0]).unwrap_or(first),
+                        None => [255; 3],
+                    };
                     for ch in 0..3 {
                         t[ch] = (c[ch] as f32 * g).min(255.0) as u8;
+                    }
+                }
+            }
+            if !by_texture {
+                let lin = |v: u8| {
+                    let x = v as f32 / 255.0;
+                    ((if x <= 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) }) * 255.0 + 0.5) as u8
+                };
+                // every material that shares this base texture
+                let mats: Vec<usize> = (0..m.materials.len()).filter(|&k| m.materials[k].base == Some(i)).collect();
+                for me in m.meshes.iter_mut().filter(|me| me.material.is_some_and(|k| mats.contains(&k))) {
+                    for v in &mut me.verts {
+                        let s = ((v.col[1] >> 2) & 7) as usize;
+                        let c = f.subs.get(s).copied().flatten().or(f.subs[0]).unwrap_or(first);
+                        v.tint = [lin(c[0]), lin(c[1]), lin(c[2]), 255];
                     }
                 }
             }
@@ -6166,6 +6186,7 @@ fn export_load_shaped(
         paint: None,
         tex_remap: Default::default(), ped_tints: Default::default(),
         part_skins: e.name.as_ref().filter(|_| !skins.is_empty()).map(|n| (n.to_ascii_lowercase(), skins.to_vec())).into_iter().collect(),
+        part_colours: Default::default(),
     };
     let item = export::export_entry(a, e, &opts)?;
     let lods = lods_in(&dir);

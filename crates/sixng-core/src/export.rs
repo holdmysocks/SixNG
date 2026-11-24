@@ -289,6 +289,11 @@ pub struct ExportOptions {
     /// store is used; without one the head-skin table decides.
     #[serde(default)]
     pub part_skins: std::collections::HashMap<String, Vec<(u64, u64)>>,
+    /// Ped clothing colours by lower-case drawable name: the base colour
+    /// (sRGB) per sub-material of the item's garment preset (`pedlook`,
+    /// `matlib`). Where a part has one it wins over `ped_tints`.
+    #[serde(default)]
+    pub part_colours: std::collections::HashMap<String, Vec<Option<[u8; 3]>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -843,6 +848,38 @@ fn bake_ped_tint(st: &ShaderTextures, part: Option<&str>, o: &ExportOptions, tdi
     };
     let shade = o.out.join(src["png"].as_str()?);
     let stem = format!("{}_g", shade.file_stem()?.to_string_lossy());
+    // Garment preset colours: one base colour per sub-material, the
+    // sub-material of a texel from the material's `materialid` texture
+    // (red x 63, as the clothing shader reads it).
+    if let Some(subs) = part.and_then(|p| o.part_colours.get(p)).filter(|s| s.iter().any(|c| c.is_some())) {
+        let first = subs.iter().flatten().next().copied()?;
+        let idp = format!("{:08x}", crate::meta7a::joaat("materialid"));
+        let ids = st.entries.iter().find(|x| x["param_hash"] == idp.as_str() && x["png"].is_string()).and_then(|x| image::open(o.out.join(x["png"].as_str()?)).ok()).map(|i| i.to_luma8());
+        let key = crate::meta7a::joaat(&format!("{subs:?}{}", ids.is_some()));
+        let p = tdir.join(format!("{stem}_preset_{key:08x}.png"));
+        if !p.exists() {
+            let mut img = image::open(&shade).ok()?.to_rgba8();
+            let (w, h) = img.dimensions();
+            for (x, y, t) in img.enumerate_pixels_mut() {
+                let s = ids.as_ref().map_or(0, |m| {
+                    let (iw, ih) = m.dimensions();
+                    ((m.get_pixel((x * iw / w).min(iw - 1), (y * ih / h).min(ih - 1)).0[0] as u32 * 63 + 127) / 255).min(7) as usize
+                });
+                // without the texture the parts are numbered per vertex: the
+                // texture keeps the shade, COLOR_0 carries the colour
+                let c = if ids.is_some() { subs.get(s).copied().flatten().or(subs[0]).unwrap_or(first) } else { [255; 3] };
+                // the fabric shade is mid grey (about 125) on plain cloth
+                let g = t.0[1] as f32 / 125.0;
+                t.0 = [(c[0] as f32 * g).min(255.0) as u8, (c[1] as f32 * g).min(255.0) as u8, (c[2] as f32 * g).min(255.0) as u8, 255];
+            }
+            let tmp = p.with_extension(format!("{:?}.tmp.png", std::thread::current().id()).replace(['(', ')'], ""));
+            texture::save_png(&tmp, img.as_raw(), w, h).ok()?;
+            fs::rename(&tmp, &p).ok()?;
+        }
+        let rec = serde_json::json!({"shade_texture": src["png"], "shade_source": source, "png": rel(&o.out, &p), "preset_colours": subs, "per_vertex": ids.is_none(),
+            "applied": if ids.is_some() { "base colour = the garment preset's colour of each texel's sub-material (materialid texture, red x 63), times the fabric shade (G / 125); the preset's gradient stops and fabric weave are not applied" } else { "base colour = the fabric shade (G / 125) only; GLB COLOR_0 holds each vertex's garment preset colour (linear), multiplied in: this material has no materialid texture and its parts are numbered per vertex (raw vertex colour green = 4 x id + 2, kept in _COLOR0). The preset's gradient stops and fabric weave are not applied" }});
+        return Some((p, rec));
+    }
     let tint = part.and_then(|p| o.ped_tints.get(p)).copied();
     let pals = tint.map(|_| crate::pedtint::palettes(game));
     let pal = match (tint, &pals) {
@@ -1338,6 +1375,18 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             (Some(p), Some(c)) => Some(tint_colours(p, c)),
             _ => None,
         };
+        // Ped clothing with parts numbered per vertex: each vertex takes
+        // its part's garment preset colour (`bake_ped_tint`).
+        if let (Some(t), Some(c)) = (material.and_then(|s| shader_tex.get(s)).and_then(|st| st.ped_tint.as_ref()).filter(|t| t["per_vertex"] == true), &m.colors) {
+            let subs: Vec<Option<[u8; 3]>> = serde_json::from_value(t["preset_colours"].clone()).unwrap_or_default();
+            if let Some(first) = subs.iter().flatten().next().copied() {
+                let lin = |v: u8| ((v as f32 / 255.0).powf(2.2) * 255.0).round() as u8;
+                tint = Some(c.iter().map(|c| {
+                    let k = subs.get(((c[1] >> 2) & 7) as usize).copied().flatten().or(subs[0]).unwrap_or(first);
+                    [lin(k[0]), lin(k[1]), lin(k[2]), 255]
+                }).collect());
+            }
+        }
         if let Some(mm) = mesh_meta.last_mut() {
             mm["tint_applied"] = tint.is_some().into();
         }
@@ -3105,7 +3154,7 @@ mod dictionary_tests {
         let a = ArchiveInfo { id: "levels.rpf".into(), path: work.join("levels.rpf"), size: archive.len() as u64, container: "rpf9".into() };
         fs::write(&a.path, archive).unwrap();
         let o = ExportOptions { out: work.join("out"), png: false, dds: false, raw: false,
-            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default() };
+            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default() };
         let dir = o.out.join("models/levels").join(export_base_name(&e));
         fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("model.json");

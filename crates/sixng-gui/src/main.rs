@@ -759,7 +759,7 @@ Optional layers not exported yet (the map works without them): {}.", opt.join(",
             body_shape,
             head_skin: self.head_skin,
             paint: None,
-            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(),
+            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default(),
         };
         self.start_task(
             &format!("Extracting {} entries", idxs.len()),
