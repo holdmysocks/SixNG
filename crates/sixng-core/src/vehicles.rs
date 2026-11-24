@@ -34,7 +34,7 @@ const OWNER: u32 = 0xfb1f_80ff;
 /// `handlingId` (case-sensitive joaat).
 const HANDLING_ID: u32 = 0xec41_bd9c;
 /// Layout version of vehicles.json; the model viewer rebuilds older files.
-pub const FORMAT: u32 = 11;
+pub const FORMAT: u32 = 12;
 /// A mod part or kit of one vehicle (in that vehicle's own pack resource):
 /// `name` joaat of the part model's name, or of a kit's name (the names of
 /// its left and right models without the side word:
@@ -52,9 +52,11 @@ const ELEMENTS: u32 = 0x7e5d_1612;
 const MOD_SLOT: u32 = 0x37a6_f9ef;
 const ELEMENT_BONE: u32 = 0x079b_aba7;
 const ELEMENT_HIDES: u32 = 0x2b49_0ab7;
-/// A mod element's part set key (64 bits); its low half is the joaat of
-/// the element's model name (1,996 of the library's 2,027 elements name an
-/// existing model that way).
+/// A mod element's model (`asset`), which is also the name of the model's
+/// part set. In the library it is 32 bits, the joaat of the model's name
+/// (1,996 of the library's 2,027 elements name an existing model that
+/// way); in a vehicle pack it is 64 bits, `meta7a::asset_id` of the name
+/// (all 69 elements of one pickup's pack name an existing model).
 const ELEMENT_SET: u32 = 0x8605_bf0e;
 const COLOUR: u32 = 0x5bdc_13e3;
 const PARTS: u32 = 0xe89b_8540;
@@ -102,7 +104,10 @@ fn mod_parts(mods: &[Value], elements: &[Value]) -> Vec<Value> {
                     // a u64 written as 16 hex digits (the bone is its low
                     // half) in the packs, a u32 in the library
                     let low = |h: u32| get(e, h).and_then(|x| x.as_str().and_then(|s| u32::from_str_radix(s.get(8..16)?, 16).ok()).or_else(|| x.as_u64().map(|v| v as u32))).unwrap_or(0);
-                    json!({"bone": hex(low(ELEMENT_BONE)), "hides": u32s(get(e, ELEMENT_HIDES)).into_iter().map(hex).collect::<Vec<_>>(), "model": hex(low(ELEMENT_SET))})
+                    // the packs' 64-bit value is the model's asset id
+                    // (`meta7a::asset_id` of its name)
+                    let asset = get(e, ELEMENT_SET).and_then(|x| x.as_str()).filter(|s| s.len() == 16);
+                    json!({"bone": hex(low(ELEMENT_BONE)), "hides": u32s(get(e, ELEMENT_HIDES)).into_iter().map(hex).collect::<Vec<_>>(), "model": hex(low(ELEMENT_SET)), "asset": asset})
                 })
                 .collect();
             if els.is_empty() {
@@ -414,7 +419,7 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("vehicles.json");
     std::fs::write(&path, serde_json::to_vec_pretty(&json!({
-        "note": "Per vehicle model: model_info (vehicles.meta-like; wheelScale / wheelScaleRear are not understood: they are not the rim radius (0.219 on comet7, whose rim is 0.82 x a 0.35 m tyre). A wheel's size, width and position are in the model's export (model.json wheel_mounts, from the collision discs), and the rim's share of it in the configuration's rim_ratio), configurations (body colour ARGB + the part models incl. rim and tyre; parts_key = a key of the part list that a vehicle export's model.json part_colours.configs uses to name the part colours of this configuration; rim_ratio = rim radius / tyre radius from the configuration's wheel fitment record, slot 39d5e253, where it has one), palettes (ARGB paint-colour lists; colours repeat, so repetition reads as the draw weight), part_groups (weighted part choices). mods are the parts with models: the vehicle pack's own and, marked shared, the library parts its configurations name (truck beds and boxes, light bars ...); an element's model is the joaat of its model's name (the low half of its part set key), bone the bone it is modelled around and hides the stock bones it replaces. lights are the vehicle's light patterns (sirens, strobes, indicators): patterns by name with slot, speed, clock and per lamp the bone name hash (joaat of siren12, indicator_lf ...) and steps of [phase offset, flash type number]; pack names the patterns of the vehicle's own light pack, a configuration's light_patterns the ones its parts link; archetypes gives a lamp bone's light set name (red, amber, led ..., a hash where the name is not known) and lamp_lights its light as [RRGGBB, intensity], from that light set of its light archetype in levels.rpf. What a flash type number looks like over time is not decoded. steering_lock is fSteeringLock of the model's handling record (radians, the largest angle of the steered wheels; from the PSO files in data.rpf, joined by handlingId). display_name and make are the game's own text for the model's name hash and its vehicleMakeName (from the first text table in data.rpf that has them: English). Names resolve where known; others are joaat hex.",
+        "note": "Per vehicle model: model_info (vehicles.meta-like; wheelScale / wheelScaleRear are not understood: they are not the rim radius (0.219 on comet7, whose rim is 0.82 x a 0.35 m tyre). A wheel's size, width and position are in the model's export (model.json wheel_mounts, from the collision discs), and the rim's share of it in the configuration's rim_ratio), configurations (body colour ARGB + the part models incl. rim and tyre; parts_key = a key of the part list that a vehicle export's model.json part_colours.configs uses to name the part colours of this configuration; rim_ratio = rim radius / tyre radius from the configuration's wheel fitment record, slot 39d5e253, where it has one), palettes (ARGB paint-colour lists; colours repeat, so repetition reads as the draw weight), part_groups (weighted part choices). mods are the parts with models: the vehicle pack's own and, marked shared, the library parts its configurations name (truck beds and boxes, light bars ...); an element's asset names its model in a vehicle pack (16 hex digits: the first half of MurmurHash3 x64 128, seed 0, of the model's lower-case name without LOD suffix; null in the library), and model is the joaat of the model's name for library parts (in a pack it is only the low half of asset), bone the bone it is modelled around and hides the stock bones it replaces. lights are the vehicle's light patterns (sirens, strobes, indicators): patterns by name with slot, speed, clock and per lamp the bone name hash (joaat of siren12, indicator_lf ...) and steps of [phase offset, flash type number]; pack names the patterns of the vehicle's own light pack, a configuration's light_patterns the ones its parts link; archetypes gives a lamp bone's light set name (red, amber, led ..., a hash where the name is not known) and lamp_lights its light as [RRGGBB, intensity], from that light set of its light archetype in levels.rpf. What a flash type number looks like over time is not decoded. steering_lock is fSteeringLock of the model's handling record (radians, the largest angle of the steered wheels; from the PSO files in data.rpf, joined by handlingId). display_name and make are the game's own text for the model's name hash and its vehicleMakeName (from the first text table in data.rpf that has them: English). Names resolve where known; others are joaat hex.",
         "format": FORMAT,
         "sources": sources,
         "vehicles": list,

@@ -52,6 +52,8 @@ struct ElemRec {
     hides: Vec<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    asset: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -200,6 +202,9 @@ pub struct Mod {
     pub elements: Vec<(u32, Vec<u32>)>,
     /// Per element, the joaat of its model's name (0 when not given).
     pub models: Vec<u32>,
+    /// Per element, its model's asset id (`meta7a::asset_id` of the name;
+    /// 0 when not given: library parts).
+    pub assets: Vec<u64>,
 }
 
 /// The vehicle table, read once per process (model loading uses it off the
@@ -382,7 +387,7 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
                     .iter()
                     .map(|m| {
                         let h = |s: &str| u32::from_str_radix(s, 16).unwrap_or(0);
-                        Mod { name: h(&m.name), slot: h(&m.slot), models: m.elements.iter().map(|e| e.model.as_deref().map_or(0, h)).collect(), elements: m.elements.iter().map(|e| (h(&e.bone), e.hides.iter().map(|x| h(x)).collect())).collect() }
+                        Mod { name: h(&m.name), slot: h(&m.slot), assets: m.elements.iter().map(|e| e.asset.as_deref().and_then(|a| u64::from_str_radix(a, 16).ok()).unwrap_or(0)).collect(), models: m.elements.iter().map(|e| e.model.as_deref().map_or(0, h)).collect(), elements: m.elements.iter().map(|e| (h(&e.bone), e.hides.iter().map(|x| h(x)).collect())).collect() }
                     })
                     .collect(),
             },
