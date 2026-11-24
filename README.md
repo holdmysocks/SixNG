@@ -435,6 +435,12 @@ again**).
   - **Body skin tone.** No painted body texture is stored (the game builds
     skin at run time), so the body takes the colour of the face texture at
     the neck.
+  - **Fabric shading.** The colour is shaded by the green channel of the
+    garment's own packed map (`speculartex`: seams and folds, mid grey on
+    plain cloth). The green of the small map every garment also binds
+    (`speculartex2`) is a grime pattern in the garment's layout, which the
+    game brings in with its dirt presets; used as the shade (as before
+    2026-11-24) it mottled every garment. Dirt is not shown.
   - **Clothing colours.** An item's stored colour is used when it has one;
     else row tint 0 of its tint palette (for `ped_tint_generic_clean`
     only when the row is the colour the item's colour tag names, because

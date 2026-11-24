@@ -3875,8 +3875,8 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path) -> bool {
     let generic = f.tint.is_some_and(|t| t.0 == 0xa7c8_d8e0);
     let pal = pal.filter(|(p, row)| !generic || f.tag.is_none_or(|t| sixng_core::pedtint::nearest_word(p.sample(*row, 128)) == t));
     let word = f.tag.and_then(|t| sixng_core::pedtint::COLOUR_WORDS.iter().find(|w| w.0 == t)).map(|w| w.1);
-    // shade maps are mid grey on plain cloth: 190 keeps the colour there
-    let flat = |c: [u8; 3]| -> [[u8; 3]; 256] { std::array::from_fn(|v| c.map(|x| ((x as f32) * (v as f32 / 190.0)).min(255.0) as u8)) };
+    // the fabric shade is mid grey (about 125) on plain cloth: the colour is kept there
+    let flat = |c: [u8; 3]| -> [[u8; 3]; 256] { std::array::from_fn(|v| c.map(|x| ((x as f32) * (v as f32 / 125.0)).min(255.0) as u8)) };
     let lut: [[u8; 3]; 256] = match (f.colour, pal, word) {
         (Some(c), _, _) => flat(c),
         (None, Some((p, row)), _) => std::array::from_fn(|v| p.sample(row, v as u8)),
@@ -6020,6 +6020,8 @@ fn export_load_shaped(
                 // and weapon parts from before their stand-in surface
                 || j.contains("e68a4a98") && !j.contains("\"gunmetal\"")
         });
+    // Cached ped clothing from before the fabric shade came from the packed map.
+    let stale_cloth = std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| j.contains("739e3d0d") && !j.contains("shade_source"));
     // Cached animal parts from before part skins (eyes, tint-mask coats).
     let stale_animal = e.name.as_deref().is_some_and(|n| sixng_core::partskin::animal_root(n).is_some())
         && std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| !j.contains("\"part_skin\""));
@@ -6028,7 +6030,7 @@ fn export_load_shaped(
         png: true,
         dds: false,
         raw: false,
-        force: head || shaped || !skins.is_empty() || stale_tint || stale_vehicle || stale_animal,
+        force: head || shaped || !skins.is_empty() || stale_tint || stale_vehicle || stale_animal || stale_cloth,
         skip_embedded_textures: false,
         body_shape,
         head_skin: HEAD_SKIN.load(std::sync::atomic::Ordering::Relaxed),

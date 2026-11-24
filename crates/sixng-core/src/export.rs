@@ -829,8 +829,18 @@ fn bake_ped_tint(st: &ShaderTextures, part: Option<&str>, o: &ExportOptions, tdi
     if m[0] < 240.0 || !(96.0..=160.0).contains(&m[3]) {
         return None;
     }
-    let shade = o.out.join(e["png"].as_str()?);
-    let stem = shade.file_stem()?.to_string_lossy().to_string();
+    // The fabric's own shading (seams, folds) is the green channel of the
+    // garment's packed map (`speculartex`, slot c6f46e79). The green of the
+    // small map that marks ped clothing (`speculartex2`) is a grime pattern
+    // in the garment's layout: used as the shade it mottles every garment.
+    // It stays the fallback for garments without a packed map.
+    let packed = st.entries.iter().find(|x| x["param_hash"] == "c6f46e79" && x["status"].as_str().is_some_and(|s| s.starts_with("ok")) && x["png"].is_string());
+    let (src, source) = match packed {
+        Some(x) => (x, "speculartex.g"),
+        None => (e, "speculartex2.g"),
+    };
+    let shade = o.out.join(src["png"].as_str()?);
+    let stem = format!("{}_g", shade.file_stem()?.to_string_lossy());
     let tint = part.and_then(|p| o.ped_tints.get(p)).copied();
     let pals = tint.map(|_| crate::pedtint::palettes(game));
     let pal = match (tint, &pals) {
@@ -848,7 +858,7 @@ fn bake_ped_tint(st: &ShaderTextures, part: Option<&str>, o: &ExportOptions, tdi
         texture::save_png(&tmp, &crate::pedtint::bake(img.as_raw(), pal), w, h).ok()?;
         fs::rename(&tmp, &p).ok()?;
     }
-    let mut rec = serde_json::json!({"shade_texture": e["png"], "png": rel(&o.out, &p)});
+    let mut rec = serde_json::json!({"shade_texture": src["png"], "shade_source": source, "png": rel(&o.out, &p)});
     match (tint, pal) {
         (Some((h, r)), Some((pl, _))) => {
             rec["palette"] = format!("{h:08x}").into();
