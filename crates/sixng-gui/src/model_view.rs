@@ -32,6 +32,11 @@ pub const RMA_ORDERS: [&str; 4] = [
 pub const FINISHES: [&str; 5] = ["metallic", "matte", "chrome", "gloss", "as stored"];
 /// `standard_vehicle_2lyr_wheel_inst`: the rim material of the shared wheels.
 const RIM_SHADER: &str = "_c5cdbdd2";
+
+/// Whether a material (named `..._<shader hash>`) has a tyre shader.
+fn tyre_material(name: &str) -> bool {
+    name.len() >= 8 && name.get(name.len() - 8..).is_some_and(sixng_core::material::is_tyre_shader)
+}
 /// Default rim colour: a plain alloy (the true per-vehicle colour is not decoded).
 const RIM_ALLOY: [f32; 3] = [0.6, 0.6, 0.62];
 pub const SLOTS: [&str; 4] = ["base colour", "normal", "packed RMA", "emissive"];
@@ -56,13 +61,20 @@ impl Caps {
         Caps {
             paint: m.materials.iter().any(|x| x.class == "car_paint" || x.parts),
             wheels: names.iter().any(|n| n.starts_with("wheel_") && !n.contains("dummy")),
-            doors: names.iter().any(|n| matches!(n.as_str(), "door_dside_f" | "door_dside_r" | "door_pside_f" | "door_pside_r")),
+            doors: names.iter().any(|n| matches!(n.as_str(), "door_dside_f" | "door_dside_r" | "door_pside_f" | "door_pside_r" | "door_dside_m" | "door_pside_m")),
             roof: names.iter().any(|n| n == "convertible_roof"),
             mounts: l.info["wheel_mounts"].as_array().is_some_and(|a| !a.is_empty()),
             joints: !m.joints.is_empty(),
             tint: m.meshes.iter().any(|x| x.verts.iter().any(|v| v.tint != [255, 255, 255, 255] && v.tint != [0, 0, 0, 0])),
             decals: m.materials.iter().any(|x| x.decal.is_some()),
         }
+    }
+}
+
+impl Loaded {
+    /// A character or an animal with a skeleton: a clip of anim.rpf can be played on it.
+    pub fn takes_clips(&self) -> bool {
+        !self.model.joints.is_empty() && (self.look.is_some() || self.fur.is_some())
     }
 }
 
@@ -128,6 +140,22 @@ pub struct PedPose {
     pub spine: [f32; 3],
     /// Nod down, turn to the left, tilt to the left.
     pub head: [f32; 3],
+    /// Per shoulder (left, right), on the collar bone: shrug (+ up),
+    /// forward (+ forward).
+    pub shoulder: [[f32; 2]; 2],
+    /// Per arm: turn of the upper arm and of the forearm about their own
+    /// length (+ rolls the thumb forward and down).
+    pub arm_twist: [f32; 2],
+    pub forearm_twist: [f32; 2],
+    /// Per wrist: bend (+ up, the back of the hand towards the forearm),
+    /// side (+ forward, towards the thumb).
+    pub wrist: [[f32; 2]; 2],
+    /// Per leg: turn of the thigh about its own length (+ toes outward).
+    pub leg_twist: [f32; 2],
+    /// Per ankle: + toes up.
+    pub ankle: [f32; 2],
+    /// Both eyeballs: look to the character's left (+), look up (+).
+    pub eyes: [f32; 2],
 }
 
 impl PedPose {
@@ -153,10 +181,16 @@ impl PedPose {
         for (i, s) in ["L", "R"].iter().enumerate() {
             // the left arm points along +x, the right along -x
             let sg = if i == 0 { 1.0 } else { -1.0 };
-            v.push((format!("SKEL_{s}_UpperArm"), [0.0, -sg * self.arm[i][1], sg * self.arm[i][0]]));
-            v.push((format!("SKEL_{s}_Forearm"), [0.0, -sg * self.elbow[i], 0.0]));
-            v.push((format!("SKEL_{s}_Thigh"), [-self.leg[i][0], 0.0, sg * self.leg[i][1]]));
+            // a turn about x is a turn about the arm's own length; it is applied first
+            v.push((format!("SKEL_{s}_Clavicle"), [0.0, -sg * self.shoulder[i][1], sg * self.shoulder[i][0]]));
+            v.push((format!("SKEL_{s}_UpperArm"), [sg * self.arm_twist[i], -sg * self.arm[i][1], sg * self.arm[i][0]]));
+            v.push((format!("SKEL_{s}_Forearm"), [sg * self.forearm_twist[i], -sg * self.elbow[i], 0.0]));
+            v.push((format!("SKEL_{s}_Hand"), [0.0, -sg * self.wrist[i][1], sg * self.wrist[i][0]]));
+            // the leg hangs along -y: a turn about y is a turn about its own length
+            v.push((format!("SKEL_{s}_Thigh"), [-self.leg[i][0], sg * self.leg_twist[i], sg * self.leg[i][1]]));
             v.push((format!("SKEL_{s}_Calf"), [self.knee[i], 0.0, 0.0]));
+            v.push((format!("SKEL_{s}_Foot"), [-self.ankle[i], 0.0, 0.0]));
+            v.push((format!("FB_{s}_Eyeball"), [-self.eyes[1], self.eyes[0], 0.0]));
         }
         for b in ["SKEL_Spine1", "SKEL_Spine2", "SKEL_Spine3", "SKEL_Spine4"] {
             v.push((b.to_string(), [self.spine[0] / 4.0, self.spine[1] / 4.0, -self.spine[2] / 4.0]));
@@ -166,6 +200,85 @@ impl PedPose {
         }
         v.retain(|x| x.1 != [0.0; 3]);
         v
+    }
+}
+
+/// The skin of an animal as the fur sees it: every skinned vertex with its
+/// joints and weights, and the joint list. Fur strands carry no bone
+/// weights that are decoded, so each fur vertex takes those of the nearest
+/// skin vertex; the fur then moves with the body under it.
+pub struct FurRig {
+    verts: Vec<([f32; 3], [u16; 4], [u8; 4])>,
+    joints: Vec<(String, Option<usize>, [f32; 16], [f32; 16])>,
+    grid: HashMap<(i32, i32, i32), Vec<u32>>,
+}
+
+impl FurRig {
+    const CELL: f32 = 0.03;
+
+    fn key(p: [f32; 3]) -> (i32, i32, i32) {
+        ((p[0] / Self::CELL).floor() as i32, (p[1] / Self::CELL).floor() as i32, (p[2] / Self::CELL).floor() as i32)
+    }
+
+    /// From a loaded model; None when it has no skinned mesh.
+    pub fn of(m: &glb::Model) -> Option<FurRig> {
+        let verts: Vec<([f32; 3], [u16; 4], [u8; 4])> = m.meshes.iter().filter(|me| me.skinned).flat_map(|me| me.verts.iter().filter(|v| v.weights.iter().any(|w| *w > 0)).map(|v| (v.pos, v.joints, v.weights))).collect();
+        if verts.is_empty() || m.joints.is_empty() {
+            return None;
+        }
+        let mut grid: HashMap<(i32, i32, i32), Vec<u32>> = HashMap::new();
+        for (i, v) in verts.iter().enumerate() {
+            grid.entry(Self::key(v.0)).or_default().push(i as u32);
+        }
+        Some(FurRig { verts, joints: m.joints.iter().map(|j| (j.name.clone(), j.parent, j.local, j.ibm)).collect(), grid })
+    }
+
+    /// Joints and weights of the skin vertex nearest to `p` (within about 15 cm).
+    fn nearest(&self, p: [f32; 3]) -> Option<([u16; 4], [u8; 4])> {
+        let k = Self::key(p);
+        let mut best: Option<(f32, u32)> = None;
+        for r in 1..=5i32 {
+            for x in -r..=r {
+                for y in -r..=r {
+                    for z in -r..=r {
+                        // only the new shell of cells
+                        if x.abs().max(y.abs()).max(z.abs()) != r && r > 1 {
+                            continue;
+                        }
+                        for &i in self.grid.get(&(k.0 + x, k.1 + y, k.2 + z)).into_iter().flatten() {
+                            let q = self.verts[i as usize].0;
+                            let d = (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2);
+                            if best.is_none_or(|b| d < b.0) {
+                                best = Some((d, i));
+                            }
+                        }
+                    }
+                }
+            }
+            // a hit within the shells searched so far is the nearest
+            if best.is_some_and(|b| b.0.sqrt() <= (r - 1).max(1) as f32 * Self::CELL) {
+                break;
+            }
+        }
+        best.map(|b| (self.verts[b.1 as usize].1, self.verts[b.1 as usize].2))
+    }
+
+    /// Bind a groom's display mesh to the skin: joints and weights per
+    /// vertex, and the animal's joint list on the model.
+    pub fn bind(&self, gm: &mut glb::Model) {
+        for me in &mut gm.meshes {
+            for v in &mut me.verts {
+                if let Some((j, w)) = self.nearest(v.pos) {
+                    v.joints = j;
+                    v.weights = w;
+                } else {
+                    v.joints = [0; 4];
+                    v.weights = [255, 0, 0, 0];
+                }
+            }
+            me.skinned = true;
+        }
+        gm.joints = self.joints.iter().map(|j| glb::Joint { name: j.0.clone(), parent: j.1, local: j.2, ibm: j.3 }).collect();
     }
 }
 
@@ -403,8 +516,14 @@ pub struct ModelView {
     pub bonnet_open: f32,
     pub boot_open: f32,
     /// Hinged panels of the loaded model: joint index -> (0 = door, 1 =
-    /// bonnet, 2 = boot; rotation axis; sign that swings it open).
+    /// bonnet, 2 = boot; rotation axis; sign that swings it open). A sliding
+    /// door is 3, with its whole travel in the bone's own space in place of
+    /// the axis.
     hinges: HashMap<usize, (u8, Vec3, f32)>,
+    /// Doors, side windows, bonnet and boot left shut whatever their slider
+    /// says (the tick boxes under the sliders), by bone name in lower case.
+    /// Kept from one vehicle to the next.
+    pub panels_off: std::collections::HashSet<String>,
     /// What the configuration's parts without a model change on the wheels:
     /// [out from the centre line, tyre width], each per axle (front, rear).
     wheel_fit_cfg: [[f32; 2]; 2],
@@ -439,6 +558,9 @@ pub struct ModelView {
     /// Animation clip for the character shown (`anim.rpf`): what is asked
     /// for (`<dictionary>/<clip>`), what is loaded, and the playback state.
     pub ped_clip: PedClip,
+    /// Animals: the clip dictionaries of the species shown (root name, the
+    /// names), from the cached dictionary list.
+    animal_clips: Option<(String, Vec<String>)>,
     /// Pose of the character shown (degrees), see `PedPose`.
     pub ped_pose: PedPose,
     /// Body shape of the character shown (`BODY_SHAPE` when it was loaded).
@@ -513,6 +635,9 @@ pub struct Hair {
     /// The hat worn and the grooms it presses down (the scalp hair).
     hat: Option<Arc<sixng_core::groom::Shell>>,
     under_hat: Vec<u64>,
+    /// Animals: the skinned vertices and joints of the model shown, so the
+    /// fur can be bound to the skin under it and move with a clip.
+    rig: Option<Arc<FurRig>>,
     /// Export of the shown grooms: write the full strand set, a run in
     /// progress, its result and where the last one went.
     pub export_full: bool,
@@ -562,6 +687,7 @@ impl Default for Hair {
             selected: Vec::new(),
             hat: None,
             under_hat: Vec::new(),
+            rig: None,
             export_full: true,
             exporting: false,
             export_done: Arc::new(Mutex::new(None)),
@@ -591,7 +717,7 @@ impl Default for Hair {
 
 impl Hair {
     fn want_key(&self) -> String {
-        format!("{:?}|{}|{:?}|{}|{}|{}|{:?}", self.selected, self.width_mm, self.colour, self.skin_colour && !self.skin.is_empty(), self.full_coat, self.density, self.hat.as_ref().map(|h| h.id))
+        format!("{:?}|{}|{:?}|{}|{}|{}|{:?}|{:?}", self.selected, self.width_mm, self.colour, self.skin_colour && !self.skin.is_empty(), self.full_coat, self.density, self.hat.as_ref().map(|h| h.id), self.rig.as_ref().map(|r| (r.verts.len(), r.joints.len())))
     }
     pub fn settled(&self) -> bool {
         !self.loading && !self.listing && !self.exporting && self.key == self.want_key()
@@ -718,6 +844,7 @@ impl ModelView {
             bonnet_open: 0.0,
             boot_open: 0.0,
             hinges: HashMap::new(),
+            panels_off: Default::default(),
             wheel_fit_cfg: [[0.0; 2]; 2],
             fit_parts_once: None,
             aims: Vec::new(),
@@ -741,6 +868,7 @@ impl ModelView {
             hair_head: None,
             hair_head_n: 0,
             ped_clip: PedClip::default(),
+            animal_clips: None,
             ped_pose: PedPose::default(),
             body_shape_shown: (0.0, 0.0),
             wheels_on: true,
@@ -866,6 +994,7 @@ impl ModelView {
         let (density, width_scale) = (self.hair.density.clamp(0.05, 1.0), self.hair.width_mm / 3.0);
         let note = self.hair.coat_note.clone();
         let (hat, under_hat) = (self.hair.hat.clone(), self.hair.under_hat.clone());
+        let rig = self.hair.rig.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<Vec<glb::Model>> {
@@ -919,6 +1048,9 @@ impl ModelView {
                     std::fs::write(&p, glb_bytes)?;
                     let mut gm = glb::load(&p, &dir)?;
                     gm.materials.iter_mut().for_each(|x| x.mr = Some([0.0, 0.85]));
+                    if let Some(r) = &rig {
+                        r.bind(&mut gm);
+                    }
                     out.push(gm);
                 }
                 *note.lock().unwrap() = if coat_on && stored > 0 { format!("coat: {drawn} of the {stored} stored strands drawn") } else { String::new() };
@@ -1196,6 +1328,11 @@ impl ModelView {
 
     /// Car extras settled: vehicle data applied and the fitted wheels loaded.
     fn idle_for_shot(&self) -> bool {
+        self.idle_for_model() && !self.livery.ed.busy()
+    }
+
+    /// The loaded model is complete (a vehicle has its data, parts and wheels).
+    fn idle_for_model(&self) -> bool {
         if self.parts_request.is_some() || self.fit_parts_once.is_some() || self.random_parts_once || !self.hair.settled() || self.auto.then.is_some() || self.auto.find_hair || self.auto.export_hair || self.hair.fitting || self.ped_clip.loading || (!self.ped_clip.want.trim().is_empty() && self.ped_clip.anim.is_none() && self.ped_clip.status.starts_with("loading")) {
             return false;
         }
@@ -1244,7 +1381,7 @@ impl ModelView {
                 }
             }
         }
-        let Some(l) = self.loaded.as_ref().filter(|l| l.look.is_some() && !l.model.joints.is_empty()) else { return };
+        let Some(l) = self.loaded.as_ref().filter(|l| l.takes_clips()) else { return };
         let want = self.ped_clip.want.trim().to_string();
         let key = format!("{want}#{}#{}", l.model.joints.len(), l.model.joints[0].name);
         if want.is_empty() {
@@ -1257,9 +1394,18 @@ impl ModelView {
             let (game, work, slot, ctx2) = (PathBuf::from(&self.game), PathBuf::from(&self.work), self.ped_clip.pending.clone(), ctx.clone());
             std::thread::spawn(move || {
                 let r = (|| -> anyhow::Result<(glb::Anim, Vec<sixng_core::anim::ClipTrack>, String)> {
-                    let (dq, cq) = want.rsplit_once('/').ok_or_else(|| anyhow::anyhow!("write it as <dictionary>/<clip> (`sixng clips --name walk` lists dictionaries)"))?;
+                    // "<dictionary>/<clip>", or a dictionary alone: then its `move` or `idle` clip, else the first that binds an animation
+                    let (dq, cq) = want.rsplit_once('/').unwrap_or((want.as_str(), ""));
                     let (_, d) = sixng_core::anim::load_dictionary(&game, &work, dq)?;
-                    let c = d.clip(cq).ok_or_else(|| anyhow::anyhow!("no clip {cq:?} in {}; it has: {}", d.name, d.clips.iter().map(|c| c.short_name()).collect::<Vec<_>>().join(", ")))?;
+                    let c = if cq.is_empty() {
+                        let bound: Vec<&sixng_core::anim::Clip> = d.clips.iter().filter(|c| c.kind == 1 && !c.bindings.is_empty()).collect();
+                        ["move", "idle"].iter().find_map(|n| bound.iter().find(|c| c.short_name() == *n).copied()).or(bound.first().copied()).ok_or_else(|| anyhow::anyhow!("{} holds no clip with animation data that is decoded (its {} clip(s) bind none here)", d.name, d.clips.len()))?
+                    } else {
+                        d.clip(cq).ok_or_else(|| anyhow::anyhow!("no clip {cq:?} in {}; it has: {}", d.name, d.clips.iter().map(|c| c.short_name()).collect::<Vec<_>>().join(", ")))?
+                    };
+                    if c.bindings.is_empty() {
+                        anyhow::bail!("clip {} of {} binds no animation in this dictionary (not decoded yet); pick another clip", c.short_name(), d.name);
+                    }
                     let joints: Vec<sixng_core::gltf::Joint> = names.iter().map(|n| sixng_core::gltf::Joint { name: n.clone(), parent: None, bind: [0.0; 16], pose: None }).collect();
                     let (ch, stats) = sixng_core::outfit::clip_channels(&d, c, &joints);
                     // RAGE (Z-up) values to the viewer's Y-up, as the GLB export does
@@ -1320,6 +1466,9 @@ impl ModelView {
         self.cam.eye += moved - self.ped_clip.travel;
         self.ped_clip.travel = moved;
         self.ped_clip.root = root;
+        if std::env::var_os("SIXNG_DEBUG_RIG").is_some() && self.ped_clip.anim.is_some() {
+            eprintln!("[clip] pos {:.2} moved {moved:?} cam target {:?} fly {}", self.ped_clip.pos, self.cam.target, self.cam.fly);
+        }
     }
 
     /// Body shape for characters (weight, muscle), before a model is opened.
@@ -1373,6 +1522,69 @@ impl ModelView {
 
     /// Character panel: the outfit of the game's outfit list, the body shape
     /// and what the viewer filled in. Returns the query to reload with.
+    /// "Animation" for an animal: the clip dictionaries of its species to
+    /// pick from, and the same playback controls as a character has.
+    fn animal_clip_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(l) = self.loaded.as_ref().filter(|l| l.look.is_none() && l.takes_clips()) else { return };
+        let root = l.source.split_whitespace().next().unwrap_or("").rsplit([':', '#', '/']).find(|s| !s.is_empty()).unwrap_or("").to_ascii_lowercase();
+        if self.animal_clips.as_ref().is_none_or(|c| c.0 != root) {
+            // the species word of `crm_cat_feral_m_00` is `cat`; some dictionaries use two words (`bengal_tiger`)
+            let t: Vec<&str> = root.split('_').collect();
+            let words: Vec<String> = match t.as_slice() {
+                [_, a, b, ..] => vec![format!("{b}_{a}"), format!("{a}_{b}"), a.to_string()],
+                [_, a] => vec![a.to_string()],
+                _ => vec![],
+            };
+            // only the cached list: building it reads every clip dictionary (about a minute)
+            let cached = Path::new(&self.work).join("index").join(sixng_core::anim::DICT_CACHE).exists();
+            let all = if cached { sixng_core::anim::dictionaries(Path::new(&self.game), Path::new(&self.work)).unwrap_or_default() } else { Vec::new() };
+            let names = words
+                .iter()
+                .map(|w| all.iter().filter(|d| d.name.starts_with("gameplay@creatures@") && d.name.split('@').any(|p| p == w)).map(|d| d.name.clone()).collect::<Vec<_>>())
+                .find(|v| !v.is_empty())
+                .unwrap_or_default();
+            self.animal_clips = Some((root.clone(), names));
+        }
+        let names = self.animal_clips.as_ref().map(|c| c.1.clone()).unwrap_or_default();
+        egui::CollapsingHeader::new("Animation").default_open(true).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.ped_clip.want).hint_text("<dictionary>[/<clip>]").desired_width(250.0));
+                if ui.button("None").clicked() {
+                    self.ped_clip.want.clear();
+                    self.ped_clip.playing = false;
+                }
+            });
+            if names.is_empty() {
+                ui.label(egui::RichText::new("No clip dictionaries listed for this animal. The list comes from `sixng clips` (run it once; it reads anim.rpf for about a minute), by the species word of the animal's name.").weak().small());
+            } else {
+                // the part of the name after the species: `normal@walk@slow`
+                let tail = |n: &str| n.split('@').skip(5).collect::<Vec<_>>().join("@");
+                let current = self.ped_clip.want.split('/').next().unwrap_or("").to_string();
+                egui::ComboBox::from_id_salt("animal_clip_dict").selected_text(if names.contains(&current) { tail(&current) } else { format!("{} clip dictionaries", names.len()) }).width(260.0).show_ui(ui, |ui| {
+                    for n in &names {
+                        if ui.selectable_label(*n == current, tail(n)).on_hover_text(n).clicked() {
+                            self.ped_clip.want = n.clone();
+                            self.ped_clip.playing = true;
+                        }
+                    }
+                });
+            }
+            if self.ped_clip.anim.is_some() {
+                ui.horizontal(|ui| {
+                    if ui.button(if self.ped_clip.playing { "⏸" } else { "▶" }).clicked() {
+                        self.ped_clip.playing = !self.ped_clip.playing;
+                    }
+                    ui.add(egui::Slider::new(&mut self.ped_clip.pos, 0.0..=1.0).show_value(false));
+                    ui.checkbox(&mut self.ped_clip.in_place, "in place").on_hover_text("Leave out the clip's own movement over the ground (its mover tracks), so the animal stays where it is.");
+                });
+            }
+            if !self.ped_clip.status.is_empty() {
+                ui.label(egui::RichText::new(&self.ped_clip.status).weak().small());
+            }
+            ui.label(egui::RichText::new("A clip of anim.rpf on this animal's skeleton. A dictionary alone plays its move or idle clip; some dictionaries hold clips whose animation data is stored elsewhere and is not decoded. The fur is bound to the nearest skin and moves with the body.").weak().small());
+        });
+    }
+
     fn look_ui(&mut self, ui: &mut egui::Ui) -> Option<String> {
         let l = self.loaded.as_ref()?;
         let look = l.look.as_ref()?;
@@ -1435,17 +1647,34 @@ impl ModelView {
                 ui.end_row();
             };
             egui::Grid::new("pose_grid").num_columns(3).show(ui, |ui| {
+                let [sl, sr] = &mut p.shoulder;
+                pair(ui, "shoulder shrug", &mut sl[0], &mut sr[0], -15.0, 35.0);
+                pair(ui, "shoulder forward", &mut sl[1], &mut sr[1], -25.0, 35.0);
                 let [al, ar] = &mut p.arm;
                 pair(ui, "arm raise", &mut al[0], &mut ar[0], -90.0, 90.0);
                 pair(ui, "arm swing", &mut al[1], &mut ar[1], -90.0, 120.0);
+                let [tl, tr] = &mut p.arm_twist;
+                pair(ui, "arm twist", tl, tr, -90.0, 90.0);
                 let [el, er] = &mut p.elbow;
                 pair(ui, "elbow", el, er, 0.0, 140.0);
+                let [fl, fr] = &mut p.forearm_twist;
+                pair(ui, "forearm twist", fl, fr, -90.0, 90.0);
+                let [wl, wr] = &mut p.wrist;
+                pair(ui, "wrist bend", &mut wl[0], &mut wr[0], -80.0, 70.0);
+                pair(ui, "wrist side", &mut wl[1], &mut wr[1], -30.0, 20.0);
                 let [ll, lr] = &mut p.leg;
                 pair(ui, "leg lift", &mut ll[0], &mut lr[0], -45.0, 110.0);
                 pair(ui, "leg spread", &mut ll[1], &mut lr[1], -20.0, 60.0);
+                let [gl, gr] = &mut p.leg_twist;
+                pair(ui, "leg twist", gl, gr, -45.0, 45.0);
                 let [kl, kr] = &mut p.knee;
                 pair(ui, "knee", kl, kr, 0.0, 140.0);
+                let [nl, nr] = &mut p.ankle;
+                pair(ui, "ankle", nl, nr, -45.0, 30.0);
             });
+            if ui.button("Reset pose").on_hover_text("Every angle back to zero: the stored pose.").clicked() {
+                *p = PedPose::default();
+            }
             ui.horizontal(|ui| {
                 ui.label("spine");
                 ui.add(egui::DragValue::new(&mut p.spine[0]).range(-40.0..=80.0).suffix("°").prefix("bend "));
@@ -1453,12 +1682,17 @@ impl ModelView {
                 ui.add(egui::DragValue::new(&mut p.spine[2]).range(-40.0..=40.0).suffix("°").prefix("lean "));
             });
             ui.horizontal(|ui| {
+                ui.label("eyes");
+                ui.add(egui::DragValue::new(&mut p.eyes[0]).range(-35.0..=35.0).suffix("°").prefix("left "));
+                ui.add(egui::DragValue::new(&mut p.eyes[1]).range(-25.0..=25.0).suffix("°").prefix("up "));
+            });
+            ui.horizontal(|ui| {
                 ui.label("head");
                 ui.add(egui::DragValue::new(&mut p.head[0]).range(-50.0..=60.0).suffix("°").prefix("nod "));
                 ui.add(egui::DragValue::new(&mut p.head[1]).range(-80.0..=80.0).suffix("°").prefix("turn "));
                 ui.add(egui::DragValue::new(&mut p.head[2]).range(-40.0..=40.0).suffix("°").prefix("tilt "));
             });
-            ui.label(egui::RichText::new("Angles on the main bones of the shared skeleton; zero is the stored pose. Drag a value or type it.").weak().small());
+            ui.label(egui::RichText::new("Angles on the main bones of the shared skeleton (collar bone, upper arm, forearm, hand, thigh, calf, foot, spine, neck and head); zero is the stored pose. The limits are a person's rough range, not from the game. Drag a value or type it.").weak().small());
         });
         egui::CollapsingHeader::new("Animation").default_open(true).show(ui, |ui| {
             let female = look.model.is_empty() || l.parts.iter().any(|p| l.selected.contains(&p.off) && p.name.contains("_fr1_"));
@@ -1822,6 +2056,10 @@ impl ModelView {
                 }
                 self.gpu = Some(g);
                 self.hair.on_loaded(&l.fur, &l.fur_skin, &l.source);
+                self.hair.rig = (l.look.is_none() && l.fur.is_some()).then(|| FurRig::of(&l.model)).flatten().map(Arc::new);
+                if std::env::var_os("SIXNG_DEBUG_RIG").is_some() {
+                    eprintln!("[rig] loaded: {} meshes, {} skinned, {} joints, fur rig {}, max joint index {:?}", l.model.meshes.len(), l.model.meshes.iter().filter(|m| m.skinned).count(), l.model.joints.len(), self.hair.rig.is_some(), l.model.meshes.iter().flat_map(|m| m.verts.iter().flat_map(|v| v.joints)).max());
+                }
                 if let Some(look) = &l.look {
                     self.hair.hat = look.hat.clone();
                     self.hair.under_hat = look.hair.iter().filter(|h| h.slot == "hair").flat_map(|h| h.grooms.iter().copied()).collect();
@@ -2506,13 +2744,31 @@ impl ModelView {
         self.apply_paint(rs);
     }
 
+    /// A vehicle is loaded: it has wheels, or part colours (boats, aircraft).
+    fn is_vehicle(&self) -> bool {
+        self.loaded.as_ref().is_some_and(|l| l.info["part_colours"].is_object() || l.info["wheel_mounts"].as_array().is_some_and(|a| !a.is_empty()))
+    }
+
+    /// The pointer on the model while the Liveries panel has a tool on.
+    /// True when the panel used it (the camera then leaves it alone).
+    fn livery_pointer(&mut self, ui: &egui::Ui, resp: &egui::Response, rect: egui::Rect) -> bool {
+        if !self.is_vehicle() || self.gpu.is_none() {
+            return false;
+        }
+        let cache = self.cache_dir();
+        self.livery.ed.ready = !self.loading && self.idle_for_model() && self.frames_since_load >= 3;
+        let Some(l) = &self.loaded else { return false };
+        let env = crate::livery_ui::Env { game: &self.game, work: &self.work, cache: &cache };
+        self.livery.pointer(ui, resp, rect, &self.cam, &l.model, &env)
+    }
+
     /// Keep the loaded vehicle's stickers (custom liveries) on the GPU.
     fn sync_livery(&mut self, rs: &egui_wgpu::RenderState) {
         let cache = self.cache_dir();
-        let (Some(l), Some(g)) = (&self.loaded, self.gpu.as_mut()) else { return };
-        if !l.info["part_colours"].is_object() && !l.info["wheel_mounts"].as_array().is_some_and(|a| !a.is_empty()) {
+        if !self.is_vehicle() {
             return;
         }
+        let (Some(l), Some(g)) = (&self.loaded, self.gpu.as_mut()) else { return };
         let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
         let parts: Vec<String> = l.info["assembled_from"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
         let key = crate::livery::vehicle_key(&crate::vehicle_db::model_key(&l.source));
@@ -2558,7 +2814,8 @@ impl ModelView {
                 self.roof_anim = (l.model.path.clone(), roof);
                 self.clip_pos = vec![self.clip_pos_all; all.len()];
                 self.clips = all;
-                self.hinges = find_hinges(&l.model);
+                let sliding: Vec<String> = l.info["sliding_doors"].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(|n| n.to_ascii_lowercase())).collect();
+                self.hinges = find_hinges(&l.model, &sliding);
                 self.aims = find_aims(&l.model);
                 self.steer_wheel = find_steering_wheel(&l.model);
                 self.window_movers = find_window_movers(&l.model);
@@ -2613,7 +2870,7 @@ impl ModelView {
             // vehicle they are fitted to (vertex colour alpha), coloured
             // from the vehicle's part colours like its own parts.
             for l in self.wheel_src.iter_mut() {
-                let wheel: Vec<bool> = l.model.materials.iter().map(|m| m.name.ends_with(RIM_SHADER) || m.name.ends_with("_99ad6fc9")).collect();
+                let wheel: Vec<bool> = l.model.materials.iter().map(|m| m.name.ends_with(RIM_SHADER) || tyre_material(&m.name)).collect();
                 for (k, m) in l.model.materials.iter_mut().enumerate() {
                     if wheel[k] {
                         m.parts = self.wheel_look.is_some();
@@ -2647,7 +2904,7 @@ impl ModelView {
                     // rims take the rim colour (the game sets it per
                     // vehicle; it is not in the files)
                     for (k, m) in l.model.materials.iter().enumerate() {
-                        if m.name.ends_with(RIM_SHADER) || (m.parts && m.name.ends_with("_99ad6fc9")) {
+                        if m.name.ends_with(RIM_SHADER) || (m.parts && tyre_material(&m.name)) {
                             // with part colours the vertices carry the colour
                             let b = if m.parts { [1.0, 1.0, 1.0, 1.0] } else { [c[0], c[1], c[2], 1.0] };
                             ren.set_material_base(rs, &mut g, k, b);
@@ -2828,7 +3085,7 @@ impl ModelView {
             playing.extend(self.clips.iter().zip(&self.clip_pos).filter(|(_, p)| **p > 0.0).map(|(a, p)| (a, *p)));
         }
         // a character's animation clip
-        if let (true, Some(a)) = (l.look.is_some(), &self.ped_clip.anim) {
+        if let (true, Some(a)) = (l.takes_clips(), &self.ped_clip.anim) {
             playing.push((a, self.ped_clip.pos));
         }
         let js: &[glb::Joint] = match playing.is_empty() {
@@ -2857,8 +3114,13 @@ impl ModelView {
                     }
                 }
                 // a character clip's movement over the ground, on the root joints
-                if l.look.is_some() && self.ped_clip.root != Mat4::IDENTITY {
-                    for j in v.iter_mut().filter(|j| j.parent.is_none()) {
+                if l.takes_clips() && self.ped_clip.root != Mat4::IDENTITY {
+                    if std::env::var_os("SIXNG_DEBUG_RIG").is_some() {
+                        eprintln!("[clip] joints {}: {:?}; animated joints {:?}", v.len(), v.iter().take(6).map(|j| (&j.name, j.parent)).collect::<Vec<_>>(), playing.iter().flat_map(|(a, _)| a.channels.iter().map(|c| c.joint)).filter(|j| *j < 4).collect::<std::collections::BTreeSet<_>>());
+                    }
+                    // a root has no parent, or names itself as its parent
+                    for (i, j) in v.iter_mut().enumerate().filter(|(i, j)| j.parent.is_none_or(|p| p == *i)) {
+                        let _ = i;
                         j.local = (self.ped_clip.root * Mat4::from_cols_array(&j.local)).to_cols_array();
                     }
                 }
@@ -2868,14 +3130,20 @@ impl ModelView {
             true => &l.model.joints,
         };
         // hinged panels: this frame's rotation per joint
-        let open = [self.door_open, self.bonnet_open, self.boot_open];
-        let swing: HashMap<usize, Mat4> = self.hinges.iter().filter(|(_, h)| open[h.0 as usize] != 0.0).map(|(i, h)| (*i, Mat4::from_quat(Quat::from_axis_angle(h.1, h.2 * open[h.0 as usize])))).collect();
+        // (a sliding door has made its whole travel at 1 on the doors slider)
+        let open = [self.door_open, self.bonnet_open, self.boot_open, self.door_open.min(1.0)];
+        let swing: HashMap<usize, Mat4> = self
+            .hinges
+            .iter()
+            .filter(|(i, h)| open[h.0 as usize] != 0.0 && !self.panel_off(&l.model.joints[**i].name))
+            .map(|(i, h)| (*i, if h.0 == 3 { Mat4::from_translation(h.1 * open[3]) } else { Mat4::from_quat(Quat::from_axis_angle(h.1, h.2 * open[h.0 as usize])) }))
+            .collect();
         // steering: the wheel_turn bones turn about the vertical, the
         // steering wheel about its own axis
         let mut swing = swing;
         // side windows: each mover slides its glass down into the door
         if self.windows_down > 0.0 {
-            for (i, d, p) in &self.window_movers {
+            for (i, d, p) in self.window_movers.iter().filter(|w| !self.panel_off(&l.model.joints[w.0].name)) {
                 // The glass is drawn down to its bottom edge instead of
                 // being moved: x' = x - t d (d . (x - p)). A straight slide
                 // along the glass's plane would leave the door (the glass
@@ -3280,7 +3548,10 @@ impl ModelView {
         // viewport
         let avail = ui.available_size();
         let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
-        self.cam.handle(ui, &resp);
+        // the Liveries panel's tools take a click or drag on the model first
+        if !self.livery_pointer(ui, &resp, rect) {
+            self.cam.handle(ui, &resp);
+        }
         if resp.double_clicked() {
             if let Some(g) = &self.gpu {
                 self.cam.fly = false;
@@ -3293,6 +3564,12 @@ impl ModelView {
         let px = [(rect.width() * ppp) as u32, (rect.height() * ppp) as u32];
         self.size = px;
         self.update_wheels(rs, &ctx);
+        // the Liveries panel floats over the view
+        if self.is_vehicle() {
+            let cache = self.cache_dir();
+            let env = crate::livery_ui::Env { game: &self.game, work: &self.work, cache: &cache };
+            self.livery.panel(&ctx, rect, &env);
+        }
         self.sync_livery(rs);
         if self.rotor_speed > 0.0 && self.air.iter().any(|p| p.kind == AirKind::Spin) {
             // slow enough to see the blades below half speed; the blurred
@@ -3369,6 +3646,12 @@ impl ModelView {
         }
         self.update_hair(rs, &ctx);
         let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+        // an animal's fur is bound to its skin and takes the same joint matrices
+        if self.hair.rig.is_some() && !skin.is_empty() {
+            for g in &self.hair.gpu {
+                ren.set_joints(rs, g, &skin);
+            }
+        }
         // a character's hair, brows and beard ride on the head bone
         if let Some(l) = self.loaded.as_ref().filter(|l| l.look.is_some()) {
             let head = l.model.joints.iter().position(|j| j.name == "SKEL_Head").and_then(|i| skin.get(i)).copied().unwrap_or(Mat4::IDENTITY);
@@ -3485,7 +3768,7 @@ impl ModelView {
             // then showed the car without wheels); 180 s is the last resort.
             let busy = self.wheel_loading || self.brake_loading || matches!(&*self.vehicles.state.lock().unwrap(), crate::vehicle_db::State::Loading(_));
             let ready = (self.gpu.is_some() && !self.loading && self.frames_since_load >= 3 && settled)
-                || (!self.loading && !self.hair.fitting && !self.auto.find_hair && !self.auto.export_hair && self.hair.settled() && self.auto.frames > 600 && (!busy || ctx.input(|i| i.time) > 180.0));
+                || (!self.loading && !self.hair.fitting && !self.auto.find_hair && !self.auto.export_hair && self.hair.settled() && self.auto.frames > 600 && !self.livery.ed.busy() && (!busy || ctx.input(|i| i.time) > 180.0));
             if ready {
                 if let Some((w, h, px)) = ren.read_back(rs) {
                     match render3d::save_png(&path, w, h, &px) {
@@ -3632,6 +3915,10 @@ impl ModelView {
         ui.add(egui::Slider::new(&mut self.look.emissive, 0.0..=12.0).text("emissive"));
         ui.add(egui::Slider::new(&mut self.look.wet, 0.0..=1.0).text("wet"));
         ui.separator();
+        if self.is_vehicle() {
+            ui.toggle_value(&mut self.livery.ed.open, "🎨 Liveries")
+                .on_hover_text("Place stickers (logos, lettering) on this vehicle by hand: pictures from the game's sticker textures or your own PNG files, on the panels you choose. Saved per vehicle.");
+        }
         self.vehicle_ui(ui);
         if self.part_ramp_done.is_some() && self.loaded.as_ref().is_some_and(|l| l.model.materials.iter().any(|m| m.ramp.is_some())) {
             ui.add(egui::Slider::new(&mut self.look.wear, 0.0..=1.0).text("wear"))
@@ -3667,9 +3954,13 @@ impl ModelView {
                 }
                 if caps.doors {
                     ui.add(egui::Slider::new(&mut self.door_open, 0.0..=1.3).text("doors open"));
+                    let doors: Vec<usize> = self.hinges.iter().filter(|(_, h)| matches!(h.0, 0 | 3)).map(|(i, _)| *i).collect();
+                    self.panel_boxes(ui, doors);
                 }
                 if self.hinges.values().any(|h| h.0 == 1) {
                     ui.add(egui::Slider::new(&mut self.bonnet_open, 0.0..=1.1).text("bonnet open"));
+                    let bonnet: Vec<usize> = self.hinges.iter().filter(|(_, h)| h.0 == 1).map(|(i, _)| *i).collect();
+                    self.panel_boxes(ui, bonnet);
                 }
                 if let Some(l) = self.loaded.as_ref().filter(|l| l.model.joints.iter().any(|j| is_steer_bone(&j.name))) {
                     let _ = l;
@@ -3714,6 +4005,8 @@ impl ModelView {
                 }
                 if !self.window_movers.is_empty() {
                     ui.add(egui::Slider::new(&mut self.windows_down, 0.0..=1.0).text("windows down")).on_hover_text("Lowers each side window by its mover bone (window_lf_mover ...): the glass is drawn down to its bottom edge, so its top edge drops to the sill. The bones are the game's; the path the game moves the glass along inside the door is not read from the files, so the glass is shortened instead of slid.");
+                    let windows: Vec<usize> = self.window_movers.iter().map(|w| w.0).collect();
+                    self.panel_boxes(ui, windows);
                 }
                 if !self.brakes.is_empty() {
                     ui.add(egui::Slider::new(&mut self.brake_heat, 0.0..=1.0).text("brake glow")).on_hover_text("Makes the brake discs glow as if hot, from dull red to orange. A viewer effect on the fitted disc models: how the game heats and lights its discs is not read from the files.");
@@ -3772,6 +4065,8 @@ impl ModelView {
                 }
                 if self.hinges.values().any(|h| h.0 == 2) {
                     ui.add(egui::Slider::new(&mut self.boot_open, 0.0..=1.1).text("boot open"));
+                    let boot: Vec<usize> = self.hinges.iter().filter(|(_, h)| h.0 == 2).map(|(i, _)| *i).collect();
+                    self.panel_boxes(ui, boot);
                 }
                 for (a, p) in self.clips.iter().zip(self.clip_pos.iter_mut()) {
                     let n = a.name.rsplit('/').next().unwrap_or(&a.name).trim_end_matches("_anim").replace('_', " ");
@@ -3836,6 +4131,7 @@ impl ModelView {
             self.hair_ui(ui);
             ui.separator();
         }
+        self.animal_clip_ui(ui);
         if let Some(q) = self.look_ui(ui).or_else(|| self.parts_ui(ui)).or_else(|| self.parts_request.take()) {
             self.keep_cam_once = true;
             let ctx = ui.ctx().clone();
@@ -4171,6 +4467,7 @@ fn load_parts(
     // per outfit part: its meshes, its joint list and the joint an attached
     // accessory was moved onto
     let mut rig_parts: Vec<(std::ops::Range<usize>, Vec<glb::Joint>, Option<usize>)> = Vec::new();
+    let mut named_parts: Vec<(std::ops::Range<usize>, Vec<(String, Option<usize>)>)> = Vec::new();
     let mut under_meshes: Vec<std::ops::Range<usize>> = Vec::new();
     let mut outer_meshes: Vec<std::ops::Range<usize>> = Vec::new();
     // Body shape: the skin and head are posed by the game's rig; clothes
@@ -4257,6 +4554,10 @@ fn load_parts(
                 }
                 if f.is_some() {
                     rig_parts.push((mesh0..mesh0 + m.meshes.len(), m.joints.iter().map(|j| glb::Joint { name: j.name.clone(), parent: j.parent, local: j.local, ibm: j.ibm }).collect(), attached));
+                } else {
+                    // an animal's part: its own joint list, to bind it to the root's skeleton by name
+                    // (empty for a part without bones, which then rides on the bone nearest to it)
+                    named_parts.push((mesh0..mesh0 + m.meshes.len(), m.joints.iter().map(|j| (j.name.clone(), j.parent)).collect()));
                 }
                 match f.map_or(0, |f| f.layer) {
                     1 => under_meshes.push(mesh0..mesh0 + m.meshes.len()),
@@ -4312,6 +4613,12 @@ fn load_parts(
         let hidden = hide_covered_skin(m, &under_meshes, &outer_meshes);
         if hidden > 0 {
             notes.push(format!("Layers: {hidden} triangles of the clothes worn under the jacket are hidden where the jacket covers them, so they do not show through it."));
+        }
+    }
+    if let (Some(m), true, false) = (&mut model, rig_parts.is_empty(), named_parts.is_empty()) {
+        let bound = rig_by_name(m, &named_parts);
+        if bound > 0 {
+            notes.push(format!("Rig: {bound} mesh(es) are bound to the skeleton by bone name, so a clip moves the animal."));
         }
     }
     if let (Some(m), false) = (&mut model, rig_parts.is_empty()) {
@@ -4610,6 +4917,72 @@ fn place_attached(m: &mut glb::Model) -> Option<usize> {
 /// helper bone goes to the nearest ancestor in the shared skeleton, and an
 /// attached accessory to the bone it was moved onto. Returns whether a
 /// skeleton was found.
+/// Bind the parts of an animal to the model's skeleton: every part comes
+/// with its own joint list, and a vertex joint is the model's joint of the
+/// same name (else of the nearest parent that has one, else the root).
+/// Weights are scaled to sum to 255. Returns the meshes bound.
+fn rig_by_name(m: &mut glb::Model, parts: &[(std::ops::Range<usize>, Vec<(String, Option<usize>)>)]) -> usize {
+    if m.joints.is_empty() {
+        return 0;
+    }
+    let by_name: HashMap<&str, usize> = m.joints.iter().enumerate().map(|(i, j)| (j.name.as_str(), i)).rev().collect();
+    let mut bound = 0;
+    for (range, pj) in parts.iter().filter(|p| !p.1.is_empty()) {
+        let map: Vec<u16> = (0..pj.len())
+            .map(|j| {
+                std::iter::successors(Some(j), |&x| pj[x].1.filter(|&p| p != x && p < pj.len())).take(64).find_map(|x| by_name.get(pj[x].0.as_str()).copied()).unwrap_or(0) as u16
+            })
+            .collect();
+        let maps: Vec<u16> = map;
+        for mi in range.clone() {
+            let Some(me) = m.meshes.get_mut(mi) else { continue };
+            for v in &mut me.verts {
+                let tot: u32 = v.weights.iter().map(|w| *w as u32).sum();
+                if tot == 0 {
+                    v.joints = [0; 4];
+                    v.weights = [255, 0, 0, 0];
+                    continue;
+                }
+                let mut w: [u32; 4] = std::array::from_fn(|k| v.weights[k] as u32 * 255 / tot);
+                w[0] += 255 - w.iter().sum::<u32>();
+                for k in 0..4 {
+                    v.joints[k] = if w[k] > 0 { maps.get(v.joints[k] as usize).copied().unwrap_or(0) } else { 0 };
+                    v.weights[k] = w[k] as u8;
+                }
+            }
+            me.skinned = true;
+            bound += 1;
+        }
+    }
+    // Parts without bones (eyes, teeth, tongue): each vertex rides on the
+    // strongest bone of the bound vertex nearest to its mesh's middle.
+    let skinned: Vec<([f32; 3], u16)> = m
+        .meshes
+        .iter()
+        .filter(|me| me.skinned)
+        .flat_map(|me| me.verts.iter().map(|v| (v.pos, v.joints[(0..4).max_by_key(|&k| v.weights[k]).unwrap_or(0)])))
+        .collect();
+    if skinned.is_empty() {
+        return bound;
+    }
+    for (range, _) in parts.iter().filter(|p| p.1.is_empty()) {
+        for mi in range.clone() {
+            let Some(me) = m.meshes.get_mut(mi).filter(|me| !me.verts.is_empty()) else { continue };
+            let n = me.verts.len() as f32;
+            let c = me.verts.iter().fold([0.0f32; 3], |a, v| [a[0] + v.pos[0] / n, a[1] + v.pos[1] / n, a[2] + v.pos[2] / n]);
+            let d = |p: &[f32; 3]| (p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2) + (p[2] - c[2]).powi(2);
+            let Some(j) = skinned.iter().min_by(|a, b| d(&a.0).total_cmp(&d(&b.0))).map(|x| x.1) else { continue };
+            for v in &mut me.verts {
+                v.joints = [j, 0, 0, 0];
+                v.weights = [255, 0, 0, 0];
+            }
+            me.skinned = true;
+            bound += 1;
+        }
+    }
+    bound
+}
+
 fn rig_character(m: &mut glb::Model, parts: &[(std::ops::Range<usize>, Vec<glb::Joint>, Option<usize>)], skin: &[std::ops::Range<usize>]) -> bool {
     use glam::Mat4;
     // the shared skeleton: the shortest full-size joint list, where the
@@ -4671,6 +5044,27 @@ fn rig_character(m: &mut glb::Model, parts: &[(std::ops::Range<usize>, Vec<glb::
         // `FACIAL_...`) hang from the head, and their parts must stay with
         // it; the nearest body skin under an eye is the neck.
         let face = |j: usize| std::iter::successors(Some(j), |&x| pj.get(x).and_then(|q| q.parent).filter(|&p| p != x && x >= n)).take(64).any(|x| pj.get(x).is_some_and(|q| q.name.starts_with("FB_") || q.name.starts_with("FACIAL_")));
+        // The eyeball bones (`FB_L_Eyeball`, its roll, iris and pupil, and
+        // the right side's) join the shared skeleton under the head, so
+        // the Pose controls can turn the eyes. Parents come first in a
+        // joint list, so one pass in order places each under its own.
+        let mut eye: HashMap<usize, u16> = HashMap::new();
+        for j in n..pj.len() {
+            if !pj[j].name.starts_with("FB_") {
+                continue;
+            }
+            let at = match joints.iter().position(|q| q.name == pj[j].name) {
+                Some(i) => i,
+                None => {
+                    let parent = pj[j].parent.filter(|&p| p != j).map_or(0, |p| eye.get(&p).copied().unwrap_or_else(|| up(p))) as usize;
+                    let local = Mat4::from_cols_array(&joints[parent].ibm) * Mat4::from_cols_array(&pj[j].ibm).inverse();
+                    joints.push(glb::Joint { name: pj[j].name.clone(), parent: Some(parent), local: if local.is_finite() { local.to_cols_array() } else { pj[j].local }, ibm: pj[j].ibm });
+                    joints.len() - 1
+                }
+            };
+            eye.insert(j, at as u16);
+        }
+        let to_shared = |j: usize| eye.get(&j).copied().unwrap_or_else(|| up(j));
         let fixed = attached.map(|a| up(a));
         for mi in range.clone() {
             let Some(me) = m.meshes.get_mut(mi) else { continue };
@@ -4696,7 +5090,7 @@ fn rig_character(m: &mut glb::Model, parts: &[(std::ops::Range<usize>, Vec<glb::
                 let rest = 255 - w.iter().sum::<u32>();
                 w[0] += rest;
                 for k in 0..4 {
-                    v.joints[k] = if w[k] > 0 { up(v.joints[k] as usize) } else { 0 };
+                    v.joints[k] = if w[k] > 0 { to_shared(v.joints[k] as usize) } else { 0 };
                     v.weights[k] = w[k] as u8;
                 }
             }
@@ -5855,6 +6249,62 @@ fn load_query_sel(
     })
 }
 
+impl ModelView {
+    /// Whether the panel on this bone is to stay shut (its box is unticked).
+    fn panel_off(&self, bone: &str) -> bool {
+        !self.panels_off.is_empty() && self.panels_off.contains(&bone.to_ascii_lowercase())
+    }
+
+    /// A row of tick boxes, one per panel bone: an unticked panel stays shut
+    /// while its slider moves the others.
+    fn panel_boxes(&mut self, ui: &mut egui::Ui, joints: Vec<usize>) {
+        let Some(l) = self.loaded.as_ref() else { return };
+        let mut names: Vec<String> = joints.iter().filter_map(|i| l.model.joints.get(*i)).map(|j| j.name.to_ascii_lowercase()).collect();
+        names.sort();
+        ui.horizontal_wrapped(|ui| {
+            for n in names {
+                let mut on = !self.panels_off.contains(&n);
+                if ui.checkbox(&mut on, panel_label(&n)).on_hover_text(format!("Unticked, this one stays shut while the slider moves the others ({n}).")).changed() {
+                    if on {
+                        self.panels_off.remove(&n);
+                    } else {
+                        self.panels_off.insert(n);
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// What a panel's tick box says, from its bone name: `door_dside_f` is the
+/// driver's front door, `window_lr_mover` the left rear window.
+fn panel_label(name: &str) -> String {
+    let n = name.to_ascii_lowercase();
+    let end = |c: &str| match c {
+        "f" => "front",
+        "r" => "rear",
+        "m" => "middle",
+        _ => "",
+    };
+    if let Some(r) = n.strip_prefix("door_") {
+        let (side, at) = r.split_once('_').unwrap_or((r, ""));
+        let side = match side {
+            "dside" => "driver",
+            "pside" => "passenger",
+            o => o,
+        };
+        return format!("{side} {}", end(at)).trim().to_string();
+    }
+    if let Some(r) = n.strip_prefix("window_").map(|r| r.trim_end_matches("_mover")) {
+        if r.len() == 2 {
+            let side = if r.starts_with('l') { "left" } else { "right" };
+            return format!("{side} {}", end(&r[1..])).trim().to_string();
+        }
+        return r.to_string();
+    }
+    n
+}
+
 /// The hinged panels of a vehicle: door, bonnet and boot bones, with the
 /// axis and the direction that opens them. Doors turn about the vertical
 /// through their bone, away from the car's centre line; bonnet and boot turn
@@ -5862,9 +6312,19 @@ fn load_query_sel(
 /// where the panel's vertices lie relative to its bone (a front-hinged
 /// bonnet and a rear-hinged door open the right way); the opening angle is
 /// the slider's, not a stored limit.
-fn find_hinges(model: &glb::Model) -> HashMap<usize, (u8, Vec3, f32)> {
+///
+/// A door bone named in `sliding` (model.json `sliding_doors`, from the bone
+/// flags) slides along its bone's track instead: the bone's own forward
+/// axis, which the model turns a little about the vertical so that the door
+/// moves out of its opening as it moves back. It always moves towards the
+/// rear. How far is not stored: the door's front edge stops 5 cm short of
+/// the rear end of its opening at sill height (where a wheel arch cuts into
+/// the door the opening is shorter there), so that a roller bracket at the
+/// door's bottom front edge stays in the opening instead of running into
+/// the panel behind it; and never more than 0.9 of the door's length.
+fn find_hinges(model: &glb::Model, sliding: &[String]) -> HashMap<usize, (u8, Vec3, f32)> {
     let kind = |n: &str| match n.to_ascii_lowercase().as_str() {
-        "door_dside_f" | "door_dside_r" | "door_pside_f" | "door_pside_r" => Some(0u8),
+        "door_dside_f" | "door_dside_r" | "door_pside_f" | "door_pside_r" | "door_dside_m" | "door_pside_m" => Some(0u8),
         "bonnet" => Some(1),
         "boot" => Some(2),
         _ => None,
@@ -5882,13 +6342,26 @@ fn find_hinges(model: &glb::Model) -> HashMap<usize, (u8, Vec3, f32)> {
             k = model.joints[j].parent.filter(|p| *p != j && depth < 64);
         }
     }
+    // a sliding door's track in model space, pointing to the rear (+Z here;
+    // the bone's forward axis is its local Z after the change to Y-up)
+    let track = |h: usize| -> Option<Vec3> {
+        sliding.contains(&model.joints[h].name.to_ascii_lowercase()).then(|| {
+            let z = Mat4::from_cols_array(&model.joints[h].ibm).inverse().z_axis.truncate().normalize_or_zero();
+            if z.z < 0.0 { -z } else { z }
+        })
+    };
     let mut sum: HashMap<usize, (Vec3, f32)> = HashMap::new();
+    // a sliding door's own vertices: place along its track, height
+    let mut span: HashMap<usize, Vec<(f32, f32)>> = HashMap::new();
     for me in model.meshes.iter().filter(|m| m.skinned) {
         for v in &me.verts {
             if let Some(h) = owner.get(v.joints[0] as usize).copied().flatten() {
                 let e = sum.entry(h).or_insert((Vec3::ZERO, 0.0));
                 e.0 += Vec3::from(v.pos);
                 e.1 += 1.0;
+                if let Some(t) = track(h).filter(|_| v.joints[0] as usize == h) {
+                    span.entry(h).or_default().push((t.dot(Vec3::from(v.pos)), v.pos[1]));
+                }
             }
         }
     }
@@ -5898,6 +6371,20 @@ fn find_hinges(model: &glb::Model) -> HashMap<usize, (u8, Vec3, f32)> {
             let pivot = Mat4::from_cols_array(&model.joints[h].ibm).inverse().w_axis.truncate();
             let d = centre - pivot;
             let k = kind(&model.joints[h].name)?;
+            if let (Some(t), Some(s)) = (track(h), span.get(&h).filter(|s| s.len() >= 8)) {
+                let mut along: Vec<f32> = s.iter().map(|p| p.0).collect();
+                along.sort_by(|a, b| a.total_cmp(b));
+                // the panel's front edge: a bracket that reaches forward of
+                // it is a few vertices only (32 of 3,564 on the minivan)
+                let (front, rear) = (along[along.len() * 3 / 100], along[along.len() - 1]);
+                let (low, high) = s.iter().fold((f32::MAX, f32::MIN), |m, p| (m.0.min(p.1), m.1.max(p.1)));
+                // the rear end of the opening at sill height
+                let sill = s.iter().filter(|p| p.1 < low + 0.15 * (high - low)).map(|p| p.0).fold(f32::MIN, f32::max);
+                let travel = (sill - front - 0.05).min(0.9 * (rear - along[0])).max(0.0);
+                // the travel in the bone's own space (a swing is applied there)
+                let local = Mat4::from_cols_array(&model.joints[h].ibm).transform_vector3(t * travel);
+                return Some((h, (3, local, 1.0)));
+            }
             Some((
                 h,
                 if k == 0 {
@@ -6940,6 +7427,9 @@ fn export_load_shaped(
                 || j.contains("\"weapon_parts\"") && !j.contains("\"sub_material_surface\"")
         });
     // Cached ped clothing from before the fabric shade came from the packed map.
+    // Cached tyres whose shader is the `_lod` tyre variant, from before its
+    // placeholder palette (entry 0 pure red) was left unapplied.
+    let stale_tyre = std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| j.contains("b994d670") && j.contains("GLB COLOR_0 = palette entry"));
     let stale_cloth = std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| j.contains("739e3d0d") && !j.contains("shade_source"));
     // Cached animal parts from before part skins (eyes, tint-mask coats).
     let stale_animal = e.name.as_deref().is_some_and(|n| sixng_core::partskin::animal_root(n).is_some())
@@ -6949,7 +7439,7 @@ fn export_load_shaped(
         png: true,
         dds: false,
         raw: false,
-        force: head || shaped || !skins.is_empty() || stale_tint || stale_vehicle || stale_animal || stale_cloth,
+        force: head || shaped || !skins.is_empty() || stale_tint || stale_vehicle || stale_animal || stale_cloth || stale_tyre,
         skip_embedded_textures: false,
         body_shape,
         head_skin: HEAD_SKIN.load(std::sync::atomic::Ordering::Relaxed),

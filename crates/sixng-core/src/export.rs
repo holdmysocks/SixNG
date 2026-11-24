@@ -260,7 +260,7 @@ fn readable_materials(model: &str, shaders: &[crate::drawable::Shader], mats: &s
                 "parameters": values,
                 "parameters_not_read": unread,
             });
-            for k in ["paint", "multilayer", "texture_fallback"] {
+            for k in ["paint", "multilayer", "stitches", "texture_fallback"] {
                 if !m[k].is_null() {
                     out[k] = m[k].clone();
                 }
@@ -431,9 +431,8 @@ const RUNTIME_SCREEN: &str = "a800afccf01aa36b";
 /// grey, orange and cyan, then shades of them. The game writes the wheel
 /// colours over it, so it is not multiplied into the rim.
 const WHEEL_RIM: &str = "c5cdbdd2";
-/// `standard_vehicle_2lyr_tyre_inst`: the shared `tyre_*` models carry the
-/// same placeholder palette.
-const WHEEL_TYRE: &str = "99ad6fc9";
+/// The tyre shaders (`material::is_tyre_shader`): the shared `tyre_*`
+/// models carry the same placeholder palette.
 
 #[derive(Default)]
 struct ShaderTextures {
@@ -719,7 +718,7 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                             }
                             match texture::embedded_rgba(r, et) {
                                 Ok(rgba) => {
-                                    if t.param_hash == TINT_PALETTE && et.height == 1 && (s.name_hash == WHEEL_RIM || s.name_hash == WHEEL_TYRE) {
+                                    if t.param_hash == TINT_PALETTE && et.height == 1 && (s.name_hash == WHEEL_RIM || crate::material::is_tyre_shader(&s.name_hash)) {
                                         e["applied"] = "not applied: a placeholder of marker colours that the game replaces with the wheel colours".into();
                                     } else if t.param_hash == TINT_PALETTE && et.height == 1 {
                                         st.tint_palette = Some(rgba.chunks(4).map(|p| [p[0], p[1], p[2], p[3]]).collect());
@@ -1310,7 +1309,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 "wheel_mounts_version": 3,
                 "part_colours_version": crate::vehcolour::EXPORT_VERSION,
                 "part_colours": shader_tex.iter().any(|st| st.vehicle_palette.is_some()).then(|| match shader_tex.iter().find_map(|st| st.vehicle_parts.as_ref()) {
-                    Some(set) => serde_json::json!({"status": "applied", "part_set": set, "shared_part": part_looks["shared"], "shared_part_note": "true for a library part's model (a truck bed or box, a light bar ...), which several vehicles fit: its part ids mean the same piece in every vehicle's part set, and it takes the colours of the vehicle and configuration it is on. This export uses the set of the first configuration found that names the part (the vehicle is the 8 hex digits after + in part_set).", "looks": part_looks["looks"], "part_patches": part_looks["part_patches"], "part_patches_note": "what fitting one more of the vehicle's own parts changes (part name -> ids and their look entries, 8 hex digits each, encoded like looks): a body kit's part rebinds the part ids of its panels, mostly to the body paint (alpha 254). Computed on top of the default look.", "rows": part_looks["rows"], "wear": part_looks["wear"], "wear_note": "per look, the second layer of each part id's surface (256 x 8 hex digits: palette row as in rows, then roughness and metalness, 0 to 255). Every surface record names a second colour and material (rust brown under paint, grey under bare metal, mostly rough and not metallic). It is not applied to the GLB. Where and how much the game shows it is not decoded; the blue channel of the layer detail texture looks like an edge wear mask.", "palette": part_looks["rows"].is_array().then_some("vehicle_palette.png"), "rows_note": "per look, the palette row of each part id (256 x 4 hex digits: slice x 256 + row; ffff = the part has a colour of its own, the one in looks). palette is the material palette beside this file, 128 columns wide, its slices one below the other (256 rows each). The game reads a part's row at the column the green channel of the material's layer detail texture (lyr0diffusetex) gives per pixel; looks and COLOR_0 hold the row at that texture's mean green instead.", "configs": part_looks["configs"], "default": part_looks["default"], "paint_finish": part_looks["paint_finish"], "paint_finish_note": "the body paint's finish: metalness and roughness of the surfaces of the primary-paint parts (COLOR_0 alpha 254), averaged over their vertices of every LOD; null when the model has none", "looks_note": "looks: the part colours each distinct configuration result gives, 256 x RGBA per look as hex (encoded like GLB COLOR_0, indexed by part id = _COLOR0 alpha); configs: a configuration's parts_key (vehicles.json) -> look; default: the look baked into the GLB", "note": "each vertex of the two-layer vehicle materials takes the colour of its part id (GLB COLOR_0; see the materials' classification.parts_note)"}),
+                    Some(set) => serde_json::json!({"status": "applied", "part_set": set, "shared_part": part_looks["shared"], "shared_part_note": "true for a library part's model (a truck bed or box, a light bar ...), which several vehicles fit: its part ids mean the same piece in every vehicle's part set, and it takes the colours of the vehicle and configuration it is on. This export uses the set of the first configuration found that names the part (the vehicle is the 8 hex digits after + in part_set).", "looks": part_looks["looks"], "part_patches": part_looks["part_patches"], "tyre_colour_note": "the tyre colour slot (f3bd038d: ten parts that give the tyre, part id 35, one of ten colours; fitted by some configurations of boxville, burrito, journey, rentalbus and stanier) is not applied: what the game does with it is not decoded, and applied to the whole tyre it would make it red or light grey. Tyres keep the rubber of the part set.", "part_patches_note": "what fitting one more of the vehicle's own parts changes (part name -> ids and their look entries, 8 hex digits each, encoded like looks): a body kit's part rebinds the part ids of its panels, mostly to the body paint (alpha 254). Computed on top of the default look.", "rows": part_looks["rows"], "wear": part_looks["wear"], "wear_note": "per look, the second layer of each part id's surface (256 x 8 hex digits: palette row as in rows, then roughness and metalness, 0 to 255). Every surface record names a second colour and material (rust brown under paint, grey under bare metal, mostly rough and not metallic). It is not applied to the GLB. Where and how much the game shows it is not decoded; the blue channel of the layer detail texture looks like an edge wear mask.", "palette": part_looks["rows"].is_array().then_some("vehicle_palette.png"), "rows_note": "per look, the palette row of each part id (256 x 4 hex digits: slice x 256 + row; ffff = the part has a colour of its own, the one in looks). palette is the material palette beside this file, 128 columns wide, its slices one below the other (256 rows each). The game reads a part's row at the column the green channel of the material's layer detail texture (lyr0diffusetex) gives per pixel; looks and COLOR_0 hold the row at that texture's mean green instead.", "configs": part_looks["configs"], "default": part_looks["default"], "paint_finish": part_looks["paint_finish"], "paint_finish_note": "the body paint's finish: metalness and roughness of the surfaces of the primary-paint parts (COLOR_0 alpha 254), averaged over their vertices of every LOD; null when the model has none", "looks_note": "looks: the part colours each distinct configuration result gives, 256 x RGBA per look as hex (encoded like GLB COLOR_0, indexed by part id = _COLOR0 alpha); configs: a configuration's parts_key (vehicles.json) -> look; default: the look baked into the GLB", "note": "each vertex of the two-layer vehicle materials takes the colour of its part id (GLB COLOR_0; see the materials' classification.parts_note)"}),
                     None => serde_json::json!({"status": "no part set found for this model: the two-layer materials keep their stand-in colours"}),
                 }),
                 "roof_animation": roof_info,
@@ -1332,6 +1331,9 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                         crate::material::four_layer_vertex_weights(&mut l, material_colours1(&lod_groups, si));
                         m["multilayer"] = l;
                     }
+                    if let Some(x) = crate::material::stitches(&s.name_hash, material_uv2(&lod_groups, si)) {
+                        m["stitches"] = x;
+                    }
                     if m["classification"]["class"] == "car_paint" {
                         m["paint"] = crate::material::paint_block();
                         if let Some(c) = o.paint {
@@ -1344,6 +1346,11 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 "materials_note": "Textures come from the data/ttdb/*.ttpf stores by 64-bit hash and are written once to <out>/textures/ttpf/<hash>.png. Roles are guessed from the shader parameter hash and the format (sRGB = colour, BC5 / known normal slots = normal map). classification.class is one of opaque/alpha/cutout/decal/glass/window/emissive/water/terrain_multilayer/car_paint, from the shader record flags and known shader families. shader_name and param_name are joaat names from <work>/names/names.json (`sixng names`), null when unknown. slot_role names the PBR map a known parameter slot holds.",
             });
             let mut j = j;
+            let sliding: Vec<String> = info.skeleton.iter().filter(|b| crate::drawable::slides(b)).map(|b| b.name.clone()).collect::<Vec<_>>();
+            if !sliding.is_empty() {
+                j["sliding_doors"] = serde_json::json!(sliding);
+                j["sliding_doors_note"] = "Door bones that slide instead of turning: their bone flags allow a limited translation (0x80) and no limited rotation (0x08 clear), where a hinged door has 0x7f. The track is the bone's own Y axis (the bone is turned about the vertical so that the door moves out as it moves back). How far a door slides is not stored in the model.".into();
+            }
             if let Some((_, rec)) = head.as_ref().filter(|h| !h.1["preset"].is_null()) {
                 j["part_skin"] = rec.clone();
                 j["part_skin_note"] = "Animal parts: the colour texture comes from the part's material preset (packs.rpf meta, struct f795e8ba) when the drawable's own one is in no store or is a tint mask (cattle: R and B patch masks, G shading, coloured in game by the preset's tint bytes through a palette that is not decoded). preset: name hash of the preset used; slot_presets: how many presets (variations) the part has; replaced: the texture the drawable binds.".into();
@@ -1393,6 +1400,13 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
 fn material_colours1(lod_groups: &[Vec<crate::gltf::NodeGroup>], shader: usize) -> impl Iterator<Item = [u8; 4]> + '_ {
     let lod = lod_groups.iter().find(|g| g.iter().any(|n| !n.prims.is_empty()));
     lod.into_iter().flatten().flat_map(|n| &n.prims).filter(move |p| p.material == Some(shader)).filter_map(|p| p.colors1.as_ref()).flatten().copied()
+}
+
+/// The third UV set of every vertex of a material, in the first populated
+/// LOD.
+fn material_uv2(lod_groups: &[Vec<crate::gltf::NodeGroup>], shader: usize) -> impl Iterator<Item = [f32; 2]> + '_ {
+    let lod = lod_groups.iter().find(|g| g.iter().any(|n| !n.prims.is_empty()));
+    lod.into_iter().flatten().flat_map(|n| &n.prims).filter(move |p| p.material == Some(shader)).filter_map(|p| p.uvs.get(2)).flatten().copied()
 }
 
 fn material_uv_fit(lod_groups: &[Vec<crate::gltf::NodeGroup>], shader: usize) -> serde_json::Value {
@@ -1695,6 +1709,9 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             if let Some(mut l) = crate::material::multilayer(s, &st.entries, || material_uv_fit(&lod_groups, si)) {
                         crate::material::four_layer_vertex_weights(&mut l, material_colours1(&lod_groups, si));
                 x["multilayer"] = l;
+            }
+            if let Some(l) = crate::material::stitches(&s.name_hash, material_uv2(&lod_groups, si)) {
+                x["stitches"] = l;
             }
             x
         },

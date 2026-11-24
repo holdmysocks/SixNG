@@ -378,6 +378,32 @@ impl ModelPicker {
                         Err(e) => errs.push(format!("{a}: {e:#}")),
                     }
                 }
+                // every model of the game's outfit list that no drawable prefix
+                // names: characters made of shared parts only (`cs_mandy`), and
+                // the models whose name is not known (`ped_0x…`)
+                match sixng_core::pedlook::listed_models(&ws.game) {
+                    Ok(models) => {
+                        let have: std::collections::HashSet<String> = v.iter().filter(|it| it.rtype == "outfit").map(|it| it.lname.clone()).collect();
+                        let mut added = 0;
+                        for m in models {
+                            if have.contains(&m.name) || sixng_core::outfit::is_animal(&m.name) {
+                                continue;
+                            }
+                            added += 1;
+                            v.push(Item {
+                                cat: Cat::People,
+                                variant: false,
+                                lname: m.name.clone(),
+                                id: format!("packs.rpf#outfit:{}", m.name),
+                                name: m.name,
+                                rtype: "outfit",
+                                bytes: 0,
+                            });
+                        }
+                        log(&format!("ped model list: {added} models added"));
+                    }
+                    Err(e) => log(&format!("ped model list: {e}")),
+                }
                 v.sort_by(|a, b| a.lname.cmp(&b.lname));
                 // generic ped pieces come as several entries with one name (their LOD
                 // copies): keep the largest listed, the others count as LOD copies

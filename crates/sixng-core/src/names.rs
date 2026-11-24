@@ -12,7 +12,19 @@
 //!   (the shader list, meta field names, enum values, material names);
 //! * `shaders`: NUL-terminated identifiers in `shaders.rpf` (technique,
 //!   sampler, texture and variable names);
-//! * `derived`: the built-in list.
+//! * `derived`: the built-in list;
+//! * `audio`: from `audio.rpf` (when indexed): identifiers of its text
+//!   entries, NUL-delimited names in its metadata files (wave slot names),
+//!   and the dotted audio pack names (`Core.RadioStation.news`);
+//! * `mounts`: virtual file-system paths (`platform:/levels/…/x.rpf`,
+//!   `common:/data/…`, `$(target)/data/…`, `audio:/config/…`) in the
+//!   text and XML of `common.rpf` and `audio.rpf`, mostly the content
+//!   files' mount lists. Each path adds itself, itself without the
+//!   extension and its file name with the extension;
+//! * `banks`: audio bank names (`core.resident/gun_pistol`), found by
+//!   joining the audio pack names and identifiers above and matching the
+//!   bank container hashes that `sixng audio-meta` records
+//!   ([`find_bank_names`]).
 //!
 //! Optionally, `sixng names --namehash <dictionary.json>` imports a
 //! [gta6-namehash](https://github.com/tarekmania/gta6-namehash) dictionary
@@ -138,6 +150,8 @@ pub enum Ctx {
     Shader,
     Param,
     Field,
+    /// Audio bank (container) and object names.
+    Audio,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -151,11 +165,12 @@ pub struct Dict {
     pub exact: BTreeMap<String, Vec<(String, String)>>,
 }
 
-fn order(ctx: Ctx) -> [&'static str; 3] {
+fn order(ctx: Ctx) -> [&'static str; 6] {
     match ctx {
-        Ctx::Shader => ["common", "shaders", "derived"],
-        Ctx::Param => ["derived", "shaders", "common"],
-        Ctx::Field => ["common", "shaders", "derived"],
+        Ctx::Shader => ["common", "shaders", "derived", "audio", "mounts", "banks"],
+        Ctx::Param => ["derived", "shaders", "common", "audio", "mounts", "banks"],
+        Ctx::Field => ["common", "shaders", "derived", "audio", "mounts", "banks"],
+        Ctx::Audio => ["banks", "audio", "mounts", "common", "shaders", "derived"],
     }
 }
 
@@ -357,6 +372,95 @@ fn idents(b: &[u8], out: &mut std::collections::HashSet<String>) {
     }
 }
 
+fn path_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'/' | b'-' | b'%' | b'@')
+}
+
+/// Virtual file-system paths of a buffer: `<mount>:/<path>` (`platform:/`,
+/// `common:/`, `audio:/` …, mount 2 to 24 letters, digits or `_`) and
+/// `$(<mount>)/<path>`. Trailing `.` and `/` are dropped; a path needs at
+/// least one character after the mount.
+pub fn mount_paths(b: &[u8], out: &mut std::collections::BTreeSet<String>) {
+    let mut push = |start: usize, body: usize| {
+        let mut end = body;
+        while end < b.len() && path_char(b[end]) {
+            end += 1;
+        }
+        while end > body && matches!(b[end - 1], b'.' | b'/') {
+            end -= 1;
+        }
+        if end > body {
+            out.insert(String::from_utf8_lossy(&b[start..end]).into_owned());
+        }
+    };
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut i = 0;
+    while i + 1 < b.len() {
+        if b[i] == b':' && b[i + 1] == b'/' {
+            let mut s = i;
+            while s > 0 && word(b[s - 1]) {
+                s -= 1;
+            }
+            if (2..=24).contains(&(i - s)) && b[s].is_ascii_alphabetic() && !b[i + 2..].starts_with(b"/") {
+                push(s, i + 2);
+            }
+        } else if b[i] == b'$' && b[i + 1] == b'(' {
+            let mut e = i + 2;
+            while e < b.len() && word(b[e]) {
+                e += 1;
+            }
+            if (2..=24).contains(&(e - i - 2)) && b[e..].starts_with(b")/") {
+                push(i, e + 2);
+            }
+        }
+        i += 1;
+    }
+}
+
+/// The names a mount path adds: the path as written, without its extension,
+/// and its file name with the extension (the file name without extension is
+/// an identifier, which `idents` already finds).
+pub fn path_names(p: &str) -> Vec<String> {
+    let mut v = vec![p.to_string()];
+    let file = p.rsplit('/').next().unwrap_or(p);
+    if let Some(dot) = file.rfind('.').filter(|&d| d > 0) {
+        v.push(p[..p.len() - file.len() + dot].to_string());
+        v.push(file.to_string());
+    }
+    v
+}
+
+/// Dotted names on lines of their own (`Core.RadioStation.news`, the audio
+/// pack list): 2 to 8 identifier parts of 2 or more characters joined by
+/// `.`, nothing else on the line (or between NULs).
+pub fn dotted_lines(b: &[u8], out: &mut std::collections::BTreeSet<String>) {
+    for l in b.split(|c| *c == b'\n' || *c == b'\r' || *c == 0) {
+        let l = l.trim_ascii();
+        let parts: Vec<&[u8]> = l.split(|c| *c == b'.').collect();
+        if (2..=8).contains(&parts.len()) && parts.iter().all(|p| p.len() >= 2 && p.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_') && p[0].is_ascii_alphabetic()) {
+            out.insert(String::from_utf8_lossy(l).into_owned());
+        }
+    }
+}
+
+/// NUL-terminated identifiers of a binary buffer: the run of identifier
+/// characters that ends at each NUL, whatever comes before it (the audio
+/// metadata files keep names in NUL-padded fields after hashes and counts).
+/// At least 4 characters, 3 of them letters, starting with a letter; names
+/// shorter than 6 also need one case throughout (or a capital and then lower
+/// case) and no digits, which keeps most chance letter runs of binary data
+/// out (`pN8G`, `emJa`).
+fn cstrings(b: &[u8], out: &mut std::collections::HashSet<String>) {
+    let tidy = |w: &[u8]| w.len() >= 6 || (!w.iter().any(|c| c.is_ascii_digit()) && (w.iter().all(|c| !c.is_ascii_uppercase()) || w.iter().all(|c| !c.is_ascii_lowercase()) || w[1..].iter().all(|c| !c.is_ascii_uppercase())));
+    for seg in b.split(|c| *c == 0) {
+        let start = seg.iter().rposition(|c| !(c.is_ascii_alphanumeric() || *c == b'_')).map_or(0, |i| i + 1);
+        let w = &seg[start..];
+        if is_ident(w) && w.len() >= 4 && w[0].is_ascii_alphabetic() && w.iter().filter(|c| c.is_ascii_alphabetic()).count() >= 3 && tidy(w) {
+            out.insert(String::from_utf8_lossy(w).into_owned());
+        }
+    }
+}
+
 /// NUL-terminated identifiers of a binary file, streamed in 4 MiB pieces.
 fn file_cstrings(path: &Path, out: &mut std::collections::HashSet<String>) -> Result<()> {
     use std::io::Read;
@@ -396,6 +500,9 @@ pub fn build(game: &Path, index_dir: &Path, work: &Path) -> Result<serde_json::V
     let mut by_src: Vec<(&str, std::collections::HashSet<String>)> = Vec::new();
     // common.rpf: text and XML entries
     let mut common = std::collections::HashSet::new();
+    // virtual file-system paths (the content files' mount lists), from
+    // common.rpf and audio.rpf
+    let mut paths = std::collections::BTreeSet::new();
     let ix = crate::scan::load_index(&crate::scan::index_path(index_dir, "common.rpf")).context("common.rpf is not indexed (run `sixng index common`)")?;
     let arch = game.join("common.rpf");
     let mut read = 0usize;
@@ -403,11 +510,39 @@ pub fn build(game: &Path, index_dir: &Path, work: &Path) -> Result<serde_json::V
         if matches!(e.kind, crate::classify::Kind::Xml | crate::classify::Kind::Text | crate::classify::Kind::Bin) {
             if let Ok(b) = crate::scan::read_entry(&arch, e) {
                 idents(&b, &mut common);
+                mount_paths(&b, &mut paths);
                 read += 1;
             }
         }
     }
     by_src.push(("common", common));
+    // audio.rpf: identifiers of the text entries (config field names, pack
+    // lists), NUL-delimited names in the metadata files (wave slots), the
+    // dotted pack names and the `audio:/` paths
+    let mut audio = std::collections::HashSet::new();
+    let mut dotted = std::collections::BTreeSet::new();
+    let mut audio_read = 0usize;
+    if let Ok(ix) = crate::scan::load_index(&crate::scan::index_path(index_dir, "audio.rpf")) {
+        let arch = game.join("audio.rpf");
+        for e in &ix.entries {
+            if matches!(e.kind, crate::classify::Kind::Xml | crate::classify::Kind::Text | crate::classify::Kind::Bin) {
+                if let Ok(b) = crate::scan::read_entry(&arch, e) {
+                    if e.kind == crate::classify::Kind::Bin {
+                        cstrings(&b, &mut audio);
+                    } else {
+                        idents(&b, &mut audio);
+                    }
+                    dotted_lines(&b, &mut dotted);
+                    mount_paths(&b, &mut paths);
+                    audio_read += 1;
+                }
+            }
+        }
+    }
+    audio.extend(dotted.iter().cloned());
+    by_src.push(("audio", audio));
+    let mounts: std::collections::HashSet<String> = paths.iter().flat_map(|p| path_names(p)).collect();
+    by_src.push(("mounts", mounts));
     let mut sh = std::collections::HashSet::new();
     let sp = game.join("shaders.rpf");
     if sp.exists() {
@@ -433,13 +568,111 @@ pub fn build(game: &Path, index_dir: &Path, work: &Path) -> Result<serde_json::V
             }
         }
     }
+    // audio bank names, when `audio-meta` has recorded the banks' containers
+    let banks = crate::audiometa::load_containers(work, "audio.rpf").map(|c| set_bank_names(&mut d, &crate::audiometa::bank_container(&c)));
     let p = dict_path(work);
+    save_dict(&p, &d)?;
+    Ok(serde_json::json!({"out": p, "hashes": d.names.len(), "case_sensitive_hashes": d.exact.len(), "identifiers": counts, "common_entries_read": read, "audio_entries_read": audio_read, "mount_paths": paths.len(), "bank_names": banks, "derived": DERIVED.len()}))
+}
+
+fn save_dict(p: &Path, d: &Dict) -> Result<()> {
     std::fs::create_dir_all(p.parent().unwrap())?;
     let tmp = p.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(&d)?)?;
-    std::fs::rename(&tmp, &p)?;
+    std::fs::write(&tmp, serde_json::to_vec(d)?)?;
+    std::fs::rename(&tmp, p)?;
     reload();
-    Ok(serde_json::json!({"out": p, "hashes": d.names.len(), "case_sensitive_hashes": d.exact.len(), "identifiers": counts, "common_entries_read": read, "derived": DERIVED.len()}))
+    Ok(())
+}
+
+fn joaat_step(mut h: u32, s: &[u8]) -> u32 {
+    for &c in s {
+        h = h.wrapping_add(c.to_ascii_lowercase() as u32);
+        h = h.wrapping_add(h << 10);
+        h ^= h >> 6;
+    }
+    h
+}
+
+fn joaat_fin(mut h: u32) -> u32 {
+    h = h.wrapping_add(h << 3);
+    h ^= h >> 11;
+    h.wrapping_add(h << 15)
+}
+
+/// Audio bank names. A bank's container hash is joaat of
+/// `<pack>/<bank>` in lower case (`core.resident/gun_pistol`), where the
+/// pack is one of the dotted audio pack names and the bank name is an
+/// identifier. Every pack in `d` (source `audio`, dotted) is tried with
+/// every identifier in `d`. `banks` is bank offset -> container hash.
+///
+/// Banks of one pack lie next to each other in the archive, so a match is
+/// kept only when the nearest matched bank before or after it (by offset)
+/// has the same pack; this drops the chance matches (about 1 in 36 on the
+/// game's audio.rpf). Returns (bank offset, container, name), by offset.
+pub fn find_bank_names(d: &Dict, banks: &BTreeMap<u64, u32>) -> Vec<(u64, u32, String)> {
+    let want: std::collections::HashSet<u32> = banks.values().copied().collect();
+    let mut packs: Vec<String> = Vec::new();
+    let mut words: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for v in d.names.values() {
+        for (n, src) in v {
+            let l = n.to_ascii_lowercase();
+            if src == "audio" && l.contains('.') && l.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'.') {
+                packs.push(l);
+            } else if is_ident(l.as_bytes()) {
+                words.insert(l);
+            }
+        }
+    }
+    packs.sort();
+    packs.dedup();
+    // container -> candidate names
+    let mut cand: HashMap<u32, Vec<String>> = HashMap::new();
+    for p in &packs {
+        let h0 = joaat_step(joaat_step(0, p.as_bytes()), b"/");
+        for w in &words {
+            let h = joaat_fin(joaat_step(h0, w.as_bytes()));
+            if want.contains(&h) {
+                cand.entry(h).or_default().push(format!("{p}/{w}"));
+            }
+        }
+    }
+    let pack = |n: &str| n.split('/').next().unwrap_or("").to_string();
+    let matched: Vec<(u64, u32, &Vec<String>)> = banks.iter().filter_map(|(o, h)| cand.get(h).map(|v| (*o, *h, v))).collect();
+    let mut out = Vec::new();
+    for (i, (off, h, names)) in matched.iter().enumerate() {
+        let near: Vec<std::collections::HashSet<String>> = [i.checked_sub(1), Some(i + 1)].into_iter().flatten().filter_map(|j| matched.get(j)).map(|m| m.2.iter().map(|n| pack(n)).collect()).collect();
+        if let Some(n) = names.iter().find(|n| near.iter().any(|s| s.contains(&pack(n)))) {
+            out.push((*off, *h, n.clone()));
+        }
+    }
+    out
+}
+
+/// Replace the `banks` names of `d` with the bank names of `banks` (bank
+/// offset -> container hash). Returns (banks with a container, banks named).
+pub fn set_bank_names(d: &mut Dict, banks: &BTreeMap<u64, u32>) -> serde_json::Value {
+    for v in d.names.values_mut() {
+        v.retain(|(_, s)| s != "banks");
+    }
+    d.names.retain(|_, v| !v.is_empty());
+    let found = find_bank_names(d, banks);
+    for (_, h, n) in &found {
+        let e = d.names.entry(format!("{h:08x}")).or_default();
+        if !e.iter().any(|(x, s)| x == n && s == "banks") {
+            e.push((n.clone(), "banks".into()));
+        }
+    }
+    serde_json::json!({"banks": banks.len(), "named": found.len()})
+}
+
+/// Name the banks of `banks` (bank offset -> container hash) in
+/// `<work>/names/names.json` (after `sixng names`; source `banks`).
+pub fn add_bank_names(work: &Path, banks: &BTreeMap<u64, u32>) -> Result<serde_json::Value> {
+    let p = dict_path(work);
+    let mut d: Dict = serde_json::from_slice(&std::fs::read(&p).with_context(|| format!("no name dictionary {} (run `sixng names`)", p.display()))?)?;
+    let r = set_bank_names(&mut d, banks);
+    save_dict(&p, &d)?;
+    Ok(r)
 }
 
 #[cfg(test)]
@@ -468,6 +701,65 @@ mod tests {
         assert_eq!(d.exact["079baba7"][0].0, "attachBone");
         // names whose hash is not the key are dropped
         assert!(!d.names.contains_key("12345678") && !d.exact.contains_key("12345678"));
+    }
+    #[test]
+    fn bank_name_search() {
+        let mut d = Dict::default();
+        let mut add = |n: &str, src: &str| d.names.entry(format!("{:08x}", joaat(n))).or_default().push((n.to_string(), src.to_string()));
+        add("Pack.Alpha", "audio");
+        add("pack.beta", "audio");
+        for w in ["guns", "doors", "rain", "wind", "zzz"] {
+            add(w, "common");
+        }
+        // partial hashing matches joaat of the joined name
+        assert_eq!(joaat_fin(joaat_step(joaat_step(0, b"Pack.Alpha"), b"/guns")), joaat("pack.alpha/guns"));
+        let h = |n: &str| joaat(n);
+        // banks in archive order: two of pack.alpha, two of pack.beta, then
+        // a lone pack.alpha bank among pack.beta ones (dropped), an unknown
+        // one (skipped over), and another pack.beta bank
+        let banks: BTreeMap<u64, u32> = [
+            (0x1000, h("pack.alpha/guns")),
+            (0x2000, h("pack.alpha/doors")),
+            (0x3000, h("pack.beta/rain")),
+            (0x4000, h("pack.beta/wind")),
+            (0x5000, h("pack.alpha/zzz")),
+            (0x6000, h("pack.beta/doors")),
+            (0x7000, 0x1234_5678),
+            (0x8000, h("pack.beta/guns")),
+        ]
+        .into_iter()
+        .collect();
+        let found: Vec<(u64, String)> = find_bank_names(&d, &banks).into_iter().map(|(o, _, n)| (o, n)).collect();
+        assert_eq!(found, [(0x1000, "pack.alpha/guns".into()), (0x2000, "pack.alpha/doors".into()), (0x3000, "pack.beta/rain".into()), (0x4000, "pack.beta/wind".into()), (0x6000, "pack.beta/doors".into()), (0x8000, "pack.beta/guns".into())]);
+        let r = set_bank_names(&mut d, &banks);
+        assert_eq!(r["named"], 6);
+        assert_eq!(d.names[&format!("{:08x}", h("pack.beta/rain"))], [("pack.beta/rain".to_string(), "banks".to_string())]);
+        // a second run replaces, not adds
+        set_bank_names(&mut d, &banks);
+        assert_eq!(d.names.values().flatten().filter(|(_, s)| s == "banks").count(), 6);
+    }
+    #[test]
+    fn mount_path_harvest() {
+        let xml = b"<Item><filename>platform:/levels/world/props/px.ityp</filename></Item>\n<id>common:/data/levels/world/area.meta</id>\n<filename>$(target)/data/lang/lang_a.rpf</filename> audio:/sfx/ http://example.com/x a:/b \0audio:/config/sounds.dat\0";
+        let mut p = std::collections::BTreeSet::new();
+        mount_paths(xml, &mut p);
+        let v: Vec<&str> = p.iter().map(|s| s.as_str()).collect();
+        // `audio:/sfx/` loses its trailing slash; `http://` (double slash)
+        // and the one-letter mount are not paths
+        assert_eq!(v, ["$(target)/data/lang/lang_a.rpf", "audio:/config/sounds.dat", "audio:/sfx", "common:/data/levels/world/area.meta", "platform:/levels/world/props/px.ityp"]);
+        assert_eq!(path_names("platform:/levels/world/props/px.ityp"), ["platform:/levels/world/props/px.ityp", "platform:/levels/world/props/px", "px.ityp"]);
+        assert_eq!(path_names("audio:/sfx"), ["audio:/sfx"]);
+        let mut d = std::collections::BTreeSet::new();
+        dotted_lines(b"Pack.Group.item\r\nPack.Other\nd.Q\nBase:file_a:Kind\n\0Group.FieldName\0", &mut d);
+        assert_eq!(d.iter().map(|s| s.as_str()).collect::<Vec<_>>(), ["Group.FieldName", "Pack.Group.item", "Pack.Other"]);
+        let mut c = std::collections::HashSet::new();
+        // a name after a hash in a NUL-padded field; runs that end before a
+        // non-identifier byte, are short, start with a digit, or are short
+        // with digits or mixed case are not names
+        cstrings(b"\0SLOT_NAME_01\0tixN#<\0e82\0\xa0\x21\xd6{SOME_NAME\0\0\0\x0c808_NAME\0\x01pN8G\0\x01emJa\0\x01Lion\0OTHER_SLOT_2\0", &mut c);
+        let mut c: Vec<_> = c.into_iter().collect();
+        c.sort();
+        assert_eq!(c, ["Lion", "OTHER_SLOT_2", "SLOT_NAME_01", "SOME_NAME"]);
     }
     #[test]
     fn known_hashes() {

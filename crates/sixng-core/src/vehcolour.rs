@@ -62,9 +62,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// `part_colours_version`); the model viewer exports older vehicles again.
 /// 21: the second colour stream (`_COLOR1`, sticker zones) is in the GLB.
 /// 22: `part_patches` (what a fitted part changes).
-pub const EXPORT_VERSION: u32 = 22;
+/// 23: `sliding_doors` in model.json.
+/// 24: the tyre colour slot is left unapplied (tyres stay black).
+pub const EXPORT_VERSION: u32 = 24;
 /// Layout version of `<work>/index/vehicle_parts.json`.
-pub const FORMAT: u32 = 19;
+pub const FORMAT: u32 = 20;
 
 const PART_SET: u32 = 0xf142_44fd;
 const SET_COLOURS: u32 = 0x7847_6477;
@@ -137,6 +139,15 @@ const PART_REF: u32 = 0x51aa_b7c1;
 /// priority 1 over a default); no record assigns it a colour, so it is taken
 /// as the body paint.
 const PAINT_CHANNEL: u32 = 0x7ed7_6b9f;
+/// The channel of the tyre colour slot (`f3bd038d`): ten library parts,
+/// each binding the tyre's group (part id 35, the one id of every shared
+/// `tyre_*` model) to this channel and assigning it one of ten colours
+/// (greys, purple, magenta, greens, blue, yellow, orange, red). Five
+/// vehicles fit one in some configurations (boxville, burrito, journey,
+/// rentalbus, stanier). What the game does with it is not decoded; applied
+/// to the tyre it paints the whole tyre red or light grey, so it is left
+/// unapplied and the tyre keeps the rubber of its part set.
+const TYRE_COLOUR_CHANNEL: u32 = 0x976f_e07e;
 /// The slot of the wheel fitment record.
 const SLOT_WHEEL_FIT: u32 = 0x39d5_e253;
 /// A wheel fitment modifier: `3d37e0df` = rim radius / tyre radius (0.82 on
@@ -653,6 +664,9 @@ fn apply_config(lib: &Library, own: &HashMap<u32, Vec<u32>>, parts: &[u32], set:
     binds.sort_by_key(|b| b.2);
     let mut changed = vec![false; set.len()];
     for &&(group, ch, _, colour, surface) in &binds {
+        if ch == TYRE_COLOUR_CHANNEL {
+            continue;
+        }
         let Some(ids) = local.get(&group).copied().or_else(|| lib.groups.get(&group)) else { continue };
         let (c, s) = if ch == PAINT_CHANNEL { (PRIMARY_PAINT, 0) } else { channel.get(&ch).copied().unwrap_or((0, 0)) };
         for &i in ids {
