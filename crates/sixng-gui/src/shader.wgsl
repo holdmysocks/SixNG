@@ -578,9 +578,12 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
         // with the game's tables: its own light sum
         let dims = textureDimensions(t_hair_m);
         if (dims.x > 1u) {
-            // the tube normal facing the eye (the game rounds it across the
-            // ribbon; the ribbons here carry no position across)
-            let tube = normalize(cross(cross(tdir, v), tdir));
+            // the tube normal as the game builds it: a side vector S across the
+            // strand as seen from the eye, and the normal rounded across the
+            // ribbon by the position u (-1 .. 1, the tangent's w) between its edges
+            let side = normalize(cross(tdir, v));
+            let u_h = clamp(i.tan.w, -1.0, 1.0);
+            let tube = normalize(side * u_h + cross(side, tdir) * sqrt(max(1.0 - u_h * u_h, 0.0)));
             // large-scale light and dark side from the head: the root normal
             let root = normalize(i.nrm);
             // the parameter ramp's values at this point of the strand, when the

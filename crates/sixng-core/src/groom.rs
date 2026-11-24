@@ -560,7 +560,8 @@ impl Groom {
                 for sg in [-1.0f32, 1.0] {
                     pos.push([p[0] + side[0] * r * sg, p[1] + side[1] * r * sg, p[2] + side[2] * r * sg]);
                     nrm.push(nr);
-                    tan.push(dir);
+                    // w: which edge of the ribbon (-1 / +1), so the shader can round the normal across it
+                    tan.push([dir[0], dir[1], dir[2], sg]);
                     if let Some(pv) = pv {
                         uv0.push([pv[0], pv[1]]);
                         uv1.push([pv[2], 1.0]);
