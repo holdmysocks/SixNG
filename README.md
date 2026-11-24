@@ -168,11 +168,11 @@ exits with code 1.
 .\target\release\sixng.exe search 'elegy|buffalo' --archive levels
 
 # Name dictionary for shader, parameter and meta field hashes (~2 s, needs the common index).
-# Built from your install into work
-ames
-ames.json; exports and the app use it.
+# Built from your install into work\names\names.json; exports and the app use it.
 .\target\release\sixng.exe names
 .\target\release\sixng.exe names --lookup bcf03fc1,c8e8c282
+# Optional: names from public GTA V lists (gta6-namehash dictionary.json) for hashes nothing else names
+.\target\release\sixng.exe names --namehash dictionary.json
 
 # Describe one entry without writing files
 .\target\release\sixng.exe inspect 'levels.rpf@10f2d2d010' --pretty
