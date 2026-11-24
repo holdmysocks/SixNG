@@ -5,8 +5,9 @@
 //! ```text
 //! a9d57751 variation: 65121749 id, Scale, fb5bb20d list of {65121749 item id, StateName}
 //! f795e8ba item:      65121749 id, Category (slot: eyes, hair, hats …),
-//!                     080eec39 / e13ebaf8 parent item (a colour variant points at
-//!                     its base garment), 12f85293 tag map {Key, Item[u32]},
+//!                     080eec39 parent item (a colour variant points at its
+//!                     base garment), e13ebaf8 layered-material preset
+//!                     (`matlib`), 12f85293 tag map {Key, Item[u32]},
 //!                     ebacf18c list of 37e52277 texture sets (64-bit texture hashes)
 //! tag keys:           4bfd27dd head drawable, 023e5a2f hair / brows / body hair,
 //!                     2a8cdb1d garment name (or a shape word), a9473ab4 style
@@ -67,6 +68,11 @@ pub struct Part {
     /// chain: black, blue, khaki … (`pedtint::COLOUR_WORDS`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub colour_tag: Option<&'static str>,
+    /// Layered-material preset (`e13ebaf8`, GarmentPreset) as hex, first
+    /// along the chain: the key of the item's colours in the clothing
+    /// material library (`matlib`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
     /// The state the variation asks for (`StateName`), as hex.
     pub state: String,
     /// Colour and normal textures (`ead733fc`, `Normal`) of the chosen state
@@ -356,7 +362,8 @@ pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers,
             let mut tg = BTreeMap::new();
             chain.iter().rev().for_each(|c| tag_words(c, pre, &mut tg));
             let tint = chain_tint(&chain);
-            parts.push(Part { item: format!("{:08x}", it[f(0x6512_1749)].as_u64().unwrap_or(0)), category, name: name.map(|p| p.0.clone()), drawable, tex_remap, tags: tg, tint, named, guid, colour, colour_tag, state: format!("{want_state:08x}"), skins, candidates: counts });
+            let preset = chain.iter().find_map(|c| c[f(0xe13e_baf8)].as_u64().filter(|&x| x != 0)).map(|x| format!("{x:08x}"));
+            parts.push(Part { item: format!("{:08x}", it[f(0x6512_1749)].as_u64().unwrap_or(0)), category, name: name.map(|p| p.0.clone()), drawable, tex_remap, tags: tg, tint, named, guid, colour, colour_tag, preset, state: format!("{want_state:08x}"), skins, candidates: counts });
         }
         let mut tags = BTreeMap::new();
         tag_words(&v, pre, &mut tags);

@@ -32,6 +32,7 @@ pub mod headdelta;
 pub mod meta7a;
 pub mod names;
 pub mod material;
+pub mod matlib;
 pub mod gfx10;
 pub mod resource;
 pub mod texture;
