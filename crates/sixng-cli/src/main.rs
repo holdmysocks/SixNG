@@ -784,6 +784,10 @@ enum Cmd {
         /// have the same names.
         #[arg(long)]
         anim_only: bool,
+        /// Leave the clip's own movement over the ground (its mover
+        /// tracks) out of the animation, so it plays in place.
+        #[arg(long)]
+        in_place: bool,
         /// Texture output: png, dds, or both.
         #[arg(long, default_value = "png")]
         tex: String,
@@ -1199,7 +1203,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 out.print(&json!({"ok": true, "results": v}));
             }
         }
-        Cmd::Outfit { character, out: glb, archive, parts, add, list, clip, anim_only, tex, body_shape, head_skin, tex_remap, tint, look } => {
+        Cmd::Outfit { character, out: glb, archive, parts, add, list, clip, anim_only, in_place, tex, body_shape, head_skin, tex_remap, tint, look } => {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
             let prefix = character.to_ascii_lowercase();
@@ -1309,7 +1313,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 let (name, pal, rows) = sixng_core::pedtint::parse_spec(t).map_err(|e| anyhow!(e))?;
                 eo.ped_tints.insert(name, (pal, rows));
             }
-            let mut r = sixng_core::outfit::export_outfit(&a, &sel, &prefix, &glb, &eo, &clip_refs, *anim_only)?;
+            let mut r = sixng_core::outfit::export_outfit(&a, &sel, &prefix, &glb, &eo, &clip_refs, *anim_only, *in_place)?;
             r["seconds"] = t.elapsed().as_secs_f64().into();
             out.print(&json!({"ok": true, "result": r}));
         }

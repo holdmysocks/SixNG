@@ -305,8 +305,11 @@ every skinned mesh on it; rest-pose skinning matches the stored vertices
 within 3e-7 m; 95.6 % of the clips' bone tracks land on a joint; joints
 whose own translation is not animated keep their length to the parent
 within 4e-7 m over the clip; rotation keys sit a median 3.6° from the rest
-pose (22° for the conjugate). Not done: the mover (root motion; the
-viewer applies it, the exported animation does not), facial
+pose (22° for the conjugate). The clip's own movement over the ground
+(its mover tracks) is written on the root joint's translation and
+rotation, so a walk travels in Blender as it does in the viewer;
+`--in-place` leaves it out, and the report's `ground_movement` gives the
+distance and the turn. Not done: facial
 animation, hair (most hair parts are 3-vertex stubs), cloth simulation.
 One field jacket names 16 palette bones that are in no skeleton found yet
 (2,161 influences, weight moved to the other influences).
