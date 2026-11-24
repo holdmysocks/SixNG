@@ -639,7 +639,8 @@ fn look_uncached(game_root: &Path, a: &ArchiveInfo, ix: &ArchiveIndex, model: &s
 }
 
 /// Vertex positions of a drawable's largest mesh.
-fn mesh_points(a: &ArchiveInfo, e: &crate::scan::Entry) -> Option<Vec<[f32; 3]>> {
+/// Vertex positions of a drawable's largest mesh (RAGE model space).
+pub fn mesh_points(a: &ArchiveInfo, e: &crate::scan::Entry) -> Option<Vec<[f32; 3]>> {
     let r = Resource::load(&a.path, e).ok()?;
     crate::headdelta::meshes(&r).into_iter().map(|m| m.0).max_by_key(|p| p.len())
 }

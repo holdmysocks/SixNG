@@ -269,6 +269,26 @@ enum Cmd {
         /// Write crossed ribbon meshes of this half-width (mm) instead of lines (render in any viewer).
         #[arg(long)]
         ribbons: Option<f32>,
+        /// Write the full strand set instead of the guide strands alone:
+        /// the strands the groom stores per root triangle, grown between
+        /// its three guides (the game's own clumping, curl and noise are
+        /// not decoded). Also writes <offset>.growth.json with the root
+        /// triangles, their strand counts, the strand width and its taper,
+        /// to rebuild the hair elsewhere. Grooms that store no counts
+        /// keep their guides.
+        #[arg(long)]
+        full: bool,
+        /// With --full: share of the stored strands to write, 0 to 1.
+        #[arg(long, default_value_t = 1.0)]
+        density: f32,
+        /// Export the fur of this animal (its root name, e.g.
+        /// crm_cat_feral_m_00): the grooms of its default body and head
+        /// fur, in the animal's model space, so they sit on the model that
+        /// `outfit <root>` exports. The link is inferred (archive order,
+        /// piece counts, distance to the skin), not stored; it is written
+        /// with its agreement score to <root>.fur.json.
+        #[arg(long)]
+        animal: Option<String>,
         /// Only these groom offsets (hex, comma-separated).
         #[arg(long, value_delimiter = ',')]
         only: Vec<String>,
@@ -1482,7 +1502,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             out.print(&json!({"ok": true, "archive": a.id, "scanned": sel.len(), "tiles": n, "tiles_with_roads": roads,
                 "seconds": t.elapsed().as_secs_f64(), "index": po.join("navmesh").join(a.id.trim_end_matches(".rpf")).join("index.jsonl")}));
         }
-        Cmd::Grooms { archive, roots, ribbons, only, list, out: po } => {
+        Cmd::Grooms { archive, roots, ribbons, full, density, animal, only, list, out: po } => {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
             let t = Instant::now();
@@ -1497,9 +1517,41 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 }
                 out.print(&json!({"ok": true, "grooms": cat.len(), "chains": cat.iter().filter(|g| g.lod == 0).count(), "chains_by_region": by, "file": dir.join("catalog.json"), "seconds": t.elapsed().as_secs_f64()}));
             } else {
-                let only: Vec<u64> = only.iter().filter_map(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()).collect();
-                let (n, errors) = sixng_core::groom::export_grooms(&a, &ix.entries, &only, po, *roots, ribbons.map(|mm| mm / 1000.0), pr)?;
-                out.print(&json!({"ok": true, "archive": a.id, "grooms": n, "errors": errors,
+                let mut only: Vec<u64> = only.iter().filter_map(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()).collect();
+                let mut fur = serde_json::Value::Null;
+                if let Some(root) = animal {
+                    let root = root.to_ascii_lowercase();
+                    // the animal's parts (not its fur placeholders), one entry per name
+                    let mut seen = std::collections::HashSet::new();
+                    let skin: Vec<(String, Vec<[f32; 3]>)> = ix
+                        .entries
+                        .iter()
+                        .filter(|e| e.rtype.as_deref() == Some("dr"))
+                        .filter_map(|e| {
+                            let n = e.name.as_ref()?.to_ascii_lowercase();
+                            (n.starts_with(&format!("{root}_")) && !n.contains("_fur_") && seen.insert(n.clone())).then_some((n, e))
+                        })
+                        .filter_map(|(n, e)| Some((n, sixng_core::pedlook::mesh_points(&a, e)?)))
+                        .collect();
+                    if skin.is_empty() {
+                        bail!("no parts named {root}_<part>_NN in {} (`sixng characters --kind animal` lists the roots)", a.id);
+                    }
+                    let link = sixng_core::furlink::for_animal(&ws.work, &a, &ix.entries, &root, &skin)?;
+                    let picked: Vec<&sixng_core::furlink::Variant> = ["body", "head"].iter().filter_map(|s| link.default_variant(s)).collect();
+                    if picked.is_empty() {
+                        bail!("no fur grooms were placed for {root}: {}", link.note);
+                    }
+                    only = picked.iter().flat_map(|v| v.grooms.iter().copied()).collect();
+                    fur = json!({"animal": root, "variants": picked.iter().map(|v| json!({"name": v.name, "slot": v.slot, "grooms": v.grooms.iter().map(|g| format!("{g:x}")).collect::<Vec<_>>(), "count_known": v.known, "count_exact": v.exact})).collect::<Vec<_>>(),
+                        "other_variants": link.variants.iter().filter(|v| !picked.iter().any(|p| p.name == v.name)).map(|v| v.name.clone()).collect::<Vec<_>>(),
+                        "agreement": link.agreement, "note": link.note,
+                        "link": "inferred from archive order, piece counts and distance to the skin; no resource stores it"});
+                    let dir = po.join("grooms").join(a.id.trim_end_matches(".rpf"));
+                    std::fs::create_dir_all(&dir)?;
+                    std::fs::write(dir.join(format!("{root}.fur.json")), serde_json::to_vec_pretty(&fur)?)?;
+                }
+                let (n, errors) = sixng_core::groom::export_grooms(&a, &ix.entries, &only, po, *roots, ribbons.map(|mm| mm / 1000.0), full.then_some(density.clamp(0.0, 1.0)), pr)?;
+                out.print(&json!({"ok": true, "archive": a.id, "grooms": n, "errors": errors, "fur": fur,
                     "seconds": t.elapsed().as_secs_f64(), "index": po.join("grooms").join(a.id.trim_end_matches(".rpf")).join("index.jsonl")}));
             }
         }

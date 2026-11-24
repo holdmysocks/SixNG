@@ -435,6 +435,57 @@ impl Groom {
         c
     }
 
+    /// Width (metres) of a strand at point `j` of `k`: the stored width
+    /// (0.3 mm when the groom stores none) times the stored 16-step taper
+    /// from root to tip (full width when the taper is all zero).
+    pub fn width_at(&self, j: usize, k: usize) -> f32 {
+        let base = if self.width > 0.0 { self.width } else { 0.0003 };
+        if self.taper.iter().all(|&b| b == 0) {
+            return base;
+        }
+        let f = j as f32 / (k.max(2) - 1) as f32;
+        base * self.taper[((f * 15.0) as usize).min(15)] as f32 / 255.0
+    }
+
+    /// The full strand set as line strips, for export: the coat's points,
+    /// each point's width, each strand's root UV (blended from its three
+    /// guides) and the segment index pairs.
+    pub fn coat_lines(&self, coat: &Coat) -> (Vec<f32>, Vec<[f32; 2]>, Vec<u32>) {
+        let (k, n) = (coat.k, coat.guides.len());
+        let (mut width, mut uv, mut seg) = (Vec::with_capacity(n * k), Vec::with_capacity(n * k), Vec::with_capacity(n * k.saturating_sub(1) * 2));
+        for (s, (g, w)) in coat.guides.iter().enumerate() {
+            let at = |i: u32| self.root_uv.get(i as usize).copied().unwrap_or([0.0, 0.0]);
+            let (a, b, d) = (at(g[0]), at(g[1]), at(g[2]));
+            let u = [a[0] * w[0] + b[0] * w[1] + d[0] * w[2], a[1] * w[0] + b[1] * w[1] + d[1] * w[2]];
+            for j in 0..k {
+                width.push(self.width_at(j, k));
+                uv.push(u);
+                if j + 1 < k {
+                    seg.extend_from_slice(&[(s * k + j) as u32, (s * k + j + 1) as u32]);
+                }
+            }
+        }
+        (width, uv, seg)
+    }
+
+    /// What a rebuild of the full strand set needs beside the guides: the
+    /// root triangles (guide strand indices) with the strands the game
+    /// grows in each, the strand width and its taper.
+    pub fn growth_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "guide_strands": self.strands,
+            "points_per_strand": self.points_per_strand,
+            "root_triangles": self.roots,
+            "triangle_counts": self.tri_counts,
+            "triangle_counts_note": "per root triangle [c0, c1, c2, c3]: c0 = strands grown in the triangle, c1 = strands in clumps (inferred), c2 = clumps (inferred), c3 unknown. Lower LODs saturate at 255",
+            "stored_strands": self.stored_strands(),
+            "strand_width_m": self.width,
+            "taper": self.taper,
+            "taper_note": "16 width steps from root to tip, each / 255 of the strand width (inferred)",
+            "method": "per root triangle, c0 + c1 strands at random barycentric points; every point of a strand is the same barycentric blend of the three guide strands' points. The game's own placement, clumping, curl and noise are not decoded",
+        })
+    }
+
     /// GLB of a coat: one flat ribbon per strand, lying in the skin's
     /// tangent plane, `width` metres wide at the root and tapered by the
     /// stored 16 steps. `guide_rgb` (linear, one per guide strand) colours
@@ -678,8 +729,12 @@ pub fn load(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], off: u64) 
 /// `index.jsonl`: line strips (with `_WIDTH` and the root UV as
 /// TEXCOORD_0), or crossed ribbons of `ribbons` half-width (metres) when
 /// given. `only` limits the export to these offsets (all grooms when
-/// empty). Returns (grooms written, errors).
-pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], only: &[u64], out: &std::path::Path, roots: bool, ribbons: Option<f32>, progress: crate::export::Progress) -> Result<(usize, usize)> {
+/// empty). With `full` (a share of the stored strand count, 0..1) a groom
+/// that stores per-triangle counts is written as the full strand set
+/// grown from its guides (`Groom::coat`) instead of the guides alone, and
+/// every groom gets `<offset>.growth.json` (`Groom::growth_json`).
+/// Returns (grooms written, errors).
+pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], only: &[u64], out: &std::path::Path, roots: bool, ribbons: Option<f32>, full: Option<f32>, progress: crate::export::Progress) -> Result<(usize, usize)> {
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     let cat = catalog(a, all)?;
@@ -706,9 +761,24 @@ pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], o
             let name = format!("groom_{:x}", e.off);
             let extras = serde_json::json!({"source": e.id, "strands": g.strands, "points_per_strand": g.points_per_strand, "bones": info.bones, "category": info.category, "chain": info.chain, "lod": info.lod,
                 "coordinate_system": "model space (Z-up metres) converted to glTF Y-up (x, z, -y)"});
-            let bytes = match ribbons {
-                Some(hw) => g.ribbon_glb(&name, hw, [0.08, 0.05, 0.03], extras),
-                None => {
+            // the full strand set, where the groom stores what to grow
+            let coat = full.filter(|_| g.stored_strands() > 0).map(|share| g.coat(share));
+            let mut extras = extras;
+            if let Some(c) = &coat {
+                extras["full_strands"] = serde_json::json!({"written": c.guides.len(), "stored": c.stored,
+                    "note": "strands grown between the guides from the stored per-triangle counts (barycentric blend of three guides); the game's placement, clumping, curl and noise are not decoded"});
+            }
+            if full.is_some() && std::fs::write(dir.join(format!("{:x}.growth.json", e.off)), g.growth_json().to_string()).is_err() {
+                errors.fetch_add(1, Ordering::Relaxed);
+            }
+            let bytes = match (ribbons, &coat) {
+                (Some(hw), Some(c)) => g.coat_glb(&name, c, hw * 2.0, &[], extras),
+                (None, Some(c)) => {
+                    let (w, uv, seg) = g.coat_lines(c);
+                    crate::gltf::lines_glb(&name, &c.points, &w, &uv, &seg, &[], extras)
+                }
+                (Some(hw), None) => g.ribbon_glb(&name, hw, [0.08, 0.05, 0.03], extras),
+                (None, None) => {
                     let tris = if roots { g.root_indices() } else { Vec::new() };
                     crate::gltf::lines_glb(&name, &g.points, &g.w, &g.point_uvs(), &g.segments(), &tris, extras)
                 }
@@ -720,6 +790,7 @@ pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], o
             }
             let len: f32 = g.lengths.iter().sum();
             Some((e.off, serde_json::json!({"id": e.id, "file": format!("{:x}.glb", e.off), "strands": g.strands, "points_per_strand": g.points_per_strand,
+                "stored_strands": g.stored_strands(), "written_strands": coat.as_ref().map_or(g.strands, |c| c.guides.len()), "strand_width_m": g.width,
                 "root_triangles": g.roots.len(), "total_length_m": (len * 1000.0).round() / 1000.0, "bones": info.bones, "category": info.category, "chain": info.chain, "lod": info.lod,
                 "root_box": g.root_box, "roots_in_box": g.roots_in_box(), "continuous": g.continuous()}).to_string(), true))
         })
@@ -738,6 +809,40 @@ pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], o
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn full_strand_set_follows_the_stored_counts() {
+        // three guides of two points each, one root triangle that stores 5 + 2 strands
+        let g = Groom {
+            strands: 3,
+            points_per_strand: 2,
+            points: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [1.0, 0.0, 1.0], [0.0, 1.0, 0.0], [0.0, 1.0, 1.0]],
+            w: vec![0.0; 6],
+            roots: vec![[0, 1, 2]],
+            lengths: vec![1.0; 3],
+            root_uv: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            bones: vec![],
+            root_box: [[0.0; 3]; 2],
+            group_box: None,
+            tri_counts: vec![[5, 2, 1, 0]],
+            width: 0.0004,
+            taper: [255, 255, 255, 255, 255, 255, 255, 255, 128, 128, 128, 128, 128, 128, 128, 128],
+        };
+        let c = g.coat(1.0);
+        assert_eq!(c.guides.len(), 7);
+        // every strand stays inside the triangle and keeps the guides' height
+        for s in 0..7 {
+            let (r, t) = (c.points[s * 2], c.points[s * 2 + 1]);
+            assert!(r[0] >= 0.0 && r[1] >= 0.0 && r[0] + r[1] <= 1.0 + 1e-6 && r[2] == 0.0 && (t[2] - 1.0).abs() < 1e-6);
+        }
+        let (w, uv, seg) = g.coat_lines(&c);
+        assert_eq!((w.len(), uv.len(), seg.len()), (14, 14, 14));
+        assert!((w[0] - 0.0004).abs() < 1e-9 && (w[1] - 0.0004 * 128.0 / 255.0).abs() < 1e-9);
+        // the root UV is the same blend as the root position
+        assert!((uv[0][0] - c.points[0][0]).abs() < 1e-6 && (uv[0][1] - c.points[0][1]).abs() < 1e-6);
+        assert_eq!(g.growth_json()["stored_strands"], 7);
+        assert_eq!(g.coat(0.0).guides.len(), 0);
+    }
+
     #[test]
     fn hair_is_pressed_under_a_hat() {
         // a hat: the upper half of a 10 cm sphere, sampled every 3 degrees
