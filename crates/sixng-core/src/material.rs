@@ -55,6 +55,20 @@ const FAMILIES: &[(&str, &str, &str)] = &[
     ("360e396b", "terrain_multilayer", "landscape blend (17 params)"),
     ("b21f1ba5", "terrain_multilayer", "landscape blend (17 params)"),
     ("0ad54cb9", "terrain_multilayer", "landscape blend (17 params)"),
+    ("27e5c49d", "terrain_multilayer", "landscape blend (17 params)"),
+    ("61fad45c", "terrain_multilayer", "landscape blend (17 params)"),
+    ("40497278", "terrain_multilayer", "landscape blend (17 params)"),
+    ("4a579bbf", "terrain_multilayer", "landscape blend (17 params)"),
+    ("76fcff28", "terrain_multilayer", "landscape blend (17 params)"),
+    ("88a32075", "terrain_multilayer", "landscape blend (17 params)"),
+    ("388f8fb6", "terrain_multilayer", "landscape blend (17 params)"),
+    ("f8e1f225", "terrain_multilayer", "landscape blend (17 params)"),
+    ("d5bdc029", "terrain_multilayer", "landscape blend (17 params)"),
+    ("6f968246", "terrain_multilayer", "landscape blend (17 params)"),
+    ("1ae17fd6", "terrain_multilayer", "landscape blend (17 params)"),
+    ("5a71e7e1", "terrain_multilayer", "landscape blend (17 params)"),
+    ("10098c2c", "terrain_multilayer", "landscape blend (17 params)"),
+    ("7543cefc", "terrain_multilayer", "landscape blend (17 params)"),
     ("77d8ab27", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
     ("1251cae5", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
     ("cd8ceb5e", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
@@ -289,8 +303,8 @@ pub fn layers(name_hash: &str, entries: &[Value]) -> Option<Value> {
             None => json!({"param": p, "png": null, "status": "no texture bound"}),
         }
     };
-    if matches!(name_hash, "61e09df7" | "b21f1ba5" | "360e396b" | "27e5c49d") {
-        return Some(four_layer(name_hash, &tex));
+    if let Some(v) = FOUR_LAYER.iter().find(|v| v.0 == name_hash) {
+        return Some(four_layer(v.1, v.2, &tex));
     }
     // (colour, normal, data, two-channel) for base and layer 2, overlay, extra data
     let (base, l2, overlay, extra): ([usize; 4], [usize; 4], usize, usize) = match name_hash {
@@ -346,6 +360,7 @@ pub fn multilayer(s: &crate::drawable::Shader, entries: &[Value], fit: impl FnOn
         l["params"] = four_layer_params(&s.constants);
         l["detail_uv"]["recommended"] = four_layer_detail_uv(&fit);
         four_layer_uv(&mut l, &s.constants);
+        four_layer_tint(&mut l, &s.constants);
     }
     if !fit.is_null() {
         l["uv_fit"] = fit;
@@ -562,6 +577,63 @@ fn four_layer_uv(l: &mut Value, consts: &[crate::drawable::ShaderConst]) {
     l["confidence"]["detail_uv_scale"] = json!("high (material constants and shader code)");
 }
 
+/// The tint of a 4-layer ground material as the shader computes it, with
+/// this material's switches resolved: `tint_formula`. Read from the base
+/// pixel program of `standard_uber_4lyr`; the most used variant's program
+/// has the same code shape. Does nothing when the material lacks the tint
+/// constants.
+fn four_layer_tint(l: &mut Value, consts: &[crate::drawable::ShaderConst]) {
+    let get = |h: &str| consts.iter().find(|c| c.hash == h).and_then(|c| c.components()).filter(|v| v.iter().all(|x| x.is_finite())).map(<[f32]>::to_vec);
+    let four = |h: &str| get(h).filter(|v| v.len() == 4);
+    let one = |h: &str| get(h).and_then(|v| v.first().copied());
+    // per layer: texture tint mode, texture tint intensity, blend amount, vertex tint mode, vertex tint intensity, mask scale
+    let (Some(mode), Some(ti), Some(blend), Some(vmode), Some(vi), Some(ms)) = (four("8e3fb0aa"), four("db26e4de"), four("1caef69a"), four("b1c84936"), four("81bc5bca"), four("896d1e47")) else { return };
+    // material switches: vertex tint on, vertex tint second form, blend amount scaled by the mask
+    let (Some(von), Some(vform), Some(masked)) = (one("3fb2b8f7"), one("834fb13b"), one("abe2c64d")) else { return };
+    let layers: Vec<Value> = (0..4)
+        .map(|k| {
+            let invert = blend[k] > 0.0 && mode[k] == 0.0;
+            let vertex = if von == 0.0 {
+                "off"
+            } else if vform != 0.0 {
+                "second form"
+            } else if vmode[k] == 1.0 {
+                "multiply"
+            } else {
+                "luminance"
+            };
+            json!({
+                "mask": if invert { "1 - a" } else { "a" }, "mask_scale": ms[k],
+                "vertex_tint": if ms[k] == 0.0 || vi[k] == 0.0 { "off" } else { vertex }, "vertex_tint_intensity": vi[k],
+                "texture_tint": if blend[k] == 0.0 || ti[k] == 0.0 { "off" } else if mode[k] == 1.0 { "multiply" } else { "luminance" },
+                "texture_tint_intensity": ti[k], "texture_tint_amount": if masked != 0.0 { json!(format!("saturate(a x {})", blend[k])) } else { json!(blend[k]) },
+            })
+        })
+        .collect();
+    l["tint_formula"] = json!({
+        "status": "not applied by the exporter",
+        "inputs": {
+            "D": "the layer's colour texture (linear)", "a": "alpha of the layer's data map",
+            "C": "the first vertex colour set (_COLOR0) rgb, decoded from sRGB to linear", "C.a": "alpha of that set", "T": "the section's tint texture (macro.tint) rgb",
+            "lum(x)": "0.2125 x.r + 0.7154 x.g + 0.0721 x.b",
+        },
+        "steps": [
+            "m = saturate(mask x mask_scale)                       (mask: a, or 1 - a where the layer's blend amount is above 0 and its texture tint mode is luminance)",
+            "V = multiply: saturate(C x intensity x D);  luminance: C x intensity x lum(D)",
+            "Dv = mix(D, V, m)                                     (the vertex-tinted colour)",
+            "D1 = Dv when the vertex tint is on, else D",
+            "W = multiply: saturate(T x intensity x D1);  luminance: T x intensity x lum(D1)",
+            "D2 = mix(D1, W, amount)                               (amount: the layer's blend amount, times a when the material scales it by the mask)",
+            "colour = mix(D2, Dv, C.a)                             (the vertex colour's alpha brings the vertex-tinted colour back over the texture tint)"
+        ],
+        "second_form": "where vertex_tint is `second form`: Dv = D + mix(C x intensity x lum(D), saturate(D x C), third vertex colour set's blue) - D, scaled by m as above. One of 203 surveyed materials uses it",
+        "switches": {"vertex tint on (3fb2b8f7)": von, "vertex tint second form (834fb13b)": vform, "blend amount scaled by the mask (abe2c64d)": masked},
+        "per_layer": layers,
+        "source": "shader code: the base pixel program of standard_uber_4lyr, read once; the most used variant's program has the same code shape. On 203 ground materials of 14 tiles, 189 have the switches 1, 0, 1. Medium confidence; not compared with a rendered image",
+        "not_read": "the switch 7a090c2a beside these, and the tint's effect on the normal (tintbump) and roughness (tintroughnessbias)",
+    });
+}
+
 /// Detail-layer UV for a 4-layer material from its measured mapping:
 /// section tiles (TEXCOORD_0 planar at about 512 m per unit, 430-620 allowing for quantisation on small patches) repeat the layers
 /// 64 times per TEXCOORD_0 unit (every 8 m); other models use the first
@@ -612,9 +684,82 @@ pub fn four_layer_params(consts: &[crate::drawable::ShaderConst]) -> Value {
 /// offset, not per-layer values.
 const UV_TRANSFORMS: [&str; 2] = ["4344d2cc", "9ecaaa1e"];
 
-/// The 17-slot 4-layer ground shaders (`standard_uber_4lyr_dpm_dm_hbb`
-/// 61e09df7, `…_pxm_hbb_fixuv1` b21f1ba5, `…_spx_dm_hbb` 360e396b,
-/// `…_pxm_hbb_uv3` 27e5c49d), same slot layout in all four. Slot names are recovered parameter names
+/// The 4-layer ground shaders: name hash, the variant's suffix after
+/// `standard_uber_4lyr`, and whether the variant's own main pixel program
+/// was compared with the one read in full (the nine variants found on 14
+/// surveyed map tiles). All 18 have the same 17 texture slots in the
+/// shader archive's tables.
+const FOUR_LAYER: [(&str, &str, bool); 18] = [
+    ("88a32075", "", false),
+    ("388f8fb6", "_dfm_dm_hbb", false),
+    ("f8e1f225", "_dfm_dm_hbb_uv3", false),
+    ("61fad45c", "_dpm_dfm_dm_hbb", true),
+    ("40497278", "_dpm_dfm_dm_hbb_uv3", true),
+    ("61e09df7", "_dpm_dm_hbb", true),
+    ("0ad54cb9", "_dpm_dm_hbb_uv3", true),
+    ("d5bdc029", "_hbo_dm_hbb", false),
+    ("6f968246", "_mud_dm_hbb", false),
+    ("1ae17fd6", "_mud_dm_hbb_uv3", false),
+    ("5a71e7e1", "_pxm", false),
+    ("4a579bbf", "_pxm_hbb", true),
+    ("b21f1ba5", "_pxm_hbb_fixuv1", true),
+    ("27e5c49d", "_pxm_hbb_uv3", true),
+    ("10098c2c", "_pxm_uv3", false),
+    ("360e396b", "_spx_dm_hbb", true),
+    ("76fcff28", "_spx_dm_hbb_uv3", true),
+    ("7543cefc", "_uv3", false),
+];
+
+/// What is known about one variant of the 4-layer ground shader, by the
+/// parts of its name: what its program was seen to do differently, and
+/// what was not read.
+fn four_layer_variant(suffix: &str, compared: bool) -> Value {
+    let has = |part: &str| suffix.split('_').any(|p| p == part);
+    let mut differences = Vec::new();
+    if has("uv3") {
+        differences.push("uv3: the pixel program takes a second tangent frame from the mesh (one more interpolated vector, or two); the layers' UV inputs are the same as without uv3. The mesh's third UV set is about 60 to 100 m per unit on these materials; what it is used for was not read");
+    }
+    if has("dfm") {
+        differences.push("dfm: reads three more textures that the engine supplies (not material slots), 9 more samples than the same variant without dfm; their use was not traced");
+    }
+    if has("pxm") {
+        differences.push("pxm: 8 more texture samples with explicit gradients than the dpm variant; not traced");
+    }
+    if has("spx") {
+        differences.push("spx: 4 more texture samples than the dpm variant; not traced. Its mesh program is the same as the pxm variant's");
+    }
+    if has("fixuv1") {
+        differences.push("fixuv1: the second UV set is not used for the layers");
+    }
+    for part in ["mud", "hbo"] {
+        if has(part) {
+            differences.push(if part == "mud" { "mud: not examined" } else { "hbo: not examined" });
+        }
+    }
+    let height_blend = if !has("hbb") {
+        "this variant has no height-blend constants (03754af2, b2339a6c, blendsoftness), so its layers probably blend by weight alone; its program was not read"
+    } else if has("dpm") {
+        "as described in height_blend: on per layer by the switch f24b51f2"
+    } else if compared {
+        "the program has the same softness code as described in height_blend, but this variant has no switch constant f24b51f2: whether the blend is then always on was not read"
+    } else {
+        "the variant has the height-blend constants; its program was not read"
+    };
+    json!({
+        "shader": format!("standard_uber_4lyr{suffix}"),
+        "program": if compared {
+            "its main pixel program was compared with the one read in full (standard_uber_4lyr_dpm_dm_hbb): the same layer UV selection, tint code and height-blend code are present; it was not read line by line"
+        } else {
+            "only its tables were compared (the same 17 texture slots as the variants that were read); no material using it was examined and its program was not read, so the description is by analogy"
+        },
+        "height_blend": height_blend,
+        "differences": differences,
+        "confidence": if compared { "medium" } else { "low" },
+    })
+}
+
+/// The 17-slot 4-layer ground shaders (`standard_uber_4lyr` and its 17
+/// variants, see `FOUR_LAYER`), same slot layout in all. Slot names are recovered parameter names
 /// (`diffusetexture_layer0` …); the unnamed data maps were paired with
 /// their layer by co-occurrence (each data-map hash goes with exactly one
 /// layer's diffuse over 200 materials). Weights: the section-wide
@@ -630,7 +775,7 @@ const UV_TRANSFORMS: [&str; 2] = ["4344d2cc", "9ecaaa1e"];
 /// with its layer, that the second vertex colour set can replace the lookup
 /// weights, that a layer is skipped when its weight is 0, and that the
 /// layers' results are added weighted.
-fn four_layer(name_hash: &str, tex: &dyn Fn(usize) -> Value) -> Value {
+fn four_layer(suffix: &str, compared: bool, tex: &dyn Fn(usize) -> Value) -> Value {
     // (colour, normal, data) per layer
     const SLOTS: [[usize; 3]; 4] = [[14, 15, 4], [12, 10, 0], [9, 11, 5], [13, 7, 1]];
     let weight = ["lookup.r", "lookup.g", "lookup.b", "1 - (lookup.r + lookup.g + lookup.b)"];
@@ -639,19 +784,18 @@ fn four_layer(name_hash: &str, tex: &dyn Fn(usize) -> Value) -> Value {
         .enumerate()
         .map(|(i, s)| json!({"name": format!("layer{i}"), "colour": tex(s[0]), "normal": tex(s[1]), "data": tex(s[2]), "uv_set": "TEXCOORD_0", "uv_scale": 128.0, "uv_offset": [0.0, 0.0], "uv_source": "assumed (the usual values on map section tiles)", "weight": weight[i]}))
         .collect();
-    let alt_uv = match name_hash {
-        "b21f1ba5" => Value::Null,
-        "27e5c49d" => json!("TEXCOORD_2"),
-        _ => json!("TEXCOORD_1"),
-    };
+    // every variant's pixel program picks a layer's UV the same way; which
+    // mesh stream the second input is comes from UV density, not code
+    let alt_uv = if suffix.ends_with("_fixuv1") { Value::Null } else { json!("TEXCOORD_1") };
     json!({
         "family": "four_layer",
+        "variant": four_layer_variant(suffix, compared),
         "layers": layers,
         "weights": {"texture": tex(2), "uv_set": "TEXCOORD_0 (on section tiles = section position / 512 m; on other models the model's own UV0, see uv_fit)", "channels": {"r": "layer0", "g": "layer1", "b": "layer2", "remainder": "layer3"}, "note": "R+G+B <= 1 (BC7 rounding up to 258/255: clamp); the remainder weights layer 3",
             "vertex_override": "weights = mix(lookup.rgb, COLOR_1.rgb, COLOR_1.a) per channel, and the remainder = saturate(1 - r - g - b) of each side mixed the same way: where the second vertex colour set has alpha 0 (the usual case) the lookup texture alone decides. From the shader code; COLOR_1 is the exported attribute `_COLOR1` (its r + g + b stays at or below 1 on map tiles, as weights do). See weights.source and weights.vertex for this material's own vertices.",
             "result": "each layer's shaded result is multiplied by its weight and the four are added; a layer whose weight is 0 is not sampled"},
         "macro": {"uv_set": "TEXCOORD_0", "tint": tex(16), "tint_normal": tex(8), "grass_mask": tex(3), "note": "section-wide maps (one 512 m section per texture): colour variation, large-scale normal, grass placement mask"},
-        "detail_uv": {"default": "each layer's uv_set, uv_scale and uv_offset come from the material's constants (4344d2cc = scale and offset of the first UV set, 9ecaaa1e of the second, 724bed95 = which set each layer uses); on most map section tiles that is TEXCOORD_0 * 128 (world-planar, one repeat per 4 m; 64 was assumed until 2026-11-24). Without the constants: `recommended` follows this material's measured mapping (`uv_fit`): set pieces and rock formations using these shaders have their own UV0 (about 35 m per unit on the street-trash grounds), usually with a planar TEXCOORD_1 at 3 m per unit", "alt_uv_set": alt_uv, "note": "TEXCOORD_1 (61e09df7, 360e396b) is world-planar / 8 m on flat ground and unwrapped elsewhere (probably slopes); constant on b21f1ba5 ('fixuv1'), so that variant tiles from position. 27e5c49d ('uv3'): TEXCOORD_1 is not a usable UV (spans >1000), TEXCOORD_2 is an unwrap (not world-planar), so the alternative set is TEXCOORD_2 (low confidence). The shader also has a branch that samples a layer again at another scale (constant 26cc8f94); not decoded"},
+        "detail_uv": {"default": "each layer's uv_set, uv_scale and uv_offset come from the material's constants (4344d2cc = scale and offset of the first UV set, 9ecaaa1e of the second, 724bed95 = which set each layer uses); on most map section tiles that is TEXCOORD_0 * 128 (world-planar, one repeat per 4 m; 64 was assumed until 2026-11-24). Without the constants: `recommended` follows this material's measured mapping (`uv_fit`): set pieces and rock formations using these shaders have their own UV0 (about 35 m per unit on the street-trash grounds), usually with a planar TEXCOORD_1 at 3 m per unit", "alt_uv_set": alt_uv, "note": "The pixel program picks each layer's UV by 724bed95: 1 = the first set, 2 = the second (the same code in all nine variants whose programs were compared, `uv3` ones included). The second set is TEXCOORD_1 by its density: about 3 to 6 m per unit on every variant over 14 tiles, like TEXCOORD_0 x 128 (4 m), while TEXCOORD_2 is 40 to 100 m per unit; medium confidence, the mesh programs that feed the inputs could not be read. Until 2026-11-24 the `uv3` variant 27e5c49d was given TEXCOORD_2 here. 'fixuv1' (b21f1ba5): the second set is taken as unused, so that variant tiles from position. The shader also has a branch that samples a layer again at another scale (constant 26cc8f94); not decoded"},
         "vertex_color_channels": {"_COLOR1": "rgb = layer weights for layers 0, 1, 2 (the remainder is layer 3), a = how much they replace the lookup texture's weights", "_COLOR0": "rgb = a vertex tint (stored sRGB), a = its blend amount; from the shader code, not applied by the exporter"},
         "texcoord_2": "a copy of TEXCOORD_0 on most 61e09df7 primitives, constant elsewhere",
         "height_blend": {
@@ -668,7 +812,7 @@ fn four_layer(name_hash: &str, tex: &dyn Fn(usize) -> Value) -> Value {
             ],
             "switch": "f24b51f2[k] is 0 or 1 per layer: with 0 on all four layers (the usual case: 49 of 57 materials on 14 tiles) the weights stay as they are and no height blend happens",
             "constants": "per layer, in params.per_layer of this material: 03754af2, b2339a6c, blendsoftness, f24b51f2",
-            "not_read": "the fade term, the fifth term, and the other variants' programs"
+            "not_read": "the fade term and the fifth term; see `variant` for what holds on this material's shader"
         },
         "data_map_channels": {"a": "tint mask of the layer: how much of the tint colour replaces the layer colour (the shader can use 1 - a instead, by a material constant)", "b": "height, for the height-based blend (see height_blend); also overlay-blended with the detail array's blue channel into a scalar that is scaled and offset per layer", "g": "a scalar that is accumulated per layer beside the colour and changed by the detail array and a grazing-angle term: roughness-like, not confirmed", "r": "not read by the programs that were read", "source": "shader code"},
         "detail_array": {"texture": tex(6), "use": "a texture array sampled once per layer after the layer's colour; the slice is a per-layer constant, red and green are a detail normal (x2 - 1), blue (around 0.5) brightens or darkens the layer colour and feeds the height and roughness-like scalars", "source": "shader code (standard_uber_4lyr); medium confidence"},
@@ -690,6 +834,28 @@ mod paint_tests {
         assert!((c[0] - 0.2158).abs() < 1e-3);
         assert_eq!(parse_paint("fff"), None);
         assert_eq!(parse_paint("zzzzzz"), None);
+    }
+
+    #[test]
+    fn four_layer_variants() {
+        let entries: Vec<Value> = vec![json!({"param": 14, "png": "t14.png", "status": "ok"})];
+        // all 18 variants are described, with the same slots; the hashes are the names' hashes
+        for (hash, suffix, _) in FOUR_LAYER {
+            assert_eq!(format!("{:08x}", crate::meta7a::joaat(&format!("standard_uber_4lyr{suffix}"))), hash);
+            let l = layers(hash, &entries).unwrap();
+            assert_eq!((l["family"].as_str(), l["layers"][0]["colour"]["png"].as_str()), (Some("four_layer"), Some("t14.png")));
+            assert_eq!(classify(hash, &[0; 8])["class"], "terrain_multilayer");
+        }
+        // a variant found on tiles: compared, uv3 keeps the second UV set, dfm is listed
+        let v = &layers("40497278", &entries).unwrap();
+        assert_eq!((v["variant"]["confidence"].as_str(), v["variant"]["differences"].as_array().map(Vec::len), v["detail_uv"]["alt_uv_set"].as_str()), (Some("medium"), Some(2), Some("TEXCOORD_1")));
+        assert!(v["variant"]["height_blend"].as_str().unwrap().starts_with("as described"));
+        // no switch constant outside the dpm variants; no height blend without hbb; unexamined variants say so
+        assert!(layers("4a579bbf", &entries).unwrap()["variant"]["height_blend"].as_str().unwrap().contains("no switch constant"));
+        let base = &layers("88a32075", &entries).unwrap()["variant"];
+        assert!(base["height_blend"].as_str().unwrap().contains("no height-blend constants") && base["program"].as_str().unwrap().starts_with("only its tables"));
+        assert_eq!((base["confidence"].as_str(), base["shader"].as_str()), (Some("low"), Some("standard_uber_4lyr")));
+        assert_eq!(layers("6f968246", &entries).unwrap()["variant"]["differences"][0], "mud: not examined");
     }
 
     #[test]
@@ -742,7 +908,7 @@ mod paint_tests {
         assert!(l["weights"]["vertex_override"].as_str().unwrap().contains("COLOR_1") && l["data_map_channels"]["a"].as_str().unwrap().starts_with("tint mask"));
         assert_eq!(l["macro"]["tint"]["png"], "t16.png");
         assert!(layers("b21f1ba5", &entries).unwrap()["detail_uv"]["alt_uv_set"].is_null());
-        assert_eq!(layers("27e5c49d", &entries).unwrap()["detail_uv"]["alt_uv_set"], "TEXCOORD_2");
+        assert_eq!(layers("27e5c49d", &entries).unwrap()["detail_uv"]["alt_uv_set"], "TEXCOORD_1");
     }
 
     fn prim(f: impl Fn(f32, f32) -> [[f32; 2]; 2]) -> crate::gltf::TriPrim {
@@ -834,5 +1000,31 @@ mod paint_tests {
         let m = gltf_fields(&json!({"class": "emissive", "alpha_mode": "OPAQUE"}), true);
         assert_eq!(m["emissiveTexture"], "base");
         assert_eq!(m["emissiveFactor"], json!([1.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn four_layer_tint_formula() {
+        let k = |hash: &str, v: [f32; 4], count: u8| crate::drawable::ShaderConst { hash: hash.into(), desc: String::new(), offset: 0, values: Some(v), buffer: 7, count, ty: None };
+        let mut consts = vec![
+            k("8e3fb0aa", [0.0, 1.0, 0.0, 0.0], 4), k("db26e4de", [2.0, 3.0, 0.0, 1.0], 4), k("1caef69a", [1.0, 1.0, 1.0, 0.0], 4), k("b1c84936", [1.0, 0.0, 0.0, 0.0], 4),
+            k("81bc5bca", [1.0, 1.5, 1.0, 0.0], 4), k("896d1e47", [1.0, 1.0, 0.0, 1.0], 4), k("3fb2b8f7", [1.0, 0.0, 0.0, 0.0], 1), k("834fb13b", [0.0; 4], 1),
+        ];
+        let mut l = json!({});
+        // a switch is missing: nothing is written
+        four_layer_tint(&mut l, &consts);
+        assert!(l["tint_formula"].is_null());
+        consts.push(k("abe2c64d", [1.0, 0.0, 0.0, 0.0], 1));
+        four_layer_tint(&mut l, &consts);
+        let p = &l["tint_formula"]["per_layer"];
+        // layer 0: luminance texture tint with a blend amount, so the mask is inverted; multiply vertex tint
+        assert_eq!((p[0]["mask"].as_str(), p[0]["vertex_tint"].as_str(), p[0]["texture_tint"].as_str(), p[0]["texture_tint_amount"].as_str()), (Some("1 - a"), Some("multiply"), Some("luminance"), Some("saturate(a x 1)")));
+        // layer 1: multiply texture tint keeps the mask; layer 2: no intensity and no mask scale; layer 3: no blend amount, no vertex intensity
+        assert_eq!((p[1]["mask"].as_str(), p[1]["vertex_tint"].as_str(), p[1]["texture_tint"].as_str()), (Some("a"), Some("luminance"), Some("multiply")));
+        assert_eq!((p[2]["vertex_tint"].as_str(), p[2]["texture_tint"].as_str(), p[3]["vertex_tint"].as_str(), p[3]["texture_tint"].as_str()), (Some("off"), Some("off"), Some("off"), Some("off")));
+        assert_eq!((l["tint_formula"]["steps"].as_array().map(Vec::len), l["tint_formula"]["switches"]["vertex tint on (3fb2b8f7)"].as_f64()), (Some(7), Some(1.0)));
+        // the blend amount as a number when the material does not scale it by the mask
+        consts.last_mut().unwrap().values = Some([0.0; 4]);
+        four_layer_tint(&mut l, &consts);
+        assert_eq!(l["tint_formula"]["per_layer"][0]["texture_tint_amount"].as_f64(), Some(1.0));
     }
 }
