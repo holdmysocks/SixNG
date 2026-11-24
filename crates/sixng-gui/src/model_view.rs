@@ -400,6 +400,9 @@ pub struct ModelView {
     /// Hinged panels of the loaded model: joint index -> (0 = door, 1 =
     /// bonnet, 2 = boot; rotation axis; sign that swings it open).
     hinges: HashMap<usize, (u8, Vec3, f32)>,
+    /// `--fit-parts <hex,hex>`: part options (archive offsets) to fit once
+    /// after the load, in place of the configuration's.
+    pub fit_parts_once: Option<String>,
     /// Brake disc and caliper models at the wheels.
     brakes: Vec<(bool, GpuModel)>,
     brake_pending: Arc<Mutex<Option<Vec<(bool, Loaded)>>>>,
@@ -693,6 +696,7 @@ impl ModelView {
             bonnet_open: 0.0,
             boot_open: 0.0,
             hinges: HashMap::new(),
+            fit_parts_once: None,
             brakes: Vec::new(),
             brake_pending: Arc::new(Mutex::new(None)),
             brake_key: String::new(),
@@ -1116,7 +1120,7 @@ impl ModelView {
 
     /// Car extras settled: vehicle data applied and the fitted wheels loaded.
     fn idle_for_shot(&self) -> bool {
-        if self.parts_request.is_some() || self.random_parts_once || !self.hair.settled() || self.auto.then.is_some() || self.auto.find_hair || self.hair.fitting || self.ped_clip.loading || (!self.ped_clip.want.trim().is_empty() && self.ped_clip.anim.is_none() && self.ped_clip.status.starts_with("loading")) {
+        if self.parts_request.is_some() || self.fit_parts_once.is_some() || self.random_parts_once || !self.hair.settled() || self.auto.then.is_some() || self.auto.find_hair || self.hair.fitting || self.ped_clip.loading || (!self.ped_clip.want.trim().is_empty() && self.ped_clip.anim.is_none() && self.ped_clip.status.starts_with("loading")) {
             return false;
         }
         let Some(l) = self
@@ -2390,6 +2394,14 @@ impl ModelView {
     }
 
     fn update_wheels(&mut self, rs: &egui_wgpu::RenderState, ctx: &egui::Context) {
+        // --fit-parts: the given part choice, once the vehicle and its
+        // configuration's parts are in
+        if self.fit_parts_once.is_some() && !self.loading && self.parts_request.is_none() {
+            if let Some(l) = &self.loaded {
+                let list = self.fit_parts_once.take().unwrap_or_default();
+                self.parts_request = Some(format!("{}#parts={list}", l.base.split("#parts=").next().unwrap_or(&l.base)));
+            }
+        }
         // --random-parts: one random choice of parts once the vehicle is in
         if self.random_parts_once && !self.loading && self.parts_request.is_none() {
             if let Some(l) = self.loaded.as_ref().filter(|l| !l.parts.is_empty()) {
@@ -5306,7 +5318,7 @@ fn load_query_sel(
         .map(|name| export::member_entry(e, name))
         .transpose()?;
     let e = selected.as_ref().unwrap_or(e);
-    let (model, lods, info) = export_load(&a, e, cache, lod)?;
+    let (model, lods, mut info) = export_load(&a, e, cache, lod)?;
     let level = lod;
     let lod = lod_index(&lods, level);
     // animals: the fragment is a skeleton with a placeholder plane; add the textured parts
@@ -5499,6 +5511,33 @@ fn load_query_sel(
             let mut chosen = chosen;
             let fitted: std::collections::HashSet<u32> = chosen.iter().flat_map(|o| part_names.get(o).into_iter().flatten().copied()).collect();
             let keys: std::collections::HashSet<u32> = fitted.iter().flat_map(|p| v.part_keys.get(p).into_iter().flatten().copied()).collect();
+            // A fitted part can change the wheels (a widebody kit, spacers):
+            // each wheel moves out from the centre line by the offsets and
+            // spacings for its axle, and its tyre widens. Applied to the
+            // stored wheel mounts, which place wheels and brakes.
+            let (mut out, mut wide) = ([0.0f32; 2], [0.0f32; 2]);
+            for f in fitted.iter().flat_map(|p| v.wheel_fits.get(p).into_iter().flatten()) {
+                for axle in 0..2 {
+                    if f.axles & (1 << axle) != 0 {
+                        out[axle] += f.offset + f.spacing;
+                        wide[axle] += f.width;
+                    }
+                }
+            }
+            if out != [0.0; 2] || wide != [0.0; 2] {
+                for m in info["wheel_mounts"].as_array_mut().into_iter().flatten() {
+                    let axle = m["bone"].as_str().is_some_and(is_rear) as usize;
+                    for k in ["centre", "pivot", "brake_centre"] {
+                        if let Some(x) = m[k][0].as_f64() {
+                            m[k][0] = (x + (out[axle] as f64).copysign(x)).into();
+                        }
+                    }
+                    if let Some(w) = m["half_width"].as_f64() {
+                        m["half_width"] = (w + wide[axle] as f64 / 2.0).into();
+                    }
+                }
+                info["wheel_fit_applied"] = serde_json::json!({"out": out, "width": wide});
+            }
             let stock: Vec<(u64, u32, Vec<u32>)> = v
                 .switches
                 .iter()
