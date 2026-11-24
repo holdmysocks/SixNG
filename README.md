@@ -167,6 +167,12 @@ exits with code 1.
 # Search names across all indexed archives
 .\target\release\sixng.exe search 'elegy|buffalo' --archive levels
 
+# Speed check: times indexing, search, texture decoding and model export on your install and prints a
+# checksum of every result (the same checksums before and after a code change = the same output).
+# Needs the archives indexed; writes nothing to the work dir. Times vary with what else the PC is doing:
+# compare the best of a few runs. --bench-only index,search,textures,models runs some parts only
+.\target\release\sixng.exe --bench --pretty
+
 # Name dictionary for shader, parameter and meta field hashes (~2 s, needs the common index).
 # Built from your install into work\names\names.json; exports and the app use it.
 .\target\release\sixng.exe names
@@ -214,6 +220,9 @@ exits with code 1.
 # UI graphics: named dictionaries (loading screens, HUD, gauges) and the UI texture store
 .\target\release\sixng.exe extract data --rtype txd -o out
 .\target\release\sixng.exe ttpf data/ttdb/ui/ttdb_ui.ttpf --all --out out\ui\ttdb_ui
+# A float lookup table with its real values (the PNG clamps to 0..1): <hash>_m0.f32, little-endian
+# 32-bit floats, every slice in order, channels interleaved; the result gives the dimensions
+.\target\release\sixng.exe ttpf ttdb_graphics --hash <hash> --float --out out\lut
 # BCPack texture gaps: every material with flat / low-mip textures, slot roles, class, terrain-layer
 # surface guesses and placement weight (~6 min; uses placements, batches, collision, surfaces)
 .\target\release\sixng.exe texture-gaps levels -o work\out --file work\texture_gaps.json --placements work\out\placements\levels

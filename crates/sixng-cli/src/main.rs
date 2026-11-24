@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+mod bench;
+
 #[derive(Parser)]
 #[command(name = "sixng", version, about = "GTA VI (RPF9 / Xbox Series) asset extractor")]
 struct Cli {
@@ -25,8 +27,10 @@ struct Cli {
     /// Pretty-print JSON output.
     #[arg(long, global = true)]
     pretty: bool,
+    #[command(flatten)]
+    bench: bench::BenchArgs,
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(clap::Args, Clone, Default)]
@@ -991,6 +995,9 @@ enum Cmd {
         /// Decode every slice of array textures and cube maps (<hash>_m<mip>_s<slice>.png); default is slice 0 only.
         #[arg(long)]
         all_slices: bool,
+        /// For float-format textures (lookup tables), also write the unclamped values as <hash>_m<mip>.f32: little-endian 32-bit floats, every slice of the mip in order, rows top to bottom, channels interleaved. The PNG clamps to 0..1 and keeps 8 bits. The result gives width, height, slices and channels.
+        #[arg(long)]
+        float: bool,
         /// Decode every texture in the store (in parallel) and write <out>/index.json; prints a summary instead of every result.
         #[arg(long)]
         all: bool,
@@ -1069,7 +1076,12 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
     let game = game_root(cli)?;
     let ws = Workspace::new(&game, &cli.work);
     let pr = progress(cli.quiet);
-    match &cli.cmd {
+    if cli.bench.bench {
+        out.print(&bench::run(&ws, &cli.bench)?);
+        return Ok(());
+    }
+    let Some(cmd) = &cli.cmd else { bail!("no command given: see `sixng --help`") };
+    match cmd {
         Cmd::Info => {
             let mut v = Vec::new();
             for a in ws.archives() {
@@ -1601,7 +1613,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             out.print(&o);
         }
-        Cmd::Ttpf { store, hash, first, mip, all_slices, all, out: tout } => {
+        Cmd::Ttpf { store, hash, first, mip, all_slices, float, all, out: tout } => {
             let a = ws.resolve(store)?;
             let st = sixng_core::ttpf::Ttpf::open(&a.path)?;
             let mut sel: Vec<&sixng_core::ttpf::TtpfTex> = Vec::new();
@@ -1631,6 +1643,18 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     // would be blank, so --all writes nothing for it.
                     if *all && skipped >= t.size as u64 {
                         return vec![json!({"hash": format!("{:016x}", t.hash), "w": t.width, "h": t.height, "format": sixng_core::texture::dxgi_name(t.dxgi_format), "error": "all data in BCPack chunks (not decodable yet)", "bcpack_only": true})];
+                    }
+                    if *float && sixng_core::texture::Fmt::from_dxgi(t.dxgi_format).is_float() {
+                        let p = dir.join(format!("{:016x}_m{mip}.f32", t.hash));
+                        let r = (0..t.slices()).try_fold((Vec::new(), 0, 0, 0), |mut acc, sl| {
+                            let (v, ch, w, h) = sixng_core::ttpf::decode_float_slice(t, &data, *mip, sl)?;
+                            acc.0.extend(v.iter().flat_map(|x| x.to_le_bytes()));
+                            anyhow::Ok((acc.0, ch, w, h))
+                        });
+                        match r.and_then(|(bytes, ch, w, h)| std::fs::write(&p, bytes).map(|_| (ch, w, h)).map_err(Into::into)) {
+                            Ok((ch, w, h)) => res.push(json!({"hash": format!("{:016x}", t.hash), "f32": p, "w": w, "h": h, "slices": t.slices(), "channels": ch, "format": sixng_core::texture::dxgi_name(t.dxgi_format), "layout": "little-endian f32; slices in order, rows top to bottom, channels interleaved", "undecoded_bytes": skipped, "partial": skipped > 0})),
+                            Err(e) => res.push(json!({"hash": format!("{:016x}", t.hash), "slices": t.slices(), "error": format!("float export: {e}")})),
+                        }
                     }
                     let n = if *all_slices { t.slices() } else { 1 };
                     for sl in 0..n {

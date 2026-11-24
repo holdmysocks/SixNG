@@ -7370,10 +7370,15 @@ fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db:
     // They place nothing themselves.
     let answered: std::collections::HashSet<u32> = v.switches.iter().flat_map(|s| s.options.iter().flat_map(|o| [o.0, o.1])).filter(|k| *k != 0).collect();
     let with_model: std::collections::HashSet<u32> = part_names.values().flatten().copied().collect();
-    let mut keyed: Vec<(&u32, &Vec<u32>)> = v.part_keys.iter().filter(|(p, k)| !with_model.contains(p) && k.iter().any(|k| answered.contains(k))).collect();
+    // So are parts whose every model is a switch's to show (a truck's side
+    // guards: one of several lengths and heights).
+    let mut keyed: Vec<&u32> = v.part_keys.iter().filter(|(p, k)| !with_model.contains(p) && k.iter().any(|k| answered.contains(k))).map(|(p, _)| p).collect();
+    let owners: Vec<u32> = v.switches.iter().filter_map(|s| s.part).filter(|p| !with_model.contains(p)).collect();
+    keyed.extend(owners.iter());
     keyed.sort();
+    keyed.dedup();
     if let Some(any) = ix.entries.first() {
-        for (p, _) in keyed {
+        for p in keyed {
             // not an archive offset: the top bit marks a part without a model
             let off = (1u64 << 63) | *p as u64;
             opts.push(crate::assemble::PartOpt { off, id: any.id.clone(), name: format!("{p:08x}"), group: format!("no model {p:08x}"), label: "fitted (changes stock pieces)".into(), default: first_config.contains(p) });
@@ -7383,7 +7388,17 @@ fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db:
     }
     opts.sort_by(|a, b| a.group.cmp(&b.group).then(a.label.cmp(&b.label)));
     // asset id -> model, for the chassis part's stock alternatives
-    let assets = by_asset.iter().map(|(a, x)| (*a, x.1.off)).collect();
+    let mut assets: HashMap<u64, u64> = by_asset.iter().map(|(a, x)| (*a, x.1.off)).collect();
+    // a library part's element names its model by name hash (the low half
+    // of the value), not by asset id
+    for e in v.switches.iter().flat_map(|s| s.options.iter().filter_map(|o| o.2.as_ref()).chain(s.default.as_ref())) {
+        if !assets.contains_key(&e.asset) {
+            let h = e.asset as u32;
+            if let Some(x) = by_hash.get(&h).and_then(|x| x.iter().find(|x| joaat(x.0) == h)) {
+                assets.insert(e.asset, x.1.off);
+            }
+        }
+    }
     (opts, kits, part_names, assets)
 }
 
