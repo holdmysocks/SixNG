@@ -441,6 +441,64 @@ fn solve3(m: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
     Some(x)
 }
 
+/// The variants of the clothing shader `ped_standard_muv` (name suffixes),
+/// from the shader archive's effect list.
+const CLOTHING_SHADERS: [&str; 22] = [
+    "", "_alpha", "_alpha_blendshape", "_alpha_secmo", "_anisotropy_alpha", "_anisotropy_sheen", "_anisotropy_sheen_secmo", "_blendshape", "_blendshape_cutout", "_cutout", "_cutout_secmo",
+    "_diffraction", "_diffraction_secmo", "_emissive", "_emissive_secmo", "_iridescence", "_iridescence_alpha", "_iridescence_alpha_secmo", "_iridescence_secmo", "_retroreflection",
+    "_retroreflection_secmo", "_secmo",
+];
+
+/// The stitch columns of the shared stitch mask texture, as U ranges.
+pub const STITCH_COLUMNS: [[f32; 2]; 3] = [[0.10, 0.23], [0.43, 0.56], [0.77, 0.89]];
+/// Store hash of the shared stitch mask texture (graphics texture store).
+pub const STITCH_MASK: &str = "19a5e59eedc47faa";
+
+/// The stitch layer of a clothing material (`ped_standard_muv` and its
+/// variants), measured on the material's third UV set. The clothing shader
+/// draws seams' stitches from one shared mask texture, sampled with that
+/// UV set: vertices away from a seam rest in an empty gap between the
+/// texture's three stitch columns, vertices on a seam lie on a column
+/// with V running along the seam. None for other shaders or a material
+/// without a third UV set.
+pub fn stitches(name_hash: &str, uv2: impl Iterator<Item = [f32; 2]>) -> Option<Value> {
+    let hash = u32::from_str_radix(name_hash.trim(), 16).ok()?;
+    if !CLOTHING_SHADERS.iter().any(|v| crate::meta7a::joaat(&format!("ped_standard_muv{v}")) == hash) {
+        return None;
+    }
+    let frac = |u: f32| u - u.floor();
+    let column = |u: f32| STITCH_COLUMNS.iter().position(|c| (c[0]..=c[1]).contains(&frac(u)));
+    let (mut n, mut cols, mut v) = (0u64, [0u64; 3], [f32::MAX, f32::MIN]);
+    for [u, w] in uv2.filter(|x| x[0].is_finite() && x[1].is_finite()) {
+        n += 1;
+        if let Some(c) = column(u) {
+            cols[c] += 1;
+            v = [v[0].min(w), v[1].max(w)];
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    let on: u64 = cols.iter().sum();
+    Some(json!({
+        "uv_set": "TEXCOORD_2",
+        "vertices": n,
+        "on_stitch_columns": on,
+        "per_column": cols,
+        "v_range_on_columns": (on > 0).then_some(v),
+        "has_stitches": on > 0,
+        "mask": {
+            "texture_hash": STITCH_MASK, "store": "graphics texture store (`sixng ttpf graphics --hash 19a5e59eedc47faa` decodes it)", "size": [128, 128], "sampling": "wrap, both ways",
+            "columns_u": STITCH_COLUMNS,
+            "channels": "as SixNG decodes it: R = the stitch mask (0 in the gaps, 255 on a stitch); G = 255 in the gaps and about 143 on a stitch; B = 255; A = 102 in the gaps and about 168 on a stitch",
+        },
+        "weight": "stitch amount (the material library preset's stitchesblendamount) x mask. The mask is the texture's R channel as decoded: the only channel that is 0 where vertices without stitches rest. The shader code names this channel alpha, so the channel order of this texture's format is not settled",
+        "colour": "from the shader code: each of the preset's three stitchtint colours is a three-stop gradient indexed by a grey channel of the mask; S = mix(grey, tint0, tint0.alpha), then S = mix(S, tint1, tint1.alpha x a mask channel) and the same for tint2; colour = mix(colour, S, weight). The normal is blended towards a stitch normal map by the same weight",
+        "source": "mask texture and UV set: measured on six garments (vertices without stitches rest in a gap between columns on all six); weight and colour: one pixel program of ped_standard_muv, read once",
+        "not_decoded": "which mask channels are the grey value and the two tint masks; the stitch normal map; the stitch amount and tints of this garment (they are in its material library preset, which a lone model does not name). Not applied to the exported textures",
+    }))
+}
+
 /// Where a 4-layer material's layer weights come from, measured on its own
 /// vertices: the shader mixes the lookup texture's weights with the second
 /// vertex colour set (`_COLOR1`) by that set's alpha, so alpha 1 means the
@@ -596,8 +654,25 @@ fn four_layer(name_hash: &str, tex: &dyn Fn(usize) -> Value) -> Value {
         "detail_uv": {"default": "each layer's uv_set, uv_scale and uv_offset come from the material's constants (4344d2cc = scale and offset of the first UV set, 9ecaaa1e of the second, 724bed95 = which set each layer uses); on most map section tiles that is TEXCOORD_0 * 128 (world-planar, one repeat per 4 m; 64 was assumed until 2026-11-24). Without the constants: `recommended` follows this material's measured mapping (`uv_fit`): set pieces and rock formations using these shaders have their own UV0 (about 35 m per unit on the street-trash grounds), usually with a planar TEXCOORD_1 at 3 m per unit", "alt_uv_set": alt_uv, "note": "TEXCOORD_1 (61e09df7, 360e396b) is world-planar / 8 m on flat ground and unwrapped elsewhere (probably slopes); constant on b21f1ba5 ('fixuv1'), so that variant tiles from position. 27e5c49d ('uv3'): TEXCOORD_1 is not a usable UV (spans >1000), TEXCOORD_2 is an unwrap (not world-planar), so the alternative set is TEXCOORD_2 (low confidence). The shader also has a branch that samples a layer again at another scale (constant 26cc8f94); not decoded"},
         "vertex_color_channels": {"_COLOR1": "rgb = layer weights for layers 0, 1, 2 (the remainder is layer 3), a = how much they replace the lookup texture's weights", "_COLOR0": "rgb = a vertex tint (stored sRGB), a = its blend amount; from the shader code, not applied by the exporter"},
         "texcoord_2": "a copy of TEXCOORD_0 on most 61e09df7 primitives, constant elsewhere",
-        "height_blend": "the shader names end in hbb (height-based blend): each layer's data map B channel looks like a height map; sharpen the weights by height for the game's look",
-        "data_map_channels": {"a": "tint mask of the layer: how much of the tint colour replaces the layer colour (the shader can use 1 - a instead, by a material constant)", "g": "read, use not traced", "b": "read, and used as 1 - b in a later step that was not traced", "r": "not read by the program that was read", "source": "shader code"},
+        "height_blend": {
+            "source": "shader code: the main deferred pixel program of standard_uber_4lyr_dpm_dm_hbb, read once; the constants' values on real materials fit (medium confidence)",
+            "height": "h[k] = B channel of layer k's data map, sampled with the layer's UV",
+            "steps": [
+                "a[k] = max(0.01, (h[k] - 03754af2[k]) * b2339a6c[k])        (per-layer height offset and scale; usually 0 and 1)",
+                "b[k] = saturate(a[k] * w[k] * fade)                            (w = the layer weights; fade is a distance term, 1 nearby)",
+                "c[k] = b[k] / max(b[0], b[1], b[2], b[3], extra)               (extra: a fifth term that was not traced; 0 when absent)",
+                "p[k] = 20 - 19 * saturate((blendsoftness[k] - 0.2) * 1.754)    (exponent: 20 at softness 0.2 or less, 1 at 0.77 or more)",
+                "d[k] = pow(c[k], p[k]) - 0.001",
+                "W[k] = saturate(d[k] / (d[0] + d[1] + d[2] + d[3] + d_extra))",
+                "final[k] = f24b51f2[k] * W[k] + (1 - sum over j of f24b51f2[j] * W[j]) * w[k]"
+            ],
+            "switch": "f24b51f2[k] is 0 or 1 per layer: with 0 on all four layers (the usual case: 49 of 57 materials on 14 tiles) the weights stay as they are and no height blend happens",
+            "constants": "per layer, in params.per_layer of this material: 03754af2, b2339a6c, blendsoftness, f24b51f2",
+            "not_read": "the fade term, the fifth term, and the other variants' programs"
+        },
+        "data_map_channels": {"a": "tint mask of the layer: how much of the tint colour replaces the layer colour (the shader can use 1 - a instead, by a material constant)", "b": "height, for the height-based blend (see height_blend); also overlay-blended with the detail array's blue channel into a scalar that is scaled and offset per layer", "g": "a scalar that is accumulated per layer beside the colour and changed by the detail array and a grazing-angle term: roughness-like, not confirmed", "r": "not read by the programs that were read", "source": "shader code"},
+        "detail_array": {"texture": tex(6), "use": "a texture array sampled once per layer after the layer's colour; the slice is a per-layer constant, red and green are a detail normal (x2 - 1), blue (around 0.5) brightens or darkens the layer colour and feeds the height and roughness-like scalars", "source": "shader code (standard_uber_4lyr); medium confidence"},
+        "tint": "not applied by the exporter. From the shader code, per layer: the layer colour is mixed towards a tinted colour by the data map's alpha (the tint mask); the tinted colour combines the vertex tint (_COLOR0 rgb, scaled by verttintintensity[k]) and the section's tint texture (macro.tint, scaled by tintintensity[k]) with the layer colour's luminance (weights 0.2125, 0.7154, 0.0721), blended by tintblendamount[k]. Several branches chosen by constants were not resolved, so there is no single formula to apply yet",
         "confidence": {"slots": "high (recovered names)", "data_map_pairing": "high (shader code: each data map is sampled with its layer's colour and normal map)", "weights_uv": "high", "channel_rgb_to_layer012": "high (shader code)", "layer3_remainder": "high (shader code)", "detail_uv_scale": "low"},
         "note": "Slots, pairing, channel order and the remainder rule are confirmed from shader code (one deferred pixel program); the UV scales and the height blend are still from recovered names and UV/seam statistics. Normal maps: DirectX green.",
     })
@@ -627,6 +702,17 @@ mod paint_tests {
         assert_eq!(l["layers"][3]["colour"]["param"], 13);
         assert_eq!(l["layers"][3]["colour"]["status"], "no texture bound");
         assert_eq!(l["weights"]["texture"]["png"], "t2.png");
+        // stitches: only clothing shaders with a third UV set; vertices on a column are counted per column
+        let muv = format!("{:08x}", crate::meta7a::joaat("ped_standard_muv_secmo"));
+        let x = stitches(&muv, [[2.33f32, 0.53], [0.5, -3.0], [-0.5, 7.0], [0.15, 1.0], [f32::NAN, 0.0]].into_iter()).unwrap();
+        assert_eq!((x["vertices"].as_u64(), x["on_stitch_columns"].as_u64(), x["per_column"][1].as_u64(), x["has_stitches"].as_bool()), (Some(4), Some(3), Some(2), Some(true)));
+        assert_eq!((x["v_range_on_columns"][0].as_f64(), x["v_range_on_columns"][1].as_f64()), (Some(-3.0), Some(7.0)));
+        let x = stitches(&muv, [[0.72f32, 0.54]; 3].into_iter()).unwrap();
+        assert_eq!((x["has_stitches"].as_bool(), x["v_range_on_columns"].is_null()), (Some(false), true));
+        assert!(stitches(&muv, std::iter::empty()).is_none());
+        assert!(stitches(&format!("{:08x}", crate::meta7a::joaat("standard")), [[0.5f32, 0.0]].into_iter()).is_none());
+        assert_eq!((l["height_blend"]["steps"].as_array().map(Vec::len), l["detail_array"]["texture"]["param"].as_u64()), (Some(7), Some(6)));
+        assert!(l["data_map_channels"]["b"].as_str().unwrap().starts_with("height") && l["tint"].as_str().unwrap().starts_with("not applied"));
         // where the weights come from, measured on the material's vertices
         let mut v = l.clone();
         four_layer_vertex_weights(&mut v, [[10u8, 20, 30, 255], [0, 0, 0, 255]].into_iter());
