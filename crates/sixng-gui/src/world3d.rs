@@ -13,6 +13,10 @@
 //!   Levels 0-6 have 64 x 64 cells (8 m cells at level 6); levels 7 and 8
 //!   split the 8 m data into smaller nodes so the roof/ground switch follows
 //!   the model range closely.
+//! * Cells with no collision (left as sea by the bake, e.g. outside a
+//!   `--bbox` collision export) take their height from the game's own
+//!   whole-world height map (`common.rpf`, 9.77 m) where that map has land,
+//!   drawn untextured in a plain land colour.
 //! * The colour is the baked 2D map tile of the same footprint
 //!   (`tiles/terrain/<z>/<x>_<y>.png`, z = min(l, 6)), so coarse nodes come
 //!   with coarse tiles and refining a node sharpens its texture.
@@ -46,6 +50,8 @@ const GROUND_LIFT: f32 = 2.0;
 const WATER_Z: f32 = -2.0;
 /// The map tiles' water colour (40, 80, 140 sRGB), linear.
 const SEA: [f32; 4] = [0.021, 0.080, 0.262, 1.0];
+/// Colour of cells filled from the height map (no map tile there), linear.
+const FILLED_LAND: [f32; 4] = [0.155, 0.262, 0.102, 1.0];
 
 #[derive(Clone, Copy, Hash, Eq, PartialEq, Debug, PartialOrd, Ord)]
 pub struct Key {
@@ -199,10 +205,51 @@ impl Level {
 pub struct Pyramids {
     roof: Vec<Level>,
     ground: Vec<Level>,
+    /// Share of each cell filled from the height map (0 = collision).
+    filled: Vec<Level>,
+}
+
+/// Fills the collision grid's empty (sea) cells from the game's height map
+/// where it has land. Returns the heights and a 0/1 filled mask.
+pub fn fill_from_heightmap(h8: &[f32], hm: &sixng_core::heightmap::HeightMap) -> (Vec<f32>, Vec<f32>) {
+    let (nx, ny) = (W / COARSE, H / COARSE);
+    let cell = CELL * COARSE as f32;
+    let mut h = h8.to_vec();
+    let mut mask = vec![0.0f32; h.len()];
+    for r in 0..ny.min(h.len() / nx) {
+        for c in 0..nx {
+            let i = r * nx + c;
+            if !h[i].is_nan() {
+                continue;
+            }
+            let x = X0 + (c as f32 + 0.5) * cell;
+            let y = Y1 - (r as f32 + 0.5) * cell;
+            if let Some((z, land)) = hm.sample(x, y) {
+                // keep shallow coast under the sea plane
+                if land && z > WATER_Z + 0.5 {
+                    h[i] = z;
+                    mask[i] = 1.0;
+                }
+            }
+        }
+    }
+    (h, mask)
+}
+
+/// Loads the best height map from the `common` index, if there is one.
+pub fn load_heightmap(game: &str, work: &str) -> Option<sixng_core::heightmap::HeightMap> {
+    let ws = sixng_core::export::Workspace::new(game, work);
+    let mut maps = sixng_core::heightmap::load_all(&ws, "common").ok()?;
+    let i = sixng_core::heightmap::best(&maps)?;
+    Some(maps.swap_remove(i).1)
 }
 
 impl Pyramids {
     pub fn build(h8: &[f32]) -> Pyramids {
+        Self::build_filled(h8, &vec![0.0; h8.len()])
+    }
+
+    pub fn build_filled(h8: &[f32], fill: &[f32]) -> Pyramids {
         let (nx, ny) = (W / COARSE, H / COARSE);
         let roof6 = Level {
             nx,
@@ -257,17 +304,22 @@ impl Pyramids {
             }
         }
         let ground6 = Level { nx, ny, h: g };
+        let fill6 = Level { nx, ny, h: fill.to_vec() };
         let mut roof = vec![roof6];
         let mut ground = vec![ground6];
+        let mut filled = vec![fill6];
         for _ in 0..DATA_LEVEL {
             let r = roof.last().unwrap().down(true);
             let gl = ground.last().unwrap().down(false);
+            let f = filled.last().unwrap().down(false);
             roof.push(r);
             ground.push(gl);
+            filled.push(f);
         }
         roof.reverse();
         ground.reverse();
-        Pyramids { roof, ground }
+        filled.reverse();
+        Pyramids { roof, ground, filled }
     }
 
     /// Highest roof height inside a node (for culling and distances).
@@ -315,13 +367,16 @@ fn node_model(
     let cs = k.cell();
     let (c0, r0) = (k.x as i64 * n as i64, k.y as i64 * n as i64);
     let ((tz, tx, ty), [u0, v0, us]) = k.tile();
+    let fl = &py.filled[k.l.min(DATA_LEVEL) as usize];
     let mut verts = Vec::with_capacity((n + 1) * (n + 1) + 4 * (n + 1));
     let mut inside = Vec::with_capacity((n + 1) * (n + 1));
+    let mut from_hm = Vec::with_capacity((n + 1) * (n + 1));
     for j in 0..=n {
         for i in 0..=n {
             let (c, r) = (c0 + i as i64, r0 + j as i64);
             let raw = lvl.get(c, r);
             inside.push(raw.is_finite() || raw.is_nan());
+            from_hm.push(raw.is_finite() && fl.get_clamped(c, r) > 0.5);
             // ground nodes are lifted by GROUND_LIFT when drawn; water stays under the sea plane
             let z = if raw.is_finite() {
                 raw - SINK
@@ -358,21 +413,27 @@ fn node_model(
     }
     let w = n + 1;
     let mut idx: Vec<u32> = Vec::with_capacity(n * n * 6);
+    // triangles whose corners all come from the height map: untextured
+    let mut idx_hm: Vec<u32> = Vec::new();
     for j in 0..n {
         for i in 0..n {
             let a = j * w + i;
             let (b, c, d) = (a + 1, a + w, a + w + 1);
-            if inside[a] && inside[b] && inside[c] {
-                idx.extend_from_slice(&[a as u32, b as u32, c as u32]);
-            }
-            if inside[b] && inside[d] && inside[c] {
-                idx.extend_from_slice(&[b as u32, d as u32, c as u32]);
+            for t in [[a, b, c], [b, d, c]] {
+                if t.iter().all(|&v| inside[v]) {
+                    let dst = if t.iter().all(|&v| from_hm[v]) { &mut idx_hm } else { &mut idx };
+                    dst.extend_from_slice(&[t[0] as u32, t[1] as u32, t[2] as u32]);
+                }
             }
         }
     }
     // Skirts hide cracks against coarser neighbours.
     let depth = cs * 1.5 + 8.0;
-    let skirt = |edge: Vec<usize>, flip: bool, verts: &mut Vec<glb::Vertex>, idx: &mut Vec<u32>| {
+    let skirt = |edge: Vec<usize>,
+                 flip: bool,
+                 verts: &mut Vec<glb::Vertex>,
+                 idx: &mut Vec<u32>,
+                 idx_hm_s: &mut Vec<u32>| {
         for p in edge.windows(2) {
             let (a, b) = (p[0], p[1]);
             if !(inside[a] && inside[b]) {
@@ -385,6 +446,7 @@ fn node_model(
                 verts.push(v);
             }
             let (a, b) = (a as u32, b as u32);
+            let idx = if from_hm[a as usize] && from_hm[b as usize] { &mut *idx_hm_s } else { &mut *idx };
             if flip {
                 idx.extend_from_slice(&[a, base, b, b, base, base + 1]);
             } else {
@@ -392,19 +454,21 @@ fn node_model(
             }
         }
     };
-    skirt((0..w).collect(), false, &mut verts, &mut idx);
+    skirt((0..w).collect(), false, &mut verts, &mut idx, &mut idx_hm);
     skirt(
         (0..w).map(|i| n * w + i).collect(),
         true,
         &mut verts,
         &mut idx,
+        &mut idx_hm,
     );
-    skirt((0..w).map(|j| j * w).collect(), true, &mut verts, &mut idx);
+    skirt((0..w).map(|j| j * w).collect(), true, &mut verts, &mut idx, &mut idx_hm);
     skirt(
         (0..w).map(|j| j * w + n).collect(),
         false,
         &mut verts,
         &mut idx,
+        &mut idx_hm,
     );
 
     // tile texture (shared by key; decoded only when not yet on the GPU)
@@ -439,21 +503,41 @@ fn node_model(
     let rect = k.rect();
     let centre = gl([(rect[0] + rect[2]) * 0.5, (rect[1] + rect[3]) * 0.5, 0.0]);
     // counter-clockwise seen from above: the coverage pass culls back faces
-    for t in idx.chunks_exact_mut(3) {
+    for t in idx.chunks_exact_mut(3).chain(idx_hm.chunks_exact_mut(3)) {
         t.swap(1, 2);
     }
-    let tris = idx.len() / 3;
+    let tris = (idx.len() + idx_hm.len()) / 3;
     let nv = verts.len();
-    let mesh = glb::Mesh {
-        name: format!("world {}/{}/{}", k.l, k.x, k.y),
-        verts,
-        indices: idx,
-        material: Some(0),
-        skinned: false,
-        has_tangents: false,
-        uv_sets: 1,
-        centre,
-    };
+    let mut meshes = Vec::new();
+    if !idx_hm.is_empty() {
+        meshes.push(glb::Mesh {
+            name: format!("world {}/{}/{} heightmap", k.l, k.x, k.y),
+            verts: verts.clone(),
+            indices: idx_hm,
+            material: Some(1),
+            skinned: false,
+            has_tangents: false,
+            uv_sets: 1,
+            centre,
+        });
+    }
+    // a node wholly filled from the height map has no textured triangles:
+    // leave out the empty mesh (zero-length index buffers stall the upload)
+    if !idx.is_empty() || meshes.is_empty() {
+        meshes.insert(
+            0,
+            glb::Mesh {
+                name: format!("world {}/{}/{}", k.l, k.x, k.y),
+                verts,
+                indices: idx,
+                material: Some(0),
+                skinned: false,
+                has_tangents: false,
+                uv_sets: 1,
+                centre,
+            },
+        );
+    }
     let mat = glb::Material {
         name: "world".into(),
         class: "map_tile".into(),
@@ -478,8 +562,16 @@ fn node_model(
     };
     glb::Model {
         path: PathBuf::new(),
-        meshes: vec![mesh],
-        materials: vec![mat],
+        meshes,
+        materials: vec![
+            mat.clone(),
+            glb::Material {
+                name: "world heightmap".into(),
+                base_factor: FILLED_LAND,
+                base: None,
+                ..mat
+            },
+        ],
         joints: vec![],
         images,
         bbox: [[rect[0], -10.0, -rect[3]], [rect[2], 500.0, -rect[1]]],
@@ -610,7 +702,9 @@ impl World {
     }
 
     /// Start the pyramid build and the workers (once).
-    pub fn start(&mut self, h8: Arc<Vec<f32>>) {
+    /// `src` (game, work) lets the build fill cells without collision from
+    /// the game's height map.
+    pub fn start(&mut self, h8: Arc<Vec<f32>>, src: Option<(String, String)>) {
         if self.started {
             return;
         }
@@ -621,7 +715,18 @@ impl World {
             let sh = self.shared.clone();
             std::thread::spawn(move || {
                 let t0 = std::time::Instant::now();
-                let py = Pyramids::build(&h8);
+                let hm = src.and_then(|(g, w)| load_heightmap(&g, &w));
+                let py = match &hm {
+                    Some(hm) => {
+                        let (h, fill) = fill_from_heightmap(&h8, hm);
+                        eprintln!(
+                            "[world] {} empty 8 m cells filled from the height map",
+                            fill.iter().filter(|&&f| f > 0.5).count()
+                        );
+                        Pyramids::build_filled(&h, &fill)
+                    }
+                    None => Pyramids::build(&h8),
+                };
                 let _ = sh.py.set(Arc::new(py));
                 eprintln!(
                     "[world] height pyramids in {:.0} ms",
