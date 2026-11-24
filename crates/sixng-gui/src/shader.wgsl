@@ -16,7 +16,7 @@ struct Frame {
     misc2: vec4<f32>,     // x fog density, yzw secondary paint colour
     misc3: vec4<f32>,     // x tint palette on (1) / off (0), w the vehicle's own paint metalness
     prev_view_proj: mat4x4<f32>,
-    jitter: vec4<f32>,
+    jitter: vec4<f32>,    // w vehicle wear (0 to 1)
 };
 
 struct Mat {
@@ -222,7 +222,7 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     if (M.tile.w > 1.5) {
         let g = textureSample(t_tile, samp, i.uv0).g;
         let id = floor(i.col.a * 255.0 + 0.5);
-        albedo = base.rgb * textureSampleLevel(t_em, samp, vec2(clamp(g, 0.004, 0.996), (id + 0.5) / 256.0), 0.0).rgb;
+        albedo = base.rgb * textureSampleLevel(t_em, samp, vec2(clamp(g, 0.004, 0.996), (id + 0.5) / 512.0), 0.0).rgb;
     }
     if (M.tile.w > 0.5 && M.tile.w < 1.5) {
         let c = cos(M.tile.y);
@@ -257,7 +257,25 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
         else if (F.mode.z == 4u) { metal = F.misc3.w; rough = clamp(F.paint1.w, 0.04, 1.0); }
         else { metal = 0.0; rough = 0.12; }
         pearl = F.paint2.rgb * F.paint2.w;
-    } else if (cls == 5u || cls == 6u) {
+    }
+    // vehicle parts, second layer of the surface (rust under paint, grey
+    // under bare metal): rows 256.. of the part ramp image hold its colour
+    // and roughness (alpha); its metalness is the alpha of the first rows.
+    // Shown where the layer detail texture's blue is high (taken as the
+    // wear mask), by the amount the user sets.
+    if (M.tile.w > 1.5 && F.jitter.w > 0.0) {
+        let d = textureSample(t_tile, samp, i.uv0);
+        let id = floor(i.col.a * 255.0 + 0.5);
+        let u = clamp(d.g, 0.004, 0.996);
+        let w1 = textureSampleLevel(t_em, samp, vec2(u, (id + 256.5) / 512.0), 0.0);
+        let m1 = textureSampleLevel(t_em, samp, vec2(u, (id + 0.5) / 512.0), 0.0).a;
+        let k = clamp(d.b * F.jitter.w * 2.0, 0.0, 1.0);
+        albedo = mix(albedo, w1.rgb, k);
+        rough = clamp(mix(rough, w1.a, k), 0.04, 1.0);
+        metal = mix(metal, m1, k);
+        pearl = pearl * (1.0 - k);
+    }
+    if (cls == 5u || cls == 6u) {
         rough = 0.04; metal = 0.0;
         alpha = min(alpha, 0.45);
         if (F.misc3.z > 0.5) {
