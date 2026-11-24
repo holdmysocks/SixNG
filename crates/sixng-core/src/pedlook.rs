@@ -623,6 +623,10 @@ pub struct LookPart {
     /// Colour word of the item's colour tag (black, blue, khaki …).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub colour_tag: Option<&'static str>,
+    /// Hair colour preset of a hair, brow, lash or beard item (hex): the key
+    /// of `hairtone`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hair_preset: Option<String>,
     /// Base colour (sRGB) per sub-material from the item's garment preset
     /// (`matlib`); empty when the item names none or it is not in the
     /// library.
@@ -991,7 +995,7 @@ fn own_look(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Option<Look> {
     let names: HashSet<String> = ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| e.name.as_ref().map(|n| n.to_ascii_lowercase())).collect();
     let exists = |n: &str| names.contains(n);
     let mut parts: Vec<LookPart> = Vec::new();
-    let plain = |slot: String, drawable: String, found_by: &'static str| LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: String::new(), guid: None, tint: None, colour: None, colour_tag: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by };
+    let plain = |slot: String, drawable: String, found_by: &'static str| LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: String::new(), guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by };
     for o in opts.iter().filter(|o| o.default || is_strand_word(item_word(&o.name))) {
         let slot = slot_of(&o.name);
         // one hair, one beard …: the first of each
@@ -1111,10 +1115,10 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
                 if slot == "eyecaps" || slot.contains("hiddenpoly") || parts.iter().any(|x| x.drawable == drawable) {
                     continue;
                 }
-                parts.push(LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: p.item.clone(), guid: p.guid.clone(), tint: p.tint.clone(), colour: p.colour, colour_tag: p.colour_tag, preset: p.preset.clone(), preset_colours: p.preset.as_deref().and_then(|h| presets?.colours(h)).map(|v| v.into_iter().map(|c| c.map(|c| [c[0], c[1], c[2]])).collect()).unwrap_or_default(), tex_remap: p.tex_remap.clone(), skins: p.skins.clone(), found_by });
+                parts.push(LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: p.item.clone(), guid: p.guid.clone(), tint: p.tint.clone(), colour: p.colour, colour_tag: p.colour_tag, hair_preset: p.hair_preset.clone(), preset: p.preset.clone(), preset_colours: p.preset.as_deref().and_then(|h| presets?.colours(h)).map(|v| v.into_iter().map(|c| c.map(|c| [c[0], c[1], c[2]])).collect()).unwrap_or_default(), tex_remap: p.tex_remap.clone(), skins: p.skins.clone(), found_by });
             }
         }
-        let plain = |slot: &str, drawable: String, found_by: &'static str| LookPart { slot: slot.into(), drawable, item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by };
+        let plain = |slot: &str, drawable: String, found_by: &'static str| LookPart { slot: slot.into(), drawable, item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by };
         if let (false, Some(h)) = (parts.iter().any(|p| p.slot == "head"), &self_head) {
             parts.push(plain("head", h.clone(), "own"));
         }
@@ -1228,7 +1232,7 @@ mod tests {
 
     #[test]
     fn choose_prefers_name_then_fit() {
-        let mut p = Part { item: "1".into(), category: None, name: None, drawable: None, tex_remap: vec![], tags: Default::default(), tint: None, named: None, guid: None, colour: None, colour_tag: None, preset: None, state: String::new(), skins: vec![], candidates: Default::default() };
+        let mut p = Part { item: "1".into(), category: None, name: None, drawable: None, tex_remap: vec![], tags: Default::default(), tint: None, named: None, guid: None, colour: None, colour_tag: None, hair_preset: None, preset: None, state: String::new(), skins: vec![], candidates: Default::default() };
         p.candidates.insert("hand_fc1_000_full".into(), 3);
         p.candidates.insert("hand_fr1_000_full".into(), 3);
         p.candidates.insert("hand_fr1_000_nude_cull".into(), 3);
