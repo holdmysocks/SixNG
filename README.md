@@ -338,7 +338,7 @@ from a single text word are marked `uncertain` (8): a control search with
 prefixes no ped model has finds as many such hits as the real prefixes, so
 a wider word search does not name the ambient models (2,132 stay unnamed;
 a few of the story names may also be chance hash hits), the rest are listed as `ped_0x<hash>`. `ped-look` and `outfit:` take
-either form, and the viewer's picker lists them all. The animal clips were
+either form, and the viewer's picker lists them all. 125 models also get the name the game shows (`display`: "Mandy" for `cs_mandy`), from the character table of `data.rpf` and the text tables; the picker shows it beside the model name and finds a character by either. The animal clips were
 checked by rendering (eagle flap, deer walk/run/idle: 91–97 % of tracks land
 on a joint). Animals have a 180° yaw on `SKEL_ROOT` in the bind pose that
 the clips do not carry, so an animated animal faces the other way from its

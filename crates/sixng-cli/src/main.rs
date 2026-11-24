@@ -1513,7 +1513,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 Ok(m) => (
                     m.into_iter()
                         .filter(|m| re.as_ref().is_none_or(|r| r.is_match(&m.name)) && kind.as_deref().is_none_or(|k| k == "model"))
-                        .map(|m| json!({"name": m.name, "hash": m.hash, "named": m.named, "uncertain": m.uncertain, "outfits": m.outfits, "listed_as_character": listed.contains(&m.name)}))
+                        .map(|m| json!({"name": m.name, "hash": m.hash, "named": m.named, "display": m.display, "uncertain": m.uncertain, "outfits": m.outfits, "listed_as_character": listed.contains(&m.name)}))
                         .collect::<Vec<_>>(),
                     None,
                 ),

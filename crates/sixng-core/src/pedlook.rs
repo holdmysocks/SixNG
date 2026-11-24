@@ -227,9 +227,20 @@ pub struct ModelNames {
     /// many such single hits as the real prefixes do.
     #[serde(default)]
     pub uncertain: std::collections::BTreeSet<u32>,
+    /// joaat(model name) -> the character's name as the game shows it
+    /// ("Mandy"). A character table of data.rpf (a PSO, record struct
+    /// `691f01d2`) gives a text label (`f249cb70`) per character name
+    /// (`Name`); a model's character name is the one the ped model table
+    /// gives it (`Models::aliases`), else its own name without `cs_`. The
+    /// string is taken from the text table that reads most like English
+    /// (which table is which language is not stored).
+    #[serde(default)]
+    pub display: BTreeMap<u32, String>,
 }
 
-const NAMES_VERSION: u32 = 2;
+const NAMES_VERSION: u32 = 3;
+const CHARACTER: u32 = 0x691f_01d2;
+const DISPLAY_LABEL: u32 = 0xf249_cb70;
 
 /// A name shaped like a ped model's: `cs_…`, `ig_…`, `player_…`,
 /// `a_f_y_…` (kind, sex, age) or an animal root.
@@ -324,6 +335,7 @@ fn build_names(game_root: &Path, work: &Path, t: &Models, ix: &ArchiveIndex) -> 
         }
     }
     let numbered: Vec<String> = (0..10).map(|n| format!("_{n:02}")).collect();
+    let mut display: BTreeMap<u32, String> = BTreeMap::new();
     let mut uncertain = std::collections::BTreeSet::new();
     let mut grouped = |stems: &HashSet<String>, names: &mut BTreeMap<u32, String>, with_cs: bool, keep_single: bool| {
         let found: Vec<(String, u32, String, bool)> = stems
@@ -409,10 +421,58 @@ fn build_names(game_root: &Path, work: &Path, t: &Models, ix: &ArchiveIndex) -> 
             for (h, n) in found {
                 names.entry(h).or_insert(n);
             }
+            // display names: character name -> label, label -> text
+            let f = crate::meta7a::field_name;
+            let labels: HashMap<u32, u32> = dix
+                .entries
+                .par_iter()
+                .filter(|e| e.kind == crate::classify::Kind::Pso && e.usize >= 1 << 16)
+                .flat_map_iter(|e| {
+                    let mut v = Vec::new();
+                    let Some(p) = crate::scan::read_entry(&a.path, e).ok().and_then(|b| crate::pso::parse(&b)) else { return v };
+                    let m = p.meta();
+                    for o in m.objects(CHARACTER) {
+                        let Some(r) = m.object(CHARACTER, o, 1) else { continue };
+                        if let (Some(name), Some(label)) = (r["Name"].as_u64(), r[f(DISPLAY_LABEL)].as_u64().filter(|l| *l != 0)) {
+                            v.push((name as u32, label as u32));
+                        }
+                    }
+                    v
+                })
+                .collect();
+            let wanted: HashSet<u32> = labels.values().copied().collect();
+            // per label the string of the most English-looking table that has it
+            let mut text: HashMap<u32, (usize, String)> = HashMap::new();
+            for tb in &tables {
+                if !tb.strings.keys().any(|h| wanted.contains(h)) {
+                    continue;
+                }
+                let score = tb.strings.values().filter(|s| s.contains(" the ")).count() + 1;
+                for (h, s) in tb.strings.iter().filter(|(h, _)| wanted.contains(h)) {
+                    let s = crate::text::plain(s);
+                    if !s.is_empty() && text.get(h).is_none_or(|x| x.0 < score) {
+                        text.insert(*h, (score, s));
+                    }
+                }
+            }
+            let shown = |character: u32| labels.get(&character).and_then(|l| text.get(l)).map(|x| x.1.clone());
+            for (character, models) in &t.aliases {
+                if let Some(s) = shown(*character) {
+                    for m in models.iter().filter(|m| keys.contains_key(m)) {
+                        display.entry(*m).or_insert_with(|| s.clone());
+                    }
+                }
+            }
+            for &m in keys.keys() {
+                let own = names.get(&m).and_then(|n| n.strip_prefix("cs_")).map(joaat);
+                if let Some(s) = own.and_then(&shown).or_else(|| shown(m)) {
+                    display.entry(m).or_insert(s);
+                }
+            }
         }
     }
     uncertain.retain(|h| names.contains_key(h));
-    ModelNames { version: NAMES_VERSION, names, uncertain }
+    ModelNames { version: NAMES_VERSION, names, uncertain, display }
 }
 
 /// The model name table (built on first use, about twenty seconds when
@@ -452,6 +512,8 @@ pub struct ListedModel {
     pub name: String,
     pub hash: String,
     pub named: bool,
+    /// The character's name as the game shows it, where the data gives one.
+    pub display: Option<String>,
     /// The name may be a chance hash hit (`ModelNames::uncertain`).
     pub uncertain: bool,
     pub outfits: usize,
@@ -467,7 +529,7 @@ pub fn listed_models(game_root: &Path) -> Result<Vec<ListedModel>, String> {
         .iter()
         .map(|(h, row)| {
             let name = n.names.get(h);
-            ListedModel { name: name.cloned().unwrap_or_else(|| format!("ped_0x{h:08x}")), hash: format!("{h:08x}"), named: name.is_some(), uncertain: n.uncertain.contains(h), outfits: row.outfits.len() }
+            ListedModel { name: name.cloned().unwrap_or_else(|| format!("ped_0x{h:08x}")), hash: format!("{h:08x}"), named: name.is_some(), display: n.display.get(h).cloned(), uncertain: n.uncertain.contains(h), outfits: row.outfits.len() }
         })
         .collect();
     v.sort_by(|a, b| (!a.named, &a.name).cmp(&(!b.named, &b.name)));

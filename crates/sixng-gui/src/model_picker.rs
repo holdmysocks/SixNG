@@ -385,17 +385,30 @@ impl ModelPicker {
                     Ok(models) => {
                         let have: std::collections::HashSet<String> = v.iter().filter(|it| it.rtype == "outfit").map(|it| it.lname.clone()).collect();
                         let mut added = 0;
+                        // the name the game shows, beside the model name ("cs_mandy (Mandy)"),
+                        // so a character is found by either
+                        let shown: std::collections::HashMap<String, String> = models.iter().filter_map(|m| m.display.clone().map(|d| (m.name.clone(), d))).collect();
+                        for it in v.iter_mut().filter(|it| it.rtype == "outfit") {
+                            if let Some(d) = shown.get(&it.lname) {
+                                it.name = format!("{} ({d})", it.name);
+                                it.lname = it.name.to_lowercase();
+                            }
+                        }
                         for m in models {
                             if have.contains(&m.name) || sixng_core::outfit::is_animal(&m.name) {
                                 continue;
                             }
                             added += 1;
+                            let label = match &m.display {
+                                Some(d) => format!("{} ({d})", m.name),
+                                None => m.name.clone(),
+                            };
                             v.push(Item {
                                 cat: Cat::People,
                                 variant: false,
-                                lname: m.name.clone(),
+                                lname: label.to_lowercase(),
                                 id: format!("packs.rpf#outfit:{}", m.name),
-                                name: m.name,
+                                name: label,
                                 rtype: "outfit",
                                 bytes: 0,
                             });
