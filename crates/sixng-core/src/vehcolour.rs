@@ -60,7 +60,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// Version of what an export writes for part colours (model.json
 /// `part_colours_version`); the model viewer exports older vehicles again.
-pub const EXPORT_VERSION: u32 = 16;
+pub const EXPORT_VERSION: u32 = 17;
 /// Layout version of `<work>/index/vehicle_parts.json`.
 pub const FORMAT: u32 = 16;
 
@@ -627,6 +627,20 @@ pub fn look_table(parts: &[Part], palette: &[[u8; 4]], u: f32, mat: [f32; 2]) ->
             [lin(rgb[0]), lin(rgb[1]), lin(rgb[2]), if p.is_primary() { 254 } else { surface_code(p, mat) }]
         })
         .collect()
+}
+
+/// The finish of a vehicle's body paint: the metalness and roughness of
+/// the surfaces of its primary-paint parts, weighted by `counts` (vertices
+/// per part id). None when no counted part is primary paint.
+pub fn paint_finish(parts: &[Part], mat: [f32; 2], counts: &[u64; 256]) -> Option<[f32; 2]> {
+    let at = |v: [f32; 2], t: f32| (v[0] + (v[1] - v[0]) * t.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    let (mut n, mut metal, mut rough) = (0.0f64, 0.0f64, 0.0f64);
+    for (p, c) in parts.iter().zip(counts).filter(|(p, c)| p.is_primary() && **c > 0) {
+        n += *c as f64;
+        metal += at(p.metal, mat[0]) as f64 * *c as f64;
+        rough += at(p.rough, mat[1]) as f64 * *c as f64;
+    }
+    (n > 0.0).then(|| [(metal / n) as f32, (rough / n) as f32])
 }
 
 /// A part's surface as the alpha of its vertex colour: metalness in four

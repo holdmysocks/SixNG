@@ -1600,7 +1600,8 @@ impl App {
             m.look.rma_order = v.min(3);
         }
         if let Some(v) = c.u("finish") {
-            m.look.finish = v.min(3);
+            m.look.finish = v.min(4);
+            m.finish_auto = false;
         }
         if let Some(v) = c.f("pearl") {
             m.look.pearl_amount = v;

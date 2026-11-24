@@ -86,8 +86,17 @@ pub const TILE: u32 = 0x8302_1d7a;
 pub const PROFILE: u32 = 0x440c_9ecb;
 /// The colour parameter: 4 entries per sub-material.
 pub const COLOUR: u32 = 0xf574_261b;
+/// Two parameters whose names are not recovered but whose values behave as
+/// a sub-material's metalness and roughness in the weapon library (read
+/// from the data, not from the shader): `0e555ef5` is 0.85 to 1.0 where
+/// present (96 % of gold sub-materials, 78 % of steel-grey ones, 34 % of
+/// wood-brown ones); `83472381` has a median of 0.15 on gold, 0.40 to 0.45
+/// on steel greys and 0.75 on wood browns.
+pub const METALLIC: u32 = 0x0e55_5ef5;
+pub const ROUGHNESS: u32 = 0x8347_2381;
+
 /// Index format version of [`Index`].
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 /// One parameter: (name hash, index, sub-material, value).
 pub type Param<T> = (u32, u8, u8, T);
@@ -272,6 +281,20 @@ impl Library {
             .collect()
     }
 
+    /// Metalness and roughness of sub-material `sub` of a preset (see
+    /// [`METALLIC`]): the preset's value for the sub-material, else its
+    /// base material's. Without one, metalness is the tile's
+    /// `tilemetallic`, else 0, and roughness is 0.5. Inferred from the
+    /// data; the shader's own use of these values was not read.
+    pub fn surface(&self, preset: u32, sub: usize) -> Option<[f32; 2]> {
+        let p = self.presets.get(&preset)?;
+        let base = self.base.get(p.bases.get(sub)?);
+        let f = |name: u32| p.floats.iter().find(|x| x.0 == name && x.2 as usize == sub).or_else(|| base?.floats.iter().find(|x| x.0 == name)).map(|x| x.3);
+        let tile = Some(p.tiles[sub]).filter(|&t| t != 0).or_else(|| base.map(|b| b.tiles[0])).and_then(|t| self.tiles.get(&t));
+        let tile_metal = tile.and_then(|t| t.floats.iter().find(|x| x.0 == crate::meta7a::joaat("tilemetallic")).map(|x| x.3));
+        Some([f(METALLIC).or(tile_metal).unwrap_or(0.0).clamp(0.0, 1.0), f(ROUGHNESS).unwrap_or(0.5).clamp(0.0, 1.0)])
+    }
+
     /// The tiling surface of sub-material `sub` of a preset.
     pub fn tile(&self, preset: u32, sub: usize) -> Option<Tile> {
         let j = crate::meta7a::joaat;
@@ -334,6 +357,9 @@ pub struct Index {
     /// Preset (hex) -> per sub-material the four colour entries as
     /// `rrggbbaa` sRGB (empty = none).
     pub presets: BTreeMap<String, Vec<[String; 4]>>,
+    /// Preset (hex) -> metalness and roughness per sub-material
+    /// (`Library::surface`).
+    pub surfaces: BTreeMap<String, Vec<[f32; 2]>>,
     /// Preset (hex) -> the tiling surface of each sub-material that has one.
     pub tiles: BTreeMap<String, Vec<Option<Tile>>>,
     /// Weapon component name hash (hex) -> preset (hex).
@@ -359,6 +385,7 @@ impl Index {
             let subs = (0..8).map(|s| [0u8, 1, 2, 3].map(|i| lib.colour(k, s, i).map(|c| format!("{:02x}{:02x}{:02x}{:02x}", c[0], c[1], c[2], c[3])).unwrap_or_default())).collect();
             self.presets.insert(format!("{k:08x}"), subs);
             self.tiles.insert(format!("{k:08x}"), (0..8).map(|s| lib.tile(k, s)).collect());
+            self.surfaces.insert(format!("{k:08x}"), (0..8).map(|s| lib.surface(k, s).unwrap_or([0.0, 0.5])).collect());
         }
     }
 
@@ -482,6 +509,11 @@ impl Index {
         best.map(|b| (b.1, b.2))
     }
 
+    /// Metalness and roughness per sub-material of a preset.
+    pub fn surface(&self, preset: &str) -> Option<&[[f32; 2]]> {
+        self.surfaces.get(preset).map(Vec::as_slice)
+    }
+
     /// Base colour (entry 0) per sub-material of a preset, sRGB RGBA.
     pub fn colours(&self, preset: &str) -> Option<Vec<Option<[u8; 4]>>> {
         let hex = |s: &str| -> Option<[u8; 4]> { Some(u32::from_str_radix(s, 16).ok().filter(|_| s.len() == 8)?.to_be_bytes()) };
@@ -522,6 +554,14 @@ mod tests {
         let t1 = lib.tile(0x22, 1).unwrap();
         assert_eq!((t1.tile.as_str(), t1.material_map.as_str(), t1.scale, t1.rotation), ("00000034", "00000000000000bb", Some(50.0), None));
         assert_eq!(lib.tile(0x22, 2), None);
+        // metalness and roughness: preset value, else base, else the tile's metallic, else 0 / 0.5
+        assert_eq!(lib.surface(0x22, 0), Some([0.0, 0.5]));
+        lib.tiles.get_mut(&0x33).unwrap().floats.push((j("tilemetallic"), 255, 255, 0.95));
+        lib.base.get_mut(&0x11).unwrap().floats.push((ROUGHNESS, 255, 255, 0.75));
+        lib.presets.get_mut(&0x22).unwrap().floats.push((METALLIC, 255, 1, 1.0));
+        assert_eq!(lib.surface(0x22, 0), Some([0.95, 0.75]));
+        assert_eq!(lib.surface(0x22, 1), Some([1.0, 0.75]));
+        lib.tiles.get_mut(&0x33).unwrap().floats.pop();
         // tint-mask layers: the base material has layer 1 (mask, opacity, tint); the preset overrides its opacity and tint for sub-material 0 and inverts it
         let b = lib.base.get_mut(&0x11).unwrap();
         b.textures.push((j("tintmaskmap"), 1, 255, 0xcc));

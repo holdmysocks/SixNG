@@ -461,12 +461,20 @@ const WEAPON_SHADER: &str = "e68a4a98";
 
 /// The layered-material preset of a weapon model and its sub-material base
 /// colours (sRGB), from the weapon library (`matlib`).
-fn weapon_preset(a: &ArchiveInfo, name: &str) -> Option<(String, Vec<Option<[u8; 3]>>)> {
+/// Metalness and roughness of a weapon sub-material as the alpha byte of
+/// its vertex colour, the code the viewer already reads for vehicle parts:
+/// metalness in four steps x 50 + roughness in 50 steps (0..=199).
+pub fn surface_code(s: [f32; 2]) -> u8 {
+    ((s[0].clamp(0.0, 1.0) * 3.0).round() * 50.0 + (s[1].clamp(0.0, 1.0) * 49.0).round()) as u8
+}
+
+fn weapon_preset(a: &ArchiveInfo, name: &str) -> Option<(String, Vec<Option<[u8; 3]>>, Vec<[f32; 2]>)> {
     static PRESETS: std::sync::OnceLock<Option<crate::matlib::Index>> = std::sync::OnceLock::new();
     let ix = PRESETS.get_or_init(|| crate::matlib::Index::load_or_build(&Workspace::new(game_root(a), crate::names::work_dir()?)).ok()).as_ref()?;
     let preset = ix.weapon_presets(name).first()?.clone();
     let subs: Vec<Option<[u8; 3]>> = ix.colours(&preset)?.iter().map(|c| c.map(|c| [c[0], c[1], c[2]])).collect();
-    subs.iter().any(|c| c.is_some()).then_some((preset, subs))
+    let surf = ix.surface(&preset).map(<[_]>::to_vec).unwrap_or_default();
+    subs.iter().any(|c| c.is_some()).then_some((preset, subs, surf))
 }
 
 fn classify_shader(s: &crate::drawable::Shader, st: &ShaderTextures) -> serde_json::Value {
@@ -1214,7 +1222,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 "wheel_mounts_version": 3,
                 "part_colours_version": crate::vehcolour::EXPORT_VERSION,
                 "part_colours": shader_tex.iter().any(|st| st.vehicle_palette.is_some()).then(|| match shader_tex.iter().find_map(|st| st.vehicle_parts.as_ref()) {
-                    Some(set) => serde_json::json!({"status": "applied", "part_set": set, "looks": part_looks["looks"], "configs": part_looks["configs"], "default": part_looks["default"], "looks_note": "looks: the part colours each distinct configuration result gives, 256 x RGBA per look as hex (encoded like GLB COLOR_0, indexed by part id = _COLOR0 alpha); configs: a configuration's parts_key (vehicles.json) -> look; default: the look baked into the GLB", "note": "each vertex of the two-layer vehicle materials takes the colour of its part id (GLB COLOR_0; see the materials' classification.parts_note)"}),
+                    Some(set) => serde_json::json!({"status": "applied", "part_set": set, "looks": part_looks["looks"], "configs": part_looks["configs"], "default": part_looks["default"], "paint_finish": part_looks["paint_finish"], "paint_finish_note": "the body paint's finish: metalness and roughness of the surfaces of the primary-paint parts (COLOR_0 alpha 254), averaged over their vertices of every LOD; null when the model has none", "looks_note": "looks: the part colours each distinct configuration result gives, 256 x RGBA per look as hex (encoded like GLB COLOR_0, indexed by part id = _COLOR0 alpha); configs: a configuration's parts_key (vehicles.json) -> look; default: the look baked into the GLB", "note": "each vertex of the two-layer vehicle materials takes the colour of its part id (GLB COLOR_0; see the materials' classification.parts_note)"}),
                     None => serde_json::json!({"status": "no part set found for this model: the two-layer materials keep their stand-in colours"}),
                 }),
                 "roof_animation": roof_info,
@@ -1325,8 +1333,8 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         for (s, st) in info.shaders.iter().zip(shader_tex.iter_mut()).filter(|(s, _)| s.name_hash == WEAPON_SHADER) {
             let _ = s;
             st.weapon_preset = Some(match &wp {
-                Some((p, subs)) => serde_json::json!({"preset": p, "sub_material_colours": subs,
-                    "applied": "COLOR_0 = the preset's base colour of each vertex's sub-material (green byte of the raw colour stream / 4), linear; the base colour factor is white. The tile texture, the gradient and the tint-mask, dirt and wear layers are not applied; metalness and roughness are one stand-in for every part."}),
+                Some((p, subs, surf)) => serde_json::json!({"preset": p, "sub_material_colours": subs, "sub_material_surface": surf,
+                    "applied": "COLOR_0 = the preset's base colour of each vertex's sub-material (green byte of the raw colour stream / 4), linear; the base colour factor is white. COLOR_0 alpha = the sub-material's metalness and roughness (`sub_material_surface`: [metalness, roughness], inferred from two unnamed library parameters) as a code: round(metalness x 3) x 50 + round(roughness x 49). The material's own metallic and roughness factors stay one stand-in. The tile texture, the gradient and the tint-mask, dirt and wear layers are not applied."}),
                 None => serde_json::json!({"preset": null}),
             });
         }
@@ -1363,10 +1371,12 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             if v.is_empty() { 0.5 } else { (v.iter().sum::<f64>() / v.len() as f64 / 255.0) as f32 }
         })
     };
-    let part_looks = match (&part_tables, e.name.as_deref(), shader_tex.iter().find_map(|st| st.vehicle_palette.as_ref())) {
+    let mut part_looks = match (&part_tables, e.name.as_deref(), shader_tex.iter().find_map(|st| st.vehicle_palette.as_ref())) {
         (Some(t), Some(n), Some(pal)) => t.looks_json(n, pal, ramp_u, mat_blend),
         _ => serde_json::Value::Null,
     };
+    // vertices per part id, for the body paint's finish
+    let part_id_counts = std::cell::RefCell::new([0u64; 256]);
     let slice = |i: usize| {
         let b = &info.buffers[i];
         let end = (b.gfx_off + b.bytes).min(r.gfx.len() as u64) as usize;
@@ -1457,9 +1467,11 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
                     let x = v as f32 / 255.0;
                     ((if x <= 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) }) * 255.0 + 0.5) as u8
                 };
+                let surf: Vec<[f32; 2]> = serde_json::from_value(w["sub_material_surface"].clone()).unwrap_or_default();
                 tint = Some(c.iter().map(|c| {
-                    let k = subs.get(((c[1] >> 2) & 7) as usize).copied().flatten().unwrap_or(first);
-                    [lin(k[0]), lin(k[1]), lin(k[2]), 255]
+                    let s = ((c[1] >> 2) & 7) as usize;
+                    let k = subs.get(s).copied().flatten().unwrap_or(first);
+                    [lin(k[0]), lin(k[1]), lin(k[2]), surf.get(s).map_or(255, |&x| surface_code(x))]
                 }).collect());
             }
         }
@@ -1469,6 +1481,9 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         // Vehicles: the colour of each part id from the vehicle's part set.
         if let (Some((_, parts)), Some(pal), Some(c)) = (&part_set, material.and_then(|s| shader_tex.get(s)).and_then(|st| st.vehicle_palette.as_ref()), &m.colors) {
             tint = Some(crate::vehcolour::vertex_colours(parts, pal, ramp_u, mat_blend, c.iter().map(|c| c[3])));
+            for c in c {
+                part_id_counts.borrow_mut()[c[3] as usize] += 1;
+            }
             if let Some(mm) = mesh_meta.last_mut() {
                 mm["part_colours_applied"] = true.into();
             }
@@ -1571,6 +1586,9 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             x
         },
     }).collect();
+    if let (Some(o), Some(f)) = (part_looks.as_object_mut(), part_set.as_ref().and_then(|(_, parts)| crate::vehcolour::paint_finish(parts, mat_blend, &part_id_counts.borrow()))) {
+        o.insert("paint_finish".into(), serde_json::json!({"metalness": f[0], "roughness": f[1]}));
+    }
     BuiltDrawable { lod_groups, part_groups, materials: mats, joints: skin.joints, mesh_meta, shader_tex, part_looks, head }
 }
 

@@ -29,7 +29,7 @@ pub const RMA_ORDERS: [&str; 4] = [
     "R metal / G rough / B AO",
     "ignore packed",
 ];
-pub const FINISHES: [&str; 4] = ["metallic", "matte", "chrome", "gloss"];
+pub const FINISHES: [&str; 5] = ["metallic", "matte", "chrome", "gloss", "as stored"];
 /// `standard_vehicle_2lyr_wheel_inst`: the rim material of the shared wheels.
 const RIM_SHADER: &str = "_c5cdbdd2";
 /// Default rim colour: a plain alloy (the true per-vehicle colour is not decoded).
@@ -327,6 +327,9 @@ pub struct ModelView {
     window_movers: Vec<(usize, Vec3, Vec3)>,
     /// A reload asked for by a configuration: its parts with models.
     parts_request: Option<String>,
+    /// The paint finish follows the model: a vehicle's own where its export
+    /// has one, metallic otherwise (until the user picks one).
+    pub finish_auto: bool,
     /// The moving parts of an aircraft among the loaded model's joints.
     air: Vec<AirPart>,
     /// Rotor and propeller speed, 0 (still) to 1; the angle they are at.
@@ -633,6 +636,7 @@ impl ModelView {
             windows_down: 0.0,
             window_movers: Vec::new(),
             parts_request: None,
+            finish_auto: true,
             air: Vec::new(),
             rotor_speed: 0.0,
             rotor_angle: 0.0,
@@ -1706,6 +1710,15 @@ impl ModelView {
         let wheeled = l.info["wheel_mounts"].as_array().is_some_and(|a| !a.is_empty());
         if !wheeled && !l.info["part_colours"].is_object() {
             return;
+        }
+        // the body paint's own finish, from the surfaces of its painted parts
+        let stored = &l.info["part_colours"]["paint_finish"];
+        let stored = stored["metalness"].as_f64().zip(stored["roughness"].as_f64()).map(|(m, r)| [m as f32, r as f32]);
+        if let Some(f) = stored {
+            self.look.stored_finish = f;
+        }
+        if self.finish_auto {
+            self.look.finish = if stored.is_some() { 4 } else { 0 };
         }
         let key = crate::vehicle_db::model_key(&l.source);
         let Some(db) = self.vehicles.get(&self.game, &self.work, ui.ctx()) else {
@@ -3285,7 +3298,9 @@ impl ModelView {
                 .selected_text(FINISHES[self.look.finish as usize])
                 .show_ui(ui, |ui| {
                     for (k, m) in FINISHES.iter().enumerate() {
-                        ui.selectable_value(&mut self.look.finish, k as u32, *m);
+                        if ui.selectable_value(&mut self.look.finish, k as u32, *m).clicked() {
+                            self.finish_auto = false;
+                        }
                     }
                 });
         }
@@ -3977,6 +3992,9 @@ fn colour_weapon(m: &mut glb::Model, name: &str, presets: &sixng_core::matlib::I
     let preset = finish.map(str::to_string).or_else(|| presets.weapon_presets(name).first().cloned())?;
     let subs: Vec<Option<[u8; 3]>> = presets.colours(&preset)?.iter().map(|c| c.map(|c| [c[0], c[1], c[2]])).collect();
     let first = subs.iter().flatten().next().copied()?;
+    // metalness and roughness per sub-material, in the tint's alpha
+    let surf = presets.surface(&preset).unwrap_or(&[]);
+    let code = |s: usize| surf.get(s).map_or(255, |&x| sixng_core::export::surface_code(x));
     let want = format!("{:08x}", sixng_core::meta7a::joaat("materialid"));
     let lin = |c: u8| {
         let x = c as f32 / 255.0;
@@ -4010,8 +4028,9 @@ fn colour_weapon(m: &mut glb::Model, name: &str, presets: &sixng_core::matlib::I
                 let b = |c: u8| (lin(c) * 255.0 + 0.5) as u8;
                 for mesh in m.meshes.iter_mut().filter(|x| x.material == Some(mi)) {
                     for v in &mut mesh.verts {
-                        let c = subs.get((v.col[1] >> 2).min(7) as usize).copied().flatten().unwrap_or(first);
-                        v.tint = [b(c[0]), b(c[1]), b(c[2]), 255];
+                        let s = (v.col[1] >> 2).min(7) as usize;
+                        let c = subs.get(s).copied().flatten().unwrap_or(first);
+                        v.tint = [b(c[0]), b(c[1]), b(c[2]), code(s)];
                     }
                 }
             }
@@ -4047,8 +4066,20 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
             if let Some(fab) = f.preset.and_then(|p| crate::fabric::fabric(game, p)) {
                 let mats: Vec<usize> = (0..m.materials.len()).filter(|&k| m.materials[k].base == Some(i)).collect();
                 let mat = m.materials[mi].clone();
-                if crate::fabric::bake(m, &mats, i, &fab, &|w, h| sub_material_map(&mat, &[cache, shaped.as_path()], w, h)) {
-                    m.images[i].key = format!("{}#fabric{:08x}", m.images[i].key, f.preset.unwrap_or(0));
+                // The wgpu shader draws the main sub-material's weave per
+                // pixel on opaque garments (alpha carries its texels); the
+                // Metal renderer has no such path and keeps the baked weave.
+                let detail = cfg!(not(target_os = "macos")) && std::env::var_os("SIXNG_NO_FABRIC_DETAIL").is_none() && mats.iter().all(|&k| m.materials[k].alpha_mode == "OPAQUE");
+                if let Some(main) = crate::fabric::bake(m, &mats, i, &fab, &|w, h| sub_material_map(&mat, &[cache, shaped.as_path()], w, h), detail) {
+                    m.images[i].key = format!("{}#fabric{:08x}{}", m.images[i].key, f.preset.unwrap_or(0), if main.is_some() { "d" } else { "" });
+                    if let Some((tile, scale, rot)) = main.and_then(|s| fab.detail(s)) {
+                        let (w, h, px) = tile.rgba();
+                        m.images.push(glb::Image { key: format!("{}#tile", m.images[i].key), mips: glb::mip_chain(w, h, px), srgb: false, bc: None });
+                        let d = glb::Detail { image: m.images.len() - 1, scale, rot, mean: tile.mean() };
+                        for &k in &mats {
+                            m.materials[k].detail = Some(d);
+                        }
+                    }
                     continue;
                 }
             }
@@ -6409,6 +6440,8 @@ fn export_load_shaped(
                 || j.contains("e68a4a98") && !j.contains("\"gunmetal\"") && !j.contains("\"weapon_parts\"")
                 // and from before weapon parts took their preset colours
                 || j.contains("e68a4a98") && !j.contains("\"weapon_preset\"")
+                // and from before their metalness and roughness per sub-material
+                || j.contains("\"weapon_parts\"") && !j.contains("\"sub_material_surface\"")
         });
     // Cached ped clothing from before the fabric shade came from the packed map.
     let stale_cloth = std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| j.contains("739e3d0d") && !j.contains("shade_source"));
