@@ -70,7 +70,11 @@ pub const DERIVED_EXACT: &[&str] = &["fMass", "fInitialDragCoeff", "fDriveBiasFr
     // 147fdab5, kit set a9d57751): case-sensitive joaat search over one- and
     // two-word PascalCase names against 26 field hashes, 2026-11-23
     "KitName", "TemplateName", "Palette", "Tint0", "Tint1", "Tint2", "GarmentPreset", "PropertyTags", "Asset", "KitLayer", "ToStateNames",
-    "Drawable", "Albedo", "Material", "AssetName", "IncludedKits"];
+    "Drawable", "Albedo", "Material", "AssetName", "IncludedKits",
+    // vehicle surface (9e4de959) reference fields: the two layer materials
+    // (range records), layer 1's colour record and the detail set.
+    // One- to three-word camelCase search ending in Hash, 2026-11-23
+    "material0Hash", "material1Hash", "albedo1Hash", "detailMapsHash"];
 
 pub const DERIVED: &[&str] = &[
     // texture parameters of the minigame pack's water and interior shaders (joaat search, 2026-11-23)
@@ -411,6 +415,12 @@ mod tests {
         assert_eq!(lookup(0xd35f_809f, Ctx::Field).as_deref(), Some("hairlength"));
         assert_eq!(lookup(0x6004_f281, Ctx::Field).as_deref(), Some("l08"));
         assert_eq!(lookup(0xdf32_4ad0, Ctx::Field).as_deref(), Some("cornrows"));
+        // vehicle surface reference fields
+        assert_eq!(joaat_exact("material0Hash"), 0x2cc7_2f7c);
+        assert_eq!(lookup(0x2cc7_2f7c, Ctx::Field).as_deref(), Some("material0Hash"));
+        assert_eq!(lookup(0x1747_70cc, Ctx::Field).as_deref(), Some("material1Hash"));
+        assert_eq!(lookup(0x5cff_e5e0, Ctx::Field).as_deref(), Some("albedo1Hash"));
+        assert_eq!(lookup(0x6c3d_dabc, Ctx::Field).as_deref(), Some("detailMapsHash"));
         // derived names resolve without a dictionary file
         assert_eq!(lookup(0xc8e8_c282, Ctx::Param).as_deref(), Some("diffusetex"));
     }
