@@ -510,6 +510,14 @@ pub fn four_layer_params(consts: &[crate::drawable::ShaderConst]) -> Value {
 /// R, G, B weight layers 0, 1, 2 (seam-continuity test across material
 /// borders: the slot a channel drives agrees across the border 66 / 74 /
 /// 92 % of the time where that channel dominates), the rest goes to layer 3.
+///
+/// Read from the shader code since (one deferred pixel program of
+/// `standard_uber_4lyr`, which the other variants also use for their
+/// alpha-clip pass; the variants' own main programs were not read): the
+/// channel order and the remainder rule above, the pairing of each data map
+/// with its layer, that the second vertex colour set can replace the lookup
+/// weights, that a layer is skipped when its weight is 0, and that the
+/// layers' results are added weighted.
 fn four_layer(name_hash: &str, tex: &dyn Fn(usize) -> Value) -> Value {
     // (colour, normal, data) per layer
     const SLOTS: [[usize; 3]; 4] = [[14, 15, 4], [12, 10, 0], [9, 11, 5], [13, 7, 1]];
@@ -527,14 +535,17 @@ fn four_layer(name_hash: &str, tex: &dyn Fn(usize) -> Value) -> Value {
     json!({
         "family": "four_layer",
         "layers": layers,
-        "weights": {"texture": tex(2), "uv_set": "TEXCOORD_0 (on section tiles = section position / 512 m; on other models the model's own UV0, see uv_fit)", "channels": {"r": "layer0", "g": "layer1", "b": "layer2", "remainder": "layer3"}, "note": "R+G+B <= 1 (BC7 rounding up to 258/255: clamp); the remainder weights layer 3"},
+        "weights": {"texture": tex(2), "uv_set": "TEXCOORD_0 (on section tiles = section position / 512 m; on other models the model's own UV0, see uv_fit)", "channels": {"r": "layer0", "g": "layer1", "b": "layer2", "remainder": "layer3"}, "note": "R+G+B <= 1 (BC7 rounding up to 258/255: clamp); the remainder weights layer 3",
+            "vertex_override": "weights = mix(lookup.rgb, COLOR_1.rgb, COLOR_1.a) per channel, and the remainder = saturate(1 - r - g - b) of each side mixed the same way: where the second vertex colour set has alpha 0 (the usual case) the lookup texture alone decides. From the shader code; which exported attribute holds that colour set was not checked on a mesh.",
+            "result": "each layer's shaded result is multiplied by its weight and the four are added; a layer whose weight is 0 is not sampled"},
         "macro": {"uv_set": "TEXCOORD_0", "tint": tex(16), "tint_normal": tex(8), "grass_mask": tex(3), "note": "section-wide maps (one 512 m section per texture): colour variation, large-scale normal, grass placement mask"},
         "detail_uv": {"default": "TEXCOORD_0 * 64 (world-planar, one repeat per 8 m) on map section tiles only; `recommended` follows this material's measured mapping (`uv_fit`): set pieces and rock formations using these shaders have their own UV0 (about 35 m per unit on the street-trash grounds), usually with a planar TEXCOORD_1 at 3 m per unit", "alt_uv_set": alt_uv, "note": "TEXCOORD_1 (61e09df7, 360e396b) is world-planar / 8 m on flat ground and unwrapped elsewhere (probably slopes); constant on b21f1ba5 ('fixuv1'), so that variant tiles from position. 27e5c49d ('uv3'): TEXCOORD_1 is not a usable UV (spans >1000), TEXCOORD_2 is an unwrap (not world-planar), so the alternative set is TEXCOORD_2 (low confidence). Per-layer tiling factors sit in the shader's constant block and are not decoded; scale per layer by eye"},
         "vertex_color_channels": {"rgb": "unverified: varies 50..230, mean ~155, not weights (does not sum to a constant); baked shading or tint", "a": "always 0"},
         "texcoord_2": "a copy of TEXCOORD_0 on most 61e09df7 primitives, constant elsewhere",
         "height_blend": "the shader names end in hbb (height-based blend): each layer's data map B channel looks like a height map; sharpen the weights by height for the game's look",
-        "confidence": {"slots": "high (recovered names)", "data_map_pairing": "high", "weights_uv": "high", "channel_rgb_to_layer012": "medium", "layer3_remainder": "low", "detail_uv_scale": "low"},
-        "note": "Derived from recovered parameter names, texture co-occurrence and UV/seam statistics, not from shader code. Normal maps: DirectX green.",
+        "data_map_channels": {"a": "tint mask of the layer: how much of the tint colour replaces the layer colour (the shader can use 1 - a instead, by a material constant)", "g": "read, use not traced", "b": "read, and used as 1 - b in a later step that was not traced", "r": "not read by the program that was read", "source": "shader code"},
+        "confidence": {"slots": "high (recovered names)", "data_map_pairing": "high (shader code: each data map is sampled with its layer's colour and normal map)", "weights_uv": "high", "channel_rgb_to_layer012": "high (shader code)", "layer3_remainder": "high (shader code)", "detail_uv_scale": "low"},
+        "note": "Slots, pairing, channel order and the remainder rule are confirmed from shader code (one deferred pixel program); the UV scales and the height blend are still from recovered names and UV/seam statistics. Normal maps: DirectX green.",
     })
 }
 
@@ -562,6 +573,8 @@ mod paint_tests {
         assert_eq!(l["layers"][3]["colour"]["param"], 13);
         assert_eq!(l["layers"][3]["colour"]["status"], "no texture bound");
         assert_eq!(l["weights"]["texture"]["png"], "t2.png");
+        assert_eq!((l["weights"]["channels"]["remainder"].as_str(), l["confidence"]["layer3_remainder"].as_str()), (Some("layer3"), Some("high (shader code)")));
+        assert!(l["weights"]["vertex_override"].as_str().unwrap().contains("COLOR_1") && l["data_map_channels"]["a"].as_str().unwrap().starts_with("tint mask"));
         assert_eq!(l["macro"]["tint"]["png"], "t16.png");
         assert!(layers("b21f1ba5", &entries).unwrap()["detail_uv"]["alt_uv_set"].is_null());
         assert_eq!(layers("27e5c49d", &entries).unwrap()["detail_uv"]["alt_uv_set"], "TEXCOORD_2");
