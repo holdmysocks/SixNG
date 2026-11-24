@@ -60,9 +60,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// Version of what an export writes for part colours (model.json
 /// `part_colours_version`); the model viewer exports older vehicles again.
-pub const EXPORT_VERSION: u32 = 17;
+pub const EXPORT_VERSION: u32 = 18;
 /// Layout version of `<work>/index/vehicle_parts.json`.
-pub const FORMAT: u32 = 16;
+pub const FORMAT: u32 = 17;
 
 const PART_SET: u32 = 0xf142_44fd;
 const SET_COLOURS: u32 = 0x7847_6477;
@@ -94,6 +94,9 @@ const CONFIG_PARTS: u32 = 0xe89b_8540;
 const MOD: u32 = 0x0cae_f606;
 const MOD_SLOT: u32 = 0x37a6_f9ef;
 const MOD_LIST: u32 = 0x61e1_e572;
+/// A part's elements (names of `77f2b89e` records) and an element's model.
+const MOD_ELEMENTS: u32 = 0x7e5d_1612;
+const ELEMENT_MODEL: u32 = 0x8605_bf0e;
 /// A named group of part ids in the library: `3acbce85` is a byte array of
 /// part ids.
 const GROUP: u32 = 0x0006_39e9;
@@ -192,6 +195,14 @@ pub struct Tables {
     /// the vehicle's part set (a pickup's bed, bumpers, bonnets ...).
     #[serde(default)]
     pub part_owner: HashMap<String, String>,
+    /// Model of a library part (joaat of its name, 8 hex digits: a truck
+    /// bed or box, a light bar ...) -> the part set of a configuration that
+    /// names the part. Such a model is fitted to several vehicles and its
+    /// vertices carry part ids of whichever one it is on; on its own it
+    /// takes the set of the first configuration found (vehicles in order
+    /// of their name hash).
+    #[serde(default)]
+    pub shared_parts: HashMap<String, String>,
 }
 
 /// A key for a configuration: FNV-1a of its part list (the name hashes in
@@ -242,6 +253,8 @@ struct Library {
     assigns: HashMap<u32, (u32, u32, u32)>,
     /// modifier name -> the parts of an option list (`f5e9d7df.bf340aab`)
     options: HashMap<u32, Vec<u32>>,
+    /// configuration part name -> the models of its elements (joaat)
+    part_models: HashMap<u32, Vec<u32>>,
     id: Option<String>,
 }
 
@@ -257,7 +270,7 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
             }
             let m = &m;
             let dump = |h: u32| m.objects(h).into_iter().filter_map(|o| m.object(h, o, 0)).collect::<Vec<_>>();
-            let mut l = Library { colours: HashMap::new(), surfaces: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), options: HashMap::new(), id: Some(e.id.clone()) };
+            let mut l = Library { colours: HashMap::new(), surfaces: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), options: HashMap::new(), part_models: HashMap::new(), id: Some(e.id.clone()) };
             for o in dump(OPTION_LIST) {
                 if let Some(n) = num(&o, NAME) {
                     l.options.insert(n as u32, get(&o, OPTION_PARTS).and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()).unwrap_or_default());
@@ -298,10 +311,24 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
                 .filter_map(|f| Some((num(f, NAME)? as u32, get(f, FIT_RIM)?.as_f64()? as f32)))
                 .filter(|(_, r)| *r > 0.2 && *r < 1.0)
                 .collect();
+            // an element's model: a 64-bit value whose low half is the
+            // joaat of the model's name (16 hex digits), or that number
+            let models: HashMap<u32, u32> = dump(crate::vehicles::MOD_ELEMENT)
+                .iter()
+                .filter_map(|e| {
+                    let m = get(e, ELEMENT_MODEL)?;
+                    let m = m.as_str().and_then(|s| u32::from_str_radix(s.get(8..16)?, 16).ok()).or_else(|| m.as_u64().map(|v| v as u32))?;
+                    Some((num(e, NAME)? as u32, m))
+                })
+                .collect();
             for p in dump(MOD) {
                 let list = get(&p, MOD_LIST).and_then(|x| x.as_array()).cloned().unwrap_or_default();
                 if let Some(n) = num(&p, NAME) {
                     l.mods.insert(n as u32, list.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect());
+                    let of: Vec<u32> = get(&p, MOD_ELEMENTS).and_then(|x| x.as_array()).into_iter().flatten().filter_map(|x| models.get(&(x.as_u64()? as u32)).copied()).filter(|m| *m != 0).collect();
+                    if !of.is_empty() {
+                        l.part_models.insert(n as u32, of);
+                    }
                 }
                 if num(&p, MOD_SLOT) != Some(SLOT_WHEEL_FIT as i64) {
                     continue;
@@ -505,6 +532,20 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
             }
         }
     }
+    // The models of the library parts a configuration names: the same ids
+    // mean the same piece in every vehicle's set (a box body, a flatbed
+    // deck, a tipper's paint), and the configuration that fits the part
+    // recolours them, so a shared model takes the set of the vehicle and
+    // configuration it is on. For the model on its own: the first found.
+    for (owner, (configs, _)) in by_owner.iter().filter(|(o, _)| **o != 0) {
+        let Some(by_config) = t.config_sets.get(&format!("{owner:08x}")) else { continue };
+        for parts in configs {
+            let Some(set) = by_config.get(&config_key(parts)) else { continue };
+            for m in parts.iter().filter_map(|p| lib.part_models.get(p)).flatten() {
+                t.shared_parts.entry(format!("{m:08x}")).or_insert_with(|| set.clone());
+            }
+        }
+    }
     Ok(t)
 }
 
@@ -584,15 +625,25 @@ pub fn tables(game_root: &Path, work: &Path) -> Result<Arc<Tables>> {
 }
 
 impl Tables {
-    /// The part set of a model: a vehicle (`comet7`, `comet7_hi`) or one of
-    /// its mod part models.
+    /// The part set of a model: a vehicle (`comet7`, `comet7_hi`), one of
+    /// its mod part models, or a library part's model (`shared_parts`).
     pub fn for_model(&self, model: &str) -> Option<(&str, &[Part])> {
         let m = model.to_ascii_lowercase();
         let base = m.strip_suffix("_hi").or_else(|| m.strip_suffix("_mid")).unwrap_or(&m);
         let key = |s: &str| format!("{:08x}", meta7a::joaat(s));
         let owned = || self.part_owner.get(&format!("{:016x}", meta7a::asset_id(base))).and_then(|v| self.models.get(v));
-        let set = self.elements.get(&key(&m)).or_else(|| self.elements.get(&key(base))).or_else(|| self.models.get(&key(base))).or_else(owned)?;
+        let set = self.elements.get(&key(&m)).or_else(|| self.elements.get(&key(base))).or_else(|| self.models.get(&key(base))).or_else(owned).or_else(|| self.shared_parts.get(&key(base)))?;
         self.sets.get_key_value(set).map(|(k, v)| (k.as_str(), v.as_slice()))
+    }
+
+    /// Whether a model's part set is only that of one of the vehicles it
+    /// can be fitted to (a library part's model).
+    pub fn is_shared(&self, model: &str) -> bool {
+        let m = model.to_ascii_lowercase();
+        let base = m.strip_suffix("_hi").or_else(|| m.strip_suffix("_mid")).unwrap_or(&m);
+        let key = |s: &str| format!("{:08x}", meta7a::joaat(s));
+        let own = self.elements.contains_key(&key(&m)) || self.elements.contains_key(&key(base)) || self.models.contains_key(&key(base)) || self.part_owner.contains_key(&format!("{:016x}", meta7a::asset_id(base)));
+        !own && self.shared_parts.contains_key(&key(base))
     }
 }
 

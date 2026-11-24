@@ -1688,6 +1688,8 @@ impl ModelView {
                 }
                 self.loaded = Some(l);
                 self.frames_since_load = 0;
+                // the new meshes carry the colours of their files
+                self.part_look_done = None;
                 self.apply_paint(rs);
             }
             Err(e) => {
@@ -2200,10 +2202,13 @@ impl ModelView {
         };
         let idx = idx as usize;
         let decode = |hex: &str| -> Arc<Vec<[u8; 4]>> { Arc::new((0..256).map(|i| std::array::from_fn(|k| u8::from_str_radix(&hex[i * 8 + k * 2..i * 8 + k * 2 + 2], 16).unwrap_or(255))).collect()) };
-        // a freshly loaded model shows the default look
+        // a freshly loaded model shows the default look, but a fitted
+        // library part (a truck bed or box) comes with the colours of
+        // another vehicle and is coloured again
         let shown = match &self.part_look_done {
             Some((p, i)) if *p == l.model.path => Some(*i),
-            _ => default.map(|d| d as usize),
+            _ if l.selected.is_empty() => default.map(|d| d as usize),
+            _ => None,
         };
         let Some(hex) = pc["looks"][idx].as_str().filter(|h| h.len() == 2048) else {
             self.part_look_table = None;
