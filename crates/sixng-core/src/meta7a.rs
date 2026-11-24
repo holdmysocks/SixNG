@@ -39,6 +39,55 @@ pub fn joaat(s: &str) -> u32 {
     h.wrapping_add(h << 15)
 }
 
+/// The 64-bit id the vehicle data gives a model (a mod part element's
+/// `asset`): the first half of MurmurHash3 x64 128 (seed 0) of the model's
+/// lower-case name without a LOD suffix.
+pub fn asset_id(name: &str) -> u64 {
+    const C1: u64 = 0x87c3_7b91_1142_53d5;
+    const C2: u64 = 0x4cf5_ad43_2745_937f;
+    let key = name.to_ascii_lowercase().into_bytes();
+    let word = |b: &[u8]| b.iter().enumerate().fold(0u64, |a, (i, c)| a | (*c as u64) << (8 * i));
+    let fmix = |mut k: u64| {
+        k ^= k >> 33;
+        k = k.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        k ^= k >> 33;
+        k = k.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        k ^ (k >> 33)
+    };
+    let (mut h1, mut h2) = (0u64, 0u64);
+    let mut blocks = key.chunks_exact(16);
+    for b in &mut blocks {
+        h1 ^= word(&b[..8]).wrapping_mul(C1).rotate_left(31).wrapping_mul(C2);
+        h1 = h1.rotate_left(27).wrapping_add(h2).wrapping_mul(5).wrapping_add(0x52dc_e729);
+        h2 ^= word(&b[8..]).wrapping_mul(C2).rotate_left(33).wrapping_mul(C1);
+        h2 = h2.rotate_left(31).wrapping_add(h1).wrapping_mul(5).wrapping_add(0x3849_5ab5);
+    }
+    let tail = blocks.remainder();
+    if tail.len() > 8 {
+        h2 ^= word(&tail[8..]).wrapping_mul(C2).rotate_left(33).wrapping_mul(C1);
+    }
+    if !tail.is_empty() {
+        h1 ^= word(&tail[..tail.len().min(8)]).wrapping_mul(C1).rotate_left(31).wrapping_mul(C2);
+    }
+    h1 ^= key.len() as u64;
+    h2 ^= key.len() as u64;
+    h1 = h1.wrapping_add(h2);
+    h2 = h2.wrapping_add(h1);
+    fmix(h1).wrapping_add(fmix(h2))
+}
+
+#[cfg(test)]
+mod asset_id_tests {
+    #[test]
+    fn known_ids() {
+        // pairs of a part's model name and its element's asset id in a vehicle pack
+        assert_eq!(super::asset_id("declasse500_bumf_01"), 0x2da2_50cd_ad02_445c);
+        assert_eq!(super::asset_id("declasse500_pickup"), 0xe0da_7376_852e_a1fa);
+        assert_eq!(super::asset_id("Declasse500_Sunshade"), 0x41c7_5e89_df70_9658);
+        assert_eq!(super::asset_id("declasse500"), 0xb9b9_435d_f4f3_2ce5);
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Member {
     pub hash: u32,
