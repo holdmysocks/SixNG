@@ -431,9 +431,8 @@ const RUNTIME_SCREEN: &str = "a800afccf01aa36b";
 /// grey, orange and cyan, then shades of them. The game writes the wheel
 /// colours over it, so it is not multiplied into the rim.
 const WHEEL_RIM: &str = "c5cdbdd2";
-/// `standard_vehicle_2lyr_tyre_inst`: the shared `tyre_*` models carry the
-/// same placeholder palette.
-const WHEEL_TYRE: &str = "99ad6fc9";
+/// The tyre shaders (`material::is_tyre_shader`): the shared `tyre_*`
+/// models carry the same placeholder palette.
 
 #[derive(Default)]
 struct ShaderTextures {
@@ -719,7 +718,7 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                             }
                             match texture::embedded_rgba(r, et) {
                                 Ok(rgba) => {
-                                    if t.param_hash == TINT_PALETTE && et.height == 1 && (s.name_hash == WHEEL_RIM || s.name_hash == WHEEL_TYRE) {
+                                    if t.param_hash == TINT_PALETTE && et.height == 1 && (s.name_hash == WHEEL_RIM || crate::material::is_tyre_shader(&s.name_hash)) {
                                         e["applied"] = "not applied: a placeholder of marker colours that the game replaces with the wheel colours".into();
                                     } else if t.param_hash == TINT_PALETTE && et.height == 1 {
                                         st.tint_palette = Some(rgba.chunks(4).map(|p| [p[0], p[1], p[2], p[3]]).collect());
