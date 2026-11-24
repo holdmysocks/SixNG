@@ -23,8 +23,11 @@
 //!
 //! What points at a preset:
 //! - a wardrobe item's `GarmentPreset` (`e13ebaf8`): clothing library;
-//! - a weapon family file's component record `85492dc3`, field `72f5e33e`,
-//!   and its variant record `6724161c`, field `14b064c2`: weapon library.
+//! - a weapon family file's component record `85492dc3`, field `72f5e33e`
+//!   (its `873ef899` is the joaat of the component's model name, e.g.
+//!   `w_ar_adb_01_barrel_01`; 972 of 1,006 resolve to a model), and its
+//!   variant record `6724161c`: `14b064c2` = preset, `c763edb4` = the part
+//!   the variant recolours (`frame`, `body` ...): weapon library.
 //!
 //! Colour (read from the game's block builder): parameter `f574261b` has
 //! four entries per sub-material. Entry 0 is the base colour; the game
@@ -52,7 +55,7 @@ pub const PRESET: u32 = 0x756a_ef9c;
 /// The colour parameter: 4 entries per sub-material.
 pub const COLOUR: u32 = 0xf574_261b;
 /// Index format version of [`Index`].
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// One parameter: (name hash, index, sub-material, value).
 pub type Param<T> = (u32, u8, u8, T);
@@ -173,8 +176,12 @@ pub struct Index {
     pub presets: BTreeMap<String, Vec<[String; 4]>>,
     /// Weapon component name hash (hex) -> preset (hex).
     pub weapon_components: BTreeMap<String, String>,
-    /// Weapon variant name hash (hex) -> preset (hex).
-    pub weapon_variants: BTreeMap<String, String>,
+    /// Weapon variant name hash (hex) -> (part name hash hex, preset hex).
+    pub weapon_variants: BTreeMap<String, (String, String)>,
+    /// Weapon model name hash (hex, joaat of the drawable name without LOD
+    /// suffix) -> the presets its component records name, in file order.
+    /// 57 of 894 models have two (a second record of the same model).
+    pub weapon_models: BTreeMap<String, Vec<String>>,
 }
 
 pub fn path(ws: &crate::export::Workspace) -> PathBuf {
@@ -192,16 +199,28 @@ impl Index {
 
     /// Weapon links of one decoded weapon family file (`Pso::to_json`).
     pub fn add_weapon_file(&mut self, pso_json: &Value) {
-        let (comp, var) = (field_name(0x72f5_e33e), field_name(0x14b0_64c2));
+        let (comp, var, model, part) = (field_name(0x72f5_e33e), field_name(0x14b0_64c2), field_name(0x873e_f899), field_name(0xc763_edb4));
         for (st, objs) in pso_json["objects"].as_object().into_iter().flatten() {
-            let (field, out) = match st.get(st.len().saturating_sub(8)..) {
-                Some("85492dc3") => (&comp, &mut self.weapon_components),
-                Some("6724161c") => (&var, &mut self.weapon_variants),
-                _ => continue,
-            };
+            let st = st.get(st.len().saturating_sub(8)..);
             for o in objs.as_array().into_iter().flatten() {
-                if let (Some(n), Some(p)) = (o["Name"].as_u64(), o[field].as_u64().filter(|&p| p != 0)) {
-                    out.insert(format!("{n:08x}"), format!("{p:08x}"));
+                let (Some(n), preset) = (o["Name"].as_u64(), |f: &str| o[f].as_u64().filter(|&p| p != 0).map(|p| format!("{p:08x}"))) else { continue };
+                match st {
+                    Some("85492dc3") => {
+                        let Some(p) = preset(&comp) else { continue };
+                        if let Some(m) = o[&model].as_u64().filter(|&m| m != 0) {
+                            let v = self.weapon_models.entry(format!("{m:08x}")).or_default();
+                            if !v.contains(&p) {
+                                v.push(p.clone());
+                            }
+                        }
+                        self.weapon_components.insert(format!("{n:08x}"), p);
+                    }
+                    Some("6724161c") => {
+                        if let Some(p) = preset(&var) {
+                            self.weapon_variants.insert(format!("{n:08x}"), (format!("{:08x}", o[&part].as_u64().unwrap_or(0)), p));
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -210,6 +229,14 @@ impl Index {
     pub fn load(ws: &crate::export::Workspace) -> Option<Index> {
         let ix: Index = serde_json::from_slice(&std::fs::read(path(ws)).ok()?).ok()?;
         (ix.version == VERSION).then_some(ix)
+    }
+
+    /// The presets of a weapon model, by drawable name (a LOD suffix
+    /// `_hi` / `_mid` is ignored).
+    pub fn weapon_presets(&self, model: &str) -> &[String] {
+        let m = model.to_ascii_lowercase();
+        let base = ["_hi", "_mid"].iter().find_map(|s| m.strip_suffix(s)).unwrap_or(&m);
+        self.weapon_models.get(&format!("{:08x}", crate::meta7a::joaat(base))).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Base colour (entry 0) per sub-material of a preset, sRGB RGBA.
@@ -269,12 +296,18 @@ mod tests {
     #[test]
     fn weapon_links_come_from_the_component_and_variant_records() {
         let j = json!({"objects": {
-            "9a16508d85492dc3": [{"Name": 0x921b_2361u32, field_name(0x72f5_e33e): 0xd9f0_240du32}, {"Name": 5, field_name(0x72f5_e33e): 0}],
-            "eafa47ee6724161c": [{"Name": 0xd0b1_bd2au32, field_name(0x14b0_64c2): 0x5e52_bcd0u32}],
+            "9a16508d85492dc3": [
+                {"Name": 0x921b_2361u32, field_name(0x72f5_e33e): 0xd9f0_240du32, field_name(0x873e_f899): crate::meta7a::joaat("w_ar_adb_01_barrel_01")},
+                {"Name": 6, field_name(0x72f5_e33e): 0x11u32, field_name(0x873e_f899): crate::meta7a::joaat("w_ar_adb_01_barrel_01")},
+                {"Name": 5, field_name(0x72f5_e33e): 0}],
+            "eafa47ee6724161c": [{"Name": 0xd0b1_bd2au32, field_name(0x14b0_64c2): 0x5e52_bcd0u32, field_name(0xc763_edb4): crate::meta7a::joaat("frame")}],
         }});
         let mut ix = Index::default();
         ix.add_weapon_file(&j);
         assert_eq!(ix.weapon_components.get("921b2361").map(String::as_str), Some("d9f0240d"));
-        assert_eq!((ix.weapon_components.len(), ix.weapon_variants["d0b1bd2a"].as_str()), (1, "5e52bcd0"));
+        assert_eq!((ix.weapon_components.len(), ix.weapon_variants["d0b1bd2a"].1.as_str()), (2, "5e52bcd0"));
+        assert_eq!(ix.weapon_variants["d0b1bd2a"].0, format!("{:08x}", crate::meta7a::joaat("frame")));
+        assert_eq!(ix.weapon_presets("W_AR_ADB_01_barrel_01_hi"), ["d9f0240d".to_string(), "00000011".to_string()]);
+        assert!(ix.weapon_presets("w_ar_adb_01").is_empty());
     }
 }
