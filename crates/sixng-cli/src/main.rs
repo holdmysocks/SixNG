@@ -667,21 +667,28 @@ enum Cmd {
         out: Option<PathBuf>,
     },
     /// World sector grids (the PSO files of levels.rpf with struct
-    /// 9c834886): cells of a 60 m world grid with cell x and y (cell =
-    /// floor(world / 60 m)), a group hash, the index in the group and a
-    /// 64-bit value (0, or a model asset id). levels.rpf holds eight: the
-    /// world grid of 26,212 cells and seven small ones; the largest is used
-    /// unless --entry picks another. Prints a summary of each (count, groups, cell
-    /// range, world box). With -o writes <out>/sector_grid/: sector_grid.csv (one line per
-    /// cell with its world box), sector_grid.json (summary and records) and
-    /// sector_grid.png (mask, one pixel per cell, north up).
+    /// 9c834886). levels.rpf holds eight, in three cell sizes (1024, 512
+    /// and 60 m, measured; cell = floor(world / size)). Each size has a
+    /// cell list and a map-group list (map group id = the map files'
+    /// 65876a4d -> the cells its entities reach). The world grid is the
+    /// 60 m cell list, 26,212 cells; it is used unless --entry picks
+    /// another. Records also carry a bundle key and the index in the
+    /// bundle. Prints a summary of each grid (kind, cell size, counts, cell
+    /// range, world box). With -o writes <out>/sector_grid/:
+    /// sector_grid.csv (one line per record with its world box),
+    /// sector_grid.json (summary and records) and sector_grid.png (mask,
+    /// one pixel per cell, north up).
     SectorGrid {
         /// Archive (default levels).
         #[arg(default_value = "levels")]
         archive: String,
-        /// Entry id of the grid to write (default: the one with most cells).
+        /// Entry id of the grid to write (default: the one with most records).
         #[arg(long)]
         entry: Option<String>,
+        /// Cell size in metres for the written grid (default: the measured
+        /// size of that file).
+        #[arg(long)]
+        cell_m: Option<f32>,
         #[arg(long, short)]
         out: Option<PathBuf>,
     },
@@ -2231,9 +2238,9 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             out.print(&json!({"ok": true, "result": res}));
         }
-        Cmd::SectorGrid { archive, entry, out: po } => {
+        Cmd::SectorGrid { archive, entry, cell_m, out: po } => {
             use sixng_core::sectorgrid as sg;
-            let grids = sg::load_all(&ws, archive)?;
+            let mut grids = sg::load_all(&ws, archive)?;
             if grids.is_empty() {
                 anyhow::bail!("no sector grid (PSO struct {:08x}) in {archive}", sg::RECORD);
             }
@@ -2243,17 +2250,21 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             };
             let desc = |id: &str, g: &sg::SectorGrid| {
                 json!({
-                    "entry": id, "records": g.sectors.len(), "groups": g.groups(), "cell_m": sg::CELL_M,
+                    "entry": id, "kind": g.kind(), "cell_m": g.cell_m, "records": g.sectors.len(),
+                    "cells": g.cells().len(), "bundles": g.groups(), "map_groups": g.map_groups(),
                     "cell_range": g.cell_range().map(|r| json!({"min_x": r[0], "min_y": r[1], "max_x": r[2], "max_y": r[3]})),
                     "world_bounds_m": g.world_bounds().map(|(lo, hi)| json!({"min": lo, "max": hi})),
                     "nonzero_zero_field": g.sectors.iter().filter(|s| s.zero != 0).count(),
                     "nonzero_hash64": g.sectors.iter().filter(|s| s.hash64 != 0).count(),
                 })
             };
+            if let Some(c) = cell_m {
+                grids[pick].1.cell_m = *c;
+            }
             let (id, g) = &grids[pick];
             let mut summary = json!({
                 "grids": grids.iter().map(|(i, g)| desc(i, g)).collect::<Vec<_>>(), "selected": pick,
-                "cell_rule": "cell = floor(world / cell_m); cell (x, y) covers x*cell_m .. (x+1)*cell_m (measured, see sectorgrid.rs)",
+                "cell_rule": "cell = floor(world / cell_m); cell (x, y) covers x*cell_m .. (x+1)*cell_m. cell_m is measured, not stored (see sectorgrid.rs)",
             });
             if let Some(po) = po {
                 let dir = po.join("sector_grid");
