@@ -43,8 +43,20 @@ struct Veh {
     wheel_fits: HashMap<String, Vec<WheelFit>>,
 }
 
-/// What a fitted part changes on the wheels (metres; `axles` 1 = front,
-/// 2 = rear, as a mask).
+/// Whether a wheel fitment record applies to an axle (0 front, 1 rear).
+/// The record's axle value is 0, 2 or 3 in the data: taken as front, rear
+/// and both (1 is not seen). Not confirmed against the game.
+pub fn fit_on_axle(axles: u32, axle: usize) -> bool {
+    match axles {
+        0 => axle == 0,
+        2 => axle == 1,
+        3 => true,
+        _ => false,
+    }
+}
+
+/// What a fitted part changes on the wheels (metres; `axles` 0 = front,
+/// 2 = rear, 3 = both).
 #[derive(Deserialize, Clone, Copy)]
 pub struct WheelFit {
     #[serde(default)]

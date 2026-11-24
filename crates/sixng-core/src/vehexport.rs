@@ -344,6 +344,25 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
         push(pn, &p.id, what, p.prims, Ok(mats), &mut groups, &mut materials, &mut reports);
     }
 
+    // What the configuration's parts change on the wheels (a widebody kit,
+    // spacers): out from the centre line and wider, per axle (front, rear).
+    let (mut fit_out, mut fit_wide) = ([0.0f32; 2], [0.0f32; 2]);
+    for (p, fits) in vehicle["wheel_fits"].as_object().into_iter().flatten() {
+        if !u32::from_str_radix(p, 16).is_ok_and(|p| fitted.contains(&p)) {
+            continue;
+        }
+        for f in fits.as_array().into_iter().flatten() {
+            let num = |k: &str| f[k].as_f64().unwrap_or(0.0) as f32;
+            for axle in 0..2 {
+                // the axle value is 0, 2 or 3 in the data: taken as front,
+                // rear and both
+                if matches!((f["axles"].as_u64().unwrap_or(9), axle), (0, 0) | (2, 1) | (3, _)) {
+                    fit_out[axle] += num("offset") + num("spacing");
+                    fit_wide[axle] += num("width");
+                }
+            }
+        }
+    }
     // wheels: rim and tyre on every wheel bone
     let mut wheel_report = Value::Null;
     if wheels {
@@ -381,7 +400,12 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
             }
             let s = d.radius / unit;
             let right = d.centre[0] > 0.0;
-            let m: Mat = [if right { -s } else { s }, 0.0, 0.0, 0.0, 0.0, s, 0.0, 0.0, 0.0, 0.0, s, 0.0, d.centre[0], d.centre[1], d.centre[2], 1.0];
+            // wheel_lr, wheel_rr, wheel_lr_inr ...: the second letter is the axle
+            let axle = (bone.to_ascii_lowercase().strip_prefix("wheel_").and_then(|b| b.chars().nth(1)) == Some('r')) as usize;
+            let x = d.centre[0] + fit_out[axle].copysign(d.centre[0]);
+            // a wider tyre: the wheel stretched along its axle
+            let sx = if d.half_width > 0.0 { s * (d.half_width + fit_wide[axle] / 2.0) / d.half_width } else { s };
+            let m: Mat = [if right { -sx } else { sx }, 0.0, 0.0, 0.0, 0.0, s, 0.0, 0.0, 0.0, 0.0, s, 0.0, x, d.centre[1], d.centre[2], 1.0];
             for (p, mats, _) in built.iter_mut() {
                 let mut prims = p.prims.clone();
                 transform(&mut prims, &m, right);
@@ -392,7 +416,7 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
             }
             placed += 1;
         }
-        wheel_report = json!({"models": models.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), "wheels": placed, "note": "rim and tyre scaled alike to the collision disc's radius; the configuration's rim_ratio is not applied"});
+        wheel_report = json!({"moved_out": fit_out, "widened": fit_wide, "models": models.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), "wheels": placed, "note": "rim and tyre scaled alike to the collision disc's radius; the configuration's rim_ratio is not applied"});
     }
     if groups.iter().all(|g| g.prims.is_empty()) {
         bail!("nothing to export for {model}");
