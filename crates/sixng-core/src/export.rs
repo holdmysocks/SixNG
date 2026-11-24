@@ -260,7 +260,7 @@ fn readable_materials(model: &str, shaders: &[crate::drawable::Shader], mats: &s
                 "parameters": values,
                 "parameters_not_read": unread,
             });
-            for k in ["paint", "multilayer", "texture_fallback"] {
+            for k in ["paint", "multilayer", "stitches", "texture_fallback"] {
                 if !m[k].is_null() {
                     out[k] = m[k].clone();
                 }
@@ -1331,6 +1331,9 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                         crate::material::four_layer_vertex_weights(&mut l, material_colours1(&lod_groups, si));
                         m["multilayer"] = l;
                     }
+                    if let Some(x) = crate::material::stitches(&s.name_hash, material_uv2(&lod_groups, si)) {
+                        m["stitches"] = x;
+                    }
                     if m["classification"]["class"] == "car_paint" {
                         m["paint"] = crate::material::paint_block();
                         if let Some(c) = o.paint {
@@ -1343,6 +1346,11 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 "materials_note": "Textures come from the data/ttdb/*.ttpf stores by 64-bit hash and are written once to <out>/textures/ttpf/<hash>.png. Roles are guessed from the shader parameter hash and the format (sRGB = colour, BC5 / known normal slots = normal map). classification.class is one of opaque/alpha/cutout/decal/glass/window/emissive/water/terrain_multilayer/car_paint, from the shader record flags and known shader families. shader_name and param_name are joaat names from <work>/names/names.json (`sixng names`), null when unknown. slot_role names the PBR map a known parameter slot holds.",
             });
             let mut j = j;
+            let sliding: Vec<String> = info.skeleton.iter().filter(|b| crate::drawable::slides(b)).map(|b| b.name.clone()).collect::<Vec<_>>();
+            if !sliding.is_empty() {
+                j["sliding_doors"] = serde_json::json!(sliding);
+                j["sliding_doors_note"] = "Door bones that slide instead of turning: their bone flags allow a limited translation (0x80) and no limited rotation (0x08 clear), where a hinged door has 0x7f. The track is the bone's own Y axis (the bone is turned about the vertical so that the door moves out as it moves back). How far a door slides is not stored in the model.".into();
+            }
             if let Some((_, rec)) = head.as_ref().filter(|h| !h.1["preset"].is_null()) {
                 j["part_skin"] = rec.clone();
                 j["part_skin_note"] = "Animal parts: the colour texture comes from the part's material preset (packs.rpf meta, struct f795e8ba) when the drawable's own one is in no store or is a tint mask (cattle: R and B patch masks, G shading, coloured in game by the preset's tint bytes through a palette that is not decoded). preset: name hash of the preset used; slot_presets: how many presets (variations) the part has; replaced: the texture the drawable binds.".into();
@@ -1392,6 +1400,13 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
 fn material_colours1(lod_groups: &[Vec<crate::gltf::NodeGroup>], shader: usize) -> impl Iterator<Item = [u8; 4]> + '_ {
     let lod = lod_groups.iter().find(|g| g.iter().any(|n| !n.prims.is_empty()));
     lod.into_iter().flatten().flat_map(|n| &n.prims).filter(move |p| p.material == Some(shader)).filter_map(|p| p.colors1.as_ref()).flatten().copied()
+}
+
+/// The third UV set of every vertex of a material, in the first populated
+/// LOD.
+fn material_uv2(lod_groups: &[Vec<crate::gltf::NodeGroup>], shader: usize) -> impl Iterator<Item = [f32; 2]> + '_ {
+    let lod = lod_groups.iter().find(|g| g.iter().any(|n| !n.prims.is_empty()));
+    lod.into_iter().flatten().flat_map(|n| &n.prims).filter(move |p| p.material == Some(shader)).filter_map(|p| p.uvs.get(2)).flatten().copied()
 }
 
 fn material_uv_fit(lod_groups: &[Vec<crate::gltf::NodeGroup>], shader: usize) -> serde_json::Value {
@@ -1694,6 +1709,9 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             if let Some(mut l) = crate::material::multilayer(s, &st.entries, || material_uv_fit(&lod_groups, si)) {
                         crate::material::four_layer_vertex_weights(&mut l, material_colours1(&lod_groups, si));
                 x["multilayer"] = l;
+            }
+            if let Some(l) = crate::material::stitches(&s.name_hash, material_uv2(&lod_groups, si)) {
+                x["stitches"] = l;
             }
             x
         },
