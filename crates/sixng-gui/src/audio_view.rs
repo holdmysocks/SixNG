@@ -52,6 +52,11 @@ pub struct AudioView {
     last_export: Option<PathBuf>,
     pending_bank: Option<u64>,
     pending_play: Option<u32>,
+    /// bank offset -> name (`core.resident/gun_pistol`), from the containers
+    /// `sixng audio-meta` records and the name dictionary
+    bank_names: std::collections::HashMap<u64, String>,
+    /// bank offset -> stream id -> name, where recovered
+    stream_names: std::collections::BTreeMap<u64, std::collections::BTreeMap<u32, String>>,
 }
 
 fn fmt_secs(s: f64) -> String {
@@ -94,6 +99,8 @@ impl AudioView {
             last_export: None,
             pending_bank: None,
             pending_play: None,
+            bank_names: Default::default(),
+            stream_names: Default::default(),
         }
     }
 
@@ -164,6 +171,7 @@ impl AudioView {
             self.scanning = false;
             match r {
                 Ok(ix) => {
+                    self.load_names(&ix.archive);
                     self.ix = Some(ix);
                     self.dirty = true;
                 }
@@ -186,6 +194,14 @@ impl AudioView {
         }
     }
 
+    fn load_names(&mut self, archive: &str) {
+        let work = std::path::Path::new(&self.work);
+        sixng_core::names::set_work_dir(work);
+        let c = sixng_core::audiometa::load_containers(work, archive).map(|c| sixng_core::audiometa::bank_container(&c)).unwrap_or_default();
+        self.bank_names = c.into_iter().filter_map(|(b, h)| sixng_core::names::lookup(h, sixng_core::names::Ctx::Audio).map(|n| (b, n))).collect();
+        self.stream_names = sixng_core::names::load_stream_names(work, archive);
+    }
+
     fn refilter(&mut self) {
         self.dirty = false;
         let Some(ix) = &self.ix else { return };
@@ -205,11 +221,13 @@ impl AudioView {
                     .streams
                     .iter()
                     .any(|s| s.layout != "none" && s.seconds() >= min);
+                let names = self.stream_names.get(&b.off);
                 let hit = q.is_empty()
                     || format!("{:x}", b.off).contains(&q)
+                    || self.bank_names.get(&b.off).is_some_and(|n| n.contains(&q))
                     || b.streams
                         .iter()
-                        .any(|s| format!("{:08x}", s.id).contains(&q));
+                        .any(|s| format!("{:08x}", s.id).contains(&q) || names.and_then(|m| m.get(&s.id)).is_some_and(|n| n.contains(&q)));
                 playable && hit
             })
             .map(|(i, _)| i)
@@ -347,7 +365,7 @@ impl AudioView {
         self.poll(ui.ctx());
         ui.horizontal(|ui| {
             ui.heading("🔊 Audio");
-            ui.weak("Banks in audio.rpf. Stream names are hashes in the game data and are not recovered, so streams are listed by bank offset and stream id.");
+            ui.weak("Banks in audio.rpf, by offset and, where recovered, name (run `sixng names` and `sixng audio-meta audio` once). Streams are listed by id and name where one was found.");
         });
         if let Some(e) = &self.error {
             ui.colored_label(ui.visuals().error_fg_color, e);
@@ -395,7 +413,7 @@ impl AudioView {
             if ui
                 .add(
                     egui::TextEdit::singleline(&mut self.search)
-                        .hint_text("bank offset or stream id (hex)")
+                        .hint_text("bank offset, stream id (hex) or name")
                         .desired_width(220.0),
                 )
                 .changed()
@@ -468,15 +486,21 @@ impl AudioView {
         ui.horizontal_top(|ui| {
             // bank list
             ui.vertical(|ui| {
-                ui.set_width(320.0);
+                ui.set_width(420.0);
                 ui.strong("Banks");
                 let rows = self.rows.clone();
                 egui::ScrollArea::vertical().id_salt("audio_banks").max_height(avail.y - 30.0).auto_shrink([false, false]).show_rows(ui, 18.0, rows.len(), |ui, range| {
                     for &bi in &rows[range] {
                         let b = &ix.banks[bi];
                         let n = b.streams.iter().filter(|s| s.layout != "none").count();
-                        let t = format!("{:>9x}  {:>4} stream{}  {}", b.off, n, if n == 1 { " " } else { "s" }, fmt_secs(b.seconds()));
-                        if ui.selectable_label(self.sel == Some(bi), egui::RichText::new(t).monospace()).clicked() {
+                        let name = self.bank_names.get(&b.off).map(|n| n.rsplit('/').next().unwrap_or(n)).unwrap_or("");
+                        let t = format!("{:>9x}  {:>4} stream{}  {}  {}", b.off, n, if n == 1 { " " } else { "s" }, fmt_secs(b.seconds()), name);
+                        let r = ui.selectable_label(self.sel == Some(bi), egui::RichText::new(t).monospace());
+                        let r = match self.bank_names.get(&b.off) {
+                            Some(full) => r.on_hover_text(full.as_str()),
+                            None => r,
+                        };
+                        if r.clicked() {
                             self.sel = Some(bi);
                         }
                     }
@@ -492,6 +516,9 @@ impl AudioView {
                 let b = ix.banks[bi].clone();
                 ui.horizontal(|ui| {
                     ui.strong(format!("Bank {:x}", b.off));
+                    if let Some(n) = self.bank_names.get(&b.off) {
+                        ui.strong(n.as_str());
+                    }
                     ui.weak(format!("{:.1} KiB, flags {:08x}", b.size as f64 / 1024.0, b.flags));
                     if ui.button("Export all .opus").on_hover_text("Lossless Ogg Opus remux of every stream").clicked() {
                         self.export(&b, None, "opus");
@@ -506,8 +533,10 @@ impl AudioView {
                 let min = self.min_seconds as f64;
                 let streams: Vec<Stream> = b.streams.iter().filter(|s| s.layout != "none" && s.seconds() >= min).cloned().collect();
                 egui::ScrollArea::vertical().id_salt("audio_streams").auto_shrink([false, false]).show(ui, |ui| {
-                    egui::Grid::new("audio_stream_grid").striped(true).num_columns(6).show(ui, |ui| {
+                    let names = self.stream_names.get(&b.off).cloned().unwrap_or_default();
+                    egui::Grid::new("audio_stream_grid").striped(true).num_columns(7).show(ui, |ui| {
                         ui.strong("Stream id");
+                        ui.strong("Name");
                         ui.strong("Length");
                         ui.strong("Rate");
                         ui.strong("Layout");
@@ -517,6 +546,7 @@ impl AudioView {
                         for s in &streams {
                             let key = (b.off, s.id);
                             ui.monospace(format!("{:08x}", s.id));
+                            ui.label(names.get(&s.id).map(|n| n.as_str()).unwrap_or(""));
                             ui.label(fmt_secs(s.seconds()));
                             ui.label(format!("{} Hz", s.rate)).on_hover_text("Rate field of the stream. Opus always decodes at 48 kHz; this is likely the source rate.");
                             match s.layout.as_str() {

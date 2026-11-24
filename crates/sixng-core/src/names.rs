@@ -22,9 +22,12 @@
 //!   files' mount lists. Each path adds itself, itself without the
 //!   extension and its file name with the extension;
 //! * `banks`: audio bank names (`core.resident/gun_pistol`), found by
-//!   joining the audio pack names and identifiers above and matching the
-//!   bank container hashes that `sixng audio-meta` records
-//!   ([`find_bank_names`]).
+//!   joining the audio pack names with the identifiers above and with the
+//!   snake-case words of data.rpf's text tables (song titles, animal names;
+//!   `<work>/names/text_words.json`, used for this search only), and
+//!   matching the bank container hashes that `sixng audio-meta` records
+//!   ([`find_bank_names`]). Stream names found on the way
+//!   ([`find_stream_names`]) go to `<work>/index/audio_stream_names_audio.json`.
 //!
 //! Optionally, `sixng names --namehash <dictionary.json>` imports a
 //! [gta6-namehash](https://github.com/tarekmania/gta6-namehash) dictionary
@@ -568,11 +571,25 @@ pub fn build(game: &Path, index_dir: &Path, work: &Path) -> Result<serde_json::V
             }
         }
     }
+    // snake-case words of data.rpf's text tables (song titles, animal and
+    // place names), for the bank and stream name searches
+    let text = harvest_text_words(game, index_dir).map(|(tables, words)| -> Result<serde_json::Value> {
+        let p = text_words_path(work);
+        std::fs::create_dir_all(p.parent().unwrap())?;
+        std::fs::write(&p, serde_json::to_vec(&words)?)?;
+        Ok(serde_json::json!({"tables": tables, "words": words.len()}))
+    }).transpose()?;
     // audio bank names, when `audio-meta` has recorded the banks' containers
-    let banks = crate::audiometa::load_containers(work, "audio.rpf").map(|c| set_bank_names(&mut d, &crate::audiometa::bank_container(&c)));
+    let banks = match (crate::audiometa::load_containers(work, "audio.rpf"), crate::audio::load_index(work, "audio.rpf")) {
+        (Some(c), Ok(ix)) => {
+            let streams: BTreeMap<u64, Vec<u32>> = ix.banks.iter().map(|b| (b.off, b.streams.iter().map(|s| s.id).collect())).collect();
+            Some(name_audio(&mut d, work, "audio.rpf", &crate::audiometa::bank_container(&c), &streams)?)
+        }
+        _ => None,
+    };
     let p = dict_path(work);
     save_dict(&p, &d)?;
-    Ok(serde_json::json!({"out": p, "hashes": d.names.len(), "case_sensitive_hashes": d.exact.len(), "identifiers": counts, "common_entries_read": read, "audio_entries_read": audio_read, "mount_paths": paths.len(), "bank_names": banks, "derived": DERIVED.len()}))
+    Ok(serde_json::json!({"out": p, "hashes": d.names.len(), "case_sensitive_hashes": d.exact.len(), "identifiers": counts, "common_entries_read": read, "audio_entries_read": audio_read, "mount_paths": paths.len(), "text_words": text, "bank_names": banks, "derived": DERIVED.len()}))
 }
 
 fn save_dict(p: &Path, d: &Dict) -> Result<()> {
@@ -599,32 +616,195 @@ fn joaat_fin(mut h: u32) -> u32 {
     h.wrapping_add(h << 15)
 }
 
-/// Audio bank names. A bank's container hash is joaat of
-/// `<pack>/<bank>` in lower case (`core.resident/gun_pistol`), where the
-/// pack is one of the dotted audio pack names and the bank name is an
-/// identifier. Every pack in `d` (source `audio`, dotted) is tried with
-/// every identifier in `d`. `banks` is bank offset -> container hash.
-///
-/// Banks of one pack lie next to each other in the archive, so a match is
-/// kept only when the nearest matched bank before or after it (by offset)
-/// has the same pack; this drops the chance matches (about 1 in 36 on the
-/// game's audio.rpf). Returns (bank offset, container, name), by offset.
-pub fn find_bank_names(d: &Dict, banks: &BTreeMap<u64, u32>) -> Vec<(u64, u32, String)> {
-    let want: std::collections::HashSet<u32> = banks.values().copied().collect();
-    let mut packs: Vec<String> = Vec::new();
-    let mut words: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+/// The lower-case identifiers of `d` plus `extra` (bank and stream name
+/// parts) and the dotted audio pack names (source `audio`), both sorted.
+fn audio_words(d: &Dict, extra: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut packs = std::collections::BTreeSet::new();
+    let mut words = std::collections::BTreeSet::new();
     for v in d.names.values() {
         for (n, src) in v {
             let l = n.to_ascii_lowercase();
             if src == "audio" && l.contains('.') && l.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'.') {
-                packs.push(l);
-            } else if is_ident(l.as_bytes()) {
+                packs.insert(l);
+            } else if src != "banks" && is_ident(l.as_bytes()) {
                 words.insert(l);
             }
         }
     }
-    packs.sort();
-    packs.dedup();
+    words.extend(extra.iter().cloned());
+    (packs.into_iter().collect(), words.into_iter().collect())
+}
+
+/// A Latin letter with its accent dropped (`é` -> `e`, `ñ` -> `n`, `ß` ->
+/// `s`), for the Latin-1 and Latin Extended-A ranges; other characters as
+/// they are.
+fn fold(c: char) -> char {
+    const L1: &str = "AAAAAAACEEEEIIIIDNOOOOOxOUUUUYTsaaaaaaaceeeeiiiidnooooo/ouuuuyty";
+    const EA: &str = "AaAaAaCcCcCcCcDdDdEeEeEeEeEeGgGgGgGgHhHhIiIiIiIiIiJjJjKkkLlLlLlLlLlNnNnNnnNnOoOoOoOoRrRrRrSsSsSsSsTtTtTtUuUuUuUuUuUuWwYyYZzZzZzs";
+    let u = c as u32;
+    match u {
+        0xc0..=0xff => L1.as_bytes()[(u - 0xc0) as usize] as char,
+        0x100..=0x17f => EA.as_bytes().get((u - 0x100) as usize).map_or(c, |b| *b as char),
+        _ => c,
+    }
+}
+
+/// Snake-case words from a text string (song titles, animal names, place
+/// names): lower case, accents dropped, each run of other characters made
+/// one `_`; once as written and once with apostrophes dropped first
+/// (`don't` -> `dont`), and the same for each side of ` - `. Words of 3 to
+/// 64 characters and at most 4 parts; longer text is sentences, which only
+/// add chance matches.
+pub fn text_words(s: &str, out: &mut std::collections::BTreeSet<String>) {
+    let t: String = plain_text(s).chars().map(|c| fold(c).to_ascii_lowercase()).collect();
+    let mut parts = vec![t.as_str()];
+    if t.contains(" - ") {
+        parts.extend(t.split(" - "));
+    }
+    for p in parts {
+        for drop_apos in [false, true] {
+            let mut w = String::new();
+            for c in p.chars().filter(|c| !(drop_apos && (*c == '\'' || *c == '\u{2019}'))) {
+                if c.is_ascii_alphanumeric() {
+                    w.push(c);
+                } else if !w.is_empty() && !w.ends_with('_') {
+                    w.push('_');
+                }
+            }
+            let w = w.trim_end_matches('_');
+            if (3..=64).contains(&w.len()) && w.matches('_').count() <= 3 {
+                out.insert(w.to_string());
+            }
+        }
+    }
+}
+
+fn plain_text(s: &str) -> String {
+    crate::text::plain(s)
+}
+
+/// `<work>/names/text_words.json`: the snake-case words of the text tables
+/// (`text_words`), written by `sixng names`, used by the bank and stream
+/// name searches only (they are not names by themselves).
+pub fn text_words_path(work: &Path) -> PathBuf {
+    work.join("names").join("text_words.json")
+}
+
+fn load_text_words(work: &Path) -> Vec<String> {
+    std::fs::read(text_words_path(work)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+/// The text words of every text table of data.rpf (`sixng text`'s tables:
+/// entries of sub type 7a), when it is indexed. Strings over 80 characters
+/// are skipped.
+fn harvest_text_words(game: &Path, index_dir: &Path) -> Option<(usize, std::collections::BTreeSet<String>)> {
+    use rayon::prelude::*;
+    let ix = crate::scan::load_index(&crate::scan::index_path(index_dir, "data.rpf")).ok()?;
+    let arch = game.join("data.rpf");
+    let sets: Vec<(usize, std::collections::BTreeSet<String>)> = ix
+        .entries
+        .par_iter()
+        .filter(|e| e.sub == "7a" && e.usize <= 64 << 20)
+        .filter_map(|e| {
+            let b = crate::scan::read_entry(&arch, e).ok()?;
+            if !crate::text::is_text_table(&b) {
+                return None;
+            }
+            let t = crate::text::parse(&b).ok()?;
+            let mut out = std::collections::BTreeSet::new();
+            for s in t.values().filter(|s| s.chars().count() <= 80) {
+                text_words(s, &mut out);
+            }
+            Some((1, out))
+        })
+        .collect();
+    let mut all = std::collections::BTreeSet::new();
+    let mut n = 0;
+    for (k, s) in sets {
+        n += k;
+        all.extend(s);
+    }
+    Some((n, all))
+}
+
+/// `name` without a variation suffix (`_01` .. `_99`, `_a` .. `_z`).
+fn stem(name: &str) -> &str {
+    let b = name.as_bytes();
+    let n = b.len();
+    if n > 3 && b[n - 3] == b'_' && b[n - 2].is_ascii_digit() && b[n - 1].is_ascii_digit() {
+        &name[..n - 3]
+    } else if n > 2 && b[n - 2] == b'_' && b[n - 1].is_ascii_lowercase() {
+        &name[..n - 2]
+    } else {
+        name
+    }
+}
+
+/// Stream names. A stream id is the low 29 bits of joaat of the wave name,
+/// which is mostly an identifier plus a variation (`<name>_01`,
+/// `<name>_a`). Every identifier of `d` is tried as is and with `_01` ..
+/// `_99` and `_a` .. `_z`. Chance matches are common at 29 bits (about two
+/// in three raw matches on audio.rpf), so a name is kept only when at least
+/// three names of the same stem match streams of the same bank. `streams`
+/// is bank offset -> stream ids; returns bank offset -> stream id -> name.
+pub fn find_stream_names(d: &Dict, extra: &[String], streams: &BTreeMap<u64, Vec<u32>>) -> BTreeMap<u64, BTreeMap<u32, String>> {
+    let mut by_id: HashMap<u32, Vec<u64>> = HashMap::new();
+    for (b, ids) in streams {
+        for &s in ids {
+            by_id.entry(s & 0x1fff_ffff).or_default().push(*b);
+        }
+    }
+    let (_, words) = audio_words(d, extra);
+    let mut raw: BTreeMap<u64, BTreeMap<u32, String>> = BTreeMap::new();
+    let mut hit = |name: String, h: u32| {
+        if let Some(bs) = by_id.get(&(h & 0x1fff_ffff)) {
+            for b in bs {
+                raw.entry(*b).or_default().entry(h & 0x1fff_ffff).or_insert_with(|| name.clone());
+            }
+        }
+    };
+    for w in &words {
+        let h0 = joaat_step(0, w.as_bytes());
+        hit(w.clone(), joaat_fin(h0));
+        for n in 1..=99u32 {
+            let suf = format!("_{n:02}");
+            hit(format!("{w}{suf}"), joaat_fin(joaat_step(h0, suf.as_bytes())));
+        }
+        for c in b'a'..=b'z' {
+            hit(format!("{w}_{}", c as char), joaat_fin(joaat_step(h0, &[b'_', c])));
+        }
+    }
+    raw.into_iter()
+        .filter_map(|(b, m)| {
+            let mut per_stem: HashMap<&str, usize> = HashMap::new();
+            for n in m.values() {
+                *per_stem.entry(stem(n)).or_default() += 1;
+            }
+            let keep: BTreeMap<u32, String> = m.iter().filter(|(_, n)| per_stem[stem(n)] >= 3).map(|(i, n)| (*i, n.clone())).collect();
+            (!keep.is_empty()).then_some((b, keep))
+        })
+        .collect()
+}
+
+/// Audio bank names. A bank's container hash is joaat of
+/// `<pack>/<bank>` in lower case (`core.resident/gun_pistol`), where the
+/// pack is one of the dotted audio pack names and the bank name is an
+/// identifier. `banks` is bank offset -> container hash.
+///
+/// Two searches:
+/// * every pack with every identifier of `d`. Banks of one pack lie next to
+///   each other in the archive, so a match is kept only when the nearest
+///   matched bank before or after it (by offset) has the same pack; this
+///   drops the chance matches (about 1 in 36 on the game's audio.rpf);
+/// * per bank, every pack with the leading and trailing word runs of its
+///   stream names' stems (`stream_names`; `distant_vehicles` from
+///   `distant_vehicles_cars_pass_by_01`). Only that bank's container is
+///   tested, so chance matches are rare and no neighbour is needed.
+///
+/// Returns (bank offset, container, name), by offset.
+pub fn find_bank_names(d: &Dict, extra: &[String], banks: &BTreeMap<u64, u32>, stream_names: &BTreeMap<u64, BTreeMap<u32, String>>) -> Vec<(u64, u32, String)> {
+    let want: std::collections::HashSet<u32> = banks.values().copied().collect();
+    let (packs, words) = audio_words(d, extra);
     // container -> candidate names
     let mut cand: HashMap<u32, Vec<String>> = HashMap::new();
     for p in &packs {
@@ -638,39 +818,87 @@ pub fn find_bank_names(d: &Dict, banks: &BTreeMap<u64, u32>) -> Vec<(u64, u32, S
     }
     let pack = |n: &str| n.split('/').next().unwrap_or("").to_string();
     let matched: Vec<(u64, u32, &Vec<String>)> = banks.iter().filter_map(|(o, h)| cand.get(h).map(|v| (*o, *h, v))).collect();
-    let mut out = Vec::new();
+    let mut out: BTreeMap<u64, (u32, String)> = BTreeMap::new();
     for (i, (off, h, names)) in matched.iter().enumerate() {
         let near: Vec<std::collections::HashSet<String>> = [i.checked_sub(1), Some(i + 1)].into_iter().flatten().filter_map(|j| matched.get(j)).map(|m| m.2.iter().map(|n| pack(n)).collect()).collect();
         if let Some(n) = names.iter().find(|n| near.iter().any(|s| s.contains(&pack(n)))) {
-            out.push((*off, *h, n.clone()));
+            out.insert(*off, (*h, n.clone()));
         }
     }
-    out
+    for (off, h) in banks {
+        if out.contains_key(off) {
+            continue;
+        }
+        let Some(sn) = stream_names.get(off) else { continue };
+        let mut parts = std::collections::BTreeSet::new();
+        for n in sn.values() {
+            let w: Vec<&str> = stem(n).split('_').collect();
+            for k in 1..=w.len() {
+                parts.insert(w[..k].join("_"));
+                parts.insert(w[w.len() - k..].join("_"));
+            }
+        }
+        'found: for p in &packs {
+            let h0 = joaat_step(joaat_step(0, p.as_bytes()), b"/");
+            for w in &parts {
+                if joaat_fin(joaat_step(h0, w.as_bytes())) == *h {
+                    out.insert(*off, (*h, format!("{p}/{w}")));
+                    break 'found;
+                }
+            }
+        }
+    }
+    out.into_iter().map(|(o, (h, n))| (o, h, n)).collect()
 }
 
 /// Replace the `banks` names of `d` with the bank names of `banks` (bank
 /// offset -> container hash). Returns (banks with a container, banks named).
-pub fn set_bank_names(d: &mut Dict, banks: &BTreeMap<u64, u32>) -> serde_json::Value {
+pub fn set_bank_names(d: &mut Dict, extra: &[String], banks: &BTreeMap<u64, u32>, stream_names: &BTreeMap<u64, BTreeMap<u32, String>>) -> serde_json::Value {
     for v in d.names.values_mut() {
         v.retain(|(_, s)| s != "banks");
     }
     d.names.retain(|_, v| !v.is_empty());
-    let found = find_bank_names(d, banks);
+    let found = find_bank_names(d, extra, banks, stream_names);
     for (_, h, n) in &found {
         let e = d.names.entry(format!("{h:08x}")).or_default();
         if !e.iter().any(|(x, s)| x == n && s == "banks") {
             e.push((n.clone(), "banks".into()));
         }
     }
-    serde_json::json!({"banks": banks.len(), "named": found.len()})
+    serde_json::json!({"banks": banks.len(), "named": found.len(), "banks_with_stream_names": stream_names.len(), "stream_names": stream_names.values().map(|m| m.len()).sum::<usize>()})
 }
 
-/// Name the banks of `banks` (bank offset -> container hash) in
-/// `<work>/names/names.json` (after `sixng names`; source `banks`).
-pub fn add_bank_names(work: &Path, banks: &BTreeMap<u64, u32>) -> Result<serde_json::Value> {
+/// `<work>/index/audio_stream_names_<archive>.json`: bank offset (hex) ->
+/// stream id (hex) -> name.
+pub fn stream_names_path(work: &Path, archive: &str) -> PathBuf {
+    work.join("index").join(format!("audio_stream_names_{}.json", archive.trim_end_matches(".rpf").replace(['/', '\\'], "_")))
+}
+
+pub fn load_stream_names(work: &Path, archive: &str) -> BTreeMap<u64, BTreeMap<u32, String>> {
+    let v: BTreeMap<String, BTreeMap<String, String>> = std::fs::read(stream_names_path(work, archive)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    v.into_iter().filter_map(|(b, m)| Some((u64::from_str_radix(&b, 16).ok()?, m.into_iter().filter_map(|(i, n)| Some((u32::from_str_radix(&i, 16).ok()?, n))).collect()))).collect()
+}
+
+/// Stream names and bank names for one archive into `d`, the stream names
+/// saved beside the audio index.
+fn name_audio(d: &mut Dict, work: &Path, archive: &str, banks: &BTreeMap<u64, u32>, streams: &BTreeMap<u64, Vec<u32>>) -> Result<serde_json::Value> {
+    let extra = load_text_words(work);
+    let sn = find_stream_names(d, &extra, streams);
+    let v: BTreeMap<String, BTreeMap<String, &String>> = sn.iter().map(|(b, m)| (format!("{b:x}"), m.iter().map(|(i, n)| (format!("{i:08x}"), n)).collect())).collect();
+    let p = stream_names_path(work, archive);
+    std::fs::create_dir_all(p.parent().unwrap())?;
+    std::fs::write(&p, serde_json::to_vec(&v)?)?;
+    Ok(set_bank_names(d, &extra, banks, &sn))
+}
+
+/// Name the banks of `banks` (bank offset -> container hash) and the
+/// streams of `streams` (bank offset -> stream ids) of an archive: bank
+/// names go into `<work>/names/names.json` (source `banks`; run `sixng
+/// names` first), stream names into [`stream_names_path`].
+pub fn add_bank_names(work: &Path, archive: &str, banks: &BTreeMap<u64, u32>, streams: &BTreeMap<u64, Vec<u32>>) -> Result<serde_json::Value> {
     let p = dict_path(work);
     let mut d: Dict = serde_json::from_slice(&std::fs::read(&p).with_context(|| format!("no name dictionary {} (run `sixng names`)", p.display()))?)?;
-    let r = set_bank_names(&mut d, banks);
+    let r = name_audio(&mut d, work, archive, banks, streams)?;
     save_dict(&p, &d)?;
     Ok(r)
 }
@@ -729,14 +957,50 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let found: Vec<(u64, String)> = find_bank_names(&d, &banks).into_iter().map(|(o, _, n)| (o, n)).collect();
+        let none = BTreeMap::new();
+        let found: Vec<(u64, String)> = find_bank_names(&d, &[], &banks, &none).into_iter().map(|(o, _, n)| (o, n)).collect();
         assert_eq!(found, [(0x1000, "pack.alpha/guns".into()), (0x2000, "pack.alpha/doors".into()), (0x3000, "pack.beta/rain".into()), (0x4000, "pack.beta/wind".into()), (0x6000, "pack.beta/doors".into()), (0x8000, "pack.beta/guns".into())]);
-        let r = set_bank_names(&mut d, &banks);
+        let r = set_bank_names(&mut d, &[], &banks, &none);
         assert_eq!(r["named"], 6);
         assert_eq!(d.names[&format!("{:08x}", h("pack.beta/rain"))], [("pack.beta/rain".to_string(), "banks".to_string())]);
         // a second run replaces, not adds
-        set_bank_names(&mut d, &banks);
+        set_bank_names(&mut d, &[], &banks, &none);
         assert_eq!(d.names.values().flatten().filter(|(_, s)| s == "banks").count(), 6);
+        // the lone bank is named from its own streams' stem: `zzz_far_off`
+        // gives `zzz` (leading run), which joins pack.alpha to its container
+        let sn: BTreeMap<u64, BTreeMap<u32, String>> = [(0x5000, [(1, "zzz_far_off_01".to_string())].into_iter().collect())].into_iter().collect();
+        let found = find_bank_names(&d, &[], &banks, &sn);
+        assert!(found.iter().any(|(o, _, n)| *o == 0x5000 && n == "pack.alpha/zzz"));
+    }
+    #[test]
+    fn text_word_forms() {
+        let mut w = std::collections::BTreeSet::new();
+        text_words("Some Artist - Don't Stop (Café Mix)", &mut w);
+        text_words("Blue Bird", &mut w);
+        text_words("~b~Red Fox~s~", &mut w);
+        text_words("This sentence has far too many words in it", &mut w);
+        text_words("Ab", &mut w);
+        // `don_t_stop_cafe_mix` (apostrophe kept as a break) has 5 parts: dropped
+        let v: Vec<&str> = w.iter().map(|s| s.as_str()).collect();
+        assert_eq!(v, ["blue_bird", "dont_stop_cafe_mix", "red_fox", "some_artist"]);
+        assert_eq!((fold('é'), fold('ñ'), fold('Ł'), fold('k')), ('e', 'n', 'L', 'k'));
+    }
+    #[test]
+    fn stream_name_search() {
+        assert_eq!((stem("rain_light_01"), stem("rain_light_b"), stem("rain_light"), stem("x_1")), ("rain_light", "rain_light", "rain_light", "x_1"));
+        let mut d = Dict::default();
+        for w in ["rain_light", "thunder", "lonely"] {
+            d.names.entry(format!("{:08x}", joaat(w))).or_default().push((w.to_string(), "common".to_string()));
+        }
+        let id = |n: &str| joaat(n) & 0x1fff_ffff;
+        // bank 1: three variations of one stem (kept) and one lone name
+        // (dropped: fewer than three of its stem); bank 2: two only (dropped)
+        let streams: BTreeMap<u64, Vec<u32>> = [(1, vec![id("rain_light_01"), id("rain_light_02"), id("rain_light_c"), id("lonely_07"), 12345]), (2, vec![id("thunder_01"), id("thunder_02")])].into_iter().collect();
+        let sn = find_stream_names(&d, &[], &streams);
+        assert_eq!(sn.len(), 1);
+        let mut v: Vec<&str> = sn[&1].values().map(|s| s.as_str()).collect();
+        v.sort();
+        assert_eq!(v, ["rain_light_01", "rain_light_02", "rain_light_c"]);
     }
     #[test]
     fn mount_path_harvest() {
