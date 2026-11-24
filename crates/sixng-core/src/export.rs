@@ -240,10 +240,11 @@ fn readable_materials(model: &str, shaders: &[crate::drawable::Shader], mats: &s
             }
             let (mut values, mut unread) = (serde_json::Map::new(), Vec::new());
             for c in &s.constants {
-                match c.values {
+                match c.components() {
+                    // a scalar as a number, a vector as its own 2 to 4 components
                     Some(v) => {
                         let k = key(&values, crate::names::param(&c.hash), &c.hash);
-                        values.insert(k, serde_json::json!(v));
+                        values.insert(k, if v.len() == 1 { serde_json::json!(v[0]) } else { serde_json::json!(v) });
                     }
                     None => unread.push(crate::names::param(&c.hash).unwrap_or_else(|| c.hash.clone())),
                 }

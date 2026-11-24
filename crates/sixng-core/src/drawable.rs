@@ -1088,17 +1088,41 @@ pub struct Shader {
 }
 
 /// A constant of a shader: the parameter table continues after the
-/// texture entries with {u32 name hash, u32 descriptor}. Descriptors
-/// `0x0040_XX_tt` index the constant block (record +0x08, which runs up to
-/// the texture-pointer array at +0x10) at float offset XX; others
-/// (`0x01…`, `0x0041…`) point into buffers that are not read. `values` is
-/// the vec4 at that offset, or None when it is not in the block.
+/// texture entries with {u32 name hash, u32 descriptor}. A descriptor is
+/// `components << 22 | byte offset << 8 | buffer`: the number of floats (1
+/// to 4), the value's byte offset in its constant buffer (14 bits), and
+/// which buffer (seen: 0x03, and 0x07 on materials with a second one).
+/// The constant block (record +0x08) starts with one pointer per buffer, in
+/// rising order of the buffer byte, each to that buffer's data inside the
+/// block (at +8 with one buffer, +16 with two). `values` holds the
+/// value's `count` floats (the rest 0), or None when it does not lie
+/// inside its buffer.
+///
+/// Until 2026-11-24 the offset was taken as a float index into the block
+/// itself (8 bits), which gave wrong values for nearly every constant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShaderConst {
     pub hash: String,
     pub desc: String,
+    /// Byte offset in the constant buffer.
     pub offset: usize,
     pub values: Option<[f32; 4]>,
+    /// Which constant buffer (the descriptor's low byte).
+    #[serde(default)]
+    pub buffer: u8,
+    /// Number of floats of the value (0 in data written before this field existed).
+    #[serde(default)]
+    pub count: u8,
+}
+
+impl ShaderConst {
+    /// The value's own components (all four where the count is not recorded).
+    pub fn components(&self) -> Option<&[f32]> {
+        self.values.as_ref().map(|v| match self.count {
+            0 => &v[..],
+            n => &v[..(n as usize).min(4)],
+        })
+    }
 }
 
 /// A texture slot of a shader: the parameter it binds to and the texture
@@ -1156,24 +1180,72 @@ fn shaders_at(r: &Resource, arr: usize) -> Vec<Shader> {
                 }
                 // constants: table entries after the textures (total count in byte 4 of the header)
                 let total = r.sys.get(pt + 4).copied().unwrap_or(0) as usize;
-                let block = r.sys_off(r.u64(s + 0x08)).and_then(|cb| r.sys_off(r.u64(s + 0x10)).filter(|&ta| ta > cb).map(|ta| (cb, (ta - cb) / 4)));
-                for i in np..total.min(256) {
-                    let v = r.u64(pt + 8 + 8 * i);
-                    if v == 0 {
-                        break;
-                    }
-                    let (h, d) = (v as u32, (v >> 32) as u32);
-                    // descriptor 0x0040_XX_tt indexes this block (XX = float offset);
-                    // others (0x01…, 0x0041…) point into buffers not read here
-                    let offset = ((d >> 8) & 0xff) as usize;
-                    let in_block = d >> 16 == 0x40;
-                    let values = block.filter(|&(_, nf)| in_block && offset + 4 <= nf).map(|(cb, _)| [0, 1, 2, 3].map(|k| r.f32(cb + 4 * (offset + k))));
-                    sh.constants.push(ShaderConst { hash: format!("{h:08x}"), desc: format!("{d:08x}"), offset, values });
-                }
+                let entries: Vec<(u32, u32)> = (np..total.min(256)).map(|i| r.u64(pt + 8 + 8 * i)).take_while(|&v| v != 0).map(|v| (v as u32, (v >> 32) as u32)).collect();
+                sh.constants = constants(r, s, pt, &entries);
             }
             sh
         })
         .collect()
+}
+
+/// The constants of the shader record at `s` (parameter table at `pt`) from
+/// its (name hash, descriptor) entries: see [`ShaderConst`].
+fn constants(r: &Resource, s: usize, pt: usize, entries: &[(u32, u32)]) -> Vec<ShaderConst> {
+    let mut ids: Vec<u8> = entries.iter().map(|e| e.1 as u8).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let cb = r.sys_off(r.u64(s + 0x08));
+    // each buffer's data: the k-th pointer of the block, up to the next buffer or the next structure after the block
+    let bases: Vec<Option<usize>> = (0..ids.len()).map(|k| cb.and_then(|cb| r.sys_off(r.u64(cb + 8 * k)).filter(|&b| b > cb))).collect();
+    let stops = [r.sys_off(r.u64(s + 0x10)), Some(pt), Some(s), Some(r.sys.len())];
+    let end_of = |base: usize| bases.iter().chain(&stops).flatten().copied().filter(|&x| x > base).min().unwrap_or(base);
+    entries
+        .iter()
+        .map(|&(h, d)| {
+            let (buffer, offset, count) = (d as u8, ((d >> 8) & 0x3fff) as usize, (d >> 22) as usize);
+            let base = ids.iter().position(|&i| i == buffer).and_then(|k| bases[k]);
+            let values = base.filter(|&b| (1..=4).contains(&count) && b + offset + 4 * count <= end_of(b)).map(|b| std::array::from_fn(|k| if k < count { r.f32(b + offset + 4 * k) } else { 0.0 }));
+            ShaderConst { hash: format!("{h:08x}"), desc: format!("{d:08x}"), offset, values, buffer, count: count.min(255) as u8 }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod constant_tests {
+    use super::*;
+
+    #[test]
+    fn constants_come_from_their_buffer_at_their_byte_offset() {
+        // shader record at 0x100: constant block at 0x200 (ends at the texture array 0x300), parameter table at 0x400
+        let mut r = Resource { sys: vec![0; 0x500], gfx: vec![], gfx_base: 0 };
+        let put = |r: &mut Resource, at: usize, b: &[u8]| r.sys[at..at + b.len()].copy_from_slice(b);
+        let ptr = |o: usize| (crate::resource::SYS_BASE + o as u64).to_le_bytes();
+        put(&mut r, 0x108, &ptr(0x200));
+        put(&mut r, 0x110, &ptr(0x300));
+        // two buffers: 0x03 at +16 (16 bytes), 0x07 at +32
+        put(&mut r, 0x200, &ptr(0x210));
+        put(&mut r, 0x208, &ptr(0x220));
+        for (at, v) in [(0x214, 0.5f32), (0x220, 128.0), (0x224, 64.0), (0x228, 1.0), (0x22c, 2.0), (0x2fc, 9.0)] {
+            put(&mut r, at, &v.to_le_bytes());
+        }
+        let desc = |count: u32, offset: u32, buffer: u32| count << 22 | offset << 8 | buffer;
+        // listed with the second buffer first: the pointers follow the buffer byte, not the table order
+        let c = constants(&r, 0x100, 0x400, &[(0xaa, desc(4, 0, 7)), (0xbb, desc(1, 4, 3)), (0xcc, desc(1, 0xdc, 7)), (0xdd, desc(1, 16, 3)), (0xee, desc(2, 0xdc, 7)), (0xff, desc(16, 0, 7))]);
+        assert_eq!((c[0].values, c[0].count, c[0].buffer, c[0].offset), (Some([128.0, 64.0, 1.0, 2.0]), 4, 7, 0));
+        assert_eq!((c[1].values, c[1].components()), (Some([0.5, 0.0, 0.0, 0.0]), Some(&[0.5f32][..])));
+        // the last float of the second buffer is read; one past the first buffer, past the block, or more than 4 floats is not
+        assert_eq!((c[2].values.map(|v| v[0]), c[2].offset), (Some(9.0), 0xdc));
+        assert!(c[3].values.is_none() && c[4].values.is_none() && c[5].values.is_none());
+        // one buffer: its data starts 8 bytes into the block
+        put(&mut r, 0x200, &ptr(0x208));
+        put(&mut r, 0x208, &0.25f32.to_le_bytes());
+        put(&mut r, 0x20c, &0.75f32.to_le_bytes());
+        let c = constants(&r, 0x100, 0x400, &[(1, desc(1, 4, 3)), (2, desc(1, 0, 3))]);
+        assert_eq!((c[0].values.map(|v| v[0]), c[1].values.map(|v| v[0])), (Some(0.75), Some(0.25)));
+        // no block: nothing is read
+        let c = constants(&Resource { sys: vec![0; 0x500], gfx: vec![], gfx_base: 0 }, 0x100, 0x400, &[(1, desc(1, 0, 3))]);
+        assert!(c[0].values.is_none());
+    }
 }
 
 /// Find the models (geometry groups) and their shader index maps.
