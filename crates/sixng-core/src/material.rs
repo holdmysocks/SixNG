@@ -500,7 +500,7 @@ pub fn four_layer_params(consts: &[crate::drawable::ShaderConst]) -> Value {
                 l.insert(key(&c.hash), json!(v[k]));
             }
         } else {
-            other.insert(key(&c.hash), if v.len() == 1 { json!(v[0]) } else { json!(v) });
+            other.insert(key(&c.hash), c.json().unwrap_or(Value::Null));
         }
     }
     json!({
