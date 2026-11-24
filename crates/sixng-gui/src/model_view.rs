@@ -176,6 +176,10 @@ pub struct LookInfo {
     pub notes: Vec<String>,
     /// Strand hair found for the outfit's hair assets (`hairlink`).
     pub hair: Vec<HairPick>,
+    /// Drawables of the outfit's hats (lower case).
+    pub hats: Vec<String>,
+    /// The hat of the outfit shown, to keep the hair under it.
+    pub hat: Option<Arc<sixng_core::groom::Shell>>,
     /// The colours of the game's hair palette (`ped_tint_hair`, each row at
     /// mid shade, sRGB), to pick from.
     pub hair_swatches: Vec<[u8; 3]>,
@@ -480,6 +484,9 @@ pub struct Hair {
     pub region: String,
     pub search: String,
     pub selected: Vec<u64>,
+    /// The hat worn and the grooms it presses down (the scalp hair).
+    hat: Option<Arc<sixng_core::groom::Shell>>,
+    under_hat: Vec<u64>,
     pub width_mm: f32,
     pub colour: [f32; 3],
     pending: Arc<Mutex<Option<Result<Vec<glb::Model>, String>>>>,
@@ -521,6 +528,8 @@ impl Default for Hair {
             region: "scalp".into(),
             search: String::new(),
             selected: Vec::new(),
+            hat: None,
+            under_hat: Vec::new(),
             width_mm: 1.0,
             colour: [0.10, 0.06, 0.035],
             pending: Arc::new(Mutex::new(None)),
@@ -546,7 +555,7 @@ impl Default for Hair {
 
 impl Hair {
     fn want_key(&self) -> String {
-        format!("{:?}|{}|{:?}|{}|{}|{}", self.selected, self.width_mm, self.colour, self.skin_colour && !self.skin.is_empty(), self.full_coat, self.density)
+        format!("{:?}|{}|{:?}|{}|{}|{}|{:?}", self.selected, self.width_mm, self.colour, self.skin_colour && !self.skin.is_empty(), self.full_coat, self.density, self.hat.as_ref().map(|h| h.id))
     }
     pub fn settled(&self) -> bool {
         !self.loading && !self.listing && self.key == self.want_key()
@@ -804,6 +813,7 @@ impl ModelView {
         let coat_on = self.hair.full_coat;
         let (density, width_scale) = (self.hair.density.clamp(0.05, 1.0), self.hair.width_mm / 3.0);
         let note = self.hair.coat_note.clone();
+        let (hat, under_hat) = (self.hair.hat.clone(), self.hair.under_hat.clone());
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<Vec<glb::Model>> {
@@ -814,7 +824,11 @@ impl ModelView {
                 let share = density * (COAT_STRANDS as f32 / stored.max(1) as f32).min(1.0);
                 let mut drawn = 0;
                 let mut out = Vec::new();
-                for (off, g) in grooms {
+                for (off, mut g) in grooms {
+                    // scalp hair stays under the hat (3 mm inside its lining)
+                    if let Some(h) = hat.as_ref().filter(|_| under_hat.contains(&off)) {
+                        h.press(&mut g.points, 0.003);
+                    }
                     // linear colour from the sRGB picker value
                     let lin = rgb.map(|c| c.powf(2.2));
                     let p = dir.join(format!("{off:x}.glb"));
@@ -1663,6 +1677,8 @@ impl ModelView {
                 self.gpu = Some(g);
                 self.hair.on_loaded(&l.fur, &l.fur_skin, &l.source);
                 if let Some(look) = &l.look {
+                    self.hair.hat = look.hat.clone();
+                    self.hair.under_hat = look.hair.iter().filter(|h| h.slot == "hair").flat_map(|h| h.grooms.iter().copied()).collect();
                     // a character: its confident hair, grown to full density
                     let key = format!("{}#{}", look.model, look.current);
                     if self.hair.look_key != key {
@@ -1688,6 +1704,7 @@ impl ModelView {
                     }
                 } else if !self.hair.look_key.is_empty() {
                     self.hair.look_key.clear();
+                    self.hair.hat = None;
                     if self.hair.fur.is_none() {
                         self.hair.selected.clear();
                     }
@@ -5009,6 +5026,7 @@ fn load_query_sel(
                 opts.iter_mut().for_each(|o| o.default = false);
                 let mut info = LookInfo { model: look.model.clone(), labels: look.outfits.iter().map(|o| o.label.clone()).collect(), current: k, ..Default::default() };
                 info.notes.extend(look.note.clone());
+                info.hats = look.outfits[k].parts.iter().filter(|p| p.slot == "hat").map(|p| p.drawable.to_ascii_lowercase()).collect();
                 for (oi, o) in look.outfits.iter().enumerate() {
                     for p in &o.parts {
                         if p.strands {
@@ -5092,6 +5110,23 @@ fn load_query_sel(
             .ok_or_else(|| anyhow::anyhow!("no part of {prefix} loaded: {}", errs.join("; ")))?;
         if let Some(l) = &mut look_info {
             l.notes.extend(notes);
+            // The hat as seen from inside the head: its centre is 10 cm
+            // under the crown, in the middle of the top of the head.
+            let is_head = |n: &str| n.contains("_head_") || n.starts_with("head_");
+            let hat: Vec<[f32; 3]> = skin.iter().filter(|(n, _)| l.hats.contains(&n.to_ascii_lowercase())).flat_map(|(_, p)| p.iter().copied()).collect();
+            let top = skin.iter().filter(|(n, _)| is_head(n)).flat_map(|(_, p)| p.iter()).map(|p| p[2]).fold(f32::MIN, f32::max);
+            if !hat.is_empty() && top > f32::MIN && !l.hair.is_empty() {
+                let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+                for p in skin.iter().filter(|(n, _)| is_head(n)).flat_map(|(_, p)| p.iter()).filter(|p| p[2] > top - 0.12) {
+                    for a in 0..2 {
+                        lo[a] = lo[a].min(p[a]);
+                        hi[a] = hi[a].max(p[a]);
+                    }
+                }
+                let head: Vec<[f32; 3]> = skin.iter().filter(|(n, _)| is_head(n)).flat_map(|(_, p)| p.iter().copied()).collect();
+                l.hat = Some(Arc::new(sixng_core::groom::Shell::new([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, top - 0.10], &hat, &head)));
+                l.notes.push("Hat: the scalp hair is pressed under the hat's lining (strand points beyond it are pulled in to 3 mm under it), so the hair does not come through the hat; an opening the hat encloses (over a cap's strap) counts as closed. A stand-in, not the game's method: the outfit asks for the plain hair, and no stored rule says how the game keeps it under the hat.".to_string());
+            }
             // Strand roots must lie on this character: pieces that do not
             // (another head shape, a neighbour's piece) are left out. Only in
             // the neutral body shape, where the skin is where the grooms expect it.
