@@ -62,7 +62,7 @@ use serde::Serialize;
 
 pub const MAGIC: u32 = 0x045a_88ea;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Object {
     /// Name hash (joaat of the object name; names are not in the install).
     pub hash: String,
@@ -462,12 +462,51 @@ pub fn link(m: &mut AudioMeta, banks: &[(u64, std::collections::HashSet<u32>)]) 
     (ok, all)
 }
 
+/// Per bank (archive offset), the container hashes of the linked waves that
+/// lie in it, with their wave counts. A container is the bank's name hash
+/// (joaat of the lower-case name, as in GTA V); one bank normally has one.
+pub type BankContainers = std::collections::BTreeMap<u64, std::collections::BTreeMap<u32, usize>>;
+
+/// Add the linked waves of `m` (after `link`) to `out`.
+pub fn bank_containers(m: &AudioMeta, out: &mut BankContainers) {
+    for w in m.objects.iter().filter_map(|o| o.wave.as_ref()) {
+        if let (Some(Ok(b)), Ok(c)) = (w.bank.as_deref().map(|b| u64::from_str_radix(b, 16)), u32::from_str_radix(&w.container, 16)) {
+            *out.entry(b).or_default().entry(c).or_default() += 1;
+        }
+    }
+}
+
+/// The container hash of each bank: the one with the most waves.
+pub fn bank_container(c: &BankContainers) -> std::collections::BTreeMap<u64, u32> {
+    c.iter().filter_map(|(b, m)| m.iter().max_by_key(|(h, n)| (**n, std::cmp::Reverse(**h))).map(|(h, _)| (*b, *h))).collect()
+}
+
+/// `<work>/index/audio_containers_<archive>.json`: bank offset (hex) ->
+/// container hash (hex) -> waves, written by `audio-meta`.
+pub fn containers_path(work: &std::path::Path, archive: &str) -> std::path::PathBuf {
+    work.join("index").join(format!("audio_containers_{}.json", archive.trim_end_matches(".rpf").replace(['/', '\\'], "_")))
+}
+
+pub fn save_containers(work: &std::path::Path, archive: &str, c: &BankContainers) -> Result<()> {
+    let v: std::collections::BTreeMap<String, std::collections::BTreeMap<String, usize>> = c.iter().map(|(b, m)| (format!("{b:x}"), m.iter().map(|(h, n)| (format!("{h:08x}"), *n)).collect())).collect();
+    let p = containers_path(work, archive);
+    std::fs::create_dir_all(p.parent().unwrap())?;
+    std::fs::write(p, serde_json::to_vec(&v)?)?;
+    Ok(())
+}
+
+pub fn load_containers(work: &std::path::Path, archive: &str) -> Option<BankContainers> {
+    let v: std::collections::BTreeMap<String, std::collections::BTreeMap<String, usize>> = serde_json::from_slice(&std::fs::read(containers_path(work, archive)).ok()?).ok()?;
+    Some(v.into_iter().filter_map(|(b, m)| Some((u64::from_str_radix(&b, 16).ok()?, m.into_iter().filter_map(|(h, n)| Some((u32::from_str_radix(&h, 16).ok()?, n))).collect()))).collect())
+}
+
 /// Decode every audio metadata file of an archive to
 /// `<out>/audio_meta/<archive>/<offset>.json` plus `index.jsonl`.
-/// Returns (decoded, failed).
+/// Returns (decoded, failed, container hashes per bank).
 /// `banks`: (bank offset, stream ids) of the archive's audio index, to link
-/// sound files to streams (empty: not linked).
-pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], banks: &[(u64, std::collections::HashSet<u32>)], out: &std::path::Path) -> Result<(usize, usize)> {
+/// sound files to streams (empty: not linked, no containers).
+pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], banks: &[(u64, std::collections::HashSet<u32>)], out: &std::path::Path) -> Result<(usize, usize, BankContainers)> {
+    let mut containers = BankContainers::new();
     let known: std::collections::HashSet<u32> = banks.iter().flat_map(|(_, s)| s.iter().copied()).collect();
     let dir = out.join("audio_meta").join(a.id.trim_end_matches(".rpf"));
     std::fs::create_dir_all(&dir)?;
@@ -493,6 +532,9 @@ pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], ban
         match parsed {
             Ok(mut m) => {
                 let linked = if m.schema == SCHEMA_SOUNDS && !banks.is_empty() { Some(link(&mut m, banks)) } else { None };
+                if linked.is_some() {
+                    bank_containers(&m, &mut containers);
+                }
                 ok += 1;
                 let file = format!("{:x}.json", e.off);
                 std::fs::write(dir.join(&file), serde_json::to_vec_pretty(&serde_json::json!({"id": e.id, "meta": m, "stitched": stitched}))?)?;
@@ -506,7 +548,7 @@ pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], ban
         lines.push('\n');
     }
     std::fs::write(dir.join("index.jsonl"), lines)?;
-    Ok((ok, bad))
+    Ok((ok, bad, containers))
 }
 
 /// A large file can be indexed as two entries with stored (not zlib) 64 KiB
@@ -558,6 +600,22 @@ fn stitch(path: &std::path::Path, e: &crate::scan::Entry, b: &[u8], by_off: &[&c
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bank_container_pick() {
+        use super::*;
+        let w = |c: &str, b: Option<&str>| Object { wave: Some(Wave { container: c.into(), stream: "1".into(), bank: b.map(String::from) }), ..Default::default() };
+        let m = AudioMeta { schema: SCHEMA_SOUNDS, data_len: 0, table_counts: [0, 0], objects: vec![w("0000000a", Some("100")), w("0000000a", Some("100")), w("0000000b", Some("100")), w("0000000c", Some("200")), w("0000000d", None)], classes: Default::default() };
+        let mut c = BankContainers::new();
+        bank_containers(&m, &mut c);
+        assert_eq!(c[&0x100][&0xa], 2);
+        assert!(!c.values().any(|m| m.contains_key(&0xd)));
+        let one = bank_container(&c);
+        assert_eq!((one[&0x100], one[&0x200]), (0xa, 0xc));
+        let dir = std::env::temp_dir().join(format!("sixng_containers_{}", std::process::id()));
+        save_containers(&dir, "audio.rpf", &c).unwrap();
+        assert_eq!(load_containers(&dir, "audio.rpf").unwrap(), c);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn parses_minimal_file() {
         // schema 26, 8 data bytes (two objects of 4), empty tables, 2 index entries
