@@ -15,6 +15,7 @@ pub struct PointPrim {
 }
 
 /// One triangle primitive (one geometry), in RAGE space.
+#[derive(Clone)]
 pub struct TriPrim {
     pub name: String,
     pub positions: Vec<[f32; 3]>,

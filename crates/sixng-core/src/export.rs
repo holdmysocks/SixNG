@@ -595,7 +595,7 @@ fn roof_animation(a: &ArchiveInfo, name: &str, joints: &[crate::gltf::Joint]) ->
 /// A wheel bone that carries a wheel: `wheel_lf`, `wheel_rm1`, and the inner
 /// wheel of a dual pair, `wheel_lr_inr`. Not the helpers (`wheel_turn_lf`,
 /// `wheel_lr_drive`, `wheel_parent_lr`).
-fn is_wheel_mount(name: &str) -> bool {
+pub(crate) fn is_wheel_mount(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     let Some(r) = n.strip_prefix("wheel_") else { return false };
     let r = r.strip_suffix("_inr").unwrap_or(r);
@@ -1312,7 +1312,7 @@ pub(crate) struct BuiltDrawable {
     pub mesh_meta: Vec<serde_json::Value>,
     shader_tex: Vec<ShaderTextures>,
     /// Vehicles: the part colours of each configuration (`vehcolour::Tables::looks_json`).
-    part_looks: serde_json::Value,
+    pub(crate) part_looks: serde_json::Value,
     /// Head skin shaders and the model.json record, for heads.
     head: Option<(Vec<crate::drawable::Shader>, serde_json::Value)>,
 }
