@@ -394,7 +394,12 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
     }
     // wheels: rim and tyre on every wheel bone
     let mut wheel_report = Value::Null;
-    if wheels {
+    // boats get no wheels, whatever bones they have (vehicle types 9 and 10)
+    let boat = matches!(vehicle["model_info"]["type"]["tag"].as_u64(), Some(9) | Some(10));
+    if boat {
+        wheel_report = json!({"wheels": 0, "note": "a boat (vehicle type 9 or 10): no wheels are fitted"});
+    }
+    if wheels && !boat {
         let named = |prefix: &str| part_names.iter().find(|p| p.starts_with(prefix)).and_then(|p| stems.get(&p.to_ascii_lowercase()).copied());
         let models: Vec<&Entry> = [named("rim_"), named("tyre_")].into_iter().flatten().collect();
         let mut placed = 0;

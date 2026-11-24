@@ -29,6 +29,23 @@ struct Mat {
 @group(0) @binding(1) var<storage, read> J: array<mat4x4<f32>>;
 @group(0) @binding(2) var samp: sampler;
 
+// A sticker placed on a vehicle (custom liveries; `livery::Record`). The
+// first record of the list is a header: its flags.x is the number of
+// records after it.
+struct Sticker {
+    zones: array<u32, 8>, // one bit per sticker zone it lies on
+    m: vec4<f32>,         // a, b, c, d: u = U*a + V*b + ou, v = U*c + V*d + ov
+    o: vec4<f32>,         // ou, ov, opacity, picture layer (-1 = none)
+    flags: vec4<u32>,     // x: 1 drawn, 2 colour mask, 4 highlight its zones, 8 outline it; y: model of the vehicle; z: UV set; w: 1 = zone under the pointer
+    c0: vec4<f32>,        // colour of the mask's red (or the picture's tint)
+    c1: vec4<f32>,
+    c2: vec4<f32>,
+};
+
+@group(0) @binding(3) var<storage, read> ST: array<Sticker>;
+@group(0) @binding(4) var t_stick: texture_2d_array<f32>;
+@group(0) @binding(5) var samp_clamp: sampler;
+
 @group(1) @binding(0) var<uniform> M: Mat;
 @group(1) @binding(1) var t_base: texture_2d<f32>;
 @group(1) @binding(2) var t_nrm: texture_2d<f32>;
@@ -51,6 +68,7 @@ struct VIn {
     @location(11) m3: vec4<f32>,
     @location(12) extra: vec4<f32>, // x skinned, y highlight, z tint code, w unused
     @location(13) tint: vec4<f32>,  // model tint palette colour (linear; white = none)
+    @location(14) zone: vec4<u32>,  // x sticker zone, y model of an assembled vehicle
 };
 
 struct VOut {
@@ -65,6 +83,8 @@ struct VOut {
     @location(7) tint: vec4<f32>,
     // light a lit vehicle lamp adds (linear colour x intensity)
     @location(8) lamp: vec3<f32>,
+    // sticker zone, model of an assembled vehicle
+    @location(9) @interpolate(flat) zone: vec2<u32>,
 };
 
 fn skin_matrix(v: VIn) -> mat4x4<f32> {
@@ -115,6 +135,7 @@ fn mesh_vertex(v: VIn) -> VOut {
     let det = determinant(mat3x3<f32>(m[0].xyz, m[1].xyz, m[2].xyz));
     o.extra.w = select(1.0, -1.0, det < 0.0);
     o.tint = v.tint;
+    o.zone = v.zone.xy;
     return o;
 }
 
@@ -137,6 +158,10 @@ fn aces(x: vec3<f32>) -> vec3<f32> {
 // pull a colour towards its own luminance by k (0 = unchanged, 1 = grey)
 fn neutral(c: vec3<f32>, k: f32) -> vec3<f32> {
     return mix(c, vec3(dot(c, vec3(0.2126, 0.7152, 0.0722))), k);
+}
+
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    return select(pow((c + 0.055) / 1.055, vec3(2.4)), c / 12.92, c <= vec3(0.04045));
 }
 
 fn checker(uv: vec2<f32>) -> f32 {
@@ -258,6 +283,61 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
         else { metal = 0.0; rough = 0.12; }
         pearl = F.paint2.rgb * F.paint2.w;
     }
+    // Stickers placed on the vehicle (custom liveries). Like the game's
+    // two-layer vehicle shader: a sticker lies on the sticker zones it
+    // lists and is drawn where the mesh UV, taken through its 2x2 matrix
+    // and offset, is between 0 and 1. A colour mask's red, green and blue
+    // are the cover of three colours; other pictures bring their own
+    // colours and alpha. Later stickers lie on top. The list is short
+    // (`livery::MAX_STICKERS`), so every pixel walks it.
+    var st_hl = 0.0;
+    var st_edge = 0.0;
+    let st_n = min(ST[0].flags.x, arrayLength(&ST) - 1u);
+    if (st_n > 0u) {
+        let dx0 = dpdx(i.uv0);
+        let dy0 = dpdy(i.uv0);
+        let dx1 = dpdx(i.uv1);
+        let dy1 = dpdy(i.uv1);
+        let zb = i.zone.x & 255u;
+        for (var k = 1u; k <= st_n; k++) {
+            let fl = ST[k].flags;
+            if ((fl.x & 1u) == 0u || fl.y != i.zone.y) { continue; }
+            if (((ST[k].zones[zb >> 5u] >> (zb & 31u)) & 1u) == 0u) { continue; }
+            if ((fl.x & 4u) != 0u) { st_hl = max(st_hl, select(0.22, 0.5, fl.w == 1u)); }
+            let o = ST[k].o;
+            if (o.w < 0.0 && (fl.x & 8u) == 0u) { continue; }
+            let m = ST[k].m;
+            var uv = i.uv0;
+            var dx = dx0;
+            var dy = dy0;
+            if (fl.z == 1u) { uv = i.uv1; dx = dx1; dy = dy1; }
+            let p = vec2(dot(m.xy, uv), dot(m.zw, uv)) + o.xy;
+            if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0) { continue; }
+            let gx = vec2(dot(m.xy, dx), dot(m.zw, dx));
+            let gy = vec2(dot(m.xy, dy), dot(m.zw, dy));
+            if (o.w >= 0.0) {
+                let t = textureSampleGrad(t_stick, samp_clamp, p, i32(o.w + 0.5), gx, gy);
+                var c = srgb_to_linear(t.rgb) * ST[k].c0.rgb;
+                var a = t.a;
+                if ((fl.x & 2u) != 0u) {
+                    let sum = t.r + t.g + t.b;
+                    a = clamp(sum, 0.0, 1.0);
+                    c = (ST[k].c0.rgb * t.r + ST[k].c1.rgb * t.g + ST[k].c2.rgb * t.b) / max(sum, 0.0001);
+                }
+                a = a * o.z;
+                albedo = mix(albedo, c, a);
+                metal = metal * (1.0 - a);
+                rough = mix(rough, 0.45, a);
+                pearl = pearl * (1.0 - a);
+            }
+            if ((fl.x & 8u) != 0u) {
+                // the selected sticker's border, about two pixels wide
+                let w = abs(gx) + abs(gy);
+                let e = min(min(p.x, 1.0 - p.x) / max(w.x, 0.000001), min(p.y, 1.0 - p.y) / max(w.y, 0.000001));
+                if (e < 2.0) { st_edge = 1.0; }
+            }
+        }
+    }
     // vehicle parts, second layer of the surface (rust under paint, grey
     // under bare metal): rows 256.. of the part ramp image hold its colour
     // and roughness (alpha); its metalness is the alpha of the first rows.
@@ -370,6 +450,9 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     // map tint (instance extra.z): 1 = selected, 2.. = gap heat
     if (i.extra.y > 0.5) { col = mix(col, vec3(1.0, 0.55, 0.1), 0.45); }
     if (i.extra.z > 0.5) { col = mix(col, gap_tint(u32(i.extra.z + 0.5) - 1u), 0.6); }
+    // livery editor: the chosen sticker's zones and its border
+    if (st_hl > 0.0) { col = mix(col, vec3(0.1, 0.55, 1.0), st_hl); }
+    if (st_edge > 0.0) { col = mix(col, vec3(1.0, 0.85, 0.1), 0.9); }
     // distance fog
     let dist = length(F.cam_pos.xyz - i.world);
     let fog = 1.0 - exp(-dist * F.misc2.x);
