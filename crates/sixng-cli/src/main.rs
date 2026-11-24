@@ -720,13 +720,17 @@ enum Cmd {
     /// the textures (slot in the material's texture list, parameter and
     /// shader-variable name), constants and programs of each matching
     /// effect. Reads the game's own reflection tables; no shader code is
-    /// decoded.
+    /// decoded. With --cache, the pipeline cache says which declared
+    /// resources each compiled program really reads.
     ShaderBindings {
         /// Regex on effect names (a material's shader name, e.g. `^standard$`).
         effect: Option<String>,
         /// Also list every program of the matching effects with its resources and constant buffers.
         #[arg(long)]
         programs: bool,
+        /// Also read the pipeline cache (the archive's compressed entry; shaders.rpf must be indexed) and join it to the programs: how many pipelines use each program, and which of its declared resources the compiled code reads (`used`).
+        #[arg(long)]
+        cache: bool,
     },
     /// Name dictionary for shader, parameter and meta field hashes (joaat of
     /// the lower-case name). Without --lookup: build `<work>/names/names.json`
@@ -1038,13 +1042,32 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             out.print(&json!({"ok": true, "category": category, "results": all}));
         }
-        Cmd::ShaderBindings { effect, programs } => {
+        Cmd::ShaderBindings { effect, programs, cache } => {
             use sixng_core::names::{lookup, Ctx};
             use sixng_core::shaderfx::{self, Table, Var};
             let t = Instant::now();
             let bytes = std::fs::read(ws.game.join("shaders.rpf"))?;
             let sh = shaderfx::read(&bytes)?;
+            // the pipeline cache: the archive's entry that starts with its magic
+            let joined = if *cache {
+                let a = ws.resolve("shaders")?;
+                let ix = ws.load_index(&a)?;
+                let e = ix.entries.iter().find(|e| e.sub == "09005350").ok_or_else(|| anyhow::anyhow!("no pipeline cache entry in the shaders.rpf index"))?;
+                let c = shaderfx::read_cache(&sixng_core::scan::read_entry(&a.path, e)?)?;
+                let j = sh.compiled(&c, &bytes);
+                Some((c, j))
+            } else {
+                None
+            };
             drop(bytes);
+            let cache_summary = joined.as_ref().map(|(c, j)| {
+                let used: Vec<_> = j.iter().flatten().collect();
+                json!({"version": c.version, "graphics_pipelines": c.graphics, "compute_pipelines": c.compute, "metadata_blobs": c.metadata_blobs, "code_blobs": c.code_blobs, "stage_blobs": c.stages.len(),
+                    "programs_in_a_pipeline": used.len(), "programs_in_no_pipeline": j.len() - used.len(),
+                    "read_records_matched": used.iter().map(|u| u.read.iter().filter(|x| **x).count()).sum::<usize>(), "read_records_unmatched": used.iter().map(|u| u.unmatched_reads).sum::<usize>(),
+                    "declared_resources_never_read": used.iter().map(|u| u.read.iter().filter(|x| !**x).count()).sum::<usize>(), "write_records": used.iter().map(|u| u.writes.len()).sum::<usize>(),
+                    "note": "counted per program over the stage blob of its first pipeline; read_records_matched counts declared resources (samplers included in declared_resources_never_read: the cache has no sampler records)"})
+            });
             let named = |h: u32| json!({"hash": format!("{h:08x}"), "name": lookup(h, Ctx::Param)});
             let member = |m: &Var| json!({"hash": format!("{:08x}", m.name), "name": lookup(m.name, Ctx::Param), "parameter": (m.alias != m.name && m.alias != 0).then(|| named(m.alias)), "type": m.member_type(), "offset": m.a});
             let resource = |t: &Table, i: usize, r: &Var| {
@@ -1086,8 +1109,28 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                             .map(|(k, st)| {
                                 let list: Vec<_> = e.programs[k]
                                     .iter()
-                                    .filter_map(|&n| sh.programs.get(sh.sections[k].0 + n as usize))
-                                    .map(|p| if full { json!({"name": p.name, "id": format!("{:016x}", p.id), "resources": p.table.resources.iter().enumerate().map(|(i, r)| resource(&p.table, i, r)).collect::<Vec<_>>()}) } else { json!(p.name) })
+                                    .filter_map(|&n| Some((sh.sections[k].0 + n as usize, sh.programs.get(sh.sections[k].0 + n as usize)?)))
+                                    .map(|(pi, p)| {
+                                        if !full {
+                                            return json!(p.name);
+                                        }
+                                        let comp = joined.as_ref().and_then(|(_, j)| j.get(pi)).and_then(Option::as_ref);
+                                        let res: Vec<_> = p.table.resources.iter().enumerate().map(|(i, r)| {
+                                            let mut v = resource(&p.table, i, r);
+                                            if let Some(c) = comp.filter(|_| r.kind != 0x23) {
+                                                v["used"] = json!(c.read[i]);
+                                            }
+                                            v
+                                        }).collect();
+                                        let mut v = json!({"name": p.name, "id": format!("{:016x}", p.id), "resources": res});
+                                        if joined.is_some() {
+                                            v["compiled"] = match comp {
+                                                Some(c) => json!({"pipelines": c.pipelines, "unmatched_reads": c.unmatched_reads, "writes": c.writes}),
+                                                None => json!(null),
+                                            };
+                                        }
+                                        v
+                                    })
                                     .collect();
                                 (st.to_string(), json!(list))
                             })
@@ -1111,7 +1154,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     "resources": sh.programs.iter().map(|p| p.table.resources.len()).sum::<usize>(), "constant_buffer_members": sh.programs.iter().map(|p| p.table.members.len()).sum::<usize>()},
                 "effects": {"stated": sh.effects_stated, "read": sh.effects.len(), "with_table": sh.effects.iter().filter(|e| e.table.is_some()).count()},
                 "material_texture_parameters": {"total": tex.len(), "unnamed": unnamed.len(), "unnamed_list": unnamed},
-                "matched_effects": effects, "seconds": t.elapsed().as_secs_f64()}));
+                "pipeline_cache": cache_summary, "matched_effects": effects, "seconds": t.elapsed().as_secs_f64()}));
         }
         Cmd::Names { lookup } => {
             if lookup.is_empty() {
