@@ -623,6 +623,25 @@ pub fn load_groups(work: &std::path::Path, archive: &str) -> Option<std::collect
     Some(v.into_iter().filter_map(|(c, g)| Some((u32::from_str_radix(&c, 16).ok()?, u32::from_str_radix(&g, 16).ok()?))).collect())
 }
 
+/// `<work>/index/audio_objects_<archive>.bin`: the name hashes of every
+/// decoded audio metadata object (sorted u32, little-endian), written by
+/// `audio-meta`; the stream name search checks its stems against them.
+pub fn objects_path(work: &std::path::Path, archive: &str) -> std::path::PathBuf {
+    work.join("index").join(format!("audio_objects_{}.bin", archive.trim_end_matches(".rpf").replace(['/', '\\'], "_")))
+}
+
+pub fn save_objects(work: &std::path::Path, archive: &str, o: &std::collections::BTreeSet<u32>) -> Result<()> {
+    let p = objects_path(work, archive);
+    std::fs::create_dir_all(p.parent().unwrap())?;
+    std::fs::write(p, o.iter().flat_map(|h| h.to_le_bytes()).collect::<Vec<u8>>())?;
+    Ok(())
+}
+
+pub fn load_objects(work: &std::path::Path, archive: &str) -> Option<std::collections::HashSet<u32>> {
+    let b = std::fs::read(objects_path(work, archive)).ok()?;
+    Some(b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+}
+
 pub fn load_containers(work: &std::path::Path, archive: &str) -> Option<BankContainers> {
     let v: std::collections::BTreeMap<String, std::collections::BTreeMap<String, usize>> = serde_json::from_slice(&std::fs::read(containers_path(work, archive)).ok()?).ok()?;
     Some(v.into_iter().filter_map(|(b, m)| Some((u64::from_str_radix(&b, 16).ok()?, m.into_iter().filter_map(|(h, n)| Some((u32::from_str_radix(&h, 16).ok()?, n))).collect()))).collect())
@@ -630,13 +649,15 @@ pub fn load_containers(work: &std::path::Path, archive: &str) -> Option<BankCont
 
 /// Decode every audio metadata file of an archive to
 /// `<out>/audio_meta/<archive>/<offset>.json` plus `index.jsonl`.
-/// Returns (decoded, failed, container hashes per bank, bank-list entries).
+/// Returns (decoded, failed, container hashes per bank, bank-list entries,
+/// the name hashes of every decoded object).
 /// `banks`: (bank offset, stream ids) of the archive's audio index, to link
 /// sound files to streams (empty: not linked, no containers); `sizes`: (bank
 /// offset, size), to place the bank list. Banks the sound files do not
 /// reach get their container from the bank list, with 0 waves.
-pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], banks: &[(u64, std::collections::HashSet<u32>)], sizes: &[(u64, u64)], out: &std::path::Path) -> Result<(usize, usize, BankContainers, Vec<BankListEntry>)> {
+pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], banks: &[(u64, std::collections::HashSet<u32>)], sizes: &[(u64, u64)], out: &std::path::Path) -> Result<(usize, usize, BankContainers, Vec<BankListEntry>, std::collections::BTreeSet<u32>)> {
     let mut containers = BankContainers::new();
+    let mut objects = std::collections::BTreeSet::new();
     let mut list: Vec<BankListEntry> = Vec::new();
     let known: std::collections::HashSet<u32> = banks.iter().flat_map(|(_, s)| s.iter().copied()).collect();
     let dir = out.join("audio_meta").join(a.id.trim_end_matches(".rpf"));
@@ -669,6 +690,7 @@ pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], ban
                 if let Some(l) = bank_list(&b, &m) {
                     list.extend(l);
                 }
+                objects.extend(m.objects.iter().filter_map(|o| u32::from_str_radix(&o.hash, 16).ok()));
                 ok += 1;
                 let file = format!("{:x}.json", e.off);
                 std::fs::write(dir.join(&file), serde_json::to_vec_pretty(&serde_json::json!({"id": e.id, "meta": m, "stitched": stitched}))?)?;
@@ -688,7 +710,7 @@ pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], ban
             containers.entry(off).or_insert_with(|| [(e.container, 0)].into_iter().collect());
         }
     }
-    Ok((ok, bad, containers, list))
+    Ok((ok, bad, containers, list, objects))
 }
 
 /// A large file can be indexed as two entries with stored (not zlib) 64 KiB

@@ -65,7 +65,8 @@ pub const XMA2_FRAME_SAMPLES: u32 = 512;
 
 /// Bumped when the index meaning changes, so older indexes get rescanned.
 /// 2: codec from 0x1C; PCM and XMA2 streams get their own layouts.
-pub const INDEX_VERSION: u32 = 2;
+/// 3: stream names from the name-tag chunks (`Bank::names`).
+pub const INDEX_VERSION: u32 = 3;
 
 const BLOCK: usize = 0x800;
 /// Opus default encoder delay, used when the packet total does not give one.
@@ -157,6 +158,36 @@ pub struct Bank {
     pub size: u64,
     pub flags: u32,
     pub streams: Vec<Stream>,
+    /// Stream id -> the wave name the bank stores itself ([`embedded_name`]).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub names: std::collections::BTreeMap<u32, String>,
+}
+
+/// A stream's name tag: chunk 0x5C, an embedded resource (`RSC8`) that holds
+/// the stream's wave name as plain text (`panic_communicate_01`). 874 banks
+/// of audio.rpf have one per stream.
+pub const CH_NAME_TAG: u8 = 0x5C;
+
+/// The name in a name-tag chunk: a NUL-terminated identifier whose joaat's
+/// low 29 bits are the stream id `id`, and whose full joaat the chunk also
+/// stores (the resource's dictionary hash). Checked against the stream's
+/// own id only, so a chance match is about one in 2^61 per string.
+pub fn embedded_name(b: &[u8], id: u32) -> Option<String> {
+    let mut start = 0;
+    for (i, &c) in b.iter().enumerate() {
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            continue;
+        }
+        if c == 0 && i - start >= 3 {
+            let s = std::str::from_utf8(&b[start..i]).ok()?;
+            let h = crate::meta7a::joaat(s);
+            if h & 0x1FFF_FFFF == id && b.windows(4).any(|w| w == h.to_le_bytes()) {
+                return Some(s.to_string());
+            }
+        }
+        start = i + 1;
+    }
+    None
 }
 
 impl Bank {
@@ -242,12 +273,20 @@ pub fn parse_header(h: &[u8], off: u64) -> Option<Bank> {
         }
         streams.push(Stream { id, chunks, data: (0, 0), samples: 0, rate: 0, codec: 0, channels: 0, layout: String::new() });
     }
-    Some(Bank { off, size, flags, streams })
+    Some(Bank { off, size, flags, streams, names: Default::default() })
 }
 
 /// Fill in format fields from the bank bytes (header + small chunks).
 fn read_formats(f: &mut File, bank: &mut Bank) -> Result<()> {
     for s in bank.streams.iter_mut() {
+        if let Some(c) = s.chunk(CH_NAME_TAG).cloned().filter(|c| c.size <= 1 << 20) {
+            let mut b = vec![0u8; c.size as usize];
+            f.seek(SeekFrom::Start(bank.off + c.off as u64))?;
+            f.read_exact(&mut b)?;
+            if let Some(n) = embedded_name(&b, s.id) {
+                bank.names.insert(s.id, n);
+            }
+        }
         let fc = s.chunks.iter().find(|c| (c.kind == CH_FORMAT || c.kind == CH_FORMAT_ALT) && c.size >= 20).cloned();
         if let Some(c) = fc {
             let mut b = vec![0u8; c.size.min(64) as usize];
@@ -385,7 +424,7 @@ pub fn scan(path: &Path, archive: &str, pr: Progress) -> Result<AudioIndex> {
         archive: archive.into(),
         archive_size: len,
         banks,
-        note: "Audio banks (ADAT) found by scanning for the magic; offsets are in the archive. Stream ids are 29-bit hashes (names not recovered). layout: blocks = Opus packets in 2 KiB blocks (exported as Ogg Opus or WAV); music = sub-streams (stems), each its own Opus stream, exported one file per sub-stream; music lengths are per sub-stream; pcm16 / pcmf32 = PCM (exported as WAV); xma2 = XMA2 packets (remuxed to RIFF XMA2, .xma); other = another codec id, not decoded (exported raw); none = no data chunk. codec = format chunk byte 0x1C (11 Opus, 0 PCM16, 2 PCM float32, 5 XMA2). Opus sample counts are 48 kHz units over all channels.".into(),
+        note: "Audio banks (ADAT) found by scanning for the magic; offsets are in the archive. Stream ids are 29-bit hashes; names = the wave names banks store in name-tag chunks (0x5C), by stream id. layout: blocks = Opus packets in 2 KiB blocks (exported as Ogg Opus or WAV); music = sub-streams (stems), each its own Opus stream, exported one file per sub-stream; music lengths are per sub-stream; pcm16 / pcmf32 = PCM (exported as WAV); xma2 = XMA2 packets (remuxed to RIFF XMA2, .xma); other = another codec id, not decoded (exported raw); none = no data chunk. codec = format chunk byte 0x1C (11 Opus, 0 PCM16, 2 PCM float32, 5 XMA2). Opus sample counts are 48 kHz units over all channels.".into(),
     })
 }
 
@@ -802,7 +841,7 @@ pub fn load_index(work: &Path, archive: &str) -> Result<AudioIndex> {
     let f = File::open(&p).with_context(|| format!("no audio index {} (run `sixng audio` first)", p.display()))?;
     let ix: AudioIndex = serde_json::from_reader(std::io::BufReader::new(flate2::read::GzDecoder::new(f)))?;
     if ix.version < INDEX_VERSION {
-        return Err(anyhow!("the audio index {} is from an older SixNG (codecs read from the wrong byte): scan audio.rpf again (`sixng audio --rescan`)", p.display()));
+        return Err(anyhow!("the audio index {} is from an older SixNG (no stream names, or codecs read from the wrong byte): scan audio.rpf again (`sixng audio --rescan`)", p.display()));
     }
     Ok(ix)
 }
@@ -819,6 +858,19 @@ pub fn save_index(work: &Path, ix: &AudioIndex) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn name_tag() {
+        let h = crate::meta7a::joaat("door_creak_03");
+        let id = h & 0x1FFF_FFFF;
+        // other strings first (not the stream's), then the name, then its
+        // full hash; a run not ended by NUL does not count
+        let mut b = b"RSC8\x01\x00\x00\x00other_name\x00\x00\x9a\xbcdoor_creak_03\x00\x00".to_vec();
+        assert_eq!(embedded_name(&b, id), None); // no dictionary hash yet
+        b.extend(h.to_le_bytes());
+        assert_eq!(embedded_name(&b, id).as_deref(), Some("door_creak_03"));
+        assert_eq!(embedded_name(&b, id ^ 1), None);
+        assert_eq!(embedded_name(b"xxdoor_creak_03", id), None);
+    }
     #[test]
     fn toc() {
         assert_eq!(packet_samples(&[0xF8, 0]), 960); // CELT FB 20 ms
