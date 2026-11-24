@@ -96,7 +96,7 @@ pub const METALLIC: u32 = 0x0e55_5ef5;
 pub const ROUGHNESS: u32 = 0x8347_2381;
 
 /// Index format version of [`Index`].
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 /// One parameter: (name hash, index, sub-material, value).
 pub type Param<T> = (u32, u8, u8, T);
@@ -337,12 +337,14 @@ pub fn stops(srgb: [u8; 3]) -> [[f32; 3]; 3] {
 }
 
 /// Weapon part types that finishes are listed under (`c763edb4` of a
-/// variant record is the joaat of one of these): 46 of the 54 hashes in
-/// use, covering 1,263 of the 1,300 variants.
+/// variant record is the joaat of one of these): 53 of the 54 hashes in
+/// use, covering all but 4 of the 1,301 variants (`060dc09e`, the fore
+/// grips, is unnamed).
 pub const PART_TYPES: &[&str] = &[
     "barrel", "receiver", "stock", "magazine", "frame", "trigger", "bolt", "pgrip", "muzzle", "grip", "slide", "optic", "handguard", "hguard", "dustcover", "body", "pump",
     "sight_front", "sight_rear", "sight", "scopemount", "slide_cover", "magwell", "magtube", "railmount", "safety", "lid", "charge", "ammo", "selector", "barrel_rail", "cheekriser", "sear",
     "frontrail", "front_rail", "railplate", "reel", "rod", "rail", "flashlight", "reflexmount", "heatshield", "accessory", "underbarrel", "under", "riser",
+    "optics", "sight_optic", "optic_rail", "carry_handle", "mag_assist", "saddle", "accs",
 ];
 
 /// The name of a part type hash (hex), when it is one of [`PART_TYPES`].
@@ -350,20 +352,20 @@ pub fn part_type_name(hex: &str) -> Option<&'static str> {
     PART_TYPES.iter().copied().find(|n| format!("{:08x}", crate::meta7a::joaat(n)) == hex)
 }
 
-/// Words of weapon model names that mean another part type: models say
-/// `mag`, `sight_f`, `sight_r`, the finish lists `magazine`, `sight_front`,
-/// `sight_rear`; a `handguard` model also takes `hguard` finishes.
-const PART_ALIASES: &[(&str, &str)] = &[("mag", "magazine"), ("sight_f", "sight_front"), ("sight_r", "sight_rear"), ("fsights", "sight_front"), ("rsights", "sight_rear"), ("rearsight", "sight_rear"), ("handguard", "hguard")];
-
-/// One weapon family file: its component models and the finishes it
-/// offers per part type.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct WeaponFamily {
-    /// Model name hashes (hex) of the family's component records.
-    pub models: Vec<String>,
-    /// Part type (hex: joaat of `frame`, `slide`, `grip`, `barrel` ...) ->
-    /// (variant name hash hex, preset hex), in file order.
-    pub finishes: BTreeMap<String, Vec<(String, String)>>,
+/// Records of the weapon family files that are joined once every file is
+/// read ([`Index::link_weapons`]); not stored.
+#[derive(Debug, Clone, Default)]
+struct WeaponLinks {
+    /// Component record -> model name hash.
+    comp_model: HashMap<u32, u32>,
+    /// Part set `5ad6772f` -> its entries: (part type, component options).
+    sets: HashMap<u32, Vec<(u32, Vec<u32>)>>,
+    /// Weapon type `454c2e3b` -> part set.
+    type_set: HashMap<u32, u32>,
+    /// Weapon `bc92474a`: own part set (0 = the type's), type, mod list.
+    weapons: Vec<(u32, u32, Vec<u32>)>,
+    /// Mod `a5791c62` -> the records it lists (`c897af02`).
+    mods: HashMap<u32, Vec<u32>>,
 }
 
 /// Compact form of the libraries for other commands
@@ -389,8 +391,12 @@ pub struct Index {
     /// suffix) -> the presets its component records name, in file order.
     /// 57 of 894 models have two (a second record of the same model).
     pub weapon_models: BTreeMap<String, Vec<String>>,
-    /// Per weapon family file: its models and its finishes by part type.
-    pub weapon_families: Vec<WeaponFamily>,
+    /// Weapon model name hash (hex) -> the finishes it can take, per part
+    /// type (hex), longest list first: (variant name hash hex, preset hex)
+    /// in the order of the weapon's mod list (`link_weapons`).
+    pub model_finishes: BTreeMap<String, Vec<(String, Vec<(String, String)>)>>,
+    #[serde(skip)]
+    links: WeaponLinks,
 }
 
 pub fn path(ws: &crate::export::Workspace) -> PathBuf {
@@ -408,21 +414,25 @@ impl Index {
         }
     }
 
-    /// Weapon links of one decoded weapon family file (`Pso::to_json`).
+    /// Weapon records of one decoded weapon family file (`Pso::to_json`).
+    /// The records of a weapon are spread over several files; call
+    /// [`Index::link_weapons`] after the last one.
     pub fn add_weapon_file(&mut self, pso_json: &Value) {
         let (comp, var, model, part) = (field_name(0x72f5_e33e), field_name(0x14b0_64c2), field_name(0x873e_f899), field_name(0xc763_edb4));
-        let mut fam = WeaponFamily::default();
+        let (set, mods, list, entry_part, option) = (field_name(0x20fa_4150), field_name(0x43ab_621f), field_name(0xc897_af02), field_name(0x5cce_ffc2), field_name(0xcac8_083d));
+        let u = |v: &Value| v.as_u64().unwrap_or(0) as u32;
+        let us = |v: &Value| v.as_array().into_iter().flatten().map(u).collect::<Vec<u32>>();
         for (st, objs) in pso_json["objects"].as_object().into_iter().flatten() {
             let st = st.get(st.len().saturating_sub(8)..);
             for o in objs.as_array().into_iter().flatten() {
                 let (Some(n), preset) = (o["Name"].as_u64(), |f: &str| o[f].as_u64().filter(|&p| p != 0).map(|p| format!("{p:08x}"))) else { continue };
                 match st {
                     Some("85492dc3") => {
+                        if let Some(m) = o[&model].as_u64().filter(|&m| m != 0) {
+                            self.links.comp_model.insert(n as u32, m as u32);
+                        }
                         let Some(p) = preset(&comp) else { continue };
                         if let Some(m) = o[&model].as_u64().filter(|&m| m != 0) {
-                            if !fam.models.contains(&format!("{m:08x}")) {
-                                fam.models.push(format!("{m:08x}"));
-                            }
                             let v = self.weapon_models.entry(format!("{m:08x}")).or_default();
                             if !v.contains(&p) {
                                 v.push(p.clone());
@@ -432,33 +442,73 @@ impl Index {
                     }
                     Some("6724161c") => {
                         if let Some(p) = preset(&var) {
-                            let slot = format!("{:08x}", o[&part].as_u64().unwrap_or(0));
-                            fam.finishes.entry(slot.clone()).or_default().push((format!("{n:08x}"), p.clone()));
-                            self.weapon_variants.insert(format!("{n:08x}"), (slot, p));
+                            self.weapon_variants.insert(format!("{n:08x}"), (format!("{:08x}", u(&o[&part])), p));
                         }
+                    }
+                    Some("5ad6772f") => {
+                        let entries = o["Entries"].as_array().into_iter().flatten().map(|e| (u(&e[&entry_part]), e["Options"].as_array().into_iter().flatten().map(|x| u(&x[&option])).collect())).collect();
+                        self.links.sets.insert(n as u32, entries);
+                    }
+                    Some("454c2e3b") => {
+                        self.links.type_set.insert(n as u32, u(&o[&set]));
+                    }
+                    Some("bc92474a") => self.links.weapons.push((u(&o[&set]), u(&o["WeaponType"]), us(&o[&mods]))),
+                    Some("a5791c62") => {
+                        self.links.mods.insert(n as u32, us(&o[&list]));
                     }
                     _ => {}
                 }
             }
         }
-        if !fam.models.is_empty() && !fam.finishes.is_empty() {
-            self.weapon_families.push(fam);
-        }
     }
 
-    /// Add the weapon links of every weapon family file of packs.rpf
-    /// (PSO files holding struct `85492dc3`), when packs.rpf is indexed.
+    /// Joins the weapon records into `model_finishes`: a weapon's part set
+    /// (its own, else its type's) lists component options per part type,
+    /// its mod list names mods, and a finish mod lists variant records, each
+    /// for one part type. A variant is offered to the models of the
+    /// components that the weapon's set lists under that part type.
+    pub fn link_weapons(&mut self) {
+        let l = std::mem::take(&mut self.links);
+        let mut out: BTreeMap<String, Vec<(String, Vec<(String, String)>)>> = BTreeMap::new();
+        for (set, ty, mods) in &l.weapons {
+            let set = if *set != 0 { *set } else { l.type_set.get(ty).copied().unwrap_or(0) };
+            let Some(entries) = l.sets.get(&set) else { continue };
+            for x in mods.iter().filter_map(|m| l.mods.get(m)).flatten() {
+                let var = format!("{x:08x}");
+                let Some((slot, preset)) = self.weapon_variants.get(&var) else { continue };
+                for model in entries.iter().filter(|e| format!("{:08x}", e.0) == *slot).flat_map(|e| &e.1).filter_map(|c| l.comp_model.get(c)) {
+                    let slots = out.entry(format!("{model:08x}")).or_default();
+                    let i = slots.iter().position(|s| s.0 == *slot).unwrap_or_else(|| {
+                        slots.push((slot.clone(), Vec::new()));
+                        slots.len() - 1
+                    });
+                    if !slots[i].1.iter().any(|f| f.0 == var) {
+                        slots[i].1.push((var.clone(), preset.clone()));
+                    }
+                }
+            }
+        }
+        for slots in out.values_mut() {
+            slots.sort_by_key(|s| std::cmp::Reverse(s.1.len()));
+        }
+        self.model_finishes = out;
+    }
+
+    /// Reads the weapon family files of packs.rpf (PSO files with weapon,
+    /// part set, component, mod or variant records) when that archive is
+    /// indexed.
     pub fn add_weapon_files(&mut self, ws: &crate::export::Workspace) {
         let Some((pa, pix)) = ws.resolve("packs").ok().and_then(|pa| Some((ws.load_index(&pa).ok()?, pa))).map(|(i, a)| (a, i)) else { return };
-        let tag = 0x8549_2dc3u32.to_le_bytes();
+        let tags = [0x8549_2dc3u32, 0x6724_161c, 0x5ad6_772f, 0x454c_2e3b, 0xbc92_474a, 0xa579_1c62].map(u32::to_le_bytes);
         for e in pix.entries.iter().filter(|e| e.kind == crate::classify::Kind::Pso) {
             let Ok(b) = crate::scan::read_entry(&pa.path, e) else { continue };
-            if b.windows(4).any(|w| w == tag) {
+            if b.windows(4).any(|w| tags.iter().any(|t| w == t)) {
                 if let Some(p) = crate::pso::parse(&b) {
                     self.add_weapon_file(&p.to_json());
                 }
             }
         }
+        self.link_weapons();
     }
 
     /// The index, read from the work directory, or built from the data.rpf
@@ -503,35 +553,17 @@ impl Index {
         self.weapon_models.get(&format!("{:08x}", crate::meta7a::joaat(base))).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    /// The finishes a weapon model can take: its family's variants for the
-    /// model's part type, as (part type hex, [(variant hex, preset hex)]).
-    /// The part type is a word of the model name (`w_pi_duke_01_slide_02`
-    /// -> `slide`), the longest that the family has finishes for; a word's
-    /// own name wins over its alias (`…_mag_01` -> `magazine`,
-    /// `…_sight_f_01` -> `sight_front`).
+    /// The finishes a weapon model can take, as (part type hex, [(variant
+    /// hex, preset hex)]): the variants that the finish mods of a weapon
+    /// list for the part type its part set gives the model's component
+    /// (`link_weapons`). A model under several part types (27 of 621) gets
+    /// its longest list. No finish mod is a weapon's default mod, so
+    /// without one a part shows its component's own preset.
     pub fn weapon_finishes(&self, model: &str) -> Option<(&str, &[(String, String)])> {
         let m = model.to_ascii_lowercase();
         let base = ["_hi", "_mid"].iter().find_map(|s| m.strip_suffix(s)).unwrap_or(&m);
-        let key = format!("{:08x}", crate::meta7a::joaat(base));
-        let fam = self.weapon_families.iter().find(|f| f.models.contains(&key))?;
-        let words: Vec<&str> = base.split('_').collect();
-        // (own name before alias, then length) -> slot and its finishes
-        let mut best: Option<((bool, usize), &str, &[(String, String)])> = None;
-        for i in 0..words.len() {
-            for k in i + 1..=words.len() {
-                let w = words[i..k].join("_");
-                let alias = PART_ALIASES.iter().find(|a| a.0 == w).map(|a| a.1);
-                for (own, name) in [(true, Some(w.as_str())), (false, alias)] {
-                    let Some(name) = name else { continue };
-                    if let Some((slot, v)) = fam.finishes.get_key_value(&format!("{:08x}", crate::meta7a::joaat(name))) {
-                        if best.is_none_or(|b| (own, w.len()) > b.0) {
-                            best = Some(((own, w.len()), slot.as_str(), v.as_slice()));
-                        }
-                    }
-                }
-            }
-        }
-        best.map(|b| (b.1, b.2))
+        let slots = self.model_finishes.get(&format!("{:08x}", crate::meta7a::joaat(base)))?;
+        slots.first().map(|s| (s.0.as_str(), s.1.as_slice()))
     }
 
     /// Metalness and roughness per sub-material of a preset.
@@ -646,35 +678,41 @@ mod tests {
         assert_eq!(ix.weapon_variants["d0b1bd2a"].0, format!("{:08x}", crate::meta7a::joaat("frame")));
         assert_eq!(ix.weapon_presets("W_AR_ADB_01_barrel_01_hi"), ["d9f0240d".to_string(), "00000011".to_string()]);
         assert!(ix.weapon_presets("w_ar_adb_01").is_empty());
-        // the family's finishes for a model's part type
+        // finishes: weapon -> part set (own, else its type's) -> component -> model; weapon -> mods -> variants of a part type
         let jj = crate::meta7a::joaat;
-        let fam = json!({"objects": {
-            "9a16508d85492dc3": [{"Name": 1, field_name(0x72f5_e33e): 0x10u32, field_name(0x873e_f899): jj("w_pi_duke_01_slide_02")}, {"Name": 2, field_name(0x72f5_e33e): 0x11u32, field_name(0x873e_f899): jj("w_pi_duke_01_sight_f_01")}],
-            "eafa47ee6724161c": [
+        let (set, mods, list, epart, opt) = (field_name(0x20fa_4150), field_name(0x43ab_621f), field_name(0xc897_af02), field_name(0x5cce_ffc2), field_name(0xcac8_083d));
+        let entry = |part: &str, comps: &[u32]| json!({&epart: jj(part), "Options": comps.iter().map(|c| json!({&opt: c})).collect::<Vec<_>>()});
+        let a = json!({"objects": {
+            "9a16508d85492dc3": [{"Name": 1, field_name(0x72f5_e33e): 0x10u32, field_name(0x873e_f899): jj("w_pi_duke_01_slide_02")}, {"Name": 2, field_name(0x873e_f899): jj("w_pi_duke_01_mag_01")},
+                {"Name": 3, field_name(0x72f5_e33e): 0x10u32, field_name(0x873e_f899): jj("w_pi_other_01_slide_01")}],
+            "c74572e55ad6772f": [{"Name": 0x51u32, "Entries": [entry("slide", &[1]), entry("magazine", &[2]), entry("frame", &[2])]}, {"Name": 0x52u32, "Entries": [entry("slide", &[3])]}],
+            "000000006724161c": [
                 {"Name": 0xa1u32, field_name(0x14b0_64c2): 0x20u32, field_name(0xc763_edb4): jj("slide")},
                 {"Name": 0xa2u32, field_name(0x14b0_64c2): 0x21u32, field_name(0xc763_edb4): jj("slide")},
-                {"Name": 0xa3u32, field_name(0x14b0_64c2): 0x22u32, field_name(0xc763_edb4): jj("sight")},
-                {"Name": 0xa4u32, field_name(0x14b0_64c2): 0x23u32, field_name(0xc763_edb4): jj("sight_f")}],
+                {"Name": 0xa3u32, field_name(0x14b0_64c2): 0x22u32, field_name(0xc763_edb4): jj("magazine")},
+                {"Name": 0xa4u32, field_name(0x14b0_64c2): 0x23u32, field_name(0xc763_edb4): jj("frame")},
+                {"Name": 0xa5u32, field_name(0x14b0_64c2): 0x24u32, field_name(0xc763_edb4): jj("frame")},
+                {"Name": 0xa6u32, field_name(0x14b0_64c2): 0x25u32, field_name(0xc763_edb4): jj("barrel")}],
         }});
-        ix.add_weapon_file(&fam);
+        // the weapon, its type and its mods sit in another file
+        let b = json!({"objects": {
+            "00000000454c2e3b": [{"Name": 0x71u32, &set: 0x51u32}],
+            "00000000bc92474a": [{"Name": 0x81u32, &set: 0, "WeaponType": 0x71u32, &mods: [0x91u32, 0x92u32, 0x93u32, 0x99u32]}, {"Name": 0x82u32, &set: 0x52u32, "WeaponType": 0x71u32, &mods: [0x94u32]}],
+            "00000000a5791c62": [{"Name": 0x91u32, &list: [0xa2u32]}, {"Name": 0x92u32, &list: [0xa1u32, 0xa3u32]}, {"Name": 0x93u32, &list: [0xa4u32, 0xa5u32, 0xa6u32, 0xa2u32]}, {"Name": 0x94u32, &list: []}],
+        }});
+        ix.add_weapon_file(&a);
+        ix.add_weapon_file(&b);
+        ix.link_weapons();
+        // in the order of the weapon's mod list, each variant once
         let (slot, f) = ix.weapon_finishes("w_pi_duke_01_slide_02_hi").unwrap();
-        assert_eq!((slot, f.len(), f[1].1.as_str()), (format!("{:08x}", jj("slide")).as_str(), 2, "00000021"));
-        assert_eq!(ix.weapon_finishes("w_pi_duke_01_sight_f_01").unwrap().1[0].1, "00000023");
+        assert_eq!((slot, f.iter().map(|f| f.1.as_str()).collect::<Vec<_>>()), (format!("{:08x}", jj("slide")).as_str(), vec!["00000021", "00000020"]));
+        // a model under two part types gets the longer list; the model's own name plays no part
+        let (slot, f) = ix.weapon_finishes("w_pi_duke_01_mag_01").unwrap();
+        assert_eq!((slot, f.len()), (format!("{:08x}", jj("frame")).as_str(), 2));
+        assert_eq!(ix.model_finishes[&format!("{:08x}", jj("w_pi_duke_01_mag_01"))][1].1[0].1, "00000022");
+        // a weapon whose mods list no finish offers none; a part type no entry has is dropped
+        assert!(ix.weapon_finishes("w_pi_other_01_slide_01").is_none());
         assert!(ix.weapon_finishes("w_ar_adb_01_barrel_01").is_none());
-        // model words that differ from the part type: mag -> magazine, sight_f -> sight_front; an own name wins over an alias
-        let fam2 = json!({"objects": {
-            "9a16508d85492dc3": [{"Name": 3, field_name(0x72f5_e33e): 0x10u32, field_name(0x873e_f899): jj("w_sg_kozlov_01_mag_01")}, {"Name": 4, field_name(0x72f5_e33e): 0x10u32, field_name(0x873e_f899): jj("w_sg_kozlov_01_sight_f_02")},
-                {"Name": 5, field_name(0x72f5_e33e): 0x10u32, field_name(0x873e_f899): jj("w_sg_kozlov_01_handguard_01")}],
-            "eafa47ee6724161c": [
-                {"Name": 0xb1u32, field_name(0x14b0_64c2): 0x30u32, field_name(0xc763_edb4): jj("magazine")},
-                {"Name": 0xb2u32, field_name(0x14b0_64c2): 0x31u32, field_name(0xc763_edb4): jj("sight_front")},
-                {"Name": 0xb3u32, field_name(0x14b0_64c2): 0x32u32, field_name(0xc763_edb4): jj("hguard")},
-                {"Name": 0xb4u32, field_name(0x14b0_64c2): 0x33u32, field_name(0xc763_edb4): jj("handguard")}],
-        }});
-        ix.add_weapon_file(&fam2);
-        assert_eq!(ix.weapon_finishes("w_sg_kozlov_01_mag_01").unwrap().1[0].1, "00000030");
-        assert_eq!(ix.weapon_finishes("w_sg_kozlov_01_sight_f_02_hi").unwrap().1[0].1, "00000031");
-        assert_eq!(ix.weapon_finishes("w_sg_kozlov_01_handguard_01").unwrap().1[0].1, "00000033");
         assert_eq!((part_type_name(&format!("{:08x}", jj("sight_rear"))), part_type_name("12345678")), (Some("sight_rear"), None));
     }
 }
