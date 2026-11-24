@@ -1451,6 +1451,47 @@ impl ModelView {
                     ui.end_row();
                 }
             });
+        // weapon finishes: the family's variant presets per part type
+        let mut finish: Vec<(String, Option<String>)> = Vec::new();
+        let mut finish_changed = false;
+        if let Some(fs) = l.info["weapon_finishes"].as_array().filter(|a| !a.is_empty()) {
+            ui.label(egui::RichText::new("Finishes (the family's colour variants of a part type; names are not recovered, the squares show the colours)").weak());
+            let squares = |ui: &mut egui::Ui, o: &serde_json::Value| {
+                for c in o["colours"].as_array().into_iter().flatten().filter_map(|c| u32::from_str_radix(c.as_str()?, 16).ok()) {
+                    ui.label(egui::RichText::new("\u{25a0}").color(egui::Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)));
+                }
+            };
+            egui::Grid::new("finish_grid").num_columns(2).striped(true).show(ui, |ui| {
+                for f in fs {
+                    let slot = f["slot"].as_str().unwrap_or("").to_string();
+                    let mut cur = f["selected"].as_str().map(str::to_string);
+                    ui.label(f["group"].as_str().filter(|g| !g.is_empty()).unwrap_or(&slot));
+                    let text = match &cur {
+                        Some(p) => format!("variant {}", f["options"].as_array().into_iter().flatten().find(|o| o["preset"] == p.as_str()).and_then(|o| o["variant"].as_str()).unwrap_or(p)),
+                        None => "default".to_string(),
+                    };
+                    egui::ComboBox::from_id_salt(("finish", slot.as_str())).selected_text(text).width(240.0).show_ui(ui, |ui| {
+                        if ui.selectable_label(cur.is_none(), "default").clicked() && cur.is_some() {
+                            cur = None;
+                            finish_changed = true;
+                        }
+                        for o in f["options"].as_array().into_iter().flatten() {
+                            let pr = o["preset"].as_str().unwrap_or("");
+                            let on = cur.as_deref() == Some(pr);
+                            ui.horizontal(|ui| {
+                                squares(ui, o);
+                                if ui.selectable_label(on, format!("variant {}", o["variant"].as_str().unwrap_or(""))).on_hover_text(format!("preset {pr}")).clicked() && !on {
+                                    cur = Some(pr.to_string());
+                                    finish_changed = true;
+                                }
+                            });
+                        }
+                    });
+                    ui.end_row();
+                    finish.push((slot, cur));
+                }
+            });
+        }
         // named sets that span several groups (`08 collarharness`: body + harness)
         let mut sets: Vec<&str> = l
             .parts
@@ -1495,10 +1536,19 @@ impl ModelView {
             }
         });
         ui.separator();
-        changed.then(|| {
+        (changed || finish_changed).then(|| {
+            // a changed finish replaces the query's `#finish=` list
+            let mut base = l.base.clone();
+            if finish_changed {
+                base = base.split("#finish=").next().unwrap_or(&base).to_string();
+                let f: Vec<String> = finish.iter().filter_map(|(s, p)| Some(format!("{s}:{}", p.as_ref()?))).collect();
+                if !f.is_empty() {
+                    base = format!("{base}#finish={}", f.join(","));
+                }
+            }
             format!(
                 "{}#parts={}",
-                l.base,
+                base,
                 sel.iter()
                     .map(|o| format!("{o:x}"))
                     .collect::<Vec<_>>()
@@ -3923,8 +3973,8 @@ fn material_presets(ws: &Workspace) -> Option<&'static sixng_core::matlib::Index
 /// colour, the sub-material of a texel from the material's `materialid`
 /// texture, else of a vertex from the green byte of its raw colour stream
 /// (as a vertex tint). Returns the preset used when anything was coloured.
-fn colour_weapon(m: &mut glb::Model, name: &str, presets: &sixng_core::matlib::Index, cache: &Path) -> Option<String> {
-    let preset = presets.weapon_presets(name).first()?.clone();
+fn colour_weapon(m: &mut glb::Model, name: &str, presets: &sixng_core::matlib::Index, cache: &Path, finish: Option<&str>) -> Option<String> {
+    let preset = finish.map(str::to_string).or_else(|| presets.weapon_presets(name).first().cloned())?;
     let subs: Vec<Option<[u8; 3]>> = presets.colours(&preset)?.iter().map(|c| c.map(|c| [c[0], c[1], c[2]])).collect();
     let first = subs.iter().flatten().next().copied()?;
     let want = format!("{:08x}", sixng_core::meta7a::joaat("materialid"));
@@ -4776,6 +4826,15 @@ fn pick<'a>(
     (chosen, parts)
 }
 
+/// `"<query>#finish=<part type>:<preset>,…"` (hex pairs) → the query and the
+/// chosen weapon finishes by part type.
+fn split_finish(q: &str) -> (&str, HashMap<String, String>) {
+    match q.split_once("#finish=") {
+        Some((b, l)) => (b.trim(), l.split(',').filter_map(|x| x.trim().split_once(':')).map(|(a, b)| (a.to_string(), b.to_string())).collect()),
+        None => (q, HashMap::new()),
+    }
+}
+
 fn load_query_sel(
     ws: &Workspace,
     cache: &Path,
@@ -4784,6 +4843,7 @@ fn load_query_sel(
     lod: usize,
     idx: &Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>,
 ) -> anyhow::Result<Loaded> {
+    let (q, finish) = split_finish(q);
     if q.to_lowercase().ends_with(".glb") {
         let p = PathBuf::from(q);
         let dir = p.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -5072,11 +5132,27 @@ fn load_query_sel(
             let mut errs = Vec::new();
             let presets = material_presets(ws);
             let mut coloured = Vec::new();
+            // the finishes the weapon's family offers for each shown part's type
+            let mut finishes: Vec<serde_json::Value> = Vec::new();
             for p in &parts {
                 let pn = p.name.clone().unwrap_or_default();
                 match export_load(&a, p, cache, level) {
                     Ok((mut m, _, pi)) => {
-                        if let Some(pr) = presets.and_then(|ix| colour_weapon(&mut m, &pn, ix, cache)) {
+                        let offered = presets.and_then(|ix| Some((ix, ix.weapon_finishes(&pn)?)));
+                        let chosen = offered.and_then(|(_, (slot, list))| finish.get(slot).filter(|pr| list.iter().any(|v| &v.1 == *pr)).map(String::as_str));
+                        if let Some((ix, (slot, list))) = offered {
+                            if !finishes.iter().any(|f| f["slot"] == slot) {
+                                let swatch = |pr: &str| -> Vec<String> {
+                                    let mut c: Vec<String> = ix.colours(pr).into_iter().flatten().flatten().map(|c| format!("{:02x}{:02x}{:02x}", c[0], c[1], c[2])).collect();
+                                    c.dedup();
+                                    c.truncate(3);
+                                    c
+                                };
+                                finishes.push(serde_json::json!({"slot": slot, "group": sixng_core::weapon::part_slot(name, &pn).unwrap_or_default(), "part": pn, "selected": chosen,
+                                    "options": list.iter().map(|(v, pr)| serde_json::json!({"variant": v, "preset": pr, "colours": swatch(pr)})).collect::<Vec<_>>()}));
+                            }
+                        }
+                        if let Some(pr) = presets.and_then(|ix| colour_weapon(&mut m, &pn, ix, cache, chosen)) {
                             coloured.push(format!("{pn}={pr}"));
                         }
                         got.push((sixng_core::weapon::part_slot(name, &pn).unwrap_or_default(), bones(&pi), m, pn))
@@ -5109,6 +5185,10 @@ fn load_query_sel(
             if let Some(o) = info.as_object_mut() {
                 o.insert("assembled_from".into(), serde_json::json!(names));
                 o.insert("parts_without_mount".into(), serde_json::json!(loose));
+                if !finishes.is_empty() {
+                    o.insert("weapon_finishes".into(), serde_json::json!(finishes));
+                    o.insert("weapon_finishes_note".into(), "finishes are the weapon family's variant presets for a part type (frame, slide, grip, barrel …); which one the game gives a weapon is not decoded, so the part's own preset is the default. Variant names are not recovered.".into());
+                }
                 if !coloured.is_empty() {
                     o.insert("weapon_presets".into(), serde_json::json!(coloured));
                     o.insert("weapon_colour_note".into(), "weapon parts take the base colours of their layered-material preset (weapon library of data.rpf), one per sub-material, picked by the part's materialid texture or, without one, per vertex (green byte of the colour stream / 4). The tile texture, the gradient and the tint-mask, dirt and wear layers are not applied.".into());
