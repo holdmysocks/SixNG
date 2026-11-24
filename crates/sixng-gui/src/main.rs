@@ -1709,6 +1709,8 @@ impl App {
         m.decal_bias = !c.has("no-decal-bias");
         m.wheel_spin = c.f("spin").unwrap_or(0.0);
         m.door_open = c.f("door").unwrap_or(0.0);
+        // --panels-off door_dside_f,window_lf_mover,boot: panels left shut
+        m.panels_off = c.get("panels-off").map(|s| s.split(',').map(|n| n.trim().to_ascii_lowercase()).filter(|n| !n.is_empty()).collect()).unwrap_or_default();
         m.roof_down = c.has("roof-down");
         m.roof_fold = c.f("roof").unwrap_or(0.0);
         m.clip_pos_all = c.f("clips").unwrap_or(0.0);

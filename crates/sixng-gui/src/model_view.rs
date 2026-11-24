@@ -407,6 +407,10 @@ pub struct ModelView {
     /// door is 3, with its whole travel in the bone's own space in place of
     /// the axis.
     hinges: HashMap<usize, (u8, Vec3, f32)>,
+    /// Doors, side windows, bonnet and boot left shut whatever their slider
+    /// says (the tick boxes under the sliders), by bone name in lower case.
+    /// Kept from one vehicle to the next.
+    pub panels_off: std::collections::HashSet<String>,
     /// What the configuration's parts without a model change on the wheels:
     /// [out from the centre line, tyre width], each per axle (front, rear).
     wheel_fit_cfg: [[f32; 2]; 2],
@@ -720,6 +724,7 @@ impl ModelView {
             bonnet_open: 0.0,
             boot_open: 0.0,
             hinges: HashMap::new(),
+            panels_off: Default::default(),
             wheel_fit_cfg: [[0.0; 2]; 2],
             fit_parts_once: None,
             aims: Vec::new(),
@@ -2876,7 +2881,7 @@ impl ModelView {
         let swing: HashMap<usize, Mat4> = self
             .hinges
             .iter()
-            .filter(|(_, h)| open[h.0 as usize] != 0.0)
+            .filter(|(i, h)| open[h.0 as usize] != 0.0 && !self.panel_off(&l.model.joints[**i].name))
             .map(|(i, h)| (*i, if h.0 == 3 { Mat4::from_translation(h.1 * open[3]) } else { Mat4::from_quat(Quat::from_axis_angle(h.1, h.2 * open[h.0 as usize])) }))
             .collect();
         // steering: the wheel_turn bones turn about the vertical, the
@@ -2884,7 +2889,7 @@ impl ModelView {
         let mut swing = swing;
         // side windows: each mover slides its glass down into the door
         if self.windows_down > 0.0 {
-            for (i, d, p) in &self.window_movers {
+            for (i, d, p) in self.window_movers.iter().filter(|w| !self.panel_off(&l.model.joints[w.0].name)) {
                 // The glass is drawn down to its bottom edge instead of
                 // being moved: x' = x - t d (d . (x - p)). A straight slide
                 // along the glass's plane would leave the door (the glass
@@ -3676,9 +3681,13 @@ impl ModelView {
                 }
                 if caps.doors {
                     ui.add(egui::Slider::new(&mut self.door_open, 0.0..=1.3).text("doors open"));
+                    let doors: Vec<usize> = self.hinges.iter().filter(|(_, h)| matches!(h.0, 0 | 3)).map(|(i, _)| *i).collect();
+                    self.panel_boxes(ui, doors);
                 }
                 if self.hinges.values().any(|h| h.0 == 1) {
                     ui.add(egui::Slider::new(&mut self.bonnet_open, 0.0..=1.1).text("bonnet open"));
+                    let bonnet: Vec<usize> = self.hinges.iter().filter(|(_, h)| h.0 == 1).map(|(i, _)| *i).collect();
+                    self.panel_boxes(ui, bonnet);
                 }
                 if let Some(l) = self.loaded.as_ref().filter(|l| l.model.joints.iter().any(|j| is_steer_bone(&j.name))) {
                     let _ = l;
@@ -3723,6 +3732,8 @@ impl ModelView {
                 }
                 if !self.window_movers.is_empty() {
                     ui.add(egui::Slider::new(&mut self.windows_down, 0.0..=1.0).text("windows down")).on_hover_text("Lowers each side window by its mover bone (window_lf_mover ...): the glass is drawn down to its bottom edge, so its top edge drops to the sill. The bones are the game's; the path the game moves the glass along inside the door is not read from the files, so the glass is shortened instead of slid.");
+                    let windows: Vec<usize> = self.window_movers.iter().map(|w| w.0).collect();
+                    self.panel_boxes(ui, windows);
                 }
                 if !self.brakes.is_empty() {
                     ui.add(egui::Slider::new(&mut self.brake_heat, 0.0..=1.0).text("brake glow")).on_hover_text("Makes the brake discs glow as if hot, from dull red to orange. A viewer effect on the fitted disc models: how the game heats and lights its discs is not read from the files.");
@@ -3781,6 +3792,8 @@ impl ModelView {
                 }
                 if self.hinges.values().any(|h| h.0 == 2) {
                     ui.add(egui::Slider::new(&mut self.boot_open, 0.0..=1.1).text("boot open"));
+                    let boot: Vec<usize> = self.hinges.iter().filter(|(_, h)| h.0 == 2).map(|(i, _)| *i).collect();
+                    self.panel_boxes(ui, boot);
                 }
                 for (a, p) in self.clips.iter().zip(self.clip_pos.iter_mut()) {
                     let n = a.name.rsplit('/').next().unwrap_or(&a.name).trim_end_matches("_anim").replace('_', " ");
@@ -5862,6 +5875,62 @@ fn load_query_sel(
         fur_skin: Default::default(),
             look: None,
     })
+}
+
+impl ModelView {
+    /// Whether the panel on this bone is to stay shut (its box is unticked).
+    fn panel_off(&self, bone: &str) -> bool {
+        !self.panels_off.is_empty() && self.panels_off.contains(&bone.to_ascii_lowercase())
+    }
+
+    /// A row of tick boxes, one per panel bone: an unticked panel stays shut
+    /// while its slider moves the others.
+    fn panel_boxes(&mut self, ui: &mut egui::Ui, joints: Vec<usize>) {
+        let Some(l) = self.loaded.as_ref() else { return };
+        let mut names: Vec<String> = joints.iter().filter_map(|i| l.model.joints.get(*i)).map(|j| j.name.to_ascii_lowercase()).collect();
+        names.sort();
+        ui.horizontal_wrapped(|ui| {
+            for n in names {
+                let mut on = !self.panels_off.contains(&n);
+                if ui.checkbox(&mut on, panel_label(&n)).on_hover_text(format!("Unticked, this one stays shut while the slider moves the others ({n}).")).changed() {
+                    if on {
+                        self.panels_off.remove(&n);
+                    } else {
+                        self.panels_off.insert(n);
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// What a panel's tick box says, from its bone name: `door_dside_f` is the
+/// driver's front door, `window_lr_mover` the left rear window.
+fn panel_label(name: &str) -> String {
+    let n = name.to_ascii_lowercase();
+    let end = |c: &str| match c {
+        "f" => "front",
+        "r" => "rear",
+        "m" => "middle",
+        _ => "",
+    };
+    if let Some(r) = n.strip_prefix("door_") {
+        let (side, at) = r.split_once('_').unwrap_or((r, ""));
+        let side = match side {
+            "dside" => "driver",
+            "pside" => "passenger",
+            o => o,
+        };
+        return format!("{side} {}", end(at)).trim().to_string();
+    }
+    if let Some(r) = n.strip_prefix("window_").map(|r| r.trim_end_matches("_mover")) {
+        if r.len() == 2 {
+            let side = if r.starts_with('l') { "left" } else { "right" };
+            return format!("{side} {}", end(&r[1..])).trim().to_string();
+        }
+        return r.to_string();
+    }
+    n
 }
 
 /// The hinged panels of a vehicle: door, bonnet and boot bones, with the
