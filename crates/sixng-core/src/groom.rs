@@ -737,7 +737,11 @@ pub fn load(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], off: u64) 
 pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], only: &[u64], out: &std::path::Path, roots: bool, ribbons: Option<f32>, full: Option<f32>, progress: crate::export::Progress) -> Result<(usize, usize)> {
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    let cat = catalog(a, all)?;
+    // the cached list when there is a work folder (reading it anew takes minutes)
+    let cat = match crate::names::work_dir() {
+        Some(w) => catalog_cached(&w, a, all)?,
+        None => catalog(a, all)?,
+    };
     let sel: Vec<&GroomInfo> = cat.iter().filter(|g| only.is_empty() || only.contains(&g.off)).collect();
     let by_off: std::collections::HashMap<u64, &crate::scan::Entry> = all.iter().map(|e| (e.off, e)).collect();
     let dir = out.join("grooms").join(a.id.trim_end_matches(".rpf"));
