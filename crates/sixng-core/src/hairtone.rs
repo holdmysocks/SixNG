@@ -278,6 +278,50 @@ impl ParamRamp {
     }
 }
 
+/// A colour ramp of the game's hair ramp files: four colour stops and one
+/// curve. The game bakes 16 texels of its colour atlas from it per strand
+/// variant (the bake is read from the game's code by the shader archive
+/// work): v = curve(t); the stops, raised to 2.4, are mixed as a four-stop
+/// gradient over v; the result goes back by 1 / 2.4.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColourRamp {
+    /// The four stops, 0..1 per channel as stored.
+    pub stops: [[f32; 3]; 4],
+    pub curve: [f32; 20],
+}
+
+impl ColourRamp {
+    /// The atlas colour at `t` along the strand (0 root, 1 tip).
+    pub fn at(&self, t: f32) -> [f32; 3] {
+        let v = curve(&self.curve, t).clamp(0.0, 1.0);
+        let w = [(3.0 * v).clamp(0.0, 1.0), (3.0 * v - 1.0).clamp(0.0, 1.0), (3.0 * v - 2.0).clamp(0.0, 1.0)];
+        [0, 1, 2].map(|c| {
+            let g = |i: usize| self.stops[i][c].max(0.0).powf(2.4);
+            let x = g(0) + (g(1) - g(0)) * w[0];
+            let x = x + (g(2) - x) * w[1];
+            let x = x + (g(3) - x) * w[2];
+            x.powf(1.0 / 2.4)
+        })
+    }
+
+    /// One record of a parsed colour ramp file as JSON: `colours` (four
+    /// RGB triples, 0..1) and `curve` (ten (x, y) pairs).
+    pub fn from_json(v: &Value) -> Option<ColourRamp> {
+        let mut stops = [[0.0f32; 3]; 4];
+        for (i, c) in v["colours"].as_array()?.iter().take(4).enumerate() {
+            for (j, x) in c.as_array()?.iter().take(3).enumerate() {
+                stops[i][j] = x.as_f64()? as f32;
+            }
+        }
+        let mut curve = [1.0f32; 20];
+        for (i, p) in v["curve"].as_array()?.iter().take(10).enumerate() {
+            curve[2 * i] = p[0].as_f64()? as f32;
+            curve[2 * i + 1] = p[1].as_f64()? as f32;
+        }
+        Some(ColourRamp { stops, curve })
+    }
+}
+
 /// A value in 0..1 for strand `i`, for presets that name no noise texture.
 pub fn scatter(i: usize) -> f32 {
     let mut x = (i as u32).wrapping_mul(0x9e37_79b9) ^ 0x85eb_ca6b;
@@ -320,6 +364,21 @@ mod tests {
         assert!((p.values[TILING] - 8.283).abs() < 1e-4 && p.values.len() == 3);
         let q = t.get(7).unwrap();
         assert_eq!((q.a, q.texture, q.flag), ([255; 3], 0, true));
+    }
+
+    #[test]
+    fn a_colour_ramp_runs_through_its_four_stops() {
+        // a medium brown of the game's ramp file: straight curve
+        let v = serde_json::json!({"colours": [[0.149, 0.137, 0.125], [0.259, 0.2, 0.153], [0.478, 0.396, 0.341], [0.443, 0.384, 0.341]],
+            "curve": [[0.0, 0.0], [0.5, 0.5], [0.5, 0.5], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]]});
+        let r = ColourRamp::from_json(&v).unwrap();
+        let near = |a: [f32; 3], b: [f32; 3]| (0..3).all(|i| (a[i] - b[i]).abs() < 2e-3);
+        // the stops sit at v = 0, 1/3, 2/3 and 1
+        assert!(near(r.at(0.0), r.stops[0]) && near(r.at(1.0), r.stops[3]), "{:?} {:?}", r.at(0.0), r.at(1.0));
+        assert!(near(r.at(1.0 / 3.0), r.stops[1]) && near(r.at(2.0 / 3.0), r.stops[2]));
+        // between two stops: between their values, mixed in the 2.4 space (above the plain mean of the lower pair is not required, only inside)
+        let m = r.at(0.5);
+        assert!(m[0] > r.stops[1][0] && m[0] < r.stops[2][0]);
     }
 
     #[test]

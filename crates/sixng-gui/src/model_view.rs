@@ -1037,6 +1037,17 @@ impl ModelView {
         let (hat, under_hat) = (self.hair.hat.clone(), self.hair.under_hat.clone());
         let rig = self.hair.rig.clone();
         let tones = if self.hair.stored_colours { self.hair.tones.clone() } else { HashMap::new() };
+        // research: SIXNG_HAIR_COLOUR=<parsed colour ramps json>#<parsed colour sets json>#<set name> gives the
+        // strands of a character's hair the four colour ramps of that set (one per strand variant)
+        let colour_set: Option<Vec<sixng_core::hairtone::ColourRamp>> = std::env::var("SIXNG_HAIR_COLOUR").ok().and_then(|s| {
+            let mut it = s.split('#');
+            let (ramps, sets, name) = (it.next()?, it.next()?, it.next()?);
+            let rj: serde_json::Value = serde_json::from_slice(&std::fs::read(ramps).ok()?).ok()?;
+            let sj: serde_json::Value = serde_json::from_slice(&std::fs::read(sets).ok()?).ok()?;
+            let names = sj[name].as_array()?;
+            let v: Vec<_> = names.iter().filter_map(|n| sixng_core::hairtone::ColourRamp::from_json(&rj[n.as_str()?])).collect();
+            (v.len() == 4).then_some(v)
+        });
         // research: SIXNG_HAIR_RAMP=<parsed ramp file json>#<record name> gives every strand that
         // parameter ramp, until the game's ramp files are read and matched to the hair shown
         let ramp: Option<sixng_core::hairtone::ParamRamp> = std::env::var("SIXNG_HAIR_RAMP").ok().and_then(|s| {
@@ -1085,6 +1096,15 @@ impl ModelView {
                         let w = (base / share.max(1e-3)).clamp(base, 0.004) * width_scale;
                         match tones.get(&off) {
                             // a character's hair: each strand's variant picks its ramp, root to tip
+                            Some(_) if colour_set.is_some() => {
+                                let cs = colour_set.as_ref().unwrap();
+                                g.coat_glb_ramped(&format!("coat_{off:x}"), &coat, w, &|s, f| {
+                                    let c = cs[(coat.variants.get(s).copied().unwrap_or(0) & 3) as usize].at(f);
+                                    // the bake stores the colour gamma-encoded (it goes back by 1 / 2.4), so the atlas texel reads as that power
+                                    let c = c.map(|x| x.max(0.0).powf(2.4));
+                                    [(c[0] * 255.0 + 0.5) as u8, (c[1] * 255.0 + 0.5) as u8, (c[2] * 255.0 + 0.5) as u8, 255]
+                                }, ramp.as_ref().map(|r| move |_: usize, f: f32| { let v = r.at(f); [v[0], v[1], v[2]] }).as_ref().map(|p| p as &dyn Fn(usize, f32) -> [f32; 3]), serde_json::json!({}))
+                            }
                             Some(t) => g.coat_glb_with(&format!("coat_{off:x}"), &coat, w, &|s, f| t.rgb(coat.variants.get(s).copied().unwrap_or(0), f), serde_json::json!({})),
                             None if ramp.is_some() => {
                                 let r = ramp.as_ref().unwrap();
