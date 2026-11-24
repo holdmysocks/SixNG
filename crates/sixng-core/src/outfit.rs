@@ -425,11 +425,93 @@ pub fn clip_channels(d: &crate::anim::ClipDictionary, c: &crate::anim::Clip, joi
     (channels, stats)
 }
 
+/// Put a clip's movement over the ground (`anim::clip_mover`) on the root
+/// joint: at every key time the root's own translation and rotation (its
+/// channels, else its rest pose) are moved and turned by the mover since
+/// the clip's start. Returns what the clip moves and turns over its
+/// length (metres, degrees about the vertical), or None when the clip has
+/// no mover tracks or the skeleton no root.
+pub fn add_mover(channels: &mut Vec<AnimChannel>, d: &crate::anim::ClipDictionary, c: &crate::anim::Clip, joints: &[Joint]) -> Option<(f32, f32)> {
+    let mover = crate::anim::clip_mover(d, c);
+    let root = joints.iter().position(|j| j.parent.is_none())?;
+    if mover.is_empty() {
+        return None;
+    }
+    fn mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+        [
+            a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+            a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+            a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+            a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+        ]
+    }
+    fn rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
+        let r = mul(mul(q, [v[0], v[1], v[2], 0.0]), [-q[0], -q[1], -q[2], q[3]]);
+        [r[0], r[1], r[2]]
+    }
+    fn sample(ch: &AnimChannel, t: f32) -> [f32; 4] {
+        let n = ch.times.len().min(ch.values.len());
+        let i = ch.times[..n].partition_point(|&x| x <= t);
+        if i == 0 {
+            return ch.values[0];
+        }
+        if i >= n {
+            return ch.values[n - 1];
+        }
+        let (a, mut b) = (ch.values[i - 1], ch.values[i]);
+        let k = ((t - ch.times[i - 1]) / (ch.times[i] - ch.times[i - 1]).max(1e-9)).clamp(0.0, 1.0);
+        if ch.path == AnimPath::Rotation && a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3] < 0.0 {
+            b = b.map(|x| -x);
+        }
+        std::array::from_fn(|c| a[c] + (b[c] - a[c]) * k)
+    }
+    // the root's rest pose: translation and rotation of its matrix (column-major, no shear)
+    let m = joints[root].pose.unwrap_or(joints[root].bind);
+    let rest_t = [m[12], m[13], m[14], 0.0];
+    let len = |c: usize| (m[c * 4] * m[c * 4] + m[c * 4 + 1] * m[c * 4 + 1] + m[c * 4 + 2] * m[c * 4 + 2]).sqrt().max(1e-9);
+    let r = |row: usize, col: usize| m[col * 4 + row] / len(col);
+    let w = (1.0 + r(0, 0) + r(1, 1) + r(2, 2)).max(0.0).sqrt() / 2.0;
+    let rest_q = if w > 1e-4 {
+        [(r(2, 1) - r(1, 2)) / (4.0 * w), (r(0, 2) - r(2, 0)) / (4.0 * w), (r(1, 0) - r(0, 1)) / (4.0 * w), w]
+    } else {
+        // a half turn: the axis is the column of largest diagonal
+        let x = ((1.0 + r(0, 0)) / 2.0).max(0.0).sqrt();
+        let y = ((1.0 + r(1, 1)) / 2.0).max(0.0).sqrt();
+        let z = ((1.0 + r(2, 2)) / 2.0).max(0.0).sqrt();
+        if x >= y && x >= z {
+            [x, r(1, 0) / (2.0 * x), r(2, 0) / (2.0 * x), 0.0]
+        } else if y >= z {
+            [r(1, 0) / (2.0 * y), y, r(2, 1) / (2.0 * y), 0.0]
+        } else {
+            [r(2, 0) / (2.0 * z), r(2, 1) / (2.0 * z), z, 0.0]
+        }
+    };
+    let take = |channels: &mut Vec<AnimChannel>, path: AnimPath| channels.iter().position(|ch| ch.joint == root && ch.path == path && !ch.times.is_empty()).map(|i| channels.remove(i));
+    let (own_t, own_r) = (take(channels, AnimPath::Translation), take(channels, AnimPath::Rotation));
+    let mut times: Vec<f32> = mover.iter().flat_map(|m| m.times.iter().copied()).chain(own_t.iter().chain(own_r.iter()).flat_map(|ch| ch.times.iter().copied())).collect();
+    times.sort_by(f32::total_cmp);
+    times.dedup_by(|a, b| (*a - *b).abs() < 1e-5);
+    let (mut tv, mut rv) = (Vec::with_capacity(times.len()), Vec::with_capacity(times.len()));
+    for &t in &times {
+        let (p, q) = crate::anim::mover_at(&mover, t);
+        let t0 = own_t.as_ref().map_or(rest_t, |ch| sample(ch, t));
+        let r0 = own_r.as_ref().map_or(rest_q, |ch| sample(ch, t));
+        let l = r0.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+        let moved = rotate(q, [t0[0], t0[1], t0[2]]);
+        tv.push([p[0] + moved[0], p[1] + moved[1], p[2] + moved[2], 0.0]);
+        rv.push(mul(q, r0.map(|x| x / l)));
+    }
+    channels.push(AnimChannel { joint: root, path: AnimPath::Translation, times: times.clone(), values: tv });
+    channels.push(AnimChannel { joint: root, path: AnimPath::Rotation, times, values: rv });
+    let (p, q) = crate::anim::mover_at(&mover, c.duration);
+    Some(((p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt(), 2.0 * q[2].atan2(q[3]).to_degrees()))
+}
+
 /// Write one rigged GLB of `parts` (LOD0) at `out`. Textures go to
 /// `<out folder>/textures/`. Each clip becomes one glTF animation, named
 /// `<dictionary>/<clip>`. With `anim_only` the GLB holds the skeleton and
 /// the animations without meshes or textures. Returns the JSON report.
-pub fn export_outfit(a: &ArchiveInfo, parts: &[&Entry], name: &str, out: &Path, o: &ExportOptions, clips: &[(&crate::anim::ClipDictionary, &crate::anim::Clip)], anim_only: bool) -> Result<serde_json::Value> {
+pub fn export_outfit(a: &ArchiveInfo, parts: &[&Entry], name: &str, out: &Path, o: &ExportOptions, clips: &[(&crate::anim::ClipDictionary, &crate::anim::Clip)], anim_only: bool, in_place: bool) -> Result<serde_json::Value> {
     if parts.is_empty() {
         bail!("no parts selected");
     }
@@ -490,7 +572,13 @@ pub fn export_outfit(a: &ArchiveInfo, parts: &[&Entry], name: &str, out: &Path, 
         if c.bindings.is_empty() {
             bail!("clip {} of {} binds no animation in this dictionary (not decoded yet); pick another clip", c.short_name(), d.name);
         }
-        let (channels, mut stats) = clip_channels(d, c, &joints);
+        let (mut channels, mut stats) = clip_channels(d, c, &joints);
+        // the clip's own movement over the ground, on the root joint
+        stats["ground_movement"] = match (in_place, if in_place { None } else { add_mover(&mut channels, d, c, &joints) }) {
+            (true, _) => serde_json::json!({"applied": false, "note": "left out (--in-place)"}),
+            (_, Some((metres, degrees))) => serde_json::json!({"applied": true, "metres": metres, "turn_degrees": degrees, "note": "the mover's absolute translation and rotation since the clip's start, on the root joint's translation and rotation; --in-place leaves it out"}),
+            (_, None) => serde_json::json!({"applied": false, "note": "the clip has no mover tracks"}),
+        };
         stats["dictionary"] = d.name.clone().into();
         stats["clip"] = c.short_name().into();
         stats["duration"] = c.duration.into();
@@ -586,7 +674,7 @@ mod tests {
         assert!(parts.len() >= 5, "{} parts", parts.len());
         let out = std::env::temp_dir().join("sixng_outfit_real").join("outfit.glb");
         let o = ExportOptions { out: out.parent().unwrap().into(), png: false, dds: false, raw: false, force: true, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default() };
-        let r = export_outfit(&a, &parts, "player_story000_00", &out, &o, &[(&d, clip)], false).unwrap();
+        let r = export_outfit(&a, &parts, "player_story000_00", &out, &o, &[(&d, clip)], false, false).unwrap();
         println!("{}", serde_json::to_string_pretty(&r).unwrap());
         assert_eq!(r["unresolved_influences"], 0);
         assert!(r["clip"]["bone_tracks_on_joints_pct"].as_f64().unwrap() >= 90.0);
@@ -597,6 +685,34 @@ mod tests {
         let doc: serde_json::Value = serde_json::from_slice(&glb[20..20 + jl]).unwrap();
         assert_eq!(doc["skins"].as_array().unwrap().len(), 1);
         assert_eq!(doc["animations"][0]["channels"].as_array().unwrap().len(), r["clip"]["channels"].as_u64().unwrap() as usize);
+    }
+
+    /// The mover goes on the root joint: its own keys are moved and turned.
+    #[test]
+    fn mover_moves_and_turns_the_root() {
+        use crate::anim::{track, Animation, Binding, Clip, ClipDictionary, Track, ValueType};
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        // two frames, one second: 2 m forward (+Y) and a quarter turn left
+        let tracks = vec![
+            Track { bone: 0, kind: track::MOVER_TRANSLATION, value: ValueType::Vector3, frames: vec![[0.0, 0.0, 0.0, 0.0], [0.0, 2.0, 0.0, 0.0]] },
+            Track { bone: 0, kind: track::MOVER_ROTATION, value: ValueType::Quaternion, frames: vec![[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, h, h]] },
+        ];
+        let d = ClipDictionary { name: "d".into(), clips: vec![], animations: vec![Animation { hash: 0, name: "a".into(), frames: 2, duration: 1.0, tracks }] };
+        let c = Clip { hash: 0, kind: 1, name: "c".into(), duration: 1.0, bindings: vec![Binding { animation: 0, start: 0.0, end: 1.0, rate: 1.0 }] };
+        // the root sits 1 m to the side (+X) at rest, and has no keys of its own
+        let joints = vec![j("root", None, 1.0), j("spine", Some(0), 1.0)];
+        let mut ch = Vec::new();
+        let (metres, degrees) = add_mover(&mut ch, &d, &c, &joints).unwrap();
+        assert!((metres - 2.0).abs() < 1e-5 && (degrees - 90.0).abs() < 1e-3, "{metres} {degrees}");
+        let t = ch.iter().find(|x| x.joint == 0 && x.path == AnimPath::Translation).unwrap();
+        let r = ch.iter().find(|x| x.joint == 0 && x.path == AnimPath::Rotation).unwrap();
+        assert_eq!(t.values[0], [1.0, 0.0, 0.0, 0.0]);
+        // turned a quarter left, the 1 m to the side points forward: (0, 2 + 1, 0)
+        let e = t.values.last().unwrap();
+        assert!(e[0].abs() < 1e-5 && (e[1] - 3.0).abs() < 1e-5, "{e:?}");
+        let q = r.values.last().unwrap();
+        assert!((q[2] - h).abs() < 1e-5 && (q[3] - h).abs() < 1e-5, "{q:?}");
+        assert!(ch.iter().all(|x| x.joint == 0));
     }
 
     /// The merged GLB is valid glTF structure: one joint root, every vertex
