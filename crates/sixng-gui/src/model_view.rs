@@ -6215,6 +6215,10 @@ fn load_query_sel(
                 let is_body = |o: &u64| opts.iter().any(|x| x.off == *o && x.group.starts_with("body"));
                 let mut order: Vec<&u64> = chosen.iter().filter(|o| is_body(o)).collect();
                 order.extend(chosen.iter().filter(|o| !is_body(o)));
+                // a model two chosen parts fit on the same bone goes on once
+                // (a pickup's rear bumper: of its bed part and of the part
+                // in the rear bumper slot)
+                let mut once: std::collections::HashSet<(u64, u32)> = std::collections::HashSet::new();
                 for o in order {
                     // the pickup bed is attached by name: it may sit at the origin
                     let by_name = is_body(o);
@@ -6224,6 +6228,9 @@ fn load_query_sel(
                         // lengths): only the ones whose bone this vehicle
                         // has are fitted. Bone 0 is the vehicle itself.
                         if *bone != 0 && !bind.contains_key(bone) && !by_name {
+                            continue;
+                        }
+                        if !once.insert((*off, *bone)) {
                             continue;
                         }
                         let Some(pe) = ix.entries.iter().find(|x| x.off == *off) else { continue };
