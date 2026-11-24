@@ -5,7 +5,8 @@
 //!   as written (upper case) and `elf` is the Unix ELF/PJW hash. Ids lie in
 //!   18..=32766; 0..17 look reserved (only 0 occurs). The material list is in
 //!   the material XML; its first 64 KiB block is not zlib and is not read, so
-//!   the materials in it stay unnamed. The deformable-terrain XML lists more
+//!   most materials in it stay unnamed (the natural-ground ones are
+//!   recovered by hash, see [`RECOVERED_SURFACE_NAMES`]). The deformable-terrain XML lists more
 //!   materials (`<PhysicsMaterials>`), some of them from that block.
 //! * **Road node street names** (u32 at +0x20 of a path node): joaat of the
 //!   lower-cased key of an `<Item key="CustomEntity<n>_<m>">` in the location
@@ -102,9 +103,51 @@ fn is_material_name(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
 }
 
+/// Natural-ground materials from the unread first block of the material XML,
+/// recovered by hash: the material suffixes the readable categories share
+/// (`DEFORM_`, `SUBMERGED_`, `TRACK_`, `STUNT_`, `VEG_`) were tried under
+/// other prefixes, and `TERRAIN_` gives an unnamed id in `levels.rpf` for 31
+/// of 76 (chance would give fewer than one). The ids sit next to other
+/// ground surfaces in the bounds and cover about 21 % of collision
+/// triangles. Names read from the XML win over these.
+pub const RECOVERED_SURFACE_NAMES: &[&str] = &[
+    "TERRAIN_CORAL",
+    "TERRAIN_DIRT_COMPACT",
+    "TERRAIN_DIRT_LOOSE",
+    "TERRAIN_GRASS_DEAD",
+    "TERRAIN_GRASS_LONG",
+    "TERRAIN_GRASS_LUSH",
+    "TERRAIN_GRASS_SHORT",
+    "TERRAIN_GRAVEL_LARGE",
+    "TERRAIN_GRAVEL_MEDIUM",
+    "TERRAIN_GRAVEL_SMALL",
+    "TERRAIN_GRAVEL_TRAP",
+    "TERRAIN_LEAVES",
+    "TERRAIN_LEAVES_DEAD",
+    "TERRAIN_MIXED_DIRT_GRASS",
+    "TERRAIN_MIXED_GRAVEL_DIRT",
+    "TERRAIN_MIXED_GRAVEL_GRASS",
+    "TERRAIN_MIXED_SAND_DIRT",
+    "TERRAIN_MIXED_SAND_GRASS",
+    "TERRAIN_MIXED_SAND_GRAVEL",
+    "TERRAIN_MUD_HARD",
+    "TERRAIN_MUD_SOFT",
+    "TERRAIN_PINE_NEEDLES",
+    "TERRAIN_ROCK_BRITTLE",
+    "TERRAIN_SAND_COMPACT",
+    "TERRAIN_SAND_LOOSE",
+    "TERRAIN_SAND_SHELL",
+    "TERRAIN_SAND_WET",
+    "TERRAIN_SEAWEED",
+    "TERRAIN_SOIL",
+    "TERRAIN_TWIGS",
+    "TERRAIN_WOODCHIPS",
+];
+
 /// Physics material names by surface id: `<name>` of the material XML
 /// (entries with `<friction`) and the `<PhysicsMaterials>` lists of the
-/// deformable-terrain XML.
+/// deformable-terrain XML, then [`RECOVERED_SURFACE_NAMES`] for ids still
+/// without a name.
 pub fn surface_names_from(texts: &[String]) -> BTreeMap<u16, String> {
     let mut out = BTreeMap::new();
     for s in texts {
@@ -118,6 +161,9 @@ pub fn surface_names_from(texts: &[String]) -> BTreeMap<u16, String> {
         for n in names.into_iter().filter(|n| is_material_name(n)) {
             out.entry(surface_id(n)).or_insert_with(|| n.to_string());
         }
+    }
+    for n in RECOVERED_SURFACE_NAMES {
+        out.entry(surface_id(n)).or_insert_with(|| n.to_string());
     }
     out
 }
@@ -169,7 +215,7 @@ pub fn annotate(ws: &Workspace, archive: &str, out: &Path, progress: crate::expo
         let by: BTreeMap<String, &String> = names.iter().map(|(k, v)| (format!("{k:04x}"), v)).filter(|(k, _)| tri.contains_key(k)).collect();
         let named_tri: u64 = by.keys().map(|k| tri[k]).sum();
         s["names_by_surface_id"] = json!(by);
-        s["names_note"] = json!("surface id = 18 + elf(material name) % 32749 (Unix ELF/PJW hash of the name as written in common.rpf's material XML). Ids without a name belong to materials in the part of that XML that is not read.");
+        s["names_note"] = json!("surface id = 18 + elf(material name) % 32749 (Unix ELF/PJW hash of the name as written in common.rpf's material XML). The TERRAIN_ names are recovered by hash (that block of the XML is not read). Ids without a name belong to other materials in that block.");
         std::fs::write(&sp, serde_json::to_vec_pretty(&s)?)?;
         let all: BTreeMap<String, &String> = names.iter().map(|(k, v)| (format!("{k:04x}"), v)).collect();
         std::fs::write(cdir.join("surface_names.json"), serde_json::to_vec_pretty(&json!({"note": s["names_note"], "names": all}))?)?;
@@ -262,5 +308,19 @@ mod tests {
         assert_eq!(s[&surface_id("DEFORM_CLAY")], "DEFORM_CLAY");
         let k = street_keys_from(&t);
         assert_eq!(k[&joaat("customentity34_5464")], ("CustomEntity34_5464".to_string(), "STREET_X_NAME".to_string()));
+    }
+    #[test]
+    fn recovered_surface_names() {
+        // Ids seen in levels.rpf bounds that the readable XML does not name.
+        for (n, id) in [("TERRAIN_SAND_WET", 0x2EA2), ("TERRAIN_GRASS_LUSH", 0x5DEF), ("TERRAIN_SAND_COMPACT", 0x3B23), ("TERRAIN_CORAL", 0x01B0)] {
+            assert_eq!(surface_id(n), id, "{n}");
+        }
+        let ids: std::collections::BTreeSet<u16> = RECOVERED_SURFACE_NAMES.iter().map(|n| surface_id(n)).collect();
+        assert_eq!(ids.len(), RECOVERED_SURFACE_NAMES.len());
+        assert!(RECOVERED_SURFACE_NAMES.iter().all(|n| is_material_name(n)));
+        // A name read from the XML keeps its id.
+        let s = surface_names_from(&["<Item>\n<name>ROAD_TARMAC</name>\n<friction value=\"1\"/></Item>".to_string()]);
+        assert_eq!(s[&0x1C31], "ROAD_TARMAC");
+        assert_eq!(s[&0x2EA2], "TERRAIN_SAND_WET");
     }
 }
