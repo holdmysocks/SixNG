@@ -472,53 +472,58 @@ const CLOTHING_SHADERS: [&str; 22] = [
     "_retroreflection_secmo", "_secmo",
 ];
 
-/// The stitch columns of the shared stitch mask texture, as U ranges.
-pub const STITCH_COLUMNS: [[f32; 2]; 3] = [[0.10, 0.23], [0.43, 0.56], [0.77, 0.89]];
-/// Store hash of the shared stitch mask texture (graphics texture store).
-pub const STITCH_MASK: &str = "19a5e59eedc47faa";
+/// The three shared stitch textures, by the names the game binds them
+/// with: colour and coverage, a second map the clothing program that was
+/// read does not sample, and the normal map. They are in the game's global
+/// graphics texture dictionary (textures archive), not in a texture store.
+pub const STITCH_TEXTURES: [&str; 3] = ["ped_stitches_d", "ped_stitches_ma", "ped_stitches_n"];
 
 /// The stitch layer of a clothing material (`ped_standard_muv` and its
 /// variants), measured on the material's third UV set. The clothing shader
-/// draws seams' stitches from one shared mask texture, sampled with that
-/// UV set: vertices away from a seam rest in an empty gap between the
-/// texture's three stitch columns, vertices on a seam lie on a column
-/// with V running along the seam. None for other shaders or a material
-/// without a third UV set.
+/// draws seams' stitches from one shared atlas of stitch styles, sampled
+/// with that UV set: vertices away from a seam are gathered in one small
+/// empty patch of the atlas (on a t-shirt about 24 x 2 texels, right beside
+/// the stitch line the garment uses), the others are laid over a stitch
+/// line with V running along the seam. None for other
+/// shaders or a material without a third UV set.
 pub fn stitches(name_hash: &str, uv2: impl Iterator<Item = [f32; 2]>) -> Option<Value> {
     let hash = u32::from_str_radix(name_hash.trim(), 16).ok()?;
     if !CLOTHING_SHADERS.iter().any(|v| crate::meta7a::joaat(&format!("ped_standard_muv{v}")) == hash) {
         return None;
     }
-    let frac = |u: f32| u - u.floor();
-    let column = |u: f32| STITCH_COLUMNS.iter().position(|c| (c[0]..=c[1]).contains(&frac(u)));
-    let (mut n, mut cols, mut v) = (0u64, [0u64; 3], [f32::MAX, f32::MIN]);
-    for [u, w] in uv2.filter(|x| x[0].is_finite() && x[1].is_finite()) {
-        n += 1;
-        if let Some(c) = column(u) {
-            cols[c] += 1;
-            v = [v[0].min(w), v[1].max(w)];
-        }
-    }
-    if n == 0 {
+    let uv: Vec<[f32; 2]> = uv2.filter(|x| x[0].is_finite() && x[1].is_finite()).collect();
+    if uv.is_empty() {
         return None;
     }
-    let on: u64 = cols.iter().sum();
+    // the rest point: the most common UV, to 0.01; vertices within 0.02 of it count as resting
+    let key = |x: &[f32; 2]| ((x[0] * 100.0).round() as i64, (x[1] * 100.0).round() as i64);
+    let mut counts: std::collections::HashMap<(i64, i64), u64> = std::collections::HashMap::new();
+    for x in &uv {
+        *counts.entry(key(x)).or_default() += 1;
+    }
+    let (&rest, _) = counts.iter().max_by_key(|(k, n)| (**n, std::cmp::Reverse(**k)))?;
+    let at_rest = uv.iter().filter(|x| (key(x).0 - rest.0).abs() <= 2 && (key(x).1 - rest.1).abs() <= 2).count() as u64;
+    let n = uv.len() as u64;
     Some(json!({
         "uv_set": "TEXCOORD_2",
         "vertices": n,
-        "on_stitch_columns": on,
-        "per_column": cols,
-        "v_range_on_columns": (on > 0).then_some(v),
-        "has_stitches": on > 0,
-        "mask": {
-            "texture_hash": STITCH_MASK, "store": "graphics texture store (`sixng ttpf graphics --hash 19a5e59eedc47faa` decodes it)", "size": [128, 128], "sampling": "wrap, both ways",
-            "columns_u": STITCH_COLUMNS,
-            "channels": "as SixNG decodes it: R = the stitch mask (0 in the gaps, 255 on a stitch); G = 255 in the gaps and about 143 on a stitch; B = 255; A = 102 in the gaps and about 168 on a stitch",
+        "rest_uv": [rest.0 as f64 / 100.0, rest.1 as f64 / 100.0],
+        "vertices_at_rest": at_rest,
+        "vertices_on_seams": n - at_rest,
+        "has_stitches": n > at_rest,
+        "textures": {
+            "colour": STITCH_TEXTURES[0], "normal": STITCH_TEXTURES[2], "third": STITCH_TEXTURES[1],
+            "where": "the game's global graphics texture dictionary in the textures archive (the dictionary that also holds the ped tint ramps); exported with it as <name>.png",
+            "size": [2048, 128], "layout": "an atlas of stitch styles side by side: vertical lines that repeat along V, and a few horizontal and looped ones; most of it is empty",
+            "colour_channels": "A = coverage (0 where there is no stitch), G = the grey value (255 off a stitch, darker on the thread), R and B = masks for the second and third stitch tint (0 on most styles)",
+            "normal_channels": "a tangent normal map (R, G; flat = 127, 127)",
+            "third_channels": "G about 243 everywhere, A between 100 and 255 on stitches; not sampled by the program that was read",
         },
-        "weight": "stitch amount (the material library preset's stitchesblendamount) x mask. The mask is the texture's R channel as decoded: the only channel that is 0 where vertices without stitches rest. The shader code names this channel alpha, so the channel order of this texture's format is not settled",
-        "colour": "from the shader code: each of the preset's three stitchtint colours is a three-stop gradient indexed by a grey channel of the mask; S = mix(grey, tint0, tint0.alpha), then S = mix(S, tint1, tint1.alpha x a mask channel) and the same for tint2; colour = mix(colour, S, weight). The normal is blended towards a stitch normal map by the same weight",
-        "source": "mask texture and UV set: measured on six garments (vertices without stitches rest in a gap between columns on all six); weight and colour: one pixel program of ped_standard_muv, read once",
-        "not_decoded": "which mask channels are the grey value and the two tint masks; the stitch normal map; the stitch amount and tints of this garment (they are in its material library preset, which a lone model does not name). Not applied to the exported textures",
+        "weight": "stitch amount (the material library preset's stitchesblendamount) x the colour texture's alpha",
+        "colour": "each of the preset's three stitchtint colours is a three-stop gradient indexed by the grey value g (below 0.5: first to second stop by 2g; above: second to third by 2(g - 0.5)); S = mix(g, tint0, tint0.alpha), then S = mix(S, tint1, tint1.alpha x R) and S = mix(S, tint2, tint2.alpha x B); colour = mix(colour, S, weight). The normal is blended towards the stitch normal map by the same weight",
+        "source": "textures: the game's code binds the shader's two stitch inputs to these names (high confidence), and their channels fit the shader's use of them. Weight and colour: one pixel program of ped_standard_muv, read twice. UV set: of a garment's four UV sets only this one runs along seams (V spans tens to hundreds of repeats), and a garment without stitches has it collapsed to one empty point of the atlas; on a t-shirt the vertices away from seams are gathered in a small empty patch beside a stitch line (medium confidence: six garments, checked by eye; V's direction was not checked). rest_uv is the most common UV to 0.01 and vertices_at_rest those within 0.02 of it: a rough split, not a per-pixel test against the atlas",
+        "not_decoded": "the stitch amount and tints of this garment (they are in its material library preset, which a lone model does not name), the default amount, and the use of the third texture. Not applied to the exported textures",
+        "changed": "until 2026-11-24 this block named a 128 x 128 mask of the graphics texture store (19a5e59eedc47faa) and counted vertices on its three columns; that was the wrong texture",
     }))
 }
 
@@ -876,13 +881,13 @@ mod paint_tests {
         assert_eq!(l["layers"][3]["colour"]["param"], 13);
         assert_eq!(l["layers"][3]["colour"]["status"], "no texture bound");
         assert_eq!(l["weights"]["texture"]["png"], "t2.png");
-        // stitches: only clothing shaders with a third UV set; vertices on a column are counted per column
+        // stitches: only clothing shaders with a third UV set; vertices away from the rest point are on seams
         let muv = format!("{:08x}", crate::meta7a::joaat("ped_standard_muv_secmo"));
-        let x = stitches(&muv, [[2.33f32, 0.53], [0.5, -3.0], [-0.5, 7.0], [0.15, 1.0], [f32::NAN, 0.0]].into_iter()).unwrap();
-        assert_eq!((x["vertices"].as_u64(), x["on_stitch_columns"].as_u64(), x["per_column"][1].as_u64(), x["has_stitches"].as_bool()), (Some(4), Some(3), Some(2), Some(true)));
-        assert_eq!((x["v_range_on_columns"][0].as_f64(), x["v_range_on_columns"][1].as_f64()), (Some(-3.0), Some(7.0)));
+        let x = stitches(&muv, [[2.33f32, 0.53], [2.334, 0.531], [0.5, -3.0], [-0.5, 7.0], [2.33, 0.53], [f32::NAN, 0.0]].into_iter()).unwrap();
+        assert_eq!((x["vertices"].as_u64(), x["vertices_at_rest"].as_u64(), x["vertices_on_seams"].as_u64(), x["has_stitches"].as_bool()), (Some(5), Some(3), Some(2), Some(true)));
+        assert_eq!((x["rest_uv"][0].as_f64(), x["rest_uv"][1].as_f64(), x["textures"]["colour"].as_str()), (Some(2.33), Some(0.53), Some("ped_stitches_d")));
         let x = stitches(&muv, [[0.72f32, 0.54]; 3].into_iter()).unwrap();
-        assert_eq!((x["has_stitches"].as_bool(), x["v_range_on_columns"].is_null()), (Some(false), true));
+        assert_eq!((x["has_stitches"].as_bool(), x["vertices_on_seams"].as_u64()), (Some(false), Some(0)));
         assert!(stitches(&muv, std::iter::empty()).is_none());
         assert!(stitches(&format!("{:08x}", crate::meta7a::joaat("standard")), [[0.5f32, 0.0]].into_iter()).is_none());
         assert_eq!((l["height_blend"]["steps"].as_array().map(Vec::len), l["detail_array"]["texture"]["param"].as_u64()), (Some(7), Some(6)));

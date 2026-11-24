@@ -507,16 +507,21 @@ again**).
     and sheen. `outfit --look` exports do not have the fabric yet.
     **Stitches** are described, not drawn: a clothing material's record
     in `model.json` and `materials.json` has a `stitches` block. The
-    game draws stitches from one shared 128 x 128 mask texture (three
-    stitch columns) sampled with the mesh's third UV set
-    (`TEXCOORD_2`): vertices away from a seam rest in an empty gap
-    between the columns, vertices on a seam lie on a column with V
-    running along the seam (measured on six garments). The block gives
-    the mask's texture hash and column positions, how many of the
-    material's vertices lie on each column, and the weight and colour
-    maths read from the shader code. Not decoded: which mask channels
-    are the grey value and the tint masks, the stitch normal map, and
-    which preset supplies a lone model's stitch amount and tints.
+    game draws stitches from one shared 2048 x 128 atlas of stitch
+    styles (`ped_stitches_d`, with the normal map `ped_stitches_n`; both
+    in the game's global graphics texture dictionary and exported with
+    it) sampled with the mesh's third UV set (`TEXCOORD_2`): vertices
+    away from a seam are gathered in a small empty patch of the atlas,
+    the others are laid over a stitch line with V running along the
+    seam. The block gives the texture
+    names and channels (alpha = coverage, green = grey value, red and
+    blue = tint masks), the rest point, roughly how many of the
+    material's vertices are away from it, and the weight and colour maths read
+    from the shader code. Until 2026-11-24 the block named a 128 x 128
+    mask from the graphics texture store instead; that was the wrong
+    texture. Not decoded: which preset supplies a lone model's stitch
+    amount and tints, the default amount, and the third stitch texture
+    (`ped_stitches_ma`).
     Not applied anywhere: the second colour the game fades towards
     and the tint rows of items that have a preset (over 6,100 items with
     a colour tag, a preset and a tint row, the preset's colour matches the
