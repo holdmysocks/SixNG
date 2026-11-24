@@ -64,7 +64,7 @@ pub mod surface;
 pub mod timecycle;
 pub mod world;
 
-pub const INDEX_VERSION: &str = "5";
+pub const INDEX_VERSION: &str = "6";
 
 /// Per-user settings folder for SixNG: `%APPDATA%\SixNG` on Windows,
 /// `~/Library/Application Support/SixNG` on macOS, `$XDG_CONFIG_HOME/SixNG`

@@ -2420,7 +2420,8 @@ impl Map3D {
         let tph = Instant::now();
         let er = rage(eye);
         if self.show_terrain {
-            self.world.start(Arc::new(data.h8.clone()));
+            self.world
+                .start(Arc::new(data.h8.clone()), Some((self.game.clone(), self.work.clone())));
             if let Some(rs) = render_state {
                 let ren = self.renderer.as_ref().unwrap();
                 if self.world.poll(rs, ren, 4.0) {

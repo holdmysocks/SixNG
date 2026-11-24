@@ -248,6 +248,17 @@ fn starts_new_file(kind: Kind) -> bool {
     matches!(kind, Kind::Resource | Kind::RageObj | Kind::Pso | Kind::Rbf | Kind::Gfx | Kind::Dds | Kind::Png)
 }
 
+/// System-page bytes a RAGE object needs: its page-map pointer (+0x08, a
+/// 0x5xxxxxxx system pointer) plus the 8-byte map header. 0 when the head
+/// has no such pointer.
+fn sys_need_of(kind: Kind, head: &[u8]) -> u64 {
+    if kind != Kind::RageObj {
+        return 0;
+    }
+    let pm = head.get(8..16).map(|b| u64::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+    if pm >> 28 == 5 { (pm & 0x0FFF_FFFF) + 8 } else { 0 }
+}
+
 /// Merge raw streams into entries.
 /// * back-to-back streams after a stream that inflated to exactly 64 KiB are
 ///   continuation chunks of one file;
@@ -267,6 +278,9 @@ pub fn group_streams(archive_id: &str, mut streams: Vec<RawStream>) -> Vec<Entry
     let mut out: Vec<Entry> = Vec::new();
     let mut next_off = u64::MAX;
     let mut last_u = 0u64;
+    // Bytes of system page the current entry needs (its page map sits at
+    // the end of it), 0 when unknown.
+    let mut sys_need = 0u64;
     for s in clean {
         let aligned_end = (s.off + s.csize + 15) & !15;
         let (kind, sub, ext) = classify(&s.head);
@@ -275,9 +289,17 @@ pub fn group_streams(archive_id: &str, mut streams: Vec<RawStream>) -> Vec<Entry
         // object stream that does not is a later system-page group of the
         // previous resource (big fragments put the root page first).
         let misaligned_obj = kind == Kind::RageObj && s.off % 4096 != 0x10;
+        // A later system-page group can also land on such a boundary: the
+        // previous entry's page-map pointer still lies past the bytes it
+        // has (a texture dictionary whose first stream inflates to 0x30000
+        // with its page map at 0x31000, split from its own graphics pages).
+        let sys_short = out.last().is_some_and(|e| e.usize < sys_need);
         let cont = contiguous
-            && (last_u == CHUNK || !starts_new_file(kind) || misaligned_obj)
+            && (last_u == CHUNK || !starts_new_file(kind) || misaligned_obj || sys_short)
             && out.last().is_some();
+        if !cont {
+            sys_need = sys_need_of(kind, &s.head);
+        }
         if cont {
             let e = out.last_mut().unwrap();
             e.csize += s.csize;
@@ -455,4 +477,35 @@ pub fn save_index(index_dir: &Path, ix: &ArchiveIndex) -> Result<()> {
     fs::write(&tmp, serde_json::to_vec(ix)?)?;
     fs::rename(&tmp, &p)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+
+    /// A RAGE object head: page-map pointer `pm` at +0x08.
+    fn obj(off: u64, csize: u64, usize: u64, pm: u64) -> RawStream {
+        let mut head = vec![0u8; 64];
+        head[8..16].copy_from_slice(&pm.to_le_bytes());
+        RawStream { off, csize, usize, head }
+    }
+
+    #[test]
+    fn later_system_page_on_a_resource_boundary_stays_with_its_resource() {
+        // Root system stream of 0x30000 bytes whose page map is at 0x31000;
+        // the next contiguous stream starts on a 4 KiB + 0x10 boundary and
+        // looks like a RAGE object, but is the rest of the system page.
+        let a = obj(0x1010, 0xBFF8, 0x30000, 0x5003_1000);
+        let b = obj(0xD010, 0x500, 0x5DD0, 0x5000_2000);
+        let g = RawStream { off: 0xD510, csize: 0x100, usize: 0x1000, head: vec![0xAB; 64] };
+        let e = group_streams("t", vec![a.clone(), b.clone(), g.clone()]);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].streams.len(), 3);
+
+        // Once the system page is complete, a resource-aligned RAGE object
+        // starts a new entry as before.
+        let a2 = obj(0x1010, 0xBFF8, 0x30000, 0x5002_F000);
+        let e = group_streams("t", vec![a2, b, g]);
+        assert_eq!(e.len(), 2);
+    }
 }

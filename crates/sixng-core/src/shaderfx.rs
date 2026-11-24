@@ -33,6 +33,18 @@
 //!   index is its slot in the material's texture list, and a sampler's `b`
 //!   is the distance from its record to its name in the table's name table.
 //!
+//! Techniques and passes of an effect sit in the part of the body that is
+//! otherwise not decoded: `u32 techniques`, one `u32` per technique (bits
+//! 0..14 = offset of its name in the effect's last name table, bits 15..23
+//! = index of its first pass, bits 24..31 = number of passes), `u32
+//! passes`, then 24 bytes per pass: six bytes with the pass's program per
+//! section (1-based into the effect's program list of that section, 0 =
+//! none), eight flag bytes, `u16` name offset, and six bytes that are not
+//! understood. The table is found by these rules (the first name offset is
+//! 1, offsets rise, each technique's first pass follows the previous one's
+//! passes, the pass count is their sum, program numbers are in range), not
+//! by decoding what precedes it.
+//!
 //! The archive's one compressed entry is a pipeline cache (magic
 //! `PS\0\x09`): a 0x80-byte header with a version string at 0x24 and six
 //! `u32` counts at 0x50 (graphics pipelines, compute pipelines, metadata
@@ -175,12 +187,31 @@ pub struct Program {
     pub table: Table,
 }
 
+/// One pass of a technique.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Pass {
+    pub name: String,
+    /// Per section the pass's program: an index into the effect's
+    /// `programs` list of that section.
+    pub programs: [Option<u8>; 6],
+    /// The eight flag bytes (not decoded).
+    pub flags: [u8; 8],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Technique {
+    pub name: String,
+    pub passes: Vec<Pass>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Effect {
     pub name: String,
     /// Program numbers per section (same order as the sections).
     pub programs: [Vec<u32>; 6],
     pub table: Option<Table>,
+    /// Empty when the effect has no programs or its tables were not found.
+    pub techniques: Vec<Technique>,
 }
 
 #[derive(Debug, Default)]
@@ -286,6 +317,54 @@ fn effect_table(body: &[u8]) -> Option<Table> {
     })
 }
 
+/// The technique and pass tables inside an effect's body, named from the
+/// name table that follows them.
+fn techniques(body: &[u8], lists: &[Vec<u32>; 6]) -> Vec<Technique> {
+    let ident = |at: usize| body.get(at).is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_');
+    for q in 0..body.len().saturating_sub(12) {
+        let Some(nt) = u32_at(body, q).map(|n| n as usize).filter(|n| (1..=400).contains(n)) else { continue };
+        let Some(ents) = (0..nt).map(|k| u32_at(body, q + 4 + 4 * k)).collect::<Option<Vec<u32>>>() else { continue };
+        let (off, first, count) = (|e: u32| (e & 0x7fff) as usize, |e: u32| ((e >> 15) & 0x1ff) as usize, |e: u32| (e >> 24) as usize);
+        let np = ents.iter().map(|&e| count(e)).sum::<usize>();
+        let mut next = 0;
+        let in_order = ents.iter().all(|&e| {
+            let ok = first(e) == next & 0x1ff;
+            next += count(e);
+            ok
+        });
+        if off(ents[0]) != 1 || !in_order || np == 0 || ents.windows(2).any(|w| off(w[1]) <= off(w[0])) || u32_at(body, q + 4 + 4 * nt) != Some(np as u32) {
+            continue;
+        }
+        let pq = q + 8 + 4 * nt;
+        let Some(passes) = body.get(pq..pq + 24 * np) else { continue };
+        if passes.chunks_exact(24).any(|x| (0..6).any(|j| x[j] as usize > lists[j].len())) || !passes.chunks_exact(24).any(|x| x[..6].iter().any(|&b| b != 0)) {
+            continue;
+        }
+        // the name table: `u32 size`, strings; every name offset must start an identifier right after a NUL
+        let mut need: Vec<usize> = ents.iter().map(|&e| off(e)).chain(passes.chunks_exact(24).map(|x| u16::from_le_bytes([x[14], x[15]]) as usize)).collect();
+        need.sort_unstable();
+        let Some(names) = (pq + 24 * np + 4..body.len()).find_map(|st| {
+            let l = u32_at(body, st - 4)? as usize;
+            let t = body.get(st..st + l)?;
+            (t.first() == Some(&0) && *need.last()? < l && need.iter().all(|&o| o >= 1 && t[o - 1] == 0 && ident(st + o))).then_some(t)
+        }) else { continue };
+        let name = |o: usize| String::from_utf8_lossy(&names[o..o + names[o..].iter().position(|&c| c == 0).unwrap_or(0)]).into_owned();
+        let mut it = passes.chunks_exact(24);
+        return ents
+            .iter()
+            .map(|&e| Technique {
+                name: name(off(e)),
+                passes: it
+                    .by_ref()
+                    .take(count(e))
+                    .map(|x| Pass { name: name(u16::from_le_bytes([x[14], x[15]]) as usize), programs: std::array::from_fn(|j| x[j].checked_sub(1)), flags: x[6..14].try_into().unwrap() })
+                    .collect(),
+            })
+            .collect();
+    }
+    Vec::new()
+}
+
 /// Reads the program sections and the effect records from the bytes of
 /// `shaders.rpf`.
 pub fn read(b: &[u8]) -> Result<Shaders> {
@@ -313,7 +392,8 @@ pub fn read(b: &[u8]) -> Result<Shaders> {
         let limit = (body + (64 << 20)).min(b.len());
         let next = if out.effects.len() + 1 >= out.effects_stated { None } else { (body + 1..limit).find_map(|q| if b[q - 1] == 0 && b[q] >= 2 { effect_header(b, q, &counts).filter(|_| name_table_ends_at(b, q, body)).map(|h| (q, h)) } else { None }) };
         let end = next.as_ref().map_or(limit.min(body + (4 << 20)), |n| n.0);
-        out.effects.push(Effect { name, programs, table: effect_table(&b[body..end]) });
+        let techniques = if programs.iter().all(Vec::is_empty) { Vec::new() } else { techniques(&b[body..end], &programs) };
+        out.effects.push(Effect { name, table: effect_table(&b[body..end]), techniques, programs });
         cur = next;
     }
     Ok(out)
@@ -533,8 +613,11 @@ mod tests {
             b.extend(0u32.to_le_bytes());
         }
         b.extend(2u32.to_le_bytes());
-        let body = [vec![9u8; 40], 0x8000_0000u32.to_le_bytes().to_vec(), et].concat();
-        b.extend(effect("standard", [&[0], &[0, 1], &[], &[], &[], &[]], &body, b"\0draw\0p0\0"));
+        // two techniques: `draw` (one pass, vertex 1 + pixel 2) and `depth` (two passes)
+        let pass = |progs: [u8; 6], name: u16| [progs.to_vec(), vec![0, 0, 0, 0, 0, 0xff, 0, 0], name.to_le_bytes().to_vec(), vec![0u8; 8]].concat();
+        let tech = [2u32.to_le_bytes().to_vec(), (1u32 | 0 << 15 | 1 << 24).to_le_bytes().to_vec(), (6u32 | 1 << 15 | 2 << 24).to_le_bytes().to_vec(), 3u32.to_le_bytes().to_vec(), pass([1, 2, 0, 0, 0, 0], 12), pass([1, 0, 0, 0, 0, 0], 12), pass([0, 1, 0, 0, 0, 0], 15)].concat();
+        let body = [vec![9u8; 40], tech, 0x8000_0000u32.to_le_bytes().to_vec(), et].concat();
+        b.extend(effect("standard", [&[0], &[0, 1], &[], &[], &[], &[]], &body, b"\0draw\0depth\0p0\0p1\0"));
         b.extend(effect("stub", [&[], &[1], &[], &[], &[], &[]], &[0u8; 30], b"\0"));
         let s = read(&b).unwrap();
         assert_eq!((s.programs.len(), s.sections[1], s.effects_stated, s.effects.len()), (3, (1, 2), 2, 2));
@@ -549,6 +632,11 @@ mod tests {
         let et = e.table.as_ref().unwrap();
         assert_eq!((et.resources[0].material_texture(), et.resources[0].name, et.resources[0].alias, et.resources[1].material_texture()), (Some((3, true)), 0x41, 0x42, None));
         assert_eq!((et.sampler_name(1), et.sampler_name(0)), (Some("DiffuseSampler"), None));
+        let t = &e.techniques;
+        assert_eq!((t.len(), t[0].name.as_str(), t[0].passes.len(), t[1].name.as_str(), t[1].passes.len()), (2, "draw", 1, "depth", 2));
+        assert_eq!((t[0].passes[0].name.as_str(), t[0].passes[0].programs, t[0].passes[0].flags[5]), ("p0", [Some(0), Some(1), None, None, None, None], 0xff));
+        assert_eq!((t[1].passes[1].name.as_str(), t[1].passes[1].programs[1]), ("p1", Some(0)));
+        assert!(s.effects[1].techniques.is_empty());
     }
 
     #[test]
