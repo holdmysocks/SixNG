@@ -627,7 +627,7 @@ archive), from an exported `.glb`, or with **Open in model viewer** in
 the Archives page. Entries are exported on the fly into `<work>/gui_cache_v4`
 (models plus PNG textures; v3 since the 2026-11-20 normals fix; older `gui_cache_v*` folders can be deleted).
 
-- Shading: base colour, normal map (DirectX green), packed
+- Shading: base colour, normal map (DirectX green, in a tangent frame the viewer builds from the first UV set: the frame stored in the models follows the second UV set), packed
   roughness/metal/AO with a channel-order switch, alpha / cutout / decal /
   glass classes (blended back to front), emissive.
 - Car paint: primary, secondary (per material **2nd**; rims use it),

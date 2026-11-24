@@ -169,7 +169,6 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
         let t = normalize(i.tan.xyz - n * dot(n, i.tan.xyz) / tl * tl);
         let b = cross(n, t) * select(1.0, -1.0, i.tan.w < 0.0);
         var tn = textureSample(t_nrm, samp, i.uv0).xyz * 2.0 - 1.0;
-        tn.y = -tn.y; // DirectX green
         tn.z = sqrt(max(1.0 - tn.x * tn.x - tn.y * tn.y, 0.0));
         n = normalize(t * tn.x + b * tn.y + n * tn.z);
     }
