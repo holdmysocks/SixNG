@@ -1318,7 +1318,11 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             // to the largest kept influence in the GLB.
             "unresolved_joints": skin_used.as_ref().map(|u| u.iter().filter(|&&i| i as usize >= skin.joints.len()).count()),
         }));
-        let mut tint = match (material.and_then(|s| shader_tex.get(s)).and_then(|st| st.tint_palette.as_ref()), &m.colors) {
+        // The placement tint of props (a palette embedded in the model,
+        // picked by the vertex colours). Not on the vehicle shaders: their
+        // vertex colours carry part ids, and a vehicle part without a part
+        // set (the shared truck beds) came out in rainbow bands.
+        let mut tint = match (material.and_then(|s| shader_tex.get(s)).filter(|st| st.vehicle_palette.is_none()).and_then(|st| st.tint_palette.as_ref()), &m.colors) {
             (Some(p), Some(c)) => Some(tint_colours(p, c)),
             _ => None,
         };
