@@ -400,6 +400,9 @@ pub struct ModelView {
     /// Hinged panels of the loaded model: joint index -> (0 = door, 1 =
     /// bonnet, 2 = boot; rotation axis; sign that swings it open).
     hinges: HashMap<usize, (u8, Vec3, f32)>,
+    /// What the configuration's parts without a model change on the wheels:
+    /// [out from the centre line, tyre width], each per axle (front, rear).
+    wheel_fit_cfg: [[f32; 2]; 2],
     /// `--fit-parts <hex,hex>`: part options (archive offsets) to fit once
     /// after the load, in place of the configuration's.
     pub fit_parts_once: Option<String>,
@@ -699,6 +702,7 @@ impl ModelView {
             bonnet_open: 0.0,
             boot_open: 0.0,
             hinges: HashMap::new(),
+            wheel_fit_cfg: [[0.0; 2]; 2],
             fit_parts_once: None,
             aims: Vec::new(),
             brakes: Vec::new(),
@@ -2043,6 +2047,21 @@ impl ModelView {
 
     fn apply_config(&mut self, v: &crate::vehicle_db::Vehicle, i: usize) {
         let c = &v.configs[i];
+        // What the configuration's parts without a model change on the
+        // wheels (spacers, fitment parts): out from the centre line and
+        // wider, per axle. Parts with a model are counted where they are
+        // fitted (the loader), so a kit taken off takes its change along.
+        let with_model: std::collections::HashSet<u32> = v.mods.iter().map(|m| m.name).collect();
+        let mut fit = [[0.0f32; 2]; 2];
+        for f in c.parts.iter().filter(|p| !with_model.contains(p)).flat_map(|p| v.wheel_fits.get(p).into_iter().flatten()) {
+            for axle in 0..2 {
+                if crate::vehicle_db::fit_on_axle(f.axles, axle) {
+                    fit[0][axle] += f.offset + f.spacing;
+                    fit[1][axle] += f.width;
+                }
+            }
+        }
+        self.wheel_fit_cfg = fit;
         // A configuration without a colour of its own (stored as pure
         // magenta) takes the most frequent colour of the vehicle's first
         // paint list that has one.
@@ -2190,10 +2209,10 @@ impl ModelView {
                         let p: [f32; 3] = serde_json::from_value(m["centre"].clone())
                             .ok()
                             .or_else(|| serde_json::from_value(m["pivot"].clone()).ok())?;
-                        Some((
-                            m["bone"].as_str()?.to_string(),
-                            Vec3::new(p[0], p[2], -p[1]),
-                        ))
+                        let bone = m["bone"].as_str()?;
+                        // the configuration's spacers move the wheel out
+                        let x = p[0] + self.wheel_fit_cfg[0][is_rear(bone) as usize].copysign(p[0]);
+                        Some((bone.to_string(), Vec3::new(x, p[2], -p[1])))
                     })
                     .collect()
             })
@@ -2218,7 +2237,8 @@ impl ModelView {
             .unwrap_or_default()
             .iter()
             .filter_map(|m| {
-                let c: [f32; 3] = serde_json::from_value(m["brake_centre"].clone()).ok()?;
+                let mut c: [f32; 3] = serde_json::from_value(m["brake_centre"].clone()).ok()?;
+                c[0] += self.wheel_fit_cfg[0][m["bone"].as_str().is_some_and(is_rear) as usize].copysign(c[0]);
                 Some((m["bone"].as_str()?.to_string(), Vec3::new(c[0], c[2], -c[1]), m["brake_radius"].as_f64()? as f32))
             })
             .collect();
@@ -2277,7 +2297,7 @@ impl ModelView {
             .map(|a| {
                 a.iter()
                     .filter(|m| m["bone"].is_string() && (m["pivot"].is_array() || m["centre"].is_array()))
-                    .map(|m| Some([m["radius"].as_f64()? as f32, m["half_width"].as_f64()? as f32]))
+                    .map(|m| Some([m["radius"].as_f64()? as f32, m["half_width"].as_f64()? as f32 + self.wheel_fit_cfg[1][m["bone"].as_str().is_some_and(is_rear) as usize] / 2.0]))
                     .collect()
             })
             .unwrap_or_default()
@@ -2582,7 +2602,8 @@ impl ModelView {
         // scale a tyre is as wide as a car's. Narrow the wheel to fit between
         // the fork legs or the swingarm (an estimate).
         let xs_key = format!(
-            "{}|{:?}|{}|{}|{}|{}|{}",
+            "{:?}|{}|{:?}|{}|{}|{}|{}|{}",
+            self.wheel_fit_cfg,
             self.wheel_auto,
             // the loaded wheel models' sizes: they arrive after the key's
             // names change, and the fit depends on them
@@ -5553,7 +5574,7 @@ fn load_query_sel(
             let (mut out, mut wide) = ([0.0f32; 2], [0.0f32; 2]);
             for f in fitted.iter().flat_map(|p| v.wheel_fits.get(p).into_iter().flatten()) {
                 for axle in 0..2 {
-                    if f.axles & (1 << axle) != 0 {
+                    if crate::vehicle_db::fit_on_axle(f.axles, axle) {
                         out[axle] += f.offset + f.spacing;
                         wide[axle] += f.width;
                     }
