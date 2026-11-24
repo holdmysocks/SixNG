@@ -324,7 +324,12 @@ character plus `--parts` makes an ad-hoc character from any drawables, for
 example the generic hikers. `--clip` takes several clips (comma-separated or
 repeated), one glTF animation each. `--anim-only` writes only the skeleton
 and the animations. `sixng characters` lists every character and animal
-`outfit` can build (327 characters and 263 animals). The animal clips were
+`outfit` can build (327 characters and 263 animals), and under `models` every
+ped model of the game's outfit list (2,713; `--kind model` for these alone).
+The list stores only name hashes: 579 models are named from index names,
+the name dictionary and the text tables (a few of these may be chance hash
+hits), the rest are listed as `ped_0x<hash>`. `ped-look` and `outfit:` take
+either form, and the viewer's picker lists them all. The animal clips were
 checked by rendering (eagle flap, deer walk/run/idle: 91–97 % of tracks land
 on a joint). Animals have a 180° yaw on `SKEL_ROOT` in the bind pose that
 the clips do not carry, so an animated animal faces the other way from its
