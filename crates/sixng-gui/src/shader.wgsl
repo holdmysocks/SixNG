@@ -258,7 +258,7 @@ fn hair_light(colour: vec3<f32>, t: vec3<f32>, v: vec3<f32>, l: vec3<f32>, rough
 // of light colour. `t` strand direction, `n` the tube normal (perpendicular
 // to the strand), `v` to the eye, `l` to the light, `g0` and `y` the two
 // per-material values the game bakes (not decoded: fixed here).
-fn hair_game(colour: vec3<f32>, t: vec3<f32>, n: vec3<f32>, v: vec3<f32>, l: vec3<f32>, g0: f32, y: f32) -> vec3<f32> {
+fn hair_game(colour: vec3<f32>, t: vec3<f32>, n: vec3<f32>, root: vec3<f32>, v: vec3<f32>, l: vec3<f32>, g0: f32, y: f32) -> vec3<f32> {
     let c = normalize(cross(n, t));
     // (the view vector here points to the eye; the tables put the surface
     // reflection where light and eye are on the same side of the strand)
@@ -271,7 +271,7 @@ fn hair_game(colour: vec3<f32>, t: vec3<f32>, n: vec3<f32>, v: vec3<f32>, l: vec
     let cos_phi = clamp((ln * vn + lc * vc) / sqrt(max((vn * vn + vc * vc) * (ln * ln + lc * lc), 0.000001)), -1.0, 1.0);
     let h = clamp(vc / sqrt(max(0.000001, 1.0 - sin_o * sin_o)), -1.0, 1.0);
     // reflectance and path length; absorption of the colour
-    let a = textureSampleLevel(t_hair_a, samp_clamp, vec2(clamp(sin_o * sin_o, 0.0, 1.0), 0.25), 0.0);
+    let a = textureSampleLevel(t_hair_a, samp_clamp, vec2(clamp(sin_o * sin_o, 0.0, 1.0), 0.5), 0.0); // between its two rows: their mean
     let f = a.r;
     let lcol = log(max(colour, vec3(0.0000001)));
     let tt0 = exp(-0.0478501 * lcol * lcol * a.a);
@@ -313,7 +313,13 @@ fn hair_game(colour: vec3<f32>, t: vec3<f32>, n: vec3<f32>, v: vec3<f32>, l: vec
     let m = max(0.001, z0 * z0);
     let aa = 1.001 * (0.1 + m) * (0.1 + m);
     let area = aa / (aa + 0.25 * (3.0 * (0.1 + m) + 1.0));
-    return max(coloured + vec3(f * m0.r * nr2 * area), vec3(0.0));
+    // visibility: the side of the head the light is on (the root normal)
+    // times the azimuth term, which reaches 2 for light from the eye's side;
+    // the program also fades this towards 1 by a depth value (not decoded)
+    // (fade 0.5 is a stand-in: without it the unlit side is black)
+    let fade = 0.5;
+    let w = clamp(dot(root, l), 0.0, 1.0) * clamp(1.0 + cos_phi, 0.0, 2.0) * (1.0 - fade) + fade;
+    return max(w * (coloured * colour / max(colour, vec3(0.000001)) + vec3(f * m0.r * nr2 * area)), vec3(0.0));
 }
 
 @fragment
@@ -564,11 +570,10 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
             let tube = normalize(cross(cross(tdir, v), tdir));
             // large-scale light and dark side from the head: the root normal
             let root = normalize(i.nrm);
-            let w_sun = clamp(dot(root, l) * 0.5 + 0.5, 0.0, 1.0);
-            let direct_h = hair_game(albedo, tdir, tube, v, l, 0.33, 0.6067) * sun * w_sun;
+            let direct_h = hair_game(albedo, tdir, tube, root, v, l, 0.33, 0.6067) * sun;
             // ambient is the viewer's own: the same sum lit from the root normal's side by the sky
             let sky_h = (neutral(F.sky_top.rgb, 0.8) + neutral(F.sky_hor.rgb, 0.8) * 0.6) * 0.5 * F.misc.w;
-            let amb_g = hair_game(albedo, tdir, tube, v, normalize(root + vec3(0.0, 0.6, 0.0)), 0.33, 0.6067) * sky_h * 3.14159;
+            let amb_g = hair_game(albedo, tdir, tube, root, v, normalize(root + vec3(0.0, 0.6, 0.0)), 0.33, 0.6067) * sky_h * 3.14159;
             col = direct_h * ao_direct + amb_g * ao;
         }
     }
