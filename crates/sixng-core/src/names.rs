@@ -74,9 +74,24 @@ pub const DERIVED_EXACT: &[&str] = &["fMass", "fInitialDragCoeff", "fDriveBiasFr
     // vehicle surface (9e4de959) reference fields: the two layer materials
     // (range records), layer 1's colour record and the detail set.
     // One- to three-word camelCase search ending in Hash, 2026-11-23
-    "material0Hash", "material1Hash", "albedo1Hash", "detailMapsHash"];
+    "material0Hash", "material1Hash", "albedo1Hash", "detailMapsHash",
+    // layered-material library (root 8419ab01, `matlib`) and the wardrobe's second preset field.
+    // One- to three-word PascalCase search, 2026-11-23
+    "Tiles", "TileName", "TileNameOverrides", "TilePresets", "TilePresetNames", "TransmissionProfiles", "TransmissionProfileName", "TransmissionProfileOverrides",
+    "FloatParameters", "ColorParameters", "UIntParameters", "TextureNameParameters", "garmentPreset"];
 
 pub const DERIVED: &[&str] = &[
+    // parameter names of the layered-material library (`matlib`): lower-case joaat, domain-vocabulary search, 2026-11-23
+    "absorptionalbedoblend", "albedovariationblendamount", "alphathreshold", "anisointensity", "anisooffset", "curvatureblendamount", "curvaturemultiplier",
+    "curvatureroughnessblendamount", "detailnormalblendamount", "diffractionprofile", "dirtcontrol", "dirtmapblendamount", "dirttint", "emissivemultiplier",
+    "engravingblendamount", "engravingbumpiness", "engravingcolor", "engravingheight", "engravingmetallic", "engravingroughness", "extinctionlut",
+    "heightmapblendamount", "porositybias", "roughnessmapblendamount", "scatteringalbedoblend", "sheenblend", "sheencolor", "specularfresnel",
+    "specularocclusionblendamount", "stitchesblendamount", "stitchtint", "tangentangleoffset", "thicknessanisotropy", "tileflags", "tilematerialmap", "tilemetallic",
+    "tilenormalmap", "tileoffset", "tilepresetflags", "tilerotation", "tileroughnessmultiplier", "tilescale", "tilesheen", "tiletint", "tintablepatternflags",
+    "tintablepatternmap", "tintablepatternopacity", "tintablepatternrotation", "tintablepatternscale", "tintablepatterntint", "tintmaskemissiveintensity",
+    "tintmaskflags", "tintmaskheightopacity", "tintmaskmap", "tintmaskmetallic", "tintmaskmetallicopacity", "tintmaskopacity", "tintmaskrotation", "tintmaskroughness",
+    "tintmaskroughnessopacity", "tintmaskscale", "tintmasktint", "translucencymapblendamount", "translucencymultiplier", "translucencyscale", "transmissionprofileflags",
+    "transmissionroughness", "windscale",
     // texture parameters of the minigame pack's water and interior shaders (joaat search, 2026-11-23)
     "watersurfacedetailtexture", "surfacedetailnormal0", "surfacedetailnormal1", "surfacedetailnormal2", "surfacedetailiridescence", "interiordiffusemaskmap", "interiorlayerdiffusemap",
     // shader constants of the 4-layer ground shaders (dictionary search, 2026-11-22)
@@ -362,6 +377,9 @@ mod tests {
     fn known_hashes() {
         // shader and parameter names: joaat of the lower-case name
         assert_eq!(joaat("standard"), 0xbcf0_3fc1);
+        // layered-material parameters and library fields
+        assert_eq!((joaat("tiletint"), joaat("tilescale"), joaat("tintmaskmap"), joaat("stitchtint")), (0xf574_261b, 0x01ae_45d3, 0xd2b5_98e5, 0x1c85_bdf6));
+        assert_eq!((joaat_exact("TilePresetNames"), joaat_exact("TileNameOverrides"), joaat_exact("ColorParameters")), (0x4a1e_bc36, 0x4bee_7340, 0xfc24_d9c5));
         assert_eq!(joaat("diffusetex"), 0xc8e8_c282);
         assert_eq!(joaat("BumpTex"), 0x1e77_bf4c);
         // case-sensitive form differs once capitals are involved
