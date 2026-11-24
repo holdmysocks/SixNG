@@ -558,7 +558,11 @@ impl ClipDictionary {
         for s in sections {
             self.animations.extend(s.animations);
         }
-        let by_hash: std::collections::HashMap<u32, usize> = self.animations.iter().enumerate().skip(base).map(|(i, a)| (a.hash, i)).collect();
+        // the first section dictionary that holds a key wins
+        let mut by_hash: std::collections::HashMap<u32, usize> = Default::default();
+        for (i, a) in self.animations.iter().enumerate().skip(base) {
+            by_hash.entry(a.hash).or_insert(i);
+        }
         let mut joined = 0;
         for c in &mut self.clips {
             let mut keep = Vec::new();
@@ -948,6 +952,12 @@ mod tests {
         let mut d2 = ClipDictionary { name: "cin@t".into(), clips: vec![Clip { hash: 2, kind: 1, name: "x".into(), duration: 1.0, bindings: Vec::new(), pending: vec![Pending { animation: 99, start: 0.0, end: 1.0, rate: 1.0, offset: 0.0 }], sections: 1 }], animations: Vec::new() };
         assert_eq!(d2.join(Vec::new()), 0);
         assert_eq!(d2.clips[0].pending.len(), 1);
+        // two section dictionaries with the same key: the first one wins
+        let first = ClipDictionary { name: "cin@t-1".into(), clips: Vec::new(), animations: vec![ramp(99, 11, 1.0, 0.0)] };
+        let second = ClipDictionary { name: "cin@tfixme-1".into(), clips: Vec::new(), animations: vec![ramp(99, 11, 1.0, 5.0)] };
+        assert_eq!(d2.join(vec![first, second]), 1);
+        let b = &d2.clips[0].bindings[0];
+        assert_eq!(d2.animations[b.animation].tracks[0].frames[0][0], 0.0);
     }
 
     #[test]
