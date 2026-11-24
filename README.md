@@ -466,8 +466,23 @@ again**).
     their own. `sixng outfit --look` exports carry the same colours: baked
     into the base texture, or as GLB `COLOR_0` over a shade-only texture
     for the per-vertex garments. The viewer builds `<work>/index/material_presets.json` itself when it
-    is missing. Not applied: the second colour the game fades towards, the
-    three-stop gradient over a tiling fabric texture (`matlib::stops`),
+    is missing.
+  - **Fabric in the viewer.** Where the preset's library is read, the
+    viewer bakes the fabric into the garment's base texture (at 2048
+    texels): each sub-material's tiling fabric texture (`tilematerialmap`
+    green, at `tilescale` over the second UV set) under the three-stop
+    gradient of its colour (`matlib::stops`), then its tint-mask layers
+    in order (`lerp(colour, gradient(tint), mask x opacity x tint
+    alpha)`): denim weave and wash, trims, prints. The gradient, layer
+    order and blend are read from the shader; assumed are the UV
+    transform order (scale, rotation, translation), the tile's scale for
+    a layer that stores none, and linear texture values. The game samples
+    the tiles per pixel, so its weave stays sharp closer up than a baked
+    texture does; where two halves of a garment share texture space the
+    later one's fabric wins. Not applied: colour set B of the layers, the
+    layer flags other than invert, the tile normal map, stitches, dirt
+    and sheen. `outfit --look` exports do not have the fabric yet.
+    Not applied anywhere: the second colour the game fades towards
     and the tint rows of items that have a preset (over 6,100 items with
     a colour tag, a preset and a tint row, the preset's colour matches the
     tag on 2,970 and the tint row on 390, so the preset leads). Items
