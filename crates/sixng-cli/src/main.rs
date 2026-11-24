@@ -153,7 +153,7 @@ impl OutArgs {
                     std::process::exit(2);
                 }
             }),
-            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(),
+            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default(),
         }
     }
 }
@@ -1066,6 +1066,9 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             for (_, p) in &look_parts {
                 if p.slot == "head" && !p.skins.is_empty() {
                     eo.part_skins.insert(p.drawable.clone(), p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect());
+                }
+                if p.colour.is_none() && p.preset_colours.iter().any(|c| c.is_some()) {
+                    eo.part_colours.insert(p.drawable.clone(), p.preset_colours.clone());
                 }
                 if let Some((pal, t)) = p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t))) {
                     eo.ped_tints.insert(p.drawable.clone(), (pal, t.rows));
