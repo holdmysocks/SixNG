@@ -543,6 +543,24 @@ enum Cmd {
         #[arg(long, short)]
         out: PathBuf,
     },
+    /// Vehicle sticker records (the logos and lettering liveries are made
+    /// of): <out>/vehicles/stickers.json, and with --textures every sticker
+    /// texture as <out>/vehicles/stickers/<64-bit id>.png. With --id, only
+    /// that texture is written (to <out>/vehicles/stickers).
+    Stickers {
+        /// Output directory.
+        #[arg(long, short)]
+        out: PathBuf,
+        /// Also decode the sticker textures to PNG.
+        #[arg(long)]
+        textures: bool,
+        /// Only stickers whose name, name hash or texture id matches (regex).
+        #[arg(long)]
+        name: Option<String>,
+        /// One texture by its 64-bit id (hex); nothing else is written.
+        #[arg(long)]
+        id: Option<String>,
+    },
     /// Particle effect dictionaries (unnamed resources with keyframe
     /// textures; data.rpf has 147): per dictionary its name (scr_arc_tl),
     /// effect/emitter rule names and keyframe-texture count, as JSON. With
@@ -1901,6 +1919,18 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 Err(e) => json!({"error": format!("{e:#}")}),
             };
             out.print(&json!({"ok": true, "archive": a.id, "stats": v, "liveries": liveries, "seconds": t.elapsed().as_secs_f64()}));
+        }
+        Cmd::Stickers { out: po, textures, name, id } => {
+            let t = Instant::now();
+            if let Some(id) = id {
+                let h = sixng_core::vehstickers::parse_texture_id(id).ok_or_else(|| anyhow::anyhow!("--id takes a 64-bit id in hex"))?;
+                let (p, size) = sixng_core::vehstickers::sticker_png(&ws.game, h, &po.join("vehicles").join("stickers"))?;
+                out.print(&json!({"ok": true, "png": p, "size": size, "seconds": t.elapsed().as_secs_f64()}));
+            } else {
+                let re = name.as_deref().map(|n| regex::RegexBuilder::new(n).case_insensitive(true).build()).transpose()?;
+                let stats = sixng_core::vehstickers::export_stickers(&ws, po, *textures, re.as_ref())?;
+                out.print(&json!({"ok": true, "stats": stats, "seconds": t.elapsed().as_secs_f64()}));
+            }
         }
         Cmd::Ptfx { archive, name, out: po, sprites } => {
             let a = ws.resolve(archive)?;

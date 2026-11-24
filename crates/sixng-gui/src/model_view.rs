@@ -5639,6 +5639,13 @@ fn load_query_sel(
                                 transform_model(&mut m, c * Mat4::from_cols_array(&t) * c.inverse());
                                 let first = model.meshes.len();
                                 glb::merge(&mut model, m);
+                                // sticker zones are numbered per model: mark
+                                // which fitted part a vertex came from (the
+                                // part's place in `assembled_from`, from 1)
+                                let slot = (names.iter().position(|n| *n == pn).unwrap_or(names.len()) + 1).min(255) as u8;
+                                for v in model.meshes[first..].iter_mut().flat_map(|me| me.verts.iter_mut()) {
+                                    v.zone[1] = slot;
+                                }
                                 // and follows that bone (an opened bonnet takes its replacement with it)
                                 if let Some(j) = model.joints.iter().position(|j| joaat(&j.name) == *bone) {
                                     for me in &mut model.meshes[first..] {
