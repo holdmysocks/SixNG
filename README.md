@@ -477,8 +477,12 @@ again**).
     order and blend are read from the shader; assumed are the UV
     transform order (scale, rotation, translation), the tile's scale for
     a layer that stores none, and linear texture values. The game samples
-    the tiles per pixel, so its weave stays sharp closer up than a baked
-    texture does; where two halves of a garment share texture space the
+    the tiles per pixel. On opaque garments the Windows and Linux
+    renderer does the same for the garment's main sub-material: its
+    texels are baked at the tile's mean grey value and the shader
+    brings the weave back per pixel (`SIXNG_NO_FABRIC_DETAIL=1` turns
+    that off). The other sub-materials, cutout garments and the Metal
+    renderer keep the baked weave, which blurs close up; where two halves of a garment share texture space the
     later one's fabric wins. Not applied: colour set B of the layers, the
     layer flags other than invert, the tile normal map, stitches, dirt
     and sheen. `outfit --look` exports do not have the fabric yet.

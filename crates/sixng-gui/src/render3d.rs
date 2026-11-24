@@ -43,6 +43,9 @@ pub struct FrameU {
 struct MatU {
     base: [f32; 4],
     flags: [u32; 4],
+    /// Fabric detail tile: UV scale, rotation, the tile's mean grey value,
+    /// 1 = bound.
+    tile: [f32; 4],
 }
 
 #[repr(C)]
@@ -628,6 +631,7 @@ impl Renderer3D {
                 tex_entry(2),
                 tex_entry(3),
                 tex_entry(4),
+                tex_entry(5),
             ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1297,6 +1301,7 @@ impl Uploader {
             mr: None,
             tint_mask: false,
             ped_shade: false,
+            detail: None,
             parts: false,
             occlusion_only: false,
             slots: vec![],
@@ -1350,6 +1355,7 @@ impl Uploader {
             let u = MatU {
                 base,
                 flags: [has, class_id(&mt.class), alpha, gap | mr],
+                tile: mt.detail.map_or([0.0; 4], |d| [d.scale, d.rot, d.mean, 1.0]),
             };
             let o = k * MAT_STRIDE as usize;
             mat_bytes[o..o + std::mem::size_of::<MatU>()].copy_from_slice(bytemuck::bytes_of(&u));
@@ -1380,6 +1386,10 @@ impl Uploader {
                     wgpu::BindGroupEntry {
                         binding: 4,
                         resource: wgpu::BindingResource::TextureView(view(mt.emissive)),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(view(mt.detail.map(|d| d.image))),
                     },
                 ],
             });
