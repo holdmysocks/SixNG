@@ -50,6 +50,7 @@ pub mod interiorents;
 pub mod pso;
 pub mod gfxfont;
 pub mod ptfx;
+pub mod vehexport;
 pub mod vehicles;
 pub mod vehcolour;
 pub mod vehlights;

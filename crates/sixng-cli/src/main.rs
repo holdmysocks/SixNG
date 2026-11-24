@@ -491,6 +491,39 @@ enum Cmd {
         out: PathBuf,
     },
     /// Vehicle data from the game-data meta resource: model info (wheel scale, wheel type, handling id, …), configurations (body colour ARGB, rim, tyre, parts), paint palettes and weighted part groups: <out>/vehicles/vehicles.json.
+    /// A whole vehicle as ONE GLB: its model with the parts of one of its
+    /// configurations fitted (truck bed or box, bumpers, light bars, the
+    /// stock alternatives the fitted parts choose), in the configuration's
+    /// part colours and paint colour, with rims and tyres on the wheel
+    /// bones. Skinned to the vehicle's skeleton. Needs levels, packs and
+    /// data indexed. With --list, prints the vehicle's configurations
+    /// instead.
+    Vehicle {
+        /// Vehicle model name (benson, comet7).
+        name: String,
+        /// Output .glb path (textures go beside it).
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+        /// Which configuration (0 = the first; see --list).
+        #[arg(long, default_value_t = 0)]
+        config: usize,
+        /// Leave the wheels out.
+        #[arg(long)]
+        no_wheels: bool,
+        /// Print the vehicle's configurations (colour, part count) and stop.
+        #[arg(long)]
+        list: bool,
+        /// A vehicles.json from `sixng vehicles` (default: built now, into
+        /// the output folder).
+        #[arg(long)]
+        data: Option<PathBuf>,
+        /// Archive with the vehicle models.
+        #[arg(long, default_value = "levels")]
+        archive: String,
+        /// Texture output: png, dds, or both.
+        #[arg(long, default_value = "png")]
+        tex: String,
+    },
     Vehicles {
         /// Archive (default packs).
         #[arg(default_value = "packs")]
@@ -1616,6 +1649,34 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let t = Instant::now();
             let v = sixng_core::pso::export_handling(&a, &sel, &names, po)?;
             out.print(&json!({"ok": true, "archive": a.id, "stats": v, "seconds": t.elapsed().as_secs_f64()}));
+        }
+        Cmd::Vehicle { name, out: glb, config, no_wheels, list, data, archive, tex } => {
+            let t = Instant::now();
+            let dir = glb.as_ref().and_then(|g| g.parent().map(|p| p.to_path_buf())).filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| PathBuf::from("."));
+            let file = match data {
+                Some(d) => d.clone(),
+                None => {
+                    sixng_core::vehicles::build(&ws, &dir)?;
+                    dir.join("vehicles").join("vehicles.json")
+                }
+            };
+            let all: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?)?;
+            let want = name.to_ascii_lowercase();
+            let Some(v) = all["vehicles"].as_array().into_iter().flatten().find(|v| v["model"].as_str().is_some_and(|m| m.eq_ignore_ascii_case(&want))) else {
+                bail!("no vehicle named {name} in {}", file.display());
+            };
+            if *list {
+                let cfgs: Vec<serde_json::Value> = v["configurations"].as_array().into_iter().flatten().enumerate().map(|(i, c)| json!({"config": i, "colour": c["colour"]["rgb"], "parts": c["parts"].as_array().map_or(0, |p| p.len()), "parts_key": c["parts_key"]})).collect();
+                out.print(&json!({"ok": true, "vehicle": want, "configurations": cfgs}));
+                return Ok(());
+            }
+            let Some(glb) = glb else { bail!("give the output file with -o <file.glb>") };
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            let oa = OutArgs { out: dir.clone(), tex: tex.clone(), raw: false, force: true, no_embedded_textures: false, dry_run: false, body_shape: None, head_skin: 0, paint: None };
+            let mut r = sixng_core::vehexport::export_vehicle(&a, &ix, v, *config, !*no_wheels, glb, &oa.opts())?;
+            r["seconds"] = t.elapsed().as_secs_f64().into();
+            out.print(&json!({"ok": true, "result": r}));
         }
         Cmd::Vehicles { archive, out: po } => {
             let a = ws.resolve(archive)?;
