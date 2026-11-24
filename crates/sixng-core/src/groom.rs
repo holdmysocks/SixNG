@@ -494,6 +494,7 @@ impl Groom {
     pub fn coat_glb(&self, name: &str, coat: &Coat, width: f32, guide_rgb: &[[u8; 3]], extras: serde_json::Value) -> Vec<u8> {
         let k = coat.k;
         let n = coat.guides.len();
+        let mut tan: Vec<[f32; 4]> = Vec::with_capacity(coat.guides.len() * coat.k * 2);
         let (mut pos, mut nrm, mut tint, mut idx) = (Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k.saturating_sub(1) * 6));
         let flat_taper = self.taper.iter().all(|&b| b == 0);
         for s in 0..n {
@@ -510,6 +511,9 @@ impl Groom {
                 let p = coat.points[s * k + j];
                 let (a, b) = (coat.points[s * k + j.saturating_sub(1)], coat.points[s * k + (j + 1).min(k - 1)]);
                 let t = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                // the strand's direction, for the hair lighting
+                let tl = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt();
+                let dir = if tl > 1e-12 { [t[0] / tl, t[1] / tl, t[2] / tl, 1.0] } else { [0.0, 0.0, 1.0, 1.0] };
                 // across the strand, in the skin's plane
                 let mut side = [t[1] * nr[2] - t[2] * nr[1], t[2] * nr[0] - t[0] * nr[2], t[0] * nr[1] - t[1] * nr[0]];
                 let l = (side[0] * side[0] + side[1] * side[1] + side[2] * side[2]).sqrt();
@@ -520,6 +524,7 @@ impl Groom {
                 for sg in [-1.0f32, 1.0] {
                     pos.push([p[0] + side[0] * r * sg, p[1] + side[1] * r * sg, p[2] + side[2] * r * sg]);
                     nrm.push(nr);
+                    tan.push(dir);
                     tint.push(c);
                 }
             }
@@ -528,13 +533,13 @@ impl Groom {
                 idx.extend_from_slice(&[v0, v0 + 1, v0 + 3, v0, v0 + 3, v0 + 2]);
             }
         }
-        let prim = crate::gltf::TriPrim { name: name.to_string(), positions: pos, normals: Some(nrm), tangents: None, uvs: vec![], colors: None, colors1: None, tint: Some(tint), indices: idx, material: Some(0), joints: None, weights: None, joints1: None, weights1: None };
+        let prim = crate::gltf::TriPrim { name: name.to_string(), positions: pos, normals: Some(nrm), tangents: Some(tan), uvs: vec![], colors: None, colors1: None, tint: Some(tint), indices: idx, material: Some(0), joints: None, weights: None, joints1: None, weights1: None };
         let mat = crate::gltf::Material {
             name: "fur".into(),
             base_color_uri: None,
             normal_uri: None,
             gltf: serde_json::json!({"doubleSided": true, "pbrMetallicRoughness": {"baseColorFactor": [1.0, 1.0, 1.0, 1.0], "metallicFactor": 0.0, "roughnessFactor": 0.85}}),
-            extras: serde_json::json!({"note": "interpolated coat: the stored per-triangle strand counts, strands blended from the three guides; placement, clumping and curl are not the game's. COLOR_0 = skin colour under the root (a display choice)"}),
+            extras: serde_json::json!({"classification": {"class": "hair"}, "note": "interpolated coat: the stored per-triangle strand counts, strands blended from the three guides; placement, clumping and curl are not the game's. COLOR_0 = skin colour under the root (a display choice)"}),
         };
         crate::gltf::mesh_glb(name, &[crate::gltf::NodeGroup { name: name.to_string(), prims: vec![prim] }], &[mat], &[], extras)
     }

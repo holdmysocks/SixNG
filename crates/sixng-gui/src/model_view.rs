@@ -352,7 +352,9 @@ impl HairTone {
                     (Some(n), Some(uv)) => n.at([uv[0] * tiling, uv[1] * tiling]),
                     _ => sixng_core::hairtone::scatter(s),
                 };
-                sixng_core::hairtone::strand(&self.preset, n).map(|c| ((c as f32 / 255.0).powf(2.2) * 255.0 + 0.5) as u8)
+                // the stored colours as they are: the hair lighting works from them
+                let (a, b) = (self.preset.a, self.preset.b);
+                [0, 1, 2].map(|q| (a[q] as f32 * n + b[q] as f32 * (1.0 - n)) / 255.0).map(|c| (c.powf(2.2) * 255.0 + 0.5) as u8)
             })
             .collect()
     }

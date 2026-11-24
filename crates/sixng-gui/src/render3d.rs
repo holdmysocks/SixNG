@@ -408,6 +408,7 @@ pub fn class_id(c: &str) -> u32 {
         "terrain_multilayer" => 9,
         "car_paint" => 10,
         "map_tile" => 11,
+        "hair" => 12,
         _ => 1,
     }
 }

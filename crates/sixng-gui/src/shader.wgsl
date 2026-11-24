@@ -184,6 +184,67 @@ fn weave_gain(g: f32) -> f32 {
     return 1.0 + 0.5 * (g - 0.5);
 }
 
+
+// Hair and fur strands (material class 12): a three-lobe fibre model.
+// R, TT and TRT lobes with a Gaussian along the strand and the published
+// fits around it (Karis, "Physically Based Hair Shading in Unreal"), plus
+// its multiple-scattering term. What is taken from the game's own hair
+// lighting program: the index of refraction (F0 = 0.046461) and the
+// absorption of the base colour, sigma = 0.0478501 ln(colour)^2 per
+// channel. The game weights its lobes with four lookup tables; those are
+// not used here yet, so the lobe shapes are the published fits.
+fn hair_g(b: f32, theta: f32) -> f32 {
+    return exp(-0.5 * theta * theta / (b * b)) / (2.5066283 * b);
+}
+
+fn hair_f(c: f32) -> f32 {
+    let f0 = 0.046461;
+    return f0 + (1.0 - f0) * pow(1.0 - c, 5.0);
+}
+
+// Transmittance of the fibre for a path of `p` fibre widths.
+fn hair_t(colour: vec3<f32>, p: f32) -> vec3<f32> {
+    let lc = log(max(colour, vec3(0.0001)));
+    return exp(-0.0478501 * lc * lc * p);
+}
+
+fn hair_light(colour: vec3<f32>, t: vec3<f32>, v: vec3<f32>, l: vec3<f32>, rough: f32, scatter: f32) -> vec3<f32> {
+    let vol = dot(v, l);
+    let sin_l = clamp(dot(t, l), -1.0, 1.0);
+    let sin_v = clamp(dot(t, v), -1.0, 1.0);
+    let cos_d = cos(0.5 * abs(asin(sin_v) - asin(sin_l)));
+    let lp = l - sin_l * t;
+    let vp = v - sin_v * t;
+    let cos_phi = dot(lp, vp) * inverseSqrt(dot(lp, lp) * dot(vp, vp) + 0.0001);
+    let cos_half = sqrt(clamp(0.5 + 0.5 * cos_phi, 0.0, 1.0));
+    let n_p = 1.19 / cos_d + 0.36 * cos_d;
+    let shift = 0.035;
+    let r2 = rough * rough;
+    var s = vec3(0.0);
+    // R: light reflected off the surface of the fibre
+    let m_r = hair_g(r2 * 1.4142135 * cos_half + 0.02, sin_l + sin_v + 2.0 * shift);
+    s += vec3(m_r * 0.25 * cos_half * hair_f(sqrt(clamp(0.5 + 0.5 * vol, 0.0, 1.0))));
+    // TT: light passing through the fibre
+    let a = 1.0 / n_p;
+    let h = cos_half * (1.0 + a * (0.6 - 0.8 * cos_phi));
+    let f_tt = hair_f(cos_d * sqrt(clamp(1.0 - h * h, 0.0, 1.0)));
+    let m_tt = hair_g(r2 * 0.5 + 0.02, sin_l + sin_v - shift);
+    let t_tt = hair_t(colour, 0.5 * sqrt(max(1.0 - h * h * a * a, 0.0)) / cos_d * 2.0);
+    s += m_tt * exp(-3.65 * cos_phi - 3.98) * (1.0 - f_tt) * (1.0 - f_tt) * t_tt;
+    // TRT: light reflected once inside the fibre
+    let f_trt = hair_f(cos_d * 0.5);
+    let m_trt = hair_g(r2 * 2.0 + 0.02, sin_l + sin_v - 4.0 * shift);
+    let t_trt = hair_t(colour, 0.8 / cos_d * 2.0);
+    s += m_trt * exp(17.0 * cos_phi - 16.78) * (1.0 - f_trt) * (1.0 - f_trt) * f_trt * t_trt;
+    // many fibres: light scattered between strands
+    let kajiya = 1.0 - abs(sin_l);
+    let fake_n = normalize(v - t * sin_v);
+    let ndl = clamp((dot(fake_n, l) + 1.0) * 0.25, 0.0, 1.0);
+    // (in full light the published model adds no tint to this term)
+    s += sqrt(colour) * (mix(ndl, kajiya, 0.33) * scatter / 3.14159);
+    return max(s, vec3(0.0));
+}
+
 @fragment
 fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let has = M.flags.x;
@@ -418,6 +479,13 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let env = mix(sky(r), (F.sky_top.rgb + F.sky_hor.rgb) * 0.5, rough) * F.misc.w;
     var col = direct * ao_direct + kd * albedo * amb_d * ao + env * fr_v * ao + emissive;
     col += pearl * pow(1.0 - ndv, 2.0) * 0.6;
+    if (cls == 12u) {
+        // strands: the fibre model on the strand's direction (the tangent)
+        let tdir = normalize(i.tan.xyz);
+        let sun = F.sun_col.rgb * F.sun_dir.w * 3.0;
+        let amb_h = sqrt(albedo) * 0.5 * (neutral(F.sky_top.rgb, 0.8) + neutral(F.sky_hor.rgb, 0.8) * 0.6) * 0.5 * F.misc.w;
+        col = hair_light(albedo, tdir, v, l, 0.33, 0.5) * sun * ao_direct + amb_h * ao;
+    }
     if (cls == 11u) {
         // baked map tiles (already hill-shaded): soft diffuse, no sky reflection
         col = albedo * (0.55 * F.sun_col.rgb * F.sun_dir.w * (0.35 + 0.65 * ndl) + 0.7 * amb_d);
