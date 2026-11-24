@@ -60,8 +60,7 @@ mod macos {
         residency: ResidencySet,
         size: PhysicalSize<u32>,
         has_presented: bool,
-        frame_presentation:
-            crate::frame_presentation_mtl4::FramePresentationMtl4,
+        frame_presentation: crate::frame_presentation_mtl4::FramePresentationMtl4,
     }
 
     impl Renderer {
@@ -111,8 +110,11 @@ mod macos {
             queue.add_residency_set(&residency)?;
             let painter = super::super::metal4_egui::Painter::new(&device)?;
             let scene = crate::render3d_metal4::Renderer3D4::new(&device, &queue)?;
+            let refresh_rate = window
+                .current_monitor()
+                .and_then(|monitor| monitor.refresh_rate_millihertz());
             let mut frame_presentation =
-                crate::frame_presentation_mtl4::FramePresentationMtl4::new();
+                crate::frame_presentation_mtl4::FramePresentationMtl4::new(refresh_rate);
             frame_presentation.resize(&device, size)?;
             frame_presentation.start()?;
 
@@ -140,23 +142,44 @@ mod macos {
             Ok(())
         }
 
+        fn set_refresh_rate_millihertz(&mut self, rate: Option<u32>) {
+            self.frame_presentation.set_refresh_rate_millihertz(rate);
+            if rate.is_none_or(|rate| rate < 119_500)
+                && self.scene.frame_generation_mode()
+                    == crate::render3d_metal4::FrameGenerationMode::Interpolate120
+            {
+                eprintln!("[frame-generation] disabled: active display is not 120 Hz");
+                self.scene
+                    .set_frame_generation_mode(crate::render3d_metal4::FrameGenerationMode::Off);
+            }
+        }
+
         fn render(
             &mut self,
             ctx: &egui::Context,
             mut output: egui::FullOutput,
         ) -> anyhow::Result<()> {
+            if self.scene.frame_generation_mode()
+                == crate::render3d_metal4::FrameGenerationMode::Interpolate120
+                && !self.frame_presentation.supports_frame_generation()
+            {
+                eprintln!("[frame-generation] disabled: active display is not 120 Hz");
+                self.scene
+                    .set_frame_generation_mode(crate::render3d_metal4::FrameGenerationMode::Off);
+            }
             let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
             if self.scene.frame_generation_mode()
                 == crate::render3d_metal4::FrameGenerationMode::Interpolate120
             {
-                let texture = if self.frame_presentation.phase()
+                let (texture, presented_interpolated) = if self.frame_presentation.phase()
                     == crate::frame_presentation_mtl4::FramePhase::Real
                 {
-                    self.scene.real_output_texture()
+                    (self.scene.real_output_texture(), false)
                 } else {
-                    self.scene
-                        .interpolated_output_texture()
-                        .or_else(|| self.scene.real_output_texture())
+                    match self.scene.interpolated_output_texture() {
+                        Some(texture) => (Some(texture), true),
+                        None => (self.scene.real_output_texture(), false),
+                    }
                 };
                 if let Some(texture) = texture {
                     self.painter.register_external_texture(
@@ -173,7 +196,7 @@ mod macos {
                     &primitives,
                     &mut output.textures_delta,
                 )?;
-                self.frame_presentation.advance();
+                self.frame_presentation.advance(presented_interpolated);
             } else {
                 if let Some(texture) = self.scene.output_texture() {
                     self.painter.register_external_texture(
@@ -252,8 +275,7 @@ mod macos {
                 return;
             };
             renderer.scene.set_frame_generation_real_slot(
-                renderer.frame_presentation.phase()
-                    == crate::frame_presentation_mtl4::FramePhase::Real,
+                renderer.frame_presentation.should_render_real_frame(),
             );
             let mut output = self.egui_ctx.run_ui(input, |ui| {
                 self.sixng.logic(ui.ctx());
@@ -291,12 +313,18 @@ mod macos {
             if renderer.scene.frame_generation_mode()
                 == crate::render3d_metal4::FrameGenerationMode::Interpolate120
             {
-                let interval = renderer.frame_presentation.pacing_interval();
+                let Some(interval) = renderer.frame_presentation.pacing_interval() else {
+                    self.fail(
+                        event_loop,
+                        anyhow::anyhow!("frame generation requires a 120 Hz display"),
+                    );
+                    return;
+                };
                 self.repaint_at = Some(renderer.frame_presentation.schedule(interval));
-                let (real, interpolated) = renderer.frame_presentation.counts();
-                if (real + interpolated).is_multiple_of(120) {
+                let (real, interpolated, fallback) = renderer.frame_presentation.counts();
+                if (real + interpolated + fallback).is_multiple_of(120) {
                     eprintln!(
-                        "[frame-generation] presented real={real} interpolated={interpolated}"
+                        "[frame-generation] presented real={real} interpolated={interpolated} fallback={fallback}"
                     );
                 }
                 event_loop.set_control_flow(ControlFlow::WaitUntil(
@@ -394,6 +422,12 @@ mod macos {
                             self.fail(event_loop, error);
                             return;
                         }
+                        renderer.set_refresh_rate_millihertz(
+                            self.window
+                                .as_ref()
+                                .and_then(|window| window.current_monitor())
+                                .and_then(|monitor| monitor.refresh_rate_millihertz()),
+                        );
                     }
                     if let Some(window) = self.window.as_ref() {
                         window.request_redraw();
@@ -410,6 +444,11 @@ mod macos {
                                 self.fail(event_loop, error);
                                 return;
                             }
+                            renderer.set_refresh_rate_millihertz(
+                                window
+                                    .current_monitor()
+                                    .and_then(|monitor| monitor.refresh_rate_millihertz()),
+                            );
                         }
                     }
                     if let Some(window) = self.window.as_ref() {

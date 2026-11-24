@@ -10,13 +10,14 @@ use metal_rust::metal::{
     IndexType, Library, LoadAction, PixelFormat, PrimitiveTopologyClass, PrimitiveType,
     RenderPassDepthAttachmentDescriptor, RenderStages, ResidencyAllocation, ResidencySet,
     ResidencySetDescriptor, ResourceOptions, SamplerAddressMode, SamplerDescriptor,
-    SamplerMinMagFilter, SamplerState, StoreAction, Texture, TextureDescriptor, TextureUsage,
+    SamplerMinMagFilter, SamplerState, Stages, StoreAction, Texture, TextureDescriptor,
+    TextureUsage,
 };
 use metal_rust::metal4::{
     ArgumentTable, ArgumentTableDescriptor, BlendState, BufferImageLayout, CommandQueue,
     CompilerDescriptor, LibraryDescriptor, LibraryFunctionDescriptor, RecordingRenderEncoder,
     RenderPassDescriptor, RenderPipelineBuildDescriptor, RenderPipelineColorAttachmentDescriptor,
-    RenderPipelineDescriptor, TextureOriginSelection, TextureRegionSelection,
+    RenderPipelineDescriptor, TextureOriginSelection, TextureRegionSelection, VisibilityOptions,
 };
 use metal_rust::metal_fx::FrameInterpolatorDescriptor;
 use std::collections::HashMap;
@@ -272,7 +273,6 @@ impl TemporalUpscaleMode {
             Self::Scale200 => 2.0,
         }
     }
-
 }
 
 fn halton(index: u32, base: u32) -> f32 {
@@ -663,8 +663,16 @@ mod texture_cache_tests {
         let now = std::time::SystemTime::now();
         trim_texture_cache_entries(
             vec![
-                (Some(now - std::time::Duration::from_secs(2)), oldest.clone(), 100),
-                (Some(now - std::time::Duration::from_secs(1)), retained.clone(), 100),
+                (
+                    Some(now - std::time::Duration::from_secs(2)),
+                    oldest.clone(),
+                    100,
+                ),
+                (
+                    Some(now - std::time::Duration::from_secs(1)),
+                    retained.clone(),
+                    100,
+                ),
                 (Some(now), protected.clone(), 100),
             ],
             200,
@@ -1019,9 +1027,7 @@ impl Renderer3D4 {
     pub fn new(device: &Device, queue: &CommandQueue) -> anyhow::Result<Self> {
         let io_queue = (|| -> anyhow::Result<_> {
             let descriptor = metal_rust::metal::IOCommandQueueDescriptor::new()?;
-            descriptor.set_type(
-                metal_rust::metal::IOCommandQueueType::IOCommandQueueTypeSerial,
-            )?;
+            descriptor.set_type(metal_rust::metal::IOCommandQueueType::IOCommandQueueTypeSerial)?;
             descriptor.set_max_command_buffer_count(8)?;
             descriptor.set_max_commands_in_flight(8)?;
             Ok(device.new_io_command_queue(&descriptor)?)
@@ -1511,7 +1517,12 @@ impl Renderer3D4 {
                 base: material.base_factor,
                 // w: gap in bits 0-1; bit 10 = vehicle parts coloured per
                 // vertex (the tint alpha 254 marks the primary body paint)
-                flags: [has, class, alpha, gap | if material.parts { 0x400 } else { 0 }],
+                flags: [
+                    has,
+                    class,
+                    alpha,
+                    gap | if material.parts { 0x400 } else { 0 },
+                ],
             };
             let offset = material_index * MATERIAL_STRIDE;
             material_data[offset..offset + std::mem::size_of::<Material4>()]
@@ -1853,13 +1864,19 @@ impl Renderer3D4 {
 
     pub fn output_texture(&self) -> Option<Texture> {
         self.target.as_ref().and_then(|target| {
-            target.upscale.clone().or_else(|| Some(target.color.clone()))
+            target
+                .upscale
+                .clone()
+                .or_else(|| Some(target.color.clone()))
         })
     }
 
     pub fn real_output_texture(&self) -> Option<Texture> {
         self.target.as_ref().and_then(|target| {
-            target.upscale.clone().or_else(|| Some(target.color.clone()))
+            target
+                .upscale
+                .clone()
+                .or_else(|| Some(target.color.clone()))
         })
     }
 
@@ -1959,11 +1976,13 @@ impl Renderer3D4 {
         let mut draw_count = 0u32;
         {
             let encoder = command_buffer.render_encoder(&pass, None)?;
-            encoder.set_render_pipeline_state(if self.temporal_mode == TemporalUpscaleMode::Off {
-                &self.pipeline
-            } else {
-                &self.temporal_pipeline
-            })?;
+            encoder.set_render_pipeline_state(
+                if self.temporal_mode == TemporalUpscaleMode::Off {
+                    &self.pipeline
+                } else {
+                    &self.temporal_pipeline
+                },
+            )?;
             encoder.set_depth_stencil_state(Some(&self.depth_state))?;
             encoder.set_argument_table(
                 Some(&self.argument_table),
@@ -2075,12 +2094,7 @@ impl Renderer3D4 {
             scaler.set_input_content_height(render_size[1] as usize)?;
             scaler.encode_to_command_buffer(&mut command_buffer)?;
         }
-        if let (
-            Some(interpolator),
-            Some(upscale),
-            Some(prev_upscale),
-            Some(interpolated),
-        ) = (
+        if let (Some(interpolator), Some(upscale), Some(prev_upscale), Some(interpolated)) = (
             self.frame_interpolator.as_ref(),
             target.upscale.as_ref(),
             target.prev_upscale.as_ref(),
@@ -2119,6 +2133,11 @@ impl Renderer3D4 {
             }
 
             let copy_encoder = command_buffer.compute_encoder()?;
+            copy_encoder.barrier_after_queue_stages(
+                Stages::StageDispatch,
+                Stages::StageBlit,
+                VisibilityOptions::VisibilityOptionDevice,
+            )?;
             copy_encoder.copy_texture(upscale, prev_upscale)?;
             copy_encoder.end()?;
             self.previous_real_frame_time = Some(now);
@@ -2228,18 +2247,14 @@ impl Renderer3D4 {
                 (size[1] as f32 * self.temporal_mode.scale()).ceil() as u32,
             ]
         };
-        if self
-            .target
-            .as_ref()
-            .is_some_and(|target| {
-                target.size == size
-                    && target.display_size == display_size
-                    && target.prev_upscale.is_some()
-                        == (self.frame_generation_mode != FrameGenerationMode::Off)
-                    && target.interpolated.is_some()
-                        == (self.frame_generation_mode != FrameGenerationMode::Off)
-            })
-        {
+        if self.target.as_ref().is_some_and(|target| {
+            target.size == size
+                && target.display_size == display_size
+                && target.prev_upscale.is_some()
+                    == (self.frame_generation_mode != FrameGenerationMode::Off)
+                && target.interpolated.is_some()
+                    == (self.frame_generation_mode != FrameGenerationMode::Off)
+        }) {
             return Ok(());
         }
 
@@ -2276,7 +2291,9 @@ impl Renderer3D4 {
                 display_size[0] as usize,
                 display_size[1] as usize,
                 ResourceOptions::PRIVATE,
-                TextureUsage::RENDER_TARGET.union(TextureUsage::SHADER_READ).union(TextureUsage::SHADER_WRITE),
+                TextureUsage::RENDER_TARGET
+                    .union(TextureUsage::SHADER_READ)
+                    .union(TextureUsage::SHADER_WRITE),
             )?;
             Some(self.device.new_texture(&output_descriptor)?)
         };
@@ -2324,7 +2341,10 @@ impl Renderer3D4 {
             },
         )?;
         let depth = self.device.new_texture(&depth_descriptor)?;
-        let mut allocations = vec![ResidencyAllocation::Texture(&color), ResidencyAllocation::Texture(&motion)];
+        let mut allocations = vec![
+            ResidencyAllocation::Texture(&color),
+            ResidencyAllocation::Texture(&motion),
+        ];
         if self.temporal_mode != TemporalUpscaleMode::Off {
             allocations.push(ResidencyAllocation::Texture(&depth));
         }
@@ -2341,7 +2361,10 @@ impl Renderer3D4 {
         self.residency.commit()?;
 
         if let Some(old) = self.target.take() {
-            let mut removals = vec![ResidencyAllocation::Texture(&old.color), ResidencyAllocation::Texture(&old.motion)];
+            let mut removals = vec![
+                ResidencyAllocation::Texture(&old.color),
+                ResidencyAllocation::Texture(&old.motion),
+            ];
             if old.depth_resident {
                 removals.push(ResidencyAllocation::Texture(&old.depth));
             }
@@ -2788,7 +2811,10 @@ mod tests {
         let mut renderer = Renderer3D4::new(&device, &queue)?;
         renderer.set_temporal_upscale_mode(TemporalUpscaleMode::Scale200);
         renderer.ensure_target([16, 12])?;
-        let target = renderer.target.as_ref().context("MTL4 temporal target missing")?;
+        let target = renderer
+            .target
+            .as_ref()
+            .context("MTL4 temporal target missing")?;
         if renderer.temporal_scaler.is_some() {
             assert_eq!(target.display_size, [32, 24]);
             assert!(target.upscale.is_some());
@@ -2823,7 +2849,10 @@ mod tests {
 
         renderer.set_frame_generation_mode(FrameGenerationMode::Interpolate120);
         renderer.ensure_target([32, 32])?;
-        assert_eq!(renderer.frame_generation_mode(), FrameGenerationMode::Interpolate120);
+        assert_eq!(
+            renderer.frame_generation_mode(),
+            FrameGenerationMode::Interpolate120
+        );
         assert!(renderer.target.as_ref().unwrap().prev_upscale.is_some());
         assert!(renderer.target.as_ref().unwrap().interpolated.is_some());
 

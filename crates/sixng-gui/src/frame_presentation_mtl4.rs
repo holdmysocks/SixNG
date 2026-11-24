@@ -4,23 +4,28 @@ use winit::dpi::PhysicalSize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FramePhase {
-    Real,
     Interpolated,
+    Real,
 }
+
 pub struct FramePresentationMtl4 {
     next_deadline: Instant,
     phase: FramePhase,
     real_presents: u64,
     interpolated_presents: u64,
+    fallback_presents: u64,
+    refresh_rate_millihertz: Option<u32>,
 }
 
 impl FramePresentationMtl4 {
-    pub fn new() -> Self {
+    pub fn new(refresh_rate_millihertz: Option<u32>) -> Self {
         Self {
             next_deadline: Instant::now(),
-            phase: FramePhase::Real,
+            phase: FramePhase::Interpolated,
             real_presents: 0,
             interpolated_presents: 0,
+            fallback_presents: 0,
+            refresh_rate_millihertz,
         }
     }
     pub fn start(&mut self) -> anyhow::Result<()> {
@@ -46,40 +51,59 @@ impl FramePresentationMtl4 {
         Ok(())
     }
 
-    pub fn advance(&mut self) {
+    pub fn advance(&mut self, presented_interpolated: bool) {
         match self.phase {
+            FramePhase::Interpolated if presented_interpolated => {
+                self.interpolated_presents += 1;
+                self.phase = FramePhase::Real;
+            }
+            FramePhase::Interpolated => {
+                self.fallback_presents += 1;
+                self.phase = FramePhase::Real;
+            }
             FramePhase::Real => {
                 self.real_presents += 1;
                 self.phase = FramePhase::Interpolated;
             }
-            FramePhase::Interpolated => {
-                self.interpolated_presents += 1;
-                self.phase = FramePhase::Real;
-            }
         }
     }
 
-    pub fn pacing_interval(&self) -> Duration {
-        if self.phase == FramePhase::Real {
-            Duration::from_micros(4167)
-        } else {
-            Duration::from_micros(4166)
-        }
+    pub fn pacing_interval(&self) -> Option<Duration> {
+        self.refresh_rate_millihertz
+            .filter(|rate| *rate >= 119_500)
+            .map(|rate| Duration::from_nanos(1_000_000_000_000 / rate as u64))
+    }
+
+    pub fn set_refresh_rate_millihertz(&mut self, rate: Option<u32>) {
+        self.refresh_rate_millihertz = rate;
+    }
+
+    pub fn supports_frame_generation(&self) -> bool {
+        self.pacing_interval().is_some()
     }
 
     pub fn phase(&self) -> FramePhase {
         self.phase
     }
 
-    pub fn counts(&self) -> (u64, u64) {
-        (self.real_presents, self.interpolated_presents)
+    pub fn should_render_real_frame(&self) -> bool {
+        self.phase == FramePhase::Interpolated
+    }
+
+    pub fn counts(&self) -> (u64, u64, u64) {
+        (
+            self.real_presents,
+            self.interpolated_presents,
+            self.fallback_presents,
+        )
     }
 
     pub fn reset(&mut self) {
-        self.phase = FramePhase::Real;
+        self.phase = FramePhase::Interpolated;
         self.next_deadline = Instant::now();
         self.real_presents = 0;
         self.interpolated_presents = 0;
+        self.fallback_presents = 0;
     }
 }
 
@@ -89,21 +113,34 @@ mod tests {
 
     #[test]
     fn phase_alternates_real_and_interpolated() {
-        let mut presentation = FramePresentationMtl4::new();
-        assert_eq!(presentation.phase(), FramePhase::Real);
-        presentation.advance();
+        let mut presentation = FramePresentationMtl4::new(Some(120_000));
         assert_eq!(presentation.phase(), FramePhase::Interpolated);
-        presentation.advance();
+        presentation.advance(true);
         assert_eq!(presentation.phase(), FramePhase::Real);
-        assert_eq!(presentation.counts(), (1, 1));
+        presentation.advance(false);
+        assert_eq!(presentation.phase(), FramePhase::Interpolated);
+        assert_eq!(presentation.counts(), (1, 1, 0));
     }
 
     #[test]
     fn pacing_advances_without_deadline_drift() {
-        let mut presentation = FramePresentationMtl4::new();
+        let mut presentation = FramePresentationMtl4::new(Some(120_000));
         let interval = Duration::from_micros(8_333);
         let first = presentation.schedule(interval);
         let second = presentation.schedule(interval);
         assert!(second >= first + interval);
+    }
+
+    #[test]
+    fn fallback_is_not_counted_as_interpolation() {
+        let mut presentation = FramePresentationMtl4::new(Some(120_000));
+        presentation.advance(false);
+        assert_eq!(presentation.counts(), (0, 0, 1));
+    }
+
+    #[test]
+    fn frame_generation_requires_120hz_display() {
+        assert!(!FramePresentationMtl4::new(Some(60_000)).supports_frame_generation());
+        assert!(FramePresentationMtl4::new(Some(120_000)).supports_frame_generation());
     }
 }
