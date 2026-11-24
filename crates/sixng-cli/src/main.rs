@@ -322,10 +322,16 @@ enum Cmd {
         /// Look up these labels (names or 0x-hashes, comma-separated) and print their strings.
         #[arg(long, value_delimiter = ',')]
         label: Vec<String>,
+        /// Search the strings with a regex (case-insensitive, matched on the text without its inline markup) and print the hits: label hash, text, and how many tables hold it.
+        #[arg(long)]
+        find: Option<String>,
+        /// Most hits --find prints.
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
         /// Strip the inline markup (~sl:…~, ~b~, ~n~ …) from printed strings.
         #[arg(long)]
         plain: bool,
-        /// Output directory (needed unless --label is given).
+        /// Output directory (needed unless --label or --find is given).
         #[arg(long, short)]
         out: Option<PathBuf>,
     },
@@ -918,7 +924,7 @@ enum Cmd {
         /// Regex on the name.
         #[arg(long)]
         name: Option<String>,
-        /// "character" or "animal".
+        /// "character", "animal" or "model" (only the game's ped model list).
         #[arg(long)]
         kind: Option<String>,
         /// Archive holding the parts.
@@ -1428,11 +1434,21 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
             let re = name.as_deref().map(|n| regex::RegexBuilder::new(n).case_insensitive(true).build()).transpose()?;
-            let v: Vec<_> = sixng_core::outfit::characters(&ix)
-                .into_iter()
-                .filter(|c| re.as_ref().is_none_or(|r| r.is_match(&c.name)) && kind.as_deref().is_none_or(|k| k == c.kind))
-                .collect();
-            out.print(&json!({"ok": true, "archive": a.id, "count": v.len(), "characters": v}));
+            let all = sixng_core::outfit::characters(&ix);
+            let listed: std::collections::HashSet<String> = all.iter().map(|c| c.name.clone()).collect();
+            let v: Vec<_> = all.into_iter().filter(|c| re.as_ref().is_none_or(|r| r.is_match(&c.name)) && kind.as_deref().is_none_or(|k| k == c.kind)).collect();
+            // every model of the game's outfit list, named where a name is known
+            let (models, models_note) = match sixng_core::pedlook::listed_models(&ws.game) {
+                Ok(m) => (
+                    m.into_iter()
+                        .filter(|m| re.as_ref().is_none_or(|r| r.is_match(&m.name)) && kind.as_deref().is_none_or(|k| k == "model"))
+                        .map(|m| json!({"name": m.name, "hash": m.hash, "named": m.named, "outfits": m.outfits, "listed_as_character": listed.contains(&m.name)}))
+                        .collect::<Vec<_>>(),
+                    None,
+                ),
+                Err(e) => (Vec::new(), Some(e)),
+            };
+            out.print(&json!({"ok": true, "archive": a.id, "count": v.len(), "characters": v, "models_count": models.len(), "models_named": models.iter().filter(|m| m["named"] == true).count(), "models": models, "models_note": models_note}));
         }
         Cmd::Clips { dict, name, limit } => {
             let re = name.as_deref().map(|n| regex::RegexBuilder::new(n).case_insensitive(true).build()).transpose()?;
@@ -1627,13 +1643,29 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             out.print(&json!({"ok": true, "archive": a.id, "cloth": n, "errors": errors,
                 "seconds": t.elapsed().as_secs_f64(), "index": po.join("cloth").join(a.id.trim_end_matches(".rpf")).join("index.jsonl")}));
         }
-        Cmd::Text { archive, only, label, plain, out: po } => {
+        Cmd::Text { archive, only, label, find, limit, plain, out: po } => {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
             let t = Instant::now();
             let only: Vec<u64> = only.iter().filter_map(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()).collect();
             let (tables, errors) = sixng_core::text::read_all(&a, &ix.entries, &only, pr)?;
-            if !label.is_empty() {
+            if let Some(q) = find {
+                let re = regex::RegexBuilder::new(q).case_insensitive(true).build()?;
+                // one copy of a string per language table: group by label and text
+                let mut hits: std::collections::BTreeMap<(u32, String), (usize, String)> = Default::default();
+                for tb in &tables {
+                    for (h, s) in &tb.strings {
+                        let p = sixng_core::text::plain(s);
+                        if re.is_match(&p) {
+                            let e = hits.entry((*h, if *plain { p } else { s.clone() })).or_insert((0, tb.id.clone()));
+                            e.0 += 1;
+                        }
+                    }
+                }
+                let total = hits.len();
+                let rows: Vec<serde_json::Value> = hits.into_iter().take(*limit).map(|((h, s), (n, first))| json!({"label": format!("{h:08x}"), "text": s, "tables": n, "first_table": first})).collect();
+                out.print(&json!({"ok": true, "archive": a.id, "tables": tables.len(), "errors": errors, "matches": total, "shown": rows.len(), "seconds": t.elapsed().as_secs_f64(), "hits": rows}));
+            } else if !label.is_empty() {
                 let keys: Vec<(String, u32)> = label
                     .iter()
                     .map(|l| {
@@ -1653,7 +1685,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     .collect();
                 out.print(&json!({"ok": true, "archive": a.id, "tables": tables.len(), "labels": found}));
             } else {
-                let Some(po) = po else { bail!("--out is needed unless --label is given") };
+                let Some(po) = po else { bail!("--out is needed unless --label or --find is given") };
                 let (n, strings) = sixng_core::text::export(&a, &tables, po)?;
                 out.print(&json!({"ok": true, "archive": a.id, "tables": n, "strings": strings, "errors": errors,
                     "seconds": t.elapsed().as_secs_f64(), "index": po.join("text").join(sixng_core::game::index_stem(&a.id)).join("index.jsonl")}));
