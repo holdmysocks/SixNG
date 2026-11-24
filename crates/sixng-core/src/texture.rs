@@ -72,6 +72,11 @@ pub enum Fmt {
 }
 
 impl Fmt {
+    /// Formats that store floats (see `to_floats`).
+    pub fn is_float(self) -> bool {
+        matches!(self, Fmt::R16f | Fmt::Rg16f | Fmt::Rgba16f | Fmt::R32f)
+    }
+
     pub fn from_dxgi(f: u32) -> Fmt {
         match f {
             70..=72 => Fmt::Bc1,
@@ -635,6 +640,30 @@ fn u32at(s: &[u8]) -> u32 {
     u32::from_le_bytes([s[0], s[1], s[2], s[3]])
 }
 
+/// The stored values of a float-format image, unclamped: channels
+/// interleaved, row by row. Returns the values and the channel count
+/// (1, 2 or 4). None for formats that do not store floats.
+pub fn to_floats(fmt: Fmt, data: &[u8], w: u32, h: u32) -> Option<(Vec<f32>, u32)> {
+    let (ch, half) = match fmt {
+        Fmt::R16f => (1, true),
+        Fmt::Rg16f => (2, true),
+        Fmt::Rgba16f => (4, true),
+        Fmt::R32f => (1, false),
+        _ => return None,
+    };
+    let n = (w as usize) * (h as usize) * ch;
+    let size = if half { 2 } else { 4 };
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        out.push(match data.get(i * size..i * size + size) {
+            Some(s) if half => f16(u16::from_le_bytes([s[0], s[1]])),
+            Some(s) => f32_or_zero(u32::from_le_bytes([s[0], s[1], s[2], s[3]])),
+            None => 0.0,
+        });
+    }
+    Some((out, ch as u32))
+}
+
 /// IEEE single float from its bits (NaN becomes 0, as in `f16`).
 fn f32_or_zero(bits: u32) -> f32 {
     let v = f32::from_bits(bits);
@@ -657,6 +686,18 @@ pub(crate) fn f16(h: u16) -> f32 {
 #[cfg(test)]
 mod alpha_tests {
     use super::*;
+
+    #[test]
+    fn floats_are_not_clamped() {
+        // half floats 2.0, -0.5, 0.25, 1.0 as one RGBA texel
+        let px: Vec<u8> = [0x4000u16, 0xb800, 0x3400, 0x3c00].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(to_floats(Fmt::Rgba16f, &px, 1, 1), Some((vec![2.0, -0.5, 0.25, 1.0], 4)));
+        assert_eq!(to_floats(Fmt::R16f, &px, 2, 2), Some((vec![2.0, -0.5, 0.25, 1.0], 1)));
+        assert_eq!(to_floats(Fmt::R32f, &3.5f32.to_le_bytes(), 1, 1), Some((vec![3.5], 1)));
+        // short data reads as 0; other formats store no floats
+        assert_eq!(to_floats(Fmt::Rg16f, &px[..4], 2, 1), Some((vec![2.0, -0.5, 0.0, 0.0], 2)));
+        assert_eq!(to_floats(Fmt::Rgba8, &px, 1, 1), None);
+    }
 
     #[test]
     fn a8_preview_preserves_alpha() {
