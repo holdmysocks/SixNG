@@ -339,6 +339,8 @@ pub struct GpuModel {
     _textures: Vec<wgpu::Texture>,
     pub joints_buf: wgpu::Buffer,
     pub frame_bg: wgpu::BindGroup,
+    /// The model's own sticker records, once it has stickers (`set_stickers`).
+    pub sticker_buf: Option<wgpu::Buffer>,
     pub instances: wgpu::Buffer,
     pub n_instances: u32,
     /// The last `n_fb` instances are coverage fallbacks (see `Instance::fallback`).
@@ -428,6 +430,7 @@ pub struct Renderer3D {
     sampler: wgpu::Sampler,
     white: wgpu::TextureView,
     dummy_joints: wgpu::Buffer,
+    stickers: StickerDefaults,
     pub default_frame_bg: wgpu::BindGroup,
     target: Option<Target>,
     /// Draw calls in the last frame.
@@ -463,6 +466,69 @@ pub struct CellGpu {
     pub bytes: u64,
     /// Any placement with a coverage-fallback range (table slot 5).
     pub has_fb: bool,
+}
+
+/// What a model without stickers binds in their place.
+#[derive(Clone)]
+struct StickerDefaults {
+    none: wgpu::Buffer,
+    view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn frame_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    frame_ub: &wgpu::Buffer,
+    joints: &wgpu::Buffer,
+    sampler: &wgpu::Sampler,
+    stickers: &wgpu::Buffer,
+    sticker_view: &wgpu::TextureView,
+    sticker_sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("frame bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: frame_ub.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: joints.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+            wgpu::BindGroupEntry { binding: 3, resource: stickers.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(sticker_view) },
+            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(sticker_sampler) },
+        ],
+    })
+}
+
+/// Sticker pictures as the layers of one square texture array: per layer
+/// its mip chain (RGBA8, `size` down to 1). Stored as plain values, not
+/// sRGB: a colour mask's channels are amounts, and the shader converts the
+/// pictures that are colours.
+pub fn sticker_array(device: &wgpu::Device, queue: &wgpu::Queue, size: u32, layers: &[Vec<Vec<u8>>]) -> wgpu::TextureView {
+    let mips = layers.iter().map(|l| l.len()).min().unwrap_or(1).max(1) as u32;
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("stickers"),
+        size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: layers.len().max(1) as u32 },
+        mip_level_count: mips,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (li, l) in layers.iter().enumerate() {
+        for (mi, px) in l.iter().take(mips as usize).enumerate() {
+            let w = (size >> mi).max(1);
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: mi as u32, origin: wgpu::Origin3d { x: 0, y: 0, z: li as u32 }, aspect: wgpu::TextureAspect::All },
+                px,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(w) },
+                wgpu::Extent3d { width: w, height: w, depth_or_array_layers: 1 },
+            );
+        }
+    }
+    tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() })
 }
 
 pub fn tex_rgba(device: &wgpu::Device, queue: &wgpu::Queue, img: &glb::Image) -> wgpu::Texture {
@@ -605,6 +671,35 @@ impl Renderer3D {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // stickers placed on a vehicle (custom liveries): their
+                // records, their pictures as layers of one array, and a
+                // clamping sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
         let tex_entry = |b: u32| wgpu::BindGroupLayoutEntry {
@@ -647,7 +742,7 @@ impl Renderer3D {
             bind_group_layouts: &[Some(&bgl_frame)],
             immediate_size: 0,
         });
-        let vattrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2, 4 => Float32x2, 5 => Unorm8x4, 6 => Uint16x4, 7 => Unorm8x4, 13 => Unorm8x4];
+        let vattrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2, 4 => Float32x2, 5 => Unorm8x4, 6 => Uint16x4, 7 => Unorm8x4, 13 => Unorm8x4, 14 => Uint8x4];
         let iattrs = wgpu::vertex_attr_array![8 => Float32x4, 9 => Float32x4, 10 => Float32x4, 11 => Float32x4, 12 => Float32x4];
         let vbufs = [
             Some(wgpu::VertexBufferLayout {
@@ -918,24 +1013,26 @@ impl Renderer3D {
             contents: bytemuck::cast_slice(&ident),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
-        let default_frame_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("frame bg"),
-            layout: &bgl_frame,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: frame_ub.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: dummy_joints.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
+        let stickers = StickerDefaults {
+            // one record: the header, which says "no stickers"
+            none: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("no stickers"),
+                contents: bytemuck::bytes_of(&crate::livery::Record::default()),
+                usage: wgpu::BufferUsages::STORAGE,
+            }),
+            view: sticker_array(device, &rs.queue, 1, &[vec![vec![255u8; 4]]]),
+            sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("stickers"),
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::MipmapFilterMode::Linear,
+                anisotropy_clamp: 8,
+                ..Default::default()
+            }),
+        };
+        let default_frame_bg = frame_bind_group(device, &bgl_frame, &frame_ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler);
         std::mem::forget(wt); // the 1x1 white texture lives for the process
                               // map cells
         let bgl_cell = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1054,6 +1151,7 @@ impl Renderer3D {
             sampler,
             white,
             dummy_joints,
+            stickers,
             default_frame_bg,
             target: None,
             draws: 0,
@@ -1117,6 +1215,7 @@ impl Renderer3D {
             sampler: self.sampler.clone(),
             white: self.white.clone(),
             bgl_cell: self.bgl_cell.clone(),
+            stickers: self.stickers.clone(),
         }
     }
 }
@@ -1139,6 +1238,7 @@ pub struct Uploader {
     sampler: wgpu::Sampler,
     white: wgpu::TextureView,
     bgl_cell: wgpu::BindGroupLayout,
+    stickers: StickerDefaults,
 }
 
 impl Uploader {
@@ -1485,24 +1585,7 @@ impl Uploader {
             .flat_map(|_| Mat4::IDENTITY.to_cols_array())
             .collect();
         queue.write_buffer(&joints_buf, 0, bytemuck::cast_slice(&ident));
-        let frame_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("frame bg model"),
-            layout: &self.bgl_frame,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.frame_ub.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: joints_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
+        let frame_bg = frame_bind_group(device, &self.bgl_frame, &self.frame_ub, &joints_buf, &self.sampler, &self.stickers.none, &self.stickers.view, &self.stickers.sampler);
         let inst = [Instance::new(Mat4::IDENTITY, !m.joints.is_empty())];
         let instances = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("inst"),
@@ -1520,6 +1603,7 @@ impl Uploader {
             _textures: textures,
             joints_buf,
             frame_bg,
+            sticker_buf: None,
             instances,
             n_instances: 1,
             n_fb: 0,
@@ -1585,6 +1669,26 @@ impl Renderer3D {
         }
         gm.n_instances = inst.len() as u32;
         gm.n_fb = n_fb as u32;
+    }
+
+    /// Give a model its stickers: the shader records (header first, see
+    /// `livery::records`) and the pictures' texture array (None while it has
+    /// none). The model keeps a buffer of its own from then on.
+    pub fn set_stickers(&self, rs: &egui_wgpu::RenderState, gm: &mut GpuModel, recs: &[crate::livery::Record], pictures: Option<&wgpu::TextureView>) {
+        let cap = crate::livery::MAX_STICKERS + 2;
+        let buf = gm.sticker_buf.get_or_insert_with(|| {
+            rs.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("stickers"),
+                size: (cap * std::mem::size_of::<crate::livery::Record>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        let n = recs.len().min(cap);
+        if n > 0 {
+            rs.queue.write_buffer(buf, 0, bytemuck::cast_slice(&recs[..n]));
+        }
+        gm.frame_bg = frame_bind_group(&rs.device, &self.bgl_frame, &self.frame_ub, &gm.joints_buf, &self.sampler, buf, pictures.unwrap_or(&self.stickers.view), &self.stickers.sampler);
     }
 
     pub fn set_joints(&self, rs: &egui_wgpu::RenderState, gm: &GpuModel, mats: &[Mat4]) {
