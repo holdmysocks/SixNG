@@ -719,7 +719,8 @@ enum Cmd {
     /// material texture parameters that have no name; with an effect regex,
     /// the textures (slot in the material's texture list, parameter and
     /// shader-variable name), constants and programs of each matching
-    /// effect. Reads the game's own reflection tables; no shader code is
+    /// effect, and its techniques with the programs of each pass. Reads the
+    /// game's own reflection tables; no shader code is
     /// decoded. With --cache, the pipeline cache says which declared
     /// resources each compiled program really reads.
     ShaderBindings {
@@ -1138,6 +1139,29 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                             .into()
                     };
                     let mut v = json!({"effect": e.name, "programs": progs(*programs)});
+                    // techniques -> passes -> the program of each stage, by name
+                    v["techniques"] = e
+                        .techniques
+                        .iter()
+                        .map(|t| {
+                            let passes: Vec<_> = t
+                                .passes
+                                .iter()
+                                .map(|ps| {
+                                    let mut o = serde_json::Map::new();
+                                    o.insert("pass".into(), json!(ps.name));
+                                    for (k, st) in stages.iter().enumerate() {
+                                        if let Some(p) = ps.programs[k].and_then(|i| e.programs[k].get(i as usize)).and_then(|&n| sh.programs.get(sh.sections[k].0 + n as usize)) {
+                                            o.insert(st.to_string(), json!(p.name));
+                                        }
+                                    }
+                                    o.insert("flags".into(), json!(ps.flags.iter().map(|b| format!("{b:02x}")).collect::<String>()));
+                                    serde_json::Value::Object(o)
+                                })
+                                .collect();
+                            json!({"technique": t.name, "passes": passes})
+                        })
+                        .collect();
                     if let Some(t) = &e.table {
                         let mut textures: Vec<_> = t.resources.iter().filter_map(|r| Some((r.material_texture()?, r))).collect();
                         textures.sort_by_key(|x| x.0 .0);
@@ -1152,7 +1176,10 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             out.print(&json!({"ok": true,
                 "programs": {"total": sh.programs.len(), "vertex_or_mesh": sh.sections[0].1, "pixel": sh.sections[1].1, "geometry": sh.sections[2].1, "compute": sh.sections[5].1,
                     "resources": sh.programs.iter().map(|p| p.table.resources.len()).sum::<usize>(), "constant_buffer_members": sh.programs.iter().map(|p| p.table.members.len()).sum::<usize>()},
-                "effects": {"stated": sh.effects_stated, "read": sh.effects.len(), "with_table": sh.effects.iter().filter(|e| e.table.is_some()).count()},
+                "effects": {"stated": sh.effects_stated, "read": sh.effects.len(), "with_table": sh.effects.iter().filter(|e| e.table.is_some()).count(),
+                    "with_programs": sh.effects.iter().filter(|e| e.programs.iter().any(|l| !l.is_empty())).count(), "with_techniques": sh.effects.iter().filter(|e| !e.techniques.is_empty()).count(),
+                    "techniques": sh.effects.iter().map(|e| e.techniques.len()).sum::<usize>(), "passes": sh.effects.iter().flat_map(|e| &e.techniques).map(|t| t.passes.len()).sum::<usize>(),
+                    "programs_not_in_any_pass": sh.effects.iter().map(|e| (0..6).map(|k| (0..e.programs[k].len()).filter(|&i| !e.techniques.iter().flat_map(|t| &t.passes).any(|ps| ps.programs[k] == Some(i as u8))).count()).sum::<usize>()).sum::<usize>()},
                 "material_texture_parameters": {"total": tex.len(), "unnamed": unnamed.len(), "unnamed_list": unnamed},
                 "pipeline_cache": cache_summary, "matched_effects": effects, "seconds": t.elapsed().as_secs_f64()}));
         }
