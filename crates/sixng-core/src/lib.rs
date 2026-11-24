@@ -49,6 +49,7 @@ pub mod bink;
 pub mod interiorents;
 pub mod pso;
 pub mod gfxfont;
+pub mod heightmap;
 pub mod ptfx;
 pub mod vehicles;
 pub mod vehcolour;
