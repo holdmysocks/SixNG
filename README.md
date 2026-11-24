@@ -329,9 +329,12 @@ repeated), one glTF animation each. `--anim-only` writes only the skeleton
 and the animations. `sixng characters` lists every character and animal
 `outfit` can build (327 characters and 263 animals), and under `models` every
 ped model of the game's outfit list (2,713; `--kind model` for these alone).
-The list stores only name hashes: 579 models are named from index names,
-the name dictionary and the text tables (a few of these may be chance hash
-hits), the rest are listed as `ped_0x<hash>`. `ped-look` and `outfit:` take
+The list stores only name hashes: 581 models are named from index names,
+the name dictionary and the text tables. Ambient names (`a_f_y_<word>_NN`)
+from a single text word are marked `uncertain` (8): a control search with
+prefixes no ped model has finds as many such hits as the real prefixes, so
+a wider word search does not name the ambient models (2,132 stay unnamed;
+a few of the story names may also be chance hash hits), the rest are listed as `ped_0x<hash>`. `ped-look` and `outfit:` take
 either form, and the viewer's picker lists them all. The animal clips were
 checked by rendering (eagle flap, deer walk/run/idle: 91–97 % of tracks land
 on a joint). Animals have a 180° yaw on `SKEL_ROOT` in the bind pose that
@@ -652,6 +655,33 @@ again**).
   bone weights are not decoded). Of 39 animal dictionaries sampled, 31
   hold animation data that decodes; the others list clips whose
   animation is stored elsewhere (the plain cat walk is one) and say so.
+- **Cutscenes** (`sixng cutscenes [<scene>] [--name <regex>] [--cast
+  <regex>] [--summary]`): the story pack's 2,823 scenes, each with its
+  cast (scene handle, ped model, whether `outfit` can assemble it), props,
+  cameras, the clip names of every object and the set-dressing models its
+  scene file places. Two kinds of files describe a scene. Its clip
+  dictionary `cin@<scene>` holds one clip per animated object, named after
+  the object's handle (`lucia`, `lucia_face`, `rs_camera_8`,
+  `prop_am_drink_soda_03a^2`); `cin@<scene>-<N>` dictionaries (25,294)
+  hold the streamed animation sections. Its scene file (a meta resource,
+  2,300 of them) names the scene by hash and lists the peds by the joaat of
+  their handle with the 64-bit asset id of their model, cameras and placed
+  objects with model ids. The first run reads the whole archive (about
+  3 minutes) and caches `<work>/index/pack_story000_story000.cutscenes.json`.
+  Measured on the whole pack: 2,313 scenes have a scene file, 4,723 cast
+  entries are characters `outfit` assembles (`player_story000_00` /
+  `_01`, `cs_raul`, `cs_andrea` …), 271 more are other peds with a named
+  model, 3,243 peds have a model id that does not resolve to a known name
+  and 1,764 have no record; 11,253 props, 9,216 cameras and 5,205 other
+  objects (vehicles, lead-in / idle clips) whose model is not known;
+  2,835 of 2,838 set-dressing model ids resolve. `sixng outfit
+  <character> --clip cin@<scene>` plays that character's own clip of the
+  scene (`--clip cin@<scene>/<clip>` picks one), and `sixng clips
+  cin@<scene>` lists a scene's clips. Most clips (16,472 objects) keep
+  their animation in the section dictionaries, which are not joined yet;
+  those are refused with that reason, and 1,441 character clips play
+  directly. Not decoded: the scene files' timing, events and state
+  transitions, and how the sections map to clips.
 - **Body sliders** (weight −1…1, muscle 0…1; `--body <w>,<m>` for
   screenshots): the skin and head are posed with the game's body-shape rig
   on the shared skeleton. Clothes and accessories follow the skin under

@@ -944,6 +944,37 @@ enum Cmd {
         #[arg(long, default_value_t = 200)]
         limit: usize,
     },
+    /// Cutscenes of the story pack: per scene its cast (scene handles with
+    /// the ped model each one is, and whether `outfit` can assemble it),
+    /// props, cameras, the clip names of each object and the set-dressing
+    /// models its scene file spawns. Read from the scene clip dictionaries
+    /// (`cin@<scene>`) and the scene files (meta resources naming the
+    /// scene); the first run reads the whole archive (several minutes) and
+    /// caches the result in <work>/index/<archive>.cutscenes.json. Models
+    /// resolve against the names of every indexed archive. A scene's clips
+    /// play on a character with `outfit <character> --clip cin@<scene>`.
+    Cutscenes {
+        /// One scene in full (name, `cin@` optional).
+        scene: Option<String>,
+        /// Regex on scene names.
+        #[arg(long)]
+        name: Option<String>,
+        /// Only scenes with this model or handle in the cast (regex on both).
+        #[arg(long)]
+        cast: Option<String>,
+        /// Archive with the cutscenes.
+        #[arg(long, default_value = sixng_core::cutscene::STORY_ARCHIVE)]
+        archive: String,
+        /// Scan the archive again instead of using the cached catalog.
+        #[arg(long)]
+        rescan: bool,
+        /// Only the totals.
+        #[arg(long)]
+        summary: bool,
+        /// At most this many scenes (0 = all).
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
+    },
     /// Inspect a ttpf texture store: list its textures, or decode some to PNG.
     Ttpf {
         /// Store id or substring (e.g. vehicles/ttdb_vehicles.ttpf).
@@ -1364,8 +1395,39 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             let mut dicts: Vec<sixng_core::anim::ClipDictionary> = Vec::new();
             let mut picks: Vec<(usize, usize)> = Vec::new();
+            // cutscene clips: `cin@<scene>` = this character's own clips in
+            // that scene; `cin@<scene>/<clip>` = one clip of the scene
+            let mut wanted: Vec<(String, String)> = Vec::new();
+            let mut cat: Option<sixng_core::cutscene::Catalog> = None;
             for c in clip {
-                let (dq, cq) = c.rsplit_once('/').ok_or_else(|| anyhow!("--clip wants <dictionary>/<clip>"))?;
+                let is_scene = c.starts_with("cin@") || c.starts_with("cine@");
+                if !is_scene {
+                    let (dq, cq) = c.rsplit_once('/').ok_or_else(|| anyhow!("--clip wants <dictionary>/<clip>"))?;
+                    wanted.push((dq.to_string(), cq.to_string()));
+                    continue;
+                }
+                if cat.is_none() {
+                    cat = Some(sixng_core::cutscene::catalog(&ws, sixng_core::cutscene::STORY_ARCHIVE, false, pr.clone())?);
+                }
+                let c_ = cat.as_ref().unwrap();
+                match c.split_once('/') {
+                    Some((dq, cq)) => {
+                        let sd = c_.dicts.iter().find(|d| d.name.eq_ignore_ascii_case(dq)).ok_or_else(|| anyhow!("no cutscene dictionary {dq:?}"))?;
+                        if sd.streamed.iter().any(|s| s.eq_ignore_ascii_case(cq)) {
+                            bail!("the animation of {cq} in {dq} is streamed in its {} section dictionaries, which are not joined yet", sd.sections);
+                        }
+                        wanted.push((sd.id.clone(), cq.to_string()));
+                    }
+                    None => {
+                        for (d, cl) in sixng_core::cutscene::model_clips(c_, c, &prefix)? {
+                            eprintln!("--clip {c}: {}/{cl}", d.name);
+                            wanted.push((d.id.clone(), cl));
+                        }
+                    }
+                }
+            }
+            for (dq, cq) in &wanted {
+                let (dq, cq) = (dq.as_str(), cq.as_str());
                 let (_, d) = sixng_core::anim::load_dictionary(&game, &ws.work, dq)?;
                 let di = match dicts.iter().position(|x| x.name == d.name) {
                     Some(i) => i,
@@ -1445,7 +1507,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 Ok(m) => (
                     m.into_iter()
                         .filter(|m| re.as_ref().is_none_or(|r| r.is_match(&m.name)) && kind.as_deref().is_none_or(|k| k == "model"))
-                        .map(|m| json!({"name": m.name, "hash": m.hash, "named": m.named, "outfits": m.outfits, "listed_as_character": listed.contains(&m.name)}))
+                        .map(|m| json!({"name": m.name, "hash": m.hash, "named": m.named, "uncertain": m.uncertain, "outfits": m.outfits, "listed_as_character": listed.contains(&m.name)}))
                         .collect::<Vec<_>>(),
                     None,
                 ),
@@ -1462,7 +1524,14 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     out.print(&json!({"ok": true, "dictionaries": all.len(), "count": hits.len(), "matches": hits.iter().take(*limit).map(|d| json!({"name": d.name, "id": d.id})).collect::<Vec<_>>()}));
                 }
                 Some(q) => {
-                    let (de, d) = sixng_core::anim::load_dictionary(&game, &ws.work, q)?;
+                    // scene clip dictionaries by name, from the cutscene catalog
+                    let q = if q.starts_with("cin@") || q.starts_with("cine@") {
+                        let c = sixng_core::cutscene::catalog(&ws, sixng_core::cutscene::STORY_ARCHIVE, false, pr.clone())?;
+                        sixng_core::cutscene::dictionary_id(&c, q).map(|s| s.to_string()).unwrap_or_else(|| q.clone())
+                    } else {
+                        q.clone()
+                    };
+                    let (de, d) = sixng_core::anim::load_dictionary(&game, &ws.work, &q)?;
                     let clips: Vec<_> = d
                         .clips
                         .iter()
@@ -1477,6 +1546,63 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     out.print(&json!({"ok": true, "dictionary": de.name, "id": de.id, "clip_count": d.clips.len(), "animations": d.animations.len(), "clips": clips}));
                 }
             }
+        }
+        Cmd::Cutscenes { scene, name, cast, archive, rescan, summary, limit } => {
+            use sixng_core::cutscene;
+            let t = Instant::now();
+            let c = cutscene::catalog(&ws, archive, *rescan, pr.clone())?;
+            // model names: every indexed archive's recovered names, and the
+            // characters `outfit` assembles (from packs)
+            let mut models = cutscene::Models::default();
+            for a in ws.archives() {
+                if !ws.is_indexed(&a) {
+                    continue;
+                }
+                let Ok(ix) = ws.load_index(&a) else { continue };
+                if a.id == "packs.rpf" {
+                    let ch = sixng_core::outfit::characters(&ix);
+                    models.add_characters(ch.iter().filter(|c| c.kind == "character").map(|c| c.name.as_str()));
+                }
+                models.add_index(&ix);
+            }
+            models.add_name_dict(&ws.work);
+            let all = cutscene::scenes(&c, &models);
+            let re = name.as_deref().map(|n| regex::RegexBuilder::new(n).case_insensitive(true).build()).transpose()?;
+            let cre = cast.as_deref().map(|n| regex::RegexBuilder::new(n).case_insensitive(true).build()).transpose()?;
+            let sel: Vec<&cutscene::Scene> = match scene {
+                Some(q) => vec![cutscene::find_scene(&all, q)?],
+                None => all
+                    .iter()
+                    .filter(|s| re.as_ref().is_none_or(|r| r.is_match(&s.name)))
+                    .filter(|s| cre.as_ref().is_none_or(|r| s.cast.iter().any(|o| r.is_match(&o.handle) || o.model.as_deref().is_some_and(|m| r.is_match(m)))))
+                    .collect(),
+            };
+            let objs = || sel.iter().flat_map(|s| s.cast.iter().chain(&s.props).chain(&s.other));
+            let count = |k: &str| objs().filter(|o| o.kind == k).count();
+            let clips: usize = sel.iter().map(|s| s.cast.iter().chain(&s.props).chain(&s.other).map(|o| o.clips.len() + o.face_clips.len()).sum::<usize>()).sum();
+            let totals = json!({
+                "scenes": sel.len(),
+                "variants": sel.iter().filter(|s| s.variant_of.is_some()).count(),
+                "with_scene_file": sel.iter().filter(|s| !s.scene_files.is_empty()).count(),
+                "section_dictionaries": sel.iter().map(|s| s.sections).sum::<usize>(),
+                "clips": clips + sel.iter().map(|s| s.cameras.len()).sum::<usize>(),
+                "cast": {"characters": count("character"), "peds_with_model": objs().filter(|o| o.kind == "ped" && o.model.is_some()).count(),
+                    "peds_model_unresolved": objs().filter(|o| o.kind == "ped" && o.model.is_none() && o.model_id.is_some()).count(),
+                    "peds_without_record": objs().filter(|o| o.kind == "ped" && o.model_id.is_none()).count(),
+                    "model_from_other_scenes": objs().filter(|o| o.model_source == Some("other scenes")).count()},
+                "props": count("prop"),
+                "cameras": sel.iter().map(|s| s.cameras.len()).sum::<usize>(),
+                "unknown": count("unknown"),
+                "streamed_objects": objs().filter(|o| o.streamed).count(),
+                "set_models": sel.iter().map(|s| s.set_models.len()).sum::<usize>(),
+                "set_models_unresolved": sel.iter().map(|s| s.set_models_unresolved.len()).sum::<usize>(),
+            });
+            let mut o = json!({"ok": true, "archive": c.archive, "dictionaries": c.dicts.len(), "scene_files": c.files.len(), "totals": totals, "seconds": t.elapsed().as_secs_f64()});
+            if !*summary {
+                let take = if *limit == 0 { sel.len() } else { *limit };
+                o["scenes"] = json!(sel.iter().take(take).collect::<Vec<_>>());
+            }
+            out.print(&o);
         }
         Cmd::Ttpf { store, hash, first, mip, all_slices, float, all, out: tout } => {
             let a = ws.resolve(store)?;
