@@ -527,7 +527,15 @@ again**).
     own head (`cs_maleek_rivers`). The outfit shown first is the first
     listed one, unless it has no clothes in the data read here and a
     later one has (about twenty characters): then the first dressed one,
-    with shoes when one has them; the panel says so. `sixng ped-look "^"` lists every character
+    with shoes when one has them; the panel says so. An item whose own
+    textures lead to no model takes the model another wardrobe's item
+    with the same asset GUID resolved to (`found_by: asset id`; the table
+    is built once, a few minutes, as `<work>/index/asset_drawables.json`).
+    Game-wide 68.5 % of the shoe items resolve by their own textures and
+    half of the rest share a GUID with one that does. Of the 292
+    characters, 225 now open with head, body, clothes and shoes, 47
+    dressed without shoes and 20 without a dressed outfit; the shoe
+    models of the 47 are found under no texture or GUID. `sixng ped-look "^"` lists every character
     with what its default outfit has. `sixng outfit <name> --look N`
     exports outfit N as one rigged GLB (parts, the face, stored tints;
     not the viewer's skin tone, colour words or hidden skin).

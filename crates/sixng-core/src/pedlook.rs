@@ -287,6 +287,92 @@ pub fn wardrobe_textures(game_root: &Path) -> Result<&'static WardrobeTextures, 
     .map_err(|e| e.clone())
 }
 
+/// Drawables by asset GUID, over every wardrobe resource: an item names
+/// its drawable by GUID only (`States` -> `Asset` -> `Drawable`), and the
+/// drawable is found through the item's textures. Where an item's own
+/// textures lead to no model, another wardrobe's item with the same GUID
+/// often does resolve; this table carries that answer over.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct AssetDrawables {
+    version: u32,
+    /// GUID (hex) -> the drawables its items resolved to, with how often.
+    pub by_guid: HashMap<String, Vec<(String, u32)>>,
+}
+
+impl AssetDrawables {
+    /// The drawable of a GUID: one of the character's fit before the
+    /// others, then the one most items agree on.
+    pub fn pick(&self, guid: &str, fit: Option<&str>, exists: &dyn Fn(&str) -> bool) -> Option<String> {
+        let has_fit = |n: &str| fit.is_some_and(|f| n.split('_').any(|t| t == f));
+        self.by_guid.get(guid)?.iter().filter(|(n, _)| exists(n)).max_by(|a, b| has_fit(&a.0).cmp(&has_fit(&b.0)).then(a.1.cmp(&b.1)).then(b.0.cmp(&a.0))).map(|x| x.0.clone())
+    }
+}
+
+/// The asset table (built from every wardrobe resource on first use, a
+/// few minutes, then cached as `<work>/index/asset_drawables.json`).
+pub fn asset_drawables(a: &ArchiveInfo, ix: &ArchiveIndex) -> Result<&'static AssetDrawables, String> {
+    static T: OnceLock<Result<AssetDrawables, String>> = OnceLock::new();
+    T.get_or_init(|| {
+        let work = crate::names::work_dir().ok_or("no work directory")?;
+        let cache = work.join("index").join("asset_drawables.json");
+        let ixp = crate::scan::index_path(&work.join("index"), "packs.rpf");
+        let stamp = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        if let Ok(b) = std::fs::read(&cache) {
+            if let Ok(t) = serde_json::from_slice::<AssetDrawables>(&b) {
+                if t.version == 1 && stamp(&cache) >= stamp(&ixp) {
+                    return Ok(t);
+                }
+            }
+        }
+        let tu = tex_users(&work)?;
+        let pre = crate::wardrobe::prefixes(ix.entries.iter().filter(|e| e.kind == crate::classify::Kind::RageObj).filter_map(|e| e.name.as_deref()));
+        let names: HashSet<String> = ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| e.name.as_ref().map(|n| n.to_ascii_lowercase())).collect();
+        let exists = |n: &str| names.contains(n);
+        let found: Vec<(String, String)> = ix
+            .entries
+            .par_iter()
+            .filter(|e| e.sub == "7a")
+            .flat_map_iter(|e| {
+                let mut v = Vec::new();
+                let Ok(r) = Resource::load_meta(&a.path, e) else { return v };
+                let Some(m) = Meta::parse(&r) else { return v };
+                if m.objects(VARIATION).is_empty() {
+                    return v;
+                }
+                // each item once per resource, whatever the number of outfits that wear it
+                let mut seen = HashSet::new();
+                for var in crate::wardrobe::variations(&m, &pre, tu, &a.id) {
+                    for p in &var.parts {
+                        let Some(g) = p.guid.as_ref().filter(|_| seen.insert(p.item.clone())) else { continue };
+                        if let Some((d, _)) = choose(p, None, &exists) {
+                            v.push((g.clone(), d));
+                        }
+                    }
+                }
+                v
+            })
+            .collect();
+        let mut by_guid: HashMap<String, Vec<(String, u32)>> = HashMap::new();
+        for (g, d) in found {
+            let v = by_guid.entry(g).or_default();
+            match v.iter_mut().find(|x| x.0 == d) {
+                Some(x) => x.1 += 1,
+                None => v.push((d, 1)),
+            }
+        }
+        if by_guid.is_empty() {
+            return Err("no wardrobe item of packs.rpf resolved to a drawable".into());
+        }
+        let t = AssetDrawables { version: 1, by_guid };
+        if let Ok(b) = serde_json::to_vec(&t) {
+            let _ = std::fs::write(&cache, b);
+        }
+        Ok(t)
+    })
+    .as_ref()
+    .map_err(|e| e.clone())
+}
+
 /// Whether the outfit list has this model (a character prefix such as
 /// `cs_ali`); false when the table is not available.
 pub fn has_model(game_root: &Path, model: &str) -> bool {
@@ -764,6 +850,10 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
     // garment preset colours (the clothing material library of data.rpf)
     static PRESETS: OnceLock<Option<crate::matlib::Index>> = OnceLock::new();
     let presets = PRESETS.get_or_init(|| crate::matlib::Index::load_or_build(&crate::export::Workspace::new(crate::export::game_root(a), &work)).ok()).as_ref();
+    // Items whose own textures find no model: the answer of another
+    // wardrobe's item with the same asset GUID. Built only when needed.
+    let needs_assets = flat.iter().flat_map(|(_, vs)| vs.iter()).flat_map(|v| &v.parts).any(|p| p.guid.is_some() && choose(p, fit.as_deref(), &exists).is_none());
+    let assets = if needs_assets { asset_drawables(a, ix).ok() } else { None };
     let mut outfits = Vec::new();
     for (o, vs) in flat {
         let mut parts: Vec<LookPart> = Vec::new();
@@ -774,7 +864,8 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
                 body_shape = v.tags.iter().filter(|(_, w)| !w.iter().any(|x| x == "BodyShapePreset")).flat_map(|(_, w)| w.first()).next().cloned();
             }
             for p in &v.parts {
-                let Some((drawable, found_by)) = choose(p, fit.as_deref(), &exists) else {
+                let by_asset = || Some((assets?.pick(p.guid.as_deref()?, fit.as_deref(), &exists)?, "asset id"));
+                let Some((drawable, found_by)) = choose(p, fit.as_deref(), &exists).or_else(by_asset) else {
                     // items without textures or names are settings, not parts
                     if p.named.is_some() || !p.candidates.is_empty() {
                         unresolved.push(format!("{} ({})", p.item, p.category.clone().unwrap_or_default()));
@@ -855,6 +946,16 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn asset_table_prefers_the_fit_then_the_count() {
+        let mut t = AssetDrawables::default();
+        t.by_guid.insert("ab".into(), vec![("shoes_mr1_000_low_fh_full".into(), 9), ("shoes_fr1_000_low_fh_full".into(), 2), ("shoes_fr1_001_low_fh_full".into(), 5), ("gone_fr1_000_full".into(), 50)]);
+        let exists = |n: &str| !n.starts_with("gone");
+        assert_eq!(t.pick("ab", Some("fr1"), &exists).as_deref(), Some("shoes_fr1_001_low_fh_full"));
+        assert_eq!(t.pick("ab", None, &exists).as_deref(), Some("shoes_mr1_000_low_fh_full"));
+        assert_eq!(t.pick("cd", Some("fr1"), &exists), None);
+    }
 
     #[test]
     fn slots_and_words() {
