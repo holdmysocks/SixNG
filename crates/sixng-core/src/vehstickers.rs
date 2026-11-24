@@ -39,6 +39,11 @@ const ENTRY_GROUP: u32 = 0xb13f_2c2f;
 const STICKER: u32 = 0xed9c_f5df;
 const STICKER_TEXTURE: u32 = 0x3950_a760;
 const STICKER_COLOURS: [u32; 3] = [0x9b5d_cd73, 0x9dbb_d803, 0xb575_2ae0];
+/// True on the records whose texture is a three-channel colour mask (an
+/// opaque picture whose red, green and blue are the cover of `colorRed`,
+/// `colorGreen` and `colorBlue`); false on pictures with colours and an
+/// alpha channel of their own.
+const STICKER_MASK: u32 = 0x54ec_9205;
 const GROUP: u32 = 0xb0dd_20cb;
 const GROUP_LAYOUTS: u32 = 0xc19c_0de4;
 /// The list of groups in the layout file's root record.
@@ -168,6 +173,89 @@ fn layout_json(l: &Value) -> Value {
     })
 }
 
+/// A texture id as stored in a sticker record (hex, with or without `0x`).
+pub fn parse_texture_id(s: &str) -> Option<u64> {
+    u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
+}
+
+/// Every sticker record of the vehicle library and the vehicle packs, one
+/// entry per record name: `sticker` (name hash), `name` (when the game's
+/// name list has it), `texture` (64-bit id in the vehicle texture stores),
+/// `colours` (the record's `colorRed`, `colorGreen` and `colorBlue`, ARGB
+/// as stored), `mask` (the picture is a colour mask: its red, green and
+/// blue each take one of the colours), `aspect` and `record` (the record's
+/// fields as read).
+/// Sorted by name, records without a name last.
+pub fn sticker_list(ws: &crate::export::Workspace) -> Result<Vec<Value>> {
+    let mut seen: BTreeMap<u32, Value> = BTreeMap::new();
+    for r in metas(ws, "data")?.iter().chain(metas(ws, "packs")?.iter()) {
+        for (k, s) in &r.stickers {
+            seen.entry(*k).or_insert_with(|| {
+                json!({
+                    "sticker": hex(*k),
+                    "name": name_of(*k),
+                    "texture": get(s, STICKER_TEXTURE).and_then(|x| x.as_str()),
+                    "colours": [hex(u(named(s, "colorRed"))), hex(u(named(s, "colorGreen"))), hex(u(named(s, "colorBlue")))],
+                    "mask": get(s, STICKER_MASK).and_then(|x| x.as_bool()).unwrap_or(false),
+                    "aspect": u(named(s, "aspectRatio")),
+                    "record": s,
+                })
+            });
+        }
+    }
+    let mut out: Vec<Value> = seen.into_values().collect();
+    out.sort_by(|a, b| (a["name"].is_null(), a["name"].as_str(), a["sticker"].as_str()).cmp(&(b["name"].is_null(), b["name"].as_str(), b["sticker"].as_str())));
+    Ok(out)
+}
+
+/// Decode one sticker texture, by its 64-bit id, from the texture stores to
+/// `<dir>/<id as 16 hex digits>.png`. A file that is there is kept, so `dir`
+/// works as a cache. Returns the file and the picture's size.
+pub fn sticker_png(game: &std::path::Path, id: u64, dir: &std::path::Path) -> Result<(std::path::PathBuf, [u32; 2])> {
+    let (store, t) = crate::ttpf::global(game).get(id).ok_or_else(|| anyhow::anyhow!("texture {id:016x} is in no texture store"))?;
+    let (p, st) = crate::ttpf::write_png(store, t, dir, false)?;
+    Ok((p, [st.width, st.height]))
+}
+
+/// Write `<out>/vehicles/stickers.json` (the sticker list) and, with
+/// `textures`, every sticker texture as `<out>/vehicles/stickers/<id>.png`.
+/// `only`: a filter on the sticker's name or name hash.
+pub fn export_stickers(ws: &crate::export::Workspace, out: &std::path::Path, textures: bool, only: Option<&regex::Regex>) -> Result<Value> {
+    let mut list = sticker_list(ws)?;
+    if let Some(re) = only {
+        list.retain(|s| re.is_match(s["name"].as_str().unwrap_or("")) || re.is_match(s["sticker"].as_str().unwrap_or("")) || re.is_match(s["texture"].as_str().unwrap_or("")));
+    }
+    let dir = out.join("vehicles");
+    std::fs::create_dir_all(&dir)?;
+    let mut ids: Vec<u64> = list.iter().filter_map(|s| parse_texture_id(s["texture"].as_str()?)).filter(|id| *id != 0).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let (mut written, mut failed) = (0usize, Vec::new());
+    if textures {
+        let tdir = dir.join("stickers");
+        let res: Vec<(u64, Result<[u32; 2]>)> = ids.par_iter().map(|id| (*id, sticker_png(&ws.game, *id, &tdir).map(|r| r.1))).collect();
+        let sizes: HashMap<u64, [u32; 2]> = res.iter().filter_map(|(id, r)| r.as_ref().ok().map(|s| (*id, *s))).collect();
+        written = sizes.len();
+        failed = res.iter().filter_map(|(id, r)| r.as_ref().err().map(|e| json!({"texture": format!("{id:016x}"), "error": format!("{e:#}")}))).collect();
+        for s in &mut list {
+            if let Some(sz) = s["texture"].as_str().and_then(parse_texture_id).and_then(|id| sizes.get(&id)) {
+                s["size"] = json!(sz);
+                s["png"] = json!(format!("stickers/{:016x}.png", parse_texture_id(s["texture"].as_str().unwrap_or("")).unwrap_or(0)));
+            }
+        }
+    }
+    let stats = json!({"stickers": list.len(), "named": list.iter().filter(|s| s["name"].is_string()).count(), "textures": ids.len(), "written": written, "failed": failed.len()});
+    let doc = json!({
+        "format": 1,
+        "note": "Sticker records of the vehicle library and packs. texture = 64-bit id in the vehicle texture stores (data/ttdb/vehicles); colours = colorRed, colorGreen, colorBlue (ARGB as stored); mask = the picture is an opaque three-channel colour mask (red, green and blue are the cover of the three colours), else a picture with its own colours and alpha; aspect = the record's aspect class; record = the record's fields as read. png and size are set when the textures were written.",
+        "stats": stats,
+        "failed": failed,
+        "stickers": list,
+    });
+    std::fs::write(dir.join("stickers.json"), serde_json::to_vec(&doc)?)?;
+    Ok(stats)
+}
+
 /// Write `<out>/vehicles/liveries.json`: per vehicle its brands, each with
 /// the stickers it places. `models`: joaat -> model name.
 pub fn build(ws: &crate::export::Workspace, models: &HashMap<u32, String>, out: &std::path::Path) -> Result<Value> {
@@ -254,4 +342,14 @@ pub fn build(ws: &crate::export::Workspace, models: &HashMap<u32, String>, out: 
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("liveries.json"), serde_json::to_vec(&doc)?)?;
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn texture_ids_parse_as_hex() {
+        assert_eq!(super::parse_texture_id("112afea77897b738"), Some(0x112a_fea7_7897_b738));
+        assert_eq!(super::parse_texture_id(" 0x10 "), Some(16));
+        assert_eq!(super::parse_texture_id("zz"), None);
+    }
 }
