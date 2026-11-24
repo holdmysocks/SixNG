@@ -485,7 +485,15 @@ again**).
   Colour: row tint 0 of `ped_tint_hair` for the items that name that
   palette (a few hundred, mostly named characters); the others leave the
   colour to the game, so the viewer starts dark and has a colour picker.
-  Hats do not flatten the hair.
+  The panel also shows the colours of the game's hair palette as
+  swatches to click (`--hair-colour r,g,b`), and lists the character's
+  other hair styles (its own placeholders that have grooms placed) to
+  tick (`--hair-style TEXT`). `player_story000_00`'s default ponytails
+  have no groom files in any archive of the install (packs, the story
+  packs and the other packs were scanned), so that character starts
+  without hair; four other styles of hers are offered, at low confidence
+  (which of her styles a piece belongs to is not settled). Hats do not
+  flatten the hair.
 - **Pose** (Character panel; `--pose rest|down|walk|sit|wave` for
   screenshots): every part of a character is bound to the shared ped
   skeleton, and the panel turns its main bones: arms (raise, swing),

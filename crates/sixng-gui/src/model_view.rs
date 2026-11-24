@@ -254,6 +254,9 @@ pub struct Automation {
     /// `--find-hair`: fit grooms to the model and show the run with the
     /// most strands (tests "Find grooms on this model").
     pub find_hair: bool,
+    /// `--hair-style TEXT`: also show the character's hair entries whose
+    /// placeholder name contains this.
+    pub hair_style: Option<String>,
     /// `--hair-width MM` for a character's own hair.
     pub hair_width: Option<f32>,
 }
@@ -1599,7 +1602,8 @@ impl ModelView {
                     let key = format!("{}#{}", look.model, look.current);
                     if self.hair.look_key != key {
                         self.hair.look_key = key;
-                        self.hair.selected = look.hair.iter().filter(|h| h.shown).flat_map(|h| h.grooms.iter().copied()).collect();
+                        let want = self.auto.hair_style.clone();
+                        self.hair.selected = look.hair.iter().filter(|h| h.shown || want.as_ref().is_some_and(|w| h.placeholder.contains(w.as_str()))).flat_map(|h| h.grooms.iter().copied()).collect();
                         if let Some(c) = look.hair.iter().find(|h| h.slot == "hair").or(look.hair.first()).and_then(|h| h.colour) {
                             self.hair.colour = c.map(|x| x as f32 / 255.0);
                         }
@@ -4729,6 +4733,21 @@ fn load_query_sel(
                     }
                     Err(e) => info.notes.push(format!("Strand hair: {e}")),
                 }
+                // the character's other hair styles (its own placeholders
+                // that have grooms placed), to tick instead
+                if let Ok(t) = sixng_core::hairlink::get(&ws.work, &a, &ix.entries) {
+                    let mut owners: Vec<String> = vec![format!("{}_", look.model)];
+                    owners.extend(info.strands.iter().filter_map(|s| sixng_core::outfit::outfit_prefix(&s.1)).map(|p| format!("{p}_")));
+                    let mut extra: Vec<&sixng_core::hairlink::Link> = t.links.values().flatten().filter(|l| !l.grooms.is_empty() && owners.iter().any(|o| l.placeholder.starts_with(o.as_str())) && !info.hair.iter().any(|h| h.placeholder == l.placeholder)).collect();
+                    extra.sort_by(|x, y| x.placeholder.cmp(&y.placeholder).then(y.confidence.total_cmp(&x.confidence)));
+                    extra.dedup_by(|x, y| x.placeholder == y.placeholder);
+                    for l in extra {
+                        let slot = sixng_core::pedlook::slot_of(&l.placeholder);
+                        if slot == "hair" || slot == "beard" {
+                            info.hair.push(HairPick { slot: format!("other {slot}"), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: t.uncontested(l), off_head: 0, shown: false, colour: None });
+                        }
+                    }
+                }
                 let o = &look.outfits[k];
                 info.body_shape = o.body_shape.clone();
                 if !o.unresolved.is_empty() {
@@ -4778,7 +4797,7 @@ fn load_query_sel(
                         h.off_head = all - h.grooms.len();
                         // body hair is fine fuzz in the game; drawn at hair
                         // width it reads as fur, so it is offered but starts off
-                        h.shown = h.slot != "body hair" && !h.grooms.is_empty() && (h.confidence >= 0.5 || (h.confidence >= 0.2 && h.off_head == 0));
+                        h.shown = h.slot != "body hair" && !h.slot.starts_with("other ") && !h.grooms.is_empty() && (h.confidence >= 0.5 || (h.confidence >= 0.2 && h.off_head == 0));
                     }
                 }
             }

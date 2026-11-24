@@ -1621,6 +1621,7 @@ impl App {
         m.hair.show = !c.has("no-fur");
         m.auto.find_hair = c.has("find-hair");
         m.auto.hair_width = c.f("hair-width");
+        m.auto.hair_style = c.get("hair-style").map(str::to_string);
         // --hair-colour r,g,b (0..255): a character's hair colour
         if let Some(v) = c.get("hair-colour") {
             let v: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse::<f32>().ok()).collect();
