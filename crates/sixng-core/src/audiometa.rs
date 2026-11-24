@@ -481,6 +481,109 @@ pub fn bank_container(c: &BankContainers) -> std::collections::BTreeMap<u64, u32
     c.iter().filter_map(|(b, m)| m.iter().max_by_key(|(h, n)| (**n, std::cmp::Reverse(**h))).map(|(h, _)| (*b, *h))).collect()
 }
 
+/// One entry of the bank list: a bank's container hash, its size in bytes
+/// and a group hash (the joaat of a word such as `props`, `streams` or
+/// `weapons` for some groups; most are not named).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BankListEntry {
+    pub container: u32,
+    pub size: u32,
+    pub group: u32,
+}
+
+/// The bank list: one class-27 object in a schema-26 file (`audio.rpf` has
+/// one, 5,955 entries). Layout after the object's first 8 bytes: u32 count,
+/// then count x 24 bytes `{u32 container, u32 size, u32 size (a smaller
+/// value in a few entries), u32 0x800 (alignment), u32 group, u32 1}`.
+/// `audio.rpf`'s other schema-26 file has a second, 194-entry list of the
+/// same layout. The first size equals the bank size,
+/// and the entries are nearly in archive order. Returns the entries when
+/// the object is exactly that long.
+pub fn bank_list(file: &[u8], m: &AudioMeta) -> Option<Vec<BankListEntry>> {
+    if m.schema != 26 {
+        return None;
+    }
+    let u = |b: &[u8], o: usize| b.get(o..o + 4).map(|x| u32::from_le_bytes(x.try_into().unwrap()));
+    m.objects.iter().filter(|o| o.class == 27).find_map(|o| {
+        let d = file.get(8 + o.offset as usize..8 + o.offset as usize + o.size as usize)?;
+        let n = u(d, 8)? as usize;
+        if d.len() != 12 + 24 * n || n == 0 {
+            return None;
+        }
+        (0..n)
+            .map(|k| {
+                let e = 12 + 24 * k;
+                Some(BankListEntry { container: u(d, e)?, size: u(d, e + 4)?, group: u(d, e + 16)? })
+            })
+            .collect()
+    })
+}
+
+/// Give banks their bank-list entry. `banks` is (offset, size) of every
+/// bank; `anchors` the containers already known (from the sound files).
+/// Entries whose container is a known bank's and whose size is that bank's
+/// are anchors; the longest run of them that rises in archive order is
+/// kept, and the entries between two anchors go, in order, to the banks
+/// between them with the same size. Checked on `audio.rpf` by holding a
+/// quarter of the anchors back: 901 of 908 placed right. Returns bank
+/// offset -> entry.
+pub fn align_bank_list(list: &[BankListEntry], banks: &[(u64, u64)], anchors: &std::collections::BTreeMap<u64, u32>) -> std::collections::BTreeMap<u64, BankListEntry> {
+    let mut banks = banks.to_vec();
+    banks.sort();
+    let pos: std::collections::HashMap<u64, usize> = banks.iter().enumerate().map(|(i, b)| (b.0, i)).collect();
+    let mut by_c: std::collections::HashMap<u32, Vec<usize>> = std::collections::HashMap::new();
+    for (off, c) in anchors {
+        if let Some(&i) = pos.get(off) {
+            by_c.entry(*c).or_default().push(i);
+        }
+    }
+    let anc: Vec<(usize, usize)> = list.iter().enumerate().flat_map(|(k, e)| by_c.get(&e.container).into_iter().flatten().filter(|&&i| banks[i].1 == e.size as u64).map(move |&i| (k, i))).collect();
+    // longest increasing chain of anchors (by bank index; entries already rise)
+    let mut tails: Vec<usize> = Vec::new();
+    let mut tail_at: Vec<usize> = Vec::new();
+    let mut prev: Vec<Option<usize>> = vec![None; anc.len()];
+    for (j, &(_, i)) in anc.iter().enumerate() {
+        let p = tails.partition_point(|&t| t < i);
+        if p == tails.len() {
+            tails.push(i);
+            tail_at.push(j);
+        } else {
+            tails[p] = i;
+            tail_at[p] = j;
+        }
+        prev[j] = p.checked_sub(1).map(|q| tail_at[q]);
+    }
+    let mut chain = Vec::new();
+    let mut j = tail_at.last().copied();
+    while let Some(x) = j {
+        chain.push(anc[x]);
+        j = prev[x];
+    }
+    chain.reverse();
+    let mut out = std::collections::BTreeMap::new();
+    let mut pts: Vec<(isize, isize)> = vec![(-1, -1)];
+    pts.extend(chain.iter().map(|&(k, i)| (k as isize, i as isize)));
+    pts.push((list.len() as isize, banks.len() as isize));
+    for w in pts.windows(2) {
+        let ((k0, i0), (k1, i1)) = (w[0], w[1]);
+        if k1 < list.len() as isize {
+            out.insert(banks[i1 as usize].0, list[k1 as usize]);
+        }
+        let mut i = (i0 + 1) as usize;
+        for k in (k0 + 1) as usize..k1 as usize {
+            let mut j = i;
+            while j < i1 as usize && banks[j].1 != list[k].size as u64 {
+                j += 1;
+            }
+            if j < i1 as usize {
+                out.insert(banks[j].0, list[k]);
+                i = j + 1;
+            }
+        }
+    }
+    out
+}
+
 /// `<work>/index/audio_containers_<archive>.json`: bank offset (hex) ->
 /// container hash (hex) -> waves, written by `audio-meta`.
 pub fn containers_path(work: &std::path::Path, archive: &str) -> std::path::PathBuf {
@@ -502,11 +605,14 @@ pub fn load_containers(work: &std::path::Path, archive: &str) -> Option<BankCont
 
 /// Decode every audio metadata file of an archive to
 /// `<out>/audio_meta/<archive>/<offset>.json` plus `index.jsonl`.
-/// Returns (decoded, failed, container hashes per bank).
+/// Returns (decoded, failed, container hashes per bank, bank-list entries).
 /// `banks`: (bank offset, stream ids) of the archive's audio index, to link
-/// sound files to streams (empty: not linked, no containers).
-pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], banks: &[(u64, std::collections::HashSet<u32>)], out: &std::path::Path) -> Result<(usize, usize, BankContainers)> {
+/// sound files to streams (empty: not linked, no containers); `sizes`: (bank
+/// offset, size), to place the bank list. Banks the sound files do not
+/// reach get their container from the bank list, with 0 waves.
+pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], banks: &[(u64, std::collections::HashSet<u32>)], sizes: &[(u64, u64)], out: &std::path::Path) -> Result<(usize, usize, BankContainers, usize)> {
     let mut containers = BankContainers::new();
+    let mut list: Vec<BankListEntry> = Vec::new();
     let known: std::collections::HashSet<u32> = banks.iter().flat_map(|(_, s)| s.iter().copied()).collect();
     let dir = out.join("audio_meta").join(a.id.trim_end_matches(".rpf"));
     std::fs::create_dir_all(&dir)?;
@@ -535,6 +641,9 @@ pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], ban
                 if linked.is_some() {
                     bank_containers(&m, &mut containers);
                 }
+                if let Some(l) = bank_list(&b, &m) {
+                    list.extend(l);
+                }
                 ok += 1;
                 let file = format!("{:x}.json", e.off);
                 std::fs::write(dir.join(&file), serde_json::to_vec_pretty(&serde_json::json!({"id": e.id, "meta": m, "stitched": stitched}))?)?;
@@ -548,7 +657,13 @@ pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], ban
         lines.push('\n');
     }
     std::fs::write(dir.join("index.jsonl"), lines)?;
-    Ok((ok, bad, containers))
+    if !list.is_empty() && !sizes.is_empty() {
+        let anchors = bank_container(&containers);
+        for (off, e) in align_bank_list(&list, sizes, &anchors) {
+            containers.entry(off).or_insert_with(|| [(e.container, 0)].into_iter().collect());
+        }
+    }
+    Ok((ok, bad, containers, list.len()))
 }
 
 /// A large file can be indexed as two entries with stored (not zlib) 64 KiB
@@ -600,6 +715,34 @@ fn stitch(path: &std::path::Path, e: &crate::scan::Entry, b: &[u8], by_off: &[&c
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bank_list_align() {
+        use super::*;
+        // a class-27 object: 8 bytes, count, then {container, size, size, 0x800, group, 1}
+        let ents: [(u32, u32); 5] = [(0xa, 100), (0xb, 200), (0xc, 100), (0xd, 300), (0xe, 200)];
+        let mut obj = vec![27u8, 0, 0, 0, 0xaa, 0xaa, 0xaa, 0xaa];
+        obj.extend_from_slice(&(ents.len() as u32).to_le_bytes());
+        for (c, s) in ents {
+            for w in [c, s, s, 0x800, 0x77, 1] {
+                obj.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+        let mut file = vec![0u8; 8];
+        file.extend_from_slice(&obj);
+        let o = Object { class: 27, offset: 0, size: obj.len() as u32, ..Default::default() };
+        let m = AudioMeta { schema: 26, data_len: 0, table_counts: [0, 0], objects: vec![o], classes: Default::default() };
+        let list = bank_list(&file, &m).unwrap();
+        assert_eq!(list.len(), 5);
+        assert_eq!(list[3], BankListEntry { container: 0xd, size: 300, group: 0x77 });
+        assert!(bank_list(&file, &AudioMeta { schema: 166, ..m.clone() }).is_none());
+        // banks in archive order with an extra bank (0x350) the list lacks;
+        // 0xa and 0xd are known (anchors), the rest are placed by size
+        let banks = [(0x100, 100), (0x200, 200), (0x300, 100), (0x350, 100), (0x400, 300), (0x500, 200)];
+        let anchors: std::collections::BTreeMap<u64, u32> = [(0x100, 0xa), (0x400, 0xd)].into_iter().collect();
+        let al = align_bank_list(&list, &banks, &anchors);
+        let got: Vec<(u64, u32)> = al.iter().map(|(b, e)| (*b, e.container)).collect();
+        assert_eq!(got, [(0x100, 0xa), (0x200, 0xb), (0x300, 0xc), (0x400, 0xd), (0x500, 0xe)]);
+    }
     #[test]
     fn bank_container_pick() {
         use super::*;
