@@ -42,6 +42,8 @@ mod render3d;
 mod siren_sound;
 #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
 mod render3d_metal4;
+#[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+mod frame_presentation_mtl4;
 mod texture_view;
 mod thumbs;
 mod vehicle_db;
@@ -867,6 +869,25 @@ impl App {
                                 ui.selectable_value(&mut mode, render3d_metal4::TemporalUpscaleMode::Scale200, "2x");
                             });
                         renderer.set_temporal_upscale_mode(mode);
+                        let mut frame_mode = renderer.frame_generation_mode();
+                        egui::ComboBox::from_id_salt("metalfx-frame-generation-mode")
+                            .selected_text(match frame_mode {
+                                render3d_metal4::FrameGenerationMode::Off => "Frame Generation Off",
+                                render3d_metal4::FrameGenerationMode::Interpolate120 => "Frame Generation 120",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut frame_mode,
+                                    render3d_metal4::FrameGenerationMode::Off,
+                                    "Off",
+                                );
+                                ui.selectable_value(
+                                    &mut frame_mode,
+                                    render3d_metal4::FrameGenerationMode::Interpolate120,
+                                    "120fps",
+                                );
+                            });
+                        renderer.set_frame_generation_mode(frame_mode);
                     }
                     if ui.button("🔍 Search  Ctrl+K").clicked() {
                         self.palette.open = true;
@@ -1313,6 +1334,11 @@ impl metal4_app::UiApp for App {
         &mut self,
         renderer: &mut render3d_metal4::Renderer3D4,
     ) -> anyhow::Result<()> {
+        if std::env::var_os("SIXNG_ENABLE_FRAME_GENERATION").is_some() {
+            renderer.set_frame_generation_mode(
+                render3d_metal4::FrameGenerationMode::Interpolate120,
+            );
+        }
         if let Err(error) = renderer.set_texture_cache_dir(&self.work) {
             eprintln!(
                 "[metal-io] texture cache disabled because {} could not be initialized: {error:#}",

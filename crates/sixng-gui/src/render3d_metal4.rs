@@ -10,20 +10,58 @@ use metal_rust::metal::{
     IndexType, Library, LoadAction, PixelFormat, PrimitiveTopologyClass, PrimitiveType,
     RenderPassDepthAttachmentDescriptor, RenderStages, ResidencyAllocation, ResidencySet,
     ResidencySetDescriptor, ResourceOptions, SamplerAddressMode, SamplerDescriptor,
-    SamplerMinMagFilter, SamplerState, StoreAction, Texture, TextureDescriptor, TextureUsage,
+    SamplerMinMagFilter, SamplerState, Stages, StoreAction, Texture, TextureDescriptor,
+    TextureUsage,
 };
 use metal_rust::metal4::{
     ArgumentTable, ArgumentTableDescriptor, BlendState, BufferImageLayout, CommandQueue,
     CompilerDescriptor, LibraryDescriptor, LibraryFunctionDescriptor, RecordingRenderEncoder,
     RenderPassDescriptor, RenderPipelineBuildDescriptor, RenderPipelineColorAttachmentDescriptor,
-    RenderPipelineDescriptor, TextureOriginSelection, TextureRegionSelection,
+    RenderPipelineDescriptor, TextureOriginSelection, TextureRegionSelection, VisibilityOptions,
 };
+use metal_rust::metal_fx::FrameInterpolatorDescriptor;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(test)]
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+fn load_metalfx() -> anyhow::Result<()> {
+    static RESULT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    let result = RESULT.get_or_init(|| {
+        // Keep the framework loaded for the process lifetime: MetalFX objects
+        // can outlive any individual renderer or command buffer.
+        // SAFETY: the framework path is a NUL-terminated constant and the
+        // flags are valid for dlopen.
+        let handle = unsafe {
+            libc::dlopen(
+                c"/System/Library/Frameworks/MetalFX.framework/MetalFX".as_ptr(),
+                libc::RTLD_NOW | libc::RTLD_LOCAL,
+            )
+        };
+        if handle.is_null() {
+            // SAFETY: dlerror returns a NUL-terminated message for this thread.
+            let error = unsafe { libc::dlerror() };
+            let message = if error.is_null() {
+                "unknown dynamic loader error".to_owned()
+            } else {
+                // SAFETY: dlerror returned a non-null message pointer.
+                unsafe { std::ffi::CStr::from_ptr(error) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            Err(message)
+        } else {
+            Ok(())
+        }
+    });
+    result
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("failed to load MetalFX: {error}"))
+        .copied()
+}
 
 pub const MAP_TEXTURE_ID: u64 = 0x5349_584e_4701;
 const GPU_TEXTURE_CACHE_DIR: &str = "metal_io_textures_v1";
@@ -211,6 +249,20 @@ pub enum TemporalUpscaleMode {
     Off,
     Scale150,
     Scale200,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameGenerationMode {
+    Off,
+    Interpolate120,
+}
+
+fn display_size_aspect(size: &[u32; 2]) -> f32 {
+    if size[1] == 0 {
+        1.0
+    } else {
+        size[0] as f32 / size[1] as f32
+    }
 }
 
 impl TemporalUpscaleMode {
@@ -611,8 +663,16 @@ mod texture_cache_tests {
         let now = std::time::SystemTime::now();
         trim_texture_cache_entries(
             vec![
-                (Some(now - std::time::Duration::from_secs(2)), oldest.clone(), 100),
-                (Some(now - std::time::Duration::from_secs(1)), retained.clone(), 100),
+                (
+                    Some(now - std::time::Duration::from_secs(2)),
+                    oldest.clone(),
+                    100,
+                ),
+                (
+                    Some(now - std::time::Duration::from_secs(1)),
+                    retained.clone(),
+                    100,
+                ),
                 (Some(now), protected.clone(), 100),
             ],
             200,
@@ -885,6 +945,8 @@ struct Target {
     color: Texture,
     motion: Texture,
     upscale: Option<Texture>,
+    prev_upscale: Option<Texture>,
+    interpolated: Option<Texture>,
     depth: Texture,
     depth_resident: bool,
 }
@@ -916,15 +978,45 @@ pub struct Renderer3D4 {
     temporal_frame: u32,
     prev_view_projection: Mat4,
     temporal_scaler: Option<metal_rust::metal4_fx::TemporalScaler>,
+    frame_generation_mode: FrameGenerationMode,
+    frame_generation_frame: u32,
+    previous_real_frame_time: Option<Instant>,
+    frame_generation_real_slot: bool,
+    frame_interpolator: Option<metal_rust::metal4_fx::FrameInterpolator>,
     compiler: metal_rust::metal4::Compiler,
 }
 
 impl Renderer3D4 {
+    pub fn set_frame_generation_mode(&mut self, mode: FrameGenerationMode) {
+        if self.frame_generation_mode != mode {
+            self.frame_generation_mode = mode;
+            self.frame_generation_frame = 0;
+            self.previous_real_frame_time = None;
+            if mode != FrameGenerationMode::Off {
+                self.set_temporal_upscale_mode(TemporalUpscaleMode::Scale200);
+            }
+            eprintln!("[frame-generation] requested mode {mode:?}");
+        }
+    }
+
+    pub fn frame_generation_mode(&self) -> FrameGenerationMode {
+        self.frame_generation_mode
+    }
+
+    pub fn set_frame_generation_real_slot(&mut self, enabled: bool) {
+        self.frame_generation_real_slot = enabled;
+    }
+
     pub fn set_temporal_upscale_mode(&mut self, mode: TemporalUpscaleMode) {
         if self.temporal_mode != mode {
             self.temporal_mode = mode;
             self.temporal_frame = 0;
             self.prev_view_projection = Mat4::IDENTITY;
+            if mode == TemporalUpscaleMode::Off {
+                self.frame_generation_mode = FrameGenerationMode::Off;
+                self.frame_generation_frame = 0;
+                self.previous_real_frame_time = None;
+            }
         }
     }
 
@@ -935,9 +1027,7 @@ impl Renderer3D4 {
     pub fn new(device: &Device, queue: &CommandQueue) -> anyhow::Result<Self> {
         let io_queue = (|| -> anyhow::Result<_> {
             let descriptor = metal_rust::metal::IOCommandQueueDescriptor::new()?;
-            descriptor.set_type(
-                metal_rust::metal::IOCommandQueueType::IOCommandQueueTypeSerial,
-            )?;
+            descriptor.set_type(metal_rust::metal::IOCommandQueueType::IOCommandQueueTypeSerial)?;
             descriptor.set_max_command_buffer_count(8)?;
             descriptor.set_max_commands_in_flight(8)?;
             Ok(device.new_io_command_queue(&descriptor)?)
@@ -1034,6 +1124,11 @@ impl Renderer3D4 {
             temporal_frame: 0,
             prev_view_projection: Mat4::IDENTITY,
             temporal_scaler: None,
+            frame_generation_mode: FrameGenerationMode::Off,
+            frame_generation_frame: 0,
+            previous_real_frame_time: None,
+            frame_generation_real_slot: true,
+            frame_interpolator: None,
             compiler,
         })
     }
@@ -1422,7 +1517,12 @@ impl Renderer3D4 {
                 base: material.base_factor,
                 // w: gap in bits 0-1; bit 10 = vehicle parts coloured per
                 // vertex (the tint alpha 254 marks the primary body paint)
-                flags: [has, class, alpha, gap | if material.parts { 0x400 } else { 0 }],
+                flags: [
+                    has,
+                    class,
+                    alpha,
+                    gap | if material.parts { 0x400 } else { 0 },
+                ],
             };
             let offset = material_index * MATERIAL_STRIDE;
             material_data[offset..offset + std::mem::size_of::<Material4>()]
@@ -1764,8 +1864,29 @@ impl Renderer3D4 {
 
     pub fn output_texture(&self) -> Option<Texture> {
         self.target.as_ref().and_then(|target| {
-            target.upscale.clone().or_else(|| Some(target.color.clone()))
+            target
+                .upscale
+                .clone()
+                .or_else(|| Some(target.color.clone()))
         })
+    }
+
+    pub fn real_output_texture(&self) -> Option<Texture> {
+        self.target.as_ref().and_then(|target| {
+            target
+                .upscale
+                .clone()
+                .or_else(|| Some(target.color.clone()))
+        })
+    }
+
+    pub fn interpolated_output_texture(&self) -> Option<Texture> {
+        if self.frame_generation_frame < 2 {
+            return None;
+        }
+        self.target
+            .as_ref()
+            .and_then(|target| target.interpolated.clone())
     }
 
     pub fn render(
@@ -1777,6 +1898,11 @@ impl Renderer3D4 {
         lines: &[LineV],
         lines_on_top: &[LineV],
     ) -> anyhow::Result<egui::TextureId> {
+        if self.frame_generation_mode != FrameGenerationMode::Off
+            && !self.frame_generation_real_slot
+        {
+            return Ok(egui::TextureId::User(MAP_TEXTURE_ID));
+        }
         let scale = self.temporal_mode.scale();
         let render_size = if self.temporal_mode == TemporalUpscaleMode::Off {
             size
@@ -1830,7 +1956,6 @@ impl Renderer3D4 {
         if self.temporal_mode != TemporalUpscaleMode::Off {
             pass.set_color_attachment(1, &target.motion, ClearColor::new(0.0, 0.0, 0.0, 1.0))?;
         }
-        pass.set_color_attachment(1, &target.motion, ClearColor::new(0.0, 0.0, 0.0, 1.0))?;
         let depth_attachment = RenderPassDepthAttachmentDescriptor::new()?;
         depth_attachment.set_texture(Some(&target.depth))?;
         depth_attachment.set_load_action(LoadAction::LoadActionClear)?;
@@ -1851,11 +1976,13 @@ impl Renderer3D4 {
         let mut draw_count = 0u32;
         {
             let encoder = command_buffer.render_encoder(&pass, None)?;
-            encoder.set_render_pipeline_state(if self.temporal_mode == TemporalUpscaleMode::Off {
-                &self.pipeline
-            } else {
-                &self.temporal_pipeline
-            })?;
+            encoder.set_render_pipeline_state(
+                if self.temporal_mode == TemporalUpscaleMode::Off {
+                    &self.pipeline
+                } else {
+                    &self.temporal_pipeline
+                },
+            )?;
             encoder.set_depth_stencil_state(Some(&self.depth_state))?;
             encoder.set_argument_table(
                 Some(&self.argument_table),
@@ -1967,6 +2094,55 @@ impl Renderer3D4 {
             scaler.set_input_content_height(render_size[1] as usize)?;
             scaler.encode_to_command_buffer(&mut command_buffer)?;
         }
+        if let (Some(interpolator), Some(upscale), Some(prev_upscale), Some(interpolated)) = (
+            self.frame_interpolator.as_ref(),
+            target.upscale.as_ref(),
+            target.prev_upscale.as_ref(),
+            target.interpolated.as_ref(),
+        ) {
+            let now = Instant::now();
+            if let Some(previous) = self.previous_real_frame_time {
+                interpolator.set_aspect_ratio(display_size_aspect(&target.display_size))?;
+                interpolator.set_field_of_view(camera.fov.to_degrees())?;
+                interpolator.set_near_plane(camera.near)?;
+                interpolator.set_far_plane(camera.far)?;
+                interpolator.set_delta_time(now.duration_since(previous).as_secs_f32())?;
+                interpolator.set_jitter_offset_x(jitter[0])?;
+                interpolator.set_jitter_offset_y(jitter[1])?;
+                interpolator.set_motion_vector_scale_x(render_size[0] as f32 * 0.5)?;
+                interpolator.set_motion_vector_scale_y(render_size[1] as f32 * 0.5)?;
+                interpolator.set_color_texture(Some(upscale))?;
+                interpolator.set_prev_color_texture(Some(prev_upscale))?;
+                interpolator.set_depth_texture(Some(&target.depth))?;
+                interpolator.set_motion_texture(Some(&target.motion))?;
+                interpolator.set_output_texture(Some(interpolated))?;
+                interpolator.set_ui_texture(None)?;
+                interpolator.set_depth_reversed(true)?;
+                interpolator.set_is_ui_texture_composited(false)?;
+                interpolator.set_should_reset_history(self.frame_generation_frame < 2)?;
+                interpolator.encode_to_command_buffer(&mut command_buffer)?;
+                if self.frame_generation_frame < 3
+                    || self.frame_generation_frame.is_multiple_of(120)
+                {
+                    eprintln!(
+                        "[frame-generation] encoded real frame {} (delta {:.3} ms)",
+                        self.frame_generation_frame,
+                        now.duration_since(previous).as_secs_f64() * 1000.0
+                    );
+                }
+            }
+
+            let copy_encoder = command_buffer.compute_encoder()?;
+            copy_encoder.barrier_after_queue_stages(
+                Stages::StageDispatch,
+                Stages::StageBlit,
+                VisibilityOptions::VisibilityOptionDevice,
+            )?;
+            copy_encoder.copy_texture(upscale, prev_upscale)?;
+            copy_encoder.end()?;
+            self.previous_real_frame_time = Some(now);
+            self.frame_generation_frame = self.frame_generation_frame.wrapping_add(1);
+        }
         self.queue
             .submit(vec![command_buffer.end()?], None)?
             .wait()?;
@@ -2057,6 +2233,12 @@ impl Renderer3D4 {
         if size.contains(&0) {
             bail!("MTL4 render target dimensions must be non-zero");
         }
+        if self.temporal_mode != TemporalUpscaleMode::Off {
+            if let Err(error) = load_metalfx() {
+                self.set_temporal_upscale_mode(TemporalUpscaleMode::Off);
+                return Err(error);
+            }
+        }
         let display_size = if self.temporal_mode == TemporalUpscaleMode::Off {
             size
         } else {
@@ -2065,13 +2247,21 @@ impl Renderer3D4 {
                 (size[1] as f32 * self.temporal_mode.scale()).ceil() as u32,
             ]
         };
-        if self
-            .target
-            .as_ref()
-            .is_some_and(|target| target.size == size && target.display_size == display_size)
-        {
+        if self.target.as_ref().is_some_and(|target| {
+            target.size == size
+                && target.display_size == display_size
+                && target.prev_upscale.is_some()
+                    == (self.frame_generation_mode != FrameGenerationMode::Off)
+                && target.interpolated.is_some()
+                    == (self.frame_generation_mode != FrameGenerationMode::Off)
+        }) {
             return Ok(());
         }
+
+        self.temporal_frame = 0;
+        self.frame_generation_frame = 0;
+        self.previous_real_frame_time = None;
+        self.prev_view_projection = Mat4::IDENTITY;
 
         let descriptor = TextureDescriptor::new_2d(
             if self.temporal_mode == TemporalUpscaleMode::Off {
@@ -2101,9 +2291,39 @@ impl Renderer3D4 {
                 display_size[0] as usize,
                 display_size[1] as usize,
                 ResourceOptions::PRIVATE,
-                TextureUsage::RENDER_TARGET.union(TextureUsage::SHADER_READ).union(TextureUsage::SHADER_WRITE),
+                TextureUsage::RENDER_TARGET
+                    .union(TextureUsage::SHADER_READ)
+                    .union(TextureUsage::SHADER_WRITE),
             )?;
             Some(self.device.new_texture(&output_descriptor)?)
+        };
+        let prev_upscale = if self.frame_generation_mode != FrameGenerationMode::Off {
+            let output_descriptor = TextureDescriptor::new_2d(
+                PixelFormat::RGBA16_FLOAT,
+                display_size[0] as usize,
+                display_size[1] as usize,
+                ResourceOptions::PRIVATE,
+                TextureUsage::RENDER_TARGET
+                    .union(TextureUsage::SHADER_READ)
+                    .union(TextureUsage::SHADER_WRITE),
+            )?;
+            Some(self.device.new_texture(&output_descriptor)?)
+        } else {
+            None
+        };
+        let interpolated = if self.frame_generation_mode != FrameGenerationMode::Off {
+            let output_descriptor = TextureDescriptor::new_2d(
+                PixelFormat::RGBA16_FLOAT,
+                display_size[0] as usize,
+                display_size[1] as usize,
+                ResourceOptions::PRIVATE,
+                TextureUsage::RENDER_TARGET
+                    .union(TextureUsage::SHADER_READ)
+                    .union(TextureUsage::SHADER_WRITE),
+            )?;
+            Some(self.device.new_texture(&output_descriptor)?)
+        } else {
+            None
         };
         let depth_descriptor = TextureDescriptor::new_2d(
             PixelFormat::DEPTH32_FLOAT,
@@ -2121,23 +2341,41 @@ impl Renderer3D4 {
             },
         )?;
         let depth = self.device.new_texture(&depth_descriptor)?;
-        let mut allocations = vec![ResidencyAllocation::Texture(&color), ResidencyAllocation::Texture(&motion)];
+        let mut allocations = vec![
+            ResidencyAllocation::Texture(&color),
+            ResidencyAllocation::Texture(&motion),
+        ];
         if self.temporal_mode != TemporalUpscaleMode::Off {
             allocations.push(ResidencyAllocation::Texture(&depth));
         }
         if let Some(upscale) = &upscale {
             allocations.push(ResidencyAllocation::Texture(upscale));
         }
+        if let Some(prev_upscale) = &prev_upscale {
+            allocations.push(ResidencyAllocation::Texture(prev_upscale));
+        }
+        if let Some(interpolated) = &interpolated {
+            allocations.push(ResidencyAllocation::Texture(interpolated));
+        }
         self.residency.add_allocations(&allocations)?;
         self.residency.commit()?;
 
         if let Some(old) = self.target.take() {
-            let mut removals = vec![ResidencyAllocation::Texture(&old.color), ResidencyAllocation::Texture(&old.motion)];
+            let mut removals = vec![
+                ResidencyAllocation::Texture(&old.color),
+                ResidencyAllocation::Texture(&old.motion),
+            ];
             if old.depth_resident {
                 removals.push(ResidencyAllocation::Texture(&old.depth));
             }
             if let Some(upscale) = &old.upscale {
                 removals.push(ResidencyAllocation::Texture(upscale));
+            }
+            if let Some(prev_upscale) = &old.prev_upscale {
+                removals.push(ResidencyAllocation::Texture(prev_upscale));
+            }
+            if let Some(interpolated) = &old.interpolated {
+                removals.push(ResidencyAllocation::Texture(interpolated));
             }
             self.residency.remove_allocations(&removals)?;
             self.residency.commit()?;
@@ -2148,19 +2386,21 @@ impl Renderer3D4 {
             display_size,
             color,
             motion,
-            upscale,
+            upscale: upscale.clone(),
+            prev_upscale: prev_upscale.clone(),
+            interpolated: interpolated.clone(),
             depth,
             depth_resident,
         });
         if self.temporal_mode != TemporalUpscaleMode::Off {
-            let Ok(descriptor) = metal_rust::metal_fx::TemporalScalerDescriptor::new() else {
-                self.temporal_mode = TemporalUpscaleMode::Off;
-                self.temporal_scaler = None;
-                if let Some(target) = self.target.as_mut() {
-                    target.upscale = None;
-                    target.display_size = target.size;
+            let descriptor = match metal_rust::metal_fx::TemporalScalerDescriptor::new() {
+                Ok(descriptor) => descriptor,
+                Err(error) => {
+                    self.set_temporal_upscale_mode(TemporalUpscaleMode::Off);
+                    self.temporal_scaler = None;
+                    self.frame_interpolator = None;
+                    return Err(error.into());
                 }
-                return Ok(());
             };
             descriptor.configure(
                 PixelFormat::RGBA16_FLOAT,
@@ -2174,17 +2414,66 @@ impl Renderer3D4 {
             )?;
             match descriptor.new_mtl4_scaler(&self.device, &self.compiler) {
                 Ok(scaler) => self.temporal_scaler = Some(scaler),
-                Err(_) => {
-                    self.temporal_mode = TemporalUpscaleMode::Off;
+                Err(error) => {
+                    self.set_temporal_upscale_mode(TemporalUpscaleMode::Off);
                     self.temporal_scaler = None;
-                    if let Some(target) = self.target.as_mut() {
-                        target.upscale = None;
-                        target.display_size = target.size;
-                    }
+                    self.frame_interpolator = None;
+                    return Err(error.into());
                 }
             }
         } else {
             self.temporal_scaler = None;
+        }
+        if self.frame_generation_mode != FrameGenerationMode::Off {
+            if let (Some(_upscale), Some(_interpolated), Some(_prev_upscale)) =
+                (&upscale, &interpolated, &prev_upscale)
+            {
+                let descriptor = match FrameInterpolatorDescriptor::new() {
+                    Ok(descriptor) => descriptor,
+                    Err(error) => {
+                        eprintln!("MetalFX frame interpolator descriptor unavailable: {error}");
+                        self.frame_generation_mode = FrameGenerationMode::Off;
+                        self.frame_interpolator = None;
+                        return Ok(());
+                    }
+                };
+                match FrameInterpolatorDescriptor::supports_metal4_fx(&self.device) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        eprintln!("MetalFX frame interpolation is not supported on this device");
+                        self.frame_generation_mode = FrameGenerationMode::Off;
+                        self.frame_interpolator = None;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        eprintln!("MetalFX frame interpolation support check failed: {error}");
+                        self.frame_generation_mode = FrameGenerationMode::Off;
+                        self.frame_interpolator = None;
+                        return Ok(());
+                    }
+                }
+                descriptor.set_input_width(size[0] as usize)?;
+                descriptor.set_input_height(size[1] as usize)?;
+                descriptor.set_output_width(display_size[0] as usize)?;
+                descriptor.set_output_height(display_size[1] as usize)?;
+                descriptor.set_color_texture_format(PixelFormat::RGBA16_FLOAT)?;
+                descriptor.set_depth_texture_format(PixelFormat::DEPTH32_FLOAT)?;
+                descriptor.set_motion_texture_format(PixelFormat::RG16_FLOAT)?;
+                descriptor.set_output_texture_format(PixelFormat::RGBA16_FLOAT)?;
+                match descriptor.new_frame_interpolator(&self.device, &self.compiler) {
+                    Ok(interpolator) => {
+                        eprintln!("[frame-generation] MTL4 interpolator ready");
+                        self.frame_interpolator = Some(interpolator);
+                    }
+                    Err(error) => {
+                        eprintln!("MetalFX frame interpolator creation failed: {error}");
+                        self.frame_generation_mode = FrameGenerationMode::Off;
+                        self.frame_interpolator = None;
+                    }
+                }
+            }
+        } else {
+            self.frame_interpolator = None;
         }
         Ok(())
     }
@@ -2522,7 +2811,10 @@ mod tests {
         let mut renderer = Renderer3D4::new(&device, &queue)?;
         renderer.set_temporal_upscale_mode(TemporalUpscaleMode::Scale200);
         renderer.ensure_target([16, 12])?;
-        let target = renderer.target.as_ref().context("MTL4 temporal target missing")?;
+        let target = renderer
+            .target
+            .as_ref()
+            .context("MTL4 temporal target missing")?;
         if renderer.temporal_scaler.is_some() {
             assert_eq!(target.display_size, [32, 24]);
             assert!(target.upscale.is_some());
@@ -2530,6 +2822,62 @@ mod tests {
             assert_eq!(renderer.temporal_upscale_mode(), TemporalUpscaleMode::Off);
             assert_eq!(target.display_size, target.size);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn mtl4_frame_generation_recreates_targets_and_primes_history() -> anyhow::Result<()> {
+        let Some(device) = Device::system_default() else {
+            return Ok(());
+        };
+        if !device.supports_family(GPUFamily::GPUFamilyMetal4)? {
+            return Ok(());
+        }
+        load_metalfx()?;
+        if !FrameInterpolatorDescriptor::supports_metal4_fx(&device)? {
+            eprintln!("Skipping: this device does not support Metal 4 frame interpolation");
+            return Ok(());
+        }
+        let queue = device.new_mtl4_command_queue()?;
+        let mut renderer = Renderer3D4::new(&device, &queue)?;
+        renderer.set_temporal_upscale_mode(TemporalUpscaleMode::Scale200);
+        renderer.ensure_target([32, 32])?;
+        if renderer.temporal_scaler.is_none() {
+            eprintln!("Skipping: MetalFX temporal scaler initialization failed");
+            return Ok(());
+        }
+
+        renderer.set_frame_generation_mode(FrameGenerationMode::Interpolate120);
+        renderer.ensure_target([32, 32])?;
+        assert_eq!(
+            renderer.frame_generation_mode(),
+            FrameGenerationMode::Interpolate120
+        );
+        assert!(renderer.target.as_ref().unwrap().prev_upscale.is_some());
+        assert!(renderer.target.as_ref().unwrap().interpolated.is_some());
+
+        let camera = Camera::default();
+        let look = Look::default();
+        renderer.render([64, 64], &camera, &look, &[], &[], &[])?;
+        assert!(renderer.interpolated_output_texture().is_none());
+        renderer.render([64, 64], &camera, &look, &[], &[], &[])?;
+        assert!(renderer.interpolated_output_texture().is_some());
+
+        renderer.ensure_target([40, 40])?;
+        assert!(renderer.interpolated_output_texture().is_none());
+        renderer.set_frame_generation_mode(FrameGenerationMode::Off);
+        renderer.ensure_target([40, 40])?;
+        let target = renderer.target.as_ref().unwrap();
+        assert!(target.prev_upscale.is_none());
+        assert!(target.interpolated.is_none());
+
+        renderer.set_frame_generation_mode(FrameGenerationMode::Interpolate120);
+        renderer.ensure_target([40, 40])?;
+        renderer.set_temporal_upscale_mode(TemporalUpscaleMode::Off);
+        assert_eq!(renderer.frame_generation_mode(), FrameGenerationMode::Off);
+        renderer.ensure_target([40, 40])?;
+        assert!(renderer.target.as_ref().unwrap().prev_upscale.is_none());
+        eprintln!("Frame interpolation target and history checks executed");
         Ok(())
     }
 

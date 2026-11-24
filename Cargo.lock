@@ -2131,15 +2131,16 @@ dependencies = [
 [[package]]
 name = "metal-rust"
 version = "1.0.0"
-source = "git+https://github.com/maple-quartz18/Metal-Rust.git?rev=c417ff66b8b263a5708116d7cdfad966b599db4a#c417ff66b8b263a5708116d7cdfad966b599db4a"
+source = "git+https://github.com/maple-quartz18/Metal-Rust.git?rev=e67e0fe6007f773a99debca0cfdb111cf49b792c#e67e0fe6007f773a99debca0cfdb111cf49b792c"
 dependencies = [
  "metal-rust-ffi",
+ "raw-window-handle",
 ]
 
 [[package]]
 name = "metal-rust-ffi"
 version = "1.0.0"
-source = "git+https://github.com/maple-quartz18/Metal-Rust.git?rev=c417ff66b8b263a5708116d7cdfad966b599db4a#c417ff66b8b263a5708116d7cdfad966b599db4a"
+source = "git+https://github.com/maple-quartz18/Metal-Rust.git?rev=e67e0fe6007f773a99debca0cfdb111cf49b792c#e67e0fe6007f773a99debca0cfdb111cf49b792c"
 dependencies = [
  "block2 0.6.2",
  "cc",
@@ -2150,6 +2151,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-metal 0.3.2",
  "objc2-quartz-core 0.3.2",
+ "raw-window-handle",
 ]
 
 [[package]]
@@ -3479,7 +3481,6 @@ dependencies = [
  "image",
  "libc",
  "metal-rust",
- "objc2 0.6.5",
  "rayon",
  "regex",
  "rfd",

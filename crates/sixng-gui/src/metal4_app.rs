@@ -17,16 +17,13 @@ mod macos {
     use metal_rust::foundation::{OperatingSystemVersion, ProcessInfo};
     use metal_rust::metal::{Device, GPUFamily, PixelFormat, ResidencySet};
     use metal_rust::quartz_core::Layer;
-    use objc2::msg_send;
-    use objc2::runtime::AnyObject;
-    use objc2::sel;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use winit::application::ApplicationHandler;
     use winit::dpi::PhysicalSize;
     use winit::event::{StartCause, WindowEvent};
     use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use winit::raw_window_handle::HasWindowHandle;
     use winit::window::{Window, WindowId};
 
     fn is_macos_26_or_later(version: &OperatingSystemVersion) -> bool {
@@ -60,6 +57,7 @@ mod macos {
         residency: ResidencySet,
         size: PhysicalSize<u32>,
         has_presented: bool,
+        frame_presentation: crate::frame_presentation_mtl4::FramePresentationMtl4,
     }
 
     impl Renderer {
@@ -75,31 +73,10 @@ mod macos {
             let layer = Layer::with_device(&device)?;
             layer.set_pixel_format(PixelFormat::BGRA8_UNORM_SRGB);
             layer.set_framebuffer_only(true);
-            layer.set_maximum_drawable_count(2)?;
+            layer.set_maximum_drawable_count(3)?;
             layer.set_display_sync_enabled(true);
             let handle = window.window_handle()?.as_raw();
-            let RawWindowHandle::AppKit(appkit) = handle else {
-                bail!("the Metal 4 window example requires an AppKit window");
-            };
-            let view = appkit.ns_view.as_ptr().cast::<AnyObject>();
-            let metal_layer = layer.as_ptr().as_ptr().cast::<AnyObject>();
-            // SAFETY: winit supplies a live NSView for this window; NSObject
-            // implements respondsToSelector: with the declared ABI.
-            let supports_layer_backing: bool =
-                unsafe { msg_send![&*view, respondsToSelector: sel!(setWantsLayer:)] };
-            // SAFETY: same live NSView and Objective-C selector ABI as above.
-            let supports_layer_assignment: bool =
-                unsafe { msg_send![&*view, respondsToSelector: sel!(setLayer:)] };
-            if !supports_layer_backing || !supports_layer_assignment {
-                bail!("AppKit NSView does not support installing a CAMetalLayer");
-            }
-            // SAFETY: winit supplies a live AppKit NSView owned by this window,
-            // Renderer is initialized on the main thread, and CAMetalLayer is
-            // retained by both this wrapper and the view after setLayer:.
-            unsafe {
-                let _: () = msg_send![&*view, setWantsLayer: true];
-                let _: () = msg_send![&*view, setLayer: &*metal_layer];
-            }
+            layer.attach_to_window(handle)?;
 
             let size = window.inner_size();
             layer.set_drawable_size(size.width as f64, size.height as f64)?;
@@ -109,6 +86,13 @@ mod macos {
             queue.add_residency_set(&residency)?;
             let painter = super::super::metal4_egui::Painter::new(&device)?;
             let scene = crate::render3d_metal4::Renderer3D4::new(&device, &queue)?;
+            let refresh_rate = window
+                .current_monitor()
+                .and_then(|monitor| monitor.refresh_rate_millihertz());
+            let mut frame_presentation =
+                crate::frame_presentation_mtl4::FramePresentationMtl4::new(refresh_rate);
+            frame_presentation.resize(&device, size)?;
+            frame_presentation.start()?;
 
             Ok(Self {
                 device,
@@ -119,6 +103,7 @@ mod macos {
                 residency,
                 size,
                 has_presented: false,
+                frame_presentation,
             })
         }
 
@@ -127,8 +112,22 @@ mod macos {
             if size.width > 0 && size.height > 0 {
                 self.layer
                     .set_drawable_size(size.width as f64, size.height as f64)?;
+                self.frame_presentation.resize(&self.device, size)?;
+                self.frame_presentation.reset();
             }
             Ok(())
+        }
+
+        fn set_refresh_rate_millihertz(&mut self, rate: Option<u32>) {
+            self.frame_presentation.set_refresh_rate_millihertz(rate);
+            if rate.is_none_or(|rate| rate < 119_500)
+                && self.scene.frame_generation_mode()
+                    == crate::render3d_metal4::FrameGenerationMode::Interpolate120
+            {
+                eprintln!("[frame-generation] disabled: active display is not 120 Hz");
+                self.scene
+                    .set_frame_generation_mode(crate::render3d_metal4::FrameGenerationMode::Off);
+            }
         }
 
         fn render(
@@ -136,22 +135,61 @@ mod macos {
             ctx: &egui::Context,
             mut output: egui::FullOutput,
         ) -> anyhow::Result<()> {
+            if self.scene.frame_generation_mode()
+                == crate::render3d_metal4::FrameGenerationMode::Interpolate120
+                && !self.frame_presentation.supports_frame_generation()
+            {
+                eprintln!("[frame-generation] disabled: active display is not 120 Hz");
+                self.scene
+                    .set_frame_generation_mode(crate::render3d_metal4::FrameGenerationMode::Off);
+            }
             let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
-            if let Some(texture) = self.scene.output_texture() {
-                self.painter.register_external_texture(
-                    egui::TextureId::User(crate::render3d_metal4::MAP_TEXTURE_ID),
-                    &texture,
+            if self.scene.frame_generation_mode()
+                == crate::render3d_metal4::FrameGenerationMode::Interpolate120
+            {
+                let (texture, presented_interpolated) = if self.frame_presentation.phase()
+                    == crate::frame_presentation_mtl4::FramePhase::Real
+                {
+                    (self.scene.real_output_texture(), false)
+                } else {
+                    match self.scene.interpolated_output_texture() {
+                        Some(texture) => (Some(texture), true),
+                        None => (self.scene.real_output_texture(), false),
+                    }
+                };
+                if let Some(texture) = texture {
+                    self.painter.register_external_texture(
+                        egui::TextureId::User(crate::render3d_metal4::MAP_TEXTURE_ID),
+                        &texture,
+                    )?;
+                }
+                self.painter.render(
+                    &self.layer,
+                    &self.queue,
+                    &self.residency,
+                    [self.size.width, self.size.height],
+                    output.pixels_per_point,
+                    &primitives,
+                    &mut output.textures_delta,
+                )?;
+                self.frame_presentation.advance(presented_interpolated);
+            } else {
+                if let Some(texture) = self.scene.output_texture() {
+                    self.painter.register_external_texture(
+                        egui::TextureId::User(crate::render3d_metal4::MAP_TEXTURE_ID),
+                        &texture,
+                    )?;
+                }
+                self.painter.render(
+                    &self.layer,
+                    &self.queue,
+                    &self.residency,
+                    [self.size.width, self.size.height],
+                    output.pixels_per_point,
+                    &primitives,
+                    &mut output.textures_delta,
                 )?;
             }
-            self.painter.render(
-                &self.layer,
-                &self.queue,
-                &self.residency,
-                [self.size.width, self.size.height],
-                output.pixels_per_point,
-                &primitives,
-                &mut output.textures_delta,
-            )?;
             if !self.has_presented {
                 println!(
                     "Presented an MTL4 egui frame on {} ({}x{})",
@@ -212,6 +250,9 @@ mod macos {
             let Some(renderer) = self.renderer.as_mut() else {
                 return;
             };
+            renderer.scene.set_frame_generation_real_slot(
+                renderer.frame_presentation.should_render_real_frame(),
+            );
             let mut output = self.egui_ctx.run_ui(input, |ui| {
                 self.sixng.logic(ui.ctx());
                 self.sixng.ui(ui, &mut renderer.scene);
@@ -243,6 +284,28 @@ mod macos {
             state.handle_platform_output(window, platform_output);
             if let Err(error) = renderer.render(&self.egui_ctx, output) {
                 self.fail(event_loop, error);
+                return;
+            }
+            if renderer.scene.frame_generation_mode()
+                == crate::render3d_metal4::FrameGenerationMode::Interpolate120
+            {
+                let Some(interval) = renderer.frame_presentation.pacing_interval() else {
+                    self.fail(
+                        event_loop,
+                        anyhow::anyhow!("frame generation requires a 120 Hz display"),
+                    );
+                    return;
+                };
+                self.repaint_at = Some(renderer.frame_presentation.schedule(interval));
+                let (real, interpolated, fallback) = renderer.frame_presentation.counts();
+                if (real + interpolated + fallback).is_multiple_of(120) {
+                    eprintln!(
+                        "[frame-generation] presented real={real} interpolated={interpolated} fallback={fallback}"
+                    );
+                }
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    self.repaint_at.expect("120fps repaint deadline was set"),
+                ));
             }
         }
     }
@@ -335,6 +398,12 @@ mod macos {
                             self.fail(event_loop, error);
                             return;
                         }
+                        renderer.set_refresh_rate_millihertz(
+                            self.window
+                                .as_ref()
+                                .and_then(|window| window.current_monitor())
+                                .and_then(|monitor| monitor.refresh_rate_millihertz()),
+                        );
                     }
                     if let Some(window) = self.window.as_ref() {
                         window.request_redraw();
@@ -351,6 +420,11 @@ mod macos {
                                 self.fail(event_loop, error);
                                 return;
                             }
+                            renderer.set_refresh_rate_millihertz(
+                                window
+                                    .current_monitor()
+                                    .and_then(|monitor| monitor.refresh_rate_millihertz()),
+                            );
                         }
                     }
                     if let Some(window) = self.window.as_ref() {
