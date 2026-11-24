@@ -482,8 +482,9 @@ pub fn bank_container(c: &BankContainers) -> std::collections::BTreeMap<u64, u32
 }
 
 /// One entry of the bank list: a bank's container hash, its size in bytes
-/// and a group hash (the joaat of a word such as `props`, `streams` or
-/// `weapons` for some groups; most are not named).
+/// and a group hash: joaat of a category named after the bank's audio pack
+/// without `core.` (`speech.ped`, `props`) or a sub-category of it
+/// (`resident.combat`, `ambience.bankloaded.birds`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BankListEntry {
     pub container: u32,
@@ -598,6 +599,30 @@ pub fn save_containers(work: &std::path::Path, archive: &str, c: &BankContainers
     Ok(())
 }
 
+/// `<work>/index/audio_bank_groups_<archive>.json`: container hash (hex) ->
+/// bank-list group hash (hex), written by `audio-meta`.
+pub fn groups_path(work: &std::path::Path, archive: &str) -> std::path::PathBuf {
+    work.join("index").join(format!("audio_bank_groups_{}.json", archive.trim_end_matches(".rpf").replace(['/', '\\'], "_")))
+}
+
+/// Container -> group of the bank list.
+pub fn bank_groups(list: &[BankListEntry]) -> std::collections::BTreeMap<u32, u32> {
+    list.iter().map(|e| (e.container, e.group)).collect()
+}
+
+pub fn save_groups(work: &std::path::Path, archive: &str, g: &std::collections::BTreeMap<u32, u32>) -> Result<()> {
+    let v: std::collections::BTreeMap<String, String> = g.iter().map(|(c, g)| (format!("{c:08x}"), format!("{g:08x}"))).collect();
+    let p = groups_path(work, archive);
+    std::fs::create_dir_all(p.parent().unwrap())?;
+    std::fs::write(p, serde_json::to_vec(&v)?)?;
+    Ok(())
+}
+
+pub fn load_groups(work: &std::path::Path, archive: &str) -> Option<std::collections::BTreeMap<u32, u32>> {
+    let v: std::collections::BTreeMap<String, String> = serde_json::from_slice(&std::fs::read(groups_path(work, archive)).ok()?).ok()?;
+    Some(v.into_iter().filter_map(|(c, g)| Some((u32::from_str_radix(&c, 16).ok()?, u32::from_str_radix(&g, 16).ok()?))).collect())
+}
+
 pub fn load_containers(work: &std::path::Path, archive: &str) -> Option<BankContainers> {
     let v: std::collections::BTreeMap<String, std::collections::BTreeMap<String, usize>> = serde_json::from_slice(&std::fs::read(containers_path(work, archive)).ok()?).ok()?;
     Some(v.into_iter().filter_map(|(b, m)| Some((u64::from_str_radix(&b, 16).ok()?, m.into_iter().filter_map(|(h, n)| Some((u32::from_str_radix(&h, 16).ok()?, n))).collect()))).collect())
@@ -610,7 +635,7 @@ pub fn load_containers(work: &std::path::Path, archive: &str) -> Option<BankCont
 /// sound files to streams (empty: not linked, no containers); `sizes`: (bank
 /// offset, size), to place the bank list. Banks the sound files do not
 /// reach get their container from the bank list, with 0 waves.
-pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], banks: &[(u64, std::collections::HashSet<u32>)], sizes: &[(u64, u64)], out: &std::path::Path) -> Result<(usize, usize, BankContainers, usize)> {
+pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], banks: &[(u64, std::collections::HashSet<u32>)], sizes: &[(u64, u64)], out: &std::path::Path) -> Result<(usize, usize, BankContainers, Vec<BankListEntry>)> {
     let mut containers = BankContainers::new();
     let mut list: Vec<BankListEntry> = Vec::new();
     let known: std::collections::HashSet<u32> = banks.iter().flat_map(|(_, s)| s.iter().copied()).collect();
@@ -663,7 +688,7 @@ pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], ban
             containers.entry(off).or_insert_with(|| [(e.container, 0)].into_iter().collect());
         }
     }
-    Ok((ok, bad, containers, list.len()))
+    Ok((ok, bad, containers, list))
 }
 
 /// A large file can be indexed as two entries with stored (not zlib) 64 KiB

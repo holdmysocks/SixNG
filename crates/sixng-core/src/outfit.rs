@@ -569,6 +569,9 @@ pub fn export_outfit(a: &ArchiveInfo, parts: &[&Entry], name: &str, out: &Path, 
         if c.kind != 1 {
             bail!("clip {} has type {} (only animation clips, type 1, are decoded)", c.short_name(), c.kind);
         }
+        if c.bindings.is_empty() && !c.pending.is_empty() {
+            bail!("clip {} of {}: all {} of its animation windows are streamed in dictionaries that are not loaded (a cutscene's `-N` sections: pick it as cin@<scene>/<clip>)", c.short_name(), d.name, c.pending.len());
+        }
         if c.bindings.is_empty() {
             bail!("clip {} of {} binds no animation in this dictionary (not decoded yet); pick another clip", c.short_name(), d.name);
         }
@@ -582,6 +585,10 @@ pub fn export_outfit(a: &ArchiveInfo, parts: &[&Entry], name: &str, out: &Path, 
         stats["dictionary"] = d.name.clone().into();
         stats["clip"] = c.short_name().into();
         stats["duration"] = c.duration.into();
+        if c.sections > 1 || !c.pending.is_empty() {
+            stats["sections"] = c.sections.into();
+            stats["missing_windows"] = c.pending.len().into();
+        }
         stats["frames"] = channels.iter().map(|ch| ch.times.len()).max().unwrap_or(0).into();
         clip_reports.push(stats);
         anims.push(crate::gltf::Animation { name: format!("{}/{}", d.name, c.short_name()), channels });
@@ -698,7 +705,7 @@ mod tests {
             Track { bone: 0, kind: track::MOVER_ROTATION, value: ValueType::Quaternion, frames: vec![[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, h, h]] },
         ];
         let d = ClipDictionary { name: "d".into(), clips: vec![], animations: vec![Animation { hash: 0, name: "a".into(), frames: 2, duration: 1.0, tracks }] };
-        let c = Clip { hash: 0, kind: 1, name: "c".into(), duration: 1.0, bindings: vec![Binding { animation: 0, start: 0.0, end: 1.0, rate: 1.0 }] };
+        let c = Clip { hash: 0, kind: 1, name: "c".into(), duration: 1.0, bindings: vec![Binding { animation: 0, start: 0.0, end: 1.0, rate: 1.0, offset: 0.0 }], pending: Vec::new(), sections: 1 };
         // the root sits 1 m to the side (+X) at rest, and has no keys of its own
         let joints = vec![j("root", None, 1.0), j("spine", Some(0), 1.0)];
         let mut ch = Vec::new();

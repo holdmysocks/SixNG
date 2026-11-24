@@ -127,6 +127,22 @@ pub struct Binding {
     pub start: f32,
     pub end: f32,
     pub rate: f32,
+    /// Clip time at which this binding starts: 0, except in the later
+    /// sections of a sectioned (cutscene) clip.
+    pub offset: f32,
+}
+
+/// One animation window of a clip section whose animation is not in this
+/// dictionary (streamed in a cutscene section dictionary); see
+/// [`ClipDictionary::join`].
+#[derive(Clone, Debug)]
+pub struct Pending {
+    /// Map key of the animation (in some section dictionary).
+    pub animation: u32,
+    pub start: f32,
+    pub end: f32,
+    pub rate: f32,
+    pub offset: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -139,6 +155,11 @@ pub struct Clip {
     pub name: String,
     pub duration: f32,
     pub bindings: Vec<Binding>,
+    /// Windows whose animation is elsewhere (cutscene sections not joined
+    /// yet).
+    pub pending: Vec<Pending>,
+    /// Number of sections (1 for ordinary clips).
+    pub sections: usize,
 }
 
 impl Clip {
@@ -165,6 +186,16 @@ pub fn is_clip_dictionary(b: &[u8]) -> bool {
 /// Name of a clip dictionary (+0x38), without decoding it.
 pub fn dictionary_name(b: &[u8]) -> Option<String> {
     is_clip_dictionary(b).then(|| str_field(b, 0x38)).flatten()
+}
+
+/// The keys of a clip dictionary's clip map, read from its system page
+/// without decoding anything (in a cutscene section dictionary: the keys of
+/// its animations).
+pub fn map_keys(b: &[u8]) -> Vec<u32> {
+    match (is_clip_dictionary(b), ptr(b, 0x48), u16_at(b, 0x50)) {
+        (true, Some(buckets), Ok(n)) => walk_map(b, buckets, n as usize).into_iter().map(|x| x.0).collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// (key hash, value offset) of every node of an `atMap`.
@@ -450,15 +481,31 @@ impl ClipDictionary {
         }
         let buckets = ptr(b, 0x48).ok_or_else(|| anyhow!("clip map missing"))?;
         let mut clips = Vec::new();
+        let mut raw_clips = Vec::new();
         for (h, co) in walk_map(b, buckets, u16_at(b, 0x50)? as usize) {
-            let kind = u32_at(b, co + 0x10)?;
-            if kind != 1 {
-                clips.push(Clip { hash: h, kind, name: format!("clip_{h:08x}"), duration: 0.0, bindings: Vec::new() });
+            // Cutscene section dictionaries (`cin@<scene>-<N>`) keep their
+            // animations in the clip map itself (name at +0x30, `.anim`).
+            if str_field(b, co + 0x30).is_some_and(|n| n.ends_with(".anim")) {
+                if !anim_at.contains_key(&co) {
+                    anim_at.insert(co, animations.len());
+                    animations.push(animation(b, co, h)?);
+                }
                 continue;
             }
+            let kind = u32_at(b, co + 0x10)?;
+            if kind == 1 {
+                raw_clips.push((h, co));
+                continue;
+            }
+            clips.push(Clip { hash: h, kind, name: format!("clip_{h:08x}"), duration: 0.0, bindings: Vec::new(), pending: Vec::new(), sections: 0 });
+        }
+        let by_hash: std::collections::HashMap<u32, usize> = animations.iter().enumerate().map(|(i, a)| (a.hash, i)).collect();
+        for (h, co) in raw_clips {
             let name = str_field(b, co + 0x28).unwrap_or_else(|| format!("clip_{h:08x}"));
             let mut duration = f32_at(b, co + 0x78)?;
             let mut bindings = Vec::new();
+            let mut pending = Vec::new();
+            let mut sections = 1;
             // Single-animation clips (map object clips such as swaying
             // cables): +0x68 points at the animation itself, with start,
             // end and rate at +0x90 and the duration field left 0.
@@ -467,20 +514,67 @@ impl ClipDictionary {
                 if duration <= 0.0 {
                     duration = (end - start) / if rate.abs() > 1e-6 { rate } else { 1.0 };
                 }
-                bindings.push(Binding { animation, start, end, rate });
+                bindings.push(Binding { animation, start, end, rate, offset: 0.0 });
             } else if let Some(holder) = ptr(b, co + 0x68) {
-                if let Some(arr) = ptr(b, holder) {
-                    for i in 0..u16_at(b, holder + 8)? as usize {
+                // +0x68 / +0x70: the clip's sections, 0x18 bytes each
+                // `{ptr windows, u16 count, u16, f32 duration}`, played one
+                // after another (cutscene clips have one per streamed
+                // section; other clips one). A window (0x38 bytes) is `{ptr
+                // animation, u32 animation key, …, +0x28 start, +0x2C end,
+                // +0x30 rate}`; the pointer is 0 when the animation is in a
+                // section dictionary.
+                let mut offset = 0.0f32;
+                let mut read = 0;
+                for s in 0..u16_at(b, co + 0x70)? as usize {
+                    let sec = holder + 0x18 * s;
+                    let Some(arr) = ptr(b, sec) else { break };
+                    read += 1;
+                    for i in 0..u16_at(b, sec + 8)? as usize {
                         let e = arr + 0x38 * i;
-                        let Some(&animation) = ptr(b, e).and_then(|ao| anim_at.get(&ao)) else { continue };
-                        bindings.push(Binding { animation, start: f32_at(b, e + 0x28)?, end: f32_at(b, e + 0x2c)?, rate: f32_at(b, e + 0x30)? });
+                        let (start, end, rate) = (f32_at(b, e + 0x28)?, f32_at(b, e + 0x2c)?, f32_at(b, e + 0x30)?);
+                        let key = u32_at(b, e + 8)?;
+                        match ptr(b, e).and_then(|ao| anim_at.get(&ao)).or_else(|| by_hash.get(&key)) {
+                            Some(&animation) => bindings.push(Binding { animation, start, end, rate, offset }),
+                            None if key != 0 => pending.push(Pending { animation: key, start, end, rate, offset }),
+                            None => {}
+                        }
                     }
+                    offset += f32_at(b, sec + 0x10)?;
                 }
+                sections = read.max(1);
             }
-            clips.push(Clip { hash: h, kind, name, duration, bindings });
+            clips.push(Clip { hash: h, kind: 1, name, duration, bindings, pending, sections });
         }
         clips.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(ClipDictionary { name, clips, animations })
+    }
+
+    /// Join cutscene section dictionaries (`cin@<scene>-<N>`, parsed) into
+    /// this base dictionary: their animations are appended and every pending
+    /// window whose animation they hold becomes a binding. Returns the number
+    /// of windows joined.
+    pub fn join(&mut self, sections: Vec<ClipDictionary>) -> usize {
+        let base = self.animations.len();
+        for s in sections {
+            self.animations.extend(s.animations);
+        }
+        let by_hash: std::collections::HashMap<u32, usize> = self.animations.iter().enumerate().skip(base).map(|(i, a)| (a.hash, i)).collect();
+        let mut joined = 0;
+        for c in &mut self.clips {
+            let mut keep = Vec::new();
+            for p in std::mem::take(&mut c.pending) {
+                match by_hash.get(&p.animation) {
+                    Some(&animation) => {
+                        c.bindings.push(Binding { animation, start: p.start, end: p.end, rate: p.rate, offset: p.offset });
+                        joined += 1;
+                    }
+                    None => keep.push(p),
+                }
+            }
+            c.pending = keep;
+            c.bindings.sort_by(|a, b| a.offset.total_cmp(&b.offset));
+        }
+        joined
     }
 
     /// A clip by short name (case-insensitive), full name or hex hash.
@@ -505,42 +599,63 @@ pub struct ClipTrack {
 /// first wins. Mover tracks (bone 0) and float tracks are left out.
 pub fn clip_tracks(d: &ClipDictionary, c: &Clip) -> Vec<ClipTrack> {
     let mut out: Vec<ClipTrack> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    // (bone, kind) -> (track index, offset of the section that filled it last)
+    let mut seen: std::collections::HashMap<(u32, u32), (usize, f32)> = Default::default();
     for bd in &c.bindings {
         let a = &d.animations[bd.animation];
-        if a.frames < 1 {
-            continue;
-        }
-        let dt = if a.frames > 1 { a.duration / (a.frames - 1) as f32 } else { 0.0 };
-        let rate = if bd.rate.abs() > 1e-6 { bd.rate } else { 1.0 };
-        let eps = 1e-3 * dt.max(1e-3);
-        let mut keys: Vec<(usize, f32)> = Vec::new();
-        for f in 0..a.frames {
-            let t = f as f32 * dt;
-            if t + eps < bd.start || t - eps > bd.end {
-                continue;
-            }
-            let ct = ((t - bd.start) / rate).clamp(0.0, c.duration.max(0.0));
-            if keys.last().is_none_or(|k| ct > k.1) {
-                keys.push((f, ct));
-            }
-        }
+        let keys = window_keys(a, bd, c.duration);
         if keys.is_empty() {
             continue;
         }
         for tr in &a.tracks {
-            if tr.bone == 0 || tr.value == ValueType::Float || tr.frames.len() < a.frames || !seen.insert((tr.bone, tr.kind)) {
+            if tr.bone == 0 || tr.value == ValueType::Float || tr.frames.len() < a.frames {
                 continue;
             }
-            out.push(ClipTrack {
-                bone: tr.bone,
-                kind: tr.kind,
-                times: keys.iter().map(|k| k.1).collect(),
-                values: keys.iter().map(|k| tr.frames.get(k.0).copied().unwrap_or([0.0, 0.0, 0.0, 1.0])).collect(),
-            });
+            let value = |f: usize| tr.frames.get(f).copied().unwrap_or([0.0, 0.0, 0.0, 1.0]);
+            match seen.get_mut(&(tr.bone, tr.kind)) {
+                // within one section the first binding wins
+                Some((_, off)) if *off == bd.offset => {}
+                // a later section continues the track
+                Some((i, off)) => {
+                    *off = bd.offset;
+                    let t = &mut out[*i];
+                    for &(f, ct) in &keys {
+                        if t.times.last().is_none_or(|&l| ct > l) {
+                            t.times.push(ct);
+                            t.values.push(value(f));
+                        }
+                    }
+                }
+                None => {
+                    seen.insert((tr.bone, tr.kind), (out.len(), bd.offset));
+                    out.push(ClipTrack { bone: tr.bone, kind: tr.kind, times: keys.iter().map(|k| k.1).collect(), values: keys.iter().map(|k| value(k.0)).collect() });
+                }
+            }
         }
     }
     out
+}
+
+/// (frame, clip time) of the animation frames inside a binding's window.
+fn window_keys(a: &Animation, bd: &Binding, clip_duration: f32) -> Vec<(usize, f32)> {
+    if a.frames < 1 {
+        return Vec::new();
+    }
+    let dt = if a.frames > 1 { a.duration / (a.frames - 1) as f32 } else { 0.0 };
+    let rate = if bd.rate.abs() > 1e-6 { bd.rate } else { 1.0 };
+    let eps = 1e-3 * dt.max(1e-3);
+    let mut keys: Vec<(usize, f32)> = Vec::new();
+    for f in 0..a.frames {
+        let t = f as f32 * dt;
+        if t + eps < bd.start || t - eps > bd.end {
+            continue;
+        }
+        let ct = (bd.offset + (t - bd.start) / rate).clamp(0.0, clip_duration.max(0.0));
+        if keys.last().is_none_or(|k| ct > k.1) {
+            keys.push((f, ct));
+        }
+    }
+    keys
 }
 
 /// The clip's own movement over the ground: the mover's absolute
@@ -550,36 +665,39 @@ pub fn clip_tracks(d: &ClipDictionary, c: &Clip) -> Vec<ClipTrack> {
 /// of an animation does not start at the origin; `mover_at` gives the
 /// movement since the clip's start.
 pub fn clip_mover(d: &ClipDictionary, c: &Clip) -> Vec<ClipTrack> {
+    // per section, the first binding that carries mover tracks; sections
+    // continue the tracks of the ones before
+    let mut out: Vec<ClipTrack> = Vec::new();
+    let mut filled: Option<f32> = None;
     for bd in &c.bindings {
-        let a = &d.animations[bd.animation];
-        if a.frames < 1 {
+        if filled == Some(bd.offset) {
             continue;
         }
-        let dt = if a.frames > 1 { a.duration / (a.frames - 1) as f32 } else { 0.0 };
-        let rate = if bd.rate.abs() > 1e-6 { bd.rate } else { 1.0 };
-        let eps = 1e-3 * dt.max(1e-3);
-        let mut keys: Vec<(usize, f32)> = Vec::new();
-        for f in 0..a.frames {
-            let t = f as f32 * dt;
-            if t + eps < bd.start || t - eps > bd.end {
-                continue;
-            }
-            let ct = ((t - bd.start) / rate).clamp(0.0, c.duration.max(0.0));
-            if keys.last().is_none_or(|k| ct > k.1) {
-                keys.push((f, ct));
-            }
+        let a = &d.animations[bd.animation];
+        let keys = window_keys(a, bd, c.duration);
+        let movers: Vec<&Track> = a.tracks.iter().filter(|t| t.bone == 0 && (t.kind == track::MOVER_TRANSLATION || t.kind == track::MOVER_ROTATION) && t.frames.len() >= a.frames).collect();
+        if keys.is_empty() || movers.is_empty() {
+            continue;
         }
-        let out: Vec<ClipTrack> = a
-            .tracks
-            .iter()
-            .filter(|t| t.bone == 0 && (t.kind == track::MOVER_TRANSLATION || t.kind == track::MOVER_ROTATION) && t.frames.len() >= a.frames)
-            .map(|tr| ClipTrack { bone: 0, kind: tr.kind, times: keys.iter().map(|k| k.1).collect(), values: keys.iter().map(|k| tr.frames[k.0]).collect() })
-            .collect();
-        if !keys.is_empty() && !out.is_empty() {
-            return out;
+        filled = Some(bd.offset);
+        for tr in movers {
+            let i = match out.iter().position(|t| t.kind == tr.kind) {
+                Some(i) => i,
+                None => {
+                    out.push(ClipTrack { bone: 0, kind: tr.kind, times: Vec::new(), values: Vec::new() });
+                    out.len() - 1
+                }
+            };
+            let t = &mut out[i];
+            for &(f, ct) in &keys {
+                if t.times.last().is_none_or(|&l| ct > l) {
+                    t.times.push(ct);
+                    t.values.push(tr.frames[f]);
+                }
+            }
         }
     }
-    Vec::new()
+    out
 }
 
 /// The mover at clip time `t` relative to the clip's start: translation
@@ -787,6 +905,49 @@ mod tests {
         assert!((p[0]).abs() < 1e-5 && (p[1] - 1.5).abs() < 1e-5 && p[2].abs() < 1e-5, "{p:?}");
         assert!(q[2].abs() < 1e-5 && (q[3] - 1.0).abs() < 1e-5, "{q:?}");
         assert_eq!(mover_at(&[], 1.0), ([0.0; 3], [0.0, 0.0, 0.0, 1.0]));
+    }
+
+    /// An animation of `frames` frames over `duration` s with one rotation
+    /// track on bone 7 (x = the frame's time + `base`) and a mover track.
+    fn ramp(hash: u32, frames: usize, duration: f32, base: f32) -> Animation {
+        let dt = duration / (frames - 1) as f32;
+        let rot = Track { bone: 7, kind: track::ROTATION, value: ValueType::Quaternion, frames: (0..frames).map(|f| [base + f as f32 * dt, 0.0, 0.0, 1.0]).collect() };
+        let mv = Track { bone: 0, kind: track::MOVER_TRANSLATION, value: ValueType::Vector3, frames: (0..frames).map(|f| [base + f as f32 * dt, 0.0, 0.0, 0.0]).collect() };
+        Animation { hash, name: format!("a{hash}"), frames, duration, tracks: vec![rot, mv] }
+    }
+
+    #[test]
+    fn sections_join_into_one_time_line() {
+        // a two-section clip: 1 s of animation 10 (from 2 s in), then 1 s of
+        // animation 11 (from its start); both streamed elsewhere
+        let pending = vec![Pending { animation: 10, start: 2.0, end: 3.0, rate: 1.0, offset: 0.0 }, Pending { animation: 11, start: 0.0, end: 1.0, rate: 1.0, offset: 1.0 }];
+        let c = Clip { hash: 1, kind: 1, name: "pack:/lucia.clip".into(), duration: 2.0, bindings: Vec::new(), pending, sections: 2 };
+        let mut d = ClipDictionary { name: "cin@s".into(), clips: vec![c], animations: Vec::new() };
+        assert!(clip_tracks(&d, &d.clips[0]).is_empty());
+        let s1 = ClipDictionary { name: "cin@s-1".into(), clips: Vec::new(), animations: vec![ramp(10, 31, 3.0, 0.0)] };
+        // animation 11 carries on where animation 10's window ended
+        let s2 = ClipDictionary { name: "cin@s-2".into(), clips: Vec::new(), animations: vec![ramp(11, 11, 1.0, 3.0), ramp(12, 2, 1.0, 9.0)] };
+        assert_eq!(d.join(vec![s1, s2]), 2);
+        let c = &d.clips[0];
+        assert!(c.pending.is_empty());
+        assert_eq!(c.bindings.iter().map(|b| (b.offset, d.animations[b.animation].hash)).collect::<Vec<_>>(), vec![(0.0, 10), (1.0, 11)]);
+        let tr = clip_tracks(&d, c);
+        assert_eq!(tr.len(), 1);
+        let t = &tr[0];
+        // 11 keys of section 1 (2.0..3.0), then 10 more of section 2 (its first key is the shared boundary)
+        assert_eq!(t.times.len(), 21);
+        assert!((t.times[0]).abs() < 1e-5 && (t.times[20] - 2.0).abs() < 1e-5);
+        assert!(t.times.windows(2).all(|w| w[1] > w[0]));
+        // values run on without a jump: x = clip time + 2
+        assert!(t.times.iter().zip(&t.values).all(|(ct, v)| (v[0] - (ct + 2.0)).abs() < 1e-4), "{:?}", t.values);
+        let mv = clip_mover(&d, c);
+        assert_eq!(mv.len(), 1);
+        assert_eq!(mv[0].times.len(), 21);
+        assert!((mv[0].values[20][0] - 4.0).abs() < 1e-4);
+        // a window whose animation no section holds stays pending
+        let mut d2 = ClipDictionary { name: "cin@t".into(), clips: vec![Clip { hash: 2, kind: 1, name: "x".into(), duration: 1.0, bindings: Vec::new(), pending: vec![Pending { animation: 99, start: 0.0, end: 1.0, rate: 1.0, offset: 0.0 }], sections: 1 }], animations: Vec::new() };
+        assert_eq!(d2.join(Vec::new()), 0);
+        assert_eq!(d2.clips[0].pending.len(), 1);
     }
 
     #[test]

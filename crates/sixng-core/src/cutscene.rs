@@ -8,9 +8,18 @@
 //!    named after the object's scene handle: `pack:/lucia.clip`,
 //!    `pack:/lucia_face.clip` (facial clip), `pack:/rs_camera_8.clip`,
 //!    `pack:/prop_am_drink_soda_03a^2.clip` (`^N` = Nth copy of the same
-//!    model). Dictionaries named `cin@<scene>-<N>` hold the streamed
-//!    animation sections (`.anim` objects only, no clips). A clip's map
-//!    key is the joaat of its short name.
+//!    model). A clip's map key is the joaat of its short name.
+//!
+//!    A scene clip plays the scene through in sections, one per camera
+//!    cut: the clip's +0x68 / +0x70 list `{windows, count, duration}` per
+//!    section, and each window names an animation by its map key and the
+//!    stretch of it to play ([`anim::Pending`]). The animations are pooled
+//!    per skeleton or model (`pack:/cinematic_q8@female@0@60_0.anim`: every
+//!    female ped's sections, 60 frames a second, cut into ~16 or ~32 s
+//!    pieces) and mostly streamed in dictionaries named `cin@<scene>-<N>`,
+//!    which hold those `.anim` objects in their clip map and no clips.
+//!    [`load_dictionary`] joins them back: on the base dictionary, the windows
+//!    play one after another over the clip's whole duration.
 //!
 //! 2. **Scene files**: self-describing meta resources (`0x7a`) holding a
 //!    small state machine whose state names (struct `dd71c9b4`, member
@@ -43,7 +52,7 @@ use std::path::Path;
 /// The archive the story cutscenes are in.
 pub const STORY_ARCHIVE: &str = "pack/story000/story000.rpf";
 /// Bumped when the cached catalog's layout or contents change.
-pub const CATALOG_VERSION: u32 = 2;
+pub const CATALOG_VERSION: u32 = 3;
 
 /// Struct and member hashes of the scene files.
 pub mod hashes {
@@ -113,11 +122,22 @@ pub struct SceneDict {
     pub clips: Vec<String>,
     /// Number of `-N` section dictionaries found for this scene.
     pub sections: usize,
-    /// Clips whose animation is not in this dictionary (no bound
-    /// animation): streamed in the section dictionaries, which are not
-    /// joined yet.
+    /// Index entry ids of those section dictionaries.
+    #[serde(default)]
+    pub section_ids: Vec<String>,
+    /// Clips with at least one window streamed in the section dictionaries.
     #[serde(default)]
     pub streamed: Vec<String>,
+    /// Clips with windows whose animation is in none of the section
+    /// dictionaries (they play with gaps, or not at all).
+    #[serde(default)]
+    pub unjoined: Vec<String>,
+    /// Streamed windows of all clips, and how many of them have no
+    /// animation in the section dictionaries.
+    #[serde(default)]
+    pub windows_streamed: usize,
+    #[serde(default)]
+    pub windows_missing: usize,
 }
 
 /// An object of a scene file's hash-keyed tables.
@@ -261,8 +281,10 @@ pub fn scan(a: &ArchiveInfo, ix: &ArchiveIndex, progress: crate::export::Progres
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     enum Hit {
-        Dict(String, String, Vec<String>, Vec<String>),
-        Section(String),
+        /// name, id, clip names, (clip, pending animation keys)
+        Dict(String, String, Vec<String>, Vec<(String, Vec<u32>)>),
+        /// scene, id, animation keys
+        Section(String, String, Vec<u32>),
         File(SceneFile),
     }
     let todo: Vec<&Entry> = ix
@@ -285,27 +307,46 @@ pub fn scan(a: &ArchiveInfo, ix: &ArchiveIndex, progress: crate::export::Progres
             let name = anim::dictionary_name(&r.sys)?;
             let (scene, section) = parse_dict_name(&name)?;
             if section.is_some() {
-                return Some(Hit::Section(scene.to_string()));
+                return Some(Hit::Section(scene.to_string(), e.id.clone(), anim::map_keys(&r.sys)));
             }
             let d = anim::ClipDictionary::parse(&anim::dictionary_bytes(&a.path, e).ok()?).ok()?;
             let clips = d.clips.iter().map(|c| c.short_name().to_string()).collect();
-            let streamed = d.clips.iter().filter(|c| c.bindings.is_empty()).map(|c| c.short_name().to_string()).collect();
-            Some(Hit::Dict(name, e.id.clone(), clips, streamed))
+            let pending = d.clips.iter().filter(|c| !c.pending.is_empty()).map(|c| (c.short_name().to_string(), c.pending.iter().map(|p| p.animation).collect())).collect();
+            Some(Hit::Dict(name, e.id.clone(), clips, pending))
         })
         .collect();
-    let mut sections: HashMap<String, usize> = HashMap::new();
+    let mut sections: HashMap<String, Vec<(String, Vec<u32>)>> = HashMap::new();
     let mut dicts = Vec::new();
+    let mut pendings = Vec::new();
     let mut files = Vec::new();
     for h in hits {
         match h {
-            Hit::Dict(name, id, clips, streamed) => dicts.push(SceneDict { name, id, clips, sections: 0, streamed }),
-            Hit::Section(s) => *sections.entry(s).or_default() += 1,
+            Hit::Dict(name, id, clips, pending) => {
+                dicts.push(SceneDict { name, id, clips, sections: 0, section_ids: Vec::new(), streamed: Vec::new(), unjoined: Vec::new(), windows_streamed: 0, windows_missing: 0 });
+                pendings.push(pending);
+            }
+            Hit::Section(s, id, keys) => sections.entry(s).or_default().push((id, keys)),
             Hit::File(f) => files.push(f),
         }
     }
-    for d in &mut dicts {
+    for (d, pending) in dicts.iter_mut().zip(pendings) {
         let s = parse_dict_name(&d.name).map(|x| x.0).unwrap_or_default();
-        d.sections = sections.get(s).copied().unwrap_or(0);
+        let secs = sections.get(s).map(Vec::as_slice).unwrap_or_default();
+        d.sections = secs.len();
+        d.section_ids = secs.iter().map(|x| x.0.clone()).collect();
+        d.section_ids.sort();
+        let have: HashSet<u32> = secs.iter().flat_map(|x| x.1.iter().copied()).collect();
+        for (clip, keys) in pending {
+            let missing = keys.iter().filter(|k| !have.contains(k)).count();
+            d.windows_streamed += keys.len();
+            d.windows_missing += missing;
+            if missing > 0 {
+                d.unjoined.push(clip.clone());
+            }
+            d.streamed.push(clip);
+        }
+        d.streamed.sort();
+        d.unjoined.sort();
     }
     // keep only scene files that name at least one of the scenes
     let scene_hashes: HashSet<u32> = dicts.iter().filter_map(|d| parse_dict_name(&d.name)).flat_map(|(s, _)| [joaat(s), joaat(parent_scene(s))]).collect();
@@ -333,6 +374,26 @@ pub fn catalog(ws: &crate::export::Workspace, archive: &str, rescan: bool, progr
     let c = scan(&a, &ix, progress)?;
     std::fs::write(&cache, serde_json::to_vec(&c)?)?;
     Ok(c)
+}
+
+/// A scene's base clip dictionary with its section dictionaries joined in
+/// ([`anim::ClipDictionary::join`]), so every clip plays the whole scene.
+pub fn load_dictionary(ws: &crate::export::Workspace, c: &Catalog, d: &SceneDict) -> Result<anim::ClipDictionary> {
+    use rayon::prelude::*;
+    let a = ws.resolve(&c.archive)?;
+    let ix = ws.load_index(&a)?;
+    let ids: Vec<&String> = std::iter::once(&d.id).chain(&d.section_ids).collect();
+    let mut parsed: Vec<anim::ClipDictionary> = ids
+        .par_iter()
+        .map(|id| {
+            let e = ix.entries.iter().find(|e| &e.id == *id).ok_or_else(|| anyhow!("{id} is not in the {} index (re-run `sixng cutscenes --rescan`)", a.id))?;
+            anim::ClipDictionary::parse(&anim::dictionary_bytes(&a.path, e)?)
+        })
+        .collect::<Result<_>>()?;
+    let sections = parsed.split_off(1);
+    let mut base = parsed.pop().unwrap();
+    base.join(sections);
+    Ok(base)
 }
 
 /// Names to resolve 64-bit asset ids and to tell models from other handles.
@@ -408,7 +469,7 @@ pub struct SceneObject {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub face_clips: Vec<String>,
     /// True when the body clips' animation is streamed in the section
-    /// dictionaries (not in the base dictionary), which are not joined yet.
+    /// dictionaries (joined by [`load_dictionary`]).
     pub streamed: bool,
 }
 
@@ -422,6 +483,13 @@ pub struct Scene {
     pub dictionary: String,
     pub dictionary_id: String,
     pub sections: usize,
+    /// Clip windows streamed in the section dictionaries, and those whose
+    /// animation none of them holds.
+    pub windows_streamed: usize,
+    pub windows_missing: usize,
+    /// Clips with missing windows.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unjoined: Vec<String>,
     /// Scene files naming this scene (entry ids).
     pub scene_files: Vec<String>,
     pub cast: Vec<SceneObject>,
@@ -559,6 +627,9 @@ pub fn scenes(c: &Catalog, models: &Models) -> Vec<Scene> {
             dictionary: d.name.clone(),
             dictionary_id: d.id.clone(),
             sections: d.sections,
+            windows_streamed: d.windows_streamed,
+            windows_missing: d.windows_missing,
+            unjoined: d.unjoined.clone(),
             scene_files: files.iter().map(|f| f.id.clone()).collect(),
             cast,
             props,
@@ -612,12 +683,6 @@ pub fn model_clips<'a>(c: &'a Catalog, scene: &str, model: &str) -> Result<Vec<(
         })
         .map(|cl| (d, cl.clone()))
         .collect();
-    let (ready, streamed): (Vec<_>, Vec<_>) = picks.into_iter().partition(|(d, cl)| !d.streamed.contains(cl));
-    if ready.is_empty() && !streamed.is_empty() {
-        let names: Vec<&str> = streamed.iter().map(|x| x.1.as_str()).collect();
-        anyhow::bail!("the animation of {} in {} is streamed in its {} section dictionaries, which are not joined yet", names.join(", "), d.name, d.sections);
-    }
-    let picks = ready;
     if picks.is_empty() {
         let mut hs: Vec<&str> = d.clips.iter().map(|cl| split_clip_name(cl)).filter(|x| !x.2).map(|x| x.0).collect();
         hs.sort();
@@ -672,7 +737,11 @@ mod tests {
             id: "a.rpf@10".into(),
             clips: ["lucia", "lucia_face", "boss", "boss_face", "prop_cup_01a", "prop_cup_01a^1", "rs_camera_1", "thing"].map(String::from).to_vec(),
             sections: 2,
+            section_ids: vec!["a.rpf@11".into(), "a.rpf@12".into()],
             streamed: vec!["boss".into()],
+            unjoined: vec![],
+            windows_streamed: 2,
+            windows_missing: 0,
         };
         let f = SceneFile {
             id: "a.rpf@20".into(),
@@ -685,7 +754,7 @@ mod tests {
             ],
         };
         // a second scene without a scene file of its own
-        let d2 = SceneDict { name: "cin@other_scene_p1_t01".into(), id: "a.rpf@30".into(), clips: ["boss", "boss_face", "ib_phone"].map(String::from).to_vec(), sections: 0, streamed: vec![] };
+        let d2 = SceneDict { name: "cin@other_scene_p1_t01".into(), id: "a.rpf@30".into(), clips: ["boss", "boss_face", "ib_phone"].map(String::from).to_vec(), sections: 0, section_ids: vec![], streamed: vec![], unjoined: vec![], windows_streamed: 0, windows_missing: 0 };
         Catalog { version: CATALOG_VERSION, archive: "a.rpf".into(), dicts: vec![d, d2], files: vec![f] }
     }
 
@@ -730,9 +799,9 @@ mod tests {
         let e = model_clips(&c, "test_scene_p1_t01", "cs_nobody").unwrap_err().to_string();
         assert!(e.contains("boss, lucia, prop_cup_01a, rs_camera_1, thing"), "{e}");
         assert!(model_clips(&c, "no_such_scene", "x").is_err());
-        // a streamed clip is refused with the reason
-        let e = model_clips(&c, "test_scene_p1_t01", "cs_boss").unwrap_err().to_string();
-        assert!(e.contains("streamed in its 2 section dictionaries"), "{e}");
+        // a streamed clip is picked too (its sections are joined on load)
+        let p = model_clips(&c, "test_scene_p1_t01", "cs_boss").unwrap();
+        assert_eq!(p.iter().map(|(_, cl)| cl.as_str()).collect::<Vec<_>>(), vec!["boss"]);
         // no scene file: the handle that is this model in other scenes
         let p = model_clips(&c, "other_scene_p1_t01", "cs_boss").unwrap();
         assert_eq!(p.iter().map(|(d, cl)| (d.id.as_str(), cl.as_str())).collect::<Vec<_>>(), vec![("a.rpf@30", "boss")]);
