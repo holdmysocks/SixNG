@@ -10,11 +10,11 @@ struct Frame {
     sky_top: vec4<f32>,
     sky_hor: vec4<f32>,   // w exposure
     mode: vec4<u32>,      // x view mode, y packed channel order, z paint finish, w slot view
-    paint1: vec4<f32>,    // primary paint colour (linear)
+    paint1: vec4<f32>,    // primary paint colour (linear), w the vehicle's own paint roughness
     paint2: vec4<f32>,    // pearl colour (linear), w pearl amount
     misc: vec4<f32>,      // x wetness, y emissive boost, z time, w ambient
     misc2: vec4<f32>,     // x fog density, yzw secondary paint colour
-    misc3: vec4<f32>,     // x tint palette on (1) / off (0)
+    misc3: vec4<f32>,     // x tint palette on (1) / off (0), w the vehicle's own paint metalness
     prev_view_proj: mat4x4<f32>,
     jitter: vec4<f32>,
 };
@@ -219,6 +219,7 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
         if (F.mode.z == 0u) { metal = 0.6; rough = 0.28; }
         else if (F.mode.z == 1u) { metal = 0.0; rough = 0.8; }
         else if (F.mode.z == 2u) { metal = 1.0; rough = 0.04; albedo = mix(vec3(0.95), albedo, 0.25); }
+        else if (F.mode.z == 4u) { metal = F.misc3.w; rough = clamp(F.paint1.w, 0.04, 1.0); }
         else { metal = 0.0; rough = 0.12; }
         pearl = F.paint2.rgb * F.paint2.w;
     } else if (cls == 5u || cls == 6u) {

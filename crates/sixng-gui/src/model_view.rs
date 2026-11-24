@@ -29,7 +29,7 @@ pub const RMA_ORDERS: [&str; 4] = [
     "R metal / G rough / B AO",
     "ignore packed",
 ];
-pub const FINISHES: [&str; 4] = ["metallic", "matte", "chrome", "gloss"];
+pub const FINISHES: [&str; 5] = ["metallic", "matte", "chrome", "gloss", "as stored"];
 /// `standard_vehicle_2lyr_wheel_inst`: the rim material of the shared wheels.
 const RIM_SHADER: &str = "_c5cdbdd2";
 /// Default rim colour: a plain alloy (the true per-vehicle colour is not decoded).
@@ -327,6 +327,9 @@ pub struct ModelView {
     window_movers: Vec<(usize, Vec3, Vec3)>,
     /// A reload asked for by a configuration: its parts with models.
     parts_request: Option<String>,
+    /// The paint finish follows the model: a vehicle's own where its export
+    /// has one, metallic otherwise (until the user picks one).
+    pub finish_auto: bool,
     /// The moving parts of an aircraft among the loaded model's joints.
     air: Vec<AirPart>,
     /// Rotor and propeller speed, 0 (still) to 1; the angle they are at.
@@ -633,6 +636,7 @@ impl ModelView {
             windows_down: 0.0,
             window_movers: Vec::new(),
             parts_request: None,
+            finish_auto: true,
             air: Vec::new(),
             rotor_speed: 0.0,
             rotor_angle: 0.0,
@@ -1706,6 +1710,15 @@ impl ModelView {
         let wheeled = l.info["wheel_mounts"].as_array().is_some_and(|a| !a.is_empty());
         if !wheeled && !l.info["part_colours"].is_object() {
             return;
+        }
+        // the body paint's own finish, from the surfaces of its painted parts
+        let stored = &l.info["part_colours"]["paint_finish"];
+        let stored = stored["metalness"].as_f64().zip(stored["roughness"].as_f64()).map(|(m, r)| [m as f32, r as f32]);
+        if let Some(f) = stored {
+            self.look.stored_finish = f;
+        }
+        if self.finish_auto {
+            self.look.finish = if stored.is_some() { 4 } else { 0 };
         }
         let key = crate::vehicle_db::model_key(&l.source);
         let Some(db) = self.vehicles.get(&self.game, &self.work, ui.ctx()) else {
@@ -3285,7 +3298,9 @@ impl ModelView {
                 .selected_text(FINISHES[self.look.finish as usize])
                 .show_ui(ui, |ui| {
                     for (k, m) in FINISHES.iter().enumerate() {
-                        ui.selectable_value(&mut self.look.finish, k as u32, *m);
+                        if ui.selectable_value(&mut self.look.finish, k as u32, *m).clicked() {
+                            self.finish_auto = false;
+                        }
                     }
                 });
         }
