@@ -502,19 +502,25 @@ again**).
     the skin triangles that lie right under a garment (top, jacket,
     trousers, dress, shoes, gloves) are hidden, so skin does not show
     through it.
-  - 280 of the 318 named characters resolve (`sixng ped-look "^"`). Most
+  - 292 of the 318 named characters resolve (`sixng ped-look "^"`). Most
     by model name (116) or through their head: the outfit list has them
     under another model name, and the wardrobe that names their head is
     theirs. A few through the ped model table's character name
     (`cs_lucia` -> the one model named "lucia", `player_story000_00`;
     `cs_jason` -> `player_story000_01`; with the character's own head
-    when it has one), from their own parts when they have a full set of
+    when it has one), through the listed model they are a variant of
+    (a second head of the same person, `hc_cs_chuck` -> `cs_chuck`; a
+    crowd-style name, `u_f_o_rhonda` -> `cs_rhonda`), from their own parts when they have a full set of
     clothes (`cs_ghost`), or by head shape when one head stands far out
     (at most 0.6 of the median distance; `u_m_m_deal_dook` -> `cs_dook`);
     looser shape matches linked unrelated people and are not used. The
     rest are heads on their own (crowd heads `hc_*`) and the `sc_*`
     creatures, shown as before. The panel says which way a character was
-    found. `sixng ped-look "^"` lists every character
+    found. An outfit whose head item does not resolve takes the model's
+    own head (`cs_maleek_rivers`). The outfit shown first is the first
+    listed one, unless it has no clothes in the data read here and a
+    later one has (about twenty characters): then the first dressed one,
+    with shoes when one has them; the panel says so. `sixng ped-look "^"` lists every character
     with what its default outfit has. `sixng outfit <name> --look N`
     exports outfit N as one rigged GLB (parts, the face, stored tints;
     not the viewer's skin tone, colour words or hidden skin).
