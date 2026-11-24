@@ -691,6 +691,19 @@ Optional layers not exported yet (the map works without them): {}.", opt.join(",
                 }
                 Err(err) => Preview::Text(format!("error: {err}")),
             },
+            (Kind::Rbf, _) => match sixng_core::scan::read_entry(&a.path, e) {
+                Ok(d) => match sixng_core::rbf::to_xml(&d) {
+                    Ok((xml, _)) => {
+                        let mut n = xml.len().min(256 * 1024);
+                        while !xml.is_char_boundary(n) {
+                            n -= 1;
+                        }
+                        Preview::Text(if n < xml.len() { format!("{}\n… (cut at 256 KB)", &xml[..n]) } else { xml })
+                    }
+                    Err(err) => Preview::Text(format!("RBF did not decode: {err}")),
+                },
+                Err(err) => Preview::Text(format!("error: {err}")),
+            },
             _ => match sixng_core::scan::read_entry(&a.path, e) {
                 Ok(d) => {
                     let n = d.len().min(256 * 1024);

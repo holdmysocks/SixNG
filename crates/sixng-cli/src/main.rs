@@ -466,6 +466,17 @@ enum Cmd {
         #[arg(long, short)]
         out: PathBuf,
     },
+    /// Decode RBF binary XML files (RBF0: UI layouts, subtitles, GPS and gamepad configs) to XML text: <out>/rbf/<archive>/<offset>.xml plus index.jsonl (per file its stats, or why it did not decode). Tag and attribute names are stored as text in the files, so all of them are real names; value elements are written as <name value="..."/>.
+    Rbf {
+        /// Archive (default data).
+        #[arg(default_value = "data")]
+        archive: String,
+        #[command(flatten)]
+        filter: FilterArgs,
+        /// Output directory.
+        #[arg(long, short)]
+        out: PathBuf,
+    },
     /// Layered-material libraries (data.rpf PSO files with root struct 8419ab01): the base materials and layered presets behind the clothing and weapon shaders, which bind no colour texture. A wardrobe item's GarmentPreset and a weapon component record name a preset; a preset gives each of its 8 sub-materials a colour. Builds <work>/index/material_presets.json (per preset the four colour entries of each sub-material as rrggbbaa sRGB, entry 0 = base colour; weapon component and variant name hashes -> preset, from the weapon family files of packs.rpf when indexed), which `ped-variations` reads. With --preset, prints those presets in full (every parameter of the preset and of its base materials; parameter names are hashes). With -o, also writes each library as <out>/materials/<archive>/<offset>.json.
     Materials {
         /// Archive with the libraries (default data).
@@ -1684,6 +1695,18 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let t = Instant::now();
             let (ok, bad) = sixng_core::pso::export(&a, &sel, po, pr)?;
             out.print(&json!({"ok": true, "archive": a.id, "decoded": ok, "failed": bad, "seconds": t.elapsed().as_secs_f64(), "out": po.join("pso")}));
+        }
+        Cmd::Rbf { archive, filter, out: po } => {
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            let mut f = filter.to_filter()?;
+            if f.kinds.is_empty() {
+                f.kinds = vec![Kind::Rbf];
+            }
+            let sel = f.select(&ix)?;
+            let t = Instant::now();
+            let s = sixng_core::rbf::export(&a, &sel, po, pr)?;
+            out.print(&json!({"ok": true, "archive": a.id, "selected": sel.len(), "decoded": s.decoded, "failed": s.failed, "errors": s.errors, "seconds": t.elapsed().as_secs_f64(), "out": po.join("rbf").join(a.id.trim_end_matches(".rpf"))}));
         }
         Cmd::Materials { archive, preset, weapon, out: po } => {
             use sixng_core::matlib;
