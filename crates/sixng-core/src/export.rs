@@ -1222,7 +1222,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 "wheel_mounts_version": 3,
                 "part_colours_version": crate::vehcolour::EXPORT_VERSION,
                 "part_colours": shader_tex.iter().any(|st| st.vehicle_palette.is_some()).then(|| match shader_tex.iter().find_map(|st| st.vehicle_parts.as_ref()) {
-                    Some(set) => serde_json::json!({"status": "applied", "part_set": set, "looks": part_looks["looks"], "configs": part_looks["configs"], "default": part_looks["default"], "paint_finish": part_looks["paint_finish"], "paint_finish_note": "the body paint's finish: metalness and roughness of the surfaces of the primary-paint parts (COLOR_0 alpha 254), averaged over their vertices of every LOD; null when the model has none", "looks_note": "looks: the part colours each distinct configuration result gives, 256 x RGBA per look as hex (encoded like GLB COLOR_0, indexed by part id = _COLOR0 alpha); configs: a configuration's parts_key (vehicles.json) -> look; default: the look baked into the GLB", "note": "each vertex of the two-layer vehicle materials takes the colour of its part id (GLB COLOR_0; see the materials' classification.parts_note)"}),
+                    Some(set) => serde_json::json!({"status": "applied", "part_set": set, "shared_part": part_looks["shared"], "shared_part_note": "true for a library part's model (a truck bed or box, a light bar ...), which several vehicles fit: its part ids mean the same piece in every vehicle's part set, and it takes the colours of the vehicle and configuration it is on. This export uses the set of the first configuration found that names the part (the vehicle is the 8 hex digits after + in part_set).", "looks": part_looks["looks"], "configs": part_looks["configs"], "default": part_looks["default"], "paint_finish": part_looks["paint_finish"], "paint_finish_note": "the body paint's finish: metalness and roughness of the surfaces of the primary-paint parts (COLOR_0 alpha 254), averaged over their vertices of every LOD; null when the model has none", "looks_note": "looks: the part colours each distinct configuration result gives, 256 x RGBA per look as hex (encoded like GLB COLOR_0, indexed by part id = _COLOR0 alpha); configs: a configuration's parts_key (vehicles.json) -> look; default: the look baked into the GLB", "note": "each vertex of the two-layer vehicle materials takes the colour of its part id (GLB COLOR_0; see the materials' classification.parts_note)"}),
                     None => serde_json::json!({"status": "no part set found for this model: the two-layer materials keep their stand-in colours"}),
                 }),
                 "roof_animation": roof_info,
@@ -1375,6 +1375,11 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         (Some(t), Some(n), Some(pal)) => t.looks_json(n, pal, ramp_u, mat_blend),
         _ => serde_json::Value::Null,
     };
+    // a library part's model (a truck bed or box, a light bar): its part
+    // set is that of one vehicle it can be fitted to
+    if part_looks.is_null() && part_tables.as_ref().zip(e.name.as_deref()).is_some_and(|(t, n)| t.is_shared(n)) {
+        part_looks = serde_json::json!({"shared": true});
+    }
     // vertices per part id, for the body paint's finish
     let part_id_counts = std::cell::RefCell::new([0u64; 256]);
     let slice = |i: usize| {
