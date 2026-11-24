@@ -1793,7 +1793,7 @@ impl ModelView {
                         ))
                         .clicked()
                     {
-                        self.look.paint = *c;
+                        self.look.paint = srgb_to_linear(*c);
                         self.veh_cfg = None;
                     }
                 }
@@ -1882,7 +1882,8 @@ impl ModelView {
         // paint list that has one.
         let listed = || v.palettes.iter().flatten().map(|p| p.0).find(|c| !crate::vehicle_db::is_placeholder(*c));
         if let Some(col) = c.colour.or_else(listed) {
-            self.look.paint = col;
+            // the lists hold display (sRGB) values, the paint is linear
+            self.look.paint = srgb_to_linear(col);
         }
         if self.rim_auto {
             self.rim_ratio = c.rim_ratio.unwrap_or(0.0);
@@ -6283,6 +6284,11 @@ pub(crate) fn assembly_ids(
 }
 
 /// sRGB [0,1] triple as an egui colour.
+/// A display (sRGB) colour as the linear one the renderer's paint takes.
+fn srgb_to_linear(c: [f32; 3]) -> [f32; 3] {
+    c.map(|v| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) })
+}
+
 fn srgb32(c: [f32; 3]) -> egui::Color32 {
     egui::Color32::from_rgb(
         (c[0] * 255.0).round() as u8,
