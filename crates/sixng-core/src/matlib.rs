@@ -336,6 +336,25 @@ pub fn stops(srgb: [u8; 3]) -> [[f32; 3]; 3] {
     [lin.map(|c| 0.1 * c), lin, light]
 }
 
+/// Weapon part types that finishes are listed under (`c763edb4` of a
+/// variant record is the joaat of one of these): 46 of the 54 hashes in
+/// use, covering 1,263 of the 1,300 variants.
+pub const PART_TYPES: &[&str] = &[
+    "barrel", "receiver", "stock", "magazine", "frame", "trigger", "bolt", "pgrip", "muzzle", "grip", "slide", "optic", "handguard", "hguard", "dustcover", "body", "pump",
+    "sight_front", "sight_rear", "sight", "scopemount", "slide_cover", "magwell", "magtube", "railmount", "safety", "lid", "charge", "ammo", "selector", "barrel_rail", "cheekriser", "sear",
+    "frontrail", "front_rail", "railplate", "reel", "rod", "rail", "flashlight", "reflexmount", "heatshield", "accessory", "underbarrel", "under", "riser",
+];
+
+/// The name of a part type hash (hex), when it is one of [`PART_TYPES`].
+pub fn part_type_name(hex: &str) -> Option<&'static str> {
+    PART_TYPES.iter().copied().find(|n| format!("{:08x}", crate::meta7a::joaat(n)) == hex)
+}
+
+/// Words of weapon model names that mean another part type: models say
+/// `mag`, `sight_f`, `sight_r`, the finish lists `magazine`, `sight_front`,
+/// `sight_rear`; a `handguard` model also takes `hguard` finishes.
+const PART_ALIASES: &[(&str, &str)] = &[("mag", "magazine"), ("sight_f", "sight_front"), ("sight_r", "sight_rear"), ("fsights", "sight_front"), ("rsights", "sight_rear"), ("rearsight", "sight_rear"), ("handguard", "hguard")];
+
 /// One weapon family file: its component models and the finishes it
 /// offers per part type.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -487,21 +506,27 @@ impl Index {
     /// The finishes a weapon model can take: its family's variants for the
     /// model's part type, as (part type hex, [(variant hex, preset hex)]).
     /// The part type is a word of the model name (`w_pi_duke_01_slide_02`
-    /// -> `slide`; `…_sight_f_01` -> `sight_f` or `sight`), the longest
-    /// that the family has finishes for.
+    /// -> `slide`), the longest that the family has finishes for; a word's
+    /// own name wins over its alias (`…_mag_01` -> `magazine`,
+    /// `…_sight_f_01` -> `sight_front`).
     pub fn weapon_finishes(&self, model: &str) -> Option<(&str, &[(String, String)])> {
         let m = model.to_ascii_lowercase();
         let base = ["_hi", "_mid"].iter().find_map(|s| m.strip_suffix(s)).unwrap_or(&m);
         let key = format!("{:08x}", crate::meta7a::joaat(base));
         let fam = self.weapon_families.iter().find(|f| f.models.contains(&key))?;
         let words: Vec<&str> = base.split('_').collect();
-        let mut best: Option<(usize, &str, &[(String, String)])> = None;
+        // (own name before alias, then length) -> slot and its finishes
+        let mut best: Option<((bool, usize), &str, &[(String, String)])> = None;
         for i in 0..words.len() {
             for k in i + 1..=words.len() {
                 let w = words[i..k].join("_");
-                if let Some((slot, v)) = fam.finishes.get_key_value(&format!("{:08x}", crate::meta7a::joaat(&w))) {
-                    if best.is_none_or(|b| w.len() > b.0) {
-                        best = Some((w.len(), slot.as_str(), v.as_slice()));
+                let alias = PART_ALIASES.iter().find(|a| a.0 == w).map(|a| a.1);
+                for (own, name) in [(true, Some(w.as_str())), (false, alias)] {
+                    let Some(name) = name else { continue };
+                    if let Some((slot, v)) = fam.finishes.get_key_value(&format!("{:08x}", crate::meta7a::joaat(name))) {
+                        if best.is_none_or(|b| (own, w.len()) > b.0) {
+                            best = Some(((own, w.len()), slot.as_str(), v.as_slice()));
+                        }
                     }
                 }
             }
@@ -636,5 +661,20 @@ mod tests {
         assert_eq!((slot, f.len(), f[1].1.as_str()), (format!("{:08x}", jj("slide")).as_str(), 2, "00000021"));
         assert_eq!(ix.weapon_finishes("w_pi_duke_01_sight_f_01").unwrap().1[0].1, "00000023");
         assert!(ix.weapon_finishes("w_ar_adb_01_barrel_01").is_none());
+        // model words that differ from the part type: mag -> magazine, sight_f -> sight_front; an own name wins over an alias
+        let fam2 = json!({"objects": {
+            "9a16508d85492dc3": [{"Name": 3, field_name(0x72f5_e33e): 0x10u32, field_name(0x873e_f899): jj("w_sg_kozlov_01_mag_01")}, {"Name": 4, field_name(0x72f5_e33e): 0x10u32, field_name(0x873e_f899): jj("w_sg_kozlov_01_sight_f_02")},
+                {"Name": 5, field_name(0x72f5_e33e): 0x10u32, field_name(0x873e_f899): jj("w_sg_kozlov_01_handguard_01")}],
+            "eafa47ee6724161c": [
+                {"Name": 0xb1u32, field_name(0x14b0_64c2): 0x30u32, field_name(0xc763_edb4): jj("magazine")},
+                {"Name": 0xb2u32, field_name(0x14b0_64c2): 0x31u32, field_name(0xc763_edb4): jj("sight_front")},
+                {"Name": 0xb3u32, field_name(0x14b0_64c2): 0x32u32, field_name(0xc763_edb4): jj("hguard")},
+                {"Name": 0xb4u32, field_name(0x14b0_64c2): 0x33u32, field_name(0xc763_edb4): jj("handguard")}],
+        }});
+        ix.add_weapon_file(&fam2);
+        assert_eq!(ix.weapon_finishes("w_sg_kozlov_01_mag_01").unwrap().1[0].1, "00000030");
+        assert_eq!(ix.weapon_finishes("w_sg_kozlov_01_sight_f_02_hi").unwrap().1[0].1, "00000031");
+        assert_eq!(ix.weapon_finishes("w_sg_kozlov_01_handguard_01").unwrap().1[0].1, "00000033");
+        assert_eq!((part_type_name(&format!("{:08x}", jj("sight_rear"))), part_type_name("12345678")), (Some("sight_rear"), None));
     }
 }

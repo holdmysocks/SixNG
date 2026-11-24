@@ -1459,7 +1459,7 @@ impl ModelView {
         let mut finish: Vec<(String, Option<String>)> = Vec::new();
         let mut finish_changed = false;
         if let Some(fs) = l.info["weapon_finishes"].as_array().filter(|a| !a.is_empty()) {
-            ui.label(egui::RichText::new("Finishes (the family's colour variants of a part type; names are not recovered, the squares show the colours)").weak());
+            ui.label(egui::RichText::new("Finishes (the family's colour variants of a part type; their names are not recovered, so each is labelled by its colours)").weak());
             let squares = |ui: &mut egui::Ui, o: &serde_json::Value| {
                 for c in o["colours"].as_array().into_iter().flatten().filter_map(|c| u32::from_str_radix(c.as_str()?, 16).ok()) {
                     ui.label(egui::RichText::new("\u{25a0}").color(egui::Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)));
@@ -1470,8 +1470,9 @@ impl ModelView {
                     let slot = f["slot"].as_str().unwrap_or("").to_string();
                     let mut cur = f["selected"].as_str().map(str::to_string);
                     ui.label(f["group"].as_str().filter(|g| !g.is_empty()).unwrap_or(&slot));
+                    let name_of = |o: &serde_json::Value| format!("{} ({})", o["label"].as_str().filter(|l| !l.is_empty()).unwrap_or("finish"), o["variant"].as_str().unwrap_or(""));
                     let text = match &cur {
-                        Some(p) => format!("variant {}", f["options"].as_array().into_iter().flatten().find(|o| o["preset"] == p.as_str()).and_then(|o| o["variant"].as_str()).unwrap_or(p)),
+                        Some(p) => f["options"].as_array().into_iter().flatten().find(|o| o["preset"] == p.as_str()).map(name_of).unwrap_or_else(|| p.clone()),
                         None => "default".to_string(),
                     };
                     egui::ComboBox::from_id_salt(("finish", slot.as_str())).selected_text(text).width(240.0).show_ui(ui, |ui| {
@@ -1484,7 +1485,7 @@ impl ModelView {
                             let on = cur.as_deref() == Some(pr);
                             ui.horizontal(|ui| {
                                 squares(ui, o);
-                                if ui.selectable_label(on, format!("variant {}", o["variant"].as_str().unwrap_or(""))).on_hover_text(format!("preset {pr}")).clicked() && !on {
+                                if ui.selectable_label(on, name_of(o)).on_hover_text(format!("preset {pr}")).clicked() && !on {
                                     cur = Some(pr.to_string());
                                     finish_changed = true;
                                 }
@@ -5179,8 +5180,18 @@ fn load_query_sel(
                                     c.truncate(3);
                                     c
                                 };
-                                finishes.push(serde_json::json!({"slot": slot, "group": sixng_core::weapon::part_slot(name, &pn).unwrap_or_default(), "part": pn, "selected": chosen,
-                                    "options": list.iter().map(|(v, pr)| serde_json::json!({"variant": v, "preset": pr, "colours": swatch(pr)})).collect::<Vec<_>>()}));
+                                // a finish has no recovered name: label it by its colours (nearest colour words)
+                                let label = |pr: &str| -> String {
+                                    let mut w: Vec<&str> = ix.colours(pr).into_iter().flatten().flatten().map(|c| sixng_core::pedtint::nearest_word([c[0], c[1], c[2]])).collect();
+                                    w.dedup();
+                                    let mut seen = std::collections::HashSet::new();
+                                    w.retain(|x| seen.insert(*x));
+                                    w.truncate(3);
+                                    w.join(" / ")
+                                };
+                                let group = sixng_core::matlib::part_type_name(slot).map(str::to_string).unwrap_or_else(|| sixng_core::weapon::part_slot(name, &pn).unwrap_or_default());
+                                finishes.push(serde_json::json!({"slot": slot, "group": group, "part": pn, "selected": chosen,
+                                    "options": list.iter().map(|(v, pr)| serde_json::json!({"variant": v, "preset": pr, "colours": swatch(pr), "label": label(pr)})).collect::<Vec<_>>()}));
                             }
                         }
                         if let Some(pr) = presets.and_then(|ix| colour_weapon(&mut m, &pn, ix, cache, chosen)) {
