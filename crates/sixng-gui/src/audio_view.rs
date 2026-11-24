@@ -171,7 +171,7 @@ impl AudioView {
             self.scanning = false;
             match r {
                 Ok(ix) => {
-                    self.load_names(&ix.archive);
+                    self.load_names(&ix);
                     self.ix = Some(ix);
                     self.dirty = true;
                 }
@@ -194,12 +194,13 @@ impl AudioView {
         }
     }
 
-    fn load_names(&mut self, archive: &str) {
+    fn load_names(&mut self, ix: &sixng_core::audio::AudioIndex) {
+        let archive = ix.archive.as_str();
         let work = std::path::Path::new(&self.work);
         sixng_core::names::set_work_dir(work);
         let c = sixng_core::audiometa::load_containers(work, archive).map(|c| sixng_core::audiometa::bank_container(&c)).unwrap_or_default();
         self.bank_names = c.into_iter().filter_map(|(b, h)| sixng_core::names::lookup(h, sixng_core::names::Ctx::Audio).map(|n| (b, n))).collect();
-        self.stream_names = sixng_core::names::load_stream_names(work, archive);
+        self.stream_names = sixng_core::names::all_stream_names(work, ix);
     }
 
     fn refilter(&mut self) {

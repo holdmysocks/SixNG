@@ -2656,13 +2656,14 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let aix = sixng_core::audio::load_index(&ws.work, &a.id).ok();
             let banks: Vec<(u64, std::collections::HashSet<u32>)> = aix.as_ref().map(|ix| ix.banks.iter().map(|b| (b.off, b.streams.iter().map(|s| s.id).collect())).collect()).unwrap_or_default();
             let sizes: Vec<(u64, u64)> = aix.as_ref().map(|ix| ix.banks.iter().map(|b| (b.off, b.size)).collect()).unwrap_or_default();
-            let (ok, bad, containers, list) = sixng_core::audiometa::export(&a, &sel, &banks, &sizes, po)?;
+            let (ok, bad, containers, list, objects) = sixng_core::audiometa::export(&a, &sel, &banks, &sizes, po)?;
             // which container (bank name hash) each bank holds, for `sixng audio`
             let named = if containers.is_empty() {
                 None
             } else {
                 sixng_core::audiometa::save_containers(&ws.work, &a.id, &containers)?;
                 sixng_core::audiometa::save_groups(&ws.work, &a.id, &sixng_core::audiometa::bank_groups(&list))?;
+                sixng_core::audiometa::save_objects(&ws.work, &a.id, &objects)?;
                 let c = sixng_core::audiometa::bank_container(&containers);
                 // bank names into the name dictionary (needs `sixng names` first)
                 let streams: std::collections::BTreeMap<u64, Vec<u32>> = aix.as_ref().map(|ix| ix.banks.iter().map(|b| (b.off, b.streams.iter().map(|s| s.id).collect())).collect()).unwrap_or_default();
@@ -2702,7 +2703,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let bank_name = |off: u64| containers.get(&off).map(|h| (format!("{h:08x}"), sixng_core::names::lookup(*h, sixng_core::names::Ctx::Audio)));
             let named = ix.banks.iter().filter(|b| bank_name(b.off).is_some_and(|(_, n)| n.is_some())).count();
             // stream names recovered by `audio-meta` / `names`
-            let stream_names = sixng_core::names::load_stream_names(&ws.work, &a.id);
+            let stream_names = sixng_core::names::all_stream_names(&ws.work, &ix);
             let list: Vec<_> = ix
                 .banks
                 .iter()
