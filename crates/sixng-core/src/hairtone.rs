@@ -20,9 +20,28 @@
 //! (black hair is 1, 1, 1; brown about 19, 13, 10), as a hair shader that
 //! scatters light wants them; others are blonde, red, orange, green and teal.
 //!
-//! Not decoded: how the game mixes the two colours (here: by the noise
-//! texture at the strand's root UV, an inference from the preset naming a
-//! noise texture and a tiling-like number), and what the seven numbers are.
+//! The two colour fields are named `color1` and `color2` (their hashes are
+//! the joaat of those words). The texture reference also holds a channel
+//! index (`7be8f914`, 0..2).
+//!
+//! What the game's strand shader does with a hair material (read from the
+//! compiled `PS_HairStrandGBuffer` program):
+//!
+//! * The base colour is fetched from a baked texture, 64 texels wide: one
+//!   row per hair material, holding 16 steps from root to tip in 4 variants;
+//!   a strand takes variant `id & 3` and interpolates along its length.
+//!   What bakes a row from a preset was not found (no shader program does),
+//!   so how `color1` and `color2` fill it is not decoded.
+//! * A second colour is laid over it through a mask texture sampled at the
+//!   strand's root UV, one channel picked by an index, with a weight that
+//!   grows toward the tip. This fits the preset's noise texture and channel
+//!   index, but which preset field feeds which shader input is not decoded.
+//! * Each strand's stored root-to-tip profile (`groom::Groom::profile`) is
+//!   passed on to the lighting.
+//!
+//! Not decoded: the bake, the lighting pass, and what the seven numbers
+//! are. Here the two colours are mixed by the noise texture at the strand's
+//! root UV: the structure of the overlay above, without its weights.
 //!
 //! The table is built once from the data.rpf index and cached as
 //! `<work>/index/hair_presets.json`.

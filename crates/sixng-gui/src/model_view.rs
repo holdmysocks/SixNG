@@ -1068,7 +1068,8 @@ impl ModelView {
                         // fewer strands than stored: wider ones, for the same cover
                         let base = if g.width > 0.0 { g.width } else { 0.0003 };
                         let w = (base / share.max(1e-3)).clamp(base, 0.004) * width_scale;
-                        g.coat_glb(&format!("coat_{off:x}"), &coat, w, &cols, serde_json::json!({}))
+                        // a character's hair with stored colours also takes its stored root-to-tip profile
+                        g.coat_glb_shaded(&format!("coat_{off:x}"), &coat, w, &cols, tones.contains_key(&off), serde_json::json!({}))
                     } else if let Some(t) = tones.get(&off) {
                         g.ribbon_glb_coloured(&format!("groom_{off:x}"), hw, &t.strands(&g), serde_json::json!({}))
                     } else if skin.is_empty() {

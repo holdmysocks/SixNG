@@ -55,6 +55,22 @@ pub struct Groom {
     pub width: f32,
     /// System +0x110: 16 width steps from root to tip (/ 255; inferred).
     pub taper: [u8; 16],
+    /// Root-to-tip profile of each guide strand (graphics header +0x0C):
+    /// four control values (/ 255) at 0, 1/3, 2/3 and 1 of the strand. The
+    /// game's strand shader blends them over the three guides of a root
+    /// triangle, joins neighbours with a smoothstep and writes the result,
+    /// scaled by a material value, to its G-buffer (read from the compiled
+    /// shader). Most grooms store 64, 128, 191, 255. Empty when not stored.
+    pub profile: Vec<[u8; 4]>,
+}
+
+/// The value of a root-to-tip profile at `t` (0 = root, 1 = tip), as the
+/// game's strand shader evaluates it.
+pub fn profile_at(c: [f32; 4], t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    let (lo, a, b) = if t > 2.0 / 3.0 { (2.0 / 3.0, c[2], c[3]) } else if t > 1.0 / 3.0 { (1.0 / 3.0, c[1], c[2]) } else { (0.0, c[0], c[1]) };
+    let x = ((t - lo) * 3.0).clamp(0.0, 1.0);
+    a + (b - a) * x * x * (3.0 - 2.0 * x)
 }
 
 /// A hat seen from a point inside the head: per direction, the distance to
@@ -295,7 +311,12 @@ pub fn parse(r: &Resource) -> Result<Groom> {
     let group_box = (gb[0][0] <= gb[1][0] && gb[0][0].is_finite() && gb[1][0].is_finite() && gb[0][0].abs() < 1e30).then_some(gb);
     let width = Some(f16(r.u16(0xF0))).filter(|w| w.is_finite() && *w > 0.0 && *w < 0.01).unwrap_or(0.0);
     let taper: [u8; 16] = r.sys.get(0x110..0x120).and_then(|b| b.try_into().ok()).unwrap_or([255; 16]);
-    Ok(Groom { strands: s, points_per_strand: k, points, w, roots, lengths, root_uv, bones, root_box, group_box, tri_counts, width, taper })
+    let a3 = gu32(0x0C) as usize;
+    let profile = match g.get(a3..a3 + s * 4) {
+        Some(p) if a3 > 0 => p.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect(),
+        _ => Vec::new(),
+    };
+    Ok(Groom { strands: s, points_per_strand: k, points, w, roots, lengths, root_uv, bones, root_box, group_box, tri_counts, width, taper, profile })
 }
 
 impl Groom {
@@ -492,6 +513,14 @@ impl Groom {
     /// each strand by its barycentric weights (COLOR_0 on a white
     /// material); strands are white where it is short.
     pub fn coat_glb(&self, name: &str, coat: &Coat, width: f32, guide_rgb: &[[u8; 3]], extras: serde_json::Value) -> Vec<u8> {
+        self.coat_glb_shaded(name, coat, width, guide_rgb, false, extras)
+    }
+
+    /// `coat_glb`, and with `shade` each strand's colour is multiplied by
+    /// its stored root-to-tip profile (`profile`: darker roots). The game
+    /// passes that value to its lighting; using it as a plain factor on the
+    /// colour is the viewer's reading.
+    pub fn coat_glb_shaded(&self, name: &str, coat: &Coat, width: f32, guide_rgb: &[[u8; 3]], shade: bool, extras: serde_json::Value) -> Vec<u8> {
         let k = coat.k;
         let n = coat.guides.len();
         let (mut pos, mut nrm, mut tint, mut idx) = (Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k.saturating_sub(1) * 6));
@@ -504,6 +533,12 @@ impl Groom {
                     c[q] = (a[q] as f32 * w[0] + b[q] as f32 * w[1] + d[q] as f32 * w[2] + 0.5) as u8;
                 }
             }
+            // the strand's profile: the control values of its three guides, blended
+            let prof = (shade && !self.profile.is_empty()).then(|| {
+                let at = |i: u32| self.profile.get(i as usize).copied().unwrap_or([64, 128, 191, 255]);
+                let (a, b, d) = (at(g[0]), at(g[1]), at(g[2]));
+                [0, 1, 2, 3].map(|q| (a[q] as f32 * w[0] + b[q] as f32 * w[1] + d[q] as f32 * w[2]) / 255.0)
+            });
             let nr = coat.normals[s];
             let base = pos.len() as u32;
             for j in 0..k {
@@ -517,10 +552,17 @@ impl Groom {
                 let f = j as f32 / (k.max(2) - 1) as f32;
                 let tap = if flat_taper { 1.0 - 0.6 * f } else { (self.taper[((f * 15.0) as usize).min(15)] as f32 / 255.0).max(0.15) };
                 let r = width * 0.5 * tap;
+                let cv = match prof {
+                    Some(pr) => {
+                        let m = profile_at(pr, f).clamp(0.0, 1.0);
+                        [(c[0] as f32 * m + 0.5) as u8, (c[1] as f32 * m + 0.5) as u8, (c[2] as f32 * m + 0.5) as u8, c[3]]
+                    }
+                    None => c,
+                };
                 for sg in [-1.0f32, 1.0] {
                     pos.push([p[0] + side[0] * r * sg, p[1] + side[1] * r * sg, p[2] + side[2] * r * sg]);
                     nrm.push(nr);
-                    tint.push(c);
+                    tint.push(cv);
                 }
             }
             for j in 0..k.saturating_sub(1) as u32 {
@@ -814,6 +856,17 @@ pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], o
 mod tests {
     use super::*;
     #[test]
+    fn the_root_to_tip_profile_joins_its_four_values_smoothly() {
+        let c = [0.25, 0.5, 0.75, 1.0];
+        assert_eq!((profile_at(c, 0.0), profile_at(c, 1.0), profile_at(c, 2.0)), (0.25, 1.0, 1.0));
+        assert!((profile_at(c, 1.0 / 3.0) - 0.5).abs() < 1e-5 && (profile_at(c, 2.0 / 3.0) - 0.75).abs() < 1e-5);
+        // half way between two control points: half way between their values
+        assert!((profile_at(c, 0.5) - 0.625).abs() < 1e-5);
+        // smoothstep, not a straight line
+        assert!(profile_at(c, 1.0 / 12.0) < 0.25 + 0.25 * 0.25);
+    }
+
+    #[test]
     fn full_strand_set_follows_the_stored_counts() {
         // three guides of two points each, one root triangle that stores 5 + 2 strands
         let g = Groom {
@@ -830,6 +883,7 @@ mod tests {
             tri_counts: vec![[5, 2, 1, 0]],
             width: 0.0004,
             taper: [255, 255, 255, 255, 255, 255, 255, 255, 128, 128, 128, 128, 128, 128, 128, 128],
+            profile: vec![],
         };
         let c = g.coat(1.0);
         assert_eq!(c.guides.len(), 7);
@@ -880,7 +934,7 @@ mod tests {
     }
     #[test]
     fn segments() {
-        let g = Groom { strands: 2, points_per_strand: 3, points: vec![[0.0; 3]; 6], w: vec![0.0; 6], roots: vec![[0, 1, 1]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0, taper: [255; 16] };
+        let g = Groom { strands: 2, points_per_strand: 3, points: vec![[0.0; 3]; 6], w: vec![0.0; 6], roots: vec![[0, 1, 1]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0, taper: [255; 16], profile: vec![] };
         assert_eq!(g.segments(), vec![0, 1, 1, 2, 3, 4, 4, 5]);
         assert_eq!(g.root_indices(), vec![0, 3, 3]);
     }
@@ -888,7 +942,7 @@ mod tests {
     fn coat_from_strand_counts() {
         // one root triangle of three 2-point guides, 40 + 10 stored strands
         let pts = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.1], [1.0, 0.0, 0.0], [1.0, 0.0, 0.1], [0.0, 1.0, 0.0], [0.0, 1.0, 0.1]];
-        let g = Groom { strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![[40, 10, 1, 0]], width: 0.0003, taper: [255; 16] };
+        let g = Groom { strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![[40, 10, 1, 0]], width: 0.0003, taper: [255; 16], profile: vec![] };
         assert_eq!(g.stored_strands(), 50);
         let c = g.coat(1.0);
         assert_eq!((c.guides.len(), c.points.len(), c.stored), (50, 100, 50));
