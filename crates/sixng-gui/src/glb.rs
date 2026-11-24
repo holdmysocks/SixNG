@@ -33,6 +33,29 @@ pub struct Mesh {
     pub centre: [f32; 3],
 }
 
+/// The fabric surface of a clothing material, from its layered-material
+/// preset (`sixng_core::matlib`). Both textures tile on the second UV set.
+#[derive(Clone, Default)]
+pub struct Fabric {
+    /// Image of the tile's material map (green = the grey value the colour
+    /// gradient runs over), with its scale and rotation (radians).
+    pub tile: Option<usize>,
+    pub tile_scale: f32,
+    pub tile_rot: f32,
+    /// Image of one tint-mask layer's mask (red), its UV scale and rotation,
+    /// strength (opacity x tint alpha), invert flag and tint (linear).
+    pub mask: Option<usize>,
+    pub mask_scale: [f32; 2],
+    pub mask_rot: f32,
+    pub mask_strength: f32,
+    pub mask_invert: bool,
+    pub mask_tint: [f32; 3],
+    /// The layer belongs to one sub-material: its weight is the base
+    /// texture's alpha (1 on that sub-material's texels) times the vertex
+    /// tint's alpha.
+    pub weight_in_alpha: bool,
+}
+
 /// One texture slot of a material, as written in the material extras.
 #[derive(Clone)]
 pub struct Slot {
@@ -66,6 +89,9 @@ pub struct Material {
     /// Ped clothing whose base texture is the grey shade map (`ped_tint` in
     /// the extras): the viewer colours it with the outfit's tint.
     pub ped_shade: bool,
+    /// Clothing with a layered-material preset: the tiling fabric texture
+    /// and the strongest tint-mask layer (the viewer fills this in).
+    pub fabric: Option<Fabric>,
     /// Vehicle parts coloured per vertex (COLOR_0; alpha 254 = the primary
     /// body paint, other values = metalness in four steps x 50 + roughness in 50 steps).
     pub parts: bool,
@@ -752,6 +778,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             mr,
             tint_mask: ex["classification"]["tint_mask"] == true,
             ped_shade: ex["ped_tint"].is_object(),
+            fabric: None,
             parts: ex["classification"]["stand_in"] == "parts",
             occlusion_only,
             slots,

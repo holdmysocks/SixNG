@@ -43,6 +43,13 @@ pub struct FrameU {
 struct MatU {
     base: [f32; 4],
     flags: [u32; 4],
+    /// Fabric tile: scale, rotation, 1 = the layer weight is in the base
+    /// alpha, 1 = a tile texture is bound.
+    tile: [f32; 4],
+    /// Tint-mask layer: UV scale x, y, rotation, strength (0 = none).
+    mask: [f32; 4],
+    /// Its tint (linear) and 1 = inverted mask.
+    mtint: [f32; 4],
 }
 
 #[repr(C)]
@@ -625,6 +632,8 @@ impl Renderer3D {
                 tex_entry(2),
                 tex_entry(3),
                 tex_entry(4),
+                tex_entry(5),
+                tex_entry(6),
             ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1294,6 +1303,7 @@ impl Uploader {
             mr: None,
             tint_mask: false,
             ped_shade: false,
+            fabric: None,
             parts: false,
             occlusion_only: false,
             slots: vec![],
@@ -1344,9 +1354,13 @@ impl Uploader {
                 | if mt.name.ends_with("29648098") { 0x800 } else { 0 }
                 // bit 13: the packed map is a vehicle material map, blue = occlusion
                 | if mt.occlusion_only { 0x2000 } else { 0 };
+            let fb = mt.fabric.clone().unwrap_or_default();
             let u = MatU {
                 base,
                 flags: [has, class_id(&mt.class), alpha, gap | mr],
+                tile: [fb.tile_scale, fb.tile_rot, fb.weight_in_alpha as u32 as f32, fb.tile.is_some() as u32 as f32],
+                mask: [fb.mask_scale[0], fb.mask_scale[1], fb.mask_rot, if fb.mask.is_some() { fb.mask_strength } else { 0.0 }],
+                mtint: [fb.mask_tint[0], fb.mask_tint[1], fb.mask_tint[2], fb.mask_invert as u32 as f32],
             };
             let o = k * MAT_STRIDE as usize;
             mat_bytes[o..o + std::mem::size_of::<MatU>()].copy_from_slice(bytemuck::bytes_of(&u));
@@ -1377,6 +1391,14 @@ impl Uploader {
                     wgpu::BindGroupEntry {
                         binding: 4,
                         resource: wgpu::BindingResource::TextureView(view(mt.emissive)),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(view(fb.tile)),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(view(fb.mask)),
                     },
                 ],
             });

@@ -22,6 +22,9 @@ struct Frame {
 struct Mat {
     base: vec4<f32>,
     flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask
+    tile: vec4<f32>,      // fabric tile: x scale, y rotation, z layer weight in base alpha, w tile bound
+    mask: vec4<f32>,      // tint-mask layer: xy UV scale, z rotation, w strength (0 = none)
+    mtint: vec4<f32>,     // its tint (linear), w = inverted
 };
 
 @group(0) @binding(0) var<uniform> F: Frame;
@@ -33,6 +36,8 @@ struct Mat {
 @group(1) @binding(2) var t_nrm: texture_2d<f32>;
 @group(1) @binding(3) var t_pk: texture_2d<f32>;
 @group(1) @binding(4) var t_em: texture_2d<f32>;
+@group(1) @binding(5) var t_tile: texture_2d<f32>;
+@group(1) @binding(6) var t_mask: texture_2d<f32>;
 
 struct VIn {
     @location(0) pos: vec3<f32>,
@@ -148,15 +153,34 @@ fn gap_tint(g: u32) -> vec3<f32> {
     return vec3(0.15, 0.75, 0.25);
 }
 
+// The clothing shader's gradient map: the game expands one colour into three
+// stops (0.1 x value; the colour; saturation x 0.55 at value x 0.55 + 0.45)
+// and runs the tile texture's grey value g over them.
+fn fabric_gradient(c: vec3<f32>, g: f32) -> vec3<f32> {
+    let v = max(max(c.r, c.g), max(c.b, 1e-5));
+    let light = (0.55 * (c / v - 1.0) + 1.0) * (0.55 * v + 0.45);
+    if (g < 0.5) { return mix(0.1 * c, c, 2.0 * g); }
+    return c + (light - c) * (g - 0.5);
+}
+
+fn rot_uv(uv: vec2<f32>, a: f32) -> vec2<f32> {
+    let c = cos(a);
+    let s = sin(a);
+    return vec2(uv.x * c - uv.y * s, uv.x * s + uv.y * c);
+}
+
 @fragment
 fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let has = M.flags.x;
     let cls = M.flags.y;
     var base = M.base;
+    // weight of a sub-material's tint-mask layer: the base texture's alpha
+    var layer_w = 1.0;
     if ((has & 1u) != 0u) {
         var bt = textureSample(t_base, samp, i.uv0);
         // tint mask (animal coats): only the green channel (shading) is a picture
         if ((M.flags.w & 512u) != 0u) { bt = vec4(vec3(bt.g), 1.0); }
+        if (M.tile.z > 0.5) { layer_w = bt.a; bt.a = 1.0; }
         base = base * bt;
     }
     if (M.flags.z == 1u && base.a < 0.5) {
@@ -197,6 +221,19 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     var albedo = base.rgb;
     // the model's tint palette entry multiplies the base colour
     if (F.misc3.x > 0.5) { albedo = albedo * i.tint.rgb; }
+    // clothing with a layered-material preset: the tile's grey value runs
+    // the colour gradient, then one tint-mask layer goes over it
+    if (M.tile.w > 0.5 || M.mask.w > 0.0) {
+        var g = 0.5;
+        if (M.tile.w > 0.5) { g = textureSample(t_tile, samp, rot_uv(i.uv1 * M.tile.x, M.tile.y)).g; }
+        albedo = fabric_gradient(albedo, g);
+        if (M.mask.w > 0.0) {
+            var mk = textureSample(t_mask, samp, rot_uv(i.uv1 * M.mask.xy, M.mask.z)).r;
+            if (M.mtint.w > 0.5) { mk = 1.0 - mk; }
+            if (M.tile.z > 0.5) { mk = mk * layer_w * i.tint.a; }
+            albedo = mix(albedo, fabric_gradient(M.mtint.rgb, g), clamp(mk * M.mask.w, 0.0, 1.0));
+        }
+    }
     var alpha = base.a;
     var emissive = vec3(0.0);
     var pearl = vec3(0.0);

@@ -213,6 +213,8 @@ pub struct PartFx {
     pub tag: Option<&'static str>,
     /// Base colour (sRGB) per sub-material from the item's garment preset.
     pub subs: Vec<Option<[u8; 3]>>,
+    /// The garment preset (hex): its tile and tint-mask layers.
+    pub preset: Option<String>,
     pub head: bool,
     /// A skin mesh without a colour texture: takes the head's neck tone.
     pub body: bool,
@@ -3881,7 +3883,7 @@ fn load_parts(
         }
     }
     if coloured > 0 {
-        notes.push(format!("Clothing colours: {coloured} part(s) coloured from the outfit data: the colours of the item's garment preset (one per sub-material, picked by the garment's materialid texture; sub-material 0 where it has none), else the item's stored colour, else row tint 0 of its tint palette (for the generic palette only when it agrees with the item's colour tag), else the colour tag itself (one of 18 words such as navy or khaki, shown in a plain shade of ours). Second and third tints are not applied."));
+        notes.push(format!("Clothing colours: {coloured} part(s) coloured from the outfit data: the colours of the item's garment preset (one per sub-material, picked by the garment's materialid texture, else per vertex from the colour stream's green byte), with the fabric tile of the garment's main sub-material as a gradient map and its strongest tint-mask layer (other sub-materials share that tile; their own layers, the tile's normal map and the pattern, stitch and dirt layers are not drawn), else the item's stored colour, else row tint 0 of its tint palette (for the generic palette only when it agrees with the item's colour tag), else the colour tag itself (one of 18 words such as navy or khaki, shown in a plain shade of ours). Second and third tints are not applied."));
     }
     (model, first, names, errs, skin, colours, mask, notes)
 }
@@ -3965,43 +3967,153 @@ fn colour_weapon(m: &mut glb::Model, name: &str, presets: &sixng_core::matlib::I
     done.then_some(preset)
 }
 
+/// The layered-material libraries of data.rpf, parsed once (a few seconds on
+/// the first outfit).
+fn material_library(game: &Path) -> Option<&'static sixng_core::matlib::Library> {
+    static LIB: std::sync::OnceLock<Option<sixng_core::matlib::Library>> = std::sync::OnceLock::new();
+    LIB.get_or_init(|| sixng_core::matlib::Library::load(&Workspace::new(game, sixng_core::names::work_dir()?)).ok()).as_ref()
+}
+
+/// A texture of the texture stores as a model image (linear, with mips),
+/// added once per model, and the mean of its red channel.
+fn store_image(m: &mut glb::Model, game: &Path, hash: u64) -> Option<(usize, f32)> {
+    let key = format!("ttpf:{hash:016x}");
+    let mean = |px: &[u8]| px.chunks_exact(4).map(|t| t[0] as f32).sum::<f32>() / (px.len() / 4).max(1) as f32 / 255.0;
+    if let Some(i) = m.images.iter().position(|im| im.key == key) {
+        return Some((i, m.images[i].mips.first().map_or(0.0, |l| mean(&l.2))));
+    }
+    let (store, t) = sixng_core::ttpf::global(game).get(hash)?;
+    let data = store.data(t).ok()?;
+    let (px, w, h) = sixng_core::ttpf::decode_rgba(t, &data, 0).ok()?;
+    let mn = mean(&px);
+    m.images.push(glb::Image { key, mips: glb::mip_chain(w, h, px), srgb: false, bc: None });
+    Some((m.images.len() - 1, mn))
+}
+
+/// The fabric surface of sub-material `sub` of a garment preset: the tile's
+/// material map with its scale and rotation, and the tint-mask layer that
+/// changes the colour most (mean mask x opacity x tint alpha). A layer or a
+/// tile whose scale the library does not give is left out.
+fn fabric_of(m: &mut glb::Model, lib: &sixng_core::matlib::Library, preset: u32, sub: usize, game: &Path, weight_in_alpha: bool) -> Option<glb::Fabric> {
+    let lin = |c: u8| {
+        let x = c as f32 / 255.0;
+        if x <= 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) }
+    };
+    let mut fb = glb::Fabric { weight_in_alpha, ..Default::default() };
+    if let Some(t) = lib.tile(preset, sub) {
+        if let (Some(scale), Ok(h)) = (t.scale, u64::from_str_radix(&t.material_map, 16)) {
+            if let Some((i, _)) = store_image(m, game, h) {
+                fb.tile = Some(i);
+                fb.tile_scale = scale;
+                fb.tile_rot = t.rotation.unwrap_or(0.0);
+            }
+        }
+    }
+    let mut best = 0.02;
+    for l in lib.layers(preset, sub) {
+        let (Some(tint), Some(sx), Ok(h)) = (l.tint, l.scale[0], u64::from_str_radix(&l.mask_map, 16)) else { continue };
+        let Some((i, mean)) = store_image(m, game, h) else { continue };
+        let strength = l.opacity * tint[3] as f32 / 255.0;
+        let score = if l.invert { 1.0 - mean } else { mean } * strength;
+        if score > best {
+            best = score;
+            fb.mask = Some(i);
+            fb.mask_scale = [sx, l.scale[1].unwrap_or(sx)];
+            fb.mask_rot = l.rotation.unwrap_or(0.0);
+            fb.mask_strength = strength.min(1.0);
+            fb.mask_invert = l.invert;
+            fb.mask_tint = [lin(tint[0]), lin(tint[1]), lin(tint[2])];
+        }
+    }
+    (fb.tile.is_some() || fb.mask.is_some()).then_some(fb)
+}
+
 fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> bool {
-    // Garment preset colours: one base colour per sub-material, the
-    // sub-material of a texel from the material's `materialid` texture.
-    // Without that texture the garment takes the colour of sub-material 0
-    // (the per-vertex sub-material id is not read).
+    // Garment preset colours: one base colour per sub-material. The
+    // sub-material of a texel comes from the material's `materialid`
+    // texture; without that texture it is per vertex, in the green byte of
+    // the raw colour stream (values 4k + 2, k = sub-material), and the
+    // colour goes on as a vertex tint over the grey shade map.
     if f.colour.is_none() && f.subs.iter().any(|c| c.is_some()) {
         let first = f.subs.iter().flatten().next().copied().unwrap_or([128; 3]);
+        let colour = |s: usize| f.subs.get(s).copied().flatten().or(f.subs[0]).unwrap_or(first);
         let shaped = cache.join("shaped");
+        let lib = f.preset.as_deref().and_then(|p| u32::from_str_radix(p, 16).ok()).and_then(|p| Some((material_library(game)?, p)));
+        let lin = |c: u8| {
+            let x = c as f32 / 255.0;
+            if x <= 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) }
+        };
+        // the fabric shade is mid grey (about 125) on plain cloth
+        let gain = 1.0 / lin(125);
         let mut done = std::collections::HashSet::new();
+        let mut any = false;
         for mi in 0..m.materials.len() {
             if !m.materials[mi].ped_shade {
                 continue;
             }
             let Some(i) = m.materials[mi].base else { continue };
-            if !done.insert(i) {
+            if m.images.get(i).is_none_or(|im| im.bc.is_some()) {
                 continue;
             }
-            let dims: Vec<(u32, u32)> = match m.images.get(i).filter(|im| im.bc.is_none()) {
-                Some(im) => im.mips.iter().map(|l| (l.0, l.1)).collect(),
-                None => continue,
-            };
-            for (level, (w, h)) in dims.into_iter().enumerate() {
-                let ids = sub_material_map(&m.materials[mi], &[cache, shaped.as_path()], w, h);
-                let px = &mut m.images[i].mips[level].2;
-                for (k, t) in px.chunks_exact_mut(4).enumerate() {
-                    let s = ids.as_ref().map_or(0, |v| v[k] as usize);
-                    let c = f.subs.get(s).copied().flatten().or(f.subs[0]).unwrap_or(first);
-                    // the fabric shade is mid grey (about 125) on plain cloth
-                    let g = t[1] as f32 / 125.0;
-                    for ch in 0..3 {
-                        t[ch] = (c[ch] as f32 * g).min(255.0) as u8;
+            any = true;
+            let opaque = m.materials[mi].alpha_mode == "OPAQUE";
+            let roots = [cache, shaped.as_path()];
+            // the sub-material that covers most of the material
+            let most = |n: [usize; 8]| (0..8).max_by_key(|&k| (n[k], 8 - k)).unwrap_or(0);
+            let small = sub_material_map(&m.materials[mi], &roots, 64, 64);
+            let by_vertex = small.is_none() && m.meshes.iter().filter(|x| x.material == Some(mi)).all(|x| x.verts.iter().all(|v| v.col[1] % 4 == 2));
+            let mut count = [0usize; 8];
+            match &small {
+                Some(ids) => ids.iter().for_each(|&s| count[s as usize] += 1),
+                None if by_vertex => m.meshes.iter().filter(|x| x.material == Some(mi)).flat_map(|x| &x.verts).for_each(|v| count[(v.col[1] >> 2).min(7) as usize] += 1),
+                None => count[0] = 1,
+            }
+            let dominant = most(count);
+            if done.insert(i) {
+                let dims: Vec<(u32, u32)> = m.images[i].mips.iter().map(|l| (l.0, l.1)).collect();
+                for (level, (w, h)) in dims.into_iter().enumerate() {
+                    let ids = sub_material_map(&m.materials[mi], &roots, w, h);
+                    let px = &mut m.images[i].mips[level].2;
+                    for (k, t) in px.chunks_exact_mut(4).enumerate() {
+                        match (&ids, by_vertex) {
+                            (None, true) => {
+                                // the shade alone; the vertex tint brings the colour
+                                let g = t[1];
+                                t[..3].copy_from_slice(&[g, g, g]);
+                            }
+                            _ => {
+                                let s = ids.as_ref().map_or(0, |v| v[k] as usize);
+                                let c = colour(s);
+                                let g = t[1] as f32 / 125.0;
+                                for ch in 0..3 {
+                                    t[ch] = (c[ch] as f32 * g).min(255.0) as u8;
+                                }
+                                if opaque {
+                                    t[3] = if s == dominant { 255 } else { 0 };
+                                }
+                            }
+                        }
+                    }
+                }
+                m.images[i].key = format!("{}#preset{:?}{}{dominant}", m.images[i].key, f.subs, if by_vertex { "v" } else { "t" });
+            }
+            if by_vertex {
+                let b = |c: u8| (lin(c) * 255.0 + 0.5) as u8;
+                let bf = m.materials[mi].base_factor;
+                m.materials[mi].base_factor = [bf[0] * gain, bf[1] * gain, bf[2] * gain, bf[3]];
+                for mesh in m.meshes.iter_mut().filter(|x| x.material == Some(mi)) {
+                    for v in &mut mesh.verts {
+                        let s = (v.col[1] >> 2).min(7) as usize;
+                        let c = colour(s);
+                        v.tint = [b(c[0]), b(c[1]), b(c[2]), if s == dominant { 255 } else { 0 }];
                     }
                 }
             }
-            m.images[i].key = format!("{}#preset{:?}", m.images[i].key, f.subs);
+            if let Some((lib, preset)) = lib {
+                m.materials[mi].fabric = fabric_of(m, lib, preset, dominant, game, opaque);
+            }
         }
-        if !done.is_empty() {
+        if any {
             return true;
         }
     }
@@ -4825,7 +4937,7 @@ fn load_query_sel(
                         }
                         if oi == k {
                             let body = p.slot == "body upper" || p.slot == "body lower";
-                            fx.insert(e.off, PartFx { tint: p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t.rows[0]))).filter(|t| t.1 != 255), colour: p.colour.map(|c| [c[1], c[2], c[3]]), tag: p.colour_tag, subs: p.preset_colours.clone(), head: p.slot == "head", body, skeletal: body || matches!(p.slot.as_str(), "head" | "eyes" | "teeth" | "teeth accessory"), covers: matches!(p.slot.as_str(), "top" | "outer" | "bottom" | "full" | "feet" | "gloves"), layer: match p.slot.as_str() { "outer" => 2, "top" | "bottom" | "full" => 1, _ => 0 }, heel: p.slot == "feet" && p.drawable.split('_').any(|t| matches!(t, "sh" | "mh" | "hh")), skins: if p.slot == "head" { p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect() } else { Vec::new() } });
+                            fx.insert(e.off, PartFx { tint: p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t.rows[0]))).filter(|t| t.1 != 255), colour: p.colour.map(|c| [c[1], c[2], c[3]]), tag: p.colour_tag, subs: p.preset_colours.clone(), preset: p.preset.clone(), head: p.slot == "head", body, skeletal: body || matches!(p.slot.as_str(), "head" | "eyes" | "teeth" | "teeth accessory"), covers: matches!(p.slot.as_str(), "top" | "outer" | "bottom" | "full" | "feet" | "gloves"), layer: match p.slot.as_str() { "outer" => 2, "top" | "bottom" | "full" => 1, _ => 0 }, heel: p.slot == "feet" && p.drawable.split('_').any(|t| matches!(t, "sh" | "mh" | "hh")), skins: if p.slot == "head" { p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect() } else { Vec::new() } });
                         }
                     }
                 }

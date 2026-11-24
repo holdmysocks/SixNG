@@ -677,6 +677,7 @@ mod tests {
             mr: None,
             tint_mask: false,
             ped_shade: false,
+            fabric: None,
             parts: false,
             occlusion_only: false,
             slots: vec![],
