@@ -364,7 +364,6 @@ const MESH_SHADER: &str = r#"
             float3 tangent = normalize(input.tangent.xyz);
             float3 bitangent = normalize(cross(normal, tangent));
             float3 sampled = normal_texture.sample(material_sampler, input.uv).xyz * 2.0 - 1.0;
-            sampled.y = -sampled.y;
             sampled.z = sqrt(max(1.0 - sampled.x * sampled.x - sampled.y * sampled.y, 0.0));
             bitangent *= select(1.0, -1.0, input.tangent.w < 0.0);
             normal = normalize(tangent * sampled.x + bitangent * sampled.y + normal * sampled.z);

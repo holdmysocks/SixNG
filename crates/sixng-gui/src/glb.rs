@@ -348,6 +348,54 @@ fn half(pw: u32, ph: u32, p: &[u8]) -> (u32, u32, Vec<u8>) {
 }
 
 /// Box-filter mip chain of an RGBA8 image.
+/// Tangent frame of the first UV set, which is the one normal maps are
+/// sampled with: tangent along +u, and `w` so that `cross(n, t) * w` runs
+/// along +v (down the image; the game's normal maps are DirectX style,
+/// green = +v). The frame stored in the model is not used for this: it
+/// follows the SECOND UV set (rhino_hi: stored tangent and sign agree with
+/// UV1 on 100 % of the surface and with UV0 on 49 %; ped jeans: 99.9 %
+/// with UV1, 93.5 % with UV0), so on models whose two layouts differ it
+/// lit normal maps from arbitrary sides. A vertex no triangle with UV area
+/// touches keeps the stored frame.
+fn uv0_tangents(v: &mut [Vertex], indices: &[u32]) {
+    let mut acc = vec![[0f32; 6]; v.len()];
+    for t in indices.chunks_exact(3) {
+        let (a, b, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
+        if a >= v.len() || b >= v.len() || c >= v.len() {
+            continue;
+        }
+        let e = |p: usize, q: usize| [v[q].pos[0] - v[p].pos[0], v[q].pos[1] - v[p].pos[1], v[q].pos[2] - v[p].pos[2]];
+        let d = |p: usize, q: usize| [v[q].uv0[0] - v[p].uv0[0], v[q].uv0[1] - v[p].uv0[1]];
+        let (e1, e2, d1, d2) = (e(a, b), e(a, c), d(a, b), d(a, c));
+        let det = d1[0] * d2[1] - d2[0] * d1[1];
+        if det.abs() < 1e-12 || !det.is_finite() {
+            continue;
+        }
+        // dP/du and dP/dv, scaled by the triangle's area (det cancels to its sign)
+        let s = det.signum();
+        for i in [a, b, c] {
+            for k in 0..3 {
+                acc[i][k] += s * (e1[k] * d2[1] - e2[k] * d1[1]);
+                acc[i][3 + k] += s * (e2[k] * d1[0] - e1[k] * d2[0]);
+            }
+        }
+    }
+    for (x, s) in v.iter_mut().zip(acc) {
+        let n = x.nrm;
+        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let (t, b) = ([s[0], s[1], s[2]], [s[3], s[4], s[5]]);
+        let k = dot(n, t);
+        let t = [t[0] - n[0] * k, t[1] - n[1] * k, t[2] - n[2] * k];
+        let l = dot(t, t).sqrt();
+        if l < 1e-12 || !l.is_finite() {
+            continue;
+        }
+        let t = [t[0] / l, t[1] / l, t[2] / l];
+        let cr = [n[1] * t[2] - n[2] * t[1], n[2] * t[0] - n[0] * t[2], n[0] * t[1] - n[1] * t[0]];
+        x.tan = [t[0], t[1], t[2], if dot(cr, b) < 0.0 { -1.0 } else { 1.0 }];
+    }
+}
+
 pub fn mip_chain(w: u32, h: u32, px: Vec<u8>) -> Vec<(u32, u32, Vec<u8>)> {
     let mut v = vec![(w, h, px)];
     loop {
@@ -959,6 +1007,9 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                     };
                 }
             }
+            if has_tangents && uv_sets >= 1 {
+                uv0_tangents(&mut v, &indices);
+            }
             tris += indices.len() / 3;
             nverts += n;
             let mut c = [0f32; 3];
@@ -1147,5 +1198,38 @@ mod bench {
         let m = bcs.iter().filter(|p| read_bc(p).is_some()).count();
         let b = t.elapsed().as_secs_f64() * 1000.0 / m.max(1) as f64;
         println!("png128 -> 64 px BC: {a:.3} ms per texture ({n}); bc64 read: {b:.3} ms per texture ({m})");
+    }
+}
+
+#[cfg(test)]
+mod tangent_tests {
+    use super::*;
+
+    fn quad(uv: [[f32; 2]; 4]) -> Vec<Vertex> {
+        // a wall facing +z: x right, y up
+        let pos = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]];
+        (0..4).map(|i| Vertex { pos: pos[i], nrm: [0.0, 0.0, 1.0], tan: [0.0, 1.0, 0.0, 1.0], uv0: uv[i], uv1: [0.0; 2], col: [255; 4], joints: [0; 4], weights: [0; 4], tint: [255; 4] }).collect()
+    }
+
+    /// cross(n, t) * w, the bitangent the shaders build.
+    fn bitangent(v: &Vertex) -> [f32; 3] {
+        let (n, t) = (v.nrm, v.tan);
+        [(n[1] * t[2] - n[2] * t[1]) * t[3], (n[2] * t[0] - n[0] * t[2]) * t[3], (n[0] * t[1] - n[1] * t[0]) * t[3]]
+    }
+
+    #[test]
+    fn frame_follows_uv0_also_when_mirrored() {
+        let idx = [0, 1, 2, 0, 2, 3];
+        // image upright on the wall: u right, v down
+        let mut v = quad([[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]);
+        uv0_tangents(&mut v, &idx);
+        assert!(v[0].tan[0] > 0.99, "tangent along +u = +x");
+        assert!(bitangent(&v[0])[1] < -0.99, "bitangent along +v = down");
+        // the same image mirrored left to right: u runs to -x, v still down
+        let mut m = quad([[1.0, 1.0], [0.0, 1.0], [0.0, 0.0], [1.0, 0.0]]);
+        uv0_tangents(&mut m, &idx);
+        assert!(m[0].tan[0] < -0.99);
+        assert!(bitangent(&m[0])[1] < -0.99);
+        assert!(v[0].tan[3] != m[0].tan[3], "mirroring flips the sign");
     }
 }

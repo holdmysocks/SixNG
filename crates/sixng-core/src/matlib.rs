@@ -87,7 +87,7 @@ pub const PROFILE: u32 = 0x440c_9ecb;
 /// The colour parameter: 4 entries per sub-material.
 pub const COLOUR: u32 = 0xf574_261b;
 /// Index format version of [`Index`].
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// One parameter: (name hash, index, sub-material, value).
 pub type Param<T> = (u32, u8, u8, T);
@@ -209,6 +209,27 @@ impl Library {
         lib
     }
 
+    /// Every layered-material library of data.rpf as one (clothing and
+    /// weapons; their preset names do not collide). A few seconds.
+    pub fn load(ws: &crate::export::Workspace) -> Result<Library, String> {
+        let a = ws.resolve("data").map_err(|e| format!("{e:#}"))?;
+        let aix = ws.load_index(&a).map_err(|e| format!("data.rpf index: {e:#}; index data.rpf first"))?;
+        let mut all = Library::default();
+        for e in aix.entries.iter().filter(|e| e.kind == crate::classify::Kind::Pso) {
+            let Ok(b) = crate::scan::read_entry(&a.path, e) else { continue };
+            let Some(p) = crate::pso::parse(&b).filter(|p| p.structs.contains_key(&ROOT)) else { continue };
+            let lib = Library::from_meta(&p.meta());
+            all.base.extend(lib.base);
+            all.presets.extend(lib.presets);
+            all.tiles.extend(lib.tiles);
+            all.profiles.extend(lib.profiles);
+        }
+        if all.presets.is_empty() {
+            return Err("no layered-material library found in data.rpf".into());
+        }
+        Ok(all)
+    }
+
     /// Colour entry `index` (0..=3) of sub-material `sub` of a preset, as
     /// sRGB RGBA: the preset's own, else its base material's.
     pub fn colour(&self, preset: u32, sub: usize, index: u8) -> Option<[u8; 4]> {
@@ -292,6 +313,17 @@ pub fn stops(srgb: [u8; 3]) -> [[f32; 3]; 3] {
     [lin.map(|c| 0.1 * c), lin, light]
 }
 
+/// One weapon family file: its component models and the finishes it
+/// offers per part type.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WeaponFamily {
+    /// Model name hashes (hex) of the family's component records.
+    pub models: Vec<String>,
+    /// Part type (hex: joaat of `frame`, `slide`, `grip`, `barrel` ...) ->
+    /// (variant name hash hex, preset hex), in file order.
+    pub finishes: BTreeMap<String, Vec<(String, String)>>,
+}
+
 /// Compact form of the libraries for other commands
 /// (`<work>/index/material_presets.json`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -312,6 +344,8 @@ pub struct Index {
     /// suffix) -> the presets its component records name, in file order.
     /// 57 of 894 models have two (a second record of the same model).
     pub weapon_models: BTreeMap<String, Vec<String>>,
+    /// Per weapon family file: its models and its finishes by part type.
+    pub weapon_families: Vec<WeaponFamily>,
 }
 
 pub fn path(ws: &crate::export::Workspace) -> PathBuf {
@@ -331,6 +365,7 @@ impl Index {
     /// Weapon links of one decoded weapon family file (`Pso::to_json`).
     pub fn add_weapon_file(&mut self, pso_json: &Value) {
         let (comp, var, model, part) = (field_name(0x72f5_e33e), field_name(0x14b0_64c2), field_name(0x873e_f899), field_name(0xc763_edb4));
+        let mut fam = WeaponFamily::default();
         for (st, objs) in pso_json["objects"].as_object().into_iter().flatten() {
             let st = st.get(st.len().saturating_sub(8)..);
             for o in objs.as_array().into_iter().flatten() {
@@ -339,6 +374,9 @@ impl Index {
                     Some("85492dc3") => {
                         let Some(p) = preset(&comp) else { continue };
                         if let Some(m) = o[&model].as_u64().filter(|&m| m != 0) {
+                            if !fam.models.contains(&format!("{m:08x}")) {
+                                fam.models.push(format!("{m:08x}"));
+                            }
                             let v = self.weapon_models.entry(format!("{m:08x}")).or_default();
                             if !v.contains(&p) {
                                 v.push(p.clone());
@@ -348,12 +386,17 @@ impl Index {
                     }
                     Some("6724161c") => {
                         if let Some(p) = preset(&var) {
-                            self.weapon_variants.insert(format!("{n:08x}"), (format!("{:08x}", o[&part].as_u64().unwrap_or(0)), p));
+                            let slot = format!("{:08x}", o[&part].as_u64().unwrap_or(0));
+                            fam.finishes.entry(slot.clone()).or_default().push((format!("{n:08x}"), p.clone()));
+                            self.weapon_variants.insert(format!("{n:08x}"), (slot, p));
                         }
                     }
                     _ => {}
                 }
             }
+        }
+        if !fam.models.is_empty() && !fam.finishes.is_empty() {
+            self.weapon_families.push(fam);
         }
     }
 
@@ -412,6 +455,31 @@ impl Index {
         let m = model.to_ascii_lowercase();
         let base = ["_hi", "_mid"].iter().find_map(|s| m.strip_suffix(s)).unwrap_or(&m);
         self.weapon_models.get(&format!("{:08x}", crate::meta7a::joaat(base))).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// The finishes a weapon model can take: its family's variants for the
+    /// model's part type, as (part type hex, [(variant hex, preset hex)]).
+    /// The part type is a word of the model name (`w_pi_duke_01_slide_02`
+    /// -> `slide`; `…_sight_f_01` -> `sight_f` or `sight`), the longest
+    /// that the family has finishes for.
+    pub fn weapon_finishes(&self, model: &str) -> Option<(&str, &[(String, String)])> {
+        let m = model.to_ascii_lowercase();
+        let base = ["_hi", "_mid"].iter().find_map(|s| m.strip_suffix(s)).unwrap_or(&m);
+        let key = format!("{:08x}", crate::meta7a::joaat(base));
+        let fam = self.weapon_families.iter().find(|f| f.models.contains(&key))?;
+        let words: Vec<&str> = base.split('_').collect();
+        let mut best: Option<(usize, &str, &[(String, String)])> = None;
+        for i in 0..words.len() {
+            for k in i + 1..=words.len() {
+                let w = words[i..k].join("_");
+                if let Some((slot, v)) = fam.finishes.get_key_value(&format!("{:08x}", crate::meta7a::joaat(&w))) {
+                    if best.is_none_or(|b| w.len() > b.0) {
+                        best = Some((w.len(), slot.as_str(), v.as_slice()));
+                    }
+                }
+            }
+        }
+        best.map(|b| (b.1, b.2))
     }
 
     /// Base colour (entry 0) per sub-material of a preset, sRGB RGBA.
@@ -513,5 +581,20 @@ mod tests {
         assert_eq!(ix.weapon_variants["d0b1bd2a"].0, format!("{:08x}", crate::meta7a::joaat("frame")));
         assert_eq!(ix.weapon_presets("W_AR_ADB_01_barrel_01_hi"), ["d9f0240d".to_string(), "00000011".to_string()]);
         assert!(ix.weapon_presets("w_ar_adb_01").is_empty());
+        // the family's finishes for a model's part type
+        let jj = crate::meta7a::joaat;
+        let fam = json!({"objects": {
+            "9a16508d85492dc3": [{"Name": 1, field_name(0x72f5_e33e): 0x10u32, field_name(0x873e_f899): jj("w_pi_duke_01_slide_02")}, {"Name": 2, field_name(0x72f5_e33e): 0x11u32, field_name(0x873e_f899): jj("w_pi_duke_01_sight_f_01")}],
+            "eafa47ee6724161c": [
+                {"Name": 0xa1u32, field_name(0x14b0_64c2): 0x20u32, field_name(0xc763_edb4): jj("slide")},
+                {"Name": 0xa2u32, field_name(0x14b0_64c2): 0x21u32, field_name(0xc763_edb4): jj("slide")},
+                {"Name": 0xa3u32, field_name(0x14b0_64c2): 0x22u32, field_name(0xc763_edb4): jj("sight")},
+                {"Name": 0xa4u32, field_name(0x14b0_64c2): 0x23u32, field_name(0xc763_edb4): jj("sight_f")}],
+        }});
+        ix.add_weapon_file(&fam);
+        let (slot, f) = ix.weapon_finishes("w_pi_duke_01_slide_02_hi").unwrap();
+        assert_eq!((slot, f.len(), f[1].1.as_str()), (format!("{:08x}", jj("slide")).as_str(), 2, "00000021"));
+        assert_eq!(ix.weapon_finishes("w_pi_duke_01_sight_f_01").unwrap().1[0].1, "00000023");
+        assert!(ix.weapon_finishes("w_ar_adb_01_barrel_01").is_none());
     }
 }

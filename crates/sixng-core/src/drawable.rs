@@ -592,6 +592,10 @@ pub struct Mesh {
     /// Tangents (x, y, z, w), model space like the normals: stream 11,
     /// format 0x27 = R10G10B10A2 (xyz = v / 1023 * 2 - 1, A2 = 3 when the
     /// bitangent is flipped, so w = -1). Orthonormalised against the normal.
+    /// The frame follows the SECOND UV set where a mesh has two (rhino_hi:
+    /// agrees with UV1 on 100 % of the surface, with UV0 on 49 %; ped jeans
+    /// 99.9 % / 93.5 %), so it is not the frame of a normal map sampled on
+    /// UV0; `cross(n, t) * w` runs along +v of that set.
     pub tangents: Option<Vec<[f32; 4]>>,
 }
 

@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 mod assemble;
 mod bc;
 mod cells;
+mod fabric;
 mod glb;
 mod map2d;
 mod map3d;
