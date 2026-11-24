@@ -21,6 +21,7 @@ pub mod batches;
 pub mod drawable;
 pub mod export;
 pub mod furlink;
+pub mod hairgen;
 pub mod hairlink;
 pub mod hairtone;
 pub mod game;
