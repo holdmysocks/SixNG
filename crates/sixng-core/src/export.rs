@@ -786,6 +786,13 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                             e["mip_used"] = stt.mip.into();
                         }
                         e["mean_rgba"] = serde_json::json!(stt.mean_rgba.map(|x| x.round()));
+                        // a head preset's array texture (the wrinkle region masks): every slice, the PNG above being slice 0
+                        if tx.slices() > 1 && u32::from_str_radix(&t.param_hash, 16).ok().and_then(crate::headskin::extra_role).is_some() {
+                            match crate::ttpf::write_png_slices(store, tx, &tdir) {
+                                Ok(ps) => e["slices"] = ps.iter().map(|p| rel(&o.out, p)).collect::<Vec<_>>().into(),
+                                Err(err) => e["slices_error"] = err.to_string().into(),
+                            }
+                        }
                         if t.param_hash == VEHICLE_PALETTE && tx.width == 128 && tx.height == 256 && stt.mip == 0 {
                             // every slice of the array, one after the other
                             // (the PNG is slice 0 only)
@@ -1331,7 +1338,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
             }
             if let Some((_, rec)) = head.as_ref().filter(|h| h.1["preset"].is_null()) {
                 j["head_skin"] = rec.clone();
-                j["head_skin_note"] = "Heads bind no textures; the face comes from the material preset whose drawable tag lists this head (source \"linked\"), else from the faces of linked heads with the same sex, body type and ethnicity code (\"auto\"). index / count: the variant chosen with --head-skin.".into();
+                j["head_skin_note"] = "Heads bind no textures; the face comes from the material preset whose drawable tag lists this head (source \"linked\"), else from the faces of linked heads with the same sex, body type and ethnicity code (\"auto\"). index / count: the variant chosen with --head-skin. extra_textures: the keyed textures of the face's preset, its own before those of its template (the male or female base head); they are added to the material's textures under their key as param_hash. The key names are not recovered and no shader slot is known for them, so the GLB material does not use them.".into();
             }
             fs::write(&marker, serde_json::to_vec_pretty(&j)?)?;
             item.files.push(rel(&o.out, &marker));
@@ -1689,6 +1696,22 @@ struct SkinSetup {
 fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Shader], o: &ExportOptions, item: &mut ExportedItem) -> Option<(Vec<crate::drawable::Shader>, serde_json::Value)> {
     let name = e.name.as_deref()?;
     let tex = |param_hash: &str, h: u64| crate::drawable::TexRef { param: 0, param_hash: param_hash.into(), hash64: format!("{h:016x}"), hash32: String::new() };
+    // the keyed textures of the face's preset (wrinkle region masks, face
+    // region mask ...): no shader slot is known for them, so each goes in
+    // under its key as the parameter hash
+    let extras = |albedo: u64| -> Vec<(u32, u64)> {
+        if !crate::headskin::is_head(name) {
+            return Vec::new();
+        }
+        crate::headskin::get(&game_root(a)).map(|t| t.extras_of(albedo).to_vec()).unwrap_or_default()
+    };
+    let extras_json = |albedo: u64| -> serde_json::Value {
+        let set = crate::ttpf::global(&game_root(a));
+        extras(albedo)
+            .iter()
+            .map(|&(k, h)| serde_json::json!({"key": format!("{k:08x}"), "texture": format!("{h:016x}"), "in_game_files": set.get(h).is_some(), "what": crate::headskin::extra_role(k)}))
+            .collect()
+    };
     // the face the outfit item names, on every shader without a colour texture
     if let Some(list) = o.part_skins.get(&name.to_ascii_lowercase()) {
         let set = crate::ttpf::global(&game_root(a));
@@ -1707,11 +1730,12 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
                             s.textures.retain(|t| t.param_hash != "1e77bf4c");
                             s.textures.push(tex("1e77bf4c", nrm));
                         }
+                        s.textures.extend(extras(alb).iter().map(|&(k, h)| tex(&format!("{k:08x}"), h)));
                     }
                     s
                 })
                 .collect();
-            let rec = serde_json::json!({"source": "outfit item", "group": "", "index": 0, "count": 1, "albedo": format!("{alb:016x}"), "normal": format!("{nrm:016x}")});
+            let rec = serde_json::json!({"source": "outfit item", "group": "", "index": 0, "count": 1, "albedo": format!("{alb:016x}"), "normal": format!("{nrm:016x}"), "extra_textures": extras_json(alb)});
             return Some((sh, rec));
         }
     }
@@ -1735,7 +1759,7 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
         item.warnings.push("head skin: no face texture found".into());
         return None;
     };
-    let rec = serde_json::json!({"source": c.source, "group": c.group, "index": c.index, "count": c.count, "albedo": format!("{:016x}", c.skin.albedo), "normal": format!("{:016x}", c.skin.normal)});
+    let rec = serde_json::json!({"source": c.source, "group": c.group, "index": c.index, "count": c.count, "albedo": format!("{:016x}", c.skin.albedo), "normal": format!("{:016x}", c.skin.normal), "extra_textures": extras_json(c.skin.albedo)});
     let sh = shaders
         .iter()
         .map(|s| {
@@ -1748,6 +1772,7 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
                     s.textures.retain(|t| t.param_hash != "1e77bf4c");
                     s.textures.push(tex("1e77bf4c", c.skin.normal));
                 }
+                s.textures.extend(extras(c.skin.albedo).iter().map(|&(k, h)| tex(&format!("{k:08x}"), h)));
             }
             s
         })

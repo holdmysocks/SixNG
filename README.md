@@ -598,6 +598,24 @@ again**).
   `model.json` records the choice (`head_skin`: linked or auto, index,
   count, texture hashes). The table is built from the `packs` index on
   first use (about 5 s) and kept in `<work>/index/head_skins.json`.
+  **Other head maps** (2026-11-24): a face's material data holds colour
+  and normal map only; there is no roughness, specular or detail texture
+  for heads in it. Through the male or female base head it inherits three
+  more textures, listed by key (the key names are not recovered). Two are
+  in the game files and are exported beside the face, under their key as
+  the parameter hash in `model.json` (also `head_skin.extra_textures`):
+  `e12585d1`, the wrinkle region masks (one 512 x 512 array of 3 slices
+  shared by every head; each colour channel of a slice marks one of 9
+  face regions; all slices are written as `<hash>_s0.png` ...), and
+  `85858f5e`, a face region mask (1024 x 512, shared). The third,
+  `2633887d` (one per sex, and one each for about 60 named characters), is in
+  no texture store of the install, so it is listed as missing; it is
+  probably the wrinkle normal map that the masks blend in. The head
+  shader (`ped_standard_head`) also has slots named `speculartex`,
+  `speculartex2`, `materialctexture`, `diffusetexanimatedblend` and three
+  unnamed ones; head models bind no textures at all, and what the game
+  puts in those slots at run time is not decoded. The GLB material still carries
+  colour and normal only.
 - Colours are never guessed. Many ped clothing and skin materials have no colour
   texture that SixNG can read (clothing colour is in BCPack; skin is built
   by the game at run time). Such materials render plain white, and the

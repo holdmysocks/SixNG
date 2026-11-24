@@ -576,6 +576,24 @@ pub fn first_write_this_run(p: &Path) -> bool {
 /// Decode mip 0 of a texture to `<dir>/<hash>.png` (plus a `.json` with
 /// its stats) unless it exists. With `force`, an existing file is decoded
 /// again (once per run). Returns the file path and the stats.
+/// Every slice of an array texture as `<hash>_s<n>.png` (mip 0), slice 0
+/// included; files that exist are kept.
+pub fn write_png_slices(store: &Ttpf, t: &TtpfTex, dir: &Path) -> Result<Vec<PathBuf>> {
+    let paths: Vec<PathBuf> = (0..t.slices()).map(|sl| dir.join(format!("{:016x}_s{sl}.png", t.hash))).collect();
+    if paths.iter().all(|p| p.exists()) {
+        return Ok(paths);
+    }
+    let data = store.data(t)?;
+    std::fs::create_dir_all(dir)?;
+    for (sl, p) in paths.iter().enumerate() {
+        let (rgba, w, h) = decode_rgba_slice(t, &data, 0, sl as u32)?;
+        let tmp = dir.join(format!("{:016x}_s{sl}.{:?}.tmp.png", t.hash, std::thread::current().id()).replace(['(', ')'], ""));
+        crate::texture::save_png(&tmp, &rgba, w, h)?;
+        std::fs::rename(&tmp, p)?;
+    }
+    Ok(paths)
+}
+
 pub fn write_png(store: &Ttpf, t: &TtpfTex, dir: &Path, force: bool) -> Result<(PathBuf, PngStats)> {
     let p = dir.join(format!("{:016x}.png", t.hash));
     let js = dir.join(format!("{:016x}.json", t.hash));
