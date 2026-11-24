@@ -67,6 +67,50 @@ pub fn display_name(name: &str) -> String {
     }
 }
 
+/// A recents or favourites entry is the query a model was opened with: an
+/// entry id, sometimes followed by what was chosen on top of it
+/// (`data.rpf@12fd1010#finish=963ad5a5:9b638b47,…`, `…#look=…`). Returns
+/// the entry id and a word for the choice.
+pub fn query_parts(q: &str) -> (&str, Option<&'static str>) {
+    let base = match q.find('#') {
+        Some(i) if q[..i].contains('@') => &q[..i],
+        _ => q,
+    };
+    let rest = &q[base.len()..];
+    let extra = if rest.contains("#finish=") {
+        Some("finish")
+    } else if rest.contains("#look=") {
+        Some("look")
+    } else if rest.is_empty() {
+        None
+    } else {
+        Some("custom")
+    };
+    (base, extra)
+}
+
+/// Title and subtitle of a recents or favourites entry: the item's
+/// readable name (with the choice in brackets) and its model name; an
+/// entry that is not in the index keeps its id as the title.
+pub fn query_label(items: &[Item], q: &str) -> (String, String) {
+    let (base, extra) = query_parts(q);
+    match items.iter().find(|it| it.id == base) {
+        Some(it) => {
+            let n = display_name(&it.name);
+            (extra.map_or(n.clone(), |x| format!("{n} ({x})")), it.name.clone())
+        }
+        None => (base.to_string(), "not in the index".to_string()),
+    }
+}
+
+/// One line of text at `pos`, cut to `width` with an ellipsis.
+fn text_clipped(ui: &egui::Ui, pos: egui::Pos2, text: &str, font: egui::FontId, color: egui::Color32, width: f32) {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font, color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(width.max(0.0));
+    let galley = ui.painter().layout_job(job);
+    ui.painter().galley(pos, galley, color);
+}
+
 fn cat_label(c: Cat) -> &'static str {
     CATS.iter().find(|x| x.0 == c).map(|x| x.1).unwrap_or("?")
 }
@@ -178,7 +222,8 @@ impl Library {
                     ui.label(format!("› {}", cat_label(*c)));
                 }
                 View::Item(id) => {
-                    ui.label(format!("› {id}"));
+                    let title = mv.picker.items().map_or_else(|| id.clone(), |items| query_label(&items, id).0);
+                    ui.label(format!("› {title}")).on_hover_text(id);
                 }
                 View::Home => {}
             }
@@ -283,21 +328,13 @@ impl Library {
                 );
             }
         }
-        p.text(
-            rect.min + egui::vec2(10.0, 126.0),
-            egui::Align2::LEFT_TOP,
-            title,
-            egui::FontId::proportional(16.0),
-            vis.text_color(),
-        );
-        p.text(
-            rect.min + egui::vec2(10.0, 148.0),
-            egui::Align2::LEFT_TOP,
-            sub,
-            egui::FontId::proportional(12.0),
-            ui.visuals().weak_text_color(),
-        );
-        r.clicked()
+        // both lines stay inside the card: a long name ends in an ellipsis and shows in full on hover
+        let w = size.x - 20.0;
+        text_clipped(ui, rect.min + egui::vec2(10.0, 126.0), title, egui::FontId::proportional(16.0), vis.text_color(), w);
+        text_clipped(ui, rect.min + egui::vec2(10.0, 148.0), sub, egui::FontId::proportional(12.0), ui.visuals().weak_text_color(), w);
+        let clicked = r.clicked();
+        r.on_hover_text(format!("{title}\n{sub}"));
+        clicked
     }
 
     fn home(
@@ -361,13 +398,10 @@ impl Library {
                 ui.heading(title);
                 ui.horizontal_wrapped(|ui| {
                     for id in ids.iter().take(12) {
-                        let name = items
-                            .iter()
-                            .find(|it| &it.id == id)
-                            .map(|it| it.name.clone())
-                            .unwrap_or_else(|| id.clone());
-                        let t = self.thumbnail(&ctx, id);
-                        if self.card(ui, &display_name(&name), &name, t) {
+                        // an entry is the query the model was opened with (`…#finish=…`): name it by its item
+                        let (title, sub) = query_label(&items, id);
+                        let t = self.thumbnail(&ctx, query_parts(id).0);
+                        if self.card(ui, &title, &sub, t) {
                             self.go(View::Item(id.clone()));
                         }
                     }
@@ -487,20 +521,8 @@ impl Library {
                             } else {
                                 ""
                             };
-                            p.text(
-                                egui::pos2(rect.min.x + 6.0, img.max.y + 4.0),
-                                egui::Align2::LEFT_TOP,
-                                format!("{fav}{}", display_name(&it.name)),
-                                egui::FontId::proportional(13.0),
-                                ui.visuals().text_color(),
-                            );
-                            p.text(
-                                egui::pos2(rect.min.x + 6.0, img.max.y + 20.0),
-                                egui::Align2::LEFT_TOP,
-                                &it.name,
-                                egui::FontId::proportional(10.0),
-                                ui.visuals().weak_text_color(),
-                            );
+                            text_clipped(ui, egui::pos2(rect.min.x + 6.0, img.max.y + 4.0), &format!("{fav}{}", display_name(&it.name)), egui::FontId::proportional(13.0), ui.visuals().text_color(), tile - 12.0);
+                            text_clipped(ui, egui::pos2(rect.min.x + 6.0, img.max.y + 20.0), &it.name, egui::FontId::proportional(10.0), ui.visuals().weak_text_color(), tile - 12.0);
                             if resp
                                 .on_hover_text(format!("{}\n{}", it.name, it.id))
                                 .clicked()
@@ -526,6 +548,9 @@ impl Library {
         act: &mut Option<Action>,
     ) {
         let ctx = ui.ctx().clone();
+        // `id` may be a query with a choice on top (`…#finish=…`): the item, its parts and its thumbnail go by the entry id
+        let query = id;
+        let id = query_parts(query).0;
         let it = items.iter().find(|it| it.id == id);
         let name = it.map(|i| i.name.clone()).unwrap_or_else(|| id.to_string());
         let parts = self
@@ -579,7 +604,7 @@ impl Library {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("🧊 Open in 3D viewer").clicked() {
-                        *act = Some(Action::OpenModel(id.to_string()));
+                        *act = Some(Action::OpenModel(query.to_string()));
                     }
                     let fav = mv.picker.is_favourite(id);
                     if ui.button(if fav { "★ Favourite" } else { "☆ Add to favourites" }).clicked() {
@@ -697,5 +722,28 @@ impl Library {
                 ui.label(egui::RichText::new("Textures referenced by the model are in the output's textures/ folder (see model.json).").small().weak());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+
+    fn item(id: &str, name: &str) -> Item {
+        Item { id: id.into(), name: name.into(), lname: name.to_ascii_lowercase(), rtype: "dr", cat: Cat::Weapons, bytes: 0, variant: false }
+    }
+
+    #[test]
+    fn a_recents_entry_is_named_by_its_item_not_by_its_query() {
+        assert_eq!(query_parts("data.rpf@12fd1010"), ("data.rpf@12fd1010", None));
+        assert_eq!(query_parts("data.rpf@12fd1010#finish=963ad5a5:9b638b47,74e3d185:0b55a901"), ("data.rpf@12fd1010", Some("finish")));
+        assert_eq!(query_parts("packs.rpf@c7d48010#look=aa:bb"), ("packs.rpf@c7d48010", Some("look")));
+        assert_eq!(query_parts("data.rpf@1#other=1"), ("data.rpf@1", Some("custom")));
+        // an outfit id has its `#` before any `@`: it is not a suffix
+        assert_eq!(query_parts("packs#outfit:player_story000_00"), ("packs#outfit:player_story000_00", None));
+        let items = [item("data.rpf@12fd1010", "w_pi_duke_01")];
+        assert_eq!(query_label(&items, "data.rpf@12fd1010#finish=963ad5a5:9b638b47"), ("Pi duke 01 (finish)".to_string(), "w_pi_duke_01".to_string()));
+        assert_eq!(query_label(&items, "data.rpf@12fd1010").0, "Pi duke 01");
+        assert_eq!(query_label(&items, "data.rpf@12495010#finish=1:2"), ("data.rpf@12495010".to_string(), "not in the index".to_string()));
     }
 }

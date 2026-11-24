@@ -829,9 +829,12 @@ impl App {
             .collect();
         if let Some(items) = self.model.picker.items() {
             let label = |id: &str| -> Option<(String, &'static str)> {
-                let it = items.iter().find(|it| it.id == id)?;
+                // a recents entry may carry a choice on top of the entry id (`…#finish=…`)
+                let (base, _) = crate::library::query_parts(id);
+                items.iter().find(|it| it.id == base)?;
+                let (title, name) = crate::library::query_label(&items, id);
                 Some((
-                    format!("{} · {}", crate::library::display_name(&it.name), it.name),
+                    format!("{title} · {name}"),
                     "model",
                 ))
             };
