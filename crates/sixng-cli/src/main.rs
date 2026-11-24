@@ -1613,6 +1613,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 "variants": sel.iter().filter(|s| s.variant_of.is_some()).count(),
                 "with_scene_file": sel.iter().filter(|s| !s.scene_files.is_empty()).count(),
                 "section_dictionaries": sel.iter().map(|s| s.sections).sum::<usize>(),
+                "section_dictionaries_adopted": c.dicts.iter().filter(|d| sel.iter().any(|s| s.dictionary_id == d.id)).map(|d| d.adopted_sections).sum::<usize>(),
                 "clips": clips + sel.iter().map(|s| s.cameras.len()).sum::<usize>(),
                 "cast": {"characters": count("character"), "peds_with_model": objs().filter(|o| o.kind == "ped" && o.model.is_some()).count(),
                     "peds_model_unresolved": objs().filter(|o| o.kind == "ped" && o.model.is_none() && o.model_id.is_some()).count(),
