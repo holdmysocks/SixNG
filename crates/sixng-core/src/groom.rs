@@ -57,6 +57,148 @@ pub struct Groom {
     pub taper: [u8; 16],
 }
 
+/// A hat seen from a point inside the head: per direction, the distance to
+/// the nearest point of the hat (its lining). Strand points that lie
+/// farther out are pulled in under it (`Shell::press`), so hair does not
+/// come through a hat. A display rule: the game's own handling of hair
+/// under a hat is not in the data read so far (no hair asset has a hat
+/// variant, and a hat item names no hair region).
+pub struct Shell {
+    pub centre: [f32; 3],
+    /// `Shell::W` x `Shell::H` distances by longitude and latitude,
+    /// infinite where no hat lies in that direction.
+    r: Vec<f32>,
+    /// Changes with the hat (cache key).
+    pub id: u64,
+}
+
+impl Shell {
+    const W: usize = 72;
+    const H: usize = 36;
+
+    fn cell(d: [f32; 3], r: f32) -> usize {
+        let lon = d[1].atan2(d[0]);
+        let lat = (d[2] / r).clamp(-1.0, 1.0).asin();
+        let x = (((lon / std::f32::consts::TAU + 0.5) * Self::W as f32) as usize).min(Self::W - 1);
+        let y = (((lat / std::f32::consts::PI + 0.5) * Self::H as f32) as usize).min(Self::H - 1);
+        y * Self::W + x
+    }
+
+    /// From surface points of the hat and of the head (RAGE space). Cells
+    /// between two covered neighbours are filled, so a coarse mesh leaves
+    /// no holes.
+    pub fn new(centre: [f32; 3], hat: &[[f32; 3]], head: &[[f32; 3]]) -> Shell {
+        let mut r = vec![f32::INFINITY; Self::W * Self::H];
+        let mut id = 0u64;
+        for p in hat {
+            let d = [p[0] - centre[0], p[1] - centre[1], p[2] - centre[2]];
+            let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            if l < 1e-4 {
+                continue;
+            }
+            let c = Self::cell(d, l);
+            r[c] = r[c].min(l);
+            id = id.wrapping_mul(0x100_0000_01b3).wrapping_add(l.to_bits() as u64 ^ c as u64);
+        }
+        let seen = r.clone();
+        for y in 0..Self::H {
+            for x in 0..Self::W {
+                if seen[y * Self::W + x].is_finite() {
+                    continue;
+                }
+                let at = |dx: usize, dy: usize| seen[((y + dy).clamp(1, Self::H) - 1) * Self::W + (x + dx + Self::W - 1) % Self::W];
+                // opposite neighbours both covered: a gap in the sampling
+                for (a, b) in [(at(0, 1), at(2, 1)), (at(1, 0), at(1, 2)), (at(0, 0), at(2, 2)), (at(2, 0), at(0, 2))] {
+                    if a.is_finite() && b.is_finite() {
+                        r[y * Self::W + x] = r[y * Self::W + x].min((a + b) / 2.0);
+                    }
+                }
+            }
+        }
+        // An opening the hat encloses (the gap over a cap's strap) is
+        // closed: open is what connects to straight down, where the head is.
+        let mut scalp = vec![0.0f32; r.len()];
+        for p in head {
+            let d = [p[0] - centre[0], p[1] - centre[1], p[2] - centre[2]];
+            let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            if l > 1e-4 {
+                let c = Self::cell(d, l);
+                scalp[c] = scalp[c].max(l);
+            }
+        }
+        let mut open = vec![false; r.len()];
+        let mut todo: Vec<usize> = (0..Self::W).filter(|&x| !r[x].is_finite()).collect();
+        todo.iter().for_each(|&c| open[c] = true);
+        while let Some(c) = todo.pop() {
+            let (x, y) = (c % Self::W, c / Self::W);
+            let mut next = vec![y * Self::W + (x + 1) % Self::W, y * Self::W + (x + Self::W - 1) % Self::W];
+            if y > 0 {
+                next.push(c - Self::W);
+            }
+            if y + 1 < Self::H {
+                next.push(c + Self::W);
+            }
+            for n in next {
+                if !r[n].is_finite() && !open[n] {
+                    open[n] = true;
+                    todo.push(n);
+                }
+            }
+        }
+        loop {
+            let seen = r.clone();
+            let mut left = false;
+            for c in (0..r.len()).filter(|&c| !seen[c].is_finite() && !open[c]) {
+                let (x, y) = (c % Self::W, c / Self::W);
+                let near = [(y > 0).then(|| c - Self::W), (y + 1 < Self::H).then(|| c + Self::W), Some(y * Self::W + (x + 1) % Self::W), Some(y * Self::W + (x + Self::W - 1) % Self::W)];
+                let v: Vec<f32> = near.iter().flatten().map(|&n| seen[n]).filter(|v| v.is_finite()).collect();
+                if v.is_empty() {
+                    left = true;
+                } else {
+                    // no cloth here: the hair may lie on the scalp
+                    r[c] = (v.iter().sum::<f32>() / v.len() as f32).max(scalp[c] + 0.006);
+                }
+            }
+            if !left {
+                break;
+            }
+        }
+        Shell { centre, r, id }
+    }
+
+    /// Pull the points that lie beyond the hat to `gap` under it. Returns
+    /// how many moved.
+    pub fn press(&self, points: &mut [[f32; 3]], gap: f32) -> usize {
+        let mut n = 0;
+        for p in points {
+            let d = [p[0] - self.centre[0], p[1] - self.centre[1], p[2] - self.centre[2]];
+            let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            if l < 1e-4 {
+                continue;
+            }
+            // blend the four cells around the direction; a cell with no
+            // hat leaves the point where it is, so the pull fades out at
+            // the hat's edge instead of stepping
+            let fx = (d[1].atan2(d[0]) / std::f32::consts::TAU + 0.5) * Self::W as f32 - 0.5;
+            let fy = ((d[2] / l).clamp(-1.0, 1.0).asin() / std::f32::consts::PI + 0.5) * Self::H as f32 - 0.5;
+            let (x0, y0) = (fx.floor(), fy.floor());
+            let (tx, ty) = (fx - x0, fy - y0);
+            let mut to = 0.0;
+            for (dx, dy, w) in [(0, 0, (1.0 - tx) * (1.0 - ty)), (1, 0, tx * (1.0 - ty)), (0, 1, (1.0 - tx) * ty), (1, 1, tx * ty)] {
+                let x = (x0 as i64 + dx).rem_euclid(Self::W as i64) as usize;
+                let y = (y0 as i64 + dy).clamp(0, Self::H as i64 - 1) as usize;
+                to += w * l.min((self.r[y * Self::W + x] - gap).max(0.0));
+            }
+            if to < l - 1e-5 {
+                let k = to / l;
+                *p = [self.centre[0] + d[0] * k, self.centre[1] + d[1] * k, self.centre[2] + d[2] * k];
+                n += 1;
+            }
+        }
+        n
+    }
+}
+
 /// Strands interpolated between the guides (`Groom::coat`).
 pub struct Coat {
     /// Points per strand.
@@ -596,6 +738,31 @@ pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], o
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hair_is_pressed_under_a_hat() {
+        // a hat: the upper half of a 10 cm sphere, sampled every 3 degrees
+        let mut hat = Vec::new();
+        for i in 0..30 {
+            for j in 0..120 {
+                let (lat, lon) = ((i as f32 * 3.0).to_radians(), (j as f32 * 3.0).to_radians());
+                hat.push([0.1 * lat.cos() * lon.cos(), 0.1 * lat.cos() * lon.sin(), 1.7 + 0.1 * lat.sin()]);
+            }
+        }
+        let s = Shell::new([0.0, 0.0, 1.7], &hat, &[]);
+        // above the hat, under it already, and below its edge
+        let mut pts = [[0.02, 0.01, 1.85], [0.0, 0.05, 1.74], [0.12, 0.0, 1.6]];
+        assert_eq!(s.press(&mut pts, 0.003), 1);
+        let r = ((pts[0][0]).powi(2) + (pts[0][1]).powi(2) + (pts[0][2] - 1.7).powi(2)).sqrt();
+        assert!((r - 0.097).abs() < 1e-3, "{r}");
+        assert_eq!(pts[1], [0.0, 0.05, 1.74]);
+        assert_eq!(pts[2], [0.12, 0.0, 1.6]);
+        // an opening in the hat that it encloses is closed
+        let holed: Vec<[f32; 3]> = hat.iter().copied().filter(|p| !(p[0] > 0.05 && p[1].abs() < 0.03 && p[2] > 1.72 && p[2] < 1.76)).collect();
+        let s = Shell::new([0.0, 0.0, 1.7], &holed, &[]);
+        let mut through = [[0.14, 0.0, 1.75]];
+        assert_eq!(s.press(&mut through, 0.003), 1);
+    }
+
     #[test]
     fn half() {
         assert_eq!(f16(0x3C00), 1.0);
