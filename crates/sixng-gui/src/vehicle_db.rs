@@ -35,6 +35,29 @@ struct Veh {
     palettes: Vec<Vec<Colour>>,
     #[serde(default)]
     mods: Vec<ModRec>,
+    #[serde(default)]
+    switches: Vec<SwitchRec>,
+    #[serde(default)]
+    part_keys: HashMap<String, Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct SwitchRec {
+    #[serde(default)]
+    part: Option<String>,
+    #[serde(default)]
+    default: Option<ElemRec>,
+    #[serde(default)]
+    options: Vec<OptionRec>,
+}
+
+#[derive(Deserialize)]
+struct OptionRec {
+    key: String,
+    #[serde(default)]
+    also: Option<String>,
+    #[serde(default)]
+    element: Option<ElemRec>,
 }
 
 #[derive(Deserialize)]
@@ -191,6 +214,41 @@ pub struct Vehicle {
     pub palettes: Vec<Vec<([f32; 3], f32)>>,
     /// Mod parts and kits that have models.
     pub mods: Vec<Mod>,
+    /// The chassis part's stock alternatives.
+    pub switches: Vec<Switch>,
+    /// Part name -> the keys it sets while fitted.
+    pub part_keys: HashMap<u32, Vec<u32>>,
+}
+
+/// A stock alternative of a part (None = the chassis part, always fitted):
+/// while the part is fitted, the element of the option whose key (and
+/// second key, where not 0) a fitted part sets is shown (None = nothing),
+/// else the default element.
+#[derive(Clone)]
+pub struct Switch {
+    pub part: Option<u32>,
+    pub default: Option<SwitchElement>,
+    pub options: Vec<(u32, u32, Option<SwitchElement>)>,
+}
+
+impl Switch {
+    /// What the switch shows with these keys set.
+    pub fn pick(&self, keys: &std::collections::HashSet<u32>) -> Option<&SwitchElement> {
+        let hit = |o: &&(u32, u32, Option<SwitchElement>)| keys.contains(&o.0) && (o.1 == 0 || keys.contains(&o.1));
+        match self.options.iter().filter(hit).max_by_key(|o| o.1 != 0) {
+            Some(o) => o.2.as_ref(),
+            None => self.default.as_ref(),
+        }
+    }
+}
+
+/// A model by asset id, the bone it is modelled around and the stock bones
+/// it replaces.
+#[derive(Clone)]
+pub struct SwitchElement {
+    pub asset: u64,
+    pub bone: u32,
+    pub hides: Vec<u32>,
 }
 
 /// A mod part or kit: joaat of its name and slot, and per model the joaat
@@ -390,6 +448,12 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
                         Mod { name: h(&m.name), slot: h(&m.slot), assets: m.elements.iter().map(|e| e.asset.as_deref().and_then(|a| u64::from_str_radix(a, 16).ok()).unwrap_or(0)).collect(), models: m.elements.iter().map(|e| e.model.as_deref().map_or(0, h)).collect(), elements: m.elements.iter().map(|e| (h(&e.bone), e.hides.iter().map(|x| h(x)).collect())).collect() }
                     })
                     .collect(),
+                switches: {
+                    let h = |s: &str| u32::from_str_radix(s, 16).unwrap_or(0);
+                    let el = |e: &ElemRec| e.asset.as_deref().and_then(|a| u64::from_str_radix(a, 16).ok()).map(|asset| SwitchElement { asset, bone: h(&e.bone), hides: e.hides.iter().map(|x| h(x)).collect() });
+                    v.switches.iter().map(|s| Switch { part: s.part.as_deref().map(h), default: s.default.as_ref().and_then(el), options: s.options.iter().map(|o| (h(&o.key), o.also.as_deref().map_or(0, h), o.element.as_ref().and_then(el))).collect() }).collect()
+                },
+                part_keys: v.part_keys.iter().map(|(p, k)| { let h = |s: &str| u32::from_str_radix(s, 16).unwrap_or(0); (h(p), k.iter().map(|k| h(k)).collect()) }).collect(),
             },
         );
     }
