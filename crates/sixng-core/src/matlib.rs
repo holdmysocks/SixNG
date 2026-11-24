@@ -209,6 +209,27 @@ impl Library {
         lib
     }
 
+    /// Every layered-material library of data.rpf as one (clothing and
+    /// weapons; their preset names do not collide). A few seconds.
+    pub fn load(ws: &crate::export::Workspace) -> Result<Library, String> {
+        let a = ws.resolve("data").map_err(|e| format!("{e:#}"))?;
+        let aix = ws.load_index(&a).map_err(|e| format!("data.rpf index: {e:#}; index data.rpf first"))?;
+        let mut all = Library::default();
+        for e in aix.entries.iter().filter(|e| e.kind == crate::classify::Kind::Pso) {
+            let Ok(b) = crate::scan::read_entry(&a.path, e) else { continue };
+            let Some(p) = crate::pso::parse(&b).filter(|p| p.structs.contains_key(&ROOT)) else { continue };
+            let lib = Library::from_meta(&p.meta());
+            all.base.extend(lib.base);
+            all.presets.extend(lib.presets);
+            all.tiles.extend(lib.tiles);
+            all.profiles.extend(lib.profiles);
+        }
+        if all.presets.is_empty() {
+            return Err("no layered-material library found in data.rpf".into());
+        }
+        Ok(all)
+    }
+
     /// Colour entry `index` (0..=3) of sub-material `sub` of a preset, as
     /// sRGB RGBA: the preset's own, else its base material's.
     pub fn colour(&self, preset: u32, sub: usize, index: u8) -> Option<[u8; 4]> {
