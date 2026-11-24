@@ -492,12 +492,7 @@ impl Groom {
     /// each strand by its barycentric weights (COLOR_0 on a white
     /// material); strands are white where it is short.
     pub fn coat_glb(&self, name: &str, coat: &Coat, width: f32, guide_rgb: &[[u8; 3]], extras: serde_json::Value) -> Vec<u8> {
-        let k = coat.k;
-        let n = coat.guides.len();
-        let mut tan: Vec<[f32; 4]> = Vec::with_capacity(coat.guides.len() * coat.k * 2);
-        let (mut pos, mut nrm, mut tint, mut idx) = (Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k.saturating_sub(1) * 6));
-        let flat_taper = self.taper.iter().all(|&b| b == 0);
-        for s in 0..n {
+        self.coat_glb_with(name, coat, width, &|s, _| {
             let (g, w) = coat.guides[s];
             let mut c = [255u8; 4];
             if let (Some(a), Some(b), Some(d)) = (guide_rgb.get(g[0] as usize), guide_rgb.get(g[1] as usize), guide_rgb.get(g[2] as usize)) {
@@ -505,6 +500,20 @@ impl Groom {
                     c[q] = (a[q] as f32 * w[0] + b[q] as f32 * w[1] + d[q] as f32 * w[2] + 0.5) as u8;
                 }
             }
+            c
+        }, extras)
+    }
+
+    /// `coat_glb` with the colour (linear) of strand `s` at `t` along it
+    /// (0 root, 1 tip) given by `colour`: for hair whose colour changes
+    /// from root to tip.
+    pub fn coat_glb_with(&self, name: &str, coat: &Coat, width: f32, colour: &dyn Fn(usize, f32) -> [u8; 4], extras: serde_json::Value) -> Vec<u8> {
+        let k = coat.k;
+        let n = coat.guides.len();
+        let mut tan: Vec<[f32; 4]> = Vec::with_capacity(coat.guides.len() * coat.k * 2);
+        let (mut pos, mut nrm, mut tint, mut idx) = (Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k.saturating_sub(1) * 6));
+        let flat_taper = self.taper.iter().all(|&b| b == 0);
+        for s in 0..n {
             let nr = coat.normals[s];
             let base = pos.len() as u32;
             for j in 0..k {
@@ -520,6 +529,7 @@ impl Groom {
                 side = if l > 1e-12 { [side[0] / l, side[1] / l, side[2] / l] } else { [1.0, 0.0, 0.0] };
                 let f = j as f32 / (k.max(2) - 1) as f32;
                 let tap = if flat_taper { 1.0 - 0.6 * f } else { (self.taper[((f * 15.0) as usize).min(15)] as f32 / 255.0).max(0.15) };
+                let c = colour(s, f);
                 let r = width * 0.5 * tap;
                 for sg in [-1.0f32, 1.0] {
                     pos.push([p[0] + side[0] * r * sg, p[1] + side[1] * r * sg, p[2] + side[2] * r * sg]);

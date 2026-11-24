@@ -565,10 +565,10 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
             // large-scale light and dark side from the head: the root normal
             let root = normalize(i.nrm);
             let w_sun = clamp(dot(root, l) * 0.5 + 0.5, 0.0, 1.0);
-            let direct_h = hair_game(albedo, tdir, tube, v, l, 0.5, 0.7133) * sun * w_sun;
+            let direct_h = hair_game(albedo, tdir, tube, v, l, 0.33, 0.6067) * sun * w_sun;
             // ambient is the viewer's own: the same sum lit from the root normal's side by the sky
             let sky_h = (neutral(F.sky_top.rgb, 0.8) + neutral(F.sky_hor.rgb, 0.8) * 0.6) * 0.5 * F.misc.w;
-            let amb_g = hair_game(albedo, tdir, tube, v, normalize(root + vec3(0.0, 0.6, 0.0)), 0.5, 0.7133) * sky_h * 3.14159;
+            let amb_g = hair_game(albedo, tdir, tube, v, normalize(root + vec3(0.0, 0.6, 0.0)), 0.33, 0.6067) * sky_h * 3.14159;
             col = direct_h * ao_direct + amb_g * ao;
         }
     }

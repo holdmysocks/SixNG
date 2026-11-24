@@ -39,7 +39,9 @@ pub const PRESET: u32 = 0x6f03_dd54;
 pub const TAG: u32 = 0xf7b1_4eb8;
 /// The number that looks like the tiling of the noise texture (1 to 10).
 pub const TILING: &str = "a43cad33";
-const VERSION: u32 = 1;
+/// Struct of a set: four references to presets, one per strand variant.
+pub const SET: u32 = 0xcb83_80c7;
+const VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Preset {
@@ -59,6 +61,12 @@ pub struct Table {
     version: u32,
     /// Preset name hash (hex) -> preset.
     pub presets: BTreeMap<String, Preset>,
+    /// Set name hash (hex) -> the preset names (hex) of strand variants 0..3.
+    /// The game's strand generation gives every strand a 2-bit variant
+    /// (`hairgen`), and a set names the colour ramp of each. Sets have the
+    /// names of the presets; most name one or two distinct presets.
+    #[serde(default)]
+    pub sets: BTreeMap<String, [String; 4]>,
 }
 
 fn rgb(v: &Value) -> [u8; 3] {
@@ -78,8 +86,16 @@ pub fn preset(v: &Value) -> Preset {
 impl Table {
     /// The presets of a decoded PSO (`Pso::to_json`).
     pub fn add(&mut self, pso_json: &Value) {
-        let suffix = format!("{PRESET:08x}");
+        let (suffix, set) = (format!("{PRESET:08x}"), format!("{SET:08x}"));
         for (k, objs) in pso_json["objects"].as_object().into_iter().flatten() {
+            if k.ends_with(&set) {
+                for o in objs.as_array().into_iter().flatten() {
+                    let r = [0x115f_f942u32, 0xb308_b4a8, 0xc13c_74b5, 0xeda9_786c].map(|h| format!("{:08x}", o[field_name(h)]["name"].as_u64().unwrap_or(0) as u32));
+                    if let Some(n) = o["name"].as_u64() {
+                        self.sets.insert(format!("{:08x}", n as u32), r);
+                    }
+                }
+            }
             if !k.ends_with(&suffix) {
                 continue;
             }
@@ -93,6 +109,14 @@ impl Table {
 
     pub fn get(&self, name: u32) -> Option<&Preset> {
         self.presets.get(&format!("{name:08x}"))
+    }
+
+    /// The presets of strand variants 0..3 of a hair item's set (the
+    /// preset of the same name where the set or a reference is missing).
+    pub fn variants(&self, name: u32) -> Option<[Preset; 4]> {
+        let own = self.get(name)?;
+        let key = format!("{name:08x}");
+        Some([0, 1, 2, 3].map(|i| self.sets.get(&key).and_then(|s| self.presets.get(&s[i])).unwrap_or(own).clone()))
     }
 
     /// The table, read from the work directory, or built from the data.rpf
@@ -173,6 +197,20 @@ pub fn strand(p: &Preset, n: f32) -> [u8; 3] {
     [0, 1, 2].map(|i| (a[i] as f32 * n + b[i] as f32 * (1.0 - n) + 0.5) as u8)
 }
 
+/// The colour of a ramp at `t` (0 root, 1 tip), 0..1 per channel: the two
+/// colours blended the way the game's ramp bake blends its colour stops
+/// (raised to 2.4, mixed, back by 1 / 2.4; read from the game's code by
+/// the shader archive work). The bake takes four colours and a curve from
+/// a record that was not found; `color1` at the root to `color2` at the
+/// tip, on a straight line, is a stand-in.
+pub fn ramp(a: [u8; 3], b: [u8; 3], t: f32) -> [f32; 3] {
+    let t = t.clamp(0.0, 1.0);
+    [0, 1, 2].map(|i| {
+        let (x, y) = ((a[i] as f32 / 255.0).powf(2.4), (b[i] as f32 / 255.0).powf(2.4));
+        (x + (y - x) * t).powf(1.0 / 2.4)
+    })
+}
+
 /// A value in 0..1 for strand `i`, for presets that name no noise texture.
 pub fn scatter(i: usize) -> f32 {
     let mut x = (i as u32).wrapping_mul(0x9e37_79b9) ^ 0x85eb_ca6b;
@@ -200,6 +238,15 @@ mod tests {
         });
         let mut t = Table::default();
         t.add(&v);
+        t.add(&serde_json::json!({"objects": {"84df66adcb8380c7": [{"115ff942": {"name": 333928843u32}, "b308b4a8": {"name": 7u32}, "c13c74b5": {"name": 99u32}, "eda9786c": {"name": 333928843u32}, "name": 333928843u32}]}}));
+        // variants through the set; a reference to a missing preset falls back
+        let var = t.variants(333928843).unwrap();
+        assert_eq!((var[0].a, var[1].a, var[2].a, var[3].a), ([19, 13, 10], [255; 3], [19, 13, 10], [19, 13, 10]));
+        assert!(t.variants(7).is_some() && t.variants(1234).is_none());
+        let r = ramp([255, 0, 128], [0, 0, 128], 0.0);
+        assert!((r[0] - 1.0).abs() < 1e-6 && r[1] == 0.0 && (r[2] - 128.0 / 255.0).abs() < 1e-5);
+        let m = ramp([255, 0, 0], [0, 0, 0], 0.5);
+        assert!((m[0] - 0.5f32.powf(1.0 / 2.4)).abs() < 1e-5);
         assert_eq!(t.presets.len(), 2);
         let p = t.get(333928843).unwrap();
         assert_eq!((p.a, p.b, p.texture, p.flag), ([19, 13, 10], [1, 1, 1], 0xb79e27e80e2c837d, false));
