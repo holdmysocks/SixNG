@@ -579,6 +579,31 @@ enum Cmd {
         #[arg(long, short)]
         out: Option<PathBuf>,
     },
+    /// Whole-world terrain height map (the MHIU blobs of common.rpf:
+    /// 2048 x 2048 u8 heights over the world box, row-compressed). The
+    /// archive has two copies; `--map` picks one (default: the one with
+    /// the most stored samples). Prints the header of each. With -o writes
+    /// <out>/heightmap/: heightmap.png (16-bit greyscale, north up,
+    /// 0..65535 = min z..max z), heightmap.json (world box, metres per
+    /// pixel, height scale, fill/sea value) and, with --preview,
+    /// hillshade.png. With --check <map dir> compares the heights with the
+    /// collision top-surface grid of the map bake (heights_8m.bin, meta.json).
+    Heightmap {
+        /// Archive (default common).
+        #[arg(default_value = "common")]
+        archive: String,
+        /// Which copy to write (0 or 1, in archive order).
+        #[arg(long)]
+        map: Option<usize>,
+        /// Also write a hill-shaded RGB preview.
+        #[arg(long)]
+        preview: bool,
+        /// Map bake folder (<work>/map) to compare against.
+        #[arg(long)]
+        check: Option<PathBuf>,
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
     /// Fonts of the UI movies (Scaleform font libraries in data.rpf:
     /// DefineFont3 outlines, code table, layout). Lists them as JSON; with
     /// -o writes <out>/fonts/<name>.ttf (TrueType, for CSS @font-face) and
@@ -1836,6 +1861,60 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             out.print(&json!({"ok": true, "summary": summary, "selected": selected}));
         }
+        Cmd::Heightmap { archive, map, preview, check, out: po } => {
+            use sixng_core::heightmap as hm;
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            let mut maps = Vec::new();
+            for e in ix.entries.iter().filter(|e| e.kind == Kind::Bin && e.usize >= 0x2C) {
+                let b = sixng_core::scan::read_entry(&a.path, e)?;
+                if hm::is_heightmap(&b) {
+                    maps.push((e.id.clone(), hm::decode(&b)?));
+                }
+            }
+            if maps.is_empty() {
+                anyhow::bail!("no MHIU height map in {}", a.id);
+            }
+            let pick = match map {
+                Some(i) if *i < maps.len() => *i,
+                Some(i) => anyhow::bail!("--map {i}: only {} height maps", maps.len()),
+                None => (0..maps.len()).max_by_key(|&i| maps[i].1.stored).unwrap(),
+            };
+            let desc = |id: &str, m: &hm::HeightMap| {
+                json!({
+                    "entry": id, "version": m.version, "width": m.width, "height": m.height,
+                    "min": m.min, "max": m.max, "metres_per_pixel": m.cell(),
+                    "metres_per_step": m.step(), "fill": m.fill, "sea_level_m": m.z(m.fill),
+                    "unknown_header_bytes": format!("{:02x}{:02x}{:02x}", m.unknown[0], m.unknown[1], m.unknown[2]),
+                    "stored_samples": m.stored,
+                })
+            };
+            let list: Vec<serde_json::Value> = maps.iter().map(|(id, m)| desc(id, m)).collect();
+            let (id, m) = &maps[pick];
+            let mut res = json!({"archive": a.id, "maps": list, "selected": pick});
+            if let Some(dir) = check {
+                res["check"] = heightmap_check(m, dir)?;
+            }
+            if let Some(po) = po {
+                let dir = po.join("heightmap");
+                std::fs::create_dir_all(&dir)?;
+                hm::write_png16(m, &dir.join("heightmap.png"))?;
+                if *preview {
+                    hm::write_hillshade(m, &dir.join("hillshade.png"))?;
+                }
+                let mut j = desc(id, m);
+                j["image"] = json!("heightmap.png");
+                j["image_rows"] = json!("north to south: pixel (c, r) centre = (min.x + (c + 0.5) * mpp.x, max.y - (r + 0.5) * mpp.y)");
+                j["height_from_png"] = json!(format!("z = {} + png / 65535 * {}", m.min[2], m.max[2] - m.min[2]));
+                j["height_scale_m"] = json!(m.max[2] - m.min[2]);
+                if let Some(c) = res.get("check") {
+                    j["check"] = c.clone();
+                }
+                std::fs::write(dir.join("heightmap.json"), serde_json::to_vec_pretty(&j)?)?;
+                res["out"] = json!(dir);
+            }
+            out.print(&json!({"ok": true, "result": res}));
+        }
         Cmd::Fonts { archive, name, out: po } => {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
@@ -2156,4 +2235,60 @@ fn do_export(a: &sixng_core::game::ArchiveInfo, sel: &[&sixng_core::scan::Entry]
 /// every indexed archive (with and without the `_hi` suffix).
 fn model_names(ws: &sixng_core::export::Workspace) -> std::collections::HashMap<u32, String> {
     sixng_core::vehicles::model_names(ws)
+}
+
+/// Compares a height map with the map bake's 8 m collision top-surface grid.
+fn heightmap_check(m: &sixng_core::heightmap::HeightMap, dir: &std::path::Path) -> Result<serde_json::Value> {
+    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)?;
+    let hb = std::fs::read(dir.join("heights_8m.bin"))?;
+    let h8: Vec<f32> = hb.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+    let cell_m = meta["cell_m"].as_f64().unwrap_or(2.0) as f32;
+    let cell = cell_m * meta["coarse_cells"].as_f64().unwrap_or(4.0) as f32;
+    let (x0, y1) = (meta["x0"].as_f64().unwrap_or(0.0) as f32, meta["y1"].as_f64().unwrap_or(0.0) as f32);
+    let w = (meta["w"].as_u64().unwrap_or(0) as f32 * cell_m / cell) as usize;
+    let h = if w > 0 { h8.len() / w } else { 0 };
+    let [cx, cy] = m.cell();
+    let mut d = Vec::new();
+    let mut sea_vs_land = 0usize;
+    for r in 0..m.height {
+        for c in 0..m.width {
+            let x = m.min[0] + (c as f32 + 0.5) * cx;
+            let y = m.min[1] + (r as f32 + 0.5) * cy;
+            let (gc, gr) = (((x - x0) / cell).floor(), ((y1 - y) / cell).floor());
+            if gc < 0.0 || gr < 0.0 || gc as usize >= w || gr as usize >= h {
+                continue;
+            }
+            let rz = h8[gr as usize * w + gc as usize];
+            if !rz.is_finite() || rz < -1000.0 {
+                continue;
+            }
+            let v = m.samples[r * m.width + c];
+            if v <= m.fill {
+                if rz > 5.0 {
+                    sea_vs_land += 1;
+                }
+                continue;
+            }
+            d.push(m.z(v) - rz);
+        }
+    }
+    if d.is_empty() {
+        anyhow::bail!("no overlap with the map bake grid");
+    }
+    let n = d.len() as f64;
+    let mean = d.iter().map(|&x| x as f64).sum::<f64>() / n;
+    let mut a: Vec<f32> = d.iter().map(|x| x.abs()).collect();
+    d.sort_by(|p, q| p.total_cmp(q));
+    a.sort_by(|p, q| p.total_cmp(q));
+    let q = |v: &Vec<f32>, f: f64| v[((v.len() - 1) as f64 * f) as usize];
+    let within = |t: f32| a.iter().filter(|&&x| x <= t).count() as f64 / n;
+    Ok(json!({
+        "reference": "collision top surface, 8 m grid (map bake)",
+        "land_samples_compared": d.len(),
+        "diff": "height map minus collision top, metres",
+        "mean_diff_m": mean, "median_diff_m": q(&d, 0.5), "p10_diff_m": q(&d, 0.1), "p90_diff_m": q(&d, 0.9),
+        "median_abs_m": q(&a, 0.5), "p90_abs_m": q(&a, 0.9),
+        "within_3m": within(3.0), "within_10m": within(10.0),
+        "sea_samples_over_land_gt_5m": sea_vs_land,
+    }))
 }
