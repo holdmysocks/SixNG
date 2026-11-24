@@ -504,7 +504,21 @@ pub fn slot_of(name: &str) -> String {
             return s.to_string();
         }
     }
+    // one-piece swimwear and bodysuits cover like a one-piece garment, the
+    // sports base layers like a top or a bottom
+    for (p, s) in [("swimsuit", "full"), ("bodysuit", "full"), ("lingeriebodysuit", "full"), ("basebottoms", "bottom"), ("basetops", "top")] {
+        if w.starts_with(p) {
+            return s.to_string();
+        }
+    }
     crate::outfit::slot_word(w)
+}
+
+/// The garment word of a wardrobe item category (the category is the
+/// joaat of a plural word; given as that word or as hex), for the
+/// categories whose missing model leaves a character visibly undressed.
+pub fn garment_category(category: &str) -> Option<&'static str> {
+    ["shirts", "tshirts", "tanktops", "hoodies", "jackets", "pants", "shorts", "skirts", "dresses", "shoes", "boots"].into_iter().find(|w| category == *w || category == format!("{:08x}", joaat(w)))
 }
 
 fn tex_users(work: &Path) -> Result<&'static crate::texusers::TexUsers, String> {
@@ -866,8 +880,13 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
             for p in &v.parts {
                 let by_asset = || Some((assets?.pick(p.guid.as_deref()?, fit.as_deref(), &exists)?, "asset id"));
                 let Some((drawable, found_by)) = choose(p, fit.as_deref(), &exists).or_else(by_asset) else {
-                    // items without textures or names are settings, not parts
-                    if p.named.is_some() || !p.candidates.is_empty() {
+                    // items without textures or names are settings, not parts;
+                    // a garment that names a model by GUID is a part whose
+                    // model was not found
+                    let garment = p.guid.as_ref().and(p.category.as_deref()).and_then(garment_category);
+                    if let Some(g) = garment {
+                        unresolved.push(format!("{} ({g}: its model is not found)", p.item));
+                    } else if p.named.is_some() || !p.candidates.is_empty() {
                         unresolved.push(format!("{} ({})", p.item, p.category.clone().unwrap_or_default()));
                     }
                     continue;
@@ -946,6 +965,16 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swimwear_and_garment_categories() {
+        assert_eq!(slot_of("swimsuitplunge_fr1_000_slim_full"), "full");
+        assert_eq!(slot_of("bodysuitbaby_mi1_000_regular_full"), "full");
+        assert_eq!(slot_of("basebottomssports_fr1_000_slim_full"), "bottom");
+        assert_eq!(garment_category("d7c6badd"), Some("shoes"));
+        assert_eq!(garment_category("skirts"), Some("skirts"));
+        assert_eq!(garment_category("864b03ae"), None);
+    }
 
     #[test]
     fn asset_table_prefers_the_fit_then_the_count() {
