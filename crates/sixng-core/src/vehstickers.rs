@@ -38,7 +38,12 @@ const ENTRY: u32 = 0x86cd_f3df;
 const ENTRY_GROUP: u32 = 0xb13f_2c2f;
 const STICKER: u32 = 0xed9c_f5df;
 const STICKER_TEXTURE: u32 = 0x3950_a760;
-const STICKER_COLOURS: [u32; 3] = [0x9b5d_cd73, 0x9dbb_d803, 0xb575_2ae0];
+/// `colorRed`, `colorGreen`, `colorBlue` (hashed with their capitals): the
+/// colours of the texture's red, green and blue mask channels.
+const STICKER_COLOURS: [u32; 3] = [0x9b5d_cd73, 0xb575_2ae0, 0x9e67_9616];
+/// A fourth colour, the same value on 5,531 of 5,650 records; its use is
+/// not known.
+const STICKER_OTHER_COLOUR: u32 = 0x9dbb_d803;
 /// True on the records whose texture is a three-channel colour mask (an
 /// opaque picture whose red, green and blue are the cover of `colorRed`,
 /// `colorGreen` and `colorBlue`); false on pictures with colours and an
@@ -308,6 +313,7 @@ pub fn build(ws: &crate::export::Workspace, models: &HashMap<u32, String>, out: 
                         "sticker": hex(sticker),
                         "texture": s.and_then(|s| get(s, STICKER_TEXTURE)).and_then(|x| x.as_str()),
                         "colours": s.map(|s| STICKER_COLOURS.iter().map(|h| hex(u(get(s, *h)))).collect::<Vec<_>>()),
+                        "other_colour": s.map(|s| hex(u(get(s, STICKER_OTHER_COLOUR)))),
                         "group": hex(group),
                         "layout_name": hex(layout),
                         "layout": l.map(layout_json),
@@ -333,8 +339,8 @@ pub fn build(ws: &crate::export::Workspace, models: &HashMap<u32, String>, out: 
     let n_unplaced = all().flat_map(|b| b["stickers"].as_array().into_iter().flatten()).filter(|s| s["layout"].is_null()).count();
     let stats = json!({"vehicles": vehicles.len(), "brands": n_brands, "stickers": n_stickers, "without_layout": n_unplaced, "layout_groups": groups.len(), "layouts": groups.values().map(|g| g.len()).sum::<usize>(), "sticker_records": stickers.len()});
     let doc = json!({
-        "format": 1,
-        "note": "Vehicle liveries. Per vehicle its brands (variation records whose parts place stickers), each with its stickers: the part that carries the entry, the sticker record, its texture (64-bit id in the vehicle texture stores) and colours (ARGB as stored), and the layout: zones = the sticker zones it covers (a vertex's zone is the fourth byte of the mesh's second colour stream, GLB _COLOR1), position and size as stored, rotation in degrees, uv_mode (1 = first UV set, 3 = second, 4 = third; 0 and 2 = the second half of the first), aspect (0 square, 1 two to one, 2 four to one). The size acts as a scale: a larger number is a smaller sticker. The exact map from position to UV space is not decoded (about: a constant per panel group minus half the position); location and other are not understood. A brand also lists the stickers of its parent variations. How the game picks a brand for a vehicle is not known.",
+        "format": 2,
+        "note": "Vehicle liveries. Per vehicle its brands (variation records whose parts place stickers), each with its stickers: the part that carries the entry, the sticker record, its texture (64-bit id in the vehicle texture stores), colours (ARGB as stored: colorRed, colorGreen and colorBlue, the colours of the texture's red, green and blue mask channels; 00000000 where a channel has none) and other_colour (a fourth stored colour, use not known), and the layout: zones = the sticker zones it covers (a vertex's zone is the fourth byte of the mesh's second colour stream, GLB _COLOR1), position and size as stored, rotation in degrees, uv_mode (1 = first UV set, 3 = second, 4 = third; 0 and 2 = the second half of the first), aspect (0 square, 1 two to one, 2 four to one). The size acts as a scale: a larger number is a smaller sticker. The exact map from position to UV space is not decoded (about: a constant per panel group minus half the position); location and other are not understood. A brand also lists the stickers of its parent variations. How the game picks a brand for a vehicle is not known.",
         "stats": stats,
         "vehicles": vehicles,
     });
