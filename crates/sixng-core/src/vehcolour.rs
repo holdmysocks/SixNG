@@ -60,9 +60,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// Version of what an export writes for part colours (model.json
 /// `part_colours_version`); the model viewer exports older vehicles again.
-pub const EXPORT_VERSION: u32 = 8;
+pub const EXPORT_VERSION: u32 = 11;
 /// Layout version of `<work>/index/vehicle_parts.json`.
-pub const FORMAT: u32 = 8;
+pub const FORMAT: u32 = 10;
 
 const PART_SET: u32 = 0xf142_44fd;
 const SET_COLOURS: u32 = 0x7847_6477;
@@ -334,7 +334,7 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
     let lib = library(game_root, work)?;
     let (path, es) = metas(game_root, work, "packs.rpf")?;
     // (sets, model links, element links) per resource
-    type Found = (Vec<(String, Vec<Part>)>, Vec<(u32, Vec<String>)>, Vec<(u32, Vec<String>)>, Vec<(u32, Vec<u32>)>, HashMap<u32, Vec<u32>>);
+    type Found = (Vec<(String, Vec<Part>)>, Vec<(u32, Vec<String>)>, Vec<(u32, Vec<String>)>, Vec<(u32, Vec<u32>)>, HashMap<u32, Vec<u32>>, bool);
     let found: Vec<Found> = es
         .par_iter()
         .filter_map(|e| {
@@ -373,14 +373,17 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
             let u64s = |v: &Value| v.as_object().into_iter().flatten().filter_map(|(_, x)| x.as_str()).filter(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())).map(|s| s.to_string()).collect::<Vec<_>>();
             let links = |h: u32, key: u32| m.objects(h).into_iter().filter_map(|o| m.object(h, o, 0)).filter_map(|v| Some((num(&v, key)? as u32, u64s(&v)))).collect::<Vec<_>>();
             let single = m.objects(crate::vehicles::MODEL_INFO).len() == 1;
-            let (models, elements) = if single { (links(crate::vehicles::VARIATION, OWNER), links(crate::vehicles::MOD_ELEMENT, NAME)) } else { (Vec::new(), Vec::new()) };
+            // Variation sets and configurations name their vehicle, so they
+            // are also read from the tables that hold several vehicles:
+            // some vehicles (journey) have no pack of their own. Mod part
+            // elements carry no owner and are a single vehicle's only.
+            let models = links(crate::vehicles::VARIATION, OWNER);
+            let elements = if single { links(crate::vehicles::MOD_ELEMENT, NAME) } else { Vec::new() };
             // the part list of every configuration, by model
             let mut configs: Vec<(u32, Vec<u32>)> = Vec::new();
-            if single {
-                for c in m.objects(crate::vehicles::CONFIG).into_iter().filter_map(|o| m.object(crate::vehicles::CONFIG, o, 0)) {
-                    let Some(owner) = num(&c, OWNER) else { continue };
-                    configs.push((owner as u32, get(&c, CONFIG_PARTS).and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()).unwrap_or_default()));
-                }
+            for c in m.objects(crate::vehicles::CONFIG).into_iter().filter_map(|o| m.object(crate::vehicles::CONFIG, o, 0)) {
+                let Some(owner) = num(&c, OWNER) else { continue };
+                configs.push((owner as u32, get(&c, CONFIG_PARTS).and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()).unwrap_or_default()));
             }
             // the vehicle's own part records (its body and mod part
             // elements): their modifier lists name the library's group
@@ -393,9 +396,29 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
                     }
                 }
             }
-            Some((sets, models, elements, configs, own))
+            Some((sets, models, elements, configs, own, single))
         })
         .collect();
+    // a vehicle's own pack before the shared tables: its records win, and
+    // each vehicle's configurations are worked through once
+    let mut found = found;
+    found.sort_by_key(|f| !f.5);
+    let found: Vec<_> = found.into_iter().map(|f| (f.0, f.1, f.2, f.3, f.4)).collect();
+    // A vehicle's configurations can sit in more than one resource (its
+    // own pack and a shared table, or two packs): all of them, each part
+    // list once, with the part records of its own packs.
+    let mut by_owner: std::collections::BTreeMap<u32, (Vec<Vec<u32>>, HashMap<u32, Vec<u32>>)> = Default::default();
+    for (_, _, _, configs, own) in &found {
+        for (owner, parts) in configs {
+            let e = by_owner.entry(*owner).or_default();
+            if !e.0.contains(parts) {
+                e.0.push(parts.clone());
+            }
+            for (k, v) in own {
+                e.1.entry(*k).or_insert_with(|| v.clone());
+            }
+        }
+    }
     let mut t = Tables { format: FORMAT, library: lib.id.clone(), rim_ratio: lib.rim_ratio.clone(), ..Default::default() };
     for (sets, _, _, _, _) in &found {
         for (n, p) in sets {
@@ -419,17 +442,15 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
     // rear deck unpainted, 15 of its other 16 paint it), so the model gets
     // its own copy of the set with the result most of its configurations
     // give (the earliest of those on a tie).
-    for (_, _, _, configs, own) in &found {
-        let mut owners: Vec<u32> = configs.iter().map(|c| c.0).collect();
-        owners.sort();
-        owners.dedup();
-        for owner in owners {
+    {
+        for (owner, (configs, own)) in &by_owner {
+            let owner = *owner;
             let key = format!("{owner:08x}");
             let Some(set) = t.models.get(&key).cloned() else { continue };
             let Some(base) = t.sets.get(&set).cloned() else { continue };
             // (result, the configurations that give it), in first-seen order
             let mut results: Vec<(Vec<Part>, Vec<String>)> = Vec::new();
-            for (_, parts) in configs.iter().filter(|c| c.0 == owner) {
+            for parts in configs {
                 let mut out = base.clone();
                 apply_config(&lib, own, parts, &mut out);
                 let ck = config_key(parts);

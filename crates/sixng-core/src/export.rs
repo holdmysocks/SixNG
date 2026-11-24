@@ -740,6 +740,14 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                 }
                 st.entries.push(e);
             }
+            // Vehicle two-layer shaders: the base colour slot often binds the
+            // layer's gradient-position map (`lyr0diffusetex`, a linear data
+            // texture whose green picks the palette column). That is not a
+            // colour: shown as one it turned parts olive. An sRGB texture in
+            // that slot is left alone, and so is one with an alpha channel in
+            // use (the decal shaders).
+            // (done once every material is read, below: the same texture
+            // may sit in the layer slot of another material only)
             if st.base.is_none() {
                 st.base = srgb_fallback.flatten();
                 if st.base.is_some() {
@@ -758,6 +766,25 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
             st
         })
         .collect();
+    // Vehicle two-layer shaders: the base colour slot often binds a layer's
+    // gradient-position map (`lyr0diffusetex`, a linear data texture whose
+    // green picks the palette column). That is not a colour: shown as one
+    // it turned parts olive. The maps are known by sitting in a layer slot
+    // of any material of the model; an sRGB texture is left alone, and so
+    // is one with an alpha channel in use (the decal shaders).
+    let data_maps: std::collections::HashSet<String> = out
+        .iter()
+        .filter(|st| st.vehicle_palette.is_some())
+        .flat_map(|st| st.entries.iter())
+        .filter(|e| LAYER_DETAIL.iter().any(|h| e["param_hash"] == *h) && e["role_guess"] == "data (linear)" && e["mean_rgba"][3].as_f64().is_none_or(|a| a >= 250.0))
+        .filter_map(|e| e["png"].as_str().map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p).to_string()))
+        .collect();
+    for st in out.iter_mut().filter(|st| st.vehicle_palette.is_some()) {
+        let file = st.base.as_deref().map(|b| b.rsplit(['/', '\\']).next().unwrap_or(b).to_string());
+        if file.is_some_and(|f| data_maps.contains(&f)) {
+            st.base = None;
+        }
+    }
     // BCPack-only textures: a flat colour. Colour slots take the average of
     // the model's decoded colour textures (same asset family), else a
     // neutral value by role; normal maps get a flat normal.
