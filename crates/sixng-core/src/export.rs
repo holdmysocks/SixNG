@@ -379,6 +379,10 @@ struct ShaderTextures {
     tint_palette: Option<Vec<[u8; 4]>>,
     /// Ped clothing colour baked from the shade map (`bake_ped_tint`).
     ped_tint: Option<serde_json::Value>,
+    /// `weapon` shaders: the model's layered-material preset and the base
+    /// colour (sRGB) of each sub-material (`weapon_preset`); the preset is
+    /// null when the weapon library names none for the model.
+    weapon_preset: Option<serde_json::Value>,
     /// The vehicle material palette (128 x 256 sRGB RGBA8), when this
     /// shader binds it and it decoded.
     vehicle_palette: Option<Vec<[u8; 4]>>,
@@ -452,8 +456,24 @@ fn tint_colours(palette: &[[u8; 4]], colours: &[[u8; 4]]) -> Vec<[u8; 4]> {
 /// Classification of a shader, corrected by its base-colour texture: an
 /// alpha-bucket material whose colour alpha is one constant value (ped
 /// clothing holds 64 or 128 there) is not see-through, so it is drawn opaque.
+/// Shader name hash of `weapon`.
+const WEAPON_SHADER: &str = "e68a4a98";
+
+/// The layered-material preset of a weapon model and its sub-material base
+/// colours (sRGB), from the weapon library (`matlib`).
+fn weapon_preset(a: &ArchiveInfo, name: &str) -> Option<(String, Vec<Option<[u8; 3]>>)> {
+    static PRESETS: std::sync::OnceLock<Option<crate::matlib::Index>> = std::sync::OnceLock::new();
+    let ix = PRESETS.get_or_init(|| crate::matlib::Index::load_or_build(&Workspace::new(game_root(a), crate::names::work_dir()?)).ok()).as_ref()?;
+    let preset = ix.weapon_presets(name).first()?.clone();
+    let subs: Vec<Option<[u8; 3]>> = ix.colours(&preset)?.iter().map(|c| c.map(|c| [c[0], c[1], c[2]])).collect();
+    subs.iter().any(|c| c.is_some()).then_some((preset, subs))
+}
+
 fn classify_shader(s: &crate::drawable::Shader, st: &ShaderTextures) -> serde_json::Value {
     let mut c = crate::material::classify(&s.name_hash, &s.flags);
+    if st.weapon_preset.as_ref().is_some_and(|w| w["preset"].is_string()) {
+        c["stand_in"] = "weapon_parts".into();
+    }
     if let Some([lo, hi]) = st.base_alpha {
         if c["alpha_mode"] == "BLEND" && c["class"] == "alpha" && hi.saturating_sub(lo) <= 12 {
             c["alpha_mode"] = "OPAQUE".into();
@@ -1295,7 +1315,22 @@ pub(crate) struct BuiltDrawable {
 /// (`drawable::select_member`), so geometries outside its models are left out.
 pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &crate::drawable::DrawableInfo, dir: &Path, member: bool, o: &ExportOptions, item: &mut ExportedItem) -> BuiltDrawable {
     let head = head_skin_shaders(a, e, &info.shaders, o, item).or_else(|| part_skin_shaders(a, e, &info.shaders, item));
-    let shader_tex = link_textures(a, head.as_ref().map_or(&info.shaders[..], |h| &h.0[..]), r, &info.embedded_textures, dir, o, e.name.as_deref());
+    let mut shader_tex = link_textures(a, head.as_ref().map_or(&info.shaders[..], |h| &h.0[..]), r, &info.embedded_textures, dir, o, e.name.as_deref());
+    // Weapons: the `weapon` shader binds no colour map; a part's colours are
+    // those of its layered-material preset, one per sub-material, and a
+    // vertex names its sub-material in the green byte of the raw colour
+    // stream (4 x id + 2).
+    if info.shaders.iter().any(|s| s.name_hash == WEAPON_SHADER) {
+        let wp = e.name.as_deref().and_then(|n| weapon_preset(a, n));
+        for (s, st) in info.shaders.iter().zip(shader_tex.iter_mut()).filter(|(s, _)| s.name_hash == WEAPON_SHADER) {
+            let _ = s;
+            st.weapon_preset = Some(match &wp {
+                Some((p, subs)) => serde_json::json!({"preset": p, "sub_material_colours": subs,
+                    "applied": "COLOR_0 = the preset's base colour of each vertex's sub-material (green byte of the raw colour stream / 4), linear; the base colour factor is white. The tile texture, the gradient and the tint-mask, dirt and wear layers are not applied; metalness and roughness are one stand-in for every part."}),
+                None => serde_json::json!({"preset": null}),
+            });
+        }
+    }
     // Vehicles (models whose shaders bind the material palette): the part
     // set that colours each part id.
     let part_tables = shader_tex.iter().any(|st| st.vehicle_palette.is_some()).then(crate::names::work_dir).flatten().and_then(|w| crate::vehcolour::tables(&game_root(a), &w).ok());
@@ -1414,6 +1449,20 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
                 }).collect());
             }
         }
+        // Weapon parts: each vertex takes its sub-material's preset colour.
+        if let (Some(w), Some(c)) = (material.and_then(|s| shader_tex.get(s)).and_then(|st| st.weapon_preset.as_ref()).filter(|w| w["preset"].is_string()), &m.colors) {
+            let subs: Vec<Option<[u8; 3]>> = serde_json::from_value(w["sub_material_colours"].clone()).unwrap_or_default();
+            if let Some(first) = subs.iter().flatten().next().copied() {
+                let lin = |v: u8| {
+                    let x = v as f32 / 255.0;
+                    ((if x <= 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) }) * 255.0 + 0.5) as u8
+                };
+                tint = Some(c.iter().map(|c| {
+                    let k = subs.get(((c[1] >> 2) & 7) as usize).copied().flatten().unwrap_or(first);
+                    [lin(k[0]), lin(k[1]), lin(k[2]), 255]
+                }).collect());
+            }
+        }
         if let Some(mm) = mesh_meta.last_mut() {
             mm["tint_applied"] = tint.is_some().into();
         }
@@ -1512,6 +1561,9 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             let mut x = serde_json::json!({"shader_name_hash": s.name_hash, "shader_name": crate::names::shader(&s.name_hash), "classification": classify_shader(s, st), "textures": st.entries, "texture_fallback": st.fallback});
             if let Some(t) = &st.ped_tint {
                 x["ped_tint"] = t.clone();
+            }
+            if let Some(w) = &st.weapon_preset {
+                x["weapon_preset"] = w.clone();
             }
             if let Some(l) = crate::material::multilayer(s, &st.entries, || material_uv_fit(&lod_groups, si)) {
                 x["multilayer"] = l;

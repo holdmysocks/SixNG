@@ -6276,7 +6276,9 @@ fn export_load_shaped(
                 // and from before brake discs and the vehicle's other clips
                 || j.contains("\"wheel_mounts_version\"") && !j.contains("\"wheel_mounts_version\": 3")
                 // and weapon parts from before their stand-in surface
-                || j.contains("e68a4a98") && !j.contains("\"gunmetal\"")
+                || j.contains("e68a4a98") && !j.contains("\"gunmetal\"") && !j.contains("\"weapon_parts\"")
+                // and from before weapon parts took their preset colours
+                || j.contains("e68a4a98") && !j.contains("\"weapon_preset\"")
         });
     // Cached ped clothing from before the fabric shade came from the packed map.
     let stale_cloth = std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| j.contains("739e3d0d") && !j.contains("shade_source"));
