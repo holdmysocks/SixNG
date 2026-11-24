@@ -564,7 +564,7 @@ mod paint_tests {
         assert_eq!(l["layers"][3]["colour"]["status"], "no texture bound");
         assert_eq!(l["weights"]["texture"]["png"], "t2.png");
         // constants: float4s per layer, the UV transforms and scalars with the material
-        let k = |hash: &str, count: u8, v: [f32; 4]| crate::drawable::ShaderConst { hash: hash.into(), desc: String::new(), offset: 0, values: Some(v), buffer: 7, count };
+        let k = |hash: &str, count: u8, v: [f32; 4]| crate::drawable::ShaderConst { hash: hash.into(), desc: String::new(), offset: 0, values: Some(v), buffer: 7, count, ty: None };
         let p = four_layer_params(&[k("4344d2cc", 4, [128.0, 128.0, 0.0, 0.0]), k("0f0f0f0f", 4, [1.0, 0.7, 0.2, 1.0]), k("0e0e0e0e", 1, [3.0, 0.0, 0.0, 0.0])]);
         assert_eq!((p["per_layer"][1]["0f0f0f0f"].as_f64().map(|x| (x * 10.0).round()), p["per_layer"][0].as_object().map(|o| o.len())), (Some(7.0), Some(1)));
         assert_eq!((p["material"]["4344d2cc"][0].as_f64(), p["material"]["0e0e0e0e"].as_f64()), (Some(128.0), Some(3.0)));

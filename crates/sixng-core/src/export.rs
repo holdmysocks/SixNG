@@ -240,11 +240,11 @@ fn readable_materials(model: &str, shaders: &[crate::drawable::Shader], mats: &s
             }
             let (mut values, mut unread) = (serde_json::Map::new(), Vec::new());
             for c in &s.constants {
-                match c.components() {
-                    // a scalar as a number, a vector as its own 2 to 4 components
+                match c.json() {
+                    // a scalar as a number, a vector as its own 2 to 4 components; integers and booleans as such
                     Some(v) => {
                         let k = key(&values, crate::names::param(&c.hash), &c.hash);
-                        values.insert(k, if v.len() == 1 { serde_json::json!(v[0]) } else { serde_json::json!(v) });
+                        values.insert(k, v);
                     }
                     None => unread.push(crate::names::param(&c.hash).unwrap_or_else(|| c.hash.clone())),
                 }
@@ -1170,6 +1170,14 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
             fs::create_dir_all(dir.join("buffers"))?;
             let r = Resource::load(&a.path, e)?;
             let mut info = crate::drawable::describe(&r);
+            // each constant's type, from the shader archive's tables (the drawable does not store it)
+            if let Ok(ix) = crate::shaderfx::ParamIndex::get(&game_root(a)) {
+                for s in &mut info.shaders {
+                    for c in &mut s.constants {
+                        c.ty = ix.kind(&s.name_hash, &c.hash).map(|k| crate::shaderfx::member_type(k).to_string());
+                    }
+                }
+            }
             let wheel_discs = if info.skeleton.iter().any(|b| b.name.starts_with("wheel_")) { crate::bounds::wheel_discs(&r) } else { Vec::new() };
             if let Some(name) = requested_member {
                 crate::drawable::select_member(&r, &mut info, name)?;
