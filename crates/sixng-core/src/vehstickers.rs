@@ -58,6 +58,12 @@ fn named<'v>(v: &'v Value, name: &str) -> Option<&'v Value> {
     get(v, meta7a::joaat(name))
 }
 
+/// A field of the layout file: its field names are hashed with their
+/// capitals (`Name`, `Location`, `Rotation`), unlike the meta resources'.
+fn cased<'v>(v: &'v Value, name: &str) -> Option<&'v Value> {
+    get(v, crate::names::joaat_exact(name)).or_else(|| named(v, name))
+}
+
 fn u(v: Option<&Value>) -> u32 {
     v.and_then(|x| x.as_u64()).unwrap_or(0) as u32
 }
@@ -140,9 +146,9 @@ fn layouts(ws: &crate::export::Workspace) -> Result<HashMap<u32, HashMap<u32, Va
         .collect();
     let mut out: HashMap<u32, HashMap<u32, Value>> = HashMap::new();
     for g in found.into_iter().flatten() {
-        let e = out.entry(u(named(&g, "name"))).or_default();
+        let e = out.entry(u(cased(&g, "Name"))).or_default();
         for l in get(&g, GROUP_LAYOUTS).and_then(|x| x.as_array()).into_iter().flatten() {
-            e.entry(u(named(l, "name"))).or_insert_with(|| l.clone());
+            e.entry(u(cased(l, "Name"))).or_insert_with(|| l.clone());
         }
     }
     Ok(out)
@@ -154,10 +160,10 @@ fn layout_json(l: &Value) -> Value {
         "zones": list(get(l, LAYOUT_ZONES)),
         "position": [f(LAYOUT_POS[0]), f(LAYOUT_POS[1])],
         "size": [f(LAYOUT_SIZE[0]), f(LAYOUT_SIZE[1])],
-        "rotation": named(l, "rotation").and_then(|x| x.as_f64()).unwrap_or(0.0),
+        "rotation": cased(l, "Rotation").and_then(|x| x.as_f64()).unwrap_or(0.0),
         "uv_mode": u(get(l, LAYOUT_UV)),
         "aspect": u(get(l, LAYOUT_ASPECT)),
-        "location": hex(u(named(l, "location"))),
+        "location": hex(u(cased(l, "Location"))),
         "other": [u(get(l, LAYOUT_OTHER[0])), u(get(l, LAYOUT_OTHER[1]))],
     })
 }
@@ -180,7 +186,6 @@ pub fn build(ws: &crate::export::Workspace, models: &HashMap<u32, String>, out: 
         stickers.extend(r.stickers.iter().map(|(k, v)| (*k, v)));
     }
     let mut vehicles: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-    let (mut n_brands, mut n_stickers, mut n_unplaced) = (0, 0, 0);
     for r in &packs {
         let own: HashMap<u32, &Value> = r.variations.iter().map(|v| (u(named(v, "name")), v)).collect();
         for v in &r.variations {
@@ -210,9 +215,6 @@ pub fn build(ws: &crate::export::Workspace, models: &HashMap<u32, String>, out: 
                     let (sticker, group, layout) = (u(named(e, "sticker")), u(get(e, ENTRY_GROUP)), u(named(e, "layout")));
                     let s = r.stickers.get(&sticker).or_else(|| stickers.get(&sticker).copied());
                     let l = groups.get(&group).and_then(|g| g.get(&layout));
-                    if l.is_none() {
-                        n_unplaced += 1;
-                    }
                     placed.push(json!({
                         "part": hex(*part),
                         "sticker": hex(sticker),
@@ -227,8 +229,6 @@ pub fn build(ws: &crate::export::Workspace, models: &HashMap<u32, String>, out: 
             if placed.is_empty() {
                 continue;
             }
-            n_brands += 1;
-            n_stickers += placed.len();
             let name = u(named(v, "name"));
             let model = models.get(&owner).cloned().unwrap_or_else(|| hex(owner));
             vehicles.entry(model).or_default().push(json!({"brand": hex(name), "name": name_of(name), "stickers": placed}));
@@ -238,6 +238,11 @@ pub fn build(ws: &crate::export::Workspace, models: &HashMap<u32, String>, out: 
         b.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()).then(a["brand"].as_str().cmp(&b["brand"].as_str())));
         b.dedup_by(|a, b| a["brand"] == b["brand"]);
     }
+    // counted once per vehicle: a vehicle's records can sit in two packs
+    let all = || vehicles.values().flatten();
+    let n_brands = all().count();
+    let n_stickers: usize = all().map(|b| b["stickers"].as_array().map_or(0, |s| s.len())).sum();
+    let n_unplaced = all().flat_map(|b| b["stickers"].as_array().into_iter().flatten()).filter(|s| s["layout"].is_null()).count();
     let stats = json!({"vehicles": vehicles.len(), "brands": n_brands, "stickers": n_stickers, "without_layout": n_unplaced, "layout_groups": groups.len(), "layouts": groups.values().map(|g| g.len()).sum::<usize>(), "sticker_records": stickers.len()});
     let doc = json!({
         "format": 1,
