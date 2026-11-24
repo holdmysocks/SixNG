@@ -171,7 +171,7 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
         var bt = textureSample(t_base, samp, i.uv0);
         // tint mask (animal coats): only the green channel (shading) is a picture
         if ((M.flags.w & 512u) != 0u) { bt = vec4(vec3(bt.g), 1.0); }
-        if (M.tile.w > 0.5) { weave_w = bt.a; bt.a = 1.0; }
+        if (M.tile.w > 0.5 && M.tile.w < 1.5) { weave_w = bt.a; bt.a = 1.0; }
         base = base * bt;
     }
     if (M.flags.z == 1u && base.a < 0.5) {
@@ -215,7 +215,16 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     // grey value; the tile itself, sampled per pixel on the second UV set,
     // moves it to the value at this pixel (its mips bring it back to the
     // mean with distance)
-    if (M.tile.w > 0.5) {
+    // vehicle parts: the colour of a part is a row of the material palette,
+    // read at the column the layer detail texture's green gives at this
+    // pixel (the vertex tint holds the row at that texture's mean). The
+    // rows come as an image with one row per part id (vertex colour alpha).
+    if (M.tile.w > 1.5) {
+        let g = textureSample(t_tile, samp, i.uv0).g;
+        let id = floor(i.col.a * 255.0 + 0.5);
+        albedo = base.rgb * textureSampleLevel(t_em, samp, vec2(clamp(g, 0.004, 0.996), (id + 0.5) / 256.0), 0.0).rgb;
+    }
+    if (M.tile.w > 0.5 && M.tile.w < 1.5) {
         let c = cos(M.tile.y);
         let s = sin(M.tile.y);
         let p = i.uv1 * M.tile.x;

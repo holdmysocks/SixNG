@@ -354,6 +354,10 @@ pub struct ModelView {
     /// The part colours on show (256 x RGBA, by part id), for the fitted
     /// wheels: a rim's and a tyre's vertices carry part ids of the vehicle.
     part_look_table: Option<Arc<Vec<[u8; 4]>>>,
+    /// The material palette of the loaded vehicle (its file, RGBA rows of
+    /// 128) and the look whose rows the model's part materials carry.
+    part_palette: Option<(PathBuf, Arc<Vec<u8>>)>,
+    part_ramp_done: Option<(PathBuf, usize)>,
     /// The part colours the uploaded wheels were coloured with.
     wheel_look: Option<Arc<Vec<[u8; 4]>>>,
     /// Vehicle lamps that are on.
@@ -650,6 +654,8 @@ impl ModelView {
             part_look_want: None,
             cfg_request: None,
             part_look_done: None,
+            part_palette: None,
+            part_ramp_done: None,
             part_look_table: None,
             wheel_look: None,
             lamps: Lamps::default(),
@@ -1690,6 +1696,7 @@ impl ModelView {
                 self.frames_since_load = 0;
                 // the new meshes carry the colours of their files
                 self.part_look_done = None;
+                self.part_ramp_done = None;
                 self.apply_paint(rs);
             }
             Err(e) => {
@@ -2214,7 +2221,52 @@ impl ModelView {
             self.part_look_table = None;
             return;
         };
-        if shown == Some(idx) {
+        // The palette rows of this look as an image for the part materials:
+        // row = part id, 128 columns (a part with a colour of its own gets
+        // that colour in every column).
+        let ramp_key = (l.model.path.clone(), idx);
+        let mut ramp_new = false;
+        if self.part_ramp_done.as_ref() != Some(&ramp_key) {
+            let file = l.model.path.parent().map(|d| d.join(pc["palette"].as_str().unwrap_or("vehicle_palette.png")));
+            if let Some(f) = file.filter(|_| pc["rows"][idx].as_str().is_some_and(|r| r.len() == 1024)) {
+                if self.part_palette.as_ref().is_none_or(|(p, _)| *p != f) {
+                    self.part_palette = image::open(&f).ok().map(|i| i.to_rgba8()).filter(|i| i.width() == 128).map(|i| (f.clone(), Arc::new(i.into_raw())));
+                }
+                if let (Some((_, pal)), Some(rows)) = (&self.part_palette, pc["rows"][idx].as_str()) {
+                    let look = decode(hex);
+                    let srgb = |v: u8| {
+                        let c = v as f32 / 255.0;
+                        ((if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }) * 255.0 + 0.5) as u8
+                    };
+                    let mut px = vec![255u8; 128 * 256 * 4];
+                    for id in 0..256 {
+                        let row = usize::from_str_radix(&rows[id * 4..id * 4 + 4], 16).unwrap_or(0xffff);
+                        let out = &mut px[id * 512..id * 512 + 512];
+                        match pal.get(row * 512..row * 512 + 512).filter(|_| row != 0xffff) {
+                            Some(src) => out.copy_from_slice(src),
+                            None => out.chunks_exact_mut(4).for_each(|c| c.copy_from_slice(&[srgb(look[id][0]), srgb(look[id][1]), srgb(look[id][2]), 255])),
+                        }
+                    }
+                    let im = glb::Image { key: "part ramp".into(), mips: vec![(128, 256, px)], srgb: true, bc: None };
+                    let at = match l.model.images.iter().position(|i| i.key == "part ramp") {
+                        Some(i) => {
+                            l.model.images[i] = im;
+                            i
+                        }
+                        None => {
+                            l.model.images.push(im);
+                            l.model.images.len() - 1
+                        }
+                    };
+                    for m in l.model.materials.iter_mut().filter(|m| m.parts && m.ramp_u.is_some()) {
+                        m.ramp = Some(at);
+                    }
+                    ramp_new = true;
+                }
+            }
+            self.part_ramp_done = Some(ramp_key);
+        }
+        if shown == Some(idx) && !ramp_new {
             if self.part_look_done.as_ref() != Some(&(l.model.path.clone(), idx)) || self.part_look_table.is_none() {
                 self.part_look_table = Some(decode(hex));
             }
