@@ -3,11 +3,11 @@
 //! ```text
 //! +0x00 "RDS5"
 //! +0x04 u32 chunk-table entries (the last one is a terminator)
-//! +0x08 u32 size of the virtual (uncompressed) space, including a 0x1000 header page
-//! +0x0C u32 0x16000000
-//! +0x10 u32 ?, +0x14 u32 0
-//! +0x18 chunk table, 8 bytes per entry:
-//!       u32 a: (a & 0xFFFFFF) << 8 = file offset of a zlib stream; bits 24-29 = flags
+//! +0x08 u32 size of the virtual (uncompressed) space, bits 0-31
+//! +0x0C u8  bits 32-39 of that size; u8 0, u16 0x1600
+//! +0x10 u32 ?, +0x14 u32 0 (counted as the first of the entries)
+//! +0x18 chunk table, 8 bytes per entry (entries - 1 of them):
+//!       u32 a: (a & 0x3FFFFFF) << 8 = file offset of a zlib stream; bits 26-29 = codec
 //!              (codec: 0x20 zlib; 0x04 BC1, 0x0C/0x10 BC3/BC4?, 0x14 BC5, 0x18 BC6H,
 //!              0x1C BC7 = per-format BCPack, the Xbox Series hardware texture codec;
 //!              BC1 decodes with `bcpack-rs`, BC3 with `bc3pack`, BC4/BC5 with `bc45pack`,
@@ -18,7 +18,7 @@
 //!              the chunk's data (stored length = next offset - offset - pad)
 //!       A chunk runs to the next entry, both in the file and in the virtual space.
 //!       The last entry is a terminator (file end, end of the virtual space). The
-//!       virtual space can exceed 4 GiB (the header's size field is truncated).
+//!       virtual space can exceed 4 GiB (see the size at +0x08).
 //! align_up(0x10 + 8 * entries, 0x100): "ETPF" texture index
 //!       +4 u32 version (0x27A), +8 u32 texture count n, +0xC u32 length of the next part
 //!       +0x10            n x 16-byte descriptors
@@ -148,6 +148,23 @@ fn fix_mip_counts(textures: &mut [TtpfTex], end: Option<u64>) {
     }
 }
 
+/// Size of the virtual space: 40 bits, the u32 at +0x08 plus the low byte
+/// of +0x0C as bits 32-39 (every store whose virtual space passes 4 GiB
+/// has 1 there, and its terminator entry ends exactly at that size).
+fn virt_size_40(h: &[u8]) -> u64 {
+    u32le(h, 8) as u64 | (h[12] as u64) << 32
+}
+
+/// One chunk-table entry: (file offset, virtual offset, flags, pad).
+/// The file offset >> 8 is the low 26 bits of `a`, so stores up to 16 GiB
+/// address correctly; the flags keep bits 26-31 (codec in 26-29, extra
+/// 4 KiB pages in 30-31) with the offset bits 24-25 cleared.
+fn chunk_entry(a: u32, b: u32) -> (u64, u64, u8, u64) {
+    let file = ((a & 0x3FF_FFFF) as u64) << 8;
+    let virt = 0x1000 + (b & 0xF_FFFF) as u64 * 0x4000 + (a >> 30) as u64 * 0x1000;
+    (file, virt, ((a >> 24) & 0xFC) as u8, (b >> 20) as u64)
+}
+
 fn u32le(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
 }
@@ -164,17 +181,18 @@ impl Ttpf {
             return Err(anyhow!("not an RDS5 store"));
         }
         let n = u32le(&h, 4) as usize;
-        let virt_size = u32le(&h, 8) as u64;
-        let mut t = vec![0u8; 8 * n];
+        let virt_size = virt_size_40(&h);
+        // The count includes the header's own entry at +0x10, so the
+        // table at +0x18 holds n - 1 entries (the last is the terminator).
+        let mut t = vec![0u8; 8 * n.saturating_sub(1)];
         f.read_exact(&mut t)?;
         let mut chunks = Vec::with_capacity(n);
-        for i in 0..n {
-            let a = u32le(&t, 8 * i);
-            let b = u32le(&t, 8 * i + 4);
+        for e in t.chunks_exact(8) {
+            let (a, b) = (u32le(e, 0), u32le(e, 4));
             if a == 0 && b == 0 {
                 break;
             }
-            chunks.push((((a & 0xFF_FFFF) as u64) << 8, 0x1000 + (b & 0xF_FFFF) as u64 * 0x4000 + (a >> 30) as u64 * 0x1000, (a >> 24) as u8, (b >> 20) as u64));
+            chunks.push(chunk_entry(a, b));
         }
         let eoff = ((0x10 + 8 * n + 0xFF) & !0xFF) as u64;
         f.seek(SeekFrom::Start(eoff))?;
@@ -644,6 +662,19 @@ mod tests {
         let mut t = TtpfTex { hash: virt, width: (d0 & 0x3FFF) + 1, height: ((d0 >> 14) & 0x3FFF) + 1, dxgi_format: (d1 >> 3) & 0x7F, virt, size: 0, d0, d1, loc: 0, cube_base: None, mips_fixed: None };
         t.size = t.layout().map(|l| l.total).unwrap_or(0);
         t
+    }
+
+    #[test]
+    fn chunk_entries_past_4_gib() {
+        // file offset 0x1_2345_6700 needs offset bits 24-25; codec BC7 (0x1C) in 26-29
+        let a = (0x1C << 24) | (0x123_4567 & 0x3FF_FFFF);
+        let (file, virt, fl, pad) = chunk_entry(a | 1 << 30, 0x0030_0010);
+        assert_eq!((file, virt, fl, pad), (0x1_2345_6700, 0x1000 + 0x10 * 0x4000 + 0x1000, 0x5C, 3));
+        assert_eq!(fl & 0x3F, CODEC_BC7);
+        let mut h = [0u8; 24];
+        h[8..12].copy_from_slice(&0x2179_d000u32.to_le_bytes());
+        h[12..16].copy_from_slice(&0x1600_0001u32.to_le_bytes());
+        assert_eq!(virt_size_40(&h), 0x1_2179_d000);
     }
 
     #[test]

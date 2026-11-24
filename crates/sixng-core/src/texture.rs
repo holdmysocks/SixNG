@@ -62,6 +62,12 @@ pub enum Fmt {
     Rgba16,
     /// R16G16B16A16_FLOAT, clamped to 0..1.
     Rgba16f,
+    /// R32_FLOAT, shown as grey clamped to 0..1.
+    R32f,
+    /// R16G16_FLOAT: red and green clamped to 0..1, blue 0.
+    Rg16f,
+    /// R10G10B10A2_UNORM: the top 8 of each 10-bit channel; 2-bit alpha.
+    Rgb10a2,
     Unknown,
 }
 
@@ -85,12 +91,15 @@ impl Fmt {
             53 | 56 | 57 => Fmt::R16,
             11 => Fmt::Rgba16,
             10 => Fmt::Rgba16f,
+            39..=41 => Fmt::R32f,
+            33 | 34 => Fmt::Rg16f,
+            23..=25 => Fmt::Rgb10a2,
             _ => Fmt::Unknown,
         }
     }
     pub fn block_dim(&self) -> u32 {
         match self {
-            Fmt::Rgba8 | Fmt::Bgra8 | Fmt::R8 | Fmt::A8 | Fmt::Rg8 | Fmt::R16f | Fmt::R16 | Fmt::Rgba16 | Fmt::Rgba16f | Fmt::Unknown => 1,
+            Fmt::Rgba8 | Fmt::Bgra8 | Fmt::R8 | Fmt::A8 | Fmt::Rg8 | Fmt::R16f | Fmt::R16 | Fmt::Rgba16 | Fmt::Rgba16f | Fmt::R32f | Fmt::Rg16f | Fmt::Rgb10a2 | Fmt::Unknown => 1,
             _ => 4,
         }
     }
@@ -98,7 +107,7 @@ impl Fmt {
         match self {
             Fmt::Bc1 | Fmt::Bc4 => 8,
             Fmt::Bc2 | Fmt::Bc3 | Fmt::Bc5 | Fmt::Bc6u | Fmt::Bc6s | Fmt::Bc7 => 16,
-            Fmt::Rgba8 | Fmt::Bgra8 => 4,
+            Fmt::Rgba8 | Fmt::Bgra8 | Fmt::R32f | Fmt::Rg16f | Fmt::Rgb10a2 => 4,
             Fmt::Rg8 | Fmt::R16f | Fmt::R16 => 2,
             Fmt::Rgba16 | Fmt::Rgba16f => 8,
             Fmt::R8 | Fmt::A8 => 1,
@@ -493,7 +502,7 @@ pub fn to_rgba(fmt: Fmt, data: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
         Fmt::Bc6u => crate::bc6h::decode_image(data, wu, hu, &mut img, false),
         Fmt::Bc6s => crate::bc6h::decode_image(data, wu, hu, &mut img, true),
         Fmt::Bc7 => td::decode_bc7(data, wu, hu, &mut img),
-        Fmt::Rgba8 | Fmt::Bgra8 | Fmt::R8 | Fmt::A8 | Fmt::Rg8 | Fmt::R16f | Fmt::R16 | Fmt::Rgba16 | Fmt::Rgba16f => {
+        Fmt::Rgba8 | Fmt::Bgra8 | Fmt::R8 | Fmt::A8 | Fmt::Rg8 | Fmt::R16f | Fmt::R16 | Fmt::Rgba16 | Fmt::Rgba16f | Fmt::R32f | Fmt::Rg16f | Fmt::Rgb10a2 => {
             let bpe = fmt.bytes_per_elem() as usize;
             let mut out = vec![255u8; wu * hu * 4];
             for i in 0..wu * hu {
@@ -522,6 +531,17 @@ pub fn to_rgba(fmt: Fmt, data: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
                     Fmt::R16 => o[..3].fill((u16at(0) >> 8) as u8),
                     Fmt::Rgba16 => (0..4).for_each(|k| o[k] = (u16at(k) >> 8) as u8),
                     Fmt::Rgba16f => (0..4).for_each(|k| o[k] = unit(f16(u16at(k)))),
+                    Fmt::R32f => o[..3].fill(unit(f32_or_zero(u32at(s)))),
+                    Fmt::Rg16f => {
+                        o[0] = unit(f16(u16at(0)));
+                        o[1] = unit(f16(u16at(1)));
+                        o[2] = 0;
+                    }
+                    Fmt::Rgb10a2 => {
+                        let v = u32at(s);
+                        (0..3).for_each(|k| o[k] = (v >> (10 * k + 2)) as u8);
+                        o[3] = (v >> 30) as u8 * 85;
+                    }
                     _ => {
                         o[0] = s[0];
                         o[1] = s[1];
@@ -611,6 +631,16 @@ fn save_dds_n(path: &Path, t: &TexInfo, fmt: Fmt, data: &[u8], nmips: u32, mip0_
     Ok(())
 }
 
+fn u32at(s: &[u8]) -> u32 {
+    u32::from_le_bytes([s[0], s[1], s[2], s[3]])
+}
+
+/// IEEE single float from its bits (NaN becomes 0, as in `f16`).
+fn f32_or_zero(bits: u32) -> f32 {
+    let v = f32::from_bits(bits);
+    if v.is_nan() { 0.0 } else { v }
+}
+
 /// IEEE half float to f32 (NaN becomes 0).
 pub(crate) fn f16(h: u16) -> f32 {
     let s = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
@@ -632,6 +662,27 @@ mod alpha_tests {
     fn a8_preview_preserves_alpha() {
         let rgba = to_rgba(Fmt::from_dxgi(65), &[0, 128, 255], 3, 1).unwrap();
         assert_eq!(rgba, [255, 255, 255, 0, 255, 255, 255, 128, 255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn r32_float_preview_is_clamped_grey() {
+        let data: Vec<u8> = [0.0f32, 0.5, 2.0, -1.0, f32::NAN].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let rgba = to_rgba(Fmt::from_dxgi(41), &data, 5, 1).unwrap();
+        assert_eq!(rgba, [0, 0, 0, 255, 128, 128, 128, 255, 255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn r16g16_float_preview_has_red_green() {
+        // 1.0 = 0x3C00, 0.5 = 0x3800
+        let rgba = to_rgba(Fmt::from_dxgi(34), &[0x00, 0x3C, 0x00, 0x38], 1, 1).unwrap();
+        assert_eq!(rgba, [255, 128, 0, 255]);
+    }
+
+    #[test]
+    fn r10g10b10a2_preview_keeps_high_bits() {
+        let v: u32 = 0x3FF | 0x200 << 10 | 0x004 << 20 | 2 << 30;
+        let rgba = to_rgba(Fmt::from_dxgi(24), &v.to_le_bytes(), 1, 1).unwrap();
+        assert_eq!(rgba, [255, 128, 1, 170]);
     }
 
     #[test]
