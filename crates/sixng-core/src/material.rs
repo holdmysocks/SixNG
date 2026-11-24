@@ -222,6 +222,9 @@ pub fn gltf_fields(c: &Value, has_base: bool) -> Value {
         // weapons: dark blued steel for every part (wood and polymer
         // furniture included, their colours are not decoded)
         Some("gunmetal") => Some((0.7, 0.45, [0.05, 0.05, 0.055, 1.0])),
+        // weapon parts coloured per vertex (COLOR_0) from their
+        // layered-material preset: a white base
+        Some("weapon_parts") => Some((0.7, 0.45, [1.0, 1.0, 1.0, 1.0])),
         _ => None,
     };
     if let Some((metal, rough, colour)) = stand {
