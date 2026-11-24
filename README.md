@@ -251,7 +251,8 @@ ames.json; exports and the app use it.
 # One variation in its stored clothing colours (--parts, --tex-remap and --tint come from ped-variations)
 .\target\release\sixng.exe outfit zombie_m -o work\out\zombie.glb --parts '^shirtduty_mr1_000_regular_c_oc_tu_short_full$','^pantscargo_mr1_000_regular_mw_boottuckmid_full$' --tint shirtduty_mr1_000_regular_c_oc_tu_short_full=a7c8d8e0:145.0.50
 # Clothing and weapon material presets: builds the index ped-variations reads; --preset prints one in full
-.	argetelease\sixng.exe materials --preset 8337d622
+.	arget
+elease\sixng.exe materials --preset 8337d622
 # Every character and animal `outfit` can build (name, kind, archive)
 .\target\release\sixng.exe characters --kind animal --name deer
 # An animal (root fragment + its parts on the animal's own skeleton), with two clips as two animations
@@ -453,6 +454,18 @@ again**).
     tiling fabric texture named only in a run-time parameter block, with
     up to eight sub-materials picked by `materialid` or a per-vertex id;
     the viewer shows one flat colour per garment instead.
+  - **Clothing colours from garment presets.** An item's `GarmentPreset`
+    is a key into the clothing material library of `data.rpf` (`matlib`,
+    `sixng materials`), which holds one base colour per sub-material of
+    the garment. The viewer colours each texel with the colour of its
+    sub-material, read from the garment's `materialid` texture (red x 63,
+    as the clothing shader does); a garment without that texture takes the
+    colour of sub-material 0 (the per-vertex sub-material id is not read).
+    The viewer builds `<work>/index/material_presets.json` itself when it
+    is missing. Not applied: the second colour the game fades towards, the
+    three-stop gradient over a tiling fabric texture (`matlib::stops`),
+    and whatever the tint rows do on items that have a preset. Items
+    without a preset fall back to the rules below.
   - **Clothing colours.** An item's stored colour is used when it has one;
     else row tint 0 of its tint palette (for `ped_tint_generic_clean`
     only when the row is the colour the item's colour tag names, because

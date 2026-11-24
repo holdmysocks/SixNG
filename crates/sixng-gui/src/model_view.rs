@@ -211,6 +211,8 @@ pub struct PartFx {
     pub colour: Option<[u8; 3]>,
     /// Colour word of the item's colour tag.
     pub tag: Option<&'static str>,
+    /// Base colour (sRGB) per sub-material from the item's garment preset.
+    pub subs: Vec<Option<[u8; 3]>>,
     pub head: bool,
     /// A skin mesh without a colour texture: takes the head's neck tone.
     pub body: bool,
@@ -3775,7 +3777,7 @@ fn load_parts(
                             w.apply(&mut m);
                         }
                     }
-                    if colour_part(&mut m, f, game) {
+                    if colour_part(&mut m, f, game, cache) {
                         coloured += 1;
                     }
                     if f.head {
@@ -3878,7 +3880,7 @@ fn load_parts(
         }
     }
     if coloured > 0 {
-        notes.push(format!("Clothing colours: {coloured} part(s) coloured from the outfit data: the item's stored colour, else row tint 0 of its tint palette (for the generic palette only when it agrees with the item's colour tag), else the colour tag itself (one of 18 words such as navy or khaki, shown in a plain shade of ours). Second and third tints are not applied."));
+        notes.push(format!("Clothing colours: {coloured} part(s) coloured from the outfit data: the colours of the item's garment preset (one per sub-material, picked by the garment's materialid texture; sub-material 0 where it has none), else the item's stored colour, else row tint 0 of its tint palette (for the generic palette only when it agrees with the item's colour tag), else the colour tag itself (one of 18 words such as navy or khaki, shown in a plain shade of ours). Second and third tints are not applied."));
     }
     (model, first, names, errs, skin, colours, mask, notes)
 }
@@ -3886,7 +3888,64 @@ fn load_parts(
 /// Colour a ped clothing part of an outfit: its grey shade maps become the
 /// item's stored colour times the shade, or the tint palette row at the
 /// shade. Returns whether anything was coloured.
-fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path) -> bool {
+/// Sub-material per texel of a material's base texture: its `materialid`
+/// texture (red x 63, as the clothing shader reads it), resampled to `w` x
+/// `h`. None when the material binds none or the file is not there.
+fn sub_material_map(mat: &glb::Material, roots: &[&Path], w: u32, h: u32) -> Option<Vec<u8>> {
+    let want = format!("{:08x}", sixng_core::meta7a::joaat("materialid"));
+    let png = mat.slots.iter().find(|s| s.param_hash == want).and_then(|s| s.png.as_ref())?;
+    let img = roots.iter().find_map(|r| image::open(r.join(png)).ok())?.to_luma8();
+    let (iw, ih) = img.dimensions();
+    let mut out = Vec::with_capacity((w * h) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let p = img.get_pixel((x * iw / w.max(1)).min(iw - 1), (y * ih / h.max(1)).min(ih - 1)).0[0];
+            out.push(((p as u32 * 63 + 127) / 255).min(7) as u8);
+        }
+    }
+    Some(out)
+}
+
+fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> bool {
+    // Garment preset colours: one base colour per sub-material, the
+    // sub-material of a texel from the material's `materialid` texture.
+    // Without that texture the garment takes the colour of sub-material 0
+    // (the per-vertex sub-material id is not read).
+    if f.colour.is_none() && f.subs.iter().any(|c| c.is_some()) {
+        let first = f.subs.iter().flatten().next().copied().unwrap_or([128; 3]);
+        let shaped = cache.join("shaped");
+        let mut done = std::collections::HashSet::new();
+        for mi in 0..m.materials.len() {
+            if !m.materials[mi].ped_shade {
+                continue;
+            }
+            let Some(i) = m.materials[mi].base else { continue };
+            if !done.insert(i) {
+                continue;
+            }
+            let dims: Vec<(u32, u32)> = match m.images.get(i).filter(|im| im.bc.is_none()) {
+                Some(im) => im.mips.iter().map(|l| (l.0, l.1)).collect(),
+                None => continue,
+            };
+            for (level, (w, h)) in dims.into_iter().enumerate() {
+                let ids = sub_material_map(&m.materials[mi], &[cache, shaped.as_path()], w, h);
+                let px = &mut m.images[i].mips[level].2;
+                for (k, t) in px.chunks_exact_mut(4).enumerate() {
+                    let s = ids.as_ref().map_or(0, |v| v[k] as usize);
+                    let c = f.subs.get(s).copied().flatten().or(f.subs[0]).unwrap_or(first);
+                    // the fabric shade is mid grey (about 125) on plain cloth
+                    let g = t[1] as f32 / 125.0;
+                    for ch in 0..3 {
+                        t[ch] = (c[ch] as f32 * g).min(255.0) as u8;
+                    }
+                }
+            }
+            m.images[i].key = format!("{}#preset{:?}", m.images[i].key, f.subs);
+        }
+        if !done.is_empty() {
+            return true;
+        }
+    }
     let pal = f.tint.and_then(|(h, row)| sixng_core::pedtint::palettes(game).ok()?.get(&h).map(|p| (p, row)));
     // `ped_tint_generic_clean` rows are often placeholders the game fills at
     // run time: such a row counts only when it is the colour the item's
@@ -4707,7 +4766,7 @@ fn load_query_sel(
                         }
                         if oi == k {
                             let body = p.slot == "body upper" || p.slot == "body lower";
-                            fx.insert(e.off, PartFx { tint: p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t.rows[0]))).filter(|t| t.1 != 255), colour: p.colour.map(|c| [c[1], c[2], c[3]]), tag: p.colour_tag, head: p.slot == "head", body, skeletal: body || matches!(p.slot.as_str(), "head" | "eyes" | "teeth" | "teeth accessory"), covers: matches!(p.slot.as_str(), "top" | "outer" | "bottom" | "full" | "feet" | "gloves"), layer: match p.slot.as_str() { "outer" => 2, "top" | "bottom" | "full" => 1, _ => 0 }, heel: p.slot == "feet" && p.drawable.split('_').any(|t| matches!(t, "sh" | "mh" | "hh")), skins: if p.slot == "head" { p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect() } else { Vec::new() } });
+                            fx.insert(e.off, PartFx { tint: p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t.rows[0]))).filter(|t| t.1 != 255), colour: p.colour.map(|c| [c[1], c[2], c[3]]), tag: p.colour_tag, subs: p.preset_colours.clone(), head: p.slot == "head", body, skeletal: body || matches!(p.slot.as_str(), "head" | "eyes" | "teeth" | "teeth accessory"), covers: matches!(p.slot.as_str(), "top" | "outer" | "bottom" | "full" | "feet" | "gloves"), layer: match p.slot.as_str() { "outer" => 2, "top" | "bottom" | "full" => 1, _ => 0 }, heel: p.slot == "feet" && p.drawable.split('_').any(|t| matches!(t, "sh" | "mh" | "hh")), skins: if p.slot == "head" { p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect() } else { Vec::new() } });
                         }
                     }
                 }
