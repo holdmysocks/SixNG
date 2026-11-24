@@ -1320,7 +1320,8 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     if let Some(fb) = &st.fallback {
                         m["texture_fallback"] = fb.clone();
                     }
-                    if let Some(l) = crate::material::multilayer(s, &st.entries, || material_uv_fit(&lod_groups, si)) {
+                    if let Some(mut l) = crate::material::multilayer(s, &st.entries, || material_uv_fit(&lod_groups, si)) {
+                        crate::material::four_layer_vertex_weights(&mut l, material_colours1(&lod_groups, si));
                         m["multilayer"] = l;
                     }
                     if m["classification"]["class"] == "car_paint" {
@@ -1379,6 +1380,13 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
 
 /// A drawable's meshes, materials and skin, ready for `gltf::mesh_glb`.
 /// Measured UV mapping of one material over the first populated LOD.
+/// The second colour stream of every vertex of a material, in the first
+/// populated LOD.
+fn material_colours1(lod_groups: &[Vec<crate::gltf::NodeGroup>], shader: usize) -> impl Iterator<Item = [u8; 4]> + '_ {
+    let lod = lod_groups.iter().find(|g| g.iter().any(|n| !n.prims.is_empty()));
+    lod.into_iter().flatten().flat_map(|n| &n.prims).filter(move |p| p.material == Some(shader)).filter_map(|p| p.colors1.as_ref()).flatten().copied()
+}
+
 fn material_uv_fit(lod_groups: &[Vec<crate::gltf::NodeGroup>], shader: usize) -> serde_json::Value {
     let lod = lod_groups.iter().find(|g| g.iter().any(|n| !n.prims.is_empty()));
     crate::material::uv_fit(lod.into_iter().flatten().flat_map(|n| &n.prims).filter(|p| p.material == Some(shader)))
@@ -1676,7 +1684,8 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             if let Some(w) = &st.weapon_preset {
                 x["weapon_preset"] = w.clone();
             }
-            if let Some(l) = crate::material::multilayer(s, &st.entries, || material_uv_fit(&lod_groups, si)) {
+            if let Some(mut l) = crate::material::multilayer(s, &st.entries, || material_uv_fit(&lod_groups, si)) {
+                        crate::material::four_layer_vertex_weights(&mut l, material_colours1(&lod_groups, si));
                 x["multilayer"] = l;
             }
             x

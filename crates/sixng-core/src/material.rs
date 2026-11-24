@@ -441,6 +441,45 @@ fn solve3(m: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
     Some(x)
 }
 
+/// Where a 4-layer material's layer weights come from, measured on its own
+/// vertices: the shader mixes the lookup texture's weights with the second
+/// vertex colour set (`_COLOR1`) by that set's alpha, so alpha 1 means the
+/// vertex colours alone decide and alpha 0 the lookup texture alone. On map
+/// section tiles the alpha is 1 on most vertices (14 tiles, about 150,000
+/// vertices: 98 % on the most used variant, 58 to 100 % on the others).
+/// Does nothing for other families or a material without that stream.
+pub fn four_layer_vertex_weights(l: &mut Value, colours1: impl Iterator<Item = [u8; 4]>) {
+    if l["family"] != "four_layer" {
+        return;
+    }
+    let (mut n, mut on, mut off, mut alpha, mut over) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    for c in colours1 {
+        n += 1;
+        on += (c[3] == 255) as u64;
+        off += (c[3] == 0) as u64;
+        alpha += c[3] as u64;
+        over += (c[0] as u32 + c[1] as u32 + c[2] as u32 > 260) as u64;
+    }
+    if n == 0 {
+        return;
+    }
+    let share = |x: u64| (x as f64 / n as f64 * 1000.0).round() / 1000.0;
+    let source = if on == n {
+        "vertex colours"
+    } else if off == n {
+        "lookup texture"
+    } else {
+        "mixed: per vertex"
+    };
+    l["weights"]["source"] = json!(source);
+    l["weights"]["vertex"] = json!({
+        "attribute": "_COLOR1", "vertices": n, "alpha_1": share(on), "alpha_0": share(off), "mean_alpha": (alpha as f64 / n as f64 / 255.0 * 1000.0).round() / 1000.0,
+        "rgb_sum_over_1": share(over),
+        "use": "weights.rgb = mix(lookup.rgb, _COLOR1.rgb / 255, _COLOR1.a / 255) per vertex; r, g, b weight layers 0, 1, 2 and the remainder layer 3",
+        "note": "alpha_1 / alpha_0: share of this material's vertices where the vertex colours alone / the lookup texture alone decide. rgb_sum_over_1: share of vertices whose r + g + b exceeds 1, where the stream is probably not a plain weight triple",
+    });
+}
+
 /// Each layer's UV of a 4-layer material from the material's own constants,
 /// as the shader code applies them (read in two deferred pixel programs,
 /// `standard_uber_4lyr` and `…_dpm_dm_hbb`): `724bed95[k] == 1` gives layer
@@ -588,6 +627,16 @@ mod paint_tests {
         assert_eq!(l["layers"][3]["colour"]["param"], 13);
         assert_eq!(l["layers"][3]["colour"]["status"], "no texture bound");
         assert_eq!(l["weights"]["texture"]["png"], "t2.png");
+        // where the weights come from, measured on the material's vertices
+        let mut v = l.clone();
+        four_layer_vertex_weights(&mut v, [[10u8, 20, 30, 255], [0, 0, 0, 255]].into_iter());
+        assert_eq!((v["weights"]["source"].as_str(), v["weights"]["vertex"]["alpha_1"].as_f64(), v["weights"]["vertex"]["vertices"].as_u64()), (Some("vertex colours"), Some(1.0), Some(2)));
+        let mut v = l.clone();
+        four_layer_vertex_weights(&mut v, [[0u8, 0, 0, 0], [200, 200, 0, 255], [0, 0, 0, 128], [0, 0, 0, 0]].into_iter());
+        assert_eq!((v["weights"]["source"].as_str(), v["weights"]["vertex"]["alpha_0"].as_f64(), v["weights"]["vertex"]["rgb_sum_over_1"].as_f64()), (Some("mixed: per vertex"), Some(0.5), Some(0.25)));
+        let mut v = l.clone();
+        four_layer_vertex_weights(&mut v, std::iter::empty());
+        assert!(v["weights"]["source"].is_null());
         // layer UVs from the material's constants: layer 1 uses the second set
         let c4 = |hash: &str, v: [f32; 4]| crate::drawable::ShaderConst { hash: hash.into(), desc: String::new(), offset: 0, values: Some(v), buffer: 7, count: 4 };
         let sh = crate::drawable::Shader { index: 0, record_off: 0, name_hash: "61e09df7".into(), param_hashes: vec![], textures: vec![], flags: vec![],
