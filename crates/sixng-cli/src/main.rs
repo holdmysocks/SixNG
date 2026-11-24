@@ -1895,7 +1895,12 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let names = model_names(&ws);
             let t = Instant::now();
             let v = sixng_core::vehicles::export(&a, &metas, &names, po)?;
-            out.print(&json!({"ok": true, "archive": a.id, "stats": v, "seconds": t.elapsed().as_secs_f64()}));
+            // liveries: the stickers each brand places (<out>/vehicles/liveries.json)
+            let liveries = match sixng_core::vehstickers::build(&ws, &names, po) {
+                Ok(s) => s,
+                Err(e) => json!({"error": format!("{e:#}")}),
+            };
+            out.print(&json!({"ok": true, "archive": a.id, "stats": v, "liveries": liveries, "seconds": t.elapsed().as_secs_f64()}));
         }
         Cmd::Ptfx { archive, name, out: po, sprites } => {
             let a = ws.resolve(archive)?;
