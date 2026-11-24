@@ -63,8 +63,8 @@ const FAMILIES: &[(&str, &str, &str)] = &[
     // other
     ("255417c3", "cutout", "vegetation"),
     ("e05f1a42", "decal", "road signs (distance_map)"),
-    ("89a1cf72", "opaque", "ped head / skin"),
-    ("379efcef", "opaque", "ped eyes"),
+    ("89a1cf72", "opaque", "ped eyes"),
+    ("379efcef", "opaque", "ped head / skin"),
 ];
 
 /// What each known texture parameter slot holds. Roles marked "likely" come
@@ -92,7 +92,7 @@ pub const SLOTS: &[(&str, &str)] = &[
 ];
 
 pub fn slot_role(param_hash: &str) -> Option<&'static str> {
-    SLOTS.iter().find(|s| s.0 == param_hash).map(|s| s.1)
+    SLOTS.iter().find(|s| s.0 == param_hash).map(|s| s.1).or_else(|| u32::from_str_radix(param_hash, 16).ok().and_then(crate::headskin::extra_role))
 }
 
 /// Classify a shader. `flags` = the 8 record bytes at +0x38.
