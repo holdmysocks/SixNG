@@ -3992,6 +3992,9 @@ fn colour_weapon(m: &mut glb::Model, name: &str, presets: &sixng_core::matlib::I
     let preset = finish.map(str::to_string).or_else(|| presets.weapon_presets(name).first().cloned())?;
     let subs: Vec<Option<[u8; 3]>> = presets.colours(&preset)?.iter().map(|c| c.map(|c| [c[0], c[1], c[2]])).collect();
     let first = subs.iter().flatten().next().copied()?;
+    // metalness and roughness per sub-material, in the tint's alpha
+    let surf = presets.surface(&preset).unwrap_or(&[]);
+    let code = |s: usize| surf.get(s).map_or(255, |&x| sixng_core::export::surface_code(x));
     let want = format!("{:08x}", sixng_core::meta7a::joaat("materialid"));
     let lin = |c: u8| {
         let x = c as f32 / 255.0;
@@ -4025,8 +4028,9 @@ fn colour_weapon(m: &mut glb::Model, name: &str, presets: &sixng_core::matlib::I
                 let b = |c: u8| (lin(c) * 255.0 + 0.5) as u8;
                 for mesh in m.meshes.iter_mut().filter(|x| x.material == Some(mi)) {
                     for v in &mut mesh.verts {
-                        let c = subs.get((v.col[1] >> 2).min(7) as usize).copied().flatten().unwrap_or(first);
-                        v.tint = [b(c[0]), b(c[1]), b(c[2]), 255];
+                        let s = (v.col[1] >> 2).min(7) as usize;
+                        let c = subs.get(s).copied().flatten().unwrap_or(first);
+                        v.tint = [b(c[0]), b(c[1]), b(c[2]), code(s)];
                     }
                 }
             }
@@ -6386,6 +6390,8 @@ fn export_load_shaped(
                 || j.contains("e68a4a98") && !j.contains("\"gunmetal\"") && !j.contains("\"weapon_parts\"")
                 // and from before weapon parts took their preset colours
                 || j.contains("e68a4a98") && !j.contains("\"weapon_preset\"")
+                // and from before their metalness and roughness per sub-material
+                || j.contains("\"weapon_parts\"") && !j.contains("\"sub_material_surface\"")
         });
     // Cached ped clothing from before the fabric shade came from the packed map.
     let stale_cloth = std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| j.contains("739e3d0d") && !j.contains("shade_source"));
