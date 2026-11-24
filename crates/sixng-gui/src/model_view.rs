@@ -1118,7 +1118,9 @@ impl ModelView {
                             // a character's hair without them: the appearance preset of each strand's variant
                             (Some(t), _) => g.coat_glb_with(&name, &coat, w, &|s, f| t.rgb(coat.variants.get(s).copied().unwrap_or(0), f), serde_json::json!({})),
                             // an animal's strands with the game's tables: the ramp of the variant times
-                            // the colour of the skin under the root (white ramps let the skin colour through)
+                            // the colour of the skin under the root. The game's strand resolve does this: colour = mix(C, C x T, w),
+                            // T a tint texture read at the strand's root UV (optionally through a palette), w a per-instance
+                            // amount x the texture's alpha. That the tint texture is the skin's colour map is inferred, and w is taken as 1.
                             (None, Some(d)) if fur_sets.is_some_and(|f| d.colour_set(f.0).is_some() || d.param_set(f.1).is_some()) => {
                                 let (cn, pn) = fur_sets.unwrap();
                                 let (cs, ps) = (d.colour_set(cn), d.param_set(pn));
