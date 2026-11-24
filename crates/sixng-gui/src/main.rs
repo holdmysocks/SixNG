@@ -1701,6 +1701,33 @@ impl App {
         if let Some(v) = three("pose-spine") {
             m.ped_pose.spine = v;
         }
+        // --pose-joints: the other angles as name=left:right pairs, comma separated
+        // (shoulder-shrug, shoulder-forward, arm-raise, arm-swing, arm-twist, elbow, forearm-twist,
+        // wrist-bend, wrist-side, leg-lift, leg-spread, leg-twist, knee, ankle), and eyes=left:up
+        for item in c.get("pose-joints").unwrap_or("").split(',').filter(|s| !s.is_empty()) {
+            let Some((k, v)) = item.split_once('=') else { continue };
+            let n: Vec<f32> = v.split(':').filter_map(|x| x.trim().parse().ok()).collect();
+            let (Some(&a), Some(&b)) = (n.first(), n.get(1)) else { continue };
+            let p = &mut m.ped_pose;
+            match k.trim() {
+                "shoulder-shrug" => (p.shoulder[0][0], p.shoulder[1][0]) = (a, b),
+                "shoulder-forward" => (p.shoulder[0][1], p.shoulder[1][1]) = (a, b),
+                "arm-raise" => (p.arm[0][0], p.arm[1][0]) = (a, b),
+                "arm-swing" => (p.arm[0][1], p.arm[1][1]) = (a, b),
+                "arm-twist" => p.arm_twist = [a, b],
+                "elbow" => p.elbow = [a, b],
+                "forearm-twist" => p.forearm_twist = [a, b],
+                "wrist-bend" => (p.wrist[0][0], p.wrist[1][0]) = (a, b),
+                "wrist-side" => (p.wrist[0][1], p.wrist[1][1]) = (a, b),
+                "leg-lift" => (p.leg[0][0], p.leg[1][0]) = (a, b),
+                "leg-spread" => (p.leg[0][1], p.leg[1][1]) = (a, b),
+                "leg-twist" => p.leg_twist = [a, b],
+                "knee" => p.knee = [a, b],
+                "ankle" => p.ankle = [a, b],
+                "eyes" => p.eyes = [a, b],
+                _ => {}
+            }
+        }
         m.livery.open_once = c.get("livery").map(PathBuf::from);
         m.livery.info_once = c.get("livery-info").map(PathBuf::from);
         m.show_skeleton = c.has("skeleton");

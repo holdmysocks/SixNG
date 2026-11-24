@@ -128,6 +128,22 @@ pub struct PedPose {
     pub spine: [f32; 3],
     /// Nod down, turn to the left, tilt to the left.
     pub head: [f32; 3],
+    /// Per shoulder (left, right), on the collar bone: shrug (+ up),
+    /// forward (+ forward).
+    pub shoulder: [[f32; 2]; 2],
+    /// Per arm: turn of the upper arm and of the forearm about their own
+    /// length (+ rolls the thumb forward and down).
+    pub arm_twist: [f32; 2],
+    pub forearm_twist: [f32; 2],
+    /// Per wrist: bend (+ up, the back of the hand towards the forearm),
+    /// side (+ forward, towards the thumb).
+    pub wrist: [[f32; 2]; 2],
+    /// Per leg: turn of the thigh about its own length (+ toes outward).
+    pub leg_twist: [f32; 2],
+    /// Per ankle: + toes up.
+    pub ankle: [f32; 2],
+    /// Both eyeballs: look to the character's left (+), look up (+).
+    pub eyes: [f32; 2],
 }
 
 impl PedPose {
@@ -153,10 +169,16 @@ impl PedPose {
         for (i, s) in ["L", "R"].iter().enumerate() {
             // the left arm points along +x, the right along -x
             let sg = if i == 0 { 1.0 } else { -1.0 };
-            v.push((format!("SKEL_{s}_UpperArm"), [0.0, -sg * self.arm[i][1], sg * self.arm[i][0]]));
-            v.push((format!("SKEL_{s}_Forearm"), [0.0, -sg * self.elbow[i], 0.0]));
-            v.push((format!("SKEL_{s}_Thigh"), [-self.leg[i][0], 0.0, sg * self.leg[i][1]]));
+            // a turn about x is a turn about the arm's own length; it is applied first
+            v.push((format!("SKEL_{s}_Clavicle"), [0.0, -sg * self.shoulder[i][1], sg * self.shoulder[i][0]]));
+            v.push((format!("SKEL_{s}_UpperArm"), [sg * self.arm_twist[i], -sg * self.arm[i][1], sg * self.arm[i][0]]));
+            v.push((format!("SKEL_{s}_Forearm"), [sg * self.forearm_twist[i], -sg * self.elbow[i], 0.0]));
+            v.push((format!("SKEL_{s}_Hand"), [0.0, -sg * self.wrist[i][1], sg * self.wrist[i][0]]));
+            // the leg hangs along -y: a turn about y is a turn about its own length
+            v.push((format!("SKEL_{s}_Thigh"), [-self.leg[i][0], sg * self.leg_twist[i], sg * self.leg[i][1]]));
             v.push((format!("SKEL_{s}_Calf"), [self.knee[i], 0.0, 0.0]));
+            v.push((format!("SKEL_{s}_Foot"), [-self.ankle[i], 0.0, 0.0]));
+            v.push((format!("FB_{s}_Eyeball"), [-self.eyes[1], self.eyes[0], 0.0]));
         }
         for b in ["SKEL_Spine1", "SKEL_Spine2", "SKEL_Spine3", "SKEL_Spine4"] {
             v.push((b.to_string(), [self.spine[0] / 4.0, self.spine[1] / 4.0, -self.spine[2] / 4.0]));
@@ -1370,17 +1392,34 @@ impl ModelView {
                 ui.end_row();
             };
             egui::Grid::new("pose_grid").num_columns(3).show(ui, |ui| {
+                let [sl, sr] = &mut p.shoulder;
+                pair(ui, "shoulder shrug", &mut sl[0], &mut sr[0], -15.0, 35.0);
+                pair(ui, "shoulder forward", &mut sl[1], &mut sr[1], -25.0, 35.0);
                 let [al, ar] = &mut p.arm;
                 pair(ui, "arm raise", &mut al[0], &mut ar[0], -90.0, 90.0);
                 pair(ui, "arm swing", &mut al[1], &mut ar[1], -90.0, 120.0);
+                let [tl, tr] = &mut p.arm_twist;
+                pair(ui, "arm twist", tl, tr, -90.0, 90.0);
                 let [el, er] = &mut p.elbow;
                 pair(ui, "elbow", el, er, 0.0, 140.0);
+                let [fl, fr] = &mut p.forearm_twist;
+                pair(ui, "forearm twist", fl, fr, -90.0, 90.0);
+                let [wl, wr] = &mut p.wrist;
+                pair(ui, "wrist bend", &mut wl[0], &mut wr[0], -80.0, 70.0);
+                pair(ui, "wrist side", &mut wl[1], &mut wr[1], -30.0, 20.0);
                 let [ll, lr] = &mut p.leg;
                 pair(ui, "leg lift", &mut ll[0], &mut lr[0], -45.0, 110.0);
                 pair(ui, "leg spread", &mut ll[1], &mut lr[1], -20.0, 60.0);
+                let [gl, gr] = &mut p.leg_twist;
+                pair(ui, "leg twist", gl, gr, -45.0, 45.0);
                 let [kl, kr] = &mut p.knee;
                 pair(ui, "knee", kl, kr, 0.0, 140.0);
+                let [nl, nr] = &mut p.ankle;
+                pair(ui, "ankle", nl, nr, -45.0, 30.0);
             });
+            if ui.button("Reset pose").on_hover_text("Every angle back to zero: the stored pose.").clicked() {
+                *p = PedPose::default();
+            }
             ui.horizontal(|ui| {
                 ui.label("spine");
                 ui.add(egui::DragValue::new(&mut p.spine[0]).range(-40.0..=80.0).suffix("°").prefix("bend "));
@@ -1388,12 +1427,17 @@ impl ModelView {
                 ui.add(egui::DragValue::new(&mut p.spine[2]).range(-40.0..=40.0).suffix("°").prefix("lean "));
             });
             ui.horizontal(|ui| {
+                ui.label("eyes");
+                ui.add(egui::DragValue::new(&mut p.eyes[0]).range(-35.0..=35.0).suffix("°").prefix("left "));
+                ui.add(egui::DragValue::new(&mut p.eyes[1]).range(-25.0..=25.0).suffix("°").prefix("up "));
+            });
+            ui.horizontal(|ui| {
                 ui.label("head");
                 ui.add(egui::DragValue::new(&mut p.head[0]).range(-50.0..=60.0).suffix("°").prefix("nod "));
                 ui.add(egui::DragValue::new(&mut p.head[1]).range(-80.0..=80.0).suffix("°").prefix("turn "));
                 ui.add(egui::DragValue::new(&mut p.head[2]).range(-40.0..=40.0).suffix("°").prefix("tilt "));
             });
-            ui.label(egui::RichText::new("Angles on the main bones of the shared skeleton; zero is the stored pose. Drag a value or type it.").weak().small());
+            ui.label(egui::RichText::new("Angles on the main bones of the shared skeleton (collar bone, upper arm, forearm, hand, thigh, calf, foot, spine, neck and head); zero is the stored pose. The limits are a person's rough range, not from the game. Drag a value or type it.").weak().small());
         });
         egui::CollapsingHeader::new("Animation").default_open(true).show(ui, |ui| {
             let female = look.model.is_empty() || l.parts.iter().any(|p| l.selected.contains(&p.off) && p.name.contains("_fr1_"));
@@ -4585,6 +4629,27 @@ fn rig_character(m: &mut glb::Model, parts: &[(std::ops::Range<usize>, Vec<glb::
         // `FACIAL_...`) hang from the head, and their parts must stay with
         // it; the nearest body skin under an eye is the neck.
         let face = |j: usize| std::iter::successors(Some(j), |&x| pj.get(x).and_then(|q| q.parent).filter(|&p| p != x && x >= n)).take(64).any(|x| pj.get(x).is_some_and(|q| q.name.starts_with("FB_") || q.name.starts_with("FACIAL_")));
+        // The eyeball bones (`FB_L_Eyeball`, its roll, iris and pupil, and
+        // the right side's) join the shared skeleton under the head, so
+        // the Pose controls can turn the eyes. Parents come first in a
+        // joint list, so one pass in order places each under its own.
+        let mut eye: HashMap<usize, u16> = HashMap::new();
+        for j in n..pj.len() {
+            if !pj[j].name.starts_with("FB_") {
+                continue;
+            }
+            let at = match joints.iter().position(|q| q.name == pj[j].name) {
+                Some(i) => i,
+                None => {
+                    let parent = pj[j].parent.filter(|&p| p != j).map_or(0, |p| eye.get(&p).copied().unwrap_or_else(|| up(p))) as usize;
+                    let local = Mat4::from_cols_array(&joints[parent].ibm) * Mat4::from_cols_array(&pj[j].ibm).inverse();
+                    joints.push(glb::Joint { name: pj[j].name.clone(), parent: Some(parent), local: if local.is_finite() { local.to_cols_array() } else { pj[j].local }, ibm: pj[j].ibm });
+                    joints.len() - 1
+                }
+            };
+            eye.insert(j, at as u16);
+        }
+        let to_shared = |j: usize| eye.get(&j).copied().unwrap_or_else(|| up(j));
         let fixed = attached.map(|a| up(a));
         for mi in range.clone() {
             let Some(me) = m.meshes.get_mut(mi) else { continue };
@@ -4610,7 +4675,7 @@ fn rig_character(m: &mut glb::Model, parts: &[(std::ops::Range<usize>, Vec<glb::
                 let rest = 255 - w.iter().sum::<u32>();
                 w[0] += rest;
                 for k in 0..4 {
-                    v.joints[k] = if w[k] > 0 { up(v.joints[k] as usize) } else { 0 };
+                    v.joints[k] = if w[k] > 0 { to_shared(v.joints[k] as usize) } else { 0 };
                     v.weights[k] = w[k] as u8;
                 }
             }
