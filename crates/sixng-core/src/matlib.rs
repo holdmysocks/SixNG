@@ -86,8 +86,17 @@ pub const TILE: u32 = 0x8302_1d7a;
 pub const PROFILE: u32 = 0x440c_9ecb;
 /// The colour parameter: 4 entries per sub-material.
 pub const COLOUR: u32 = 0xf574_261b;
+/// Two parameters whose names are not recovered but whose values behave as
+/// a sub-material's metalness and roughness in the weapon library (read
+/// from the data, not from the shader): `0e555ef5` is 0.85 to 1.0 where
+/// present (96 % of gold sub-materials, 78 % of steel-grey ones, 34 % of
+/// wood-brown ones); `83472381` has a median of 0.15 on gold, 0.40 to 0.45
+/// on steel greys and 0.75 on wood browns.
+pub const METALLIC: u32 = 0x0e55_5ef5;
+pub const ROUGHNESS: u32 = 0x8347_2381;
+
 /// Index format version of [`Index`].
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 /// One parameter: (name hash, index, sub-material, value).
 pub type Param<T> = (u32, u8, u8, T);
@@ -272,6 +281,20 @@ impl Library {
             .collect()
     }
 
+    /// Metalness and roughness of sub-material `sub` of a preset (see
+    /// [`METALLIC`]): the preset's value for the sub-material, else its
+    /// base material's. Without one, metalness is the tile's
+    /// `tilemetallic`, else 0, and roughness is 0.5. Inferred from the
+    /// data; the shader's own use of these values was not read.
+    pub fn surface(&self, preset: u32, sub: usize) -> Option<[f32; 2]> {
+        let p = self.presets.get(&preset)?;
+        let base = self.base.get(p.bases.get(sub)?);
+        let f = |name: u32| p.floats.iter().find(|x| x.0 == name && x.2 as usize == sub).or_else(|| base?.floats.iter().find(|x| x.0 == name)).map(|x| x.3);
+        let tile = Some(p.tiles[sub]).filter(|&t| t != 0).or_else(|| base.map(|b| b.tiles[0])).and_then(|t| self.tiles.get(&t));
+        let tile_metal = tile.and_then(|t| t.floats.iter().find(|x| x.0 == crate::meta7a::joaat("tilemetallic")).map(|x| x.3));
+        Some([f(METALLIC).or(tile_metal).unwrap_or(0.0).clamp(0.0, 1.0), f(ROUGHNESS).unwrap_or(0.5).clamp(0.0, 1.0)])
+    }
+
     /// The tiling surface of sub-material `sub` of a preset.
     pub fn tile(&self, preset: u32, sub: usize) -> Option<Tile> {
         let j = crate::meta7a::joaat;
@@ -313,6 +336,25 @@ pub fn stops(srgb: [u8; 3]) -> [[f32; 3]; 3] {
     [lin.map(|c| 0.1 * c), lin, light]
 }
 
+/// Weapon part types that finishes are listed under (`c763edb4` of a
+/// variant record is the joaat of one of these): 46 of the 54 hashes in
+/// use, covering 1,263 of the 1,300 variants.
+pub const PART_TYPES: &[&str] = &[
+    "barrel", "receiver", "stock", "magazine", "frame", "trigger", "bolt", "pgrip", "muzzle", "grip", "slide", "optic", "handguard", "hguard", "dustcover", "body", "pump",
+    "sight_front", "sight_rear", "sight", "scopemount", "slide_cover", "magwell", "magtube", "railmount", "safety", "lid", "charge", "ammo", "selector", "barrel_rail", "cheekriser", "sear",
+    "frontrail", "front_rail", "railplate", "reel", "rod", "rail", "flashlight", "reflexmount", "heatshield", "accessory", "underbarrel", "under", "riser",
+];
+
+/// The name of a part type hash (hex), when it is one of [`PART_TYPES`].
+pub fn part_type_name(hex: &str) -> Option<&'static str> {
+    PART_TYPES.iter().copied().find(|n| format!("{:08x}", crate::meta7a::joaat(n)) == hex)
+}
+
+/// Words of weapon model names that mean another part type: models say
+/// `mag`, `sight_f`, `sight_r`, the finish lists `magazine`, `sight_front`,
+/// `sight_rear`; a `handguard` model also takes `hguard` finishes.
+const PART_ALIASES: &[(&str, &str)] = &[("mag", "magazine"), ("sight_f", "sight_front"), ("sight_r", "sight_rear"), ("fsights", "sight_front"), ("rsights", "sight_rear"), ("rearsight", "sight_rear"), ("handguard", "hguard")];
+
 /// One weapon family file: its component models and the finishes it
 /// offers per part type.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -334,6 +376,9 @@ pub struct Index {
     /// Preset (hex) -> per sub-material the four colour entries as
     /// `rrggbbaa` sRGB (empty = none).
     pub presets: BTreeMap<String, Vec<[String; 4]>>,
+    /// Preset (hex) -> metalness and roughness per sub-material
+    /// (`Library::surface`).
+    pub surfaces: BTreeMap<String, Vec<[f32; 2]>>,
     /// Preset (hex) -> the tiling surface of each sub-material that has one.
     pub tiles: BTreeMap<String, Vec<Option<Tile>>>,
     /// Weapon component name hash (hex) -> preset (hex).
@@ -359,6 +404,7 @@ impl Index {
             let subs = (0..8).map(|s| [0u8, 1, 2, 3].map(|i| lib.colour(k, s, i).map(|c| format!("{:02x}{:02x}{:02x}{:02x}", c[0], c[1], c[2], c[3])).unwrap_or_default())).collect();
             self.presets.insert(format!("{k:08x}"), subs);
             self.tiles.insert(format!("{k:08x}"), (0..8).map(|s| lib.tile(k, s)).collect());
+            self.surfaces.insert(format!("{k:08x}"), (0..8).map(|s| lib.surface(k, s).unwrap_or([0.0, 0.5])).collect());
         }
     }
 
@@ -460,26 +506,37 @@ impl Index {
     /// The finishes a weapon model can take: its family's variants for the
     /// model's part type, as (part type hex, [(variant hex, preset hex)]).
     /// The part type is a word of the model name (`w_pi_duke_01_slide_02`
-    /// -> `slide`; `…_sight_f_01` -> `sight_f` or `sight`), the longest
-    /// that the family has finishes for.
+    /// -> `slide`), the longest that the family has finishes for; a word's
+    /// own name wins over its alias (`…_mag_01` -> `magazine`,
+    /// `…_sight_f_01` -> `sight_front`).
     pub fn weapon_finishes(&self, model: &str) -> Option<(&str, &[(String, String)])> {
         let m = model.to_ascii_lowercase();
         let base = ["_hi", "_mid"].iter().find_map(|s| m.strip_suffix(s)).unwrap_or(&m);
         let key = format!("{:08x}", crate::meta7a::joaat(base));
         let fam = self.weapon_families.iter().find(|f| f.models.contains(&key))?;
         let words: Vec<&str> = base.split('_').collect();
-        let mut best: Option<(usize, &str, &[(String, String)])> = None;
+        // (own name before alias, then length) -> slot and its finishes
+        let mut best: Option<((bool, usize), &str, &[(String, String)])> = None;
         for i in 0..words.len() {
             for k in i + 1..=words.len() {
                 let w = words[i..k].join("_");
-                if let Some((slot, v)) = fam.finishes.get_key_value(&format!("{:08x}", crate::meta7a::joaat(&w))) {
-                    if best.is_none_or(|b| w.len() > b.0) {
-                        best = Some((w.len(), slot.as_str(), v.as_slice()));
+                let alias = PART_ALIASES.iter().find(|a| a.0 == w).map(|a| a.1);
+                for (own, name) in [(true, Some(w.as_str())), (false, alias)] {
+                    let Some(name) = name else { continue };
+                    if let Some((slot, v)) = fam.finishes.get_key_value(&format!("{:08x}", crate::meta7a::joaat(name))) {
+                        if best.is_none_or(|b| (own, w.len()) > b.0) {
+                            best = Some(((own, w.len()), slot.as_str(), v.as_slice()));
+                        }
                     }
                 }
             }
         }
         best.map(|b| (b.1, b.2))
+    }
+
+    /// Metalness and roughness per sub-material of a preset.
+    pub fn surface(&self, preset: &str) -> Option<&[[f32; 2]]> {
+        self.surfaces.get(preset).map(Vec::as_slice)
     }
 
     /// Base colour (entry 0) per sub-material of a preset, sRGB RGBA.
@@ -522,6 +579,14 @@ mod tests {
         let t1 = lib.tile(0x22, 1).unwrap();
         assert_eq!((t1.tile.as_str(), t1.material_map.as_str(), t1.scale, t1.rotation), ("00000034", "00000000000000bb", Some(50.0), None));
         assert_eq!(lib.tile(0x22, 2), None);
+        // metalness and roughness: preset value, else base, else the tile's metallic, else 0 / 0.5
+        assert_eq!(lib.surface(0x22, 0), Some([0.0, 0.5]));
+        lib.tiles.get_mut(&0x33).unwrap().floats.push((j("tilemetallic"), 255, 255, 0.95));
+        lib.base.get_mut(&0x11).unwrap().floats.push((ROUGHNESS, 255, 255, 0.75));
+        lib.presets.get_mut(&0x22).unwrap().floats.push((METALLIC, 255, 1, 1.0));
+        assert_eq!(lib.surface(0x22, 0), Some([0.95, 0.75]));
+        assert_eq!(lib.surface(0x22, 1), Some([1.0, 0.75]));
+        lib.tiles.get_mut(&0x33).unwrap().floats.pop();
         // tint-mask layers: the base material has layer 1 (mask, opacity, tint); the preset overrides its opacity and tint for sub-material 0 and inverts it
         let b = lib.base.get_mut(&0x11).unwrap();
         b.textures.push((j("tintmaskmap"), 1, 255, 0xcc));
@@ -596,5 +661,20 @@ mod tests {
         assert_eq!((slot, f.len(), f[1].1.as_str()), (format!("{:08x}", jj("slide")).as_str(), 2, "00000021"));
         assert_eq!(ix.weapon_finishes("w_pi_duke_01_sight_f_01").unwrap().1[0].1, "00000023");
         assert!(ix.weapon_finishes("w_ar_adb_01_barrel_01").is_none());
+        // model words that differ from the part type: mag -> magazine, sight_f -> sight_front; an own name wins over an alias
+        let fam2 = json!({"objects": {
+            "9a16508d85492dc3": [{"Name": 3, field_name(0x72f5_e33e): 0x10u32, field_name(0x873e_f899): jj("w_sg_kozlov_01_mag_01")}, {"Name": 4, field_name(0x72f5_e33e): 0x10u32, field_name(0x873e_f899): jj("w_sg_kozlov_01_sight_f_02")},
+                {"Name": 5, field_name(0x72f5_e33e): 0x10u32, field_name(0x873e_f899): jj("w_sg_kozlov_01_handguard_01")}],
+            "eafa47ee6724161c": [
+                {"Name": 0xb1u32, field_name(0x14b0_64c2): 0x30u32, field_name(0xc763_edb4): jj("magazine")},
+                {"Name": 0xb2u32, field_name(0x14b0_64c2): 0x31u32, field_name(0xc763_edb4): jj("sight_front")},
+                {"Name": 0xb3u32, field_name(0x14b0_64c2): 0x32u32, field_name(0xc763_edb4): jj("hguard")},
+                {"Name": 0xb4u32, field_name(0x14b0_64c2): 0x33u32, field_name(0xc763_edb4): jj("handguard")}],
+        }});
+        ix.add_weapon_file(&fam2);
+        assert_eq!(ix.weapon_finishes("w_sg_kozlov_01_mag_01").unwrap().1[0].1, "00000030");
+        assert_eq!(ix.weapon_finishes("w_sg_kozlov_01_sight_f_02_hi").unwrap().1[0].1, "00000031");
+        assert_eq!(ix.weapon_finishes("w_sg_kozlov_01_handguard_01").unwrap().1[0].1, "00000033");
+        assert_eq!((part_type_name(&format!("{:08x}", jj("sight_rear"))), part_type_name("12345678")), (Some("sight_rear"), None));
     }
 }

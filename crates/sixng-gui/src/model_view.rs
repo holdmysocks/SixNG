@@ -1459,7 +1459,7 @@ impl ModelView {
         let mut finish: Vec<(String, Option<String>)> = Vec::new();
         let mut finish_changed = false;
         if let Some(fs) = l.info["weapon_finishes"].as_array().filter(|a| !a.is_empty()) {
-            ui.label(egui::RichText::new("Finishes (the family's colour variants of a part type; names are not recovered, the squares show the colours)").weak());
+            ui.label(egui::RichText::new("Finishes (the family's colour variants of a part type; their names are not recovered, so each is labelled by its colours)").weak());
             let squares = |ui: &mut egui::Ui, o: &serde_json::Value| {
                 for c in o["colours"].as_array().into_iter().flatten().filter_map(|c| u32::from_str_radix(c.as_str()?, 16).ok()) {
                     ui.label(egui::RichText::new("\u{25a0}").color(egui::Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)));
@@ -1470,8 +1470,9 @@ impl ModelView {
                     let slot = f["slot"].as_str().unwrap_or("").to_string();
                     let mut cur = f["selected"].as_str().map(str::to_string);
                     ui.label(f["group"].as_str().filter(|g| !g.is_empty()).unwrap_or(&slot));
+                    let name_of = |o: &serde_json::Value| format!("{} ({})", o["label"].as_str().filter(|l| !l.is_empty()).unwrap_or("finish"), o["variant"].as_str().unwrap_or(""));
                     let text = match &cur {
-                        Some(p) => format!("variant {}", f["options"].as_array().into_iter().flatten().find(|o| o["preset"] == p.as_str()).and_then(|o| o["variant"].as_str()).unwrap_or(p)),
+                        Some(p) => f["options"].as_array().into_iter().flatten().find(|o| o["preset"] == p.as_str()).map(name_of).unwrap_or_else(|| p.clone()),
                         None => "default".to_string(),
                     };
                     egui::ComboBox::from_id_salt(("finish", slot.as_str())).selected_text(text).width(240.0).show_ui(ui, |ui| {
@@ -1484,7 +1485,7 @@ impl ModelView {
                             let on = cur.as_deref() == Some(pr);
                             ui.horizontal(|ui| {
                                 squares(ui, o);
-                                if ui.selectable_label(on, format!("variant {}", o["variant"].as_str().unwrap_or(""))).on_hover_text(format!("preset {pr}")).clicked() && !on {
+                                if ui.selectable_label(on, name_of(o)).on_hover_text(format!("preset {pr}")).clicked() && !on {
                                     cur = Some(pr.to_string());
                                     finish_changed = true;
                                 }
@@ -1962,7 +1963,7 @@ impl ModelView {
             if let Some(ix) = ix {
                 // the model's own name, LOD suffix and all ("<id> <name> (+3 parts)")
                 let model = l.source.split_whitespace().nth(1).unwrap_or("");
-                let (_, _, part_names) = vehicle_part_options(&ix, model, v);
+                let (_, _, part_names, _) = vehicle_part_options(&ix, model, v);
                 // one part per group: a part list also holds the choices
                 // of its option lists, of which the game takes one
                 let mut groups = std::collections::HashSet::new();
@@ -3992,6 +3993,9 @@ fn colour_weapon(m: &mut glb::Model, name: &str, presets: &sixng_core::matlib::I
     let preset = finish.map(str::to_string).or_else(|| presets.weapon_presets(name).first().cloned())?;
     let subs: Vec<Option<[u8; 3]>> = presets.colours(&preset)?.iter().map(|c| c.map(|c| [c[0], c[1], c[2]])).collect();
     let first = subs.iter().flatten().next().copied()?;
+    // metalness and roughness per sub-material, in the tint's alpha
+    let surf = presets.surface(&preset).unwrap_or(&[]);
+    let code = |s: usize| surf.get(s).map_or(255, |&x| sixng_core::export::surface_code(x));
     let want = format!("{:08x}", sixng_core::meta7a::joaat("materialid"));
     let lin = |c: u8| {
         let x = c as f32 / 255.0;
@@ -4025,8 +4029,9 @@ fn colour_weapon(m: &mut glb::Model, name: &str, presets: &sixng_core::matlib::I
                 let b = |c: u8| (lin(c) * 255.0 + 0.5) as u8;
                 for mesh in m.meshes.iter_mut().filter(|x| x.material == Some(mi)) {
                     for v in &mut mesh.verts {
-                        let c = subs.get((v.col[1] >> 2).min(7) as usize).copied().flatten().unwrap_or(first);
-                        v.tint = [b(c[0]), b(c[1]), b(c[2]), 255];
+                        let s = (v.col[1] >> 2).min(7) as usize;
+                        let c = subs.get(s).copied().flatten().unwrap_or(first);
+                        v.tint = [b(c[0]), b(c[1]), b(c[2]), code(s)];
                     }
                 }
             }
@@ -4062,8 +4067,20 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
             if let Some(fab) = f.preset.and_then(|p| crate::fabric::fabric(game, p)) {
                 let mats: Vec<usize> = (0..m.materials.len()).filter(|&k| m.materials[k].base == Some(i)).collect();
                 let mat = m.materials[mi].clone();
-                if crate::fabric::bake(m, &mats, i, &fab, &|w, h| sub_material_map(&mat, &[cache, shaped.as_path()], w, h)) {
-                    m.images[i].key = format!("{}#fabric{:08x}", m.images[i].key, f.preset.unwrap_or(0));
+                // The wgpu shader draws the main sub-material's weave per
+                // pixel on opaque garments (alpha carries its texels); the
+                // Metal renderer has no such path and keeps the baked weave.
+                let detail = cfg!(not(target_os = "macos")) && std::env::var_os("SIXNG_NO_FABRIC_DETAIL").is_none() && mats.iter().all(|&k| m.materials[k].alpha_mode == "OPAQUE");
+                if let Some(main) = crate::fabric::bake(m, &mats, i, &fab, &|w, h| sub_material_map(&mat, &[cache, shaped.as_path()], w, h), detail) {
+                    m.images[i].key = format!("{}#fabric{:08x}{}", m.images[i].key, f.preset.unwrap_or(0), if main.is_some() { "d" } else { "" });
+                    if let Some((tile, scale, rot)) = main.and_then(|s| fab.detail(s)) {
+                        let (w, h, px) = tile.rgba();
+                        m.images.push(glb::Image { key: format!("{}#tile", m.images[i].key), mips: glb::mip_chain(w, h, px), srgb: false, bc: None });
+                        let d = glb::Detail { image: m.images.len() - 1, scale, rot, mean: tile.mean() };
+                        for &k in &mats {
+                            m.materials[k].detail = Some(d);
+                        }
+                    }
                     continue;
                 }
             }
@@ -5163,8 +5180,18 @@ fn load_query_sel(
                                     c.truncate(3);
                                     c
                                 };
-                                finishes.push(serde_json::json!({"slot": slot, "group": sixng_core::weapon::part_slot(name, &pn).unwrap_or_default(), "part": pn, "selected": chosen,
-                                    "options": list.iter().map(|(v, pr)| serde_json::json!({"variant": v, "preset": pr, "colours": swatch(pr)})).collect::<Vec<_>>()}));
+                                // a finish has no recovered name: label it by its colours (nearest colour words)
+                                let label = |pr: &str| -> String {
+                                    let mut w: Vec<&str> = ix.colours(pr).into_iter().flatten().flatten().map(|c| sixng_core::pedtint::nearest_word([c[0], c[1], c[2]])).collect();
+                                    w.dedup();
+                                    let mut seen = std::collections::HashSet::new();
+                                    w.retain(|x| seen.insert(*x));
+                                    w.truncate(3);
+                                    w.join(" / ")
+                                };
+                                let group = sixng_core::matlib::part_type_name(slot).map(str::to_string).unwrap_or_else(|| sixng_core::weapon::part_slot(name, &pn).unwrap_or_default());
+                                finishes.push(serde_json::json!({"slot": slot, "group": group, "part": pn, "selected": chosen,
+                                    "options": list.iter().map(|(v, pr)| serde_json::json!({"variant": v, "preset": pr, "colours": swatch(pr), "label": label(pr)})).collect::<Vec<_>>()}));
                             }
                         }
                         if let Some(pr) = presets.and_then(|ix| colour_weapon(&mut m, &pn, ix, cache, chosen)) {
@@ -5237,7 +5264,7 @@ fn load_query_sel(
     if e.rtype.as_deref() == Some("ft") && info["wheel_mounts"].as_array().is_some_and(|w| !w.is_empty()) {
         let db = sixng_core::names::work_dir().and_then(|w| crate::vehicle_db::shared(&export::game_root(&a).to_string_lossy(), &w.to_string_lossy()).ok());
         if let Some(v) = db.as_ref().and_then(|db| crate::vehicle_db::find(db, &crate::vehicle_db::model_key(name))) {
-            let (opts, kits, _) = vehicle_part_options(&ix, name, v);
+            let (opts, mut kits, part_names, assets) = vehicle_part_options(&ix, name, v);
             // no choice made yet: the parts of the first configuration
             let chosen: Vec<u64> = sel
                 .clone()
@@ -5249,6 +5276,25 @@ fn load_query_sel(
                 .into_iter()
                 .filter(|o| kits.contains_key(o))
                 .collect();
+            // The stock alternatives of the fitted parts (bonnet variants,
+            // aerial, light bar and plate mounts, engine pieces): a fitted
+            // part sets keys, and each switch of a fitted part shows the
+            // element its options give for them, else its default.
+            const STOCK: u64 = u64::MAX;
+            let mut chosen = chosen;
+            let fitted: std::collections::HashSet<u32> = chosen.iter().flat_map(|o| part_names.get(o).into_iter().flatten().copied()).collect();
+            let keys: std::collections::HashSet<u32> = fitted.iter().flat_map(|p| v.part_keys.get(p).into_iter().flatten().copied()).collect();
+            let stock: Vec<(u64, u32, Vec<u32>)> = v
+                .switches
+                .iter()
+                .filter(|s| s.part.is_none_or(|p| fitted.contains(&p)))
+                .filter_map(|s| s.pick(&keys))
+                .filter_map(|e| Some((*assets.get(&e.asset)?, e.bone, e.hides.clone())))
+                .collect();
+            if !stock.is_empty() {
+                kits.insert(STOCK, stock);
+                chosen.push(STOCK);
+            }
             if !chosen.is_empty() {
                 let joaat = |s: &str| sixng_core::meta7a::joaat(&s.to_ascii_lowercase());
                 let mut model = model;
@@ -5336,7 +5382,7 @@ fn load_query_sel(
                     source: format!("{} {} (+{} parts)", e.id, name, names.len()),
                     info,
                     parts: opts,
-                    selected: chosen,
+                    selected: chosen.into_iter().filter(|o| *o != STOCK).collect(),
                     base: String::new(),
                     fur: None,
                     fur_skin: Default::default(),
@@ -6137,7 +6183,7 @@ fn is_wheel_bone(n: &str) -> bool {
 /// option the name hashes of its parts (what a configuration's part list
 /// holds; two parts can fit the same model).
 #[allow(clippy::type_complexity)]
-fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db::Vehicle) -> (Vec<crate::assemble::PartOpt>, HashMap<u64, Vec<(u64, u32, Vec<u32>)>>, HashMap<u64, Vec<u32>>) {
+fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db::Vehicle) -> (Vec<crate::assemble::PartOpt>, HashMap<u64, Vec<(u64, u32, Vec<u32>)>>, HashMap<u64, Vec<u32>>, HashMap<u64, u64>) {
     let mut part_names: HashMap<u64, Vec<u32>> = HashMap::new();
     let joaat = sixng_core::meta7a::joaat;
     let vl = vehicle.to_ascii_lowercase();
@@ -6283,8 +6329,27 @@ fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db:
         opts.push(crate::assemble::PartOpt { off: e.off, id: e.id.clone(), name: stem.clone(), group: "body (link not known)".into(), label: body.to_string(), default: i == 0 && !v.configs.is_empty() && !opts.iter().any(|o| o.group == "body") });
         kits.insert(e.off, vec![(e.off, joaat("mod_bed_attach"), Vec::new())]);
     }
+    // Parts without a model that set a key some switch answers to (a
+    // front number plate, a roof aerial ...): offered as choices too, so a
+    // configuration's and the user's choice of them reaches the switches.
+    // They place nothing themselves.
+    let answered: std::collections::HashSet<u32> = v.switches.iter().flat_map(|s| s.options.iter().flat_map(|o| [o.0, o.1])).filter(|k| *k != 0).collect();
+    let with_model: std::collections::HashSet<u32> = part_names.values().flatten().copied().collect();
+    let mut keyed: Vec<(&u32, &Vec<u32>)> = v.part_keys.iter().filter(|(p, k)| !with_model.contains(p) && k.iter().any(|k| answered.contains(k))).collect();
+    keyed.sort();
+    if let Some(any) = ix.entries.first() {
+        for (p, _) in keyed {
+            // not an archive offset: the top bit marks a part without a model
+            let off = (1u64 << 63) | *p as u64;
+            opts.push(crate::assemble::PartOpt { off, id: any.id.clone(), name: format!("{p:08x}"), group: format!("no model {p:08x}"), label: "fitted (changes stock pieces)".into(), default: first_config.contains(p) });
+            part_names.entry(off).or_default().push(*p);
+            kits.insert(off, Vec::new());
+        }
+    }
     opts.sort_by(|a, b| a.group.cmp(&b.group).then(a.label.cmp(&b.label)));
-    (opts, kits, part_names)
+    // asset id -> model, for the chassis part's stock alternatives
+    let assets = by_asset.iter().map(|(a, x)| (*a, x.1.off)).collect();
+    (opts, kits, part_names, assets)
 }
 
 /// Move a model's geometry by a rigid transform (weapon parts onto their
@@ -6386,6 +6451,8 @@ fn export_load_shaped(
                 || j.contains("e68a4a98") && !j.contains("\"gunmetal\"") && !j.contains("\"weapon_parts\"")
                 // and from before weapon parts took their preset colours
                 || j.contains("e68a4a98") && !j.contains("\"weapon_preset\"")
+                // and from before their metalness and roughness per sub-material
+                || j.contains("\"weapon_parts\"") && !j.contains("\"sub_material_surface\"")
         });
     // Cached ped clothing from before the fabric shade came from the packed map.
     let stale_cloth = std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| j.contains("739e3d0d") && !j.contains("shade_source"));

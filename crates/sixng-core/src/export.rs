@@ -461,12 +461,20 @@ const WEAPON_SHADER: &str = "e68a4a98";
 
 /// The layered-material preset of a weapon model and its sub-material base
 /// colours (sRGB), from the weapon library (`matlib`).
-fn weapon_preset(a: &ArchiveInfo, name: &str) -> Option<(String, Vec<Option<[u8; 3]>>)> {
+/// Metalness and roughness of a weapon sub-material as the alpha byte of
+/// its vertex colour, the code the viewer already reads for vehicle parts:
+/// metalness in four steps x 50 + roughness in 50 steps (0..=199).
+pub fn surface_code(s: [f32; 2]) -> u8 {
+    ((s[0].clamp(0.0, 1.0) * 3.0).round() * 50.0 + (s[1].clamp(0.0, 1.0) * 49.0).round()) as u8
+}
+
+fn weapon_preset(a: &ArchiveInfo, name: &str) -> Option<(String, Vec<Option<[u8; 3]>>, Vec<[f32; 2]>)> {
     static PRESETS: std::sync::OnceLock<Option<crate::matlib::Index>> = std::sync::OnceLock::new();
     let ix = PRESETS.get_or_init(|| crate::matlib::Index::load_or_build(&Workspace::new(game_root(a), crate::names::work_dir()?)).ok()).as_ref()?;
     let preset = ix.weapon_presets(name).first()?.clone();
     let subs: Vec<Option<[u8; 3]>> = ix.colours(&preset)?.iter().map(|c| c.map(|c| [c[0], c[1], c[2]])).collect();
-    subs.iter().any(|c| c.is_some()).then_some((preset, subs))
+    let surf = ix.surface(&preset).map(<[_]>::to_vec).unwrap_or_default();
+    subs.iter().any(|c| c.is_some()).then_some((preset, subs, surf))
 }
 
 fn classify_shader(s: &crate::drawable::Shader, st: &ShaderTextures) -> serde_json::Value {
@@ -1325,8 +1333,8 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         for (s, st) in info.shaders.iter().zip(shader_tex.iter_mut()).filter(|(s, _)| s.name_hash == WEAPON_SHADER) {
             let _ = s;
             st.weapon_preset = Some(match &wp {
-                Some((p, subs)) => serde_json::json!({"preset": p, "sub_material_colours": subs,
-                    "applied": "COLOR_0 = the preset's base colour of each vertex's sub-material (green byte of the raw colour stream / 4), linear; the base colour factor is white. The tile texture, the gradient and the tint-mask, dirt and wear layers are not applied; metalness and roughness are one stand-in for every part."}),
+                Some((p, subs, surf)) => serde_json::json!({"preset": p, "sub_material_colours": subs, "sub_material_surface": surf,
+                    "applied": "COLOR_0 = the preset's base colour of each vertex's sub-material (green byte of the raw colour stream / 4), linear; the base colour factor is white. COLOR_0 alpha = the sub-material's metalness and roughness (`sub_material_surface`: [metalness, roughness], inferred from two unnamed library parameters) as a code: round(metalness x 3) x 50 + round(roughness x 49). The material's own metallic and roughness factors stay one stand-in. The tile texture, the gradient and the tint-mask, dirt and wear layers are not applied."}),
                 None => serde_json::json!({"preset": null}),
             });
         }
@@ -1459,9 +1467,11 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
                     let x = v as f32 / 255.0;
                     ((if x <= 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) }) * 255.0 + 0.5) as u8
                 };
+                let surf: Vec<[f32; 2]> = serde_json::from_value(w["sub_material_surface"].clone()).unwrap_or_default();
                 tint = Some(c.iter().map(|c| {
-                    let k = subs.get(((c[1] >> 2) & 7) as usize).copied().flatten().unwrap_or(first);
-                    [lin(k[0]), lin(k[1]), lin(k[2]), 255]
+                    let s = ((c[1] >> 2) & 7) as usize;
+                    let k = subs.get(s).copied().flatten().unwrap_or(first);
+                    [lin(k[0]), lin(k[1]), lin(k[2]), surf.get(s).map_or(255, |&x| surface_code(x))]
                 }).collect());
             }
         }

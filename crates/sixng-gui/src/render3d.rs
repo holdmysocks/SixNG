@@ -43,6 +43,9 @@ pub struct FrameU {
 struct MatU {
     base: [f32; 4],
     flags: [u32; 4],
+    /// Fabric detail tile: UV scale, rotation, the tile's mean grey value,
+    /// 1 = bound.
+    tile: [f32; 4],
 }
 
 #[repr(C)]
@@ -628,6 +631,7 @@ impl Renderer3D {
                 tex_entry(2),
                 tex_entry(3),
                 tex_entry(4),
+                tex_entry(5),
             ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1297,6 +1301,7 @@ impl Uploader {
             mr: None,
             tint_mask: false,
             ped_shade: false,
+            detail: None,
             parts: false,
             occlusion_only: false,
             slots: vec![],
@@ -1342,7 +1347,10 @@ impl Uploader {
             let mr = mt.mr.map_or(0, |[m, r]| {
                 let q = |x: f32| (x.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
                 0x100 | (q(m) << 16) | (q(r) << 24)
-            }) | if mt.tint_mask { 0x200 } else { 0 } | if mt.parts { 0x400 } else { 0 }
+            }) | if mt.tint_mask { 0x200 } else { 0 }
+                // bit 10: the vertex tint's alpha carries metalness and roughness
+                // (vehicle parts; weapon parts, by the `weapon` shader's hash)
+                | if mt.parts || mt.shader_hash == "e68a4a98" { 0x400 } else { 0 }
                 // bit 11: a lamp's emissive mesh (standard_vehicle_emissive_animated_bones)
                 | if mt.name.ends_with("29648098") { 0x800 } else { 0 }
                 // bit 13: the packed map is a vehicle material map, blue = occlusion
@@ -1350,6 +1358,7 @@ impl Uploader {
             let u = MatU {
                 base,
                 flags: [has, class_id(&mt.class), alpha, gap | mr],
+                tile: mt.detail.map_or([0.0; 4], |d| [d.scale, d.rot, d.mean, 1.0]),
             };
             let o = k * MAT_STRIDE as usize;
             mat_bytes[o..o + std::mem::size_of::<MatU>()].copy_from_slice(bytemuck::bytes_of(&u));
@@ -1380,6 +1389,10 @@ impl Uploader {
                     wgpu::BindGroupEntry {
                         binding: 4,
                         resource: wgpu::BindingResource::TextureView(view(mt.emissive)),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(view(mt.detail.map(|d| d.image))),
                     },
                 ],
             });
