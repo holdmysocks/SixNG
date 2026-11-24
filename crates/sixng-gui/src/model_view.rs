@@ -1949,7 +1949,7 @@ impl ModelView {
             if let Some(ix) = ix {
                 // the model's own name, LOD suffix and all ("<id> <name> (+3 parts)")
                 let model = l.source.split_whitespace().nth(1).unwrap_or("");
-                let (_, _, part_names) = vehicle_part_options(&ix, model, v);
+                let (_, _, part_names, _) = vehicle_part_options(&ix, model, v);
                 // one part per group: a part list also holds the choices
                 // of its option lists, of which the game takes one
                 let mut groups = std::collections::HashSet::new();
@@ -5222,7 +5222,7 @@ fn load_query_sel(
     if e.rtype.as_deref() == Some("ft") && info["wheel_mounts"].as_array().is_some_and(|w| !w.is_empty()) {
         let db = sixng_core::names::work_dir().and_then(|w| crate::vehicle_db::shared(&export::game_root(&a).to_string_lossy(), &w.to_string_lossy()).ok());
         if let Some(v) = db.as_ref().and_then(|db| crate::vehicle_db::find(db, &crate::vehicle_db::model_key(name))) {
-            let (opts, kits, _) = vehicle_part_options(&ix, name, v);
+            let (opts, mut kits, part_names, assets) = vehicle_part_options(&ix, name, v);
             // no choice made yet: the parts of the first configuration
             let chosen: Vec<u64> = sel
                 .clone()
@@ -5234,6 +5234,25 @@ fn load_query_sel(
                 .into_iter()
                 .filter(|o| kits.contains_key(o))
                 .collect();
+            // The stock alternatives of the fitted parts (bonnet variants,
+            // aerial, light bar and plate mounts, engine pieces): a fitted
+            // part sets keys, and each switch of a fitted part shows the
+            // element its options give for them, else its default.
+            const STOCK: u64 = u64::MAX;
+            let mut chosen = chosen;
+            let fitted: std::collections::HashSet<u32> = chosen.iter().flat_map(|o| part_names.get(o).into_iter().flatten().copied()).collect();
+            let keys: std::collections::HashSet<u32> = fitted.iter().flat_map(|p| v.part_keys.get(p).into_iter().flatten().copied()).collect();
+            let stock: Vec<(u64, u32, Vec<u32>)> = v
+                .switches
+                .iter()
+                .filter(|s| s.part.is_none_or(|p| fitted.contains(&p)))
+                .filter_map(|s| s.pick(&keys))
+                .filter_map(|e| Some((*assets.get(&e.asset)?, e.bone, e.hides.clone())))
+                .collect();
+            if !stock.is_empty() {
+                kits.insert(STOCK, stock);
+                chosen.push(STOCK);
+            }
             if !chosen.is_empty() {
                 let joaat = |s: &str| sixng_core::meta7a::joaat(&s.to_ascii_lowercase());
                 let mut model = model;
@@ -5321,7 +5340,7 @@ fn load_query_sel(
                     source: format!("{} {} (+{} parts)", e.id, name, names.len()),
                     info,
                     parts: opts,
-                    selected: chosen,
+                    selected: chosen.into_iter().filter(|o| *o != STOCK).collect(),
                     base: String::new(),
                     fur: None,
                     fur_skin: Default::default(),
@@ -6122,7 +6141,7 @@ fn is_wheel_bone(n: &str) -> bool {
 /// option the name hashes of its parts (what a configuration's part list
 /// holds; two parts can fit the same model).
 #[allow(clippy::type_complexity)]
-fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db::Vehicle) -> (Vec<crate::assemble::PartOpt>, HashMap<u64, Vec<(u64, u32, Vec<u32>)>>, HashMap<u64, Vec<u32>>) {
+fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db::Vehicle) -> (Vec<crate::assemble::PartOpt>, HashMap<u64, Vec<(u64, u32, Vec<u32>)>>, HashMap<u64, Vec<u32>>, HashMap<u64, u64>) {
     let mut part_names: HashMap<u64, Vec<u32>> = HashMap::new();
     let joaat = sixng_core::meta7a::joaat;
     let vl = vehicle.to_ascii_lowercase();
@@ -6268,8 +6287,27 @@ fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db:
         opts.push(crate::assemble::PartOpt { off: e.off, id: e.id.clone(), name: stem.clone(), group: "body (link not known)".into(), label: body.to_string(), default: i == 0 && !v.configs.is_empty() && !opts.iter().any(|o| o.group == "body") });
         kits.insert(e.off, vec![(e.off, joaat("mod_bed_attach"), Vec::new())]);
     }
+    // Parts without a model that set a key some switch answers to (a
+    // front number plate, a roof aerial ...): offered as choices too, so a
+    // configuration's and the user's choice of them reaches the switches.
+    // They place nothing themselves.
+    let answered: std::collections::HashSet<u32> = v.switches.iter().flat_map(|s| s.options.iter().flat_map(|o| [o.0, o.1])).filter(|k| *k != 0).collect();
+    let with_model: std::collections::HashSet<u32> = part_names.values().flatten().copied().collect();
+    let mut keyed: Vec<(&u32, &Vec<u32>)> = v.part_keys.iter().filter(|(p, k)| !with_model.contains(p) && k.iter().any(|k| answered.contains(k))).collect();
+    keyed.sort();
+    if let Some(any) = ix.entries.first() {
+        for (p, _) in keyed {
+            // not an archive offset: the top bit marks a part without a model
+            let off = (1u64 << 63) | *p as u64;
+            opts.push(crate::assemble::PartOpt { off, id: any.id.clone(), name: format!("{p:08x}"), group: format!("no model {p:08x}"), label: "fitted (changes stock pieces)".into(), default: first_config.contains(p) });
+            part_names.entry(off).or_default().push(*p);
+            kits.insert(off, Vec::new());
+        }
+    }
     opts.sort_by(|a, b| a.group.cmp(&b.group).then(a.label.cmp(&b.label)));
-    (opts, kits, part_names)
+    // asset id -> model, for the chassis part's stock alternatives
+    let assets = by_asset.iter().map(|(a, x)| (*a, x.1.off)).collect();
+    (opts, kits, part_names, assets)
 }
 
 /// Move a model's geometry by a rigid transform (weapon parts onto their
