@@ -500,7 +500,7 @@ pub fn four_layer_params(consts: &[crate::drawable::ShaderConst]) -> Value {
                 l.insert(key(&c.hash), json!(v[k]));
             }
         } else {
-            other.insert(key(&c.hash), if v.len() == 1 { json!(v[0]) } else { json!(v) });
+            other.insert(key(&c.hash), c.json().unwrap_or(Value::Null));
         }
     }
     json!({
@@ -589,7 +589,7 @@ mod paint_tests {
         assert_eq!(l["layers"][3]["colour"]["status"], "no texture bound");
         assert_eq!(l["weights"]["texture"]["png"], "t2.png");
         // layer UVs from the material's constants: layer 1 uses the second set
-        let c4 = |hash: &str, v: [f32; 4]| crate::drawable::ShaderConst { hash: hash.into(), desc: String::new(), offset: 0, values: Some(v), buffer: 7, count: 4 };
+        let c4 = |hash: &str, v: [f32; 4]| crate::drawable::ShaderConst { hash: hash.into(), desc: String::new(), offset: 0, values: Some(v), buffer: 7, count: 4, ty: None };
         let sh = crate::drawable::Shader { index: 0, record_off: 0, name_hash: "61e09df7".into(), param_hashes: vec![], textures: vec![], flags: vec![],
             constants: vec![c4("4344d2cc", [128.0, 128.0, 0.0, 0.0]), c4("9ecaaa1e", [1.0, 2.0, 0.5, 0.0]), c4("724bed95", [1.0, 2.0, 1.0, 1.0])] };
         let m = multilayer(&sh, &entries, || Value::Null).unwrap();
@@ -599,7 +599,7 @@ mod paint_tests {
         // without the constants the assumed values stay and say so
         assert_eq!((l["layers"][0]["uv_scale"].as_f64(), l["layers"][0]["uv_source"].as_str().map(|s| s.starts_with("assumed"))), (Some(128.0), Some(true)));
         // constants: float4s per layer, the UV transforms and scalars with the material
-        let k = |hash: &str, count: u8, v: [f32; 4]| crate::drawable::ShaderConst { hash: hash.into(), desc: String::new(), offset: 0, values: Some(v), buffer: 7, count };
+        let k = |hash: &str, count: u8, v: [f32; 4]| crate::drawable::ShaderConst { hash: hash.into(), desc: String::new(), offset: 0, values: Some(v), buffer: 7, count, ty: None };
         let p = four_layer_params(&[k("4344d2cc", 4, [128.0, 128.0, 0.0, 0.0]), k("0f0f0f0f", 4, [1.0, 0.7, 0.2, 1.0]), k("0e0e0e0e", 1, [3.0, 0.0, 0.0, 0.0])]);
         assert_eq!((p["per_layer"][1]["0f0f0f0f"].as_f64().map(|x| (x * 10.0).round()), p["per_layer"][0].as_object().map(|o| o.len())), (Some(7.0), Some(1)));
         assert_eq!((p["material"]["4344d2cc"][0].as_f64(), p["material"]["0e0e0e0e"].as_f64()), (Some(128.0), Some(3.0)));

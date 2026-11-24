@@ -1874,10 +1874,10 @@ impl ModelView {
             // token value (0.05 to 0.08); their wheel bones mark the skids
             // (an electric scooter has the same token wheelScale and no rim,
             // but its wheels have collision discs)
-            self.veh_no_wheels = !v.configs.is_empty()
-                && v.configs.iter().all(|c| c.rim.is_none())
-                && v.wheel_scale.is_some_and(|w| w < 0.1)
-                && self.discs().iter().all(|d| d.is_none());
+            // boats: an airboat has wheel bones and an ordinary wheelScale,
+            // but it is a boat
+            self.veh_no_wheels = crate::vehicle_db::is_boat(v.vtype)
+                || (!v.configs.is_empty() && v.configs.iter().all(|c| c.rim.is_none()) && v.wheel_scale.is_some_and(|w| w < 0.1) && self.discs().iter().all(|d| d.is_none()));
             self.veh_cfg = None;
             if !v.configs.is_empty() {
                 self.apply_config(v, self.cfg_request.filter(|i| *i < v.configs.len()).unwrap_or(0));
@@ -4582,6 +4582,10 @@ fn rig_character(m: &mut glb::Model, parts: &[(std::ops::Range<usize>, Vec<glb::
     let mut helper: Vec<(usize, usize)> = Vec::new();
     for (range, pj, attached) in parts {
         let same = pj.len() >= n && (0..n).all(|i| pj[i].name == joints[i].name);
+        if std::env::var_os("SIXNG_DEBUG_RIG").is_some() {
+            let first = (0..n.min(pj.len())).find(|&i| pj[i].name != joints[i].name);
+            eprintln!("[rig] meshes {range:?}: {} joints (shared {n}), same {same}, first difference {:?}, attached {attached:?}, mesh {:?}", pj.len(), first.map(|i| (i, &pj[i].name, &joints[i].name)), m.meshes.get(range.start).map(|x| (&x.name, x.skinned, x.verts.len())));
+        }
         if !same {
             continue;
         }
@@ -4597,6 +4601,26 @@ fn rig_character(m: &mut glb::Model, parts: &[(std::ops::Range<usize>, Vec<glb::
             }
             j.min(n - 1) as u16
         };
+        if std::env::var_os("SIXNG_DEBUG_RIG").is_some() {
+            let mut seen = std::collections::BTreeSet::new();
+            for me in range.clone().filter_map(|mi| m.meshes.get(mi)) {
+                for v in &me.verts {
+                    for k in 0..4 {
+                        if v.weights[k] > 0 && v.joints[k] as usize >= n {
+                            seen.insert(v.joints[k] as usize);
+                        }
+                    }
+                }
+            }
+            for j in seen.iter().take(12) {
+                let chain: Vec<String> = std::iter::successors(Some(*j), |&x| pj.get(x).and_then(|q| q.parent).filter(|&p| p != x)).take(6).map(|x| format!("{}#{x}", pj[x].name)).collect();
+                eprintln!("[rig]   own joint {} -> {} | chain {chain:?}", pj[*j].name, joints[up(*j) as usize].name);
+            }
+        }
+        // The face rig's own bones (eyeballs, irises, tongue: `FB_...`,
+        // `FACIAL_...`) hang from the head, and their parts must stay with
+        // it; the nearest body skin under an eye is the neck.
+        let face = |j: usize| std::iter::successors(Some(j), |&x| pj.get(x).and_then(|q| q.parent).filter(|&p| p != x && x >= n)).take(64).any(|x| pj.get(x).is_some_and(|q| q.name.starts_with("FB_") || q.name.starts_with("FACIAL_")));
         let fixed = attached.map(|a| up(a));
         for mi in range.clone() {
             let Some(me) = m.meshes.get_mut(mi) else { continue };
@@ -4614,7 +4638,8 @@ fn rig_character(m: &mut glb::Model, parts: &[(std::ops::Range<usize>, Vec<glb::
                     continue;
                 }
                 let own: u32 = (0..4).filter(|&k| v.joints[k] as usize >= n).map(|k| v.weights[k] as u32).sum();
-                if own * 2 >= tot {
+                let on_face: u32 = (0..4).filter(|&k| v.joints[k] as usize >= n && face(v.joints[k] as usize)).map(|k| v.weights[k] as u32).sum();
+                if own * 2 >= tot && on_face * 2 < own {
                     helper.push((mi, vi));
                 }
                 let mut w: [u32; 4] = std::array::from_fn(|k| v.weights[k] as u32 * 255 / tot);

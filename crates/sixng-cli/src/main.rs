@@ -269,6 +269,26 @@ enum Cmd {
         /// Write crossed ribbon meshes of this half-width (mm) instead of lines (render in any viewer).
         #[arg(long)]
         ribbons: Option<f32>,
+        /// Write the full strand set instead of the guide strands alone:
+        /// the strands the groom stores per root triangle, grown between
+        /// its three guides (the game's own clumping, curl and noise are
+        /// not decoded). Also writes <offset>.growth.json with the root
+        /// triangles, their strand counts, the strand width and its taper,
+        /// to rebuild the hair elsewhere. Grooms that store no counts
+        /// keep their guides.
+        #[arg(long)]
+        full: bool,
+        /// With --full: share of the stored strands to write, 0 to 1.
+        #[arg(long, default_value_t = 1.0)]
+        density: f32,
+        /// Export the fur of this animal (its root name, e.g.
+        /// crm_cat_feral_m_00): the grooms of its default body and head
+        /// fur, in the animal's model space, so they sit on the model that
+        /// `outfit <root>` exports. The link is inferred (archive order,
+        /// piece counts, distance to the skin), not stored; it is written
+        /// with its agreement score to <root>.fur.json.
+        #[arg(long)]
+        animal: Option<String>,
         /// Only these groom offsets (hex, comma-separated).
         #[arg(long, value_delimiter = ',')]
         only: Vec<String>,
@@ -524,6 +544,19 @@ enum Cmd {
         /// Print the vehicle's configurations (colour, part count) and stop.
         #[arg(long)]
         list: bool,
+        /// Print the vehicle's parts that have models (part name, slot,
+        /// models, how many configurations name it) and stop.
+        #[arg(long)]
+        list_parts: bool,
+        /// Parts to fit on top of the configuration's, by part name (8 hex
+        /// digits from --list-parts, comma separated). A part replaces the
+        /// configuration's part in the same slot.
+        #[arg(long, value_delimiter = ',')]
+        with: Vec<String>,
+        /// Parts of the configuration to leave off (8 hex digits, comma
+        /// separated).
+        #[arg(long, value_delimiter = ',')]
+        without: Vec<String>,
         /// A vehicles.json from `sixng vehicles` (default: built now, into
         /// the output folder).
         #[arg(long)]
@@ -758,6 +791,11 @@ enum Cmd {
         /// Hashes (hex) to look up instead of building.
         #[arg(long, value_delimiter = ',')]
         lookup: Vec<String>,
+        /// Import a gta6-namehash dictionary.json (public GTA V names) into
+        /// `<work>/names/namehash.json` instead of building. Its names are
+        /// used only for hashes no other source names.
+        #[arg(long)]
+        namehash: Option<PathBuf>,
     },
     /// Export a character or an animal as ONE rigged GLB: its outfit parts
     /// (head, hair, top, bottom, shoes …; the default look, or --parts), or
@@ -802,6 +840,10 @@ enum Cmd {
         /// have the same names.
         #[arg(long)]
         anim_only: bool,
+        /// Leave the clip's own movement over the ground (its mover
+        /// tracks) out of the animation, so it plays in place.
+        #[arg(long)]
+        in_place: bool,
         /// Texture output: png, dds, or both.
         #[arg(long, default_value = "png")]
         tex: String,
@@ -1201,8 +1243,12 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 "material_texture_parameters": {"total": tex.len(), "unnamed": unnamed.len(), "unnamed_list": unnamed},
                 "pipeline_cache": cache_summary, "matched_effects": effects, "seconds": t.elapsed().as_secs_f64()}));
         }
-        Cmd::Names { lookup } => {
-            if lookup.is_empty() {
+        Cmd::Names { lookup, namehash } => {
+            if let Some(p) = namehash {
+                let mut r = sixng_core::names::import_namehash(&p, &ws.work)?;
+                r["ok"] = json!(true);
+                out.print(&r);
+            } else if lookup.is_empty() {
                 let t = Instant::now();
                 let mut r = sixng_core::names::build(&ws.game, &ws.index_dir(), &ws.work)?;
                 r["seconds"] = json!(t.elapsed().as_secs_f64());
@@ -1217,7 +1263,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 out.print(&json!({"ok": true, "results": v}));
             }
         }
-        Cmd::Outfit { character, out: glb, archive, parts, add, list, clip, anim_only, tex, body_shape, head_skin, tex_remap, tint, look } => {
+        Cmd::Outfit { character, out: glb, archive, parts, add, list, clip, anim_only, in_place, tex, body_shape, head_skin, tex_remap, tint, look } => {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
             let prefix = character.to_ascii_lowercase();
@@ -1327,7 +1373,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 let (name, pal, rows) = sixng_core::pedtint::parse_spec(t).map_err(|e| anyhow!(e))?;
                 eo.ped_tints.insert(name, (pal, rows));
             }
-            let mut r = sixng_core::outfit::export_outfit(&a, &sel, &prefix, &glb, &eo, &clip_refs, *anim_only)?;
+            let mut r = sixng_core::outfit::export_outfit(&a, &sel, &prefix, &glb, &eo, &clip_refs, *anim_only, *in_place)?;
             r["seconds"] = t.elapsed().as_secs_f64().into();
             out.print(&json!({"ok": true, "result": r}));
         }
@@ -1496,7 +1542,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             out.print(&json!({"ok": true, "archive": a.id, "scanned": sel.len(), "tiles": n, "tiles_with_roads": roads,
                 "seconds": t.elapsed().as_secs_f64(), "index": po.join("navmesh").join(a.id.trim_end_matches(".rpf")).join("index.jsonl")}));
         }
-        Cmd::Grooms { archive, roots, ribbons, only, list, out: po } => {
+        Cmd::Grooms { archive, roots, ribbons, full, density, animal, only, list, out: po } => {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
             let t = Instant::now();
@@ -1511,9 +1557,41 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 }
                 out.print(&json!({"ok": true, "grooms": cat.len(), "chains": cat.iter().filter(|g| g.lod == 0).count(), "chains_by_region": by, "file": dir.join("catalog.json"), "seconds": t.elapsed().as_secs_f64()}));
             } else {
-                let only: Vec<u64> = only.iter().filter_map(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()).collect();
-                let (n, errors) = sixng_core::groom::export_grooms(&a, &ix.entries, &only, po, *roots, ribbons.map(|mm| mm / 1000.0), pr)?;
-                out.print(&json!({"ok": true, "archive": a.id, "grooms": n, "errors": errors,
+                let mut only: Vec<u64> = only.iter().filter_map(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()).collect();
+                let mut fur = serde_json::Value::Null;
+                if let Some(root) = animal {
+                    let root = root.to_ascii_lowercase();
+                    // the animal's parts (not its fur placeholders), one entry per name
+                    let mut seen = std::collections::HashSet::new();
+                    let skin: Vec<(String, Vec<[f32; 3]>)> = ix
+                        .entries
+                        .iter()
+                        .filter(|e| e.rtype.as_deref() == Some("dr"))
+                        .filter_map(|e| {
+                            let n = e.name.as_ref()?.to_ascii_lowercase();
+                            (n.starts_with(&format!("{root}_")) && !n.contains("_fur_") && seen.insert(n.clone())).then_some((n, e))
+                        })
+                        .filter_map(|(n, e)| Some((n, sixng_core::pedlook::mesh_points(&a, e)?)))
+                        .collect();
+                    if skin.is_empty() {
+                        bail!("no parts named {root}_<part>_NN in {} (`sixng characters --kind animal` lists the roots)", a.id);
+                    }
+                    let link = sixng_core::furlink::for_animal(&ws.work, &a, &ix.entries, &root, &skin)?;
+                    let picked: Vec<&sixng_core::furlink::Variant> = ["body", "head"].iter().filter_map(|s| link.default_variant(s)).collect();
+                    if picked.is_empty() {
+                        bail!("no fur grooms were placed for {root}: {}", link.note);
+                    }
+                    only = picked.iter().flat_map(|v| v.grooms.iter().copied()).collect();
+                    fur = json!({"animal": root, "variants": picked.iter().map(|v| json!({"name": v.name, "slot": v.slot, "grooms": v.grooms.iter().map(|g| format!("{g:x}")).collect::<Vec<_>>(), "count_known": v.known, "count_exact": v.exact})).collect::<Vec<_>>(),
+                        "other_variants": link.variants.iter().filter(|v| !picked.iter().any(|p| p.name == v.name)).map(|v| v.name.clone()).collect::<Vec<_>>(),
+                        "agreement": link.agreement, "note": link.note,
+                        "link": "inferred from archive order, piece counts and distance to the skin; no resource stores it"});
+                    let dir = po.join("grooms").join(a.id.trim_end_matches(".rpf"));
+                    std::fs::create_dir_all(&dir)?;
+                    std::fs::write(dir.join(format!("{root}.fur.json")), serde_json::to_vec_pretty(&fur)?)?;
+                }
+                let (n, errors) = sixng_core::groom::export_grooms(&a, &ix.entries, &only, po, *roots, ribbons.map(|mm| mm / 1000.0), full.then_some(density.clamp(0.0, 1.0)), pr)?;
+                out.print(&json!({"ok": true, "archive": a.id, "grooms": n, "errors": errors, "fur": fur,
                     "seconds": t.elapsed().as_secs_f64(), "index": po.join("grooms").join(a.id.trim_end_matches(".rpf")).join("index.jsonl")}));
             }
         }
@@ -1878,7 +1956,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let v = sixng_core::pso::export_handling(&a, &sel, &names, po)?;
             out.print(&json!({"ok": true, "archive": a.id, "stats": v, "seconds": t.elapsed().as_secs_f64()}));
         }
-        Cmd::Vehicle { name, out: glb, config, no_wheels, list, data, archive, tex } => {
+        Cmd::Vehicle { name, out: glb, config, no_wheels, list, list_parts, with, without, data, archive, tex } => {
             let t = Instant::now();
             let dir = glb.as_ref().and_then(|g| g.parent().map(|p| p.to_path_buf())).filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| PathBuf::from("."));
             let file = match data {
@@ -1898,11 +1976,17 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 out.print(&json!({"ok": true, "vehicle": want, "configurations": cfgs}));
                 return Ok(());
             }
-            let Some(glb) = glb else { bail!("give the output file with -o <file.glb>") };
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
+            if *list_parts {
+                out.print(&json!({"ok": true, "vehicle": want, "parts": sixng_core::vehexport::list_parts(&ix, v)}));
+                return Ok(());
+            }
+            let Some(glb) = glb else { bail!("give the output file with -o <file.glb>") };
+            let parts = |l: &[String]| -> Result<Vec<u32>> { l.iter().map(|p| u32::from_str_radix(p.trim(), 16).map_err(|_| anyhow::anyhow!("{p} is not a part name (8 hex digits, see --list-parts)"))).collect() };
+            let (with, without) = (parts(with)?, parts(without)?);
             let oa = OutArgs { out: dir.clone(), tex: tex.clone(), raw: false, force: true, no_embedded_textures: false, dry_run: false, body_shape: None, head_skin: 0, paint: None };
-            let mut r = sixng_core::vehexport::export_vehicle(&a, &ix, v, *config, !*no_wheels, glb, &oa.opts())?;
+            let mut r = sixng_core::vehexport::export_vehicle(&a, &ix, v, *config, &with, &without, !*no_wheels, glb, &oa.opts())?;
             r["seconds"] = t.elapsed().as_secs_f64().into();
             out.print(&json!({"ok": true, "result": r}));
         }

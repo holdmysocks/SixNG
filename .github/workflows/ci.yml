@@ -12,7 +12,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
+        # macOS runners are often unavailable; a merge to master runs Windows and
+        # Linux only. PRs and a manual run (do one before a release) run all three.
+        os: ${{ github.event_name == 'push' && fromJSON('["windows-latest", "ubuntu-latest"]') || fromJSON('["windows-latest", "macos-latest", "ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
