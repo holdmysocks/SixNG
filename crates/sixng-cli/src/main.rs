@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+mod bench;
+
 #[derive(Parser)]
 #[command(name = "sixng", version, about = "GTA VI (RPF9 / Xbox Series) asset extractor")]
 struct Cli {
@@ -25,8 +27,10 @@ struct Cli {
     /// Pretty-print JSON output.
     #[arg(long, global = true)]
     pretty: bool,
+    #[command(flatten)]
+    bench: bench::BenchArgs,
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(clap::Args, Clone, Default)]
@@ -1032,7 +1036,12 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
     let game = game_root(cli)?;
     let ws = Workspace::new(&game, &cli.work);
     let pr = progress(cli.quiet);
-    match &cli.cmd {
+    if cli.bench.bench {
+        out.print(&bench::run(&ws, &cli.bench)?);
+        return Ok(());
+    }
+    let Some(cmd) = &cli.cmd else { bail!("no command given: see `sixng --help`") };
+    match cmd {
         Cmd::Info => {
             let mut v = Vec::new();
             for a in ws.archives() {
