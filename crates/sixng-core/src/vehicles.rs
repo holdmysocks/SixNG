@@ -34,7 +34,7 @@ const OWNER: u32 = 0xfb1f_80ff;
 /// `handlingId` (case-sensitive joaat).
 const HANDLING_ID: u32 = 0xec41_bd9c;
 /// Layout version of vehicles.json; the model viewer rebuilds older files.
-pub const FORMAT: u32 = 14;
+pub const FORMAT: u32 = 15;
 /// A mod part or kit of one vehicle (in that vehicle's own pack resource):
 /// `name` joaat of the part model's name, or of a kit's name (the names of
 /// its left and right models without the side word:
@@ -148,6 +148,37 @@ fn element_json(e: &Value) -> Value {
 
 /// The keys a part sets while fitted: part name -> keys, from its modifier
 /// list and the key modifiers of the same resource.
+/// A wheel fitment record (`9a172293`), named in a part's modifier list.
+/// One marked relative (`0341ff8f`) changes the wheels of the vehicle the
+/// part is on: a widebody kit moves them out and widens the tyres.
+const WHEEL_FIT: u32 = 0x9a17_2293;
+const FIT_RELATIVE: u32 = 0x0341_ff8f;
+const FIT_OFFSET: u32 = 0x534c_819f;
+const FIT_AXLES: u32 = 0xba43_4b0e;
+
+/// What a wheel fitment record changes, or None when it changes none of
+/// width, offset and spacing (a rim size record).
+fn fit_json(f: &Value) -> Option<Value> {
+    let num = |h: u32| get(f, h).and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let (width, offset, spacing) = (num(crate::meta7a::joaat("width")), num(FIT_OFFSET), num(crate::meta7a::joaat("spacing")));
+    if width == 0.0 && offset == 0.0 && spacing == 0.0 {
+        return None;
+    }
+    // a 64-bit value whose high half is the axle mask
+    let axles = get(f, FIT_AXLES).and_then(|x| x.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()).or_else(|| x.as_u64())).map_or(0, |v| (v >> 32) as u32);
+    Some(json!({"axles": axles, "width": width, "offset": offset, "spacing": spacing, "relative": get(f, FIT_RELATIVE).and_then(|x| x.as_bool()).unwrap_or(false)}))
+}
+
+/// Part name -> its modifier list, and the wheel fitment records of a
+/// resource by name.
+type FitSource = (HashMap<u32, Vec<u32>>, HashMap<u32, Value>);
+
+fn fit_source(mods: &[Value], fits: &[Value]) -> FitSource {
+    let lists = mods.iter().filter_map(|m| Some((get(m, NAME)?.as_u64()? as u32, u32s(get(m, MOD_LIST))))).filter(|(_, l)| !l.is_empty()).collect();
+    let recs = fits.iter().filter_map(|f| Some((get(f, NAME)?.as_u64()? as u32, fit_json(f)?))).collect();
+    (lists, recs)
+}
+
 fn part_keys(mods: &[Value], key_mods: &HashMap<u32, u32>) -> HashMap<u32, Vec<u32>> {
     mods.iter()
         .filter_map(|m| {
@@ -252,7 +283,7 @@ pub fn build(ws: &crate::export::Workspace, out: &std::path::Path) -> Result<Val
 pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, out: &std::path::Path) -> Result<Value> {
     // The resource(s) with model-info records.
     type Switches = (Vec<Value>, HashMap<u32, Vec<u32>>);
-    let found: Vec<(String, Vec<Value>, Vec<Value>, Vec<Value>, Vec<Value>, Switches)> = metas
+    let found: Vec<(String, Vec<Value>, Vec<Value>, Vec<Value>, Vec<Value>, Switches, FitSource)> = metas
         .par_iter()
         .filter_map(|e| {
             let r = Resource::load_sys(&a.path, e).ok()?;
@@ -268,7 +299,8 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
             let mods = if single { mod_parts(&dump(MOD), &dump(MOD_ELEMENT)) } else { Vec::new() };
             // the chassis part's switches and the keys the pack's own parts set
             let switches = if single { (switches_json(&dump(SWITCH), &dump(MOD_ELEMENT), &dump(MOD)), part_keys(&dump(MOD), &key_mods(&dump(KEY_MOD)))) } else { Default::default() };
-            Some((e.id.clone(), infos, dump(CONFIG), dump(VARIATION), mods, switches))
+            let fit = if single { fit_source(&dump(MOD), &dump(WHEEL_FIT)) } else { Default::default() };
+            Some((e.id.clone(), infos, dump(CONFIG), dump(VARIATION), mods, switches, fit))
         })
         .collect();
     let name = |h: u32| names.get(&h).cloned();
@@ -286,12 +318,14 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
     let mut by_handling: Vec<(u32, Value)> = Vec::new();
     let mut mods_of: Vec<(u32, Vec<Value>)> = Vec::new();
     let mut switches_of: Vec<(u32, Switches)> = Vec::new();
-    for (id, infos, cfgs, vars, mods, switches) in found {
+    let mut fits_of: Vec<(u32, FitSource)> = Vec::new();
+    for (id, infos, cfgs, vars, mods, switches, fit) in found {
         sources.push(id);
         if let Some(mi) = infos.first().filter(|_| !mods.is_empty()) {
             let h = get(mi, HANDLING_ID).and_then(|x| x.as_u64()).filter(|&h| h != 0).or_else(|| get(mi, GAME_NAME).and_then(|x| x.as_u64())).unwrap_or(0) as u32;
             mods_of.push((h, mods));
             switches_of.push((h, switches));
+            fits_of.push((h, fit));
         }
         for mut mi in infos {
             let h = get(&mi, GAME_NAME).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
@@ -395,7 +429,7 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
     // they are records of the library, named in a configuration's part
     // list like any other part. Each vehicle gets the ones its
     // configurations use.
-    let library_parts: Vec<(Vec<Value>, HashMap<u32, Vec<u32>>)> = crate::names::work_dir()
+    let library_parts: Vec<(Vec<Value>, HashMap<u32, Vec<u32>>, FitSource)> = crate::names::work_dir()
         .and_then(|w| crate::scan::load_index(&crate::scan::index_path(&w.join("index"), "data.rpf")).ok())
         .map(|ix| {
             let path = crate::export::game_root(a).join("data.rpf");
@@ -410,13 +444,20 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
                     }
                     let dump = |h: u32| m.objects(h).iter().filter_map(|&o| m.object(h, o, 0)).collect::<Vec<_>>();
                     let mods = dump(MOD);
-                    Some((mod_parts(&mods, &dump(MOD_ELEMENT)), part_keys(&mods, &key_mods(&dump(KEY_MOD)))))
+                    Some((mod_parts(&mods, &dump(MOD_ELEMENT)), part_keys(&mods, &key_mods(&dump(KEY_MOD))), fit_source(&mods, &dump(WHEEL_FIT))))
                 })
                 .collect()
         })
         .unwrap_or_default();
     // the keys the library's parts set while fitted
     let library_keys: HashMap<u32, Vec<u32>> = library_parts.iter().flat_map(|l| l.1.iter().map(|(k, v)| (*k, v.clone()))).collect();
+    // the library's modifier lists and wheel fitment records
+    let mut library_fit: FitSource = Default::default();
+    for l in &library_parts {
+        let (lists, recs) = &l.2;
+        library_fit.0.extend(lists.iter().map(|(k, v)| (*k, v.clone())));
+        library_fit.1.extend(recs.iter().map(|(k, v)| (*k, v.clone())));
+    }
     let library: HashMap<u32, Value> = library_parts.into_iter().flat_map(|l| l.0).filter_map(|p| Some((u32::from_str_radix(p["name"].as_str()?, 16).ok()?, p))).collect();
     let mut n_shared = 0;
     for (h, parts) in &parts_of {
@@ -458,6 +499,26 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
         n_switches += switches.len();
         m["switches"] = json!(switches);
         m["part_keys"] = json!(keys);
+    }
+    // What the parts that can be fitted change on the wheels: the pack's
+    // own parts and the library parts its configurations name. A part's
+    // fitment records can be in the library while the part is the pack's.
+    let mut n_fits = 0;
+    for (h, (lists, recs)) in fits_of {
+        let Some(m) = models.get_mut(&h) else { continue };
+        let parts: std::collections::BTreeSet<u32> = lists.keys().copied().chain(parts_of.get(&h).into_iter().flatten().copied()).collect();
+        let mut out: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+        for p in parts {
+            let Some(list) = lists.get(&p).or_else(|| library_fit.0.get(&p)) else { continue };
+            let f: Vec<Value> = list.iter().filter_map(|x| recs.get(x).or_else(|| library_fit.1.get(x))).cloned().collect();
+            if !f.is_empty() {
+                out.insert(format!("{p:08x}"), f);
+            }
+        }
+        if !out.is_empty() {
+            n_fits += out.len();
+            m["wheel_fits"] = json!(out);
+        }
     }
     let mut n_lights = 0;
     if let Some(l) = &lights {
@@ -510,10 +571,10 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("vehicles.json");
     std::fs::write(&path, serde_json::to_vec_pretty(&json!({
-        "note": "Per vehicle model: model_info (vehicles.meta-like; wheelScale / wheelScaleRear are not understood: they are not the rim radius (0.219 on comet7, whose rim is 0.82 x a 0.35 m tyre). A wheel's size, width and position are in the model's export (model.json wheel_mounts, from the collision discs), and the rim's share of it in the configuration's rim_ratio), configurations (body colour ARGB + the part models incl. rim and tyre; parts_key = a key of the part list that a vehicle export's model.json part_colours.configs uses to name the part colours of this configuration; rim_ratio = rim radius / tyre radius from the configuration's wheel fitment record, slot 39d5e253, where it has one), palettes (ARGB paint-colour lists; colours repeat, so repetition reads as the draw weight), part_groups (weighted part choices). mods are the parts with models: the vehicle pack's own and, marked shared, the library parts its configurations name (truck beds and boxes, light bars ...); an element's asset names its model in a vehicle pack (16 hex digits: the first half of MurmurHash3 x64 128, seed 0, of the model's lower-case name without LOD suffix; null in the library), and model is the joaat of the model's name for library parts (in a pack it is only the low half of asset), bone the bone it is modelled around and hides the stock bones it replaces. switches are the stock alternatives of a part (bonnet variants, aerial, light bar and plate mounts, engine pieces): a fitted part sets keys (part_keys: part name -> keys, for the pack's own parts and the library parts its configurations name), and a switch, in force while its part is fitted (part; null = the chassis part, always fitted), shows the element of the option whose key is set (and whose also key, where it has one, is set too: such an option goes first; a null element shows nothing), else its default element (null = nothing). lights are the vehicle's light patterns (sirens, strobes, indicators): patterns by name with slot, speed, clock and per lamp the bone name hash (joaat of siren12, indicator_lf ...) and steps of [phase offset, flash type number]; pack names the patterns of the vehicle's own light pack, a configuration's light_patterns the ones its parts link; archetypes gives a lamp bone's light set name (red, amber, led ..., a hash where the name is not known) and lamp_lights its light as [RRGGBB, intensity], from that light set of its light archetype in levels.rpf. What a flash type number looks like over time is not decoded. steering_lock is fSteeringLock of the model's handling record (radians, the largest angle of the steered wheels; from the PSO files in data.rpf, joined by handlingId). display_name and make are the game's own text for the model's name hash and its vehicleMakeName (from the first text table in data.rpf that has them: English). Names resolve where known; others are joaat hex.",
+        "note": "Per vehicle model: model_info (vehicles.meta-like; wheelScale / wheelScaleRear are not understood: they are not the rim radius (0.219 on comet7, whose rim is 0.82 x a 0.35 m tyre). A wheel's size, width and position are in the model's export (model.json wheel_mounts, from the collision discs), and the rim's share of it in the configuration's rim_ratio), configurations (body colour ARGB + the part models incl. rim and tyre; parts_key = a key of the part list that a vehicle export's model.json part_colours.configs uses to name the part colours of this configuration; rim_ratio = rim radius / tyre radius from the configuration's wheel fitment record, slot 39d5e253, where it has one), palettes (ARGB paint-colour lists; colours repeat, so repetition reads as the draw weight), part_groups (weighted part choices). mods are the parts with models: the vehicle pack's own and, marked shared, the library parts its configurations name (truck beds and boxes, light bars ...); an element's asset names its model in a vehicle pack (16 hex digits: the first half of MurmurHash3 x64 128, seed 0, of the model's lower-case name without LOD suffix; null in the library), and model is the joaat of the model's name for library parts (in a pack it is only the low half of asset), bone the bone it is modelled around and hides the stock bones it replaces. switches are the stock alternatives of a part (bonnet variants, aerial, light bar and plate mounts, engine pieces): a fitted part sets keys (part_keys: part name -> keys, for the pack's own parts and the library parts its configurations name), and a switch, in force while its part is fitted (part; null = the chassis part, always fitted), shows the element of the option whose key is set (and whose also key, where it has one, is set too: such an option goes first; a null element shows nothing), else its default element (null = nothing). wheel_fits is what a fitted part changes on the wheels (part name -> wheel fitment records, struct 9a172293: a widebody kit, spacers): offset and spacing in metres (both taken as moving the wheel out from the centre line), width in metres added to the tyre, axles a mask (1 and 2; taken as front and rear, not confirmed), relative as stored. lights are the vehicle's light patterns (sirens, strobes, indicators): patterns by name with slot, speed, clock and per lamp the bone name hash (joaat of siren12, indicator_lf ...) and steps of [phase offset, flash type number]; pack names the patterns of the vehicle's own light pack, a configuration's light_patterns the ones its parts link; archetypes gives a lamp bone's light set name (red, amber, led ..., a hash where the name is not known) and lamp_lights its light as [RRGGBB, intensity], from that light set of its light archetype in levels.rpf. What a flash type number looks like over time is not decoded. steering_lock is fSteeringLock of the model's handling record (radians, the largest angle of the steered wheels; from the PSO files in data.rpf, joined by handlingId). display_name and make are the game's own text for the model's name hash and its vehicleMakeName (from the first text table in data.rpf that has them: English). Names resolve where known; others are joaat hex.",
         "format": FORMAT,
         "sources": sources,
         "vehicles": list,
     }))?)?;
-    Ok(json!({"models": list.len(), "named": named, "with_model_info": with_info, "configurations": n_cfg, "configurations_with_rim": n_rim, "palettes": n_pal, "display_names": n_named, "shared_parts": n_shared, "switches": n_switches, "light_patterns": n_lights, "steering_locks": n_lock, "file": path}))
+    Ok(json!({"models": list.len(), "named": named, "with_model_info": with_info, "configurations": n_cfg, "configurations_with_rim": n_rim, "palettes": n_pal, "display_names": n_named, "shared_parts": n_shared, "wheel_fits": n_fits, "switches": n_switches, "light_patterns": n_lights, "steering_locks": n_lock, "file": path}))
 }

@@ -1645,6 +1645,9 @@ impl App {
         if let Some(v) = c.f("wear") {
             m.look.wear = (v as f32).clamp(0.0, 1.0);
         }
+        if let Some(v) = c.get("fit-parts") {
+            m.fit_parts_once = Some(v.to_string());
+        }
         if let Some(v) = c.u("finish") {
             m.look.finish = v.min(4);
             m.finish_auto = false;

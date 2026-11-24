@@ -39,6 +39,22 @@ struct Veh {
     switches: Vec<SwitchRec>,
     #[serde(default)]
     part_keys: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    wheel_fits: HashMap<String, Vec<WheelFit>>,
+}
+
+/// What a fitted part changes on the wheels (metres; `axles` 1 = front,
+/// 2 = rear, as a mask).
+#[derive(Deserialize, Clone, Copy)]
+pub struct WheelFit {
+    #[serde(default)]
+    pub axles: u32,
+    #[serde(default)]
+    pub width: f32,
+    #[serde(default)]
+    pub offset: f32,
+    #[serde(default)]
+    pub spacing: f32,
 }
 
 #[derive(Deserialize)]
@@ -218,6 +234,8 @@ pub struct Vehicle {
     pub switches: Vec<Switch>,
     /// Part name -> the keys it sets while fitted.
     pub part_keys: HashMap<u32, Vec<u32>>,
+    /// Part name -> what it changes on the wheels while fitted.
+    pub wheel_fits: HashMap<u32, Vec<WheelFit>>,
 }
 
 /// A stock alternative of a part (None = the chassis part, always fitted):
@@ -453,6 +471,7 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
                     let el = |e: &ElemRec| e.asset.as_deref().and_then(|a| u64::from_str_radix(a, 16).ok()).map(|asset| SwitchElement { asset, bone: h(&e.bone), hides: e.hides.iter().map(|x| h(x)).collect() });
                     v.switches.iter().map(|s| Switch { part: s.part.as_deref().map(h), default: s.default.as_ref().and_then(el), options: s.options.iter().map(|o| (h(&o.key), o.also.as_deref().map_or(0, h), o.element.as_ref().and_then(el))).collect() }).collect()
                 },
+                wheel_fits: v.wheel_fits.iter().map(|(p, f)| (u32::from_str_radix(p, 16).unwrap_or(0), f.clone())).collect(),
                 part_keys: v.part_keys.iter().map(|(p, k)| { let h = |s: &str| u32::from_str_radix(s, 16).unwrap_or(0); (h(p), k.iter().map(|k| h(k)).collect()) }).collect(),
             },
         );
