@@ -101,8 +101,17 @@ pub struct PedClip {
     pub playing: bool,
     pub status: String,
     loading: bool,
-    pending: Arc<Mutex<Option<(String, Result<(glb::Anim, String), String>)>>>,
+    pending: Arc<Mutex<Option<(String, Result<(glb::Anim, Vec<sixng_core::anim::ClipTrack>, String), String>)>>>,
     last: Option<std::time::Instant>,
+    /// The clip's own movement over the ground (`anim::clip_mover`).
+    mover: Vec<sixng_core::anim::ClipTrack>,
+    /// Play in place: leave that movement out.
+    pub in_place: bool,
+    /// Where the finished loops have taken the character, and where it
+    /// is now (viewer space); `travel` is what the camera has followed.
+    base: Mat4,
+    root: Mat4,
+    travel: Vec3,
 }
 
 /// A character's pose: angles in degrees on the main bones of the shared
@@ -1124,9 +1133,11 @@ impl ModelView {
             self.ped_clip.loading = false;
             self.ped_clip.loaded_key = key;
             match r {
-                Ok((a, note)) => {
+                Ok((a, mover, note)) => {
                     self.ped_clip.status = note;
                     self.ped_clip.anim = Some(a);
+                    self.ped_clip.mover = mover;
+                    self.ped_clip.base = Mat4::IDENTITY;
                 }
                 Err(e) => {
                     self.ped_clip.status = e;
@@ -1146,7 +1157,7 @@ impl ModelView {
             let names: Vec<String> = l.model.joints.iter().map(|j| j.name.clone()).collect();
             let (game, work, slot, ctx2) = (PathBuf::from(&self.game), PathBuf::from(&self.work), self.ped_clip.pending.clone(), ctx.clone());
             std::thread::spawn(move || {
-                let r = (|| -> anyhow::Result<(glb::Anim, String)> {
+                let r = (|| -> anyhow::Result<(glb::Anim, Vec<sixng_core::anim::ClipTrack>, String)> {
                     let (dq, cq) = want.rsplit_once('/').ok_or_else(|| anyhow::anyhow!("write it as <dictionary>/<clip> (`sixng clips --name walk` lists dictionaries)"))?;
                     let (_, d) = sixng_core::anim::load_dictionary(&game, &work, dq)?;
                     let c = d.clip(cq).ok_or_else(|| anyhow::anyhow!("no clip {cq:?} in {}; it has: {}", d.name, d.clips.iter().map(|c| c.short_name()).collect::<Vec<_>>().join(", ")))?;
@@ -1165,8 +1176,15 @@ impl ModelView {
                         })
                         .collect();
                     let duration = channels.iter().filter_map(|c| c.times.last().copied()).fold(c.duration, f32::max).max(1e-3);
-                    let note = format!("{} bone tracks of {} on this skeleton, {:.2} s. The clip's own movement over the ground is left out (it plays in place).", stats["bone_tracks_on_joints"], stats["bone_tracks"], duration);
-                    Ok((glb::Anim { name: want.clone(), duration, channels }, note))
+                    let mover = sixng_core::anim::clip_mover(&d, c);
+                    let (moved, turned) = sixng_core::anim::mover_at(&mover, c.duration);
+                    let ground = if mover.is_empty() {
+                        "The clip stores no movement over the ground, so it plays in place.".to_string()
+                    } else {
+                        format!("Over the ground the clip moves {:.2} m and turns {:.0} degrees (its mover tracks); each loop carries on from where the last one ended, and the camera follows.", (moved[0] * moved[0] + moved[1] * moved[1] + moved[2] * moved[2]).sqrt(), (2.0 * turned[2].atan2(turned[3]).to_degrees()).abs())
+                    };
+                    let note = format!("{} bone tracks of {} on this skeleton, {:.2} s. {ground}", stats["bone_tracks_on_joints"], stats["bone_tracks"], duration);
+                    Ok((glb::Anim { name: want.clone(), duration, channels }, mover, note))
                 })()
                 .map_err(|e| format!("{e:#}"));
                 *slot.lock().unwrap() = Some((key, r));
@@ -1176,10 +1194,33 @@ impl ModelView {
         // playback
         let now = std::time::Instant::now();
         let dt = self.ped_clip.last.replace(now).map_or(0.0, |t| (now - t).as_secs_f32()).min(0.1);
+        // the mover in viewer space (Y-up) at a clip time
+        let at = |m: &[sixng_core::anim::ClipTrack], t: f32| {
+            let (p, q) = sixng_core::anim::mover_at(m, t);
+            Mat4::from_rotation_translation(Quat::from_xyzw(q[0], q[2], -q[1], q[3]).normalize(), Vec3::new(p[0], p[2], -p[1]))
+        };
         if let (true, Some(a)) = (self.ped_clip.playing, &self.ped_clip.anim) {
-            self.ped_clip.pos = (self.ped_clip.pos + dt / a.duration).fract();
+            let next = self.ped_clip.pos + dt / a.duration;
+            if next >= 1.0 {
+                // a loop ended: the next one starts where this one stopped
+                self.ped_clip.base *= at(&self.ped_clip.mover, a.duration);
+            }
+            self.ped_clip.pos = next.fract();
             ctx.request_repaint();
         }
+        let root = match &self.ped_clip.anim {
+            Some(a) if !self.ped_clip.in_place && !self.ped_clip.mover.is_empty() => self.ped_clip.base * at(&self.ped_clip.mover, self.ped_clip.pos * a.duration),
+            _ => {
+                self.ped_clip.base = Mat4::IDENTITY;
+                Mat4::IDENTITY
+            }
+        };
+        // the camera goes with the character
+        let moved = root.w_axis.truncate();
+        self.cam.target += moved - self.ped_clip.travel;
+        self.cam.eye += moved - self.ped_clip.travel;
+        self.ped_clip.travel = moved;
+        self.ped_clip.root = root;
     }
 
     /// Body shape for characters (weight, muscle), before a model is opened.
@@ -1340,6 +1381,7 @@ impl ModelView {
                         self.ped_clip.playing = !self.ped_clip.playing;
                     }
                     ui.add(egui::Slider::new(&mut self.ped_clip.pos, 0.0..=1.0).show_value(false));
+                    ui.checkbox(&mut self.ped_clip.in_place, "in place").on_hover_text("Leave out the clip's own movement over the ground (its mover tracks), so the character stays where it is.");
                 });
             }
             if !self.ped_clip.status.is_empty() {
@@ -1632,6 +1674,8 @@ impl ModelView {
                 ren.ensure_edges(rs, &mut g, &l.model);
                 if !keep_cam {
                     self.cam.frame_bbox(g.bbox[0], g.bbox[1]);
+                    // framed on the stored pose: the walked distance is added again
+                    self.ped_clip.travel = Vec3::ZERO;
                     if let Some(z) = self.zoom_after_load {
                         self.cam.dist *= z;
                     }
@@ -2613,6 +2657,12 @@ impl ModelView {
                         j.local = Mat4::from_scale_rotation_translation(s, r, t).to_cols_array();
                     }
                 }
+                // a character clip's movement over the ground, on the root joints
+                if l.look.is_some() && self.ped_clip.root != Mat4::IDENTITY {
+                    for j in v.iter_mut().filter(|j| j.parent.is_none()) {
+                        j.local = (self.ped_clip.root * Mat4::from_cols_array(&j.local)).to_cols_array();
+                    }
+                }
                 posed = v;
                 &posed
             }
@@ -2827,31 +2877,24 @@ impl ModelView {
         let ext = (hi - lo).max_element().max(1.0);
         let step = 10f32.powf((ext / 4.0).log10().floor()).max(0.1);
         let n = ((ext * 0.75) / step).ceil() as i32;
-        let c = (lo + hi) * 0.5;
+        // the grid stays put on the ground; its window goes with a walking
+        // character, and then every tenth line is brighter so the ground
+        // is seen to pass
+        let walked = self.ped_clip.travel;
+        let shift = ((walked.x / step).round() as i32, (walked.z / step).round() as i32);
+        let c = (lo + hi) * 0.5 + Vec3::new(shift.0 as f32 * step, 0.0, shift.1 as f32 * step);
+        let col = |world: i32| match (walked == Vec3::ZERO, world) {
+            (true, 0) => [255, 255, 255, 90],
+            (false, w) if w % 10 == 0 => [255, 255, 255, 90],
+            _ => [255, 255, 255, 35],
+        };
         for k in -n..=n {
-            let col = if k == 0 {
-                [255, 255, 255, 90]
-            } else {
-                [255, 255, 255, 35]
-            };
             let x = c.x + k as f32 * step;
             let z = c.z + k as f32 * step;
-            under.push(LineV {
-                pos: [x, lo.y, c.z - n as f32 * step],
-                col,
-            });
-            under.push(LineV {
-                pos: [x, lo.y, c.z + n as f32 * step],
-                col,
-            });
-            under.push(LineV {
-                pos: [c.x - n as f32 * step, lo.y, z],
-                col,
-            });
-            under.push(LineV {
-                pos: [c.x + n as f32 * step, lo.y, z],
-                col,
-            });
+            under.push(LineV { pos: [x, lo.y, c.z - n as f32 * step], col: col(k + shift.0) });
+            under.push(LineV { pos: [x, lo.y, c.z + n as f32 * step], col: col(k + shift.0) });
+            under.push(LineV { pos: [c.x - n as f32 * step, lo.y, z], col: col(k + shift.1) });
+            under.push(LineV { pos: [c.x + n as f32 * step, lo.y, z], col: col(k + shift.1) });
         }
         (under, top)
     }
@@ -3013,6 +3056,8 @@ impl ModelView {
             if let Some(g) = &self.gpu {
                 self.cam.fly = false;
                 self.cam.frame_bbox(g.bbox[0], g.bbox[1]);
+                // framed on the stored pose: the walked distance is added again
+                self.ped_clip.travel = Vec3::ZERO;
             }
         }
         let ppp = ctx.pixels_per_point();

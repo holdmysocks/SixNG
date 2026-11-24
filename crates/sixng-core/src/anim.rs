@@ -100,6 +100,11 @@ pub mod track {
     pub const ROTATION: u32 = 0x98e1750c;
     /// `bonetranslation`
     pub const TRANSLATION: u32 = 0xf791a95f;
+    /// `moverabsolutetranslation`: the mover's position over the clip's
+    /// animation (metres, RAGE space; a walk runs along +Y).
+    pub const MOVER_TRANSLATION: u32 = 0x7e58c0a0;
+    /// `moverabsoluterotation`: the mover's rotation (a turn about Z).
+    pub const MOVER_ROTATION: u32 = 0x103ca38a;
     /// joaat("bonescale").
     pub fn scale() -> u32 {
         crate::meta7a::joaat("bonescale")
@@ -538,6 +543,92 @@ pub fn clip_tracks(d: &ClipDictionary, c: &Clip) -> Vec<ClipTrack> {
     out
 }
 
+/// The clip's own movement over the ground: the mover's absolute
+/// translation and rotation tracks (`track::MOVER_TRANSLATION`,
+/// `track::MOVER_ROTATION`) on the clip's time line, from the first binding
+/// that carries them. Values are as stored, so a clip cut from the middle
+/// of an animation does not start at the origin; `mover_at` gives the
+/// movement since the clip's start.
+pub fn clip_mover(d: &ClipDictionary, c: &Clip) -> Vec<ClipTrack> {
+    for bd in &c.bindings {
+        let a = &d.animations[bd.animation];
+        if a.frames < 1 {
+            continue;
+        }
+        let dt = if a.frames > 1 { a.duration / (a.frames - 1) as f32 } else { 0.0 };
+        let rate = if bd.rate.abs() > 1e-6 { bd.rate } else { 1.0 };
+        let eps = 1e-3 * dt.max(1e-3);
+        let mut keys: Vec<(usize, f32)> = Vec::new();
+        for f in 0..a.frames {
+            let t = f as f32 * dt;
+            if t + eps < bd.start || t - eps > bd.end {
+                continue;
+            }
+            let ct = ((t - bd.start) / rate).clamp(0.0, c.duration.max(0.0));
+            if keys.last().is_none_or(|k| ct > k.1) {
+                keys.push((f, ct));
+            }
+        }
+        let out: Vec<ClipTrack> = a
+            .tracks
+            .iter()
+            .filter(|t| t.bone == 0 && (t.kind == track::MOVER_TRANSLATION || t.kind == track::MOVER_ROTATION) && t.frames.len() >= a.frames)
+            .map(|tr| ClipTrack { bone: 0, kind: tr.kind, times: keys.iter().map(|k| k.1).collect(), values: keys.iter().map(|k| tr.frames[k.0]).collect() })
+            .collect();
+        if !keys.is_empty() && !out.is_empty() {
+            return out;
+        }
+    }
+    Vec::new()
+}
+
+/// The mover at clip time `t` relative to the clip's start: translation
+/// (in the start's own frame) and rotation (x, y, z, w), linear between
+/// keys. Identity when the clip has no mover tracks.
+pub fn mover_at(mover: &[ClipTrack], t: f32) -> ([f32; 3], [f32; 4]) {
+    fn sample(tr: &ClipTrack, t: f32, quat: bool) -> [f32; 4] {
+        let n = tr.times.len().min(tr.values.len());
+        if n == 0 {
+            return [0.0, 0.0, 0.0, 1.0];
+        }
+        let i = tr.times[..n].partition_point(|&x| x <= t);
+        if i == 0 {
+            return tr.values[0];
+        }
+        if i >= n {
+            return tr.values[n - 1];
+        }
+        let (a, mut b) = (tr.values[i - 1], tr.values[i]);
+        let k = ((t - tr.times[i - 1]) / (tr.times[i] - tr.times[i - 1]).max(1e-9)).clamp(0.0, 1.0);
+        if quat && a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3] < 0.0 {
+            b = b.map(|x| -x);
+        }
+        std::array::from_fn(|c| a[c] + (b[c] - a[c]) * k)
+    }
+    fn norm(q: [f32; 4]) -> [f32; 4] {
+        let l = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if l > 1e-9 { q.map(|x| x / l) } else { [0.0, 0.0, 0.0, 1.0] }
+    }
+    fn mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+        [
+            a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+            a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+            a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+            a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+        ]
+    }
+    fn rotate(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
+        let r = mul(mul(q, [v[0], v[1], v[2], 0.0]), [-q[0], -q[1], -q[2], q[3]]);
+        [r[0], r[1], r[2]]
+    }
+    let tr = mover.iter().find(|m| m.kind == track::MOVER_TRANSLATION);
+    let ro = mover.iter().find(|m| m.kind == track::MOVER_ROTATION);
+    let (p0, p1) = tr.map_or(([0.0; 4], [0.0; 4]), |m| (sample(m, 0.0, false), sample(m, t, false)));
+    let (q0, q1) = ro.map_or(([0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]), |m| (norm(sample(m, 0.0, true)), norm(sample(m, t, true))));
+    let inv0 = [-q0[0], -q0[1], -q0[2], q0[3]];
+    (rotate(inv0, [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]]), norm(mul(inv0, q1)))
+}
+
 /// Every bone track of a clip, mover and float tracks included, for
 /// coverage counts: (bone, kind).
 pub fn all_tracks(d: &ClipDictionary, c: &Clip) -> Vec<(u32, u32, ValueType)> {
@@ -682,6 +773,21 @@ pub fn dictionary_bytes(archive: &std::path::Path, e: &crate::scan::Entry) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mover_is_measured_from_the_clip_start() {
+        // a clip cut from the middle of an animation: it starts 2 m out, already turned a quarter left
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        let m = vec![
+            ClipTrack { bone: 0, kind: track::MOVER_TRANSLATION, times: vec![0.0, 1.0, 2.0], values: vec![[-2.0, 0.0, 0.0, 0.0], [-3.0, 0.0, 0.0, 0.0], [-4.0, 0.0, 0.0, 0.0]] },
+            ClipTrack { bone: 0, kind: track::MOVER_ROTATION, times: vec![0.0, 2.0], values: vec![[0.0, 0.0, h, h], [0.0, 0.0, h, h]] },
+        ];
+        // moving along -X while facing -X is moving forward (+Y) in the start's own frame
+        let (p, q) = mover_at(&m, 1.5);
+        assert!((p[0]).abs() < 1e-5 && (p[1] - 1.5).abs() < 1e-5 && p[2].abs() < 1e-5, "{p:?}");
+        assert!(q[2].abs() < 1e-5 && (q[3] - 1.0).abs() < 1e-5, "{q:?}");
+        assert_eq!(mover_at(&[], 1.0), ([0.0; 3], [0.0, 0.0, 0.0, 1.0]));
+    }
 
     #[test]
     fn track_hashes() {

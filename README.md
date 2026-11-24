@@ -297,7 +297,8 @@ every skinned mesh on it; rest-pose skinning matches the stored vertices
 within 3e-7 m; 95.6 % of the clips' bone tracks land on a joint; joints
 whose own translation is not animated keep their length to the parent
 within 4e-7 m over the clip; rotation keys sit a median 3.6° from the rest
-pose (22° for the conjugate). Not done: the mover (root motion), facial
+pose (22° for the conjugate). Not done: the mover (root motion; the
+viewer applies it, the exported animation does not), facial
 animation, hair (most hair parts are 3-vertex stubs), cloth simulation.
 One field jacket names 16 palette bones that are in no skeleton found yet
 (2,161 influences, weight moved to the other influences).
@@ -568,10 +569,15 @@ again**).
   skeleton, with play / pause and a position slider. **Walk** loads a walk
   clip of the game for the body type. Bone tracks are matched to the
   shared skeleton by name hash, so the clip also drives the twist and
-  muscle helper bones the Pose controls leave alone. The clip's movement
-  over the ground is left out (it plays in place), float tracks (facial
-  and other controls) are not applied, and the Pose angles are added on
-  top. `sixng clips --name <regex>` lists dictionaries.
+  muscle helper bones the Pose controls leave alone. The clip's own
+  movement over the ground is applied: its mover tracks
+  (`moverabsolutetranslation`, `moverabsoluterotation`) move and turn the
+  root, each loop carries on from where the last one ended, the camera
+  goes with the character and every tenth grid line is brighter so the
+  ground is seen to pass; **in place** leaves it out. On the female walk
+  clip (6.65 m in 3.7 s) each planted foot stays within 1 cm on the
+  ground while it is down. Float tracks (facial and other controls) are
+  not applied, and the Pose angles are added on top. `sixng clips --name <regex>` lists dictionaries.
 - **Body sliders** (weight −1…1, muscle 0…1; `--body <w>,<m>` for
   screenshots): the skin and head are posed with the game's body-shape rig
   on the shared skeleton. Clothes and accessories follow the skin under
