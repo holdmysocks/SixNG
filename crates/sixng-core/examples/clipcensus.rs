@@ -28,6 +28,15 @@ fn main() -> anyhow::Result<()> {
                     if !c.bindings.is_empty() {
                         *n.entry("clips with bindings".into()).or_default() += 1;
                     }
+                    if c.sections > 1 {
+                        *n.entry("clips with sections".into()).or_default() += 1;
+                        if std::env::var_os("CENSUS_VERBOSE").is_some() {
+                            eprintln!("{} {} sections={} duration={} offsets={:?}", d.name, c.short_name(), c.sections, c.duration, c.bindings.iter().map(|b| (b.offset, b.start, b.end)).collect::<Vec<_>>());
+                        }
+                    }
+                    if !c.pending.is_empty() {
+                        *n.entry("clips with pending windows".into()).or_default() += 1;
+                    }
                 }
             }
             Err(err) => {

@@ -683,11 +683,16 @@ again**).
   2,835 of 2,838 set-dressing model ids resolve. `sixng outfit
   <character> --clip cin@<scene>` plays that character's own clip of the
   scene (`--clip cin@<scene>/<clip>` picks one), and `sixng clips
-  cin@<scene>` lists a scene's clips. Most clips (16,472 objects) keep
-  their animation in the section dictionaries, which are not joined yet;
-  those are refused with that reason, and 1,441 character clips play
-  directly. Not decoded: the scene files' timing, events and state
-  transitions, and how the sections map to clips.
+  cin@<scene>` lists a scene's clips. A scene clip plays the scene in
+  sections, one per camera cut; each section plays a stretch of a pooled
+  animation (`cinematic_q8@female@0@60_0.anim`: 60 frames a second, every
+  female ped of the scene), and most of those animations are streamed in
+  the section dictionaries. Both commands join them back in, so a clip
+  runs the whole scene (Lucia in `air_beach_ext_p1_t05`: 48.6 s, 11
+  sections, 2,917 frames, no jump where sections meet). Of 143,050
+  streamed windows, 15 (in 2 scenes) have no animation in any section
+  dictionary; 4,720 of the 4,723 character cast entries play in full. Not
+  decoded: the scene files' timing, events and state transitions.
 - **Body sliders** (weight −1…1, muscle 0…1; `--body <w>,<m>` for
   screenshots): the skin and head are posed with the game's body-shape rig
   on the shared skeleton. Clothes and accessories follow the skin under
