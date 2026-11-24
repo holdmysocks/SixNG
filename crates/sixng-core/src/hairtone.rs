@@ -322,6 +322,75 @@ impl ColourRamp {
     }
 }
 
+/// The game's hair and fur strand tables as parsed from its four ramp files
+/// (colour ramps, colour sets, parameter ramps, parameter sets), from one
+/// JSON of those four maps keyed by name.
+///
+/// A hair or fur asset names a colour set and a parameter set (asset
+/// catalogue properties 960033653 and 2259149558: the joaat of the set's
+/// lower-case name); a wardrobe hair item names a colour set with tag
+/// `f7b14eb8`. A set gives one ramp to each of the four strand variants.
+/// Field names of a parameter ramp, with what the game's bake puts in its
+/// parameter atlas: Roughness x its curve (red: the roughness value g0),
+/// BinormalRoughness x its curve (green: the profile), Translucency x its
+/// curve (blue: the fill of the unlit side), the Thickness curve (alpha);
+/// Thickness is the strand width in metres.
+#[derive(Debug, Clone, Default)]
+pub struct StrandData {
+    colour_sets: std::collections::HashMap<u32, [ColourRamp; 4]>,
+    param_sets: std::collections::HashMap<u32, [ParamRamp; 4]>,
+}
+
+fn pairs20(v: &Value) -> Option<[f32; 20]> {
+    let mut c = [1.0f32; 20];
+    for (i, p) in v.as_array()?.iter().take(10).enumerate() {
+        c[2 * i] = p[0].as_f64()? as f32;
+        c[2 * i + 1] = p[1].as_f64()? as f32;
+    }
+    Some(c)
+}
+
+impl StrandData {
+    /// From the JSON of the four tables. Sets with a slot whose ramp has
+    /// no record are left out.
+    pub fn from_json(v: &Value) -> StrandData {
+        let hash = |r: &Value| r["hash"].as_str().and_then(|h| u32::from_str_radix(h, 16).ok());
+        let pramp = |r: &Value| -> Option<ParamRamp> {
+            let f = |k: &str| r[k].as_f64().map(|x| x as f32);
+            Some(ParamRamp { width: f("Thickness")?, mul: [f("Roughness")?, f("Translucency")?, f("BinormalRoughness")?], curves: [pairs20(&r["ThicknessCurve"])?, pairs20(&r["RoughnessCurve"])?, pairs20(&r["TranslucencyCurve"])?, pairs20(&r["BinormalRoughnessCurve"])?] })
+        };
+        let mut d = StrandData::default();
+        for s in v["colour_sets"].as_object().into_iter().flat_map(|m| m.values()) {
+            let ramps: Vec<ColourRamp> = s["colours"].as_array().into_iter().flatten().filter_map(|n| ColourRamp::from_json(&v["colour_ramps"][n.as_str()?])).collect();
+            if let (Some(h), Ok(r)) = (hash(s), <[ColourRamp; 4]>::try_from(ramps)) {
+                d.colour_sets.insert(h, r);
+            }
+        }
+        for s in v["parameter_sets"].as_object().into_iter().flat_map(|m| m.values()) {
+            let ramps: Vec<ParamRamp> = s["materials"].as_array().into_iter().flatten().filter_map(|n| pramp(&v["parameter_ramps"][n.as_str()?])).collect();
+            if let (Some(h), Ok(r)) = (hash(s), <[ParamRamp; 4]>::try_from(ramps)) {
+                d.param_sets.insert(h, r);
+            }
+        }
+        d
+    }
+
+    /// The colour ramps of the four strand variants of a colour set, by the
+    /// set's name hash.
+    pub fn colour_set(&self, name: u32) -> Option<&[ColourRamp; 4]> {
+        self.colour_sets.get(&name)
+    }
+
+    /// The parameter ramps of the four strand variants of a parameter set.
+    pub fn param_set(&self, name: u32) -> Option<&[ParamRamp; 4]> {
+        self.param_sets.get(&name)
+    }
+
+    pub fn counts(&self) -> (usize, usize) {
+        (self.colour_sets.len(), self.param_sets.len())
+    }
+}
+
 /// A value in 0..1 for strand `i`, for presets that name no noise texture.
 pub fn scatter(i: usize) -> f32 {
     let mut x = (i as u32).wrapping_mul(0x9e37_79b9) ^ 0x85eb_ca6b;
@@ -379,6 +448,26 @@ mod tests {
         // between two stops: between their values, mixed in the 2.4 space (above the plain mean of the lower pair is not required, only inside)
         let m = r.at(0.5);
         assert!(m[0] > r.stops[1][0] && m[0] < r.stops[2][0]);
+    }
+
+    #[test]
+    fn strand_tables_give_each_variant_its_ramps() {
+        let curve = serde_json::json!([[0.0, 0.0], [0.5, 0.5], [0.5, 0.5], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]]);
+        let flat = serde_json::json!([[0.0, 1.0], [0.5, 1.0], [0.5, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]]);
+        let v = serde_json::json!({
+            "colour_ramps": {"A": {"colours": [[0.1, 0.1, 0.1], [0.2, 0.2, 0.2], [0.3, 0.3, 0.3], [0.4, 0.4, 0.4]], "curve": curve}, "B": {"colours": [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]], "curve": curve}},
+            "colour_sets": {"S": {"hash": "0000000a", "colours": ["A", "B", "A", "A"]}, "Broken": {"hash": "0000000b", "colours": ["A", "Missing", "A", "A"]}},
+            "parameter_ramps": {"P": {"Thickness": 0.00025, "ThicknessCurve": flat, "Roughness": 0.5, "RoughnessCurve": flat, "Translucency": 0.25, "TranslucencyCurve": flat, "BinormalRoughness": 0.9, "BinormalRoughnessCurve": flat}},
+            "parameter_sets": {"PS": {"hash": "0000000c", "materials": ["P", "P", "P", "P"]}}
+        });
+        let d = StrandData::from_json(&v);
+        assert_eq!(d.counts(), (1, 1));
+        let s = d.colour_set(10).unwrap();
+        assert!((s[0].at(0.0)[0] - 0.1).abs() < 2e-3 && (s[1].at(0.3)[0] - 1.0).abs() < 1e-4 && (s[0].at(1.0)[0] - 0.4).abs() < 2e-3);
+        assert!(d.colour_set(11).is_none());
+        // roughness, fill (translucency), profile (binormal roughness), coverage
+        let p = d.param_set(12).unwrap()[3].at(0.5);
+        assert!((p[0] - 0.5).abs() < 1e-4 && (p[1] - 0.25).abs() < 1e-4 && (p[2] - 0.9).abs() < 1e-4 && (p[3] - 1.0).abs() < 1e-4, "{p:?}");
     }
 
     #[test]

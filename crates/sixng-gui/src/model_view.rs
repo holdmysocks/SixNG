@@ -338,6 +338,8 @@ pub struct HairPick {
 #[derive(Clone)]
 pub struct HairTone {
     pub name: u32,
+    /// hair, brows, lashes, beard ...
+    pub slot: String,
     pub variants: [sixng_core::hairtone::Preset; 4],
 }
 
@@ -1037,24 +1039,19 @@ impl ModelView {
         let (hat, under_hat) = (self.hair.hat.clone(), self.hair.under_hat.clone());
         let rig = self.hair.rig.clone();
         let tones = if self.hair.stored_colours { self.hair.tones.clone() } else { HashMap::new() };
-        // research: SIXNG_HAIR_COLOUR=<parsed colour ramps json>#<parsed colour sets json>#<set name> gives the
-        // strands of a character's hair the four colour ramps of that set (one per strand variant)
-        let colour_set: Option<Vec<sixng_core::hairtone::ColourRamp>> = std::env::var("SIXNG_HAIR_COLOUR").ok().and_then(|s| {
-            let mut it = s.split('#');
-            let (ramps, sets, name) = (it.next()?, it.next()?, it.next()?);
-            let rj: serde_json::Value = serde_json::from_slice(&std::fs::read(ramps).ok()?).ok()?;
-            let sj: serde_json::Value = serde_json::from_slice(&std::fs::read(sets).ok()?).ok()?;
-            let names = sj[name].as_array()?;
-            let v: Vec<_> = names.iter().filter_map(|n| sixng_core::hairtone::ColourRamp::from_json(&rj[n.as_str()?])).collect();
-            (v.len() == 4).then_some(v)
+        // research, until the game's ramp files are read by SixNG itself: SIXNG_HAIR_DATA=<json of the four
+        // parsed tables> makes every hair piece of a character take the colour set its wardrobe item names.
+        // SIXNG_HAIR_COLOURSET=<name> forces one colour set; SIXNG_HAIR_PARAMSETS=hair=<set>,brows=<set>
+        // names the parameter set per slot (the asset property that names it is not read here yet);
+        // SIXNG_FUR_SETS=<colour set>,<parameter set> gives an animal's strands those sets.
+        let joaat = sixng_core::meta7a::joaat;
+        let strand_data: Option<Arc<sixng_core::hairtone::StrandData>> = std::env::var("SIXNG_HAIR_DATA").ok().and_then(|f| {
+            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(f).ok()?).ok()?;
+            Some(Arc::new(sixng_core::hairtone::StrandData::from_json(&v)))
         });
-        // research: SIXNG_HAIR_RAMP=<parsed ramp file json>#<record name> gives every strand that
-        // parameter ramp, until the game's ramp files are read and matched to the hair shown
-        let ramp: Option<sixng_core::hairtone::ParamRamp> = std::env::var("SIXNG_HAIR_RAMP").ok().and_then(|s| {
-            let (file, name) = s.rsplit_once('#')?;
-            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(file).ok()?).ok()?;
-            sixng_core::hairtone::ParamRamp::from_json(&v[name])
-        });
+        let force_colour: Option<u32> = std::env::var("SIXNG_HAIR_COLOURSET").ok().map(|n| joaat(&n.to_ascii_lowercase()));
+        let slot_params: HashMap<String, u32> = std::env::var("SIXNG_HAIR_PARAMSETS").ok().map(|s| s.split(',').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_string(), joaat(&v.to_ascii_lowercase()))).collect()).unwrap_or_default();
+        let fur_sets: Option<(u32, u32)> = std::env::var("SIXNG_FUR_SETS").ok().and_then(|s| s.split_once(',').map(|(c, p)| (joaat(&c.to_ascii_lowercase()), joaat(&p.to_ascii_lowercase()))));
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<Vec<glb::Model>> {
@@ -1094,29 +1091,36 @@ impl ModelView {
                         // fewer strands than stored: wider ones, for the same cover
                         let base = if g.width > 0.0 { g.width } else { 0.0003 };
                         let w = (base / share.max(1e-3)).clamp(base, 0.004) * width_scale;
-                        match tones.get(&off) {
-                            // a character's hair: each strand's variant picks its ramp, root to tip
-                            Some(_) if colour_set.is_some() => {
-                                let cs = colour_set.as_ref().unwrap();
-                                g.coat_glb_ramped(&format!("coat_{off:x}"), &coat, w, &|s, f| {
-                                    let c = cs[(coat.variants.get(s).copied().unwrap_or(0) & 3) as usize].at(f);
-                                    // the bake stores the colour gamma-encoded (it goes back by 1 / 2.4), so the atlas texel reads as that power
-                                    let c = c.map(|x| x.max(0.0).powf(2.4));
-                                    [(c[0] * 255.0 + 0.5) as u8, (c[1] * 255.0 + 0.5) as u8, (c[2] * 255.0 + 0.5) as u8, 255]
-                                }, ramp.as_ref().map(|r| move |_: usize, f: f32| { let v = r.at(f); [v[0], v[1], v[2]] }).as_ref().map(|p| p as &dyn Fn(usize, f32) -> [f32; 3]), serde_json::json!({}))
+                        let var = |s: usize| (coat.variants.get(s).copied().unwrap_or(0) & 3) as usize;
+                        // the atlas colour is stored gamma-encoded: the linear base colour is its 2.4 power
+                        let lin8 = |c: [f32; 3], m: [u8; 3]| -> [u8; 4] { [0, 1, 2].map(|q| (c[q].max(0.0).powf(2.4) * m[q] as f32 + 0.5) as u8).iter().copied().chain([255u8]).collect::<Vec<u8>>().try_into().unwrap() };
+                        let blend = |s: usize| -> [u8; 3] {
+                            let (gd, wt) = coat.guides[s];
+                            let at = |i: u32| cols.get(i as usize).copied().unwrap_or([255; 3]);
+                            let (a, b, d) = (at(gd[0]), at(gd[1]), at(gd[2]));
+                            [0, 1, 2].map(|q| (a[q] as f32 * wt[0] + b[q] as f32 * wt[1] + d[q] as f32 * wt[2] + 0.5) as u8)
+                        };
+                        let name = format!("coat_{off:x}");
+                        match (tones.get(&off), strand_data.as_deref()) {
+                            // a character's hair with the game's tables: the colour set its item names
+                            // (or the forced one) and the parameter set named for its slot
+                            (Some(t), Some(d)) if d.colour_set(force_colour.unwrap_or(t.name)).is_some() => {
+                                let cs = d.colour_set(force_colour.unwrap_or(t.name)).unwrap();
+                                let ps = slot_params.get(&t.slot).and_then(|n| d.param_set(*n));
+                                let pf = |s: usize, f: f32| { let v = ps.unwrap()[var(s)].at(f); [v[0], v[1], v[2]] };
+                                g.coat_glb_ramped(&name, &coat, w, &|s, f| lin8(cs[var(s)].at(f), [255; 3]), ps.map(|_| &pf as &dyn Fn(usize, f32) -> [f32; 3]), serde_json::json!({}))
                             }
-                            Some(t) => g.coat_glb_with(&format!("coat_{off:x}"), &coat, w, &|s, f| t.rgb(coat.variants.get(s).copied().unwrap_or(0), f), serde_json::json!({})),
-                            None if ramp.is_some() => {
-                                let r = ramp.as_ref().unwrap();
-                                let blend = |s: usize| {
-                                    let (gd, wt) = coat.guides[s];
-                                    let at = |i: u32| cols.get(i as usize).copied().unwrap_or([255; 3]);
-                                    let (a, b, d) = (at(gd[0]), at(gd[1]), at(gd[2]));
-                                    [0, 1, 2].map(|q| (a[q] as f32 * wt[0] + b[q] as f32 * wt[1] + d[q] as f32 * wt[2] + 0.5) as u8)
-                                };
-                                g.coat_glb_ramped(&format!("coat_{off:x}"), &coat, w, &|s, _| { let c = blend(s); [c[0], c[1], c[2], 255] }, Some(&|_, f| { let v = r.at(f); [v[0], v[1], v[2]] }), serde_json::json!({}))
+                            // a character's hair without them: the appearance preset of each strand's variant
+                            (Some(t), _) => g.coat_glb_with(&name, &coat, w, &|s, f| t.rgb(coat.variants.get(s).copied().unwrap_or(0), f), serde_json::json!({})),
+                            // an animal's strands with the game's tables: the ramp of the variant times
+                            // the colour of the skin under the root (white ramps let the skin colour through)
+                            (None, Some(d)) if fur_sets.is_some_and(|f| d.colour_set(f.0).is_some() || d.param_set(f.1).is_some()) => {
+                                let (cn, pn) = fur_sets.unwrap();
+                                let (cs, ps) = (d.colour_set(cn), d.param_set(pn));
+                                let pf = |s: usize, f: f32| { let v = ps.unwrap()[var(s)].at(f); [v[0], v[1], v[2]] };
+                                g.coat_glb_ramped(&name, &coat, w, &|s, f| match cs { Some(cs) => lin8(cs[var(s)].at(f), blend(s)), None => { let c = blend(s); [c[0], c[1], c[2], 255] } }, ps.map(|_| &pf as &dyn Fn(usize, f32) -> [f32; 3]), serde_json::json!({}))
                             }
-                            None => g.coat_glb(&format!("coat_{off:x}"), &coat, w, &cols, serde_json::json!({})),
+                            (None, _) => g.coat_glb(&name, &coat, w, &cols, serde_json::json!({})),
                         }
                     } else if let Some(t) = tones.get(&off) {
                         g.ribbon_glb_coloured(&format!("groom_{off:x}"), hw, &t.strands(&g), serde_json::json!({}))
@@ -5860,7 +5864,7 @@ fn load_query_sel(
                             let Some(l) = u64::from_str_radix(guid, 16).ok().and_then(|g| t.resolve(g, look.fit.as_deref())).or_else(|| guid.is_empty().then(|| t.by_placeholder(placeholder)).flatten()) else { continue };
                             let colour = info.strand_tints.iter().find(|t| t.0 == *slot && t.1 == 0x1e64_f584).and_then(|t| Some(sixng_core::pedtint::palettes(&ws.game).ok()?.get(&t.1)?.sample(t.2, 128)));
                             // presets whose colours are white are not hair colours (their flag is set)
-                            let tone = info.strand_presets.iter().find(|p| p.0 == *slot).and_then(|p| Some((p.1, presets.as_ref()?.variants(p.1)?))).filter(|(_, v)| !v[0].flag).map(|(name, variants)| HairTone { name, variants });
+                            let tone = info.strand_presets.iter().find(|p| p.0 == *slot).and_then(|p| Some((p.1, presets.as_ref()?.variants(p.1)?))).filter(|(_, v)| !v[0].flag).map(|(name, variants)| HairTone { name, slot: slot.clone(), variants });
                             let colour = colour.or(tone.as_ref().map(|t| sixng_core::hairtone::display(t.variants[0].a)));
                             info.hair.push(HairPick { slot: slot.clone(), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: t.uncontested(l), off_head: 0, shown: l.confidence >= 0.5 && slot != "body hair", colour, tone });
                         }
