@@ -1078,7 +1078,7 @@ impl ModelView {
 
     /// Car extras settled: vehicle data applied and the fitted wheels loaded.
     fn idle_for_shot(&self) -> bool {
-        if !self.hair.settled() || self.auto.then.is_some() || self.auto.find_hair || self.hair.fitting || self.ped_clip.loading || (!self.ped_clip.want.trim().is_empty() && self.ped_clip.anim.is_none() && self.ped_clip.status.starts_with("loading")) {
+        if self.parts_request.is_some() || !self.hair.settled() || self.auto.then.is_some() || self.auto.find_hair || self.hair.fitting || self.ped_clip.loading || (!self.ped_clip.want.trim().is_empty() && self.ped_clip.anim.is_none() && self.ped_clip.status.starts_with("loading")) {
             return false;
         }
         let Some(l) = self
@@ -1903,7 +1903,10 @@ impl ModelView {
                 // one part per group: a part list also holds the choices
                 // of its option lists, of which the game takes one
                 let mut groups = std::collections::HashSet::new();
-                let mut want: Vec<u64> = l.parts.iter().filter(|o| (part_names.get(&o.off).is_some_and(|n| c.parts.contains(n)) || (o.default && o.group.starts_with("body ("))) && groups.insert(o.group.clone())).map(|o| o.off).collect();
+                let named = |o: &crate::assemble::PartOpt| part_names.get(&o.off).is_some_and(|n| n.iter().any(|n| c.parts.contains(n)));
+                // a body the configuration does not name stays as it was
+                let names_body = l.parts.iter().any(|o| o.group.starts_with("body") && named(o));
+                let mut want: Vec<u64> = l.parts.iter().filter(|o| (named(o) || (o.default && !names_body && o.group.starts_with("body"))) && groups.insert(o.group.clone())).map(|o| o.off).collect();
                 let mut have = l.selected.clone();
                 want.sort_unstable();
                 have.sort_unstable();
@@ -3068,7 +3071,7 @@ impl ModelView {
             // the wheel models takes longer than 600 frames, and the shot
             // then showed the car without wheels); 180 s is the last resort.
             let busy = self.wheel_loading || self.brake_loading || matches!(&*self.vehicles.state.lock().unwrap(), crate::vehicle_db::State::Loading(_));
-            let ready = (self.gpu.is_some() && self.frames_since_load >= 3 && settled)
+            let ready = (self.gpu.is_some() && !self.loading && self.frames_since_load >= 3 && settled)
                 || (!self.loading && !self.hair.fitting && !self.auto.find_hair && self.hair.settled() && self.auto.frames > 600 && (!busy || ctx.input(|i| i.time) > 180.0));
             if ready {
                 if let Some((w, h, px)) = ren.read_back(rs) {
@@ -5173,7 +5176,7 @@ fn load_query_sel(
                 let (mut names, mut errs) = (Vec::new(), Vec::new());
                 // bodies first: the parts that mount on a bed's bones (its
                 // rear bumper, its tailgate) need the bed in place
-                let is_body = |o: &u64| opts.iter().any(|x| x.off == *o && x.group.starts_with("body ("));
+                let is_body = |o: &u64| opts.iter().any(|x| x.off == *o && x.group.starts_with("body"));
                 let mut order: Vec<&u64> = chosen.iter().filter(|o| is_body(o)).collect();
                 order.extend(chosen.iter().filter(|o| !is_body(o)));
                 for o in order {
@@ -6036,10 +6039,11 @@ fn is_wheel_bone(n: &str) -> bool {
 #[allow(clippy::type_complexity)]
 /// The mod parts of a vehicle that have models here: the options, per
 /// option the models it places (model, bone, stock bones it hides), and per
-/// option the name hash of its part (what a configuration's part list holds).
+/// option the name hashes of its parts (what a configuration's part list
+/// holds; two parts can fit the same model).
 #[allow(clippy::type_complexity)]
-fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db::Vehicle) -> (Vec<crate::assemble::PartOpt>, HashMap<u64, Vec<(u64, u32, Vec<u32>)>>, HashMap<u64, u32>) {
-    let mut part_names: HashMap<u64, u32> = HashMap::new();
+fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db::Vehicle) -> (Vec<crate::assemble::PartOpt>, HashMap<u64, Vec<(u64, u32, Vec<u32>)>>, HashMap<u64, Vec<u32>>) {
+    let mut part_names: HashMap<u64, Vec<u32>> = HashMap::new();
     let joaat = sixng_core::meta7a::joaat;
     let vl = vehicle.to_ascii_lowercase();
     let suffix = ["_hi", "_mid"].into_iter().find(|s| vl.ends_with(s)).unwrap_or("");
@@ -6073,6 +6077,12 @@ fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db:
             }
         }
     }
+    let is_body = |stem: &str| ["_pickup", "_flatbed", "_cargobed"].iter().any(|b| stem.ends_with(b));
+    // the slot of the parts that fit a body behind the cab (pickup bed,
+    // flatbed, tow bed ...); its name is not known
+    const BODY_SLOT: u32 = 0x1c9d_d6fe;
+    // asset id -> model
+    let by_asset: HashMap<u64, (&String, &sixng_core::scan::Entry)> = stems.iter().map(|(stem, e)| (sixng_core::meta7a::asset_id(stem), (stem, *e))).collect();
     const SLOTS: [&str; 24] = [
         "bonnet", "boot", "bumper_f", "bumper_r", "exhaust", "spoiler", "splitter", "diffuser", "towing", "roof", "chassis", "skirt", "skirts", "grille", "wing", "cage", "seats", "intake", "plate", "canards", "interior", "engine", "suspension", "lights",
     ];
@@ -6085,12 +6095,21 @@ fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db:
         if m.elements.is_empty() {
             continue;
         }
-        // the models its elements name (truck beds, shared light bars ...)
+        // the models its elements name: by asset id in a vehicle's own
+        // pack (a pickup's bed and rear bumper, kits), by name hash in the
+        // library (truck beds, shared light bars ...). The chassis part
+        // lists every stock alternative (bonnets, aerials, roof lights), of
+        // which the game takes some by rules that are not decoded: it is
+        // left to its name.
         let named: Vec<(&(&String, &sixng_core::scan::Entry), usize)> = m
             .models
             .iter()
             .enumerate()
-            .filter_map(|(k, h)| by_hash.get(h).and_then(|x| x.iter().find(|x| joaat(x.0) == *h)).map(|x| (x, k)))
+            .filter(|_| m.slot != joaat("chassis"))
+            .filter_map(|(k, h)| {
+                let by_asset = m.assets.get(k).filter(|a| **a != 0).and_then(|a| by_asset.get(a));
+                by_asset.or_else(|| by_hash.get(h).and_then(|x| x.iter().find(|x| joaat(x.0) == *h))).map(|x| (x, k))
+            })
             .collect();
         let mut ms: Vec<&(&String, &sixng_core::scan::Entry)>;
         let list: Vec<(u64, u32, Vec<u32>)> = if !named.is_empty() {
@@ -6116,8 +6135,19 @@ fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db:
             }).collect()
         };
         let first = ms[0].1;
+        // a second part that fits the same model: the option answers to
+        // both names
+        if kits.contains_key(&first.off) {
+            part_names.entry(first.off).or_default().push(m.name);
+            if first_config.contains(&m.name) {
+                if let Some(o) = opts.iter_mut().find(|o: &&mut crate::assemble::PartOpt| o.off == first.off) {
+                    o.default = true;
+                }
+            }
+            continue;
+        }
         // wheels and brakes are fitted at the wheel mounts by the viewer
-        if kits.contains_key(&first.off) || ["rim_", "tyre_", "brakedisc_", "caliper_", "drumbrake_"].iter().any(|w| ms[0].0.starts_with(w)) {
+        if ["rim_", "tyre_", "brakedisc_", "caliper_", "drumbrake_"].iter().any(|w| ms[0].0.starts_with(w)) {
             continue;
         }
         let part = ms[0].0.strip_prefix(&format!("{}_", crate::vehicle_db::model_key(vehicle))).unwrap_or(ms[0].0).to_string();
@@ -6126,27 +6156,36 @@ fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db:
             off: first.off,
             id: first.id.clone(),
             name: ms[0].0.to_string(),
-            group: slot_name.get(&m.slot).map(|s| s.to_string()).unwrap_or_else(|| format!("slot {:08x}", m.slot)),
+            // the part that fits a pickup's bed (and its rear bumper)
+            group: if m.slot == BODY_SLOT || ms.iter().any(|x| is_body(x.0)) { "body".to_string() } else { slot_name.get(&m.slot).map(|s| s.to_string()).unwrap_or_else(|| format!("slot {:08x}", m.slot)) },
             label,
             default: first_config.contains(&m.name),
         });
-        part_names.insert(first.off, m.name);
+        part_names.entry(first.off).or_default().push(m.name);
         kits.insert(first.off, list);
     }
     // A pickup's bed is a model named `<vehicle>_pickup` (also `_flatbed`
-    // ...). The part that fits it names its models by hashes that match
-    // no model name, so the link is not known: the bed is offered as a
-    // part of its own, placed at the `mod_bed_attach` bone (where those
-    // parts put their models; the vehicle's origin without it), and is on
-    // to begin with when the vehicle has configurations.
+    // ...), fitted by a part of the vehicle's pack whose elements name it
+    // by asset id. Where no part names it (vehicle data from before the
+    // asset ids, or a bed no part lists) it is offered as a part of its
+    // own, placed at the `mod_bed_attach` bone (where those parts put
+    // their models; the vehicle's origin without it), and is on to begin
+    // with when the vehicle has configurations.
     let key = crate::vehicle_db::model_key(vehicle);
+    let placed: std::collections::HashSet<u64> = kits.values().flatten().map(|x: &(u64, u32, Vec<u32>)| x.0).collect();
+    // no configuration names a body part: the first one is on to begin with
+    if !v.configs.is_empty() && !opts.iter().any(|o| o.group == "body" && o.default) {
+        if let Some(o) = opts.iter_mut().filter(|o| o.group == "body").min_by(|a, b| a.label.cmp(&b.label)) {
+            o.default = true;
+        }
+    }
     for (i, body) in ["pickup", "flatbed", "cargobed"].into_iter().enumerate() {
         let stem = format!("{key}_{body}");
         let Some(e) = stems.get(&stem) else { continue };
-        if kits.contains_key(&e.off) || e.rtype.as_deref() != Some("ft") {
+        if placed.contains(&e.off) || kits.contains_key(&e.off) || e.rtype.as_deref() != Some("ft") {
             continue;
         }
-        opts.push(crate::assemble::PartOpt { off: e.off, id: e.id.clone(), name: stem.clone(), group: "body (link not known)".into(), label: body.to_string(), default: i == 0 && !v.configs.is_empty() });
+        opts.push(crate::assemble::PartOpt { off: e.off, id: e.id.clone(), name: stem.clone(), group: "body (link not known)".into(), label: body.to_string(), default: i == 0 && !v.configs.is_empty() && !opts.iter().any(|o| o.group == "body") });
         kits.insert(e.off, vec![(e.off, joaat("mod_bed_attach"), Vec::new())]);
     }
     opts.sort_by(|a, b| a.group.cmp(&b.group).then(a.label.cmp(&b.label)));
