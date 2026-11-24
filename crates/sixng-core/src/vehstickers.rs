@@ -39,6 +39,11 @@ const ENTRY_GROUP: u32 = 0xb13f_2c2f;
 const STICKER: u32 = 0xed9c_f5df;
 const STICKER_TEXTURE: u32 = 0x3950_a760;
 const STICKER_COLOURS: [u32; 3] = [0x9b5d_cd73, 0x9dbb_d803, 0xb575_2ae0];
+/// True on the records whose texture is a three-channel colour mask (an
+/// opaque picture whose red, green and blue are the cover of `colorRed`,
+/// `colorGreen` and `colorBlue`); false on pictures with colours and an
+/// alpha channel of their own.
+const STICKER_MASK: u32 = 0x54ec_9205;
 const GROUP: u32 = 0xb0dd_20cb;
 const GROUP_LAYOUTS: u32 = 0xc19c_0de4;
 /// The list of groups in the layout file's root record.
@@ -176,7 +181,10 @@ pub fn parse_texture_id(s: &str) -> Option<u64> {
 /// Every sticker record of the vehicle library and the vehicle packs, one
 /// entry per record name: `sticker` (name hash), `name` (when the game's
 /// name list has it), `texture` (64-bit id in the vehicle texture stores),
-/// `colours` (as stored) and `record` (the record's fields as read).
+/// `colours` (the record's `colorRed`, `colorGreen` and `colorBlue`, ARGB
+/// as stored), `mask` (the picture is a colour mask: its red, green and
+/// blue each take one of the colours), `aspect` and `record` (the record's
+/// fields as read).
 /// Sorted by name, records without a name last.
 pub fn sticker_list(ws: &crate::export::Workspace) -> Result<Vec<Value>> {
     let mut seen: BTreeMap<u32, Value> = BTreeMap::new();
@@ -187,7 +195,9 @@ pub fn sticker_list(ws: &crate::export::Workspace) -> Result<Vec<Value>> {
                     "sticker": hex(*k),
                     "name": name_of(*k),
                     "texture": get(s, STICKER_TEXTURE).and_then(|x| x.as_str()),
-                    "colours": STICKER_COLOURS.iter().map(|h| hex(u(get(s, *h)))).collect::<Vec<_>>(),
+                    "colours": ["colorRed", "colorGreen", "colorBlue"].iter().map(|n| hex(u(named(s, n)))).collect::<Vec<_>>(),
+                    "mask": get(s, STICKER_MASK).and_then(|x| x.as_bool()).unwrap_or(false),
+                    "aspect": u(named(s, "aspectRatio")),
                     "record": s,
                 })
             });
@@ -217,7 +227,7 @@ pub fn export_stickers(ws: &crate::export::Workspace, out: &std::path::Path, tex
     }
     let dir = out.join("vehicles");
     std::fs::create_dir_all(&dir)?;
-    let mut ids: Vec<u64> = list.iter().filter_map(|s| parse_texture_id(s["texture"].as_str()?)).collect();
+    let mut ids: Vec<u64> = list.iter().filter_map(|s| parse_texture_id(s["texture"].as_str()?)).filter(|id| *id != 0).collect();
     ids.sort_unstable();
     ids.dedup();
     let (mut written, mut failed) = (0usize, Vec::new());
@@ -237,7 +247,7 @@ pub fn export_stickers(ws: &crate::export::Workspace, out: &std::path::Path, tex
     let stats = json!({"stickers": list.len(), "named": list.iter().filter(|s| s["name"].is_string()).count(), "textures": ids.len(), "written": written, "failed": failed.len()});
     let doc = json!({
         "format": 1,
-        "note": "Sticker records of the vehicle library and packs. texture = 64-bit id in the vehicle texture stores (data/ttdb/vehicles); colours as stored; record = the record's fields as read. png and size are set when the textures were written.",
+        "note": "Sticker records of the vehicle library and packs. texture = 64-bit id in the vehicle texture stores (data/ttdb/vehicles); colours = colorRed, colorGreen, colorBlue (ARGB as stored); mask = the picture is an opaque three-channel colour mask (red, green and blue are the cover of the three colours), else a picture with its own colours and alpha; aspect = the record's aspect class; record = the record's fields as read. png and size are set when the textures were written.",
         "stats": stats,
         "failed": failed,
         "stickers": list,
@@ -332,4 +342,14 @@ pub fn build(ws: &crate::export::Workspace, models: &HashMap<u32, String>, out: 
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("liveries.json"), serde_json::to_vec(&doc)?)?;
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn texture_ids_parse_as_hex() {
+        assert_eq!(super::parse_texture_id("112afea77897b738"), Some(0x112a_fea7_7897_b738));
+        assert_eq!(super::parse_texture_id(" 0x10 "), Some(16));
+        assert_eq!(super::parse_texture_id("zz"), None);
+    }
 }
