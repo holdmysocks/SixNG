@@ -1621,6 +1621,13 @@ impl App {
         m.hair.show = !c.has("no-fur");
         m.auto.find_hair = c.has("find-hair");
         m.auto.hair_width = c.f("hair-width");
+        // --hair-colour r,g,b (0..255): a character's hair colour
+        if let Some(v) = c.get("hair-colour") {
+            let v: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse::<f32>().ok()).collect();
+            if v.len() == 3 {
+                m.hair.colour = [v[0] / 255.0, v[1] / 255.0, v[2] / 255.0];
+            }
+        }
         // --pose rest|down|walk|sit|wave: a character's pose
         if let Some(p) = c.get("pose").and_then(|n| model_view::PedPose::preset(&n.replace('-', " "))) {
             m.ped_pose = p;

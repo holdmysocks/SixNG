@@ -176,6 +176,9 @@ pub struct LookInfo {
     pub notes: Vec<String>,
     /// Strand hair found for the outfit's hair assets (`hairlink`).
     pub hair: Vec<HairPick>,
+    /// The colours of the game's hair palette (`ped_tint_hair`, each row at
+    /// mid shade, sRGB), to pick from.
+    pub hair_swatches: Vec<[u8; 3]>,
 }
 
 /// The grooms of one hair asset of an outfit.
@@ -1354,6 +1357,18 @@ impl ModelView {
                 ui.color_edit_button_rgb(&mut self.hair.colour);
                 ui.label(egui::RichText::new("(stored for items that name the hair palette; most leave it to the game, so pick one)").weak().small());
             });
+            if !look.hair_swatches.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+                    for c in look.hair_swatches.iter().take(64) {
+                        let (r, resp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+                        ui.painter().rect_filled(r, 2.0, egui::Color32::from_rgb(c[0], c[1], c[2]));
+                        if resp.on_hover_text("A colour of the game's hair palette (ped_tint_hair)").clicked() {
+                            self.hair.colour = c.map(|x| x as f32 / 255.0);
+                        }
+                    }
+                });
+            }
         }
         let unplaced: Vec<&str> = look.strands.iter().filter(|s| !look.hair.iter().any(|h| h.slot == s.0)).map(|s| s.1.as_str()).collect();
         if !unplaced.is_empty() {
@@ -4689,6 +4704,16 @@ fn load_query_sel(
                         if oi == k {
                             let body = p.slot == "body upper" || p.slot == "body lower";
                             fx.insert(e.off, PartFx { tint: p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t.rows[0]))).filter(|t| t.1 != 255), colour: p.colour.map(|c| [c[1], c[2], c[3]]), tag: p.colour_tag, head: p.slot == "head", body, skeletal: body || matches!(p.slot.as_str(), "head" | "eyes" | "teeth" | "teeth accessory"), covers: matches!(p.slot.as_str(), "top" | "outer" | "bottom" | "full" | "feet" | "gloves"), layer: match p.slot.as_str() { "outer" => 2, "top" | "bottom" | "full" => 1, _ => 0 }, heel: p.slot == "feet" && p.drawable.split('_').any(|t| matches!(t, "sh" | "mh" | "hh")), skins: if p.slot == "head" { p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect() } else { Vec::new() } });
+                        }
+                    }
+                }
+                if let Some(p) = sixng_core::pedtint::palettes(&ws.game).ok().and_then(|ps| ps.get(&0x1e64_f584)) {
+                    for row in 0..p.h.min(256) {
+                        let c = p.sample(row as u8, 128);
+                        // rows repeat and the unused ones are black or white
+                        let dull = c.iter().all(|x| *x < 6) || c.iter().all(|x| *x > 250);
+                        if !dull && !info.hair_swatches.iter().any(|s| (0..3).all(|k| (s[k] as i32 - c[k] as i32).abs() < 6)) {
+                            info.hair_swatches.push(c);
                         }
                     }
                 }
