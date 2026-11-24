@@ -60,7 +60,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// Version of what an export writes for part colours (model.json
 /// `part_colours_version`); the model viewer exports older vehicles again.
-pub const EXPORT_VERSION: u32 = 18;
+pub const EXPORT_VERSION: u32 = 19;
 /// Layout version of `<work>/index/vehicle_parts.json`.
 pub const FORMAT: u32 = 17;
 
@@ -721,13 +721,27 @@ impl Tables {
         names.dedup();
         let hex = |n: &String| self.sets.get(n).map(|p| look_table(p, palette, u, mat).iter().flat_map(|c| c.iter().map(|b| format!("{b:02x}"))).collect::<String>());
         let looks: Vec<Value> = names.iter().map(|n| hex(n).map_or(Value::Null, Value::String)).collect();
+        let rows: Vec<Value> = names.iter().map(|n| self.sets.get(*n).map_or(Value::Null, |p| Value::String(row_table(p)))).collect();
         let index = |n: &String| names.iter().position(|x| *x == n);
         serde_json::json!({
             "looks": looks,
+            "rows": rows,
             "configs": by_config.iter().filter_map(|(k, n)| Some((k.clone(), Value::from(index(n)?)))).collect::<serde_json::Map<String, Value>>(),
             "default": index(default),
         })
     }
+}
+
+/// The palette row of each of the 256 part ids, 4 hex digits each: slice x
+/// 256 + row for a part that reads its colour from the material palette,
+/// `ffff` for one with a colour of its own (see `look_table`).
+pub fn row_table(parts: &[Part]) -> String {
+    (0..256)
+        .map(|i| match parts.get(i) {
+            Some(p) if p.rgb == [0; 3] && p.row >= 0 && (0..8).contains(&p.mode) => format!("{:04x}", p.mode as usize * 256 + (p.row as usize & 255)),
+            _ => "ffff".to_string(),
+        })
+        .collect()
 }
 
 /// The colour of a row of a palette slice at position `u` (0 to 1): the
