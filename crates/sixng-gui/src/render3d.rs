@@ -1295,6 +1295,7 @@ impl Uploader {
             tint_mask: false,
             ped_shade: false,
             parts: false,
+            occlusion_only: false,
             slots: vec![],
             gap: "ok".into(),
             shader_hash: String::new(),
@@ -1340,7 +1341,9 @@ impl Uploader {
                 0x100 | (q(m) << 16) | (q(r) << 24)
             }) | if mt.tint_mask { 0x200 } else { 0 } | if mt.parts { 0x400 } else { 0 }
                 // bit 11: a lamp's emissive mesh (standard_vehicle_emissive_animated_bones)
-                | if mt.name.ends_with("29648098") { 0x800 } else { 0 };
+                | if mt.name.ends_with("29648098") { 0x800 } else { 0 }
+                // bit 13: the packed map is a vehicle material map, blue = occlusion
+                | if mt.occlusion_only { 0x2000 } else { 0 };
             let u = MatU {
                 base,
                 flags: [has, class_id(&mt.class), alpha, gap | mr],

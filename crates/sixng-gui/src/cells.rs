@@ -678,6 +678,7 @@ mod tests {
             tint_mask: false,
             ped_shade: false,
             parts: false,
+            occlusion_only: false,
             slots: vec![],
             gap: "ok".into(),
             shader_hash: String::new(),

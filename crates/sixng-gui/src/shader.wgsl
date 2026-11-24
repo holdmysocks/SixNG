@@ -181,7 +181,13 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
         metal = f32((M.flags.w >> 16u) & 255u) / 255.0;
         rough = clamp(f32(M.flags.w >> 24u) / 255.0, 0.04, 1.0);
     }
-    if ((has & 4u) != 0u && F.mode.y < 3u) {
+    // a vehicle layer's material map: blue is occlusion, on the direct
+    // light as well (the game multiplies its diffuse and specular sides)
+    var ao_direct = 1.0;
+    if ((has & 4u) != 0u && (M.flags.w & 8192u) != 0u) {
+        ao = textureSample(t_pk, samp, i.uv0).b;
+        ao_direct = ao;
+    } else if ((has & 4u) != 0u && F.mode.y < 3u) {
         let p = textureSample(t_pk, samp, i.uv0);
         if (F.mode.y == 0u) { rough = p.r; metal = p.g; ao = p.b; }
         else if (F.mode.y == 1u) { ao = p.r; rough = p.g; metal = p.b; }
@@ -277,7 +283,7 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let fr_v = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
     let r = reflect(-v, n);
     let env = mix(sky(r), (F.sky_top.rgb + F.sky_hor.rgb) * 0.5, rough) * F.misc.w;
-    var col = direct + kd * albedo * amb_d * ao + env * fr_v * ao + emissive;
+    var col = direct * ao_direct + kd * albedo * amb_d * ao + env * fr_v * ao + emissive;
     col += pearl * pow(1.0 - ndv, 2.0) * 0.6;
     if (cls == 11u) {
         // baked map tiles (already hill-shaded): soft diffuse, no sky reflection

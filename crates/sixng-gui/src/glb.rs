@@ -69,6 +69,9 @@ pub struct Material {
     /// Vehicle parts coloured per vertex (COLOR_0; alpha 254 = the primary
     /// body paint, other values = metalness in four steps x 50 + roughness in 50 steps).
     pub parts: bool,
+    /// The packed slot holds a vehicle layer's material map
+    /// (`lyr0materialatex`): only its blue channel is used, as occlusion.
+    pub occlusion_only: bool,
     pub slots: Vec<Slot>,
     /// worst slot status: ok / lowmip / flat
     pub gap: String,
@@ -654,6 +657,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             .and_then(|p| add_img(p, false, &mut images));
         let mut slots = Vec::new();
         let mut packed = None;
+        let mut occlusion_only = false;
         // The export names the emissive map when the shader has its own.
         let mut emissive = if class == "emissive" {
             uri_of(&m["emissiveTexture"]).and_then(|p| add_img(p, true, &mut images))
@@ -672,6 +676,18 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             {
                 if let Some(p) = &png {
                     packed = add_img(out_root.join(p), false, &mut images);
+                }
+            }
+            // A vehicle layer's material map (`lyr0materialatex`): its blue
+            // channel is an occlusion factor on the diffuse and the specular
+            // side (read from the paint shader); red and green blend the
+            // surface's metalness and roughness, which the export has
+            // already done per model. Not on the Metal renderer, which
+            // reads a packed map as roughness / metalness.
+            if t["param_hash"] == "2bb2ede8" && packed.is_none() && !opts.base_only && tiny_png(&t).is_none() && status == "ok" && cfg!(not(target_os = "macos")) {
+                if let Some(p) = &png {
+                    packed = add_img(out_root.join(p), false, &mut images);
+                    occlusion_only = packed.is_some();
                 }
             }
             if class == "emissive"
@@ -737,6 +753,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             tint_mask: ex["classification"]["tint_mask"] == true,
             ped_shade: ex["ped_tint"].is_object(),
             parts: ex["classification"]["stand_in"] == "parts",
+            occlusion_only,
             slots,
             gap: gap.into(),
             shader_hash: ex["shader_name_hash"].as_str().unwrap_or("").into(),
