@@ -290,6 +290,21 @@ impl Index {
         }
     }
 
+    /// Add the weapon links of every weapon family file of packs.rpf
+    /// (PSO files holding struct `85492dc3`), when packs.rpf is indexed.
+    pub fn add_weapon_files(&mut self, ws: &crate::export::Workspace) {
+        let Some((pa, pix)) = ws.resolve("packs").ok().and_then(|pa| Some((ws.load_index(&pa).ok()?, pa))).map(|(i, a)| (a, i)) else { return };
+        let tag = 0x8549_2dc3u32.to_le_bytes();
+        for e in pix.entries.iter().filter(|e| e.kind == crate::classify::Kind::Pso) {
+            let Ok(b) = crate::scan::read_entry(&pa.path, e) else { continue };
+            if b.windows(4).any(|w| w == tag) {
+                if let Some(p) = crate::pso::parse(&b) {
+                    self.add_weapon_file(&p.to_json());
+                }
+            }
+        }
+    }
+
     /// The index, read from the work directory, or built from the data.rpf
     /// index and written there when it is missing or out of date (what
     /// `sixng materials` does; a few seconds).
@@ -308,6 +323,7 @@ impl Index {
         if index.presets.is_empty() {
             return Err("no layered-material library found in data.rpf".into());
         }
+        index.add_weapon_files(ws);
         if let Ok(b) = serde_json::to_vec(&index) {
             let p = path(ws);
             if let Some(d) = p.parent() {

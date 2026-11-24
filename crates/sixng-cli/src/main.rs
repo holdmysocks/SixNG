@@ -1575,19 +1575,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 }
             }
             // weapon family files of packs.rpf name presets per component
-            if let Ok(pa) = ws.resolve("packs") {
-                if let Ok(pix) = ws.load_index(&pa) {
-                    let tag = 0x8549_2dc3u32.to_le_bytes();
-                    for e in pix.entries.iter().filter(|e| e.kind == Kind::Pso) {
-                        let Ok(b) = sixng_core::scan::read_entry(&pa.path, e) else { continue };
-                        if b.windows(4).any(|w| w == tag) {
-                            if let Some(p) = sixng_core::pso::parse(&b) {
-                                index.add_weapon_file(&p.to_json());
-                            }
-                        }
-                    }
-                }
-            }
+            index.add_weapon_files(&ws);
             if index.libraries.is_empty() {
                 anyhow::bail!("no material library (PSO with root struct 8419ab01) in {}", a.id);
             }
