@@ -83,6 +83,8 @@ pub struct Look {
     pub mode: u32,
     pub rma_order: u32,
     pub finish: u32,
+    /// The vehicle's own paint finish (metalness, roughness), for finish 4.
+    pub stored_finish: [f32; 2],
     pub slot: u32,
     pub paint: [f32; 3],
     pub paint2nd: [f32; 3],
@@ -113,6 +115,7 @@ impl Default for Look {
             // mirror of the sky (washed-out, bluish look). Selectable in the UI.
             rma_order: 3,
             finish: 0,
+            stored_finish: [0.0, 0.12],
             slot: 0,
             paint: [0.55, 0.02, 0.02],
             paint2nd: [0.6, 0.6, 0.62],
@@ -1670,6 +1673,8 @@ impl Renderer3D {
     pub fn frame_uniform(&self, cam: &Camera, look: &Look, aspect: f32, time: f32) -> FrameU {
         let vp = cam.proj(aspect) * cam.view();
         let lin = |c: [f32; 3]| [c[0], c[1], c[2], 1.0];
+        let mut paint1 = lin(look.paint);
+        paint1[3] = look.stored_finish[1];
         FrameU {
             view_proj: vp.to_cols_array_2d(),
             inv_view_proj: vp.inverse().to_cols_array_2d(),
@@ -1684,7 +1689,7 @@ impl Renderer3D {
                 look.exposure,
             ],
             mode: [look.mode, look.rma_order, look.finish, look.slot],
-            paint1: lin(look.paint),
+            paint1,
             paint2: [
                 look.pearl[0],
                 look.pearl[1],
@@ -1702,7 +1707,7 @@ impl Renderer3D {
                 look.tint as u32 as f32,
                 self.lod_k,
                 self.map_glass as u32 as f32,
-                0.0,
+                look.stored_finish[0],
             ],
             prev_view_proj: vp.to_cols_array_2d(),
             jitter: [0.0, 0.0, 0.0, 0.0],

@@ -1214,7 +1214,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 "wheel_mounts_version": 3,
                 "part_colours_version": crate::vehcolour::EXPORT_VERSION,
                 "part_colours": shader_tex.iter().any(|st| st.vehicle_palette.is_some()).then(|| match shader_tex.iter().find_map(|st| st.vehicle_parts.as_ref()) {
-                    Some(set) => serde_json::json!({"status": "applied", "part_set": set, "looks": part_looks["looks"], "configs": part_looks["configs"], "default": part_looks["default"], "looks_note": "looks: the part colours each distinct configuration result gives, 256 x RGBA per look as hex (encoded like GLB COLOR_0, indexed by part id = _COLOR0 alpha); configs: a configuration's parts_key (vehicles.json) -> look; default: the look baked into the GLB", "note": "each vertex of the two-layer vehicle materials takes the colour of its part id (GLB COLOR_0; see the materials' classification.parts_note)"}),
+                    Some(set) => serde_json::json!({"status": "applied", "part_set": set, "looks": part_looks["looks"], "configs": part_looks["configs"], "default": part_looks["default"], "paint_finish": part_looks["paint_finish"], "paint_finish_note": "the body paint's finish: metalness and roughness of the surfaces of the primary-paint parts (COLOR_0 alpha 254), averaged over their vertices of every LOD; null when the model has none", "looks_note": "looks: the part colours each distinct configuration result gives, 256 x RGBA per look as hex (encoded like GLB COLOR_0, indexed by part id = _COLOR0 alpha); configs: a configuration's parts_key (vehicles.json) -> look; default: the look baked into the GLB", "note": "each vertex of the two-layer vehicle materials takes the colour of its part id (GLB COLOR_0; see the materials' classification.parts_note)"}),
                     None => serde_json::json!({"status": "no part set found for this model: the two-layer materials keep their stand-in colours"}),
                 }),
                 "roof_animation": roof_info,
@@ -1363,10 +1363,12 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             if v.is_empty() { 0.5 } else { (v.iter().sum::<f64>() / v.len() as f64 / 255.0) as f32 }
         })
     };
-    let part_looks = match (&part_tables, e.name.as_deref(), shader_tex.iter().find_map(|st| st.vehicle_palette.as_ref())) {
+    let mut part_looks = match (&part_tables, e.name.as_deref(), shader_tex.iter().find_map(|st| st.vehicle_palette.as_ref())) {
         (Some(t), Some(n), Some(pal)) => t.looks_json(n, pal, ramp_u, mat_blend),
         _ => serde_json::Value::Null,
     };
+    // vertices per part id, for the body paint's finish
+    let part_id_counts = std::cell::RefCell::new([0u64; 256]);
     let slice = |i: usize| {
         let b = &info.buffers[i];
         let end = (b.gfx_off + b.bytes).min(r.gfx.len() as u64) as usize;
@@ -1469,6 +1471,9 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         // Vehicles: the colour of each part id from the vehicle's part set.
         if let (Some((_, parts)), Some(pal), Some(c)) = (&part_set, material.and_then(|s| shader_tex.get(s)).and_then(|st| st.vehicle_palette.as_ref()), &m.colors) {
             tint = Some(crate::vehcolour::vertex_colours(parts, pal, ramp_u, mat_blend, c.iter().map(|c| c[3])));
+            for c in c {
+                part_id_counts.borrow_mut()[c[3] as usize] += 1;
+            }
             if let Some(mm) = mesh_meta.last_mut() {
                 mm["part_colours_applied"] = true.into();
             }
@@ -1571,6 +1576,9 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             x
         },
     }).collect();
+    if let (Some(o), Some(f)) = (part_looks.as_object_mut(), part_set.as_ref().and_then(|(_, parts)| crate::vehcolour::paint_finish(parts, mat_blend, &part_id_counts.borrow()))) {
+        o.insert("paint_finish".into(), serde_json::json!({"metalness": f[0], "roughness": f[1]}));
+    }
     BuiltDrawable { lod_groups, part_groups, materials: mats, joints: skin.joints, mesh_meta, shader_tex, part_looks, head }
 }
 
