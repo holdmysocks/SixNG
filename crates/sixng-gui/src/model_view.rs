@@ -1049,6 +1049,9 @@ impl ModelView {
             let v: serde_json::Value = serde_json::from_slice(&std::fs::read(f).ok()?).ok()?;
             Some(Arc::new(sixng_core::hairtone::StrandData::from_json(&v)))
         });
+        // SIXNG_HAIR_SUM=1 lights every strand by the hair lighting, whatever its set's UseStandardBsdf says
+        let force_hair_sum = std::env::var("SIXNG_HAIR_SUM").is_ok();
+        if std::env::var("SIXNG_DEBUG_HAIR").is_ok() { eprintln!("strand tables: {:?}", strand_data.as_ref().map(|d| d.counts())); }
         let force_colour: Option<u32> = std::env::var("SIXNG_HAIR_COLOURSET").ok().map(|n| joaat(&n.to_ascii_lowercase()));
         let slot_params: HashMap<String, u32> = std::env::var("SIXNG_HAIR_PARAMSETS").ok().map(|s| s.split(',').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_string(), joaat(&v.to_ascii_lowercase()))).collect()).unwrap_or_default();
         let fur_sets: Option<(u32, u32)> = std::env::var("SIXNG_FUR_SETS").ok().and_then(|s| s.split_once(',').map(|(c, p)| (joaat(&c.to_ascii_lowercase()), joaat(&p.to_ascii_lowercase()))));
@@ -1092,6 +1095,7 @@ impl ModelView {
                         let base = if g.width > 0.0 { g.width } else { 0.0003 };
                         let w = (base / share.max(1e-3)).clamp(base, 0.004) * width_scale;
                         let var = |s: usize| (coat.variants.get(s).copied().unwrap_or(0) & 3) as usize;
+                        if std::env::var("SIXNG_DEBUG_HAIR").is_ok() { let mut h = [0usize; 4]; for s in 0..coat.guides.len() { h[var(s)] += 1; } eprintln!("coat {off:x}: variants {h:?}"); }
                         // the atlas colour is stored gamma-encoded: the linear base colour is its 2.4 power
                         let lin8 = |c: [f32; 3], m: [u8; 3]| -> [u8; 4] { [0, 1, 2].map(|q| (c[q].max(0.0).powf(2.4) * m[q] as f32 + 0.5) as u8).iter().copied().chain([255u8]).collect::<Vec<u8>>().try_into().unwrap() };
                         let blend = |s: usize| -> [u8; 3] {
@@ -1107,8 +1111,9 @@ impl ModelView {
                             (Some(t), Some(d)) if d.colour_set(force_colour.unwrap_or(t.name)).is_some() => {
                                 let cs = d.colour_set(force_colour.unwrap_or(t.name)).unwrap();
                                 let ps = slot_params.get(&t.slot).and_then(|n| d.param_set(*n));
-                                let pf = |s: usize, f: f32| { let r = &ps.unwrap()[var(s)]; let v = r.at(f); [v[0], v[1], v[2], r.width * v[3].max(0.05) * w / base] };
-                                g.coat_glb_ramped(&name, &coat, w, &|s, f| lin8(cs[var(s)].at(f), [255; 3]), ps.map(|_| &pf as &dyn Fn(usize, f32) -> [f32; 4]), serde_json::json!({}))
+                                let lit = slot_params.get(&t.slot).and_then(|n| d.param_flags(*n)).filter(|_| !force_hair_sum).map_or(1.0, |(std, fs)| if std { 2.0 + fs } else { 1.0 });
+                                let pf = |s: usize, f: f32| { let r = &ps.unwrap()[var(s)]; let v = r.at(f); [v[0], v[1], v[2], r.width * v[3].max(0.05) * w / base, lit] };
+                                g.coat_glb_ramped(&name, &coat, w, &|s, f| lin8(cs[var(s)].at(f), [255; 3]), ps.map(|_| &pf as &dyn Fn(usize, f32) -> [f32; 5]), serde_json::json!({}))
                             }
                             // a character's hair without them: the appearance preset of each strand's variant
                             (Some(t), _) => g.coat_glb_with(&name, &coat, w, &|s, f| t.rgb(coat.variants.get(s).copied().unwrap_or(0), f), serde_json::json!({})),
@@ -1117,8 +1122,9 @@ impl ModelView {
                             (None, Some(d)) if fur_sets.is_some_and(|f| d.colour_set(f.0).is_some() || d.param_set(f.1).is_some()) => {
                                 let (cn, pn) = fur_sets.unwrap();
                                 let (cs, ps) = (d.colour_set(cn), d.param_set(pn));
-                                let pf = |s: usize, f: f32| { let r = &ps.unwrap()[var(s)]; let v = r.at(f); [v[0], v[1], v[2], r.width * v[3].max(0.05) * w / base] };
-                                g.coat_glb_ramped(&name, &coat, w, &|s, f| match cs { Some(cs) => lin8(cs[var(s)].at(f), blend(s)), None => { let c = blend(s); [c[0], c[1], c[2], 255] } }, ps.map(|_| &pf as &dyn Fn(usize, f32) -> [f32; 4]), serde_json::json!({}))
+                                let lit = d.param_flags(pn).filter(|_| !force_hair_sum).map_or(1.0, |(std, fs)| if std { 2.0 + fs } else { 1.0 });
+                                let pf = |s: usize, f: f32| { let r = &ps.unwrap()[var(s)]; let v = r.at(f); [v[0], v[1], v[2], r.width * v[3].max(0.05) * w / base, lit] };
+                                g.coat_glb_ramped(&name, &coat, w, &|s, f| match cs { Some(cs) => lin8(cs[var(s)].at(f), blend(s)), None => { let c = blend(s); [c[0], c[1], c[2], 255] } }, ps.map(|_| &pf as &dyn Fn(usize, f32) -> [f32; 5]), serde_json::json!({}))
                             }
                             (None, _) => g.coat_glb(&name, &coat, w, &cols, serde_json::json!({})),
                         }

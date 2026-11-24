@@ -531,7 +531,7 @@ impl Groom {
     /// game's strand shader reads from its parameter ramp at that point of
     /// the strand: TEXCOORD_0 = (g0, fill of the unlit side), TEXCOORD_1 =
     /// (profile scale, 1). Without it both are left out.
-    pub fn coat_glb_ramped(&self, name: &str, coat: &Coat, width: f32, colour: &dyn Fn(usize, f32) -> [u8; 4], params: Option<&dyn Fn(usize, f32) -> [f32; 4]>, extras: serde_json::Value) -> Vec<u8> {
+    pub fn coat_glb_ramped(&self, name: &str, coat: &Coat, width: f32, colour: &dyn Fn(usize, f32) -> [u8; 4], params: Option<&dyn Fn(usize, f32) -> [f32; 5]>, extras: serde_json::Value) -> Vec<u8> {
         let k = coat.k;
         let n = coat.guides.len();
         let (mut uv0, mut uv1): (Vec<[f32; 2]>, Vec<[f32; 2]>) = (Vec::new(), Vec::new());
@@ -565,7 +565,8 @@ impl Groom {
                     tan.push([dir[0], dir[1], dir[2], sg]);
                     if let Some(pv) = pv {
                         uv0.push([pv[0], pv[1]]);
-                        uv1.push([pv[2], 1.0]);
+                        // y: 1 = lit by the hair lighting; 2 + reflectance scale = by the standard lighting
+                        uv1.push([pv[2], pv[4]]);
                     }
                     tint.push(c);
                 }

@@ -339,6 +339,7 @@ impl ColourRamp {
 pub struct StrandData {
     colour_sets: std::collections::HashMap<u32, [ColourRamp; 4]>,
     param_sets: std::collections::HashMap<u32, [ParamRamp; 4]>,
+    param_flags: std::collections::HashMap<u32, (bool, f32)>,
 }
 
 fn pairs20(v: &Value) -> Option<[f32; 20]> {
@@ -370,6 +371,7 @@ impl StrandData {
             let ramps: Vec<ParamRamp> = s["materials"].as_array().into_iter().flatten().filter_map(|n| pramp(&v["parameter_ramps"][n.as_str()?])).collect();
             if let (Some(h), Ok(r)) = (hash(s), <[ParamRamp; 4]>::try_from(ramps)) {
                 d.param_sets.insert(h, r);
+                d.param_flags.insert(h, (s["UseStandardBsdf"].as_bool().unwrap_or(false), (s["FresnelScale"].as_f64().unwrap_or(255.0) as f32 / 255.0).max(0.5)));
             }
         }
         d
@@ -384,6 +386,14 @@ impl StrandData {
     /// The parameter ramps of the four strand variants of a parameter set.
     pub fn param_set(&self, name: u32) -> Option<&[ParamRamp; 4]> {
         self.param_sets.get(&name)
+    }
+
+    /// Of a parameter set: whether its strands are lit by the standard
+    /// lighting (UseStandardBsdf: lighting type 0; else the hair lighting,
+    /// type 6), and its reflectance scale max(0.5, FresnelScale / 255) on
+    /// F0 = 0.0465.
+    pub fn param_flags(&self, name: u32) -> Option<(bool, f32)> {
+        self.param_flags.get(&name).copied()
     }
 
     pub fn counts(&self) -> (usize, usize) {
@@ -458,13 +468,14 @@ mod tests {
             "colour_ramps": {"A": {"colours": [[0.1, 0.1, 0.1], [0.2, 0.2, 0.2], [0.3, 0.3, 0.3], [0.4, 0.4, 0.4]], "curve": curve}, "B": {"colours": [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]], "curve": curve}},
             "colour_sets": {"S": {"hash": "0000000a", "colours": ["A", "B", "A", "A"]}, "Broken": {"hash": "0000000b", "colours": ["A", "Missing", "A", "A"]}},
             "parameter_ramps": {"P": {"Thickness": 0.00025, "ThicknessCurve": flat, "Roughness": 0.5, "RoughnessCurve": flat, "Translucency": 0.25, "TranslucencyCurve": flat, "BinormalRoughness": 0.9, "BinormalRoughnessCurve": flat}},
-            "parameter_sets": {"PS": {"hash": "0000000c", "materials": ["P", "P", "P", "P"]}}
+            "parameter_sets": {"PS": {"hash": "0000000c", "materials": ["P", "P", "P", "P"], "UseStandardBsdf": true, "FresnelScale": 102}}
         });
         let d = StrandData::from_json(&v);
         assert_eq!(d.counts(), (1, 1));
         let s = d.colour_set(10).unwrap();
         assert!((s[0].at(0.0)[0] - 0.1).abs() < 2e-3 && (s[1].at(0.3)[0] - 1.0).abs() < 1e-4 && (s[0].at(1.0)[0] - 0.4).abs() < 2e-3);
         assert!(d.colour_set(11).is_none());
+        assert_eq!(d.param_flags(12), Some((true, 0.5)));
         // roughness, fill (translucency), profile (binormal roughness), coverage
         let p = d.param_set(12).unwrap()[3].at(0.5);
         assert!((p[0] - 0.5).abs() < 1e-4 && (p[1] - 0.25).abs() < 1e-4 && (p[2] - 0.9).abs() < 1e-4 && (p[3] - 1.0).abs() < 1e-4, "{p:?}");

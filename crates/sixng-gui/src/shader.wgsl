@@ -599,6 +599,26 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
             let sky_h = mix(neutral(F.sky_hor.rgb, 0.8) * 0.6, neutral(F.sky_top.rgb, 0.8), up_h) * F.misc.w;
             let amb_g = sky_h * albedo * hair_ambient(tdir, v, g0h, 1.0) + sky_h * 0.012;
             col = direct_h * ao_direct + amb_g * ao;
+            // a set with UseStandardBsdf (uv1.y = 2 + reflectance scale; nearly all hair and fur): the game
+            // lights the strand by its standard lighting, with the atlas colour as base colour, the ramp's
+            // roughness, the tube normal and F0 = 0.0465 x the scale
+            if (i.uv1.y > 1.5) {
+                let rs = clamp(g0h, 0.05, 1.0);
+                let f0s = vec3(0.0465 * clamp(i.uv1.y - 2.0, 0.5, 1.0));
+                let nls = max(dot(tube, l), 0.0);
+                let nvs = max(dot(tube, v), 0.001);
+                let hs = normalize(v + l);
+                let nhs = max(dot(tube, hs), 0.0);
+                let a2s = rs * rs * rs * rs;
+                let dds = nhs * nhs * (a2s - 1.0) + 1.0;
+                let ks = (rs + 1.0) * (rs + 1.0) / 8.0;
+                let gs = (nls / (nls * (1.0 - ks) + ks)) * (nvs / (nvs * (1.0 - ks) + ks));
+                let frs = f0s + (1.0 - f0s) * pow(1.0 - max(dot(hs, v), 0.0), 5.0);
+                let specs = a2s / (3.14159 * dds * dds) * gs * frs / max(4.0 * nls * nvs, 0.001);
+                // stand-in for the shadow the rest of the hair casts: the side of the head turned from the light
+                let shade = smoothstep(-0.35, 0.35, dot(root, l));
+                col = ((1.0 - frs) * albedo / 3.14159 + specs) * sun * nls * shade * ao_direct + sky_h * (albedo + f0s) * ao;
+            }
         }
     }
     if (cls == 11u) {
