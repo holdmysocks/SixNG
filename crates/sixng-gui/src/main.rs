@@ -1625,6 +1625,10 @@ impl App {
         if let Some(v) = c.u("rma") {
             m.look.rma_order = v.min(3);
         }
+        if let Some(v) = c.u("random-parts") {
+            m.random_parts_once = true;
+            m.random_parts_seed = 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(v as u64 + 1);
+        }
         if let Some(v) = c.f("wear") {
             m.look.wear = (v as f32).clamp(0.0, 1.0);
         }

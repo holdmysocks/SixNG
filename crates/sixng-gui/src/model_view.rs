@@ -358,6 +358,9 @@ pub struct ModelView {
     /// The part colours on show (256 x RGBA, by part id), for the fitted
     /// wheels: a rim's and a tyre's vertices carry part ids of the vehicle.
     part_look_table: Option<Arc<Vec<[u8; 4]>>>,
+    /// `--random-parts <seed>`: pick random parts once after the load.
+    pub random_parts_once: bool,
+    pub random_parts_seed: u64,
     /// The material palette of the loaded vehicle (its file, RGBA rows of
     /// 128) and the look whose rows the model's part materials carry.
     part_palette: Option<(PathBuf, Arc<Vec<u8>>)>,
@@ -663,6 +666,8 @@ impl ModelView {
             part_look_want: None,
             cfg_request: None,
             part_look_done: None,
+            random_parts_once: false,
+            random_parts_seed: 0,
             part_palette: None,
             part_ramp_done: None,
             part_look_table: None,
@@ -1102,7 +1107,7 @@ impl ModelView {
 
     /// Car extras settled: vehicle data applied and the fitted wheels loaded.
     fn idle_for_shot(&self) -> bool {
-        if self.parts_request.is_some() || !self.hair.settled() || self.auto.then.is_some() || self.auto.find_hair || self.hair.fitting || self.ped_clip.loading || (!self.ped_clip.want.trim().is_empty() && self.ped_clip.anim.is_none() && self.ped_clip.status.starts_with("loading")) {
+        if self.parts_request.is_some() || self.random_parts_once || !self.hair.settled() || self.auto.then.is_some() || self.auto.find_hair || self.hair.fitting || self.ped_clip.loading || (!self.ped_clip.want.trim().is_empty() && self.ped_clip.anim.is_none() && self.ped_clip.status.starts_with("loading")) {
             return false;
         }
         let Some(l) = self
@@ -1545,6 +1550,23 @@ impl ModelView {
                     }
                     changed = true;
                 }
+            }
+            // vehicles: a random choice in every group
+            if l.info["wheel_mounts"].as_array().is_some_and(|a| !a.is_empty())
+                && ui
+                    .button("🎲 Randomize")
+                    .on_hover_text("A random choice for every group of parts (bonnet, bumpers, exhaust, spoiler, body ...), from the options this vehicle has. A group that starts with a part always gets one; a group that starts empty may stay empty.")
+                    .clicked()
+            {
+                let mut seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0x9e37_79b9_7f4a_7c15, |d| d.as_nanos() as u64) | 1;
+                let mut next = |n: usize| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed >> 11) as usize % n.max(1)
+                };
+                sel = random_parts(&groups, &mut next);
+                changed = true;
             }
             if ui
                 .button("Defaults")
@@ -2324,6 +2346,26 @@ impl ModelView {
     }
 
     fn update_wheels(&mut self, rs: &egui_wgpu::RenderState, ctx: &egui::Context) {
+        // --random-parts: one random choice of parts once the vehicle is in
+        if self.random_parts_once && !self.loading && self.parts_request.is_none() {
+            if let Some(l) = self.loaded.as_ref().filter(|l| !l.parts.is_empty()) {
+                let mut groups: std::collections::BTreeMap<&str, Vec<&crate::assemble::PartOpt>> = Default::default();
+                for o in &l.parts {
+                    groups.entry(o.group.as_str()).or_default().push(o);
+                }
+                let mut seed = self.random_parts_seed | 1;
+                let sel = random_parts(&groups, &mut |n| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed >> 11) as usize % n.max(1)
+                });
+                self.parts_request = Some(format!("{}#parts={}", l.base.split("#parts=").next().unwrap_or(&l.base), sel.iter().map(|o| format!("{o:x}")).collect::<Vec<_>>().join(",")));
+                self.random_parts_once = false;
+            } else if self.loaded.is_some() {
+                self.random_parts_once = false;
+            }
+        }
         self.sync_part_look(rs);
         // the roof clip of the loaded convertible, read once per model file
         if let Some(l) = &self.loaded {
@@ -3850,6 +3892,21 @@ pub(crate) fn load_query(
     let mut l = load_query_sel(ws, cache, q, sel, lod, idx)?;
     l.base = q.to_string();
     Ok(l)
+}
+
+/// A random choice of parts: one option of every group. A group with a
+/// default option always gets one of its options; a group without (an
+/// accessory that starts off) may also get none. `next(n)` gives a number
+/// below `n`.
+fn random_parts(groups: &std::collections::BTreeMap<&str, Vec<&crate::assemble::PartOpt>>, next: &mut impl FnMut(usize) -> usize) -> Vec<u64> {
+    let mut out = Vec::new();
+    for opts in groups.values() {
+        let none = if opts.iter().any(|o| o.default) { 0 } else { 1 };
+        if let Some(o) = opts.get(next(opts.len() + none)) {
+            out.push(o.off);
+        }
+    }
+    out
 }
 
 /// `"<query>#parts=<hex>,<hex>"` → the query and the chosen part offsets.
@@ -6717,6 +6774,21 @@ fn srgb32(c: [f32; 3]) -> egui::Color32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn random_parts_keep_fitted_groups_fitted() {
+        let opt = |off: u64, group: &str, default: bool| crate::assemble::PartOpt { off, id: String::new(), name: String::new(), group: group.into(), label: String::new(), default };
+        let all = [opt(1, "bonnet", true), opt(2, "bonnet", false), opt(3, "spoiler", false), opt(4, "spoiler", false)];
+        let mut groups: std::collections::BTreeMap<&str, Vec<&crate::assemble::PartOpt>> = Default::default();
+        for o in &all {
+            groups.entry(o.group.as_str()).or_default().push(o);
+        }
+        // the highest number: the last option, or none where none is allowed
+        let top = super::random_parts(&groups, &mut |n| n - 1);
+        assert_eq!(top, vec![2]);
+        let first = super::random_parts(&groups, &mut |_| 0);
+        assert_eq!(first, vec![1, 3]);
+    }
+
     use super::*;
 
     #[test]
