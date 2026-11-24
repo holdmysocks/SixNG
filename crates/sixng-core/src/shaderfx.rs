@@ -72,7 +72,8 @@
 //! that ends exactly there.
 
 use anyhow::{anyhow, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 const MAGIC: [u8; 4] = [0xe7, 0xdc, 0x0d, 0x00];
 const STATE: usize = 140;
@@ -132,18 +133,31 @@ impl Var {
     pub fn material_texture(&self) -> Option<(u8, bool)> {
         (self.flags() & 0x80 != 0 && matches!(self.kind & 0x3f, 0x02)).then_some((self.index as u8, self.kind & 0x40 != 0))
     }
-    /// Type of a constant buffer member, where the size was checked from
-    /// the spacing of offsets: float (0x09), float2, float3, float4,
-    /// float4x4 (0x0e). Others are given as `type_xx`.
+    /// Type of a constant buffer member: see [`member_type`].
     pub fn member_type(&self) -> String {
-        match self.kind {
-            0x09 => "float".into(),
-            0x0a => "float2".into(),
-            0x0b => "float3".into(),
-            0x0c => "float4".into(),
-            0x0e => "float4x4".into(),
-            k => format!("type_{k:02x}"),
-        }
+        member_type(self.kind)
+    }
+}
+
+/// Type of a constant buffer member from its type code. Floats: 0x09 to
+/// 0x0c are float to float4 and 0x0e float4x4 (sizes from the spacing of
+/// offsets). Integers: 0x01 is `int` and 0x03 `int3`, checked on real
+/// materials (about 20,000 values of code 0x01 are zero or small integers,
+/// never a float; code 0x03 takes three components and holds byte
+/// patterns); 0x02 and 0x04 are named `int2` and `int4` by that pattern.
+/// Others are given as `type_xx`.
+pub fn member_type(kind: u8) -> String {
+    match kind {
+        0x01 => "int".into(),
+        0x02 => "int2".into(),
+        0x03 => "int3".into(),
+        0x04 => "int4".into(),
+        0x09 => "float".into(),
+        0x0a => "float2".into(),
+        0x0b => "float3".into(),
+        0x0c => "float4".into(),
+        0x0e => "float4x4".into(),
+        k => format!("type_{k:02x}"),
     }
 }
 
@@ -399,6 +413,73 @@ pub fn read(b: &[u8]) -> Result<Shaders> {
     Ok(out)
 }
 
+/// The material constants of every effect, for readers of a model's
+/// materials: effect (hex joaat of its lower-case name, a drawable's
+/// shader name hash) -> parameter hash (hex) -> (type code of the constant
+/// buffer member, hash of the shader variable's name).
+/// `<work>/index/shader_params.json`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ParamIndex {
+    pub version: u32,
+    pub effects: BTreeMap<String, BTreeMap<String, (u8, String)>>,
+}
+
+const PARAM_INDEX_VERSION: u32 = 1;
+
+impl ParamIndex {
+    pub fn build(sh: &Shaders) -> ParamIndex {
+        let mut effects = BTreeMap::new();
+        for e in &sh.effects {
+            let Some(t) = &e.table else { continue };
+            let mut m = BTreeMap::new();
+            for (i, _) in t.resources.iter().enumerate().filter(|(_, r)| r.is_cbuffer() && r.flags() & 0x80 != 0) {
+                for v in t.members_of(i) {
+                    // a material names the parameter (the alias); the variable's own name is kept beside it
+                    m.insert(format!("{:08x}", v.alias), (v.kind, format!("{:08x}", v.name)));
+                    m.entry(format!("{:08x}", v.name)).or_insert((v.kind, format!("{:08x}", v.name)));
+                }
+            }
+            if !m.is_empty() {
+                effects.insert(format!("{:08x}", crate::meta7a::joaat(&e.name.to_ascii_lowercase())), m);
+            }
+        }
+        ParamIndex { version: PARAM_INDEX_VERSION, effects }
+    }
+
+    /// The type code of a parameter of an effect.
+    pub fn kind(&self, effect: &str, param: &str) -> Option<u8> {
+        self.effects.get(effect)?.get(param).map(|x| x.0)
+    }
+
+    /// The index, read from the work directory or built from `shaders.rpf`
+    /// (about 2 s) and written there; rebuilt when the archive is newer.
+    pub fn get(game_root: &std::path::Path) -> Result<&'static ParamIndex, String> {
+        static T: std::sync::OnceLock<Result<ParamIndex, String>> = std::sync::OnceLock::new();
+        T.get_or_init(|| {
+            let work = crate::names::work_dir().ok_or("no work directory")?;
+            let (cache, archive) = (work.join("index").join("shader_params.json"), game_root.join("shaders.rpf"));
+            let stamp = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            if let Some(t) = std::fs::read(&cache).ok().and_then(|b| serde_json::from_slice::<ParamIndex>(&b).ok()) {
+                if t.version == PARAM_INDEX_VERSION && stamp(&cache) >= stamp(&archive) {
+                    return Ok(t);
+                }
+            }
+            let bytes = std::fs::read(&archive).map_err(|e| format!("{}: {e}", archive.display()))?;
+            let t = ParamIndex::build(&read(&bytes).map_err(|e| format!("shaders.rpf: {e:#}"))?);
+            if t.effects.is_empty() {
+                return Err("no effect tables found in shaders.rpf".into());
+            }
+            if let Ok(b) = serde_json::to_vec(&t) {
+                let _ = std::fs::create_dir_all(work.join("index"));
+                let _ = std::fs::write(&cache, b);
+            }
+            Ok(t)
+        })
+        .as_ref()
+        .map_err(|e| e.clone())
+    }
+}
+
 impl Program {
     /// The 16-byte digest of the compiled program (bytes 4..20 of its
     /// `HASH` chunk), which the pipeline cache names a stage by. `file` is
@@ -626,6 +707,16 @@ mod tests {
         assert_eq!((p.table.resources[0].resource_kind().as_str(), p.table.resources[0].index, p.table.resources[1].is_cbuffer(), p.table.resources[1].c), ("texture", 237, true, 0x20));
         let m = p.table.members_of(1);
         assert_eq!((m.len(), m[1].name, m[1].a, m[1].member_type().as_str()), (2, 0x32, 0x10, "float4"));
+        assert_eq!((member_type(0x01).as_str(), member_type(0x03).as_str(), member_type(0x05).as_str()), ("int", "int3", "type_05"));
+        // the parameter index: an effect's material constants by parameter (alias) and by variable name
+        let mut fx = s.effects[0].clone();
+        let mut t = fx.table.take().unwrap();
+        t.resources.push(Var { name: 0x61, alias: 0x61, kind: 0x30, dim: 4, index: 4, a: 2 | 0x80 << 8 | 24 << 16, b: 0, c: 0x20 });
+        t.members = vec![Var { name: 0x71, alias: 0x72, kind: 0x01, dim: 0, index: 0, a: 0, b: 0, c: 0 }, Var { name: 0x73, alias: 0x73, kind: 0x0c, dim: 0, index: 0, a: 0x10, b: 0, c: 0 }];
+        fx.table = Some(t);
+        let ix = ParamIndex::build(&Shaders { effects: vec![fx], ..Default::default() });
+        let e = format!("{:08x}", crate::meta7a::joaat("standard"));
+        assert_eq!((ix.kind(&e, "00000072"), ix.kind(&e, "00000071"), ix.kind(&e, "00000073"), ix.kind(&e, "00000099"), ix.kind("00000000", "00000072")), (Some(1), Some(1), Some(0x0c), None, None));
         assert!(p.table.members_of(0).is_empty());
         let e = &s.effects[0];
         assert_eq!((e.name.as_str(), e.programs[1].as_slice(), s.effects[1].name.as_str(), s.effects[1].table.is_none()), ("standard", &[0u32, 1][..], "stub", true));
