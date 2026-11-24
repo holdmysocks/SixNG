@@ -12,6 +12,17 @@ use sixng_core::ttpf::{self, TtpfSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// What the wardrobe data says about textures no model binds (ped skin):
+/// the table, and names for its heads and wardrobe resources.
+pub struct WardrobeUsers {
+    table: &'static sixng_core::pedlook::WardrobeTextures,
+    /// joaat(head drawable name) -> (entry id, name)
+    heads: std::collections::HashMap<u32, (String, String)>,
+    /// wardrobe resource -> named characters that use it
+    characters: std::collections::HashMap<u64, Vec<String>>,
+}
+type WardrobeSlot = Arc<Mutex<Option<Result<Arc<WardrobeUsers>, String>>>>;
+
 type UsersSlot = Arc<Mutex<Option<Result<Arc<sixng_core::texusers::TexUsers>, String>>>>;
 
 const CHANNELS: [&str; 6] = ["RGBA", "RGB", "R", "G", "B", "A"];
@@ -59,6 +70,9 @@ pub struct TextureView {
     users: Option<Result<Arc<sixng_core::texusers::TexUsers>, String>>,
     users_slot: UsersSlot,
     users_started: bool,
+    wardrobe: Option<Result<Arc<WardrobeUsers>, String>>,
+    wardrobe_slot: WardrobeSlot,
+    wardrobe_started: bool,
     /// Set when "Used by" asks to open a model in the Model viewer.
     pub open_model: Option<String>,
     /// Set when "Used by" asks to build its index (a `texture-users` job).
@@ -98,6 +112,9 @@ impl TextureView {
             users: None,
             users_slot: Arc::new(Mutex::new(None)),
             users_started: false,
+            wardrobe: None,
+            wardrobe_slot: Arc::new(Mutex::new(None)),
+            wardrobe_started: false,
             open_model: None,
             want_users_job: false,
         }
@@ -130,6 +147,110 @@ impl TextureView {
                 };
                 *slot.lock().unwrap() = Some(r);
             });
+        }
+    }
+
+    /// The wardrobe's texture links, read on a worker thread the first time a
+    /// texture has no material that uses it.
+    fn ensure_wardrobe(&mut self) {
+        if self.wardrobe.is_some() {
+            return;
+        }
+        if let Some(r) = self.wardrobe_slot.lock().unwrap().take() {
+            self.wardrobe = Some(r);
+            return;
+        }
+        if !self.wardrobe_started {
+            self.wardrobe_started = true;
+            let (game, work, slot) = (std::path::PathBuf::from(&self.game), std::path::PathBuf::from(&self.work), self.wardrobe_slot.clone());
+            std::thread::spawn(move || {
+                let r = (|| -> Result<Arc<WardrobeUsers>, String> {
+                    let table = sixng_core::pedlook::wardrobe_textures(&game)?;
+                    let ix = sixng_core::scan::load_index(&sixng_core::scan::index_path(&work.join("index"), "packs.rpf")).map_err(|e| format!("{e:#}"))?;
+                    let joaat = sixng_core::meta7a::joaat;
+                    let mut heads = std::collections::HashMap::new();
+                    for (n, e) in sixng_core::outfit::dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
+                        let n = e.name.as_ref()?.to_ascii_lowercase();
+                        n.contains("head_").then_some((n, e))
+                    })) {
+                        heads.insert(joaat(&n), (e.id.clone(), n));
+                    }
+                    let mut characters: std::collections::HashMap<u64, Vec<String>> = Default::default();
+                    if let Ok(models) = sixng_core::pedlook::models(&game) {
+                        for c in sixng_core::outfit::characters(&ix).into_iter().filter(|c| c.kind == "character") {
+                            if let Some(row) = models.by_model.get(&joaat(&c.name)) {
+                                characters.entry(row.resource).or_default().push(c.name);
+                            }
+                        }
+                    }
+                    Ok(Arc::new(WardrobeUsers { table, heads, characters }))
+                })();
+                *slot.lock().unwrap() = Some(r);
+            });
+        }
+    }
+
+    /// For a texture no material uses: what the wardrobe data names it for
+    /// (heads to open, characters to open, and how many other wardrobes).
+    fn wardrobe_users_ui(&mut self, ui: &mut egui::Ui, hash: u64) {
+        self.ensure_wardrobe();
+        let w = match &self.wardrobe {
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.weak("reading the wardrobe data (about a minute the first time)");
+                });
+                ui.ctx().request_repaint();
+                return;
+            }
+            Some(Err(e)) => {
+                ui.weak(format!("No material in the indexed models uses this texture. (Wardrobe data not read: {e})"));
+                return;
+            }
+            Some(Ok(w)) => w.clone(),
+        };
+        let Some(rows) = w.table.by_texture.get(&hash) else {
+            ui.weak("No material in the indexed models uses this texture, and no wardrobe item names it.");
+            return;
+        };
+        ui.label("No model binds this texture. Ped skin (faces, body, eyes) gets its textures from the wardrobe data, which names this one for:");
+        let mut heads: Vec<&(String, String)> = rows.iter().filter_map(|r| w.heads.get(&r.1)).collect();
+        heads.sort();
+        heads.dedup();
+        let mut chars: Vec<&String> = rows.iter().flat_map(|r| w.characters.get(&r.0).into_iter().flatten()).collect();
+        chars.sort();
+        chars.dedup();
+        let mut res: Vec<u64> = rows.iter().map(|r| r.0).collect();
+        res.sort();
+        res.dedup();
+        let unnamed = res.iter().filter(|r| !w.characters.contains_key(r)).count();
+        let mut open = None;
+        egui::ScrollArea::vertical().id_salt("tv_wardrobe_scroll").auto_shrink([false; 2]).show(ui, |ui| {
+            if !heads.is_empty() {
+                ui.strong(format!("{} head{}", heads.len(), if heads.len() == 1 { "" } else { "s" }));
+                for (id, name) in heads.iter().take(40) {
+                    if ui.link(egui::RichText::new(name.as_str()).small()).on_hover_text(format!("open {id} in the Model viewer")).clicked() {
+                        open = Some(id.clone());
+                    }
+                }
+            }
+            if !chars.is_empty() {
+                ui.strong(format!("{} character{}", chars.len(), if chars.len() == 1 { "" } else { "s" }));
+                for c in chars.iter().take(40) {
+                    if ui.link(egui::RichText::new(c.as_str()).small()).on_hover_text("open this character in the Model viewer").clicked() {
+                        open = Some(format!("packs.rpf#outfit:{c}"));
+                    }
+                }
+                if chars.len() > 40 {
+                    ui.weak(format!("+ {} more", chars.len() - 40));
+                }
+            }
+            if unnamed > 0 {
+                ui.weak(format!("{}{unnamed} wardrobe{} of models without a name in the index", if heads.is_empty() && chars.is_empty() { "" } else { "+ " }, if unnamed == 1 { "" } else { "s" }));
+            }
+        });
+        if open.is_some() {
+            self.open_model = open;
         }
     }
 
@@ -167,7 +288,7 @@ impl TextureView {
         };
         let mats = users.users(hash);
         if mats.is_empty() {
-            ui.weak("No material in the indexed models uses this texture.");
+            self.wardrobe_users_ui(ui, hash);
             return;
         }
         let models: std::collections::HashSet<u32> = mats
@@ -238,6 +359,8 @@ impl TextureView {
             && !self.decoding
             && (self.sel.is_none() || self.tex.is_some() || self.error.is_some())
             && (self.sel.is_none() || self.users.is_some())
+            // the wardrobe links, once asked for, have arrived
+            && (!self.wardrobe_started || self.wardrobe.is_some())
     }
 
     fn ensure_loading(&mut self) {

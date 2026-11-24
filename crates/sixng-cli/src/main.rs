@@ -466,6 +466,18 @@ enum Cmd {
         #[arg(long, short)]
         out: PathBuf,
     },
+    /// Layered-material libraries (data.rpf PSO files with root struct 8419ab01): the base materials and layered presets behind the clothing and weapon shaders, which bind no colour texture. A wardrobe item's GarmentPreset and a weapon component record name a preset; a preset gives each of its 8 sub-materials a colour. Builds <work>/index/material_presets.json (per preset the four colour entries of each sub-material as rrggbbaa sRGB, entry 0 = base colour; weapon component and variant name hashes -> preset, from the weapon family files of packs.rpf when indexed), which `ped-variations` reads. With --preset, prints those presets in full (every parameter of the preset and of its base materials; parameter names are hashes). With -o, also writes each library as <out>/materials/<archive>/<offset>.json.
+    Materials {
+        /// Archive with the libraries (default data).
+        #[arg(default_value = "data")]
+        archive: String,
+        /// Presets to print in full (name hash, hex).
+        #[arg(long)]
+        preset: Vec<String>,
+        /// Output directory for the full libraries.
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
     /// Vehicle handling records from the PSO files (mass, drag, transmission, engine, suspension, steering, damage …), named by model where the name is known: <out>/pso/handling.json.
     Handling {
         /// Archive (default data).
@@ -1517,6 +1529,65 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let (ok, bad) = sixng_core::pso::export(&a, &sel, po, pr)?;
             out.print(&json!({"ok": true, "archive": a.id, "decoded": ok, "failed": bad, "seconds": t.elapsed().as_secs_f64(), "out": po.join("pso")}));
         }
+        Cmd::Materials { archive, preset, out: po } => {
+            use sixng_core::matlib;
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            let t = Instant::now();
+            let rec = |r: &matlib::Record| {
+                json!({
+                    "bases": r.bases.iter().map(|b| format!("{b:08x}")).collect::<Vec<_>>(),
+                    "floats": r.floats.iter().map(|p| json!([format!("{:08x}", p.0), p.1, p.2, p.3])).collect::<Vec<_>>(),
+                    "textures": r.textures.iter().map(|p| json!([format!("{:08x}", p.0), p.1, p.2, format!("{:016x}", p.3)])).collect::<Vec<_>>(),
+                    "colours": r.colours.iter().map(|p| json!([format!("{:08x}", p.0), p.1, p.2, format!("{:08x}", p.3)])).collect::<Vec<_>>(),
+                    "ints": r.ints.iter().map(|p| json!([format!("{:08x}", p.0), p.1, p.2, p.3])).collect::<Vec<_>>(),
+                })
+            };
+            let want: Vec<u32> = preset.iter().map(|p| u32::from_str_radix(p.trim_start_matches("0x"), 16).map_err(|_| anyhow!("bad preset {p}"))).collect::<Result<_>>()?;
+            let (mut index, mut shown) = (matlib::Index { version: matlib::VERSION, ..Default::default() }, serde_json::Map::new());
+            for e in ix.entries.iter().filter(|e| e.kind == Kind::Pso) {
+                let Ok(b) = sixng_core::scan::read_entry(&a.path, e) else { continue };
+                let Some(p) = sixng_core::pso::parse(&b).filter(|p| p.structs.contains_key(&matlib::ROOT)) else { continue };
+                let lib = matlib::Library::from_meta(&p.meta());
+                index.add(&e.id, &lib);
+                for &w in &want {
+                    if let Some(r) = lib.presets.get(&w) {
+                        let bases: serde_json::Map<String, serde_json::Value> = r.bases.iter().filter_map(|b| Some((format!("{b:08x}"), rec(lib.base.get(b)?)))).collect();
+                        let colours: Vec<_> = (0..8).map(|s| lib.colour(w, s, 0).map(|c| json!({"srgb": format!("{:02x}{:02x}{:02x}", c[0], c[1], c[2]), "alpha": c[3], "stops_linear": matlib::stops([c[0], c[1], c[2]])}))).collect();
+                        shown.insert(format!("{w:08x}"), json!({"library": e.id, "colours": colours, "preset": rec(r), "base_materials": bases}));
+                    }
+                }
+                if let Some(po) = po {
+                    let dir = po.join("materials").join(sixng_core::game::index_stem(&a.id));
+                    std::fs::create_dir_all(&dir)?;
+                    let maps = |m: &std::collections::HashMap<u32, matlib::Record>| -> std::collections::BTreeMap<String, serde_json::Value> { m.iter().map(|(k, r)| (format!("{k:08x}"), rec(r))).collect() };
+                    std::fs::write(dir.join(format!("{:x}.json", e.off)), serde_json::to_vec(&json!({"id": e.id, "base_materials": maps(&lib.base), "presets": maps(&lib.presets)}))?)?;
+                }
+            }
+            // weapon family files of packs.rpf name presets per component
+            if let Ok(pa) = ws.resolve("packs") {
+                if let Ok(pix) = ws.load_index(&pa) {
+                    let tag = 0x8549_2dc3u32.to_le_bytes();
+                    for e in pix.entries.iter().filter(|e| e.kind == Kind::Pso) {
+                        let Ok(b) = sixng_core::scan::read_entry(&pa.path, e) else { continue };
+                        if b.windows(4).any(|w| w == tag) {
+                            if let Some(p) = sixng_core::pso::parse(&b) {
+                                index.add_weapon_file(&p.to_json());
+                            }
+                        }
+                    }
+                }
+            }
+            if index.libraries.is_empty() {
+                anyhow::bail!("no material library (PSO with root struct 8419ab01) in {}", a.id);
+            }
+            std::fs::create_dir_all(ws.index_dir())?;
+            std::fs::write(matlib::path(&ws), serde_json::to_vec(&index)?)?;
+            let resolved = |m: &std::collections::BTreeMap<String, String>| m.values().filter(|p| index.presets.contains_key(*p)).count();
+            out.print(&json!({"ok": true, "archive": a.id, "libraries": index.libraries.iter().map(|l| json!({"id": l.0, "base_materials": l.1, "presets": l.2})).collect::<Vec<_>>(), "presets": index.presets.len(),
+                "weapon_components": {"count": index.weapon_components.len(), "resolved": resolved(&index.weapon_components)}, "weapon_variants": {"count": index.weapon_variants.len(), "resolved": resolved(&index.weapon_variants)},
+                "index": matlib::path(&ws), "shown": shown, "seconds": t.elapsed().as_secs_f64()}));
+        }
         Cmd::Handling { archive, out: po } => {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
@@ -1803,6 +1874,8 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     })
                 })
                 .unwrap_or_default();
+            // layered-material presets (`sixng materials`), if built
+            let presets = sixng_core::matlib::Index::load(&ws);
             let mut res = serde_json::Map::new();
             for id in ids {
                 let off = id.rsplit('@').next().unwrap_or(id).trim_start_matches("0x");
@@ -1819,9 +1892,19 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                         let remap: Vec<String> = v.parts.iter().flat_map(|p| p.tex_remap.iter().map(|(a, b)| format!("{a}={b}"))).collect();
                         let mut tints: Vec<String> = v.parts.iter().filter_map(|p| Some(format!("{}={}", p.drawable.as_deref()?, p.tint.as_ref()?.spec))).collect();
                         tints.dedup();
+                        // per drawable: the preset and its sub-materials' base colours (sRGB rrggbb, null = none)
+                        let pc: serde_json::Map<String, serde_json::Value> = v
+                            .parts
+                            .iter()
+                            .filter_map(|p| {
+                                let (d, pr) = (p.drawable.as_deref()?, p.preset.as_deref()?);
+                                let cols = presets.as_ref()?.colours(pr)?;
+                                Some((d.to_string(), json!({"preset": pr, "sub_materials": cols.iter().map(|c| c.map(|c| format!("{:02x}{:02x}{:02x}", c[0], c[1], c[2]))).collect::<Vec<_>>()})))
+                            })
+                            .collect();
                         let dv: serde_json::Map<String, serde_json::Value> = v.parts.iter().flat_map(|p| p.tags.values().flatten()).filter_map(|w| dirt.get(w).map(|d| (w.clone(), d.clone()))).collect();
                         let listed = u32::from_str_radix(&v.id, 16).ok().and_then(|i| lists.get(&i)).map(|&(m, c, s)| json!({"model": format!("{m:08x}"), "outfit_type": format!("{c:08x}"), "scale": s}));
-                        json!({"id": v.id, "scale": v.scale, "listed": listed, "tags": v.tags, "parts": d.iter().map(|n| format!("^{n}$")).collect::<Vec<_>>().join(","), "tex_remap": remap.join(","), "tints": tints.join(","), "dirt": dv, "items": v.parts})
+                        json!({"id": v.id, "scale": v.scale, "listed": listed, "tags": v.tags, "parts": d.iter().map(|n| format!("^{n}$")).collect::<Vec<_>>().join(","), "tex_remap": remap.join(","), "tints": tints.join(","), "dirt": dv, "preset_colours": pc, "items": v.parts})
                     })
                     .collect();
                 res.insert(e.id.clone(), json!(vs));
