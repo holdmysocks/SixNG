@@ -50,6 +50,8 @@ struct ElemRec {
     bone: String,
     #[serde(default)]
     hides: Vec<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -164,6 +166,8 @@ pub struct Config {
     pub parts_key: Option<String>,
     /// Names of the light patterns the configuration's parts link.
     pub light_patterns: Vec<String>,
+    /// The configuration's part list as name hashes.
+    pub parts: Vec<u32>,
 }
 
 #[derive(Clone, Default)]
@@ -194,6 +198,8 @@ pub struct Mod {
     pub name: u32,
     pub slot: u32,
     pub elements: Vec<(u32, Vec<u32>)>,
+    /// Per element, the joaat of its model's name (0 when not given).
+    pub models: Vec<u32>,
 }
 
 /// The vehicle table, read once per process (model loading uses it off the
@@ -310,6 +316,8 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
                 rim_ratio: c.rim_ratio,
                 parts_key: c.parts_key,
                 light_patterns: c.light_patterns,
+                // a name where it is known, else the hash as 8 hex digits
+                parts: c.parts.iter().map(|p| if p.len() == 8 && p.bytes().all(|b| b.is_ascii_hexdigit()) && !p.contains('_') { u32::from_str_radix(p, 16).unwrap_or(0) } else { sixng_core::meta7a::joaat(p) }).collect(),
                 // pure magenta is stored where a configuration has no body
                 // colour of its own (aircraft, some trailers)
                 colour: c.colour.and_then(|c| hex(&c.srgb_if_linear)).filter(|c| !is_placeholder(*c)),
@@ -374,7 +382,7 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
                     .iter()
                     .map(|m| {
                         let h = |s: &str| u32::from_str_radix(s, 16).unwrap_or(0);
-                        Mod { name: h(&m.name), slot: h(&m.slot), elements: m.elements.iter().map(|e| (h(&e.bone), e.hides.iter().map(|x| h(x)).collect())).collect() }
+                        Mod { name: h(&m.name), slot: h(&m.slot), models: m.elements.iter().map(|e| e.model.as_deref().map_or(0, h)).collect(), elements: m.elements.iter().map(|e| (h(&e.bone), e.hides.iter().map(|x| h(x)).collect())).collect() }
                     })
                     .collect(),
             },

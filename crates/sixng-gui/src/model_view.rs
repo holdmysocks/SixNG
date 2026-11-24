@@ -315,6 +315,8 @@ pub struct ModelView {
     /// direction along the glass and a point on its bottom edge, both in
     /// the joint's own space.
     window_movers: Vec<(usize, Vec3, Vec3)>,
+    /// A reload asked for by a configuration: its parts with models.
+    parts_request: Option<String>,
     /// The moving parts of an aircraft among the loaded model's joints.
     air: Vec<AirPart>,
     /// Rotor and propeller speed, 0 (still) to 1; the angle they are at.
@@ -620,6 +622,7 @@ impl ModelView {
             brake_heat: 0.0,
             windows_down: 0.0,
             window_movers: Vec::new(),
+            parts_request: None,
             air: Vec::new(),
             rotor_speed: 0.0,
             rotor_angle: 0.0,
@@ -1381,7 +1384,7 @@ impl ModelView {
             l.parts.len()
         ));
         ui.label(
-            egui::RichText::new("One choice per group. Accessories and alternate sets start off.")
+            egui::RichText::new("One choice per group. Accessories and alternate sets start off; a vehicle starts with the parts of its first configuration.")
                 .weak(),
         );
         egui::Grid::new("parts_grid")
@@ -1864,6 +1867,27 @@ impl ModelView {
             self.rim_ratio = c.rim_ratio.unwrap_or(0.0);
         }
         self.part_look_want = c.parts_key.clone();
+        // the parts with models this configuration names
+        if let Some(l) = self.loaded.as_ref().filter(|l| !l.parts.is_empty()) {
+            // the index its parts come from (ids are "<archive>@<offset>")
+            let archive = l.parts[0].id.split('@').next().unwrap_or("");
+            let ix = self.indexes.lock().unwrap().values().find(|x| x.entries.first().is_some_and(|e| e.id.split('@').next() == Some(archive))).cloned();
+            if let Some(ix) = ix {
+                // the model's own name, LOD suffix and all ("<id> <name> (+3 parts)")
+                let model = l.source.split_whitespace().nth(1).unwrap_or("");
+                let (_, _, part_names) = vehicle_part_options(&ix, model, v);
+                // one part per group: a part list also holds the choices
+                // of its option lists, of which the game takes one
+                let mut groups = std::collections::HashSet::new();
+                let mut want: Vec<u64> = l.parts.iter().filter(|o| (part_names.get(&o.off).is_some_and(|n| c.parts.contains(n)) || (o.default && o.group.starts_with("body ("))) && groups.insert(o.group.clone())).map(|o| o.off).collect();
+                let mut have = l.selected.clone();
+                want.sort_unstable();
+                have.sort_unstable();
+                if want != have {
+                    self.parts_request = Some(format!("{}#parts={}", l.base.split("#parts=").next().unwrap_or(&l.base), want.iter().map(|o| format!("{o:x}")).collect::<Vec<_>>().join(",")));
+                }
+            }
+        }
         self.cfg_patterns = c.light_patterns.clone();
         self.siren_dirty = true;
         if let Some(r) = &c.rim {
@@ -3366,7 +3390,7 @@ impl ModelView {
             self.hair_ui(ui);
             ui.separator();
         }
-        if let Some(q) = self.look_ui(ui).or_else(|| self.parts_ui(ui)) {
+        if let Some(q) = self.look_ui(ui).or_else(|| self.parts_ui(ui)).or_else(|| self.parts_request.take()) {
             self.keep_cam_once = true;
             let ctx = ui.ctx().clone();
             self.open(&q, 0, &ctx);
@@ -4902,15 +4926,26 @@ fn load_query_sel(
         });
         }
     }
-    // vehicles: mod parts (bonnets, bumpers, spoilers, exhausts ...) are
-    // separate models; the vehicle data says which bone each is modelled
-    // around and which stock bones it replaces. None is on by default.
+    // vehicles: mod parts (bonnets, bumpers, spoilers, exhausts, truck beds
+    // ...) are separate models; the vehicle data says which bone each is
+    // modelled around and which stock bones it replaces. The parts of the
+    // first configuration are on by default.
     let mut veh_opts = Vec::new();
     if e.rtype.as_deref() == Some("ft") && info["wheel_mounts"].as_array().is_some_and(|w| !w.is_empty()) {
         let db = sixng_core::names::work_dir().and_then(|w| crate::vehicle_db::shared(&export::game_root(&a).to_string_lossy(), &w.to_string_lossy()).ok());
         if let Some(v) = db.as_ref().and_then(|db| crate::vehicle_db::find(db, &crate::vehicle_db::model_key(name))) {
-            let (opts, kits) = vehicle_part_options(&ix, name, v);
-            let chosen: Vec<u64> = sel.clone().unwrap_or_default().into_iter().filter(|o| kits.contains_key(o)).collect();
+            let (opts, kits, _) = vehicle_part_options(&ix, name, v);
+            // no choice made yet: the parts of the first configuration
+            let chosen: Vec<u64> = sel
+                .clone()
+                .unwrap_or_else(|| {
+                    // one per group (a part list also holds the choices of its option lists)
+                    let mut groups = std::collections::HashSet::new();
+                    opts.iter().filter(|o| o.default && groups.insert(o.group.clone())).map(|o| o.off).collect()
+                })
+                .into_iter()
+                .filter(|o| kits.contains_key(o))
+                .collect();
             if !chosen.is_empty() {
                 let joaat = |s: &str| sixng_core::meta7a::joaat(&s.to_ascii_lowercase());
                 let mut model = model;
@@ -5768,7 +5803,12 @@ fn is_wheel_bone(n: &str) -> bool {
 /// at the vehicle's own LOD suffix. Options in the same slot replace each
 /// other.
 #[allow(clippy::type_complexity)]
-fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db::Vehicle) -> (Vec<crate::assemble::PartOpt>, HashMap<u64, Vec<(u64, u32, Vec<u32>)>>) {
+/// The mod parts of a vehicle that have models here: the options, per
+/// option the models it places (model, bone, stock bones it hides), and per
+/// option the name hash of its part (what a configuration's part list holds).
+#[allow(clippy::type_complexity)]
+fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db::Vehicle) -> (Vec<crate::assemble::PartOpt>, HashMap<u64, Vec<(u64, u32, Vec<u32>)>>, HashMap<u64, u32>) {
+    let mut part_names: HashMap<u64, u32> = HashMap::new();
     let joaat = sixng_core::meta7a::joaat;
     let vl = vehicle.to_ascii_lowercase();
     let suffix = ["_hi", "_mid"].into_iter().find(|s| vl.ends_with(s)).unwrap_or("");
@@ -5808,27 +5848,47 @@ fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db:
     let slot_name: HashMap<u32, &str> = SLOTS.iter().map(|s| (joaat(s), *s)).collect();
     let mut opts = Vec::new();
     let mut kits = HashMap::new();
+    // the parts of the first configuration are on to begin with
+    let first_config: std::collections::HashSet<u32> = v.configs.first().map(|c| c.parts.iter().copied().collect()).unwrap_or_default();
     for m in &v.mods {
-        let Some(models) = by_hash.get(&m.name) else { continue };
-        // a name that is both a model and a kit: the model itself
-        let mut ms: Vec<&(&String, &sixng_core::scan::Entry)> = models.iter().filter(|x| joaat(x.0) == m.name).collect();
-        if ms.is_empty() {
-            ms = models.iter().collect();
-        }
-        ms.sort_by(|a, b| a.0.cmp(b.0));
-        ms.dedup_by(|a, b| a.0 == b.0);
-        if ms.is_empty() || m.elements.is_empty() {
+        if m.elements.is_empty() {
             continue;
         }
+        // the models its elements name (truck beds, shared light bars ...)
+        let named: Vec<(&(&String, &sixng_core::scan::Entry), usize)> = m
+            .models
+            .iter()
+            .enumerate()
+            .filter_map(|(k, h)| by_hash.get(h).and_then(|x| x.iter().find(|x| joaat(x.0) == *h)).map(|x| (x, k)))
+            .collect();
+        let mut ms: Vec<&(&String, &sixng_core::scan::Entry)>;
+        let list: Vec<(u64, u32, Vec<u32>)> = if !named.is_empty() {
+            ms = named.iter().map(|x| x.0).collect();
+            named.iter().map(|(x, k)| (x.1.off, m.elements[*k].0, m.elements[*k].1.clone())).collect()
+        } else {
+            // else the model called like the part itself
+            let Some(models) = by_hash.get(&m.name) else { continue };
+            // a name that is both a model and a kit: the model itself
+            ms = models.iter().filter(|x| joaat(x.0) == m.name).collect();
+            if ms.is_empty() {
+                ms = models.iter().collect();
+            }
+            ms.sort_by(|a, b| a.0.cmp(b.0));
+            ms.dedup_by(|a, b| a.0 == b.0);
+            if ms.is_empty() {
+                continue;
+            }
+            // elements and models pair up in order (left before right in both)
+            ms.iter().enumerate().map(|(k, x)| {
+                let el = m.elements.get(k).or(m.elements.last()).unwrap();
+                (x.1.off, el.0, el.1.clone())
+            }).collect()
+        };
         let first = ms[0].1;
-        if kits.contains_key(&first.off) {
+        // wheels and brakes are fitted at the wheel mounts by the viewer
+        if kits.contains_key(&first.off) || ["rim_", "tyre_", "brakedisc_", "caliper_", "drumbrake_"].iter().any(|w| ms[0].0.starts_with(w)) {
             continue;
         }
-        // elements and models pair up in order (left before right in both)
-        let list: Vec<(u64, u32, Vec<u32>)> = ms.iter().enumerate().map(|(k, x)| {
-            let el = m.elements.get(k).or(m.elements.last()).unwrap();
-            (x.1.off, el.0, el.1.clone())
-        }).collect();
         let part = ms[0].0.strip_prefix(&format!("{}_", crate::vehicle_db::model_key(vehicle))).unwrap_or(ms[0].0).to_string();
         let label = if ms.len() > 1 { format!("{} (+{})", part.replace('_', " "), ms.len() - 1) } else { part.replace('_', " ") };
         opts.push(crate::assemble::PartOpt {
@@ -5837,12 +5897,29 @@ fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db:
             name: ms[0].0.to_string(),
             group: slot_name.get(&m.slot).map(|s| s.to_string()).unwrap_or_else(|| format!("slot {:08x}", m.slot)),
             label,
-            default: false,
+            default: first_config.contains(&m.name),
         });
+        part_names.insert(first.off, m.name);
         kits.insert(first.off, list);
     }
+    // A pickup's bed is a model named `<vehicle>_pickup` (also `_flatbed`
+    // ...). The part that fits it names its models by hashes that match
+    // no model name, so the link is not known: the bed is offered as a
+    // part of its own, placed at the `mod_bed_attach` bone (where those
+    // parts put their models; the vehicle's origin without it), and is on
+    // to begin with when the vehicle has configurations.
+    let key = crate::vehicle_db::model_key(vehicle);
+    for (i, body) in ["pickup", "flatbed", "cargobed"].into_iter().enumerate() {
+        let stem = format!("{key}_{body}");
+        let Some(e) = stems.get(&stem) else { continue };
+        if kits.contains_key(&e.off) || e.rtype.as_deref() != Some("ft") {
+            continue;
+        }
+        opts.push(crate::assemble::PartOpt { off: e.off, id: e.id.clone(), name: stem.clone(), group: "body (link not known)".into(), label: body.to_string(), default: i == 0 && !v.configs.is_empty() });
+        kits.insert(e.off, vec![(e.off, joaat("mod_bed_attach"), Vec::new())]);
+    }
     opts.sort_by(|a, b| a.group.cmp(&b.group).then(a.label.cmp(&b.label)));
-    (opts, kits)
+    (opts, kits, part_names)
 }
 
 /// Move a model's geometry by a rigid transform (weapon parts onto their
