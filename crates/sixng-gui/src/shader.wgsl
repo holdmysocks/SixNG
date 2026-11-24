@@ -309,10 +309,10 @@ fn hair_game(colour: vec3<f32>, t: vec3<f32>, n: vec3<f32>, root: vec3<f32>, v: 
     let sb = q * q * cos_i * inv2pi + (vec3(f * mb.r) + tt * mb.g + trt * mb.b + res * mb.a) * inv2pi;
     // the program divides by the colour here and multiplies it back later
     let coloured = pc * (s0 + q * sc + q * q * sb);
-    // the uncoloured surface reflection, with the light's size factor
-    let m = max(0.001, z0 * z0);
-    let aa = 1.001 * (0.1 + m) * (0.1 + m);
-    let area = aa / (aa + 0.25 * (3.0 * (0.1 + m) + 1.0));
+    // the light's size factor a / (a + 0.25 s (3 (0.1 + m) + s)) scales both
+    // parts; s is the source size from the light's record, near 0 for the
+    // sun, so the factor is 1
+    let area = 1.0;
     // visibility: the side of the head the light is on (the root normal)
     // times the azimuth term, which reaches 2 for light from the eye's side;
     // the program also fades this towards 1 by a depth value (not decoded)
