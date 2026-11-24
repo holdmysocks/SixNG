@@ -4964,7 +4964,16 @@ fn load_query_sel(
                     .unwrap_or_default();
                 let (mut names, mut errs) = (Vec::new(), Vec::new());
                 for o in &chosen {
+                    // the pickup bed is attached by name: it may sit at the origin
+                    let by_name = opts.iter().any(|x| x.off == *o && x.group.starts_with("body ("));
                     for (off, bone, _) in &kits[o] {
+                        // A part lists a model per mounting bone (side
+                        // guards in short, mid and long for the chassis
+                        // lengths): only the ones whose bone this vehicle
+                        // has are fitted. Bone 0 is the vehicle itself.
+                        if *bone != 0 && !bind.contains_key(bone) && !by_name {
+                            continue;
+                        }
                         let Some(pe) = ix.entries.iter().find(|x| x.off == *off) else { continue };
                         let pn = pe.name.clone().unwrap_or_default();
                         match export_load(&a, pe, cache, level) {
