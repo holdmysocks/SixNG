@@ -611,6 +611,33 @@ again**).
   clip (6.65 m in 3.7 s) each planted foot stays within 1 cm on the
   ground while it is down. Float tracks (facial and other controls) are
   not applied, and the Pose angles are added on top. `sixng clips --name <regex>` lists dictionaries.
+- **Cutscenes** (`sixng cutscenes [<scene>] [--name <regex>] [--cast
+  <regex>] [--summary]`): the story pack's 2,823 scenes, each with its
+  cast (scene handle, ped model, whether `outfit` can assemble it), props,
+  cameras, the clip names of every object and the set-dressing models its
+  scene file places. Two kinds of files describe a scene. Its clip
+  dictionary `cin@<scene>` holds one clip per animated object, named after
+  the object's handle (`lucia`, `lucia_face`, `rs_camera_8`,
+  `prop_am_drink_soda_03a^2`); `cin@<scene>-<N>` dictionaries (25,294)
+  hold the streamed animation sections. Its scene file (a meta resource,
+  2,300 of them) names the scene by hash and lists the peds by the joaat of
+  their handle with the 64-bit asset id of their model, cameras and placed
+  objects with model ids. The first run reads the whole archive (about
+  3 minutes) and caches `<work>/index/pack_story000_story000.cutscenes.json`.
+  Measured on the whole pack: 2,313 scenes have a scene file, 4,723 cast
+  entries are characters `outfit` assembles (`player_story000_00` /
+  `_01`, `cs_raul`, `cs_andrea` …), 271 more are other peds with a named
+  model, 3,243 peds have a model id that does not resolve to a known name
+  and 1,764 have no record; 11,253 props, 9,216 cameras and 5,205 other
+  objects (vehicles, lead-in / idle clips) whose model is not known;
+  2,835 of 2,838 set-dressing model ids resolve. `sixng outfit
+  <character> --clip cin@<scene>` plays that character's own clip of the
+  scene (`--clip cin@<scene>/<clip>` picks one), and `sixng clips
+  cin@<scene>` lists a scene's clips. Most clips (16,472 objects) keep
+  their animation in the section dictionaries, which are not joined yet;
+  those are refused with that reason, and 1,441 character clips play
+  directly. Not decoded: the scene files' timing, events and state
+  transitions, and how the sections map to clips.
 - **Body sliders** (weight −1…1, muscle 0…1; `--body <w>,<m>` for
   screenshots): the skin and head are posed with the game's body-shape rig
   on the shared skeleton. Clothes and accessories follow the skin under
