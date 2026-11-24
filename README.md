@@ -326,9 +326,12 @@ repeated), one glTF animation each. `--anim-only` writes only the skeleton
 and the animations. `sixng characters` lists every character and animal
 `outfit` can build (327 characters and 263 animals), and under `models` every
 ped model of the game's outfit list (2,713; `--kind model` for these alone).
-The list stores only name hashes: 579 models are named from index names,
-the name dictionary and the text tables (a few of these may be chance hash
-hits), the rest are listed as `ped_0x<hash>`. `ped-look` and `outfit:` take
+The list stores only name hashes: 581 models are named from index names,
+the name dictionary and the text tables. Ambient names (`a_f_y_<word>_NN`)
+from a single text word are marked `uncertain` (8): a control search with
+prefixes no ped model has finds as many such hits as the real prefixes, so
+a wider word search does not name the ambient models (2,132 stay unnamed;
+a few of the story names may also be chance hash hits), the rest are listed as `ped_0x<hash>`. `ped-look` and `outfit:` take
 either form, and the viewer's picker lists them all. The animal clips were
 checked by rendering (eagle flap, deer walk/run/idle: 91–97 % of tracks land
 on a joint). Animals have a 180° yaw on `SKEL_ROOT` in the bind pose that

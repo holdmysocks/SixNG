@@ -221,9 +221,15 @@ pub struct ModelNames {
     version: u32,
     /// joaat(model name) -> name
     pub names: BTreeMap<u32, String>,
+    /// Names that may be chance hash hits: an ambient-style name
+    /// (`a_f_y_<word>_NN`) made from a text word, with no second model on
+    /// the same word. A control run with prefixes no ped model has finds as
+    /// many such single hits as the real prefixes do.
+    #[serde(default)]
+    pub uncertain: std::collections::BTreeSet<u32>,
 }
 
-const NAMES_VERSION: u32 = 1;
+const NAMES_VERSION: u32 = 2;
 
 /// A name shaped like a ped model's: `cs_…`, `ig_…`, `player_…`,
 /// `a_f_y_…` (kind, sex, age) or an animal root.
@@ -267,6 +273,7 @@ fn build_names(game_root: &Path, work: &Path, t: &Models, ix: &ArchiveIndex) -> 
     let keys = &t.by_model;
     // names and name prefixes of the index
     let mut seen: HashSet<&str> = HashSet::new();
+    let mut words: HashSet<String> = HashSet::new();
     for e in &ix.entries {
         let Some(n) = e.name.as_deref() else { continue };
         if !seen.insert(n) {
@@ -274,6 +281,12 @@ fn build_names(game_root: &Path, work: &Path, t: &Models, ix: &ArchiveIndex) -> 
         }
         let n = n.to_ascii_lowercase();
         let cuts = n.match_indices('_').map(|(i, _)| i).skip(1).chain(std::iter::once(n.len()));
+        // single words of the names, for the ambient forms below
+        for w in n.split('_').filter(|w| w.len() >= 3 && w.bytes().all(|c| c.is_ascii_alphabetic())) {
+            if !words.contains(w) {
+                words.insert(w.to_string());
+            }
+        }
         for c in cuts {
             let p = &n[..c];
             // `hc_cs_x` and `hc_x` parts belong to the models `cs_x` and `x`
@@ -295,6 +308,67 @@ fn build_names(game_root: &Path, work: &Path, t: &Models, ix: &ArchiveIndex) -> 
             }
         }
     }
+    // Ambient forms (`g_m_m_<word>_NN`) and numbered story models
+    // (`cs_<word>_NN`): a hit counts when the same word also hits behind
+    // another prefix (`g_f_m_` beside `g_m_m_`), which chance does not
+    // produce. Several numbers behind one prefix prove nothing: models come
+    // in numbered families, and one chance match of the hash state before
+    // the number hits the whole family. A single hit from a text word is
+    // kept, with the narrow number range only, and marked uncertain.
+    let mut ambient: Vec<String> = Vec::new();
+    for k in "agsu".chars() {
+        for s in "fm".chars() {
+            for age in "ymo".chars() {
+                ambient.push(format!("{k}_{s}_{age}_"));
+            }
+        }
+    }
+    let numbered: Vec<String> = (0..10).map(|n| format!("_{n:02}")).collect();
+    let mut uncertain = std::collections::BTreeSet::new();
+    let mut grouped = |stems: &HashSet<String>, names: &mut BTreeMap<u32, String>, with_cs: bool, keep_single: bool| {
+        let found: Vec<(String, u32, String, bool)> = stems
+            .par_iter()
+            .flat_map_iter(|stem| {
+                let mut v = Vec::new();
+                for p in ambient.iter().map(String::as_str).chain(with_cs.then_some("cs_")) {
+                    for suffix in std::iter::once("").chain(numbered.iter().map(String::as_str)) {
+                        // `cs_<word>` alone is covered by the other sources
+                        if p == "cs_" && suffix.is_empty() {
+                            continue;
+                        }
+                        let cand = format!("{p}{stem}{suffix}");
+                        let h = joaat(&cand);
+                        if keys.contains_key(&h) {
+                            v.push((stem.clone(), h, cand, matches!(suffix, "" | "_00" | "_01" | "_02")));
+                        }
+                    }
+                }
+                v
+            })
+            .collect();
+        let mut per_stem: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for (stem, _, n, _) in &found {
+            per_stem.entry(stem.as_str()).or_default().insert(n.find(stem.as_str()).map_or("", |i| &n[..i]));
+        }
+        let mut count: HashMap<&str, usize> = HashMap::new();
+        for (stem, _, _, _) in &found {
+            *count.entry(stem.as_str()).or_insert(0) += 1;
+        }
+        let mut found: Vec<&(String, u32, String, bool)> = found.iter().collect();
+        found.sort();
+        for (stem, h, n, narrow) in found {
+            // the few index words make a chance family hit unlikely (about 0.05 expected)
+            let several = per_stem[stem.as_str()].len() > 1 || (with_cs && count[stem.as_str()] > 1);
+            if names.contains_key(h) || !(several || keep_single && *narrow) {
+                continue;
+            }
+            names.insert(*h, n.clone());
+            if !several {
+                uncertain.insert(*h);
+            }
+        }
+    };
+    grouped(&words, &mut names, true, false);
     // the text tables of data.rpf, when it is indexed
     let ixp = crate::scan::index_path(&work.join("index"), "data.rpf");
     if let Ok(dix) = crate::scan::load_index(&ixp) {
@@ -312,14 +386,8 @@ fn build_names(game_root: &Path, work: &Path, t: &Models, ix: &ArchiveIndex) -> 
                     a.extend(b);
                     a
                 });
-            let mut prefixes: Vec<String> = ["cs_", "hc_cs_", "hc_", "ig_", "csb_"].iter().map(|s| s.to_string()).collect();
-            for k in "agsu".chars() {
-                for s in "fm".chars() {
-                    for age in "ymo".chars() {
-                        prefixes.push(format!("{k}_{s}_{age}_"));
-                    }
-                }
-            }
+            let prefixes: Vec<String> = ["cs_", "hc_cs_", "hc_", "ig_", "csb_"].iter().map(|s| s.to_string()).collect();
+            grouped(&stems, &mut names, false, true);
             let found: Vec<(u32, String)> = stems
                 .par_iter()
                 .flat_map_iter(|stem| {
@@ -343,7 +411,8 @@ fn build_names(game_root: &Path, work: &Path, t: &Models, ix: &ArchiveIndex) -> 
             }
         }
     }
-    ModelNames { version: NAMES_VERSION, names }
+    uncertain.retain(|h| names.contains_key(h));
+    ModelNames { version: NAMES_VERSION, names, uncertain }
 }
 
 /// The model name table (built on first use, about twenty seconds when
@@ -383,6 +452,8 @@ pub struct ListedModel {
     pub name: String,
     pub hash: String,
     pub named: bool,
+    /// The name may be a chance hash hit (`ModelNames::uncertain`).
+    pub uncertain: bool,
     pub outfits: usize,
 }
 
@@ -396,7 +467,7 @@ pub fn listed_models(game_root: &Path) -> Result<Vec<ListedModel>, String> {
         .iter()
         .map(|(h, row)| {
             let name = n.names.get(h);
-            ListedModel { name: name.cloned().unwrap_or_else(|| format!("ped_0x{h:08x}")), hash: format!("{h:08x}"), named: name.is_some(), outfits: row.outfits.len() }
+            ListedModel { name: name.cloned().unwrap_or_else(|| format!("ped_0x{h:08x}")), hash: format!("{h:08x}"), named: name.is_some(), uncertain: n.uncertain.contains(h), outfits: row.outfits.len() }
         })
         .collect();
     v.sort_by(|a, b| (!a.named, &a.name).cmp(&(!b.named, &b.name)));
