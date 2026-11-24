@@ -20,6 +20,11 @@ pub struct Vertex {
     pub weights: [u8; 4],
     /// Tint palette colour (GLB COLOR_0, linear); white = no tint.
     pub tint: [u8; 4],
+    /// Vehicle sticker zone: `[0]` the zone (fourth byte of the model's
+    /// second colour stream, GLB `_COLOR1`; 0 where the model has none),
+    /// `[1]` which model of an assembled vehicle the vertex came from
+    /// (0 = the vehicle itself, 1.. = fitted parts).
+    pub zone: [u8; 4],
 }
 
 pub struct Mesh {
@@ -987,6 +992,12 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                     v[i].col = c[i];
                 }
             }
+            if let Some(a) = at["_COLOR1"].as_u64() {
+                let c = d.u8x4(a as usize)?;
+                for i in 0..n.min(c.len()) {
+                    v[i].zone = [c[i][3], 0, 0, 0];
+                }
+            }
             if let Some(a) = at["COLOR_0"].as_u64() {
                 let c = d.u8x4(a as usize)?;
                 for i in 0..n.min(c.len()) {
@@ -1246,7 +1257,7 @@ mod tangent_tests {
     fn quad(uv: [[f32; 2]; 4]) -> Vec<Vertex> {
         // a wall facing +z: x right, y up
         let pos = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]];
-        (0..4).map(|i| Vertex { pos: pos[i], nrm: [0.0, 0.0, 1.0], tan: [0.0, 1.0, 0.0, 1.0], uv0: uv[i], uv1: [0.0; 2], col: [255; 4], joints: [0; 4], weights: [0; 4], tint: [255; 4] }).collect()
+        (0..4).map(|i| Vertex { pos: pos[i], nrm: [0.0, 0.0, 1.0], tan: [0.0, 1.0, 0.0, 1.0], uv0: uv[i], uv1: [0.0; 2], col: [255; 4], joints: [0; 4], weights: [0; 4], tint: [255; 4], zone: [0; 4] }).collect()
     }
 
     /// cross(n, t) * w, the bitangent the shaders build.

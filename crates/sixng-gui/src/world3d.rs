@@ -408,6 +408,7 @@ fn node_model(
                 joints: [0; 4],
                 weights: [0; 4],
                 tint: [255; 4],
+                zone: [0; 4],
             });
         }
     }
@@ -1227,6 +1228,7 @@ fn ocean_model() -> glb::Model {
         joints: [0; 4],
         weights: [0; 4],
         tint: [255; 4],
+        zone: [0; 4],
     };
     let verts = vec![
         v(cx - e, cy - e),

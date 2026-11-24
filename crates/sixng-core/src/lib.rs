@@ -54,6 +54,7 @@ pub mod heightmap;
 pub mod ptfx;
 pub mod vehexport;
 pub mod vehicles;
+pub mod vehstickers;
 pub mod vehcolour;
 pub mod vehlights;
 pub mod weapon;

@@ -654,7 +654,8 @@ mod tests {
                     col: [255; 4],
                     joints: [0; 4],
                     weights: [0; 4],
-                    tint: [255; 4]
+                    tint: [255; 4],
+                    zone: [0; 4],
                 };
                 3
             ],

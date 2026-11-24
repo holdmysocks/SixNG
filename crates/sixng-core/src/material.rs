@@ -345,6 +345,7 @@ pub fn multilayer(s: &crate::drawable::Shader, entries: &[Value], fit: impl FnOn
     if l["family"] == "four_layer" {
         l["params"] = four_layer_params(&s.constants);
         l["detail_uv"]["recommended"] = four_layer_detail_uv(&fit);
+        four_layer_uv(&mut l, &s.constants);
     }
     if !fit.is_null() {
         l["uv_fit"] = fit;
@@ -440,6 +441,30 @@ fn solve3(m: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
     Some(x)
 }
 
+/// Each layer's UV of a 4-layer material from the material's own constants,
+/// as the shader code applies them (read in two deferred pixel programs,
+/// `standard_uber_4lyr` and `…_dpm_dm_hbb`): `724bed95[k] == 1` gives layer
+/// k the first UV set times `4344d2cc.xy` plus `.zw`, anything else the
+/// second set times `9ecaaa1e.xy` plus `.zw`. Replaces the assumed values
+/// in `layers` and the recommendation; nothing changes when a constant is
+/// missing.
+fn four_layer_uv(l: &mut Value, consts: &[crate::drawable::ShaderConst]) {
+    let get = |h: &str| consts.iter().find(|c| c.hash == h).and_then(|c| c.components()).filter(|v| v.len() == 4 && v.iter().all(|x| x.is_finite())).map(<[f32]>::to_vec);
+    let (Some(first), Some(second), Some(pick)) = (get("4344d2cc"), get("9ecaaa1e"), get("724bed95")) else { return };
+    let alt = l["detail_uv"]["alt_uv_set"].as_str().unwrap_or("the second UV set").to_string();
+    for (k, layer) in l["layers"].as_array_mut().into_iter().flatten().enumerate().take(4) {
+        let (set, t) = if pick[k] == 1.0 { ("TEXCOORD_0".to_string(), &first) } else { (alt.clone(), &second) };
+        layer["uv_set"] = json!(set);
+        layer["uv_scale"] = if t[0] == t[1] { json!(t[0]) } else { json!([t[0], t[1]]) };
+        layer["uv_offset"] = json!([t[2], t[3]]);
+        layer["uv_source"] = json!("material constants");
+    }
+    let l0 = l["layers"][0].clone();
+    l["detail_uv"]["recommended"] = json!({"uv": l0["uv_set"], "scale": l0["uv_scale"], "offset": l0["uv_offset"], "per_layer": true,
+        "why": "the material's own constants, as the shader applies them: see uv_set, uv_scale and uv_offset of each layer (a layer can use the other UV set)"});
+    l["confidence"]["detail_uv_scale"] = json!("high (material constants and shader code)");
+}
+
 /// Detail-layer UV for a 4-layer material from its measured mapping:
 /// section tiles (TEXCOORD_0 planar at about 512 m per unit, 430-620 allowing for quantisation on small patches) repeat the layers
 /// 64 times per TEXCOORD_0 unit (every 8 m); other models use the first
@@ -515,7 +540,7 @@ fn four_layer(name_hash: &str, tex: &dyn Fn(usize) -> Value) -> Value {
     let layers: Vec<Value> = SLOTS
         .iter()
         .enumerate()
-        .map(|(i, s)| json!({"name": format!("layer{i}"), "colour": tex(s[0]), "normal": tex(s[1]), "data": tex(s[2]), "uv_set": "TEXCOORD_0", "uv_scale": 64.0, "weight": weight[i]}))
+        .map(|(i, s)| json!({"name": format!("layer{i}"), "colour": tex(s[0]), "normal": tex(s[1]), "data": tex(s[2]), "uv_set": "TEXCOORD_0", "uv_scale": 128.0, "uv_offset": [0.0, 0.0], "uv_source": "assumed (the usual values on map section tiles)", "weight": weight[i]}))
         .collect();
     let alt_uv = match name_hash {
         "b21f1ba5" => Value::Null,
@@ -529,7 +554,7 @@ fn four_layer(name_hash: &str, tex: &dyn Fn(usize) -> Value) -> Value {
             "vertex_override": "weights = mix(lookup.rgb, COLOR_1.rgb, COLOR_1.a) per channel, and the remainder = saturate(1 - r - g - b) of each side mixed the same way: where the second vertex colour set has alpha 0 (the usual case) the lookup texture alone decides. From the shader code; which exported attribute holds that colour set was not checked on a mesh.",
             "result": "each layer's shaded result is multiplied by its weight and the four are added; a layer whose weight is 0 is not sampled"},
         "macro": {"uv_set": "TEXCOORD_0", "tint": tex(16), "tint_normal": tex(8), "grass_mask": tex(3), "note": "section-wide maps (one 512 m section per texture): colour variation, large-scale normal, grass placement mask"},
-        "detail_uv": {"default": "TEXCOORD_0 * 64 (world-planar, one repeat per 8 m) on map section tiles only; `recommended` follows this material's measured mapping (`uv_fit`): set pieces and rock formations using these shaders have their own UV0 (about 35 m per unit on the street-trash grounds), usually with a planar TEXCOORD_1 at 3 m per unit", "alt_uv_set": alt_uv, "note": "TEXCOORD_1 (61e09df7, 360e396b) is world-planar / 8 m on flat ground and unwrapped elsewhere (probably slopes); constant on b21f1ba5 ('fixuv1'), so that variant tiles from position. 27e5c49d ('uv3'): TEXCOORD_1 is not a usable UV (spans >1000), TEXCOORD_2 is an unwrap (not world-planar), so the alternative set is TEXCOORD_2 (low confidence). Per-layer tiling factors sit in the shader's constant block and are not decoded; scale per layer by eye"},
+        "detail_uv": {"default": "each layer's uv_set, uv_scale and uv_offset come from the material's constants (4344d2cc = scale and offset of the first UV set, 9ecaaa1e of the second, 724bed95 = which set each layer uses); on most map section tiles that is TEXCOORD_0 * 128 (world-planar, one repeat per 4 m; 64 was assumed until 2026-11-24). Without the constants: `recommended` follows this material's measured mapping (`uv_fit`): set pieces and rock formations using these shaders have their own UV0 (about 35 m per unit on the street-trash grounds), usually with a planar TEXCOORD_1 at 3 m per unit", "alt_uv_set": alt_uv, "note": "TEXCOORD_1 (61e09df7, 360e396b) is world-planar / 8 m on flat ground and unwrapped elsewhere (probably slopes); constant on b21f1ba5 ('fixuv1'), so that variant tiles from position. 27e5c49d ('uv3'): TEXCOORD_1 is not a usable UV (spans >1000), TEXCOORD_2 is an unwrap (not world-planar), so the alternative set is TEXCOORD_2 (low confidence). The shader also has a branch that samples a layer again at another scale (constant 26cc8f94); not decoded"},
         "vertex_color_channels": {"rgb": "unverified: varies 50..230, mean ~155, not weights (does not sum to a constant); baked shading or tint", "a": "always 0"},
         "texcoord_2": "a copy of TEXCOORD_0 on most 61e09df7 primitives, constant elsewhere",
         "height_blend": "the shader names end in hbb (height-based blend): each layer's data map B channel looks like a height map; sharpen the weights by height for the game's look",
@@ -563,6 +588,16 @@ mod paint_tests {
         assert_eq!(l["layers"][3]["colour"]["param"], 13);
         assert_eq!(l["layers"][3]["colour"]["status"], "no texture bound");
         assert_eq!(l["weights"]["texture"]["png"], "t2.png");
+        // layer UVs from the material's constants: layer 1 uses the second set
+        let c4 = |hash: &str, v: [f32; 4]| crate::drawable::ShaderConst { hash: hash.into(), desc: String::new(), offset: 0, values: Some(v), buffer: 7, count: 4, ty: None };
+        let sh = crate::drawable::Shader { index: 0, record_off: 0, name_hash: "61e09df7".into(), param_hashes: vec![], textures: vec![], flags: vec![],
+            constants: vec![c4("4344d2cc", [128.0, 128.0, 0.0, 0.0]), c4("9ecaaa1e", [1.0, 2.0, 0.5, 0.0]), c4("724bed95", [1.0, 2.0, 1.0, 1.0])] };
+        let m = multilayer(&sh, &entries, || Value::Null).unwrap();
+        assert_eq!((m["layers"][0]["uv_set"].as_str(), m["layers"][0]["uv_scale"].as_f64(), m["layers"][0]["uv_source"].as_str()), (Some("TEXCOORD_0"), Some(128.0), Some("material constants")));
+        assert_eq!((m["layers"][1]["uv_set"].as_str(), m["layers"][1]["uv_scale"][1].as_f64(), m["layers"][1]["uv_offset"][0].as_f64()), (Some("TEXCOORD_1"), Some(2.0), Some(0.5)));
+        assert_eq!(m["detail_uv"]["recommended"]["scale"].as_f64(), Some(128.0));
+        // without the constants the assumed values stay and say so
+        assert_eq!((l["layers"][0]["uv_scale"].as_f64(), l["layers"][0]["uv_source"].as_str().map(|s| s.starts_with("assumed"))), (Some(128.0), Some(true)));
         // constants: float4s per layer, the UV transforms and scalars with the material
         let k = |hash: &str, count: u8, v: [f32; 4]| crate::drawable::ShaderConst { hash: hash.into(), desc: String::new(), offset: 0, values: Some(v), buffer: 7, count, ty: None };
         let p = four_layer_params(&[k("4344d2cc", 4, [128.0, 128.0, 0.0, 0.0]), k("0f0f0f0f", 4, [1.0, 0.7, 0.2, 1.0]), k("0e0e0e0e", 1, [3.0, 0.0, 0.0, 0.0])]);
