@@ -207,12 +207,17 @@ pub fn in_region(min: [f32; 3], max: [f32; 3]) -> bool {
 /// is known and by hash where it is not. The same facts as model.json's
 /// `materials` and `drawable.shaders`, laid out to be read.
 fn readable_materials(model: &str, shaders: &[crate::drawable::Shader], mats: &serde_json::Value) -> serde_json::Value {
-    // one key per slot or parameter: its name, else its hash; a second use of a name gets its hash appended
+    // one key per slot or parameter: its name, else its hash; a second use of a name gets its hash
+    // appended, and any key still taken gets a number, so no entry replaces another
     fn key(map: &serde_json::Map<String, serde_json::Value>, name: Option<String>, hash: &str) -> String {
-        match name {
+        let k = match name {
             Some(n) if !map.contains_key(&n) => n,
             Some(n) => format!("{n} ({hash})"),
             None => hash.to_string(),
+        };
+        match (2..).map(|i| format!("{k} #{i}")).find(|c| !map.contains_key(c)) {
+            Some(c) if map.contains_key(&k) => c,
+            _ => k,
         }
     }
     let list: Vec<serde_json::Value> = shaders
@@ -224,7 +229,7 @@ fn readable_materials(model: &str, shaders: &[crate::drawable::Shader], mats: &s
             for t in m["textures"].as_array().into_iter().flatten() {
                 let hash = t["param_hash"].as_str().unwrap_or("");
                 let mut rec = serde_json::Map::new();
-                for (to, from) in [("file", "png"), ("role", "role_guess"), ("status", "status"), ("width", "width"), ("height", "height"), ("format", "format"), ("texture_hash", "hash64")] {
+                for (to, from) in [("file", "png"), ("role", "role_guess"), ("status", "status"), ("width", "width"), ("height", "height"), ("format", "format"), ("texture_hash", "hash64"), ("slices", "slices")] {
                     if !t[from].is_null() {
                         rec.insert(to.to_string(), t[from].clone());
                     }
@@ -264,7 +269,7 @@ fn readable_materials(model: &str, shaders: &[crate::drawable::Shader], mats: &s
         .collect();
     serde_json::json!({
         "model": model,
-        "note": "One record per material, in the order of the GLB's materials. shader and the keys of textures and parameters are names where the name is known, else the 8-digit hash (joaat of the lower-case name). A texture's file is relative to the export folder; base_color and normal are the paths the GLB uses, relative to this folder. role is a guess from the slot and the format. A parameter's value is the four floats the material stores for it (a scalar uses the first, a colour the first three); what each parameter does is not decoded, and the names are the game's own. parameters_not_read are parameters the shader lists whose values lie outside the material's constant block. Normal maps are DirectX style (green = +v down). model.json holds the same data with the full technical record.",
+        "note": "One record per material, in the order of the GLB's materials. shader and the keys of textures and parameters are names where the name is known, else the 8-digit hash (joaat of the lower-case name). A texture's file is relative to the export folder, and so are its slices when the texture is an array (file is slice 0); base_color and normal are the paths the GLB uses, relative to this folder. role is a guess from the slot and the format. A parameter's value is the four floats the material stores for it (a scalar uses the first, a colour the first three); what each parameter does is not decoded, and the names are the game's own. parameters_not_read are parameters the shader lists whose values lie outside the material's constant block. Normal maps are DirectX style (green = +v down). model.json holds the same data with the full technical record.",
         "materials": list,
     })
 }
@@ -662,7 +667,7 @@ fn roof_animation(a: &ArchiveInfo, name: &str, joints: &[crate::gltf::Joint]) ->
 /// A wheel bone that carries a wheel: `wheel_lf`, `wheel_rm1`, and the inner
 /// wheel of a dual pair, `wheel_lr_inr`. Not the helpers (`wheel_turn_lf`,
 /// `wheel_lr_drive`, `wheel_parent_lr`).
-fn is_wheel_mount(name: &str) -> bool {
+pub(crate) fn is_wheel_mount(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     let Some(r) = n.strip_prefix("wheel_") else { return false };
     let r = r.strip_suffix("_inr").unwrap_or(r);
@@ -786,6 +791,13 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                             e["mip_used"] = stt.mip.into();
                         }
                         e["mean_rgba"] = serde_json::json!(stt.mean_rgba.map(|x| x.round()));
+                        // a head preset's array texture (the wrinkle region masks): every slice, the PNG above being slice 0
+                        if tx.slices() > 1 && u32::from_str_radix(&t.param_hash, 16).ok().and_then(crate::headskin::extra_role).is_some() {
+                            match crate::ttpf::write_png_slices(store, tx, &tdir) {
+                                Ok(ps) => e["slices"] = ps.iter().map(|p| rel(&o.out, p)).collect::<Vec<_>>().into(),
+                                Err(err) => e["slices_error"] = err.to_string().into(),
+                            }
+                        }
                         if t.param_hash == VEHICLE_PALETTE && tx.width == 128 && tx.height == 256 && stt.mip == 0 {
                             // every slice of the array, one after the other
                             // (the PNG is slice 0 only)
@@ -1331,7 +1343,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
             }
             if let Some((_, rec)) = head.as_ref().filter(|h| h.1["preset"].is_null()) {
                 j["head_skin"] = rec.clone();
-                j["head_skin_note"] = "Heads bind no textures; the face comes from the material preset whose drawable tag lists this head (source \"linked\"), else from the faces of linked heads with the same sex, body type and ethnicity code (\"auto\"). index / count: the variant chosen with --head-skin.".into();
+                j["head_skin_note"] = "Heads bind no textures; the face comes from the material preset whose drawable tag lists this head (source \"linked\"), else from the faces of linked heads with the same sex, body type and ethnicity code (\"auto\"). index / count: the variant chosen with --head-skin. extra_textures: the keyed textures of the face's preset, its own before those of its template (the male or female base head); they are added to the material's textures under their key as param_hash. The key names are not recovered and no shader slot is known for them, so the GLB material does not use them.".into();
             }
             fs::write(&marker, serde_json::to_vec_pretty(&j)?)?;
             item.files.push(rel(&o.out, &marker));
@@ -1382,7 +1394,7 @@ pub(crate) struct BuiltDrawable {
     pub mesh_meta: Vec<serde_json::Value>,
     shader_tex: Vec<ShaderTextures>,
     /// Vehicles: the part colours of each configuration (`vehcolour::Tables::looks_json`).
-    part_looks: serde_json::Value,
+    pub(crate) part_looks: serde_json::Value,
     /// Head skin shaders and the model.json record, for heads.
     head: Option<(Vec<crate::drawable::Shader>, serde_json::Value)>,
 }
@@ -1689,6 +1701,22 @@ struct SkinSetup {
 fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Shader], o: &ExportOptions, item: &mut ExportedItem) -> Option<(Vec<crate::drawable::Shader>, serde_json::Value)> {
     let name = e.name.as_deref()?;
     let tex = |param_hash: &str, h: u64| crate::drawable::TexRef { param: 0, param_hash: param_hash.into(), hash64: format!("{h:016x}"), hash32: String::new() };
+    // the keyed textures of the face's preset (wrinkle region masks, face
+    // region mask ...): no shader slot is known for them, so each goes in
+    // under its key as the parameter hash
+    let extras = |albedo: u64| -> Vec<(u32, u64)> {
+        if !crate::headskin::is_head(name) {
+            return Vec::new();
+        }
+        crate::headskin::get(&game_root(a)).map(|t| t.extras_of(albedo).to_vec()).unwrap_or_default()
+    };
+    let extras_json = |albedo: u64| -> serde_json::Value {
+        let set = crate::ttpf::global(&game_root(a));
+        extras(albedo)
+            .iter()
+            .map(|&(k, h)| serde_json::json!({"key": format!("{k:08x}"), "texture": format!("{h:016x}"), "in_game_files": set.get(h).is_some(), "what": crate::headskin::extra_role(k)}))
+            .collect()
+    };
     // the face the outfit item names, on every shader without a colour texture
     if let Some(list) = o.part_skins.get(&name.to_ascii_lowercase()) {
         let set = crate::ttpf::global(&game_root(a));
@@ -1707,11 +1735,12 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
                             s.textures.retain(|t| t.param_hash != "1e77bf4c");
                             s.textures.push(tex("1e77bf4c", nrm));
                         }
+                        s.textures.extend(extras(alb).iter().map(|&(k, h)| tex(&format!("{k:08x}"), h)));
                     }
                     s
                 })
                 .collect();
-            let rec = serde_json::json!({"source": "outfit item", "group": "", "index": 0, "count": 1, "albedo": format!("{alb:016x}"), "normal": format!("{nrm:016x}")});
+            let rec = serde_json::json!({"source": "outfit item", "group": "", "index": 0, "count": 1, "albedo": format!("{alb:016x}"), "normal": format!("{nrm:016x}"), "extra_textures": extras_json(alb)});
             return Some((sh, rec));
         }
     }
@@ -1735,7 +1764,7 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
         item.warnings.push("head skin: no face texture found".into());
         return None;
     };
-    let rec = serde_json::json!({"source": c.source, "group": c.group, "index": c.index, "count": c.count, "albedo": format!("{:016x}", c.skin.albedo), "normal": format!("{:016x}", c.skin.normal)});
+    let rec = serde_json::json!({"source": c.source, "group": c.group, "index": c.index, "count": c.count, "albedo": format!("{:016x}", c.skin.albedo), "normal": format!("{:016x}", c.skin.normal), "extra_textures": extras_json(c.skin.albedo)});
     let sh = shaders
         .iter()
         .map(|s| {
@@ -1748,6 +1777,7 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
                     s.textures.retain(|t| t.param_hash != "1e77bf4c");
                     s.textures.push(tex("1e77bf4c", c.skin.normal));
                 }
+                s.textures.extend(extras(c.skin.albedo).iter().map(|&(k, h)| tex(&format!("{k:08x}"), h)));
             }
             s
         })
@@ -3267,13 +3297,16 @@ mod dictionary_tests {
             ]
         }])).unwrap();
         let mats = serde_json::json!([{"classification": {"class": "opaque"}, "base_color": "a.png", "normal": null,
-            "textures": [{"param_hash": "33333333", "param_name": "diffusetex", "png": "a.png", "role_guess": "colour (sRGB)", "hash64": "00"},
-                         {"param_hash": "44444444", "param_name": null, "status": "missing"}]}]);
+            "textures": [{"param_hash": "33333333", "param_name": "diffusetex", "png": "a.png", "role_guess": "colour (sRGB)", "hash64": "00", "slices": ["a.png", "a_1.png"]},
+                         {"param_hash": "44444444", "param_name": null, "status": "missing"},
+                         {"param_hash": "44444444", "param_name": null, "png": "b.png"}]}]);
         let j = readable_materials("m", &shaders, &mats);
         let m = &j["materials"][0];
         assert_eq!(m["shader"], "0badf00d");
         assert_eq!(m["textures"]["diffusetex"]["file"], "a.png");
+        assert_eq!(m["textures"]["diffusetex"]["slices"][1], "a_1.png");
         assert_eq!(m["textures"]["44444444"]["status"], "missing");
+        assert_eq!(m["textures"]["44444444 #2"]["file"], "b.png");
         assert_eq!(m["parameters"]["11111111"], serde_json::json!([1.0, 0.5, 0.0, 0.0]));
         assert_eq!(m["parameters_not_read"], serde_json::json!(["22222222"]));
     }

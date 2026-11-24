@@ -101,8 +101,17 @@ pub struct PedClip {
     pub playing: bool,
     pub status: String,
     loading: bool,
-    pending: Arc<Mutex<Option<(String, Result<(glb::Anim, String), String>)>>>,
+    pending: Arc<Mutex<Option<(String, Result<(glb::Anim, Vec<sixng_core::anim::ClipTrack>, String), String>)>>>,
     last: Option<std::time::Instant>,
+    /// The clip's own movement over the ground (`anim::clip_mover`).
+    mover: Vec<sixng_core::anim::ClipTrack>,
+    /// Play in place: leave that movement out.
+    pub in_place: bool,
+    /// Where the finished loops have taken the character, and where it
+    /// is now (viewer space); `travel` is what the camera has followed.
+    base: Mat4,
+    root: Mat4,
+    travel: Vec3,
 }
 
 /// A character's pose: angles in degrees on the main bones of the shared
@@ -176,6 +185,10 @@ pub struct LookInfo {
     pub notes: Vec<String>,
     /// Strand hair found for the outfit's hair assets (`hairlink`).
     pub hair: Vec<HairPick>,
+    /// Drawables of the outfit's hats (lower case).
+    pub hats: Vec<String>,
+    /// The hat of the outfit shown, to keep the hair under it.
+    pub hat: Option<Arc<sixng_core::groom::Shell>>,
     /// The colours of the game's hair palette (`ped_tint_hair`, each row at
     /// mid shade, sRGB), to pick from.
     pub hair_swatches: Vec<[u8; 3]>,
@@ -354,6 +367,9 @@ pub struct ModelView {
     /// The part colours on show (256 x RGBA, by part id), for the fitted
     /// wheels: a rim's and a tyre's vertices carry part ids of the vehicle.
     part_look_table: Option<Arc<Vec<[u8; 4]>>>,
+    /// `--random-parts <seed>`: pick random parts once after the load.
+    pub random_parts_once: bool,
+    pub random_parts_seed: u64,
     /// The material palette of the loaded vehicle (its file, RGBA rows of
     /// 128) and the look whose rows the model's part materials carry.
     part_palette: Option<(PathBuf, Arc<Vec<u8>>)>,
@@ -384,6 +400,9 @@ pub struct ModelView {
     /// Hinged panels of the loaded model: joint index -> (0 = door, 1 =
     /// bonnet, 2 = boot; rotation axis; sign that swings it open).
     hinges: HashMap<usize, (u8, Vec3, f32)>,
+    /// Struts and rods between a hinged panel and the body: (bone, the
+    /// bone it aims at).
+    aims: Vec<(usize, usize)>,
     /// Brake disc and caliper models at the wheels.
     brakes: Vec<(bool, GpuModel)>,
     brake_pending: Arc<Mutex<Option<Vec<(bool, Loaded)>>>>,
@@ -480,6 +499,9 @@ pub struct Hair {
     pub region: String,
     pub search: String,
     pub selected: Vec<u64>,
+    /// The hat worn and the grooms it presses down (the scalp hair).
+    hat: Option<Arc<sixng_core::groom::Shell>>,
+    under_hat: Vec<u64>,
     pub width_mm: f32,
     pub colour: [f32; 3],
     pending: Arc<Mutex<Option<Result<Vec<glb::Model>, String>>>>,
@@ -521,6 +543,8 @@ impl Default for Hair {
             region: "scalp".into(),
             search: String::new(),
             selected: Vec::new(),
+            hat: None,
+            under_hat: Vec::new(),
             width_mm: 1.0,
             colour: [0.10, 0.06, 0.035],
             pending: Arc::new(Mutex::new(None)),
@@ -546,7 +570,7 @@ impl Default for Hair {
 
 impl Hair {
     fn want_key(&self) -> String {
-        format!("{:?}|{}|{:?}|{}|{}|{}", self.selected, self.width_mm, self.colour, self.skin_colour && !self.skin.is_empty(), self.full_coat, self.density)
+        format!("{:?}|{}|{:?}|{}|{}|{}|{:?}", self.selected, self.width_mm, self.colour, self.skin_colour && !self.skin.is_empty(), self.full_coat, self.density, self.hat.as_ref().map(|h| h.id))
     }
     pub fn settled(&self) -> bool {
         !self.loading && !self.listing && self.key == self.want_key()
@@ -654,6 +678,8 @@ impl ModelView {
             part_look_want: None,
             cfg_request: None,
             part_look_done: None,
+            random_parts_once: false,
+            random_parts_seed: 0,
             part_palette: None,
             part_ramp_done: None,
             part_look_table: None,
@@ -670,6 +696,7 @@ impl ModelView {
             bonnet_open: 0.0,
             boot_open: 0.0,
             hinges: HashMap::new(),
+            aims: Vec::new(),
             brakes: Vec::new(),
             brake_pending: Arc::new(Mutex::new(None)),
             brake_key: String::new(),
@@ -804,6 +831,7 @@ impl ModelView {
         let coat_on = self.hair.full_coat;
         let (density, width_scale) = (self.hair.density.clamp(0.05, 1.0), self.hair.width_mm / 3.0);
         let note = self.hair.coat_note.clone();
+        let (hat, under_hat) = (self.hair.hat.clone(), self.hair.under_hat.clone());
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<Vec<glb::Model>> {
@@ -814,7 +842,11 @@ impl ModelView {
                 let share = density * (COAT_STRANDS as f32 / stored.max(1) as f32).min(1.0);
                 let mut drawn = 0;
                 let mut out = Vec::new();
-                for (off, g) in grooms {
+                for (off, mut g) in grooms {
+                    // scalp hair stays under the hat (3 mm inside its lining)
+                    if let Some(h) = hat.as_ref().filter(|_| under_hat.contains(&off)) {
+                        h.press(&mut g.points, 0.003);
+                    }
                     // linear colour from the sRGB picker value
                     let lin = rgb.map(|c| c.powf(2.2));
                     let p = dir.join(format!("{off:x}.glb"));
@@ -1088,7 +1120,7 @@ impl ModelView {
 
     /// Car extras settled: vehicle data applied and the fitted wheels loaded.
     fn idle_for_shot(&self) -> bool {
-        if self.parts_request.is_some() || !self.hair.settled() || self.auto.then.is_some() || self.auto.find_hair || self.hair.fitting || self.ped_clip.loading || (!self.ped_clip.want.trim().is_empty() && self.ped_clip.anim.is_none() && self.ped_clip.status.starts_with("loading")) {
+        if self.parts_request.is_some() || self.random_parts_once || !self.hair.settled() || self.auto.then.is_some() || self.auto.find_hair || self.hair.fitting || self.ped_clip.loading || (!self.ped_clip.want.trim().is_empty() && self.ped_clip.anim.is_none() && self.ped_clip.status.starts_with("loading")) {
             return false;
         }
         let Some(l) = self
@@ -1124,9 +1156,11 @@ impl ModelView {
             self.ped_clip.loading = false;
             self.ped_clip.loaded_key = key;
             match r {
-                Ok((a, note)) => {
+                Ok((a, mover, note)) => {
                     self.ped_clip.status = note;
                     self.ped_clip.anim = Some(a);
+                    self.ped_clip.mover = mover;
+                    self.ped_clip.base = Mat4::IDENTITY;
                 }
                 Err(e) => {
                     self.ped_clip.status = e;
@@ -1146,7 +1180,7 @@ impl ModelView {
             let names: Vec<String> = l.model.joints.iter().map(|j| j.name.clone()).collect();
             let (game, work, slot, ctx2) = (PathBuf::from(&self.game), PathBuf::from(&self.work), self.ped_clip.pending.clone(), ctx.clone());
             std::thread::spawn(move || {
-                let r = (|| -> anyhow::Result<(glb::Anim, String)> {
+                let r = (|| -> anyhow::Result<(glb::Anim, Vec<sixng_core::anim::ClipTrack>, String)> {
                     let (dq, cq) = want.rsplit_once('/').ok_or_else(|| anyhow::anyhow!("write it as <dictionary>/<clip> (`sixng clips --name walk` lists dictionaries)"))?;
                     let (_, d) = sixng_core::anim::load_dictionary(&game, &work, dq)?;
                     let c = d.clip(cq).ok_or_else(|| anyhow::anyhow!("no clip {cq:?} in {}; it has: {}", d.name, d.clips.iter().map(|c| c.short_name()).collect::<Vec<_>>().join(", ")))?;
@@ -1165,8 +1199,15 @@ impl ModelView {
                         })
                         .collect();
                     let duration = channels.iter().filter_map(|c| c.times.last().copied()).fold(c.duration, f32::max).max(1e-3);
-                    let note = format!("{} bone tracks of {} on this skeleton, {:.2} s. The clip's own movement over the ground is left out (it plays in place).", stats["bone_tracks_on_joints"], stats["bone_tracks"], duration);
-                    Ok((glb::Anim { name: want.clone(), duration, channels }, note))
+                    let mover = sixng_core::anim::clip_mover(&d, c);
+                    let (moved, turned) = sixng_core::anim::mover_at(&mover, c.duration);
+                    let ground = if mover.is_empty() {
+                        "The clip stores no movement over the ground, so it plays in place.".to_string()
+                    } else {
+                        format!("Over the ground the clip moves {:.2} m and turns {:.0} degrees (its mover tracks); each loop carries on from where the last one ended, and the camera follows.", (moved[0] * moved[0] + moved[1] * moved[1] + moved[2] * moved[2]).sqrt(), (2.0 * turned[2].atan2(turned[3]).to_degrees()).abs())
+                    };
+                    let note = format!("{} bone tracks of {} on this skeleton, {:.2} s. {ground}", stats["bone_tracks_on_joints"], stats["bone_tracks"], duration);
+                    Ok((glb::Anim { name: want.clone(), duration, channels }, mover, note))
                 })()
                 .map_err(|e| format!("{e:#}"));
                 *slot.lock().unwrap() = Some((key, r));
@@ -1176,10 +1217,33 @@ impl ModelView {
         // playback
         let now = std::time::Instant::now();
         let dt = self.ped_clip.last.replace(now).map_or(0.0, |t| (now - t).as_secs_f32()).min(0.1);
+        // the mover in viewer space (Y-up) at a clip time
+        let at = |m: &[sixng_core::anim::ClipTrack], t: f32| {
+            let (p, q) = sixng_core::anim::mover_at(m, t);
+            Mat4::from_rotation_translation(Quat::from_xyzw(q[0], q[2], -q[1], q[3]).normalize(), Vec3::new(p[0], p[2], -p[1]))
+        };
         if let (true, Some(a)) = (self.ped_clip.playing, &self.ped_clip.anim) {
-            self.ped_clip.pos = (self.ped_clip.pos + dt / a.duration).fract();
+            let next = self.ped_clip.pos + dt / a.duration;
+            if next >= 1.0 {
+                // a loop ended: the next one starts where this one stopped
+                self.ped_clip.base *= at(&self.ped_clip.mover, a.duration);
+            }
+            self.ped_clip.pos = next.fract();
             ctx.request_repaint();
         }
+        let root = match &self.ped_clip.anim {
+            Some(a) if !self.ped_clip.in_place && !self.ped_clip.mover.is_empty() => self.ped_clip.base * at(&self.ped_clip.mover, self.ped_clip.pos * a.duration),
+            _ => {
+                self.ped_clip.base = Mat4::IDENTITY;
+                Mat4::IDENTITY
+            }
+        };
+        // the camera goes with the character
+        let moved = root.w_axis.truncate();
+        self.cam.target += moved - self.ped_clip.travel;
+        self.cam.eye += moved - self.ped_clip.travel;
+        self.ped_clip.travel = moved;
+        self.ped_clip.root = root;
     }
 
     /// Body shape for characters (weight, muscle), before a model is opened.
@@ -1340,6 +1404,7 @@ impl ModelView {
                         self.ped_clip.playing = !self.ped_clip.playing;
                     }
                     ui.add(egui::Slider::new(&mut self.ped_clip.pos, 0.0..=1.0).show_value(false));
+                    ui.checkbox(&mut self.ped_clip.in_place, "in place").on_hover_text("Leave out the clip's own movement over the ground (its mover tracks), so the character stays where it is.");
                 });
             }
             if !self.ped_clip.status.is_empty() {
@@ -1532,6 +1597,23 @@ impl ModelView {
                     changed = true;
                 }
             }
+            // vehicles: a random choice in every group
+            if l.info["wheel_mounts"].as_array().is_some_and(|a| !a.is_empty())
+                && ui
+                    .button("🎲 Randomize")
+                    .on_hover_text("A random choice for every group of parts (bonnet, bumpers, exhaust, spoiler, body ...), from the options this vehicle has. A group that starts with a part always gets one; a group that starts empty may stay empty.")
+                    .clicked()
+            {
+                let mut seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0x9e37_79b9_7f4a_7c15, |d| d.as_nanos() as u64) | 1;
+                let mut next = |n: usize| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed >> 11) as usize % n.max(1)
+                };
+                sel = random_parts(&groups, &mut next);
+                changed = true;
+            }
             if ui
                 .button("Defaults")
                 .on_hover_text("Back to the default parts")
@@ -1632,6 +1714,8 @@ impl ModelView {
                 ren.ensure_edges(rs, &mut g, &l.model);
                 if !keep_cam {
                     self.cam.frame_bbox(g.bbox[0], g.bbox[1]);
+                    // framed on the stored pose: the walked distance is added again
+                    self.ped_clip.travel = Vec3::ZERO;
                     if let Some(z) = self.zoom_after_load {
                         self.cam.dist *= z;
                     }
@@ -1663,6 +1747,8 @@ impl ModelView {
                 self.gpu = Some(g);
                 self.hair.on_loaded(&l.fur, &l.fur_skin, &l.source);
                 if let Some(look) = &l.look {
+                    self.hair.hat = look.hat.clone();
+                    self.hair.under_hat = look.hair.iter().filter(|h| h.slot == "hair").flat_map(|h| h.grooms.iter().copied()).collect();
                     // a character: its confident hair, grown to full density
                     let key = format!("{}#{}", look.model, look.current);
                     if self.hair.look_key != key {
@@ -1688,6 +1774,7 @@ impl ModelView {
                     }
                 } else if !self.hair.look_key.is_empty() {
                     self.hair.look_key.clear();
+                    self.hair.hat = None;
                     if self.hair.fur.is_none() {
                         self.hair.selected.clear();
                     }
@@ -2307,6 +2394,26 @@ impl ModelView {
     }
 
     fn update_wheels(&mut self, rs: &egui_wgpu::RenderState, ctx: &egui::Context) {
+        // --random-parts: one random choice of parts once the vehicle is in
+        if self.random_parts_once && !self.loading && self.parts_request.is_none() {
+            if let Some(l) = self.loaded.as_ref().filter(|l| !l.parts.is_empty()) {
+                let mut groups: std::collections::BTreeMap<&str, Vec<&crate::assemble::PartOpt>> = Default::default();
+                for o in &l.parts {
+                    groups.entry(o.group.as_str()).or_default().push(o);
+                }
+                let mut seed = self.random_parts_seed | 1;
+                let sel = random_parts(&groups, &mut |n| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed >> 11) as usize % n.max(1)
+                });
+                self.parts_request = Some(format!("{}#parts={}", l.base.split("#parts=").next().unwrap_or(&l.base), sel.iter().map(|o| format!("{o:x}")).collect::<Vec<_>>().join(",")));
+                self.random_parts_once = false;
+            } else if self.loaded.is_some() {
+                self.random_parts_once = false;
+            }
+        }
         self.sync_part_look(rs);
         // the roof clip of the loaded convertible, read once per model file
         if let Some(l) = &self.loaded {
@@ -2318,6 +2425,7 @@ impl ModelView {
                 self.clip_pos = vec![self.clip_pos_all; all.len()];
                 self.clips = all;
                 self.hinges = find_hinges(&l.model);
+                self.aims = find_aims(&l.model);
                 self.steer_wheel = find_steering_wheel(&l.model);
                 self.window_movers = find_window_movers(&l.model);
                 self.air = find_air_parts(&l.model);
@@ -2613,6 +2721,12 @@ impl ModelView {
                         j.local = Mat4::from_scale_rotation_translation(s, r, t).to_cols_array();
                     }
                 }
+                // a character clip's movement over the ground, on the root joints
+                if l.look.is_some() && self.ped_clip.root != Mat4::IDENTITY {
+                    for j in v.iter_mut().filter(|j| j.parent.is_none()) {
+                        j.local = (self.ped_clip.root * Mat4::from_cols_array(&j.local)).to_cols_array();
+                    }
+                }
                 posed = v;
                 &posed
             }
@@ -2716,6 +2830,36 @@ impl ModelView {
                 let turn = Mat4::from_quat(qw.inverse() * r * qw);
                 let m = swing.get(&i).map_or(turn, |m| *m * turn);
                 swing.insert(i, m);
+            }
+        }
+        // Gas struts and stay rods of a bonnet, boot or door: each half is
+        // a bone on one side (panel or body) with a target bone on the
+        // other, and turns about its own mount to keep aiming at it. With
+        // the panel swung, the half is turned from where its target was to
+        // where it is now.
+        if !self.aims.is_empty() && !swing.is_empty() {
+            let pose = |i: usize, swing: &HashMap<usize, Mat4>| -> Mat4 {
+                let mut chain = Vec::new();
+                let mut k = Some(i);
+                while let Some(j) = k.filter(|_| chain.len() < 64) {
+                    chain.push(j);
+                    k = js[j].parent.filter(|p| *p != j);
+                }
+                chain.iter().rev().fold(Mat4::IDENTITY, |m, j| m * Mat4::from_cols_array(&js[*j].local) * swing.get(j).copied().unwrap_or(Mat4::IDENTITY))
+            };
+            let none = HashMap::new();
+            let turns: Vec<(usize, Mat4)> = self
+                .aims
+                .iter()
+                .filter_map(|&(j, t)| {
+                    let was = pose(j, &none).inverse().transform_point3(pose(t, &none).w_axis.truncate());
+                    let now = pose(j, &swing).inverse().transform_point3(pose(t, &swing).w_axis.truncate());
+                    (was.length() > 1e-4 && now.length() > 1e-4 && was.normalize().dot(now.normalize()) < 0.999_999).then(|| (j, Mat4::from_quat(Quat::from_rotation_arc(was.normalize(), now.normalize()))))
+                })
+                .collect();
+            for (j, m) in turns {
+                let m = swing.get(&j).map_or(m, |s| *s * m);
+                swing.insert(j, m);
             }
         }
         let mut global: Vec<Option<Mat4>> = vec![None; js.len()];
@@ -2827,31 +2971,24 @@ impl ModelView {
         let ext = (hi - lo).max_element().max(1.0);
         let step = 10f32.powf((ext / 4.0).log10().floor()).max(0.1);
         let n = ((ext * 0.75) / step).ceil() as i32;
-        let c = (lo + hi) * 0.5;
+        // the grid stays put on the ground; its window goes with a walking
+        // character, and then every tenth line is brighter so the ground
+        // is seen to pass
+        let walked = self.ped_clip.travel;
+        let shift = ((walked.x / step).round() as i32, (walked.z / step).round() as i32);
+        let c = (lo + hi) * 0.5 + Vec3::new(shift.0 as f32 * step, 0.0, shift.1 as f32 * step);
+        let col = |world: i32| match (walked == Vec3::ZERO, world) {
+            (true, 0) => [255, 255, 255, 90],
+            (false, w) if w % 10 == 0 => [255, 255, 255, 90],
+            _ => [255, 255, 255, 35],
+        };
         for k in -n..=n {
-            let col = if k == 0 {
-                [255, 255, 255, 90]
-            } else {
-                [255, 255, 255, 35]
-            };
             let x = c.x + k as f32 * step;
             let z = c.z + k as f32 * step;
-            under.push(LineV {
-                pos: [x, lo.y, c.z - n as f32 * step],
-                col,
-            });
-            under.push(LineV {
-                pos: [x, lo.y, c.z + n as f32 * step],
-                col,
-            });
-            under.push(LineV {
-                pos: [c.x - n as f32 * step, lo.y, z],
-                col,
-            });
-            under.push(LineV {
-                pos: [c.x + n as f32 * step, lo.y, z],
-                col,
-            });
+            under.push(LineV { pos: [x, lo.y, c.z - n as f32 * step], col: col(k + shift.0) });
+            under.push(LineV { pos: [x, lo.y, c.z + n as f32 * step], col: col(k + shift.0) });
+            under.push(LineV { pos: [c.x - n as f32 * step, lo.y, z], col: col(k + shift.1) });
+            under.push(LineV { pos: [c.x + n as f32 * step, lo.y, z], col: col(k + shift.1) });
         }
         (under, top)
     }
@@ -3013,6 +3150,8 @@ impl ModelView {
             if let Some(g) = &self.gpu {
                 self.cam.fly = false;
                 self.cam.frame_bbox(g.bbox[0], g.bbox[1]);
+                // framed on the stored pose: the walked distance is added again
+                self.ped_clip.travel = Vec3::ZERO;
             }
         }
         let ppp = ctx.pixels_per_point();
@@ -3833,6 +3972,21 @@ pub(crate) fn load_query(
     let mut l = load_query_sel(ws, cache, q, sel, lod, idx)?;
     l.base = q.to_string();
     Ok(l)
+}
+
+/// A random choice of parts: one option of every group. A group with a
+/// default option always gets one of its options; a group without (an
+/// accessory that starts off) may also get none. `next(n)` gives a number
+/// below `n`.
+fn random_parts(groups: &std::collections::BTreeMap<&str, Vec<&crate::assemble::PartOpt>>, next: &mut impl FnMut(usize) -> usize) -> Vec<u64> {
+    let mut out = Vec::new();
+    for opts in groups.values() {
+        let none = if opts.iter().any(|o| o.default) { 0 } else { 1 };
+        if let Some(o) = opts.get(next(opts.len() + none)) {
+            out.push(o.off);
+        }
+    }
+    out
 }
 
 /// `"<query>#parts=<hex>,<hex>"` → the query and the chosen part offsets.
@@ -5009,6 +5163,7 @@ fn load_query_sel(
                 opts.iter_mut().for_each(|o| o.default = false);
                 let mut info = LookInfo { model: look.model.clone(), labels: look.outfits.iter().map(|o| o.label.clone()).collect(), current: k, ..Default::default() };
                 info.notes.extend(look.note.clone());
+                info.hats = look.outfits[k].parts.iter().filter(|p| p.slot == "hat").map(|p| p.drawable.to_ascii_lowercase()).collect();
                 for (oi, o) in look.outfits.iter().enumerate() {
                     for p in &o.parts {
                         if p.strands {
@@ -5092,6 +5247,23 @@ fn load_query_sel(
             .ok_or_else(|| anyhow::anyhow!("no part of {prefix} loaded: {}", errs.join("; ")))?;
         if let Some(l) = &mut look_info {
             l.notes.extend(notes);
+            // The hat as seen from inside the head: its centre is 10 cm
+            // under the crown, in the middle of the top of the head.
+            let is_head = |n: &str| n.contains("_head_") || n.starts_with("head_");
+            let hat: Vec<[f32; 3]> = skin.iter().filter(|(n, _)| l.hats.contains(&n.to_ascii_lowercase())).flat_map(|(_, p)| p.iter().copied()).collect();
+            let top = skin.iter().filter(|(n, _)| is_head(n)).flat_map(|(_, p)| p.iter()).map(|p| p[2]).fold(f32::MIN, f32::max);
+            if !hat.is_empty() && top > f32::MIN && !l.hair.is_empty() {
+                let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+                for p in skin.iter().filter(|(n, _)| is_head(n)).flat_map(|(_, p)| p.iter()).filter(|p| p[2] > top - 0.12) {
+                    for a in 0..2 {
+                        lo[a] = lo[a].min(p[a]);
+                        hi[a] = hi[a].max(p[a]);
+                    }
+                }
+                let head: Vec<[f32; 3]> = skin.iter().filter(|(n, _)| is_head(n)).flat_map(|(_, p)| p.iter().copied()).collect();
+                l.hat = Some(Arc::new(sixng_core::groom::Shell::new([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, top - 0.10], &hat, &head)));
+                l.notes.push("Hat: the scalp hair is pressed under the hat's lining (strand points beyond it are pulled in to 3 mm under it), so the hair does not come through the hat; an opening the hat encloses (over a cap's strap) counts as closed. A stand-in, not the game's method: the outfit asks for the plain hair, and no stored rule says how the game keeps it under the hat.".to_string());
+            }
             // Strand roots must lie on this character: pieces that do not
             // (another head shape, a neighbour's piece) are left out. Only in
             // the neutral body shape, where the skin is where the grooms expect it.
@@ -5539,6 +5711,44 @@ fn find_hinges(model: &glb::Model) -> HashMap<usize, (u8, Vec3, f32)> {
                     (k, Vec3::X, if d.z > 0.0 { -1.0 } else { 1.0 })
                 },
             ))
+        })
+        .collect()
+}
+
+/// Struts and rods that span a hinged panel and the body: a bone named
+/// `strut_male_<x>` / `strut_female_<x>` with a `strut_male_target_<x>` /
+/// `strut_female_target_<x>` bone, or `<x>_lookat<y>` with `<x>_target<y>`,
+/// where one of the two hangs from a door, the bonnet or the boot and the
+/// other does not hang from the same panel.
+fn find_aims(model: &glb::Model) -> Vec<(usize, usize)> {
+    let names: Vec<String> = model.joints.iter().map(|j| j.name.to_ascii_lowercase()).collect();
+    let by_name: HashMap<&str, usize> = names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+    let panel = |n: &str| matches!(n, "door_dside_f" | "door_dside_r" | "door_pside_f" | "door_pside_r" | "bonnet" | "boot");
+    // the panel a joint hangs from
+    let owner = |i: usize| {
+        let (mut k, mut depth) = (Some(i), 0);
+        while let Some(j) = k {
+            if panel(&names[j]) {
+                return Some(j);
+            }
+            depth += 1;
+            k = model.joints[j].parent.filter(|p| *p != j && depth < 64);
+        }
+        None
+    };
+    names
+        .iter()
+        .enumerate()
+        .filter_map(|(i, n)| {
+            let target = if n.contains("_lookat") {
+                n.replacen("_lookat", "_target", 1)
+            } else if n.starts_with("strut_") && !n.contains("target") && !n.contains("mesh") {
+                if n.contains("_female") { n.replacen("_female", "_female_target", 1) } else if n.contains("_male") { n.replacen("_male", "_male_target", 1) } else { return None }
+            } else {
+                return None;
+            };
+            let t = *by_name.get(target.as_str())?;
+            (owner(i) != owner(t)).then_some((i, t))
         })
         .collect()
 }
@@ -6682,6 +6892,21 @@ fn srgb32(c: [f32; 3]) -> egui::Color32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn random_parts_keep_fitted_groups_fitted() {
+        let opt = |off: u64, group: &str, default: bool| crate::assemble::PartOpt { off, id: String::new(), name: String::new(), group: group.into(), label: String::new(), default };
+        let all = [opt(1, "bonnet", true), opt(2, "bonnet", false), opt(3, "spoiler", false), opt(4, "spoiler", false)];
+        let mut groups: std::collections::BTreeMap<&str, Vec<&crate::assemble::PartOpt>> = Default::default();
+        for o in &all {
+            groups.entry(o.group.as_str()).or_default().push(o);
+        }
+        // the highest number: the last option, or none where none is allowed
+        let top = super::random_parts(&groups, &mut |n| n - 1);
+        assert_eq!(top, vec![2]);
+        let first = super::random_parts(&groups, &mut |_| 0);
+        assert_eq!(first, vec![1, 3]);
+    }
+
     use super::*;
 
     #[test]

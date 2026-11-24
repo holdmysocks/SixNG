@@ -691,6 +691,19 @@ Optional layers not exported yet (the map works without them): {}.", opt.join(",
                 }
                 Err(err) => Preview::Text(format!("error: {err}")),
             },
+            (Kind::Rbf, _) => match sixng_core::scan::read_entry(&a.path, e) {
+                Ok(d) => match sixng_core::rbf::to_xml(&d) {
+                    Ok((xml, _)) => {
+                        let mut n = xml.len().min(256 * 1024);
+                        while !xml.is_char_boundary(n) {
+                            n -= 1;
+                        }
+                        Preview::Text(if n < xml.len() { format!("{}\n… (cut at 256 KB)", &xml[..n]) } else { xml })
+                    }
+                    Err(err) => Preview::Text(format!("RBF did not decode: {err}")),
+                },
+                Err(err) => Preview::Text(format!("error: {err}")),
+            },
             _ => match sixng_core::scan::read_entry(&a.path, e) {
                 Ok(d) => {
                     let n = d.len().min(256 * 1024);
@@ -1624,6 +1637,10 @@ impl App {
         }
         if let Some(v) = c.u("rma") {
             m.look.rma_order = v.min(3);
+        }
+        if let Some(v) = c.u("random-parts") {
+            m.random_parts_once = true;
+            m.random_parts_seed = 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(v as u64 + 1);
         }
         if let Some(v) = c.f("wear") {
             m.look.wear = (v as f32).clamp(0.0, 1.0);

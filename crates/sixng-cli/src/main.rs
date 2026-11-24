@@ -466,6 +466,17 @@ enum Cmd {
         #[arg(long, short)]
         out: PathBuf,
     },
+    /// Decode RBF binary XML files (RBF0: UI layouts, subtitles, GPS and gamepad configs) to XML text: <out>/rbf/<archive>/<offset>.xml plus index.jsonl (per file its stats, or why it did not decode). Tag and attribute names are stored as text in the files, so all of them are real names; value elements are written as <name value="..."/>.
+    Rbf {
+        /// Archive (default data).
+        #[arg(default_value = "data")]
+        archive: String,
+        #[command(flatten)]
+        filter: FilterArgs,
+        /// Output directory.
+        #[arg(long, short)]
+        out: PathBuf,
+    },
     /// Layered-material libraries (data.rpf PSO files with root struct 8419ab01): the base materials and layered presets behind the clothing and weapon shaders, which bind no colour texture. A wardrobe item's GarmentPreset and a weapon component record name a preset; a preset gives each of its 8 sub-materials a colour. Builds <work>/index/material_presets.json (per preset the four colour entries of each sub-material as rrggbbaa sRGB, entry 0 = base colour; weapon component and variant name hashes -> preset, from the weapon family files of packs.rpf when indexed), which `ped-variations` reads. With --preset, prints those presets in full (every parameter of the preset and of its base materials; parameter names are hashes). With -o, also writes each library as <out>/materials/<archive>/<offset>.json.
     Materials {
         /// Archive with the libraries (default data).
@@ -491,6 +502,39 @@ enum Cmd {
         out: PathBuf,
     },
     /// Vehicle data from the game-data meta resource: model info (wheel scale, wheel type, handling id, …), configurations (body colour ARGB, rim, tyre, parts), paint palettes and weighted part groups: <out>/vehicles/vehicles.json.
+    /// A whole vehicle as ONE GLB: its model with the parts of one of its
+    /// configurations fitted (truck bed or box, bumpers, light bars, the
+    /// stock alternatives the fitted parts choose), in the configuration's
+    /// part colours and paint colour, with rims and tyres on the wheel
+    /// bones. Skinned to the vehicle's skeleton. Needs levels, packs and
+    /// data indexed. With --list, prints the vehicle's configurations
+    /// instead.
+    Vehicle {
+        /// Vehicle model name (benson, comet7).
+        name: String,
+        /// Output .glb path (textures go beside it).
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+        /// Which configuration (0 = the first; see --list).
+        #[arg(long, default_value_t = 0)]
+        config: usize,
+        /// Leave the wheels out.
+        #[arg(long)]
+        no_wheels: bool,
+        /// Print the vehicle's configurations (colour, part count) and stop.
+        #[arg(long)]
+        list: bool,
+        /// A vehicles.json from `sixng vehicles` (default: built now, into
+        /// the output folder).
+        #[arg(long)]
+        data: Option<PathBuf>,
+        /// Archive with the vehicle models.
+        #[arg(long, default_value = "levels")]
+        archive: String,
+        /// Texture output: png, dds, or both.
+        #[arg(long, default_value = "png")]
+        tex: String,
+    },
     Vehicles {
         /// Archive (default packs).
         #[arg(default_value = "packs")]
@@ -666,6 +710,27 @@ enum Cmd {
         /// Export every bank (with --bank omitted).
         #[arg(long)]
         all: bool,
+    },
+    /// What each compiled shader program and each effect (a material's
+    /// shader) of shaders.rpf declares: resources (textures, samplers,
+    /// constant buffers and others) with their register index, and the
+    /// members of the constant buffers with their byte offsets, by name
+    /// hash (names where the dictionary has them). Prints a summary and the
+    /// material texture parameters that have no name; with an effect regex,
+    /// the textures (slot in the material's texture list, parameter and
+    /// shader-variable name), constants and programs of each matching
+    /// effect. Reads the game's own reflection tables; no shader code is
+    /// decoded. With --cache, the pipeline cache says which declared
+    /// resources each compiled program really reads.
+    ShaderBindings {
+        /// Regex on effect names (a material's shader name, e.g. `^standard$`).
+        effect: Option<String>,
+        /// Also list every program of the matching effects with its resources and constant buffers.
+        #[arg(long)]
+        programs: bool,
+        /// Also read the pipeline cache (the archive's compressed entry; shaders.rpf must be indexed) and join it to the programs: how many pipelines use each program, and which of its declared resources the compiled code reads (`used`).
+        #[arg(long)]
+        cache: bool,
     },
     /// Name dictionary for shader, parameter and meta field hashes (joaat of
     /// the lower-case name). Without --lookup: build `<work>/names/names.json`
@@ -976,6 +1041,120 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 all.push(do_export_collect(&a, &sel, oa, pr.clone())?);
             }
             out.print(&json!({"ok": true, "category": category, "results": all}));
+        }
+        Cmd::ShaderBindings { effect, programs, cache } => {
+            use sixng_core::names::{lookup, Ctx};
+            use sixng_core::shaderfx::{self, Table, Var};
+            let t = Instant::now();
+            let bytes = std::fs::read(ws.game.join("shaders.rpf"))?;
+            let sh = shaderfx::read(&bytes)?;
+            // the pipeline cache: the archive's entry that starts with its magic
+            let joined = if *cache {
+                let a = ws.resolve("shaders")?;
+                let ix = ws.load_index(&a)?;
+                let e = ix.entries.iter().find(|e| e.sub == "09005350").ok_or_else(|| anyhow::anyhow!("no pipeline cache entry in the shaders.rpf index"))?;
+                let c = shaderfx::read_cache(&sixng_core::scan::read_entry(&a.path, e)?)?;
+                let j = sh.compiled(&c, &bytes);
+                Some((c, j))
+            } else {
+                None
+            };
+            drop(bytes);
+            let cache_summary = joined.as_ref().map(|(c, j)| {
+                let used: Vec<_> = j.iter().flatten().collect();
+                json!({"version": c.version, "graphics_pipelines": c.graphics, "compute_pipelines": c.compute, "metadata_blobs": c.metadata_blobs, "code_blobs": c.code_blobs, "stage_blobs": c.stages.len(),
+                    "programs_in_a_pipeline": used.len(), "programs_in_no_pipeline": j.len() - used.len(),
+                    "read_records_matched": used.iter().map(|u| u.read.iter().filter(|x| **x).count()).sum::<usize>(), "read_records_unmatched": used.iter().map(|u| u.unmatched_reads).sum::<usize>(),
+                    "declared_resources_never_read": used.iter().map(|u| u.read.iter().filter(|x| !**x).count()).sum::<usize>(), "write_records": used.iter().map(|u| u.writes.len()).sum::<usize>(),
+                    "note": "counted per program over the stage blob of its first pipeline; read_records_matched counts declared resources (samplers included in declared_resources_never_read: the cache has no sampler records)"})
+            });
+            let named = |h: u32| json!({"hash": format!("{h:08x}"), "name": lookup(h, Ctx::Param)});
+            let member = |m: &Var| json!({"hash": format!("{:08x}", m.name), "name": lookup(m.name, Ctx::Param), "parameter": (m.alias != m.name && m.alias != 0).then(|| named(m.alias)), "type": m.member_type(), "offset": m.a});
+            let resource = |t: &Table, i: usize, r: &Var| {
+                let mut v = json!({"hash": format!("{:08x}", r.name), "name": t.sampler_name(i).map(str::to_string).or_else(|| lookup(r.name, Ctx::Param)), "kind": r.resource_kind(), "dimension": r.dim, "index": r.index, "flags": format!("{:02x}", r.flags())});
+                if r.is_cbuffer() {
+                    v["size"] = json!(r.c & 0xffff);
+                    v["members"] = t.members_of(i).iter().map(member).collect();
+                }
+                v
+            };
+            // material texture parameters over all effects: parameter hash -> (variable hash, array) -> effects
+            use std::collections::BTreeMap;
+            let mut tex: BTreeMap<u32, BTreeMap<(u32, bool), Vec<&str>>> = BTreeMap::new();
+            for e in &sh.effects {
+                for r in e.table.iter().flat_map(|t| &t.resources) {
+                    if let Some((_, array)) = r.material_texture() {
+                        tex.entry(r.alias).or_default().entry((r.name, array)).or_default().push(&e.name);
+                    }
+                }
+            }
+            let unnamed: Vec<_> = tex
+                .iter()
+                .filter(|(h, _)| lookup(**h, Ctx::Param).is_none())
+                .map(|(h, v)| json!({"parameter": format!("{h:08x}"), "effects": v.values().map(Vec::len).sum::<usize>(), "example_effects": v.values().flatten().take(3).collect::<Vec<_>>(),
+                    "variables": v.iter().map(|((n, array), es)| json!({"hash": format!("{n:08x}"), "name": lookup(*n, Ctx::Param), "array": array, "effects": es.len()})).collect::<Vec<_>>()}))
+                .collect();
+            let re = effect.as_deref().map(regex::Regex::new).transpose()?;
+            let stages = ["vertex_or_mesh", "pixel", "geometry", "section_3", "section_4", "compute"];
+            let effects: Vec<_> = sh
+                .effects
+                .iter()
+                .filter(|e| re.as_ref().is_some_and(|r| r.is_match(&e.name)))
+                .map(|e| {
+                    let progs = |full: bool| -> serde_json::Value {
+                        stages
+                            .iter()
+                            .enumerate()
+                            .filter(|(k, _)| !e.programs[*k].is_empty())
+                            .map(|(k, st)| {
+                                let list: Vec<_> = e.programs[k]
+                                    .iter()
+                                    .filter_map(|&n| Some((sh.sections[k].0 + n as usize, sh.programs.get(sh.sections[k].0 + n as usize)?)))
+                                    .map(|(pi, p)| {
+                                        if !full {
+                                            return json!(p.name);
+                                        }
+                                        let comp = joined.as_ref().and_then(|(_, j)| j.get(pi)).and_then(Option::as_ref);
+                                        let res: Vec<_> = p.table.resources.iter().enumerate().map(|(i, r)| {
+                                            let mut v = resource(&p.table, i, r);
+                                            if let Some(c) = comp.filter(|_| r.kind != 0x23) {
+                                                v["used"] = json!(c.read[i]);
+                                            }
+                                            v
+                                        }).collect();
+                                        let mut v = json!({"name": p.name, "id": format!("{:016x}", p.id), "resources": res});
+                                        if joined.is_some() {
+                                            v["compiled"] = match comp {
+                                                Some(c) => json!({"pipelines": c.pipelines, "unmatched_reads": c.unmatched_reads, "writes": c.writes}),
+                                                None => json!(null),
+                                            };
+                                        }
+                                        v
+                                    })
+                                    .collect();
+                                (st.to_string(), json!(list))
+                            })
+                            .collect::<serde_json::Map<_, _>>()
+                            .into()
+                    };
+                    let mut v = json!({"effect": e.name, "programs": progs(*programs)});
+                    if let Some(t) = &e.table {
+                        let mut textures: Vec<_> = t.resources.iter().filter_map(|r| Some((r.material_texture()?, r))).collect();
+                        textures.sort_by_key(|x| x.0 .0);
+                        v["textures"] = textures.iter().map(|((slot, array), r)| json!({"slot": slot, "array": array, "dimension": r.dim, "parameter": named(r.alias), "variable": named(r.name)})).collect();
+                        v["constants"] = t.resources.iter().enumerate().filter(|(_, r)| r.is_cbuffer() && r.flags() & 0x80 != 0).map(|(i, r)| json!({"buffer": named(r.name), "size": r.c & 0xffff, "members": t.members_of(i).iter().map(member).collect::<Vec<_>>()})).collect();
+                        v["samplers"] = (0..t.resources.len()).filter_map(|i| t.sampler_name(i)).collect();
+                        v["other_resources"] = t.resources.iter().enumerate().filter(|(_, r)| r.material_texture().is_none() && r.kind != 0x23 && !(r.is_cbuffer() && r.flags() & 0x80 != 0)).map(|(i, r)| resource(t, i, r)).collect();
+                    }
+                    v
+                })
+                .collect();
+            out.print(&json!({"ok": true,
+                "programs": {"total": sh.programs.len(), "vertex_or_mesh": sh.sections[0].1, "pixel": sh.sections[1].1, "geometry": sh.sections[2].1, "compute": sh.sections[5].1,
+                    "resources": sh.programs.iter().map(|p| p.table.resources.len()).sum::<usize>(), "constant_buffer_members": sh.programs.iter().map(|p| p.table.members.len()).sum::<usize>()},
+                "effects": {"stated": sh.effects_stated, "read": sh.effects.len(), "with_table": sh.effects.iter().filter(|e| e.table.is_some()).count()},
+                "material_texture_parameters": {"total": tex.len(), "unnamed": unnamed.len(), "unnamed_list": unnamed},
+                "pipeline_cache": cache_summary, "matched_effects": effects, "seconds": t.elapsed().as_secs_f64()}));
         }
         Cmd::Names { lookup } => {
             if lookup.is_empty() {
@@ -1560,6 +1739,18 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let (ok, bad) = sixng_core::pso::export(&a, &sel, po, pr)?;
             out.print(&json!({"ok": true, "archive": a.id, "decoded": ok, "failed": bad, "seconds": t.elapsed().as_secs_f64(), "out": po.join("pso")}));
         }
+        Cmd::Rbf { archive, filter, out: po } => {
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            let mut f = filter.to_filter()?;
+            if f.kinds.is_empty() {
+                f.kinds = vec![Kind::Rbf];
+            }
+            let sel = f.select(&ix)?;
+            let t = Instant::now();
+            let s = sixng_core::rbf::export(&a, &sel, po, pr)?;
+            out.print(&json!({"ok": true, "archive": a.id, "selected": sel.len(), "decoded": s.decoded, "failed": s.failed, "errors": s.errors, "seconds": t.elapsed().as_secs_f64(), "out": po.join("rbf").join(a.id.trim_end_matches(".rpf"))}));
+        }
         Cmd::Materials { archive, preset, weapon, out: po } => {
             use sixng_core::matlib;
             let a = ws.resolve(archive)?;
@@ -1641,6 +1832,34 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let t = Instant::now();
             let v = sixng_core::pso::export_handling(&a, &sel, &names, po)?;
             out.print(&json!({"ok": true, "archive": a.id, "stats": v, "seconds": t.elapsed().as_secs_f64()}));
+        }
+        Cmd::Vehicle { name, out: glb, config, no_wheels, list, data, archive, tex } => {
+            let t = Instant::now();
+            let dir = glb.as_ref().and_then(|g| g.parent().map(|p| p.to_path_buf())).filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| PathBuf::from("."));
+            let file = match data {
+                Some(d) => d.clone(),
+                None => {
+                    sixng_core::vehicles::build(&ws, &dir)?;
+                    dir.join("vehicles").join("vehicles.json")
+                }
+            };
+            let all: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).map_err(|e| anyhow::anyhow!("read {}: {e}", file.display()))?)?;
+            let want = name.to_ascii_lowercase();
+            let Some(v) = all["vehicles"].as_array().into_iter().flatten().find(|v| v["model"].as_str().is_some_and(|m| m.eq_ignore_ascii_case(&want))) else {
+                bail!("no vehicle named {name} in {}", file.display());
+            };
+            if *list {
+                let cfgs: Vec<serde_json::Value> = v["configurations"].as_array().into_iter().flatten().enumerate().map(|(i, c)| json!({"config": i, "colour": c["colour"]["rgb"], "parts": c["parts"].as_array().map_or(0, |p| p.len()), "parts_key": c["parts_key"]})).collect();
+                out.print(&json!({"ok": true, "vehicle": want, "configurations": cfgs}));
+                return Ok(());
+            }
+            let Some(glb) = glb else { bail!("give the output file with -o <file.glb>") };
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            let oa = OutArgs { out: dir.clone(), tex: tex.clone(), raw: false, force: true, no_embedded_textures: false, dry_run: false, body_shape: None, head_skin: 0, paint: None };
+            let mut r = sixng_core::vehexport::export_vehicle(&a, &ix, v, *config, !*no_wheels, glb, &oa.opts())?;
+            r["seconds"] = t.elapsed().as_secs_f64().into();
+            out.print(&json!({"ok": true, "result": r}));
         }
         Cmd::Vehicles { archive, out: po } => {
             let a = ws.resolve(archive)?;
