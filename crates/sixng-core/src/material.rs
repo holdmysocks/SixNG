@@ -441,6 +441,45 @@ fn solve3(m: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
     Some(x)
 }
 
+/// Where a 4-layer material's layer weights come from, measured on its own
+/// vertices: the shader mixes the lookup texture's weights with the second
+/// vertex colour set (`_COLOR1`) by that set's alpha, so alpha 1 means the
+/// vertex colours alone decide and alpha 0 the lookup texture alone. On map
+/// section tiles the alpha is 1 on most vertices (14 tiles, about 150,000
+/// vertices: 98 % on the most used variant, 58 to 100 % on the others).
+/// Does nothing for other families or a material without that stream.
+pub fn four_layer_vertex_weights(l: &mut Value, colours1: impl Iterator<Item = [u8; 4]>) {
+    if l["family"] != "four_layer" {
+        return;
+    }
+    let (mut n, mut on, mut off, mut alpha, mut over) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    for c in colours1 {
+        n += 1;
+        on += (c[3] == 255) as u64;
+        off += (c[3] == 0) as u64;
+        alpha += c[3] as u64;
+        over += (c[0] as u32 + c[1] as u32 + c[2] as u32 > 260) as u64;
+    }
+    if n == 0 {
+        return;
+    }
+    let share = |x: u64| (x as f64 / n as f64 * 1000.0).round() / 1000.0;
+    let source = if on == n {
+        "vertex colours"
+    } else if off == n {
+        "lookup texture"
+    } else {
+        "mixed: per vertex"
+    };
+    l["weights"]["source"] = json!(source);
+    l["weights"]["vertex"] = json!({
+        "attribute": "_COLOR1", "vertices": n, "alpha_1": share(on), "alpha_0": share(off), "mean_alpha": (alpha as f64 / n as f64 / 255.0 * 1000.0).round() / 1000.0,
+        "rgb_sum_over_1": share(over),
+        "use": "weights.rgb = mix(lookup.rgb, _COLOR1.rgb / 255, _COLOR1.a / 255) per vertex; r, g, b weight layers 0, 1, 2 and the remainder layer 3",
+        "note": "alpha_1 / alpha_0: share of this material's vertices where the vertex colours alone / the lookup texture alone decide. rgb_sum_over_1: share of vertices whose r + g + b exceeds 1, where the stream is probably not a plain weight triple",
+    });
+}
+
 /// Each layer's UV of a 4-layer material from the material's own constants,
 /// as the shader code applies them (read in two deferred pixel programs,
 /// `standard_uber_4lyr` and `…_dpm_dm_hbb`): `724bed95[k] == 1` gives layer
@@ -551,11 +590,11 @@ fn four_layer(name_hash: &str, tex: &dyn Fn(usize) -> Value) -> Value {
         "family": "four_layer",
         "layers": layers,
         "weights": {"texture": tex(2), "uv_set": "TEXCOORD_0 (on section tiles = section position / 512 m; on other models the model's own UV0, see uv_fit)", "channels": {"r": "layer0", "g": "layer1", "b": "layer2", "remainder": "layer3"}, "note": "R+G+B <= 1 (BC7 rounding up to 258/255: clamp); the remainder weights layer 3",
-            "vertex_override": "weights = mix(lookup.rgb, COLOR_1.rgb, COLOR_1.a) per channel, and the remainder = saturate(1 - r - g - b) of each side mixed the same way: where the second vertex colour set has alpha 0 (the usual case) the lookup texture alone decides. From the shader code; which exported attribute holds that colour set was not checked on a mesh.",
+            "vertex_override": "weights = mix(lookup.rgb, COLOR_1.rgb, COLOR_1.a) per channel, and the remainder = saturate(1 - r - g - b) of each side mixed the same way: where the second vertex colour set has alpha 0 (the usual case) the lookup texture alone decides. From the shader code; COLOR_1 is the exported attribute `_COLOR1` (its r + g + b stays at or below 1 on map tiles, as weights do). See weights.source and weights.vertex for this material's own vertices.",
             "result": "each layer's shaded result is multiplied by its weight and the four are added; a layer whose weight is 0 is not sampled"},
         "macro": {"uv_set": "TEXCOORD_0", "tint": tex(16), "tint_normal": tex(8), "grass_mask": tex(3), "note": "section-wide maps (one 512 m section per texture): colour variation, large-scale normal, grass placement mask"},
         "detail_uv": {"default": "each layer's uv_set, uv_scale and uv_offset come from the material's constants (4344d2cc = scale and offset of the first UV set, 9ecaaa1e of the second, 724bed95 = which set each layer uses); on most map section tiles that is TEXCOORD_0 * 128 (world-planar, one repeat per 4 m; 64 was assumed until 2026-11-24). Without the constants: `recommended` follows this material's measured mapping (`uv_fit`): set pieces and rock formations using these shaders have their own UV0 (about 35 m per unit on the street-trash grounds), usually with a planar TEXCOORD_1 at 3 m per unit", "alt_uv_set": alt_uv, "note": "TEXCOORD_1 (61e09df7, 360e396b) is world-planar / 8 m on flat ground and unwrapped elsewhere (probably slopes); constant on b21f1ba5 ('fixuv1'), so that variant tiles from position. 27e5c49d ('uv3'): TEXCOORD_1 is not a usable UV (spans >1000), TEXCOORD_2 is an unwrap (not world-planar), so the alternative set is TEXCOORD_2 (low confidence). The shader also has a branch that samples a layer again at another scale (constant 26cc8f94); not decoded"},
-        "vertex_color_channels": {"rgb": "unverified: varies 50..230, mean ~155, not weights (does not sum to a constant); baked shading or tint", "a": "always 0"},
+        "vertex_color_channels": {"_COLOR1": "rgb = layer weights for layers 0, 1, 2 (the remainder is layer 3), a = how much they replace the lookup texture's weights", "_COLOR0": "rgb = a vertex tint (stored sRGB), a = its blend amount; from the shader code, not applied by the exporter"},
         "texcoord_2": "a copy of TEXCOORD_0 on most 61e09df7 primitives, constant elsewhere",
         "height_blend": "the shader names end in hbb (height-based blend): each layer's data map B channel looks like a height map; sharpen the weights by height for the game's look",
         "data_map_channels": {"a": "tint mask of the layer: how much of the tint colour replaces the layer colour (the shader can use 1 - a instead, by a material constant)", "g": "read, use not traced", "b": "read, and used as 1 - b in a later step that was not traced", "r": "not read by the program that was read", "source": "shader code"},
@@ -588,6 +627,16 @@ mod paint_tests {
         assert_eq!(l["layers"][3]["colour"]["param"], 13);
         assert_eq!(l["layers"][3]["colour"]["status"], "no texture bound");
         assert_eq!(l["weights"]["texture"]["png"], "t2.png");
+        // where the weights come from, measured on the material's vertices
+        let mut v = l.clone();
+        four_layer_vertex_weights(&mut v, [[10u8, 20, 30, 255], [0, 0, 0, 255]].into_iter());
+        assert_eq!((v["weights"]["source"].as_str(), v["weights"]["vertex"]["alpha_1"].as_f64(), v["weights"]["vertex"]["vertices"].as_u64()), (Some("vertex colours"), Some(1.0), Some(2)));
+        let mut v = l.clone();
+        four_layer_vertex_weights(&mut v, [[0u8, 0, 0, 0], [200, 200, 0, 255], [0, 0, 0, 128], [0, 0, 0, 0]].into_iter());
+        assert_eq!((v["weights"]["source"].as_str(), v["weights"]["vertex"]["alpha_0"].as_f64(), v["weights"]["vertex"]["rgb_sum_over_1"].as_f64()), (Some("mixed: per vertex"), Some(0.5), Some(0.25)));
+        let mut v = l.clone();
+        four_layer_vertex_weights(&mut v, std::iter::empty());
+        assert!(v["weights"]["source"].is_null());
         // layer UVs from the material's constants: layer 1 uses the second set
         let c4 = |hash: &str, v: [f32; 4]| crate::drawable::ShaderConst { hash: hash.into(), desc: String::new(), offset: 0, values: Some(v), buffer: 7, count: 4, ty: None };
         let sh = crate::drawable::Shader { index: 0, record_off: 0, name_hash: "61e09df7".into(), param_hashes: vec![], textures: vec![], flags: vec![],
