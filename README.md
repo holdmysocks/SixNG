@@ -167,6 +167,12 @@ exits with code 1.
 # Search names across all indexed archives
 .\target\release\sixng.exe search 'elegy|buffalo' --archive levels
 
+# Speed check: times indexing, search, texture decoding and model export on your install and prints a
+# checksum of every result (the same checksums before and after a code change = the same output).
+# Needs the archives indexed; writes nothing to the work dir. Times vary with what else the PC is doing:
+# compare the best of a few runs. --bench-only index,search,textures,models runs some parts only
+.\target\release\sixng.exe --bench --pretty
+
 # Name dictionary for shader, parameter and meta field hashes (~2 s, needs the common index).
 # Built from your install into work\names\names.json; exports and the app use it.
 .\target\release\sixng.exe names

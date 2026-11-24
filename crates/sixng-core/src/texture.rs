@@ -461,11 +461,75 @@ fn repair_bc23_colour(data: &[u8], w: usize, h: usize, img: &mut [u32]) {
     }
 }
 
+/// Block rows per band for a `bw` x `bh` block image, or all of them when
+/// the image is too small to gain: handing a few milliseconds of work to
+/// other cores costs more than it saves when they are busy. BC6H and BC7
+/// decode about five times slower than the others, so they split sooner
+/// (from 512 x 512 pixels; the others from 2048 x 2048). About four bands
+/// per thread, so that slow and fast bands even out.
+fn band_rows(fmt: Fmt, bw: usize, bh: usize) -> usize {
+    let (min_blocks, band_blocks): (usize, usize) = match fmt {
+        Fmt::Bc6u | Fmt::Bc6s | Fmt::Bc7 => (1 << 14, 1 << 12),
+        _ => (1 << 18, 1 << 14),
+    };
+    if bw * bh < min_blocks {
+        return bh.max(1);
+    }
+    let bands = rayon::current_num_threads() * 4;
+    bh.div_ceil(bands).max(band_blocks.div_ceil(bw))
+}
+
+/// Decode a block-compressed image (BC1 to BC7, blocks in row order) to
+/// RGBA8 in bands of `rows` block rows, each on its own core. Blocks do not
+/// depend on each other, so the bands give the same bytes as one pass.
+fn bc_to_rgba(fmt: Fmt, data: &[u8], w: usize, h: usize, rows: usize) -> Result<Vec<u8>, &'static str> {
+    use rayon::prelude::*;
+    use texture2ddecoder as td;
+    let bw = w.div_ceil(4);
+    let bpe = fmt.bytes_per_elem() as usize;
+    // One band: block rows starting at `data`, `bh` pixel rows into `out`.
+    let band = |data: &[u8], bh: usize, out: &mut [u8]| -> Result<(), &'static str> {
+        let mut img = vec![0u32; w * bh];
+        match fmt {
+            Fmt::Bc1 => td::decode_bc1a(data, w, bh, &mut img)?,
+            Fmt::Bc2 => {
+                td::decode_bc2(data, w, bh, &mut img)?;
+                repair_bc23_colour(data, w, bh, &mut img);
+            }
+            Fmt::Bc3 => {
+                td::decode_bc3(data, w, bh, &mut img)?;
+                repair_bc23_colour(data, w, bh, &mut img);
+            }
+            Fmt::Bc4 => td::decode_bc4(data, w, bh, &mut img)?,
+            Fmt::Bc5 => {
+                td::decode_bc5(data, w, bh, &mut img)?;
+                reconstruct_bc5_z(&mut img);
+            }
+            Fmt::Bc6u => crate::bc6h::decode_image(data, w, bh, &mut img, false)?,
+            Fmt::Bc6s => crate::bc6h::decode_image(data, w, bh, &mut img, true)?,
+            Fmt::Bc7 => td::decode_bc7(data, w, bh, &mut img)?,
+            _ => return Err("unsupported"),
+        }
+        for (o, px) in out.chunks_exact_mut(4).zip(&img) {
+            // texture2ddecoder packs as 0xAARRGGBB
+            o.copy_from_slice(&[(px >> 16) as u8, (px >> 8) as u8, *px as u8, (px >> 24) as u8]);
+        }
+        Ok(())
+    };
+    let mut out = vec![0u8; w * h * 4];
+    if rows * 4 >= h || w == 0 {
+        band(data, h, &mut out)?;
+    } else {
+        out.par_chunks_mut(rows * 4 * w * 4)
+            .enumerate()
+            .try_for_each(|(i, o)| band(&data[i * rows * bw * bpe..], o.len() / (w * 4), o))?;
+    }
+    Ok(out)
+}
+
 /// Decode linear mip0 to RGBA8.
 pub fn to_rgba(fmt: Fmt, data: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
-    use texture2ddecoder as td;
     let (wu, hu) = (w as usize, h as usize);
-    let mut img = vec![0u32; wu * hu];
     let need_blocks = (w.div_ceil(4) * h.div_ceil(4)) as usize;
     let mut buf;
     let data = if fmt.block_dim() == 4 && data.len() < need_blocks * fmt.bytes_per_elem() as usize {
@@ -475,33 +539,11 @@ pub fn to_rgba(fmt: Fmt, data: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
     } else {
         data
     };
-    let r = match fmt {
-        Fmt::Bc1 => td::decode_bc1a(data, wu, hu, &mut img),
-        Fmt::Bc2 => {
-            let r = td::decode_bc2(data, wu, hu, &mut img);
-            if r.is_ok() {
-                repair_bc23_colour(data, wu, hu, &mut img);
-            }
-            r
+    match fmt {
+        Fmt::Bc1 | Fmt::Bc2 | Fmt::Bc3 | Fmt::Bc4 | Fmt::Bc5 | Fmt::Bc6u | Fmt::Bc6s | Fmt::Bc7 => {
+            let rows = band_rows(fmt, wu.div_ceil(4), hu.div_ceil(4));
+            bc_to_rgba(fmt, data, wu, hu, rows).map_err(|e| anyhow!("decode: {e}"))
         }
-        Fmt::Bc3 => {
-            let r = td::decode_bc3(data, wu, hu, &mut img);
-            if r.is_ok() {
-                repair_bc23_colour(data, wu, hu, &mut img);
-            }
-            r
-        }
-        Fmt::Bc4 => td::decode_bc4(data, wu, hu, &mut img),
-        Fmt::Bc5 => {
-            let r = td::decode_bc5(data, wu, hu, &mut img);
-            if r.is_ok() {
-                reconstruct_bc5_z(&mut img);
-            }
-            r
-        }
-        Fmt::Bc6u => crate::bc6h::decode_image(data, wu, hu, &mut img, false),
-        Fmt::Bc6s => crate::bc6h::decode_image(data, wu, hu, &mut img, true),
-        Fmt::Bc7 => td::decode_bc7(data, wu, hu, &mut img),
         Fmt::Rgba8 | Fmt::Bgra8 | Fmt::R8 | Fmt::A8 | Fmt::Rg8 | Fmt::R16f | Fmt::R16 | Fmt::Rgba16 | Fmt::Rgba16f | Fmt::R32f | Fmt::Rg16f | Fmt::Rgb10a2 => {
             let bpe = fmt.bytes_per_elem() as usize;
             let mut out = vec![255u8; wu * hu * 4];
@@ -549,17 +591,10 @@ pub fn to_rgba(fmt: Fmt, data: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
                     }
                 }
             }
-            return Ok(out);
+            Ok(out)
         }
-        Fmt::Unknown => Err("unsupported"),
-    };
-    r.map_err(|e| anyhow!("decode: {e}"))?;
-    let mut out = Vec::with_capacity(wu * hu * 4);
-    for px in img {
-        // texture2ddecoder packs as 0xAARRGGBB
-        out.extend_from_slice(&[(px >> 16) as u8, (px >> 8) as u8, px as u8, (px >> 24) as u8]);
+        Fmt::Unknown => Err(anyhow!("decode: unsupported")),
     }
-    Ok(out)
 }
 
 /// Reconstruct the tangent-space Z component into the blue channel of a decoded
@@ -867,6 +902,35 @@ mod bc_colour_tests {
         tilted[9] = 128;
         let rgba = to_rgba(Fmt::Bc5, &tilted, 4, 4).unwrap();
         assert_eq!(px(&rgba, 0), [255, 128, 128, 255]);
+    }
+}
+
+#[cfg(test)]
+mod band_tests {
+    use super::{bc_to_rgba, Fmt};
+
+    /// Every band split gives the bytes of a single pass, on random blocks
+    /// and on sizes that are not whole blocks.
+    #[test]
+    fn bands_equal_one_pass() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for fmt in [Fmt::Bc1, Fmt::Bc2, Fmt::Bc3, Fmt::Bc4, Fmt::Bc5, Fmt::Bc6u, Fmt::Bc6s, Fmt::Bc7] {
+            for (w, h) in [(64usize, 64usize), (37, 50), (4, 128), (130, 9)] {
+                let (bw, bh) = (w.div_ceil(4), h.div_ceil(4));
+                let data: Vec<u8> = (0..bw * bh * fmt.bytes_per_elem() as usize).map(|_| (next() >> 32) as u8).collect();
+                let whole = bc_to_rgba(fmt, &data, w, h, bh).unwrap();
+                assert_eq!(whole.len(), w * h * 4);
+                for rows in [1, 2, 3, 5, bh - 1] {
+                    assert!(bc_to_rgba(fmt, &data, w, h, rows.max(1)).unwrap() == whole, "{fmt:?} {w}x{h} in bands of {rows}");
+                }
+            }
+        }
     }
 }
 
