@@ -635,7 +635,9 @@ impl State {
     }
 
     pub fn unsaved(&self) -> bool {
-        self.livery.stickers != self.saved.stickers
+        // `fresh` is not saved, so it does not count
+        let plain = |l: &Livery| l.stickers.iter().map(|s| Sticker { fresh: false, ..s.clone() }).collect::<Vec<_>>();
+        plain(&self.livery) != plain(&self.saved)
     }
 
     /// Bring the GPU in line with the placements. Called every frame with
@@ -879,6 +881,8 @@ mod tests {
         let mut s = Sticker::new(Picture::Game("00112233445566aa".into()));
         s.zones = vec![169, 170];
         s.model = "truckbeds_box_01_hi".into();
+        // not saved: a sticker read from a file counts as placed by hand
+        s.fresh = false;
         let l = Livery { format: 1, vehicle: "benson_hi".into(), stickers: vec![s] };
         let back: Livery = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
         assert_eq!(l, back);
