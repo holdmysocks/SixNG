@@ -2640,12 +2640,13 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let aix = sixng_core::audio::load_index(&ws.work, &a.id).ok();
             let banks: Vec<(u64, std::collections::HashSet<u32>)> = aix.as_ref().map(|ix| ix.banks.iter().map(|b| (b.off, b.streams.iter().map(|s| s.id).collect())).collect()).unwrap_or_default();
             let sizes: Vec<(u64, u64)> = aix.as_ref().map(|ix| ix.banks.iter().map(|b| (b.off, b.size)).collect()).unwrap_or_default();
-            let (ok, bad, containers, list_len) = sixng_core::audiometa::export(&a, &sel, &banks, &sizes, po)?;
+            let (ok, bad, containers, list) = sixng_core::audiometa::export(&a, &sel, &banks, &sizes, po)?;
             // which container (bank name hash) each bank holds, for `sixng audio`
             let named = if containers.is_empty() {
                 None
             } else {
                 sixng_core::audiometa::save_containers(&ws.work, &a.id, &containers)?;
+                sixng_core::audiometa::save_groups(&ws.work, &a.id, &sixng_core::audiometa::bank_groups(&list))?;
                 let c = sixng_core::audiometa::bank_container(&containers);
                 // bank names into the name dictionary (needs `sixng names` first)
                 let streams: std::collections::BTreeMap<u64, Vec<u32>> = aix.as_ref().map(|ix| ix.banks.iter().map(|b| (b.off, b.streams.iter().map(|s| s.id).collect())).collect()).unwrap_or_default();
@@ -2653,7 +2654,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     Ok(r) => r,
                     Err(e) => json!({"error": e.to_string()}),
                 };
-                Some(json!({"banks": c.len(), "from_sounds": containers.values().filter(|m| m.values().any(|n| *n > 0)).count(), "bank_list_entries": list_len, "names": names, "file": sixng_core::audiometa::containers_path(&ws.work, &a.id)}))
+                Some(json!({"banks": c.len(), "from_sounds": containers.values().filter(|m| m.values().any(|n| *n > 0)).count(), "bank_list_entries": list.len(), "names": names, "file": sixng_core::audiometa::containers_path(&ws.work, &a.id)}))
             };
             out.print(&json!({"ok": true, "archive": a.id, "scanned": sel.len(), "decoded": ok, "failed": bad, "linked_to_banks": !banks.is_empty(), "bank_containers": named, "seconds": t.elapsed().as_secs_f64(), "out": po.join("audio_meta")}));
         }
