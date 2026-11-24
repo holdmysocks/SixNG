@@ -207,12 +207,17 @@ pub fn in_region(min: [f32; 3], max: [f32; 3]) -> bool {
 /// is known and by hash where it is not. The same facts as model.json's
 /// `materials` and `drawable.shaders`, laid out to be read.
 fn readable_materials(model: &str, shaders: &[crate::drawable::Shader], mats: &serde_json::Value) -> serde_json::Value {
-    // one key per slot or parameter: its name, else its hash; a second use of a name gets its hash appended
+    // one key per slot or parameter: its name, else its hash; a second use of a name gets its hash
+    // appended, and any key still taken gets a number, so no entry replaces another
     fn key(map: &serde_json::Map<String, serde_json::Value>, name: Option<String>, hash: &str) -> String {
-        match name {
+        let k = match name {
             Some(n) if !map.contains_key(&n) => n,
             Some(n) => format!("{n} ({hash})"),
             None => hash.to_string(),
+        };
+        match (2..).map(|i| format!("{k} #{i}")).find(|c| !map.contains_key(c)) {
+            Some(c) if map.contains_key(&k) => c,
+            _ => k,
         }
     }
     let list: Vec<serde_json::Value> = shaders
@@ -3268,12 +3273,14 @@ mod dictionary_tests {
         }])).unwrap();
         let mats = serde_json::json!([{"classification": {"class": "opaque"}, "base_color": "a.png", "normal": null,
             "textures": [{"param_hash": "33333333", "param_name": "diffusetex", "png": "a.png", "role_guess": "colour (sRGB)", "hash64": "00"},
-                         {"param_hash": "44444444", "param_name": null, "status": "missing"}]}]);
+                         {"param_hash": "44444444", "param_name": null, "status": "missing"},
+                         {"param_hash": "44444444", "param_name": null, "png": "b.png"}]}]);
         let j = readable_materials("m", &shaders, &mats);
         let m = &j["materials"][0];
         assert_eq!(m["shader"], "0badf00d");
         assert_eq!(m["textures"]["diffusetex"]["file"], "a.png");
         assert_eq!(m["textures"]["44444444"]["status"], "missing");
+        assert_eq!(m["textures"]["44444444 #2"]["file"], "b.png");
         assert_eq!(m["parameters"]["11111111"], serde_json::json!([1.0, 0.5, 0.0, 0.0]));
         assert_eq!(m["parameters_not_read"], serde_json::json!(["22222222"]));
     }
