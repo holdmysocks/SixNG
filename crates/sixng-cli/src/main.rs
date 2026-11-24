@@ -760,6 +760,11 @@ enum Cmd {
         /// Hashes (hex) to look up instead of building.
         #[arg(long, value_delimiter = ',')]
         lookup: Vec<String>,
+        /// Import a gta6-namehash dictionary.json (public GTA V names) into
+        /// `<work>/names/namehash.json` instead of building. Its names are
+        /// used only for hashes no other source names.
+        #[arg(long)]
+        namehash: Option<PathBuf>,
     },
     /// Export a character or an animal as ONE rigged GLB: its outfit parts
     /// (head, hair, top, bottom, shoes …; the default look, or --parts), or
@@ -1207,8 +1212,12 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 "material_texture_parameters": {"total": tex.len(), "unnamed": unnamed.len(), "unnamed_list": unnamed},
                 "pipeline_cache": cache_summary, "matched_effects": effects, "seconds": t.elapsed().as_secs_f64()}));
         }
-        Cmd::Names { lookup } => {
-            if lookup.is_empty() {
+        Cmd::Names { lookup, namehash } => {
+            if let Some(p) = namehash {
+                let mut r = sixng_core::names::import_namehash(&p, &ws.work)?;
+                r["ok"] = json!(true);
+                out.print(&r);
+            } else if lookup.is_empty() {
                 let t = Instant::now();
                 let mut r = sixng_core::names::build(&ws.game, &ws.index_dir(), &ws.work)?;
                 r["seconds"] = json!(t.elapsed().as_secs_f64());
