@@ -289,6 +289,8 @@ pub struct LookInfo {
     pub strands: Vec<(String, String, String)>,
     /// Their stored tints by slot: palette name hash and row of tint 0.
     pub strand_tints: Vec<(String, u32, u8)>,
+    /// Hair colour preset (name hash) of the strand parts, by slot.
+    pub strand_presets: Vec<(String, u32)>,
     /// What the viewer did or could not do (skin tone source, unresolved items).
     pub notes: Vec<String>,
     /// Strand hair found for the outfit's hair assets (`hairlink`).
@@ -319,8 +321,36 @@ pub struct HairPick {
     /// or more with every piece rooted on this head.
     pub shown: bool,
     /// Stored colour (sRGB): row tint 0 of `ped_tint_hair`, when the item
-    /// names that palette.
+    /// names that palette; else the first colour of its hair preset, as
+    /// shown (`hairtone::display`).
     pub colour: Option<[u8; 3]>,
+    /// The item's hair colour preset, when it names one.
+    pub tone: Option<HairTone>,
+}
+
+/// A hair colour preset as the viewer draws it: its two colours, mixed per
+/// strand by the preset's noise texture (`hairtone`).
+#[derive(Clone)]
+pub struct HairTone {
+    pub name: u32,
+    pub preset: sixng_core::hairtone::Preset,
+    pub noise: Option<Arc<sixng_core::hairtone::Noise>>,
+}
+
+impl HairTone {
+    /// Colour of each guide strand of a groom, linear RGB bytes.
+    fn strands(&self, g: &sixng_core::groom::Groom) -> Vec<[u8; 3]> {
+        let tiling = self.preset.values.get(sixng_core::hairtone::TILING).copied().filter(|t| *t > 0.0).unwrap_or(1.0);
+        (0..g.strands)
+            .map(|s| {
+                let n = match (&self.noise, g.root_uv.get(s)) {
+                    (Some(n), Some(uv)) => n.at([uv[0] * tiling, uv[1] * tiling]),
+                    _ => sixng_core::hairtone::scatter(s),
+                };
+                sixng_core::hairtone::strand(&self.preset, n).map(|c| ((c as f32 / 255.0).powf(2.2) * 255.0 + 0.5) as u8)
+            })
+            .collect()
+    }
 }
 
 /// Colouring of one loaded part of an outfit.
@@ -653,6 +683,10 @@ pub struct Hair {
     fur_pick: [String; 2],
     /// Colour each strand from the skin under its root (automatic fur).
     pub skin_colour: bool,
+    /// Characters: the hair colour preset of each groom shown.
+    pub tones: HashMap<u64, HairTone>,
+    /// Colour the grooms that have a preset with it (else the one colour).
+    pub stored_colours: bool,
     /// Draw the chosen grooms (the guide strands); off hides them without
     /// dropping the choice.
     pub show: bool,
@@ -698,6 +732,8 @@ impl Default for Hair {
             fur_note: String::new(),
             fur_pick: [String::new(), String::new()],
             skin_colour: true,
+            tones: HashMap::new(),
+            stored_colours: true,
             show: true,
             full_coat: true,
             density: 1.0,
@@ -712,7 +748,9 @@ impl Default for Hair {
 
 impl Hair {
     fn want_key(&self) -> String {
-        format!("{:?}|{}|{:?}|{}|{}|{}|{:?}|{:?}", self.selected, self.width_mm, self.colour, self.skin_colour && !self.skin.is_empty(), self.full_coat, self.density, self.hat.as_ref().map(|h| h.id), self.rig.as_ref().map(|r| (r.verts.len(), r.joints.len())))
+        let mut tones: Vec<(u64, u32)> = self.tones.iter().filter(|_| self.stored_colours).map(|(k, t)| (*k, t.name)).collect();
+        tones.sort();
+        format!("{tones:?}|{:?}|{}|{:?}|{}|{}|{}|{:?}|{:?}", self.selected, self.width_mm, self.colour, self.skin_colour && !self.skin.is_empty(), self.full_coat, self.density, self.hat.as_ref().map(|h| h.id), self.rig.as_ref().map(|r| (r.verts.len(), r.joints.len())))
     }
     pub fn settled(&self) -> bool {
         !self.loading && !self.listing && !self.exporting && self.key == self.want_key()
@@ -990,6 +1028,7 @@ impl ModelView {
         let note = self.hair.coat_note.clone();
         let (hat, under_hat) = (self.hair.hat.clone(), self.hair.under_hat.clone());
         let rig = self.hair.rig.clone();
+        let tones = if self.hair.stored_colours { self.hair.tones.clone() } else { HashMap::new() };
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<Vec<glb::Model>> {
@@ -1015,7 +1054,11 @@ impl ModelView {
                     let glb_bytes = if coat_on && g.stored_strands() > 0 {
                         let k = g.points_per_strand.max(1);
                         let one = lin.map(|c| (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
-                        let cols: Vec<[u8; 3]> = (0..g.strands).map(|s| if skin.is_empty() { one } else { nearest(g.points[s * k], &skin) }).collect();
+                        let cols: Vec<[u8; 3]> = match tones.get(&off) {
+                            // a character's hair: the two colours of its preset
+                            Some(t) => t.strands(&g),
+                            None => (0..g.strands).map(|s| if skin.is_empty() { one } else { nearest(g.points[s * k], &skin) }).collect(),
+                        };
                         // Long hair has many points per strand: keep one groom
                         // under about 1.5 million ribbon vertices (a vertex
                         // buffer may not exceed 256 MiB).
@@ -1026,6 +1069,8 @@ impl ModelView {
                         let base = if g.width > 0.0 { g.width } else { 0.0003 };
                         let w = (base / share.max(1e-3)).clamp(base, 0.004) * width_scale;
                         g.coat_glb(&format!("coat_{off:x}"), &coat, w, &cols, serde_json::json!({}))
+                    } else if let Some(t) = tones.get(&off) {
+                        g.ribbon_glb_coloured(&format!("groom_{off:x}"), hw, &t.strands(&g), serde_json::json!({}))
                     } else if skin.is_empty() {
                         g.ribbon_glb(&format!("groom_{off:x}"), hw, lin, serde_json::json!({}))
                     } else {
@@ -1301,6 +1346,9 @@ impl ModelView {
                     if self.hair.full_coat {
                         ui.add(egui::Slider::new(&mut self.hair.density, 0.05..=1.0).text("density"));
                     }
+                }
+                if !self.hair.tones.is_empty() {
+                    ui.checkbox(&mut self.hair.stored_colours, "stored hair colours").on_hover_text("Each hair, brow, lash and beard piece takes the two colours of the hair preset its item names, mixed per strand by the preset's noise texture (how the game mixes them is not decoded). Shown brighter than stored: the game's hair shader scatters light and the viewer's does not. Off: the one colour above.");
                 }
                 if !self.hair.skin.is_empty() {
                     ui.checkbox(&mut self.hair.skin_colour, "colour from the skin").on_hover_text("Each strand takes the colour of the skin texture under its root. A display choice: the game colours fur with its own textures and tints.");
@@ -2067,6 +2115,7 @@ impl ModelView {
                         if let Some(c) = look.hair.iter().find(|h| h.slot == "hair").or(look.hair.first()).and_then(|h| h.colour) {
                             self.hair.colour = c.map(|x| x as f32 / 255.0);
                         }
+                        self.hair.tones = look.hair.iter().filter_map(|h| Some((h, h.tone.as_ref()?))).flat_map(|(h, t)| h.grooms.iter().map(move |g| (*g, t.clone()))).collect();
                         if !look.hair.is_empty() {
                             self.hair.full_coat = true;
                             self.hair.skin_colour = false;
@@ -5722,6 +5771,9 @@ fn load_query_sel(
                                 if let Some((pal, t)) = p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t))) {
                                     info.strand_tints.push((p.slot.clone(), pal, t.rows[0]));
                                 }
+                                if let Some(h) = p.hair_preset.as_deref().and_then(|h| u32::from_str_radix(h, 16).ok()) {
+                                    info.strand_presets.push((p.slot.clone(), h));
+                                }
                             }
                             continue;
                         }
@@ -5752,11 +5804,20 @@ fn load_query_sel(
                 // strand hair: the grooms placed for each hair asset
                 match sixng_core::hairlink::get(&ws.work, &a, &ix.entries) {
                     Ok(t) => {
+                        // the hair colour preset of each strand part, with its noise texture
+                        let presets = if info.strand_presets.is_empty() { None } else { sixng_core::hairtone::Table::load_or_build(&ws).map_err(|e| info.notes.push(format!("Hair colours: {e}"))).ok() };
+                        let mut noises: HashMap<u64, Option<Arc<sixng_core::hairtone::Noise>>> = HashMap::new();
                         for (slot, placeholder, guid) in &info.strands {
                             // by the item's hair asset, else by the character's own placeholder
                             let Some(l) = u64::from_str_radix(guid, 16).ok().and_then(|g| t.resolve(g, look.fit.as_deref())).or_else(|| guid.is_empty().then(|| t.by_placeholder(placeholder)).flatten()) else { continue };
                             let colour = info.strand_tints.iter().find(|t| t.0 == *slot && t.1 == 0x1e64_f584).and_then(|t| Some(sixng_core::pedtint::palettes(&ws.game).ok()?.get(&t.1)?.sample(t.2, 128)));
-                            info.hair.push(HairPick { slot: slot.clone(), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: t.uncontested(l), off_head: 0, shown: l.confidence >= 0.5 && slot != "body hair", colour });
+                            // presets whose colours are white are not hair colours (their flag is set)
+                            let tone = info.strand_presets.iter().find(|p| p.0 == *slot).and_then(|p| Some((p.1, presets.as_ref()?.get(p.1)?.clone()))).filter(|(_, p)| !p.flag).map(|(name, preset)| {
+                                let noise = if preset.texture == 0 { None } else { noises.entry(preset.texture).or_insert_with(|| sixng_core::hairtone::Noise::load(&ws.game, preset.texture).map(Arc::new)).clone() };
+                                HairTone { name, preset, noise }
+                            });
+                            let colour = colour.or(tone.as_ref().map(|t| sixng_core::hairtone::display(t.preset.a)));
+                            info.hair.push(HairPick { slot: slot.clone(), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: t.uncontested(l), off_head: 0, shown: l.confidence >= 0.5 && slot != "body hair", colour, tone });
                         }
                     }
                     Err(e) => info.notes.push(format!("Strand hair: {e}")),
@@ -5772,7 +5833,7 @@ fn load_query_sel(
                     for l in extra {
                         let slot = sixng_core::pedlook::slot_of(&l.placeholder);
                         if slot == "hair" || slot == "beard" {
-                            info.hair.push(HairPick { slot: format!("other {slot}"), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: t.uncontested(l), off_head: 0, shown: false, colour: None });
+                            info.hair.push(HairPick { slot: format!("other {slot}"), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: t.uncontested(l), off_head: 0, shown: false, colour: None, tone: None });
                         }
                     }
                 }

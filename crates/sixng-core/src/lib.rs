@@ -21,6 +21,7 @@ pub mod drawable;
 pub mod export;
 pub mod furlink;
 pub mod hairlink;
+pub mod hairtone;
 pub mod game;
 pub mod gltf;
 pub mod groom;
