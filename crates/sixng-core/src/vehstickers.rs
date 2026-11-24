@@ -195,7 +195,7 @@ pub fn sticker_list(ws: &crate::export::Workspace) -> Result<Vec<Value>> {
                     "sticker": hex(*k),
                     "name": name_of(*k),
                     "texture": get(s, STICKER_TEXTURE).and_then(|x| x.as_str()),
-                    "colours": ["colorRed", "colorGreen", "colorBlue"].iter().map(|n| hex(u(named(s, n)))).collect::<Vec<_>>(),
+                    "colours": [hex(u(named(s, "colorRed"))), hex(u(named(s, "colorGreen"))), hex(u(named(s, "colorBlue")))],
                     "mask": get(s, STICKER_MASK).and_then(|x| x.as_bool()).unwrap_or(false),
                     "aspect": u(named(s, "aspectRatio")),
                     "record": s,
