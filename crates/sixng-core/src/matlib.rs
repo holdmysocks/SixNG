@@ -290,6 +290,34 @@ impl Index {
         }
     }
 
+    /// The index, read from the work directory, or built from the data.rpf
+    /// index and written there when it is missing or out of date (what
+    /// `sixng materials` does; a few seconds).
+    pub fn load_or_build(ws: &crate::export::Workspace) -> Result<Index, String> {
+        if let Some(ix) = Index::load(ws) {
+            return Ok(ix);
+        }
+        let a = ws.resolve("data").map_err(|e| format!("{e:#}"))?;
+        let aix = ws.load_index(&a).map_err(|e| format!("data.rpf index: {e:#}; index data.rpf first"))?;
+        let mut index = Index { version: VERSION, ..Default::default() };
+        for e in aix.entries.iter().filter(|e| e.kind == crate::classify::Kind::Pso) {
+            let Ok(b) = crate::scan::read_entry(&a.path, e) else { continue };
+            let Some(p) = crate::pso::parse(&b).filter(|p| p.structs.contains_key(&ROOT)) else { continue };
+            index.add(&e.id, &Library::from_meta(&p.meta()));
+        }
+        if index.presets.is_empty() {
+            return Err("no layered-material library found in data.rpf".into());
+        }
+        if let Ok(b) = serde_json::to_vec(&index) {
+            let p = path(ws);
+            if let Some(d) = p.parent() {
+                let _ = std::fs::create_dir_all(d);
+            }
+            let _ = std::fs::write(p, b);
+        }
+        Ok(index)
+    }
+
     pub fn load(ws: &crate::export::Workspace) -> Option<Index> {
         let ix: Index = serde_json::from_slice(&std::fs::read(path(ws)).ok()?).ok()?;
         (ix.version == VERSION).then_some(ix)

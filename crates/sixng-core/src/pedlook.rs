@@ -206,6 +206,87 @@ pub fn models(game_root: &Path) -> Result<&'static Models, String> {
     .map_err(|e| e.clone())
 }
 
+/// Textures the wardrobe data names: store hash -> (wardrobe resource, head
+/// drawable hash or 0). Ped skin has no texture bound in its drawables: a
+/// head's face, the body's normal, detail and mask maps and the eyes'
+/// colour are named only by wardrobe items (`States` -> `Asset`), so the
+/// texture-users index, built from model materials, does not know them.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct WardrobeTextures {
+    version: u32,
+    pub by_texture: HashMap<u64, Vec<(u64, u32)>>,
+}
+
+/// The wardrobe texture table (built from the packs.rpf index on first use,
+/// about a minute, then cached as `<work>/index/wardrobe_textures.json`).
+pub fn wardrobe_textures(game_root: &Path) -> Result<&'static WardrobeTextures, String> {
+    static T: OnceLock<Result<WardrobeTextures, String>> = OnceLock::new();
+    T.get_or_init(|| {
+        let work = crate::names::work_dir().ok_or("no work directory")?;
+        let cache = work.join("index").join("wardrobe_textures.json");
+        let ixp = crate::scan::index_path(&work.join("index"), "packs.rpf");
+        let stamp = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        if let Ok(b) = std::fs::read(&cache) {
+            if let Ok(t) = serde_json::from_slice::<WardrobeTextures>(&b) {
+                if t.version == 2 && stamp(&cache) >= stamp(&ixp) {
+                    return Ok(t);
+                }
+            }
+        }
+        let ix = crate::scan::load_index(&ixp).map_err(|e| format!("packs.rpf index ({}): {e}; index packs.rpf first", ixp.display()))?;
+        let packs = game_root.join("packs.rpf");
+        fn hashes(v: &serde_json::Value, out: &mut Vec<u64>) {
+            match v {
+                serde_json::Value::Array(a) => a.iter().for_each(|x| hashes(x, out)),
+                serde_json::Value::Object(m) => m.values().for_each(|x| hashes(x, out)),
+                serde_json::Value::String(s) if s.len() == 16 => out.extend(u64::from_str_radix(s, 16).ok().filter(|&h| h != 0)),
+                _ => {}
+            }
+        }
+        let found: Vec<(u64, u64, u32)> = ix
+            .entries
+            .par_iter()
+            .filter(|e| e.sub == "7a")
+            .flat_map_iter(|e| {
+                let mut v = Vec::new();
+                let Ok(r) = Resource::load_meta(&packs, e) else { return v };
+                let Some(m) = Meta::parse(&r) else { return v };
+                if m.objects(VARIATION).is_empty() {
+                    return v;
+                }
+                let f = crate::meta7a::field_name;
+                for o in m.objects(0xf795_e8ba) {
+                    let Some(p) = m.object(0xf795_e8ba, o, 4) else { continue };
+                    let head = p[f(0x12f8_5293)].as_array().into_iter().flatten().filter(|t| t["Key"].as_u64() == Some(0x4bfd_27dd)).find_map(|t| t["Item"].as_array()?.first()?.as_u64()).unwrap_or(0) as u32;
+                    let mut hs = Vec::new();
+                    hashes(&p[f(0xebac_f18c)], &mut hs);
+                    hs.sort();
+                    hs.dedup();
+                    v.extend(hs.into_iter().map(|h| (h, e.off, head)));
+                }
+                v
+            })
+            .collect();
+        let mut by_texture: HashMap<u64, Vec<(u64, u32)>> = HashMap::new();
+        for (h, off, head) in found {
+            let v = by_texture.entry(h).or_default();
+            if !v.contains(&(off, head)) {
+                v.push((off, head));
+            }
+        }
+        if by_texture.is_empty() {
+            return Err("no wardrobe textures found in packs.rpf".into());
+        }
+        let t = WardrobeTextures { version: 2, by_texture };
+        if let Ok(b) = serde_json::to_vec(&t) {
+            let _ = std::fs::write(&cache, b);
+        }
+        Ok(t)
+    })
+    .as_ref()
+    .map_err(|e| e.clone())
+}
+
 /// Whether the outfit list has this model (a character prefix such as
 /// `cs_ali`); false when the table is not available.
 pub fn has_model(game_root: &Path, model: &str) -> bool {
@@ -252,6 +333,11 @@ pub struct LookPart {
     /// Colour word of the item's colour tag (black, blue, khaki …).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub colour_tag: Option<&'static str>,
+    /// Base colour (sRGB) per sub-material from the item's garment preset
+    /// (`matlib`); empty when the item names none or it is not in the
+    /// library.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub preset_colours: Vec<Option<[u8; 3]>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tex_remap: Vec<(String, String)>,
     /// Colour and normal textures the item names (hex), item first: used for
@@ -551,7 +637,7 @@ fn own_look(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Option<Look> {
     let names: HashSet<String> = ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| e.name.as_ref().map(|n| n.to_ascii_lowercase())).collect();
     let exists = |n: &str| names.contains(n);
     let mut parts: Vec<LookPart> = Vec::new();
-    let plain = |slot: String, drawable: String, found_by: &'static str| LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: String::new(), guid: None, tint: None, colour: None, colour_tag: None, tex_remap: vec![], skins: vec![], found_by };
+    let plain = |slot: String, drawable: String, found_by: &'static str| LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: String::new(), guid: None, tint: None, colour: None, colour_tag: None, preset_colours: vec![], tex_remap: vec![], skins: vec![], found_by };
     for o in opts.iter().filter(|o| o.default || is_strand_word(item_word(&o.name))) {
         let slot = slot_of(&o.name);
         // one hair, one beard …: the first of each
@@ -619,6 +705,9 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
     if flat.is_empty() {
         return Err(format!("none of the {} outfits of {model} is in its wardrobe resource", row.outfits.len()));
     }
+    // garment preset colours (the clothing material library of data.rpf)
+    static PRESETS: OnceLock<Option<crate::matlib::Index>> = OnceLock::new();
+    let presets = PRESETS.get_or_init(|| crate::matlib::Index::load_or_build(&crate::export::Workspace::new(crate::export::game_root(a), &work)).ok()).as_ref();
     let mut outfits = Vec::new();
     for (o, vs) in flat {
         let mut parts: Vec<LookPart> = Vec::new();
@@ -651,10 +740,10 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
                 if slot == "eyecaps" || slot.contains("hiddenpoly") || parts.iter().any(|x| x.drawable == drawable) {
                     continue;
                 }
-                parts.push(LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: p.item.clone(), guid: p.guid.clone(), tint: p.tint.clone(), colour: p.colour, colour_tag: p.colour_tag, tex_remap: p.tex_remap.clone(), skins: p.skins.clone(), found_by });
+                parts.push(LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: p.item.clone(), guid: p.guid.clone(), tint: p.tint.clone(), colour: p.colour, colour_tag: p.colour_tag, preset_colours: p.preset.as_deref().and_then(|h| presets?.colours(h)).map(|v| v.into_iter().map(|c| c.map(|c| [c[0], c[1], c[2]])).collect()).unwrap_or_default(), tex_remap: p.tex_remap.clone(), skins: p.skins.clone(), found_by });
             }
         }
-        let plain = |slot: &str, drawable: String, found_by: &'static str| LookPart { slot: slot.into(), drawable, item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, tex_remap: vec![], skins: vec![], found_by };
+        let plain = |slot: &str, drawable: String, found_by: &'static str| LookPart { slot: slot.into(), drawable, item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, preset_colours: vec![], tex_remap: vec![], skins: vec![], found_by };
         // The eyes that go with the head (`<head>_eyes_full`): the item's
         // textures are shared by every eye mesh, so the texture link can
         // pick another head's.
