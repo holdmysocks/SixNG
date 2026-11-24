@@ -248,6 +248,17 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
         }
     }
     fit.sort_by_key(|f| !f.3);
+    // A model two parts fit on the same bone goes on once (a pickup's rear
+    // bumper is an element of its bed part and of the part in the rear
+    // bumper slot). What the stock pieces lose is the sum of both.
+    let mut repeated = 0;
+    let mut once: HashSet<(u64, u32)> = HashSet::new();
+    let hidden: HashSet<u32> = fit.iter().flat_map(|f| f.2.iter().copied()).collect();
+    fit.retain(|f| {
+        let new = once.insert((f.0.off, f.1));
+        repeated += usize::from(!new);
+        new
+    });
 
     let build = |e: &Entry| -> Result<(Piece, Vec<crate::gltf::Material>)> {
         let mut item = ExportedItem { id: e.id.clone(), archive: a.id.clone(), kind: e.kind.name(), rtype: e.rtype.clone(), name: e.name.clone(), status: "ok".into(), files: vec![], error: None, warnings: vec![] };
@@ -309,8 +320,7 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
         }
     };
 
-    // stock pieces the fitted elements replace
-    let hidden: HashSet<u32> = fit.iter().flat_map(|f| f.2.iter().copied()).collect();
+    // stock pieces the fitted elements replace (`hidden`)
     let gone: Vec<bool> = joints.iter().map(|j| hidden.contains(&joaat(&j.name.to_ascii_lowercase()))).collect();
     let mut dropped = 0;
     if gone.iter().any(|g| *g) {
@@ -517,7 +527,7 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
         "glb": out, "bytes": glb.len(), "vehicle": model, "configuration": config, "configurations": configs.len(),
         "pieces": reports, "joints": joints.len(), "stock_triangles_replaced": dropped,
         "part_colours": if look.is_some() { "the configuration's" } else { "as exported (the vehicle has no part colours per configuration)" },
-        "paint": paint, "wheels": wheel_report, "not_fitted": skipped, "left_out": unresolved, "warnings": warnings,
+        "paint": paint, "wheels": wheel_report, "repeated_elements_skipped": repeated, "not_fitted": skipped, "left_out": unresolved, "warnings": warnings,
     }))
 }
 
