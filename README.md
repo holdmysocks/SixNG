@@ -586,17 +586,24 @@ again**).
   flatten the hair.
 - **Pose** (Character panel; `--pose rest|down|walk|sit|wave` for
   screenshots): every part of a character is bound to the shared ped
-  skeleton, and the panel turns its main bones: arms (raise, swing),
-  elbows, legs (lift, spread), knees, spine (bend, twist, lean) and head
-  (nod, turn, tilt), with five presets. Zero is the stored pose (arms
-  out). Limits: a part's own helper bones are moved in the game by data
+  skeleton, and the panel turns its main bones: shoulders (shrug,
+  forward, on the collar bone), arms (raise, swing, twist), elbows,
+  forearm twist, wrists (bend, side), legs (lift, spread, twist), knees,
+  ankles, spine (bend, twist, lean), head (nod, turn, tilt) and eyes
+  (left, up, on the eyeball bones of the face rig, which join the shared
+  skeleton under the head), with five presets and a reset. Zero is the
+  stored pose (arms out); the limits are a person's rough range, not from
+  the game. Limits: a part's own helper bones are moved in the game by data
   that is not decoded, so clothing on them takes the bone weights of the
   nearest skin vertex; the first four of a vertex's eight bone weights are
   used; twist and muscle helper bones follow their parent rigidly, so
   shoulders, elbows and knees bend more simply than in the game. Hair,
   brows and beards ride on the head bone as one piece (no strand
-  simulation). `--pose-head nod,turn,tilt` and `--pose-spine
-  bend,twist,lean` add to a preset for screenshots.
+  simulation). `--pose-head nod,turn,tilt`, `--pose-spine
+  bend,twist,lean` and `--pose-joints name=left:right,…` (shoulder-shrug,
+  shoulder-forward, arm-raise, arm-swing, arm-twist, elbow, forearm-twist,
+  wrist-bend, wrist-side, leg-lift, leg-spread, leg-twist, knee, ankle;
+  `eyes=left:up`) add to a preset for screenshots.
 - **Animation** (Character panel; `--anim <dictionary>/<clip>
   [--anim-pos 0..1]`): a clip of `anim.rpf` played on the character's
   skeleton, with play / pause and a position slider. **Walk** loads a walk
