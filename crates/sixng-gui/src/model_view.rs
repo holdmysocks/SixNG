@@ -66,6 +66,13 @@ impl Caps {
     }
 }
 
+impl Loaded {
+    /// A character or an animal with a skeleton: a clip of anim.rpf can be played on it.
+    pub fn takes_clips(&self) -> bool {
+        !self.model.joints.is_empty() && (self.look.is_some() || self.fur.is_some())
+    }
+}
+
 pub struct Loaded {
     pub model: glb::Model,
     pub lods: Vec<PathBuf>,
@@ -166,6 +173,85 @@ impl PedPose {
         }
         v.retain(|x| x.1 != [0.0; 3]);
         v
+    }
+}
+
+/// The skin of an animal as the fur sees it: every skinned vertex with its
+/// joints and weights, and the joint list. Fur strands carry no bone
+/// weights that are decoded, so each fur vertex takes those of the nearest
+/// skin vertex; the fur then moves with the body under it.
+pub struct FurRig {
+    verts: Vec<([f32; 3], [u16; 4], [u8; 4])>,
+    joints: Vec<(String, Option<usize>, [f32; 16], [f32; 16])>,
+    grid: HashMap<(i32, i32, i32), Vec<u32>>,
+}
+
+impl FurRig {
+    const CELL: f32 = 0.03;
+
+    fn key(p: [f32; 3]) -> (i32, i32, i32) {
+        ((p[0] / Self::CELL).floor() as i32, (p[1] / Self::CELL).floor() as i32, (p[2] / Self::CELL).floor() as i32)
+    }
+
+    /// From a loaded model; None when it has no skinned mesh.
+    pub fn of(m: &glb::Model) -> Option<FurRig> {
+        let verts: Vec<([f32; 3], [u16; 4], [u8; 4])> = m.meshes.iter().filter(|me| me.skinned).flat_map(|me| me.verts.iter().filter(|v| v.weights.iter().any(|w| *w > 0)).map(|v| (v.pos, v.joints, v.weights))).collect();
+        if verts.is_empty() || m.joints.is_empty() {
+            return None;
+        }
+        let mut grid: HashMap<(i32, i32, i32), Vec<u32>> = HashMap::new();
+        for (i, v) in verts.iter().enumerate() {
+            grid.entry(Self::key(v.0)).or_default().push(i as u32);
+        }
+        Some(FurRig { verts, joints: m.joints.iter().map(|j| (j.name.clone(), j.parent, j.local, j.ibm)).collect(), grid })
+    }
+
+    /// Joints and weights of the skin vertex nearest to `p` (within about 15 cm).
+    fn nearest(&self, p: [f32; 3]) -> Option<([u16; 4], [u8; 4])> {
+        let k = Self::key(p);
+        let mut best: Option<(f32, u32)> = None;
+        for r in 1..=5i32 {
+            for x in -r..=r {
+                for y in -r..=r {
+                    for z in -r..=r {
+                        // only the new shell of cells
+                        if x.abs().max(y.abs()).max(z.abs()) != r && r > 1 {
+                            continue;
+                        }
+                        for &i in self.grid.get(&(k.0 + x, k.1 + y, k.2 + z)).into_iter().flatten() {
+                            let q = self.verts[i as usize].0;
+                            let d = (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2);
+                            if best.is_none_or(|b| d < b.0) {
+                                best = Some((d, i));
+                            }
+                        }
+                    }
+                }
+            }
+            // a hit within the shells searched so far is the nearest
+            if best.is_some_and(|b| b.0.sqrt() <= (r - 1).max(1) as f32 * Self::CELL) {
+                break;
+            }
+        }
+        best.map(|b| (self.verts[b.1 as usize].1, self.verts[b.1 as usize].2))
+    }
+
+    /// Bind a groom's display mesh to the skin: joints and weights per
+    /// vertex, and the animal's joint list on the model.
+    pub fn bind(&self, gm: &mut glb::Model) {
+        for me in &mut gm.meshes {
+            for v in &mut me.verts {
+                if let Some((j, w)) = self.nearest(v.pos) {
+                    v.joints = j;
+                    v.weights = w;
+                } else {
+                    v.joints = [0; 4];
+                    v.weights = [255, 0, 0, 0];
+                }
+            }
+            me.skinned = true;
+        }
+        gm.joints = self.joints.iter().map(|j| glb::Joint { name: j.0.clone(), parent: j.1, local: j.2, ibm: j.3 }).collect();
     }
 }
 
@@ -439,6 +525,9 @@ pub struct ModelView {
     /// Animation clip for the character shown (`anim.rpf`): what is asked
     /// for (`<dictionary>/<clip>`), what is loaded, and the playback state.
     pub ped_clip: PedClip,
+    /// Animals: the clip dictionaries of the species shown (root name, the
+    /// names), from the cached dictionary list.
+    animal_clips: Option<(String, Vec<String>)>,
     /// Pose of the character shown (degrees), see `PedPose`.
     pub ped_pose: PedPose,
     /// Body shape of the character shown (`BODY_SHAPE` when it was loaded).
@@ -513,6 +602,9 @@ pub struct Hair {
     /// The hat worn and the grooms it presses down (the scalp hair).
     hat: Option<Arc<sixng_core::groom::Shell>>,
     under_hat: Vec<u64>,
+    /// Animals: the skinned vertices and joints of the model shown, so the
+    /// fur can be bound to the skin under it and move with a clip.
+    rig: Option<Arc<FurRig>>,
     /// Export of the shown grooms: write the full strand set, a run in
     /// progress, its result and where the last one went.
     pub export_full: bool,
@@ -562,6 +654,7 @@ impl Default for Hair {
             selected: Vec::new(),
             hat: None,
             under_hat: Vec::new(),
+            rig: None,
             export_full: true,
             exporting: false,
             export_done: Arc::new(Mutex::new(None)),
@@ -591,7 +684,7 @@ impl Default for Hair {
 
 impl Hair {
     fn want_key(&self) -> String {
-        format!("{:?}|{}|{:?}|{}|{}|{}|{:?}", self.selected, self.width_mm, self.colour, self.skin_colour && !self.skin.is_empty(), self.full_coat, self.density, self.hat.as_ref().map(|h| h.id))
+        format!("{:?}|{}|{:?}|{}|{}|{}|{:?}|{:?}", self.selected, self.width_mm, self.colour, self.skin_colour && !self.skin.is_empty(), self.full_coat, self.density, self.hat.as_ref().map(|h| h.id), self.rig.as_ref().map(|r| (r.verts.len(), r.joints.len())))
     }
     pub fn settled(&self) -> bool {
         !self.loading && !self.listing && !self.exporting && self.key == self.want_key()
@@ -741,6 +834,7 @@ impl ModelView {
             hair_head: None,
             hair_head_n: 0,
             ped_clip: PedClip::default(),
+            animal_clips: None,
             ped_pose: PedPose::default(),
             body_shape_shown: (0.0, 0.0),
             wheels_on: true,
@@ -866,6 +960,7 @@ impl ModelView {
         let (density, width_scale) = (self.hair.density.clamp(0.05, 1.0), self.hair.width_mm / 3.0);
         let note = self.hair.coat_note.clone();
         let (hat, under_hat) = (self.hair.hat.clone(), self.hair.under_hat.clone());
+        let rig = self.hair.rig.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<Vec<glb::Model>> {
@@ -919,6 +1014,9 @@ impl ModelView {
                     std::fs::write(&p, glb_bytes)?;
                     let mut gm = glb::load(&p, &dir)?;
                     gm.materials.iter_mut().for_each(|x| x.mr = Some([0.0, 0.85]));
+                    if let Some(r) = &rig {
+                        r.bind(&mut gm);
+                    }
                     out.push(gm);
                 }
                 *note.lock().unwrap() = if coat_on && stored > 0 { format!("coat: {drawn} of the {stored} stored strands drawn") } else { String::new() };
@@ -1244,7 +1342,7 @@ impl ModelView {
                 }
             }
         }
-        let Some(l) = self.loaded.as_ref().filter(|l| l.look.is_some() && !l.model.joints.is_empty()) else { return };
+        let Some(l) = self.loaded.as_ref().filter(|l| l.takes_clips()) else { return };
         let want = self.ped_clip.want.trim().to_string();
         let key = format!("{want}#{}#{}", l.model.joints.len(), l.model.joints[0].name);
         if want.is_empty() {
@@ -1257,9 +1355,18 @@ impl ModelView {
             let (game, work, slot, ctx2) = (PathBuf::from(&self.game), PathBuf::from(&self.work), self.ped_clip.pending.clone(), ctx.clone());
             std::thread::spawn(move || {
                 let r = (|| -> anyhow::Result<(glb::Anim, Vec<sixng_core::anim::ClipTrack>, String)> {
-                    let (dq, cq) = want.rsplit_once('/').ok_or_else(|| anyhow::anyhow!("write it as <dictionary>/<clip> (`sixng clips --name walk` lists dictionaries)"))?;
+                    // "<dictionary>/<clip>", or a dictionary alone: then its `move` or `idle` clip, else the first that binds an animation
+                    let (dq, cq) = want.rsplit_once('/').unwrap_or((want.as_str(), ""));
                     let (_, d) = sixng_core::anim::load_dictionary(&game, &work, dq)?;
-                    let c = d.clip(cq).ok_or_else(|| anyhow::anyhow!("no clip {cq:?} in {}; it has: {}", d.name, d.clips.iter().map(|c| c.short_name()).collect::<Vec<_>>().join(", ")))?;
+                    let c = if cq.is_empty() {
+                        let bound: Vec<&sixng_core::anim::Clip> = d.clips.iter().filter(|c| c.kind == 1 && !c.bindings.is_empty()).collect();
+                        ["move", "idle"].iter().find_map(|n| bound.iter().find(|c| c.short_name() == *n).copied()).or(bound.first().copied()).ok_or_else(|| anyhow::anyhow!("{} holds no clip with animation data that is decoded (its {} clip(s) bind none here)", d.name, d.clips.len()))?
+                    } else {
+                        d.clip(cq).ok_or_else(|| anyhow::anyhow!("no clip {cq:?} in {}; it has: {}", d.name, d.clips.iter().map(|c| c.short_name()).collect::<Vec<_>>().join(", ")))?
+                    };
+                    if c.bindings.is_empty() {
+                        anyhow::bail!("clip {} of {} binds no animation in this dictionary (not decoded yet); pick another clip", c.short_name(), d.name);
+                    }
                     let joints: Vec<sixng_core::gltf::Joint> = names.iter().map(|n| sixng_core::gltf::Joint { name: n.clone(), parent: None, bind: [0.0; 16], pose: None }).collect();
                     let (ch, stats) = sixng_core::outfit::clip_channels(&d, c, &joints);
                     // RAGE (Z-up) values to the viewer's Y-up, as the GLB export does
@@ -1320,6 +1427,9 @@ impl ModelView {
         self.cam.eye += moved - self.ped_clip.travel;
         self.ped_clip.travel = moved;
         self.ped_clip.root = root;
+        if std::env::var_os("SIXNG_DEBUG_RIG").is_some() && self.ped_clip.anim.is_some() {
+            eprintln!("[clip] pos {:.2} moved {moved:?} cam target {:?} fly {}", self.ped_clip.pos, self.cam.target, self.cam.fly);
+        }
     }
 
     /// Body shape for characters (weight, muscle), before a model is opened.
@@ -1373,6 +1483,69 @@ impl ModelView {
 
     /// Character panel: the outfit of the game's outfit list, the body shape
     /// and what the viewer filled in. Returns the query to reload with.
+    /// "Animation" for an animal: the clip dictionaries of its species to
+    /// pick from, and the same playback controls as a character has.
+    fn animal_clip_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(l) = self.loaded.as_ref().filter(|l| l.look.is_none() && l.takes_clips()) else { return };
+        let root = l.source.split_whitespace().next().unwrap_or("").rsplit([':', '#', '/']).find(|s| !s.is_empty()).unwrap_or("").to_ascii_lowercase();
+        if self.animal_clips.as_ref().is_none_or(|c| c.0 != root) {
+            // the species word of `crm_cat_feral_m_00` is `cat`; some dictionaries use two words (`bengal_tiger`)
+            let t: Vec<&str> = root.split('_').collect();
+            let words: Vec<String> = match t.as_slice() {
+                [_, a, b, ..] => vec![format!("{b}_{a}"), format!("{a}_{b}"), a.to_string()],
+                [_, a] => vec![a.to_string()],
+                _ => vec![],
+            };
+            // only the cached list: building it reads every clip dictionary (about a minute)
+            let cached = Path::new(&self.work).join("index").join(sixng_core::anim::DICT_CACHE).exists();
+            let all = if cached { sixng_core::anim::dictionaries(Path::new(&self.game), Path::new(&self.work)).unwrap_or_default() } else { Vec::new() };
+            let names = words
+                .iter()
+                .map(|w| all.iter().filter(|d| d.name.starts_with("gameplay@creatures@") && d.name.split('@').any(|p| p == w)).map(|d| d.name.clone()).collect::<Vec<_>>())
+                .find(|v| !v.is_empty())
+                .unwrap_or_default();
+            self.animal_clips = Some((root.clone(), names));
+        }
+        let names = self.animal_clips.as_ref().map(|c| c.1.clone()).unwrap_or_default();
+        egui::CollapsingHeader::new("Animation").default_open(true).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.ped_clip.want).hint_text("<dictionary>[/<clip>]").desired_width(250.0));
+                if ui.button("None").clicked() {
+                    self.ped_clip.want.clear();
+                    self.ped_clip.playing = false;
+                }
+            });
+            if names.is_empty() {
+                ui.label(egui::RichText::new("No clip dictionaries listed for this animal. The list comes from `sixng clips` (run it once; it reads anim.rpf for about a minute), by the species word of the animal's name.").weak().small());
+            } else {
+                // the part of the name after the species: `normal@walk@slow`
+                let tail = |n: &str| n.split('@').skip(5).collect::<Vec<_>>().join("@");
+                let current = self.ped_clip.want.split('/').next().unwrap_or("").to_string();
+                egui::ComboBox::from_id_salt("animal_clip_dict").selected_text(if names.contains(&current) { tail(&current) } else { format!("{} clip dictionaries", names.len()) }).width(260.0).show_ui(ui, |ui| {
+                    for n in &names {
+                        if ui.selectable_label(*n == current, tail(n)).on_hover_text(n).clicked() {
+                            self.ped_clip.want = n.clone();
+                            self.ped_clip.playing = true;
+                        }
+                    }
+                });
+            }
+            if self.ped_clip.anim.is_some() {
+                ui.horizontal(|ui| {
+                    if ui.button(if self.ped_clip.playing { "⏸" } else { "▶" }).clicked() {
+                        self.ped_clip.playing = !self.ped_clip.playing;
+                    }
+                    ui.add(egui::Slider::new(&mut self.ped_clip.pos, 0.0..=1.0).show_value(false));
+                    ui.checkbox(&mut self.ped_clip.in_place, "in place").on_hover_text("Leave out the clip's own movement over the ground (its mover tracks), so the animal stays where it is.");
+                });
+            }
+            if !self.ped_clip.status.is_empty() {
+                ui.label(egui::RichText::new(&self.ped_clip.status).weak().small());
+            }
+            ui.label(egui::RichText::new("A clip of anim.rpf on this animal's skeleton. A dictionary alone plays its move or idle clip; some dictionaries hold clips whose animation data is stored elsewhere and is not decoded. The fur is bound to the nearest skin and moves with the body.").weak().small());
+        });
+    }
+
     fn look_ui(&mut self, ui: &mut egui::Ui) -> Option<String> {
         let l = self.loaded.as_ref()?;
         let look = l.look.as_ref()?;
@@ -1822,6 +1995,10 @@ impl ModelView {
                 }
                 self.gpu = Some(g);
                 self.hair.on_loaded(&l.fur, &l.fur_skin, &l.source);
+                self.hair.rig = (l.look.is_none() && l.fur.is_some()).then(|| FurRig::of(&l.model)).flatten().map(Arc::new);
+                if std::env::var_os("SIXNG_DEBUG_RIG").is_some() {
+                    eprintln!("[rig] loaded: {} meshes, {} skinned, {} joints, fur rig {}, max joint index {:?}", l.model.meshes.len(), l.model.meshes.iter().filter(|m| m.skinned).count(), l.model.joints.len(), self.hair.rig.is_some(), l.model.meshes.iter().flat_map(|m| m.verts.iter().flat_map(|v| v.joints)).max());
+                }
                 if let Some(look) = &l.look {
                     self.hair.hat = look.hat.clone();
                     self.hair.under_hat = look.hair.iter().filter(|h| h.slot == "hair").flat_map(|h| h.grooms.iter().copied()).collect();
@@ -2828,7 +3005,7 @@ impl ModelView {
             playing.extend(self.clips.iter().zip(&self.clip_pos).filter(|(_, p)| **p > 0.0).map(|(a, p)| (a, *p)));
         }
         // a character's animation clip
-        if let (true, Some(a)) = (l.look.is_some(), &self.ped_clip.anim) {
+        if let (true, Some(a)) = (l.takes_clips(), &self.ped_clip.anim) {
             playing.push((a, self.ped_clip.pos));
         }
         let js: &[glb::Joint] = match playing.is_empty() {
@@ -2857,8 +3034,13 @@ impl ModelView {
                     }
                 }
                 // a character clip's movement over the ground, on the root joints
-                if l.look.is_some() && self.ped_clip.root != Mat4::IDENTITY {
-                    for j in v.iter_mut().filter(|j| j.parent.is_none()) {
+                if l.takes_clips() && self.ped_clip.root != Mat4::IDENTITY {
+                    if std::env::var_os("SIXNG_DEBUG_RIG").is_some() {
+                        eprintln!("[clip] joints {}: {:?}; animated joints {:?}", v.len(), v.iter().take(6).map(|j| (&j.name, j.parent)).collect::<Vec<_>>(), playing.iter().flat_map(|(a, _)| a.channels.iter().map(|c| c.joint)).filter(|j| *j < 4).collect::<std::collections::BTreeSet<_>>());
+                    }
+                    // a root has no parent, or names itself as its parent
+                    for (i, j) in v.iter_mut().enumerate().filter(|(i, j)| j.parent.is_none_or(|p| p == *i)) {
+                        let _ = i;
                         j.local = (self.ped_clip.root * Mat4::from_cols_array(&j.local)).to_cols_array();
                     }
                 }
@@ -3369,6 +3551,12 @@ impl ModelView {
         }
         self.update_hair(rs, &ctx);
         let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+        // an animal's fur is bound to its skin and takes the same joint matrices
+        if self.hair.rig.is_some() && !skin.is_empty() {
+            for g in &self.hair.gpu {
+                ren.set_joints(rs, g, &skin);
+            }
+        }
         // a character's hair, brows and beard ride on the head bone
         if let Some(l) = self.loaded.as_ref().filter(|l| l.look.is_some()) {
             let head = l.model.joints.iter().position(|j| j.name == "SKEL_Head").and_then(|i| skin.get(i)).copied().unwrap_or(Mat4::IDENTITY);
@@ -3836,6 +4024,7 @@ impl ModelView {
             self.hair_ui(ui);
             ui.separator();
         }
+        self.animal_clip_ui(ui);
         if let Some(q) = self.look_ui(ui).or_else(|| self.parts_ui(ui)).or_else(|| self.parts_request.take()) {
             self.keep_cam_once = true;
             let ctx = ui.ctx().clone();
@@ -4171,6 +4360,7 @@ fn load_parts(
     // per outfit part: its meshes, its joint list and the joint an attached
     // accessory was moved onto
     let mut rig_parts: Vec<(std::ops::Range<usize>, Vec<glb::Joint>, Option<usize>)> = Vec::new();
+    let mut named_parts: Vec<(std::ops::Range<usize>, Vec<(String, Option<usize>)>)> = Vec::new();
     let mut under_meshes: Vec<std::ops::Range<usize>> = Vec::new();
     let mut outer_meshes: Vec<std::ops::Range<usize>> = Vec::new();
     // Body shape: the skin and head are posed by the game's rig; clothes
@@ -4257,6 +4447,10 @@ fn load_parts(
                 }
                 if f.is_some() {
                     rig_parts.push((mesh0..mesh0 + m.meshes.len(), m.joints.iter().map(|j| glb::Joint { name: j.name.clone(), parent: j.parent, local: j.local, ibm: j.ibm }).collect(), attached));
+                } else {
+                    // an animal's part: its own joint list, to bind it to the root's skeleton by name
+                    // (empty for a part without bones, which then rides on the bone nearest to it)
+                    named_parts.push((mesh0..mesh0 + m.meshes.len(), m.joints.iter().map(|j| (j.name.clone(), j.parent)).collect()));
                 }
                 match f.map_or(0, |f| f.layer) {
                     1 => under_meshes.push(mesh0..mesh0 + m.meshes.len()),
@@ -4312,6 +4506,12 @@ fn load_parts(
         let hidden = hide_covered_skin(m, &under_meshes, &outer_meshes);
         if hidden > 0 {
             notes.push(format!("Layers: {hidden} triangles of the clothes worn under the jacket are hidden where the jacket covers them, so they do not show through it."));
+        }
+    }
+    if let (Some(m), true, false) = (&mut model, rig_parts.is_empty(), named_parts.is_empty()) {
+        let bound = rig_by_name(m, &named_parts);
+        if bound > 0 {
+            notes.push(format!("Rig: {bound} mesh(es) are bound to the skeleton by bone name, so a clip moves the animal."));
         }
     }
     if let (Some(m), false) = (&mut model, rig_parts.is_empty()) {
@@ -4610,6 +4810,72 @@ fn place_attached(m: &mut glb::Model) -> Option<usize> {
 /// helper bone goes to the nearest ancestor in the shared skeleton, and an
 /// attached accessory to the bone it was moved onto. Returns whether a
 /// skeleton was found.
+/// Bind the parts of an animal to the model's skeleton: every part comes
+/// with its own joint list, and a vertex joint is the model's joint of the
+/// same name (else of the nearest parent that has one, else the root).
+/// Weights are scaled to sum to 255. Returns the meshes bound.
+fn rig_by_name(m: &mut glb::Model, parts: &[(std::ops::Range<usize>, Vec<(String, Option<usize>)>)]) -> usize {
+    if m.joints.is_empty() {
+        return 0;
+    }
+    let by_name: HashMap<&str, usize> = m.joints.iter().enumerate().map(|(i, j)| (j.name.as_str(), i)).rev().collect();
+    let mut bound = 0;
+    for (range, pj) in parts.iter().filter(|p| !p.1.is_empty()) {
+        let map: Vec<u16> = (0..pj.len())
+            .map(|j| {
+                std::iter::successors(Some(j), |&x| pj[x].1.filter(|&p| p != x && p < pj.len())).take(64).find_map(|x| by_name.get(pj[x].0.as_str()).copied()).unwrap_or(0) as u16
+            })
+            .collect();
+        let maps: Vec<u16> = map;
+        for mi in range.clone() {
+            let Some(me) = m.meshes.get_mut(mi) else { continue };
+            for v in &mut me.verts {
+                let tot: u32 = v.weights.iter().map(|w| *w as u32).sum();
+                if tot == 0 {
+                    v.joints = [0; 4];
+                    v.weights = [255, 0, 0, 0];
+                    continue;
+                }
+                let mut w: [u32; 4] = std::array::from_fn(|k| v.weights[k] as u32 * 255 / tot);
+                w[0] += 255 - w.iter().sum::<u32>();
+                for k in 0..4 {
+                    v.joints[k] = if w[k] > 0 { maps.get(v.joints[k] as usize).copied().unwrap_or(0) } else { 0 };
+                    v.weights[k] = w[k] as u8;
+                }
+            }
+            me.skinned = true;
+            bound += 1;
+        }
+    }
+    // Parts without bones (eyes, teeth, tongue): each vertex rides on the
+    // strongest bone of the bound vertex nearest to its mesh's middle.
+    let skinned: Vec<([f32; 3], u16)> = m
+        .meshes
+        .iter()
+        .filter(|me| me.skinned)
+        .flat_map(|me| me.verts.iter().map(|v| (v.pos, v.joints[(0..4).max_by_key(|&k| v.weights[k]).unwrap_or(0)])))
+        .collect();
+    if skinned.is_empty() {
+        return bound;
+    }
+    for (range, _) in parts.iter().filter(|p| p.1.is_empty()) {
+        for mi in range.clone() {
+            let Some(me) = m.meshes.get_mut(mi).filter(|me| !me.verts.is_empty()) else { continue };
+            let n = me.verts.len() as f32;
+            let c = me.verts.iter().fold([0.0f32; 3], |a, v| [a[0] + v.pos[0] / n, a[1] + v.pos[1] / n, a[2] + v.pos[2] / n]);
+            let d = |p: &[f32; 3]| (p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2) + (p[2] - c[2]).powi(2);
+            let Some(j) = skinned.iter().min_by(|a, b| d(&a.0).total_cmp(&d(&b.0))).map(|x| x.1) else { continue };
+            for v in &mut me.verts {
+                v.joints = [j, 0, 0, 0];
+                v.weights = [255, 0, 0, 0];
+            }
+            me.skinned = true;
+            bound += 1;
+        }
+    }
+    bound
+}
+
 fn rig_character(m: &mut glb::Model, parts: &[(std::ops::Range<usize>, Vec<glb::Joint>, Option<usize>)], skin: &[std::ops::Range<usize>]) -> bool {
     use glam::Mat4;
     // the shared skeleton: the shortest full-size joint list, where the
