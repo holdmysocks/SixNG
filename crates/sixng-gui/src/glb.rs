@@ -33,6 +33,18 @@ pub struct Mesh {
     pub centre: [f32; 3],
 }
 
+/// Close-up fabric weave of a clothing material (see `Material::detail`).
+#[derive(Clone, Copy)]
+pub struct Detail {
+    /// Image of the tile's grey value (linear, tiling, with mips).
+    pub image: usize,
+    /// Scale and rotation (radians) of the second UV set.
+    pub scale: f32,
+    pub rot: f32,
+    /// The tile's mean grey value: what the baked colour was made with.
+    pub mean: f32,
+}
+
 /// One texture slot of a material, as written in the material extras.
 #[derive(Clone)]
 pub struct Slot {
@@ -66,6 +78,11 @@ pub struct Material {
     /// Ped clothing whose base texture is the grey shade map (`ped_tint` in
     /// the extras): the viewer colours it with the outfit's tint.
     pub ped_shade: bool,
+    /// Clothing: the tiling fabric texture of the garment's main
+    /// sub-material, drawn by the shader as close-up weave over the baked
+    /// colour (`fabric::bake` keeps that sub-material's weave out of the
+    /// bake and marks its texels in the base texture's alpha).
+    pub detail: Option<Detail>,
     /// Vehicle parts coloured per vertex (COLOR_0; alpha 254 = the primary
     /// body paint, other values = metalness in four steps x 50 + roughness in 50 steps).
     pub parts: bool,
@@ -800,6 +817,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             mr,
             tint_mask: ex["classification"]["tint_mask"] == true,
             ped_shade: ex["ped_tint"].is_object(),
+            detail: None,
             parts: ex["classification"]["stand_in"] == "parts",
             occlusion_only,
             slots,
@@ -1060,6 +1078,9 @@ pub fn merge(into: &mut Model, other: Model) {
             if let Some(i) = x {
                 *i += img0;
             }
+        }
+        if let Some(d) = &mut m.detail {
+            d.image += img0;
         }
         into.materials.push(m);
     }

@@ -57,6 +57,17 @@ impl Tex {
         ((at(0, 0) * (1.0 - fx) + at(1, 0) * fx) * (1.0 - fy) + (at(0, 1) * (1.0 - fx) + at(1, 1) * fx) * fy) / 255.0
     }
 
+    /// Mean value 0..1 (the last mip).
+    pub fn mean(&self) -> f32 {
+        self.mips.last().and_then(|l| l.2.first()).map_or(0.5, |&v| v as f32 / 255.0)
+    }
+
+    /// The top level as grey RGBA8, for a GPU texture.
+    pub fn rgba(&self) -> (u32, u32, Vec<u8>) {
+        let (w, h, p) = &self.mips[0];
+        (*w, *h, p.iter().flat_map(|&v| [v, v, v, 255]).collect())
+    }
+
     /// Value 0..1 at (u, v), repeating; `foot` = how much of the texture
     /// (in u, v units) one output texel covers.
     fn sample(&self, u: f32, v: f32, foot: f32) -> f32 {
@@ -185,16 +196,24 @@ fn srgb(x: f32) -> f32 {
 }
 
 impl Fabric {
+    /// The tile of sub-material `s` for the shader's close-up weave: its
+    /// texture, UV scale and rotation (radians).
+    pub fn detail(&self, s: usize) -> Option<(&Tex, f32, f32)> {
+        let sub = self.subs.get(s)?;
+        Some((sub.tile.as_deref()?, sub.scale, sub.rot.0.atan2(sub.rot.1)))
+    }
+
     /// Colour (linear) of sub-material `s` at tiling UV `uv`; `foot` = the
-    /// tiling-UV distance one output texel covers.
-    fn colour(&self, s: usize, uv: [f32; 2], foot: f32) -> Option<[f32; 3]> {
+    /// tiling-UV distance one output texel covers. `flat` takes the tile at
+    /// its mean value (the shader draws its weave).
+    fn colour(&self, s: usize, uv: [f32; 2], foot: f32, flat: bool) -> Option<[f32; 3]> {
         let sub = self.subs.get(s).filter(|x| x.stops.is_some()).or_else(|| self.subs.iter().find(|x| x.stops.is_some()))?;
         let stops = sub.stops.as_ref()?;
         let turn = |p: [f32; 2], (sn, cs): (f32, f32)| [p[0] * cs - p[1] * sn, p[0] * sn + p[1] * cs];
         let g = match &sub.tile {
             Some(t) => {
                 let p = turn([uv[0] * sub.scale, uv[1] * sub.scale], sub.rot);
-                t.sample(p[0], p[1], foot * sub.scale.abs())
+                if flat { t.mean() } else { t.sample(p[0], p[1], foot * sub.scale.abs()) }
             }
             None => 0.5,
         };
@@ -216,11 +235,16 @@ impl Fabric {
 /// on plain cloth), which stays multiplied in. `ids` gives the sub-material
 /// per texel at a size (the garment's `materialid` texture); without it the
 /// sub-material is the part number in the raw vertex colour's green byte.
-/// False (and nothing changed) when no triangle maps into the texture.
-pub fn bake(m: &mut glb::Model, mats: &[usize], image: usize, fab: &Fabric, ids: &dyn Fn(u32, u32) -> Option<Vec<u8>>) -> bool {
+/// None (and nothing changed) when no triangle maps into the texture.
+///
+/// With `detail` the weave of the garment's main sub-material (the one with
+/// a tile that covers most texels) is left to the shader: its texels are
+/// baked at the tile's mean value and marked with alpha 255, all others get
+/// alpha 0, and the sub-material is returned.
+pub fn bake(m: &mut glb::Model, mats: &[usize], image: usize, fab: &Fabric, ids: &dyn Fn(u32, u32) -> Option<Vec<u8>>, detail: bool) -> Option<Option<usize>> {
     let (sw, sh) = (m.images[image].mips[0].0, m.images[image].mips[0].1);
     if sw == 0 || sh == 0 {
-        return false;
+        return None;
     }
     // the weave wants more texels than most shade maps have
     let up = (2048 / sw.max(sh)).max(1);
@@ -271,7 +295,7 @@ pub fn bake(m: &mut glb::Model, mats: &[usize], image: usize, fab: &Fabric, ids:
         }
     }
     if sub.iter().all(|&s| s == 255) {
-        return false;
+        return None;
     }
     // grow the islands a few texels into the gutters (filtering and mips reach there)
     for _ in 0..4 {
@@ -292,26 +316,36 @@ pub fn bake(m: &mut glb::Model, mats: &[usize], image: usize, fab: &Fabric, ids:
             }
         }
     }
+    let sub_at = |k: usize| match (&ids, sub[k]) {
+        (Some(v), _) => v[k] as usize,
+        (None, 255) => 0,
+        (None, s) => s as usize,
+    };
+    // the sub-material whose weave the shader draws
+    let main = detail
+        .then(|| {
+            let mut count = [0usize; 8];
+            (0..n).filter(|&k| sub[k] != 255).for_each(|k| count[sub_at(k).min(7)] += 1);
+            (0..8).filter(|&s| count[s] > 0 && fab.detail(s).is_some()).max_by_key(|&s| (count[s], 8 - s))
+        })
+        .flatten();
     let shade = &m.images[image].mips[0].2;
     let mut px = vec![0u8; n * 4];
     use rayon::prelude::*;
     px.par_chunks_exact_mut(4 * w as usize).enumerate().for_each(|(y, row)| {
         for x in 0..w as usize {
             let k = y * w as usize + x;
-            let s = match (&ids, sub[k]) {
-                (Some(v), _) => v[k] as usize,
-                (None, 255) => 0,
-                (None, s) => s as usize,
-            };
+            let s = sub_at(k);
+            let flat = main == Some(s);
             // outside every triangle: the plain colour (middle of the gradient, no layers)
-            let c = if sub[k] == 255 { fab.subs.get(s).and_then(|x| x.stops).or(fab.subs.iter().find_map(|x| x.stops)).map(|st| st[1]) } else { fab.colour(s, uv[k], foot[k]) }.unwrap_or([0.5; 3]);
+            let c = if sub[k] == 255 { fab.subs.get(s).and_then(|x| x.stops).or(fab.subs.iter().find_map(|x| x.stops)).map(|st| st[1]) } else { fab.colour(s, uv[k], foot[k], flat) }.unwrap_or([0.5; 3]);
             let g = shade[((y as u32 / up) * sw + x as u32 / up) as usize * 4 + 1] as f32 / 125.0;
             for i in 0..3 {
                 row[x * 4 + i] = (srgb(c[i]) * g * 255.0).min(255.0) as u8;
             }
-            row[x * 4 + 3] = 255;
+            row[x * 4 + 3] = if main.is_none() || (flat && sub[k] != 255) { 255 } else { 0 };
         }
     });
     m.images[image].mips = glb::mip_chain(w, h, px);
-    true
+    Some(main)
 }

@@ -4047,8 +4047,20 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
             if let Some(fab) = f.preset.and_then(|p| crate::fabric::fabric(game, p)) {
                 let mats: Vec<usize> = (0..m.materials.len()).filter(|&k| m.materials[k].base == Some(i)).collect();
                 let mat = m.materials[mi].clone();
-                if crate::fabric::bake(m, &mats, i, &fab, &|w, h| sub_material_map(&mat, &[cache, shaped.as_path()], w, h)) {
-                    m.images[i].key = format!("{}#fabric{:08x}", m.images[i].key, f.preset.unwrap_or(0));
+                // The wgpu shader draws the main sub-material's weave per
+                // pixel on opaque garments (alpha carries its texels); the
+                // Metal renderer has no such path and keeps the baked weave.
+                let detail = cfg!(not(target_os = "macos")) && std::env::var_os("SIXNG_NO_FABRIC_DETAIL").is_none() && mats.iter().all(|&k| m.materials[k].alpha_mode == "OPAQUE");
+                if let Some(main) = crate::fabric::bake(m, &mats, i, &fab, &|w, h| sub_material_map(&mat, &[cache, shaped.as_path()], w, h), detail) {
+                    m.images[i].key = format!("{}#fabric{:08x}{}", m.images[i].key, f.preset.unwrap_or(0), if main.is_some() { "d" } else { "" });
+                    if let Some((tile, scale, rot)) = main.and_then(|s| fab.detail(s)) {
+                        let (w, h, px) = tile.rgba();
+                        m.images.push(glb::Image { key: format!("{}#tile", m.images[i].key), mips: glb::mip_chain(w, h, px), srgb: false, bc: None });
+                        let d = glb::Detail { image: m.images.len() - 1, scale, rot, mean: tile.mean() };
+                        for &k in &mats {
+                            m.materials[k].detail = Some(d);
+                        }
+                    }
                     continue;
                 }
             }

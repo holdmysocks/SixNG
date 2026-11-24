@@ -22,6 +22,7 @@ struct Frame {
 struct Mat {
     base: vec4<f32>,
     flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask
+    tile: vec4<f32>,      // fabric detail tile: x UV scale, y rotation, z mean grey value, w bound
 };
 
 @group(0) @binding(0) var<uniform> F: Frame;
@@ -33,6 +34,7 @@ struct Mat {
 @group(1) @binding(2) var t_nrm: texture_2d<f32>;
 @group(1) @binding(3) var t_pk: texture_2d<f32>;
 @group(1) @binding(4) var t_em: texture_2d<f32>;
+@group(1) @binding(5) var t_tile: texture_2d<f32>;
 
 struct VIn {
     @location(0) pos: vec3<f32>,
@@ -148,15 +150,28 @@ fn gap_tint(g: u32) -> vec3<f32> {
     return vec3(0.15, 0.75, 0.25);
 }
 
+// Brightness the clothing gradient map gives a colour at the tile's grey
+// value g, relative to the colour itself: the dark half is exact (0.1 x the
+// colour at g = 0, the colour at 0.5); the light half, which also
+// desaturates in the game, is kept as a gentle brightening.
+fn weave_gain(g: f32) -> f32 {
+    if (g < 0.5) { return 0.1 + 1.8 * g; }
+    return 1.0 + 0.5 * (g - 0.5);
+}
+
 @fragment
 fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let has = M.flags.x;
     let cls = M.flags.y;
     var base = M.base;
+    // clothing with a fabric detail tile: the base texture's alpha marks the
+    // texels of the sub-material the tile belongs to
+    var weave_w = 0.0;
     if ((has & 1u) != 0u) {
         var bt = textureSample(t_base, samp, i.uv0);
         // tint mask (animal coats): only the green channel (shading) is a picture
         if ((M.flags.w & 512u) != 0u) { bt = vec4(vec3(bt.g), 1.0); }
+        if (M.tile.w > 0.5) { weave_w = bt.a; bt.a = 1.0; }
         base = base * bt;
     }
     if (M.flags.z == 1u && base.a < 0.5) {
@@ -196,6 +211,17 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     var albedo = base.rgb;
     // the model's tint palette entry multiplies the base colour
     if (F.misc3.x > 0.5) { albedo = albedo * i.tint.rgb; }
+    // close-up fabric weave: the baked colour was made at the tile's mean
+    // grey value; the tile itself, sampled per pixel on the second UV set,
+    // moves it to the value at this pixel (its mips bring it back to the
+    // mean with distance)
+    if (M.tile.w > 0.5) {
+        let c = cos(M.tile.y);
+        let s = sin(M.tile.y);
+        let p = i.uv1 * M.tile.x;
+        let g = textureSample(t_tile, samp, vec2(p.x * c - p.y * s, p.x * s + p.y * c)).g;
+        albedo = albedo * mix(1.0, weave_gain(g) / weave_gain(M.tile.z), weave_w);
+    }
     var alpha = base.a;
     var emissive = vec3(0.0);
     var pearl = vec3(0.0);
