@@ -172,5 +172,16 @@ Corresponding FFI wrappers and tests are included in that fork. The published
 crates remain the versioned dependency baseline; no binding sources are
 vendored in this repository.
 
+## gta6-namehash
+
+Thanks to the gta6-namehash contributors for their name dictionary
+(https://github.com/tarekmania/gta6-namehash), which `sixng names --namehash`
+can import as a last-resort source of names. The dictionary is distributed
+under the MIT License; no dictionary data is included in this repository.
+
+```
+Copyright (c) 2026 the gta6-namehash contributors
+```
+
 Rust crate dependencies keep their own licences; see `Cargo.lock` and each
 crate's metadata (`cargo license` lists them).

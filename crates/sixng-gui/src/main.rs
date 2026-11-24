@@ -15,6 +15,7 @@ mod bc;
 mod cells;
 mod fabric;
 mod glb;
+mod livery;
 mod map2d;
 mod map3d;
 mod map_cells;
@@ -1701,6 +1702,8 @@ impl App {
         if let Some(v) = three("pose-spine") {
             m.ped_pose.spine = v;
         }
+        m.livery.open_once = c.get("livery").map(PathBuf::from);
+        m.livery.info_once = c.get("livery-info").map(PathBuf::from);
         m.show_skeleton = c.has("skeleton");
         m.show_normals = c.has("normals");
         m.decal_bias = !c.has("no-decal-bias");

@@ -377,6 +377,8 @@ pub struct ModelView {
     /// 128) and the look whose rows the model's part materials carry.
     part_palette: Option<(PathBuf, Arc<Vec<u8>>)>,
     part_ramp_done: Option<(PathBuf, usize)>,
+    /// Stickers the user placed on the loaded vehicle (custom liveries).
+    pub livery: crate::livery::State,
     /// The part colours the uploaded wheels were coloured with.
     wheel_look: Option<Arc<Vec<[u8; 4]>>>,
     /// Vehicle lamps that are on.
@@ -701,6 +703,7 @@ impl ModelView {
             random_parts_seed: 0,
             part_palette: None,
             part_ramp_done: None,
+            livery: Default::default(),
             part_look_table: None,
             wheel_look: None,
             lamps: Lamps::default(),
@@ -1931,10 +1934,10 @@ impl ModelView {
             // token value (0.05 to 0.08); their wheel bones mark the skids
             // (an electric scooter has the same token wheelScale and no rim,
             // but its wheels have collision discs)
-            self.veh_no_wheels = !v.configs.is_empty()
-                && v.configs.iter().all(|c| c.rim.is_none())
-                && v.wheel_scale.is_some_and(|w| w < 0.1)
-                && self.discs().iter().all(|d| d.is_none());
+            // boats: an airboat has wheel bones and an ordinary wheelScale,
+            // but it is a boat
+            self.veh_no_wheels = crate::vehicle_db::is_boat(v.vtype)
+                || (!v.configs.is_empty() && v.configs.iter().all(|c| c.rim.is_none()) && v.wheel_scale.is_some_and(|w| w < 0.1) && self.discs().iter().all(|d| d.is_none()));
             self.veh_cfg = None;
             if !v.configs.is_empty() {
                 self.apply_config(v, self.cfg_request.filter(|i| *i < v.configs.len()).unwrap_or(0));
@@ -2480,6 +2483,19 @@ impl ModelView {
         ren.ensure_edges(rs, &mut g, &l.model);
         self.gpu = Some(g);
         self.apply_paint(rs);
+    }
+
+    /// Keep the loaded vehicle's stickers (custom liveries) on the GPU.
+    fn sync_livery(&mut self, rs: &egui_wgpu::RenderState) {
+        let cache = self.cache_dir();
+        let (Some(l), Some(g)) = (&self.loaded, self.gpu.as_mut()) else { return };
+        if !l.info["part_colours"].is_object() && !l.info["wheel_mounts"].as_array().is_some_and(|a| !a.is_empty()) {
+            return;
+        }
+        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+        let parts: Vec<String> = l.info["assembled_from"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
+        let key = crate::livery::vehicle_key(&crate::vehicle_db::model_key(&l.source));
+        self.livery.sync(rs, ren, g, &l.model, &key, &parts, Path::new(&self.game), Path::new(&self.work), &cache);
     }
 
     fn update_wheels(&mut self, rs: &egui_wgpu::RenderState, ctx: &egui::Context) {
@@ -3256,6 +3272,7 @@ impl ModelView {
         let px = [(rect.width() * ppp) as u32, (rect.height() * ppp) as u32];
         self.size = px;
         self.update_wheels(rs, &ctx);
+        self.sync_livery(rs);
         if self.rotor_speed > 0.0 && self.air.iter().any(|p| p.kind == AirKind::Spin) {
             // slow enough to see the blades below half speed; the blurred
             // set turns slowly, as a blur does
@@ -4594,6 +4611,10 @@ fn rig_character(m: &mut glb::Model, parts: &[(std::ops::Range<usize>, Vec<glb::
     let mut helper: Vec<(usize, usize)> = Vec::new();
     for (range, pj, attached) in parts {
         let same = pj.len() >= n && (0..n).all(|i| pj[i].name == joints[i].name);
+        if std::env::var_os("SIXNG_DEBUG_RIG").is_some() {
+            let first = (0..n.min(pj.len())).find(|&i| pj[i].name != joints[i].name);
+            eprintln!("[rig] meshes {range:?}: {} joints (shared {n}), same {same}, first difference {:?}, attached {attached:?}, mesh {:?}", pj.len(), first.map(|i| (i, &pj[i].name, &joints[i].name)), m.meshes.get(range.start).map(|x| (&x.name, x.skinned, x.verts.len())));
+        }
         if !same {
             continue;
         }
@@ -4609,6 +4630,26 @@ fn rig_character(m: &mut glb::Model, parts: &[(std::ops::Range<usize>, Vec<glb::
             }
             j.min(n - 1) as u16
         };
+        if std::env::var_os("SIXNG_DEBUG_RIG").is_some() {
+            let mut seen = std::collections::BTreeSet::new();
+            for me in range.clone().filter_map(|mi| m.meshes.get(mi)) {
+                for v in &me.verts {
+                    for k in 0..4 {
+                        if v.weights[k] > 0 && v.joints[k] as usize >= n {
+                            seen.insert(v.joints[k] as usize);
+                        }
+                    }
+                }
+            }
+            for j in seen.iter().take(12) {
+                let chain: Vec<String> = std::iter::successors(Some(*j), |&x| pj.get(x).and_then(|q| q.parent).filter(|&p| p != x)).take(6).map(|x| format!("{}#{x}", pj[x].name)).collect();
+                eprintln!("[rig]   own joint {} -> {} | chain {chain:?}", pj[*j].name, joints[up(*j) as usize].name);
+            }
+        }
+        // The face rig's own bones (eyeballs, irises, tongue: `FB_...`,
+        // `FACIAL_...`) hang from the head, and their parts must stay with
+        // it; the nearest body skin under an eye is the neck.
+        let face = |j: usize| std::iter::successors(Some(j), |&x| pj.get(x).and_then(|q| q.parent).filter(|&p| p != x && x >= n)).take(64).any(|x| pj.get(x).is_some_and(|q| q.name.starts_with("FB_") || q.name.starts_with("FACIAL_")));
         let fixed = attached.map(|a| up(a));
         for mi in range.clone() {
             let Some(me) = m.meshes.get_mut(mi) else { continue };
@@ -4626,7 +4667,8 @@ fn rig_character(m: &mut glb::Model, parts: &[(std::ops::Range<usize>, Vec<glb::
                     continue;
                 }
                 let own: u32 = (0..4).filter(|&k| v.joints[k] as usize >= n).map(|k| v.weights[k] as u32).sum();
-                if own * 2 >= tot {
+                let on_face: u32 = (0..4).filter(|&k| v.joints[k] as usize >= n && face(v.joints[k] as usize)).map(|k| v.weights[k] as u32).sum();
+                if own * 2 >= tot && on_face * 2 < own {
                     helper.push((mi, vi));
                 }
                 let mut w: [u32; 4] = std::array::from_fn(|k| v.weights[k] as u32 * 255 / tot);

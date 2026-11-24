@@ -115,6 +115,18 @@ struct Info {
     wheel_scale_rear: Option<f32>,
     #[serde(rename = "steerWheelMult")]
     steer_wheel_mult: Option<f32>,
+    /// The vehicle type, an enum value written as `{tag: n, ...}`.
+    #[serde(rename = "type", default)]
+    vtype: Option<serde_json::Value>,
+}
+
+/// Vehicle types (model info `type`) that are boats: 9 (38 models: speed
+/// boats, pontoons, the airboat ...) and 10 (the kayak). Their wheel bones,
+/// where they have any, are not wheels. The other values seen: 0 cars and
+/// trucks, 1 planes, 2 quads and small carts, 5 helicopters, 7 motorbikes,
+/// 8 bicycles, 12 and 13 rail vehicles.
+pub fn is_boat(vtype: Option<u32>) -> bool {
+    matches!(vtype, Some(9) | Some(10))
 }
 
 #[derive(Deserialize)]
@@ -227,6 +239,8 @@ pub struct Config {
 pub struct Vehicle {
     pub wheel_scale: Option<f32>,
     pub wheel_scale_rear: Option<f32>,
+    /// The vehicle type (model info `type`), see `is_boat`.
+    pub vtype: Option<u32>,
     /// `steerWheelMult` of the model info.
     pub steer_wheel_mult: Option<f32>,
     /// `fSteeringLock` of the handling record (radians).
@@ -442,15 +456,16 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
             Some(mk) if !n.to_lowercase().starts_with(&mk.to_lowercase()) => format!("{mk} {n}"),
             _ => n.clone(),
         });
-        let (ws, wr, sm) = v
+        let (ws, wr, sm, vtype) = v
             .model_info
-            .map(|i| (i.wheel_scale, i.wheel_scale_rear, i.steer_wheel_mult))
-            .unwrap_or((None, None, None));
+            .map(|i| (i.wheel_scale, i.wheel_scale_rear, i.steer_wheel_mult, i.vtype.and_then(|t| t["tag"].as_u64().or_else(|| t.as_u64())).map(|t| t as u32)))
+            .unwrap_or((None, None, None, None));
         m.insert(
             name.to_ascii_lowercase(),
             Vehicle {
                 wheel_scale: ws,
                 wheel_scale_rear: wr,
+                vtype,
                 steer_wheel_mult: sm,
                 steer_lock: v.steering_lock,
                 lights: v.lights.map(|l| {

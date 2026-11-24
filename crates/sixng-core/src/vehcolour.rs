@@ -60,7 +60,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// Version of what an export writes for part colours (model.json
 /// `part_colours_version`); the model viewer exports older vehicles again.
-pub const EXPORT_VERSION: u32 = 20;
+/// 21: the second colour stream (`_COLOR1`, sticker zones) is in the GLB.
+pub const EXPORT_VERSION: u32 = 21;
 /// Layout version of `<work>/index/vehicle_parts.json`.
 pub const FORMAT: u32 = 18;
 
