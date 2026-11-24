@@ -17,16 +17,13 @@ mod macos {
     use metal_rust::foundation::{OperatingSystemVersion, ProcessInfo};
     use metal_rust::metal::{Device, GPUFamily, PixelFormat, ResidencySet};
     use metal_rust::quartz_core::Layer;
-    use objc2::msg_send;
-    use objc2::runtime::AnyObject;
-    use objc2::sel;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use winit::application::ApplicationHandler;
     use winit::dpi::PhysicalSize;
     use winit::event::{StartCause, WindowEvent};
     use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use winit::raw_window_handle::HasWindowHandle;
     use winit::window::{Window, WindowId};
 
     fn is_macos_26_or_later(version: &OperatingSystemVersion) -> bool {
@@ -79,28 +76,7 @@ mod macos {
             layer.set_maximum_drawable_count(3)?;
             layer.set_display_sync_enabled(true);
             let handle = window.window_handle()?.as_raw();
-            let RawWindowHandle::AppKit(appkit) = handle else {
-                bail!("the Metal 4 window example requires an AppKit window");
-            };
-            let view = appkit.ns_view.as_ptr().cast::<AnyObject>();
-            let metal_layer = layer.as_ptr().as_ptr().cast::<AnyObject>();
-            // SAFETY: winit supplies a live NSView for this window; NSObject
-            // implements respondsToSelector: with the declared ABI.
-            let supports_layer_backing: bool =
-                unsafe { msg_send![&*view, respondsToSelector: sel!(setWantsLayer:)] };
-            // SAFETY: same live NSView and Objective-C selector ABI as above.
-            let supports_layer_assignment: bool =
-                unsafe { msg_send![&*view, respondsToSelector: sel!(setLayer:)] };
-            if !supports_layer_backing || !supports_layer_assignment {
-                bail!("AppKit NSView does not support installing a CAMetalLayer");
-            }
-            // SAFETY: winit supplies a live AppKit NSView owned by this window,
-            // Renderer is initialized on the main thread, and CAMetalLayer is
-            // retained by both this wrapper and the view after setLayer:.
-            unsafe {
-                let _: () = msg_send![&*view, setWantsLayer: true];
-                let _: () = msg_send![&*view, setLayer: &*metal_layer];
-            }
+            layer.attach_to_window(handle)?;
 
             let size = window.inner_size();
             layer.set_drawable_size(size.width as f64, size.height as f64)?;
