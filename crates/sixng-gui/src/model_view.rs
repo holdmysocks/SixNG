@@ -403,6 +403,9 @@ pub struct ModelView {
     /// `--fit-parts <hex,hex>`: part options (archive offsets) to fit once
     /// after the load, in place of the configuration's.
     pub fit_parts_once: Option<String>,
+    /// Struts and rods between a hinged panel and the body: (bone, the
+    /// bone it aims at).
+    aims: Vec<(usize, usize)>,
     /// Brake disc and caliper models at the wheels.
     brakes: Vec<(bool, GpuModel)>,
     brake_pending: Arc<Mutex<Option<Vec<(bool, Loaded)>>>>,
@@ -697,6 +700,7 @@ impl ModelView {
             boot_open: 0.0,
             hinges: HashMap::new(),
             fit_parts_once: None,
+            aims: Vec::new(),
             brakes: Vec::new(),
             brake_pending: Arc::new(Mutex::new(None)),
             brake_key: String::new(),
@@ -2433,6 +2437,7 @@ impl ModelView {
                 self.clip_pos = vec![self.clip_pos_all; all.len()];
                 self.clips = all;
                 self.hinges = find_hinges(&l.model);
+                self.aims = find_aims(&l.model);
                 self.steer_wheel = find_steering_wheel(&l.model);
                 self.window_movers = find_window_movers(&l.model);
                 self.air = find_air_parts(&l.model);
@@ -2837,6 +2842,36 @@ impl ModelView {
                 let turn = Mat4::from_quat(qw.inverse() * r * qw);
                 let m = swing.get(&i).map_or(turn, |m| *m * turn);
                 swing.insert(i, m);
+            }
+        }
+        // Gas struts and stay rods of a bonnet, boot or door: each half is
+        // a bone on one side (panel or body) with a target bone on the
+        // other, and turns about its own mount to keep aiming at it. With
+        // the panel swung, the half is turned from where its target was to
+        // where it is now.
+        if !self.aims.is_empty() && !swing.is_empty() {
+            let pose = |i: usize, swing: &HashMap<usize, Mat4>| -> Mat4 {
+                let mut chain = Vec::new();
+                let mut k = Some(i);
+                while let Some(j) = k.filter(|_| chain.len() < 64) {
+                    chain.push(j);
+                    k = js[j].parent.filter(|p| *p != j);
+                }
+                chain.iter().rev().fold(Mat4::IDENTITY, |m, j| m * Mat4::from_cols_array(&js[*j].local) * swing.get(j).copied().unwrap_or(Mat4::IDENTITY))
+            };
+            let none = HashMap::new();
+            let turns: Vec<(usize, Mat4)> = self
+                .aims
+                .iter()
+                .filter_map(|&(j, t)| {
+                    let was = pose(j, &none).inverse().transform_point3(pose(t, &none).w_axis.truncate());
+                    let now = pose(j, &swing).inverse().transform_point3(pose(t, &swing).w_axis.truncate());
+                    (was.length() > 1e-4 && now.length() > 1e-4 && was.normalize().dot(now.normalize()) < 0.999_999).then(|| (j, Mat4::from_quat(Quat::from_rotation_arc(was.normalize(), now.normalize()))))
+                })
+                .collect();
+            for (j, m) in turns {
+                let m = swing.get(&j).map_or(m, |s| *s * m);
+                swing.insert(j, m);
             }
         }
         let mut global: Vec<Option<Mat4>> = vec![None; js.len()];
@@ -5715,6 +5750,44 @@ fn find_hinges(model: &glb::Model) -> HashMap<usize, (u8, Vec3, f32)> {
                     (k, Vec3::X, if d.z > 0.0 { -1.0 } else { 1.0 })
                 },
             ))
+        })
+        .collect()
+}
+
+/// Struts and rods that span a hinged panel and the body: a bone named
+/// `strut_male_<x>` / `strut_female_<x>` with a `strut_male_target_<x>` /
+/// `strut_female_target_<x>` bone, or `<x>_lookat<y>` with `<x>_target<y>`,
+/// where one of the two hangs from a door, the bonnet or the boot and the
+/// other does not hang from the same panel.
+fn find_aims(model: &glb::Model) -> Vec<(usize, usize)> {
+    let names: Vec<String> = model.joints.iter().map(|j| j.name.to_ascii_lowercase()).collect();
+    let by_name: HashMap<&str, usize> = names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+    let panel = |n: &str| matches!(n, "door_dside_f" | "door_dside_r" | "door_pside_f" | "door_pside_r" | "bonnet" | "boot");
+    // the panel a joint hangs from
+    let owner = |i: usize| {
+        let (mut k, mut depth) = (Some(i), 0);
+        while let Some(j) = k {
+            if panel(&names[j]) {
+                return Some(j);
+            }
+            depth += 1;
+            k = model.joints[j].parent.filter(|p| *p != j && depth < 64);
+        }
+        None
+    };
+    names
+        .iter()
+        .enumerate()
+        .filter_map(|(i, n)| {
+            let target = if n.contains("_lookat") {
+                n.replacen("_lookat", "_target", 1)
+            } else if n.starts_with("strut_") && !n.contains("target") && !n.contains("mesh") {
+                if n.contains("_female") { n.replacen("_female", "_female_target", 1) } else if n.contains("_male") { n.replacen("_male", "_male_target", 1) } else { return None }
+            } else {
+                return None;
+            };
+            let t = *by_name.get(target.as_str())?;
+            (owner(i) != owner(t)).then_some((i, t))
         })
         .collect()
 }

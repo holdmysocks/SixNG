@@ -33,6 +33,27 @@
 //!   index is its slot in the material's texture list, and a sampler's `b`
 //!   is the distance from its record to its name in the table's name table.
 //!
+//! The archive's one compressed entry is a pipeline cache (magic
+//! `PS\0\x09`): a 0x80-byte header with a version string at 0x24 and six
+//! `u32` counts at 0x50 (graphics pipelines, compute pipelines, metadata
+//! blobs, code blobs, metadata bytes, code bytes); graphics pipeline
+//! records of 0x70 bytes (seven `(u32 code, u32 metadata)` pairs from 0x38,
+//! `ffffffff` = none); compute pipeline records of 0x18 bytes (code at
+//! 0x10, metadata at 0x14); a metadata directory and a code directory of
+//! `(u32 offset, u32 size)`; the metadata area; the code area. A stage's
+//! metadata blob is a 16- or 24-byte header and 32-byte records: `0x41`
+//! (where the code finds a resource; not decoded further), `0x42` (a
+//! resource the code uses: `u8 access` at 8 (1 read, 2 write), `u8 type`
+//! at 10, `u32 register` at 12, `u32 space` at 16) and one `0x43` with the
+//! 16-byte digest that is also bytes 4..20 of the compiled program's `HASH`
+//! chunk. That digest joins a pipeline stage to a program record.
+//!
+//! A read record's (space, register) is the declared resource with flags
+//! 0x40 = space 1, 0x80 = space 2, else space 0, and register = index, plus
+//! 256 when the kind has bit 0x80. This holds for every read record of
+//! every joined stage (333,965). Write records use another numbering that
+//! was not worked out.
+//!
 //! Effect records have no length field that was understood, so the next
 //! record is found by trying each position: its header must parse with
 //! program numbers in range, and the bytes before it must be a name table
@@ -80,6 +101,19 @@ impl Var {
     /// 0x40 and 0x02 seen on shared resources (meaning not pinned).
     pub fn flags(&self) -> u8 {
         (self.a >> 8) as u8
+    }
+    /// Register space of a resource in the compiled code: 2 for the
+    /// material's (flag 0x80), 1 for flag 0x40, else 0.
+    pub fn space(&self) -> u32 {
+        match self.flags() {
+            f if f & 0x80 != 0 => 2,
+            f if f & 0x40 != 0 => 1,
+            _ => 0,
+        }
+    }
+    /// Register of a resource in the compiled code's read records.
+    pub fn register(&self) -> u32 {
+        self.index as u32 + if self.kind & 0x80 != 0 { 256 } else { 0 }
     }
     /// A material texture of an effect table: (slot in the material's
     /// texture list, is an array).
@@ -285,6 +319,153 @@ pub fn read(b: &[u8]) -> Result<Shaders> {
     Ok(out)
 }
 
+impl Program {
+    /// The 16-byte digest of the compiled program (bytes 4..20 of its
+    /// `HASH` chunk), which the pipeline cache names a stage by. `file` is
+    /// the bytes `read` was given.
+    pub fn digest(&self, file: &[u8]) -> Option<[u8; 16]> {
+        use std::io::Read;
+        let mut d = Vec::new();
+        flate2::read::DeflateDecoder::new(file.get(self.data.0..self.data.0 + self.data.1)?).read_to_end(&mut d).ok()?;
+        if d.get(..4)? != b"DXBC" {
+            return None;
+        }
+        (0..u32_at(&d, 28)? as usize).find_map(|i| {
+            let at = u32_at(&d, 32 + 4 * i)? as usize;
+            (d.get(at..at + 4)? == b"HASH").then(|| d.get(at + 12..at + 28)?.try_into().ok()).flatten()
+        })
+    }
+}
+
+/// A resource that a compiled stage uses (a `0x42` record of its metadata).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Use {
+    pub write: bool,
+    pub kind: u8,
+    pub register: u32,
+    pub space: u32,
+}
+
+/// One stage's metadata blob of the pipeline cache.
+#[derive(Debug, Clone, Default)]
+pub struct Stage {
+    pub digest: [u8; 16],
+    pub uses: Vec<Use>,
+    /// Number of `0x41` records.
+    pub locations: usize,
+    /// Pipelines whose stage this is.
+    pub pipelines: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct Cache {
+    pub version: String,
+    pub graphics: usize,
+    pub compute: usize,
+    pub metadata_blobs: usize,
+    pub code_blobs: usize,
+    /// The stage blobs, by metadata index.
+    pub stages: std::collections::BTreeMap<u32, Stage>,
+}
+
+fn stage_at(b: &[u8]) -> Option<Stage> {
+    if !matches!(u32_at(b, 0)?, 2 | 0x403) {
+        return None;
+    }
+    let head = if b.len() > 16 && (b.len() - 16) % 32 == 0 { 16 } else { 24 };
+    if b.len() <= head || (b.len() - head) % 32 != 0 {
+        return None;
+    }
+    let mut st = Stage::default();
+    let mut digest = None;
+    for r in b[head..].chunks_exact(32) {
+        match u32_at(r, 0)? {
+            0x41 => st.locations += 1,
+            0x42 => st.uses.push(Use { write: r[8] == 2, kind: r[10], register: u32_at(r, 12)?, space: u32_at(r, 16)? }),
+            0x43 => digest = Some(r[4..20].try_into().ok()?),
+            _ => return None,
+        }
+    }
+    st.digest = digest?;
+    Some(st)
+}
+
+/// Reads the pipeline cache (the unpacked bytes of the archive's compressed
+/// entry).
+pub fn read_cache(b: &[u8]) -> Result<Cache> {
+    if b.get(..4) != Some(b"PS\0\x09") || b.len() < 0x80 {
+        return Err(anyhow!("not a pipeline cache"));
+    }
+    let n = |i: usize| u32_at(b, 0x50 + 4 * i).unwrap_or(0) as usize;
+    let (ng, nc, nm, nk, meta_bytes, code_bytes) = (n(0), n(1), n(2), n(3), n(4), n(5));
+    let (g, c) = (0x80, 0x80 + ng * 0x70);
+    let md = c + nc * 0x18;
+    let kd = md + nm * 8;
+    let ma = kd + nk * 8;
+    if ma + meta_bytes + code_bytes != b.len() {
+        return Err(anyhow!("pipeline cache: the areas do not add up to the file size"));
+    }
+    let version = b[0x24..0x48].split(|&x| x == 0).next().map(|s| String::from_utf8_lossy(s).into_owned()).unwrap_or_default();
+    let mut out = Cache { version, graphics: ng, compute: nc, metadata_blobs: nm, code_blobs: nk, ..Default::default() };
+    for i in 0..nm {
+        let (Some(o), Some(sz)) = (u32_at(b, md + 8 * i), u32_at(b, md + 8 * i + 4)) else { continue };
+        if let Some(st) = b.get(ma + o as usize..ma + o as usize + sz as usize).and_then(stage_at) {
+            out.stages.insert(i as u32, st);
+        }
+    }
+    let metas = (0..ng).flat_map(|i| (0..7).map(move |k| g + i * 0x70 + 0x38 + 8 * k + 4)).chain((0..nc).map(|i| c + i * 0x18 + 0x14));
+    for at in metas {
+        if let Some(st) = u32_at(b, at).and_then(|m| out.stages.get_mut(&m)) {
+            st.pipelines += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// What the compiled code of one program uses, from the cache.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Compiled {
+    /// Pipelines with this program as a stage.
+    pub pipelines: usize,
+    /// Per declared resource: true when a read record names it.
+    pub read: Vec<bool>,
+    /// Read records that match no declared resource.
+    pub unmatched_reads: usize,
+    /// Write records (their numbering is not matched to the declarations).
+    pub writes: Vec<Use>,
+}
+
+impl Shaders {
+    /// Joins the cache's stages to the programs by digest: for each
+    /// program (same order as `programs`) what its compiled code uses, or
+    /// None when no pipeline has it. `file` is the bytes `read` was given.
+    pub fn compiled(&self, cache: &Cache, file: &[u8]) -> Vec<Option<Compiled>> {
+        use rayon::prelude::*;
+        let mut by: std::collections::HashMap<[u8; 16], Vec<&Stage>> = Default::default();
+        for st in cache.stages.values() {
+            by.entry(st.digest).or_default().push(st);
+        }
+        self.programs
+            .par_iter()
+            .map(|p| {
+                let stages = by.get(&p.digest(file)?)?;
+                let mut c = Compiled { pipelines: stages.iter().map(|s| s.pipelines).sum(), read: vec![false; p.table.resources.len()], ..Default::default() };
+                // the blobs of one program carry the same records: read the first
+                for u in &stages[0].uses {
+                    if u.write {
+                        c.writes.push(*u);
+                    } else if let Some(i) = p.table.resources.iter().position(|r| r.kind != 0x23 && r.space() == u.space && r.register() == u.register && r.is_cbuffer() == (u.kind == 0x0d)) {
+                        c.read[i] = true;
+                    } else {
+                        c.unmatched_reads += 1;
+                    }
+                }
+                Some(c)
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,5 +549,76 @@ mod tests {
         let et = e.table.as_ref().unwrap();
         assert_eq!((et.resources[0].material_texture(), et.resources[0].name, et.resources[0].alias, et.resources[1].material_texture()), (Some((3, true)), 0x41, 0x42, None));
         assert_eq!((et.sampler_name(1), et.sampler_name(0)), (Some("DiffuseSampler"), None));
+    }
+
+    #[test]
+    fn cache_stages_join_programs_by_digest() {
+        use std::io::Write;
+        // a compiled program: a container with a HASH chunk, deflated
+        let digest = [7u8; 16];
+        let mut dxbc = b"DXBC".to_vec();
+        dxbc.extend([0u8; 24]);
+        dxbc.extend(1u32.to_le_bytes());
+        dxbc.extend(36u32.to_le_bytes());
+        dxbc.extend(b"HASH");
+        dxbc.extend(20u32.to_le_bytes());
+        dxbc.extend(0u32.to_le_bytes());
+        dxbc.extend(digest);
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&dxbc).unwrap();
+        let deflated = enc.finish().unwrap();
+        // declared: a texture at index 5 in space 1, one at 300 (kind bit 0x80, index 44) in space 0, a constant buffer 4 in space 2, an unused texture
+        let t = Table { resources: vec![
+            Var { name: 1, alias: 1, kind: 0x02, dim: 1, index: 5, a: 0x4200, b: 0, c: 0 },
+            Var { name: 2, alias: 2, kind: 0x82, dim: 1, index: 44, a: 0x0200, b: 0, c: 0 },
+            Var { name: 3, alias: 3, kind: 0x30, dim: 4, index: 4, a: 0x8200, b: 0, c: 0x10 },
+            Var { name: 4, alias: 4, kind: 0x02, dim: 1, index: 9, a: 0x0200, b: 0, c: 0 },
+        ], members: vec![], names: vec![] };
+        let file = [vec![0u8; 3], deflated.clone()].concat();
+        let sh = Shaders { programs: vec![
+            Program { section: 1, name: "PS_A".into(), kind: 0x32, id: 1, mask: 0, data: (3, deflated.len()), table: t },
+            Program { section: 1, name: "PS_B".into(), kind: 0x32, id: 2, mask: 0, data: (0, 2), table: Table::default() },
+        ], ..Default::default() };
+        assert_eq!(sh.programs[0].digest(&file), Some(digest));
+        // the cache: one graphics pipeline whose pixel stage is metadata 1; metadata 0 is not a stage blob
+        let rec = |tag: u32, f: &dyn Fn(&mut [u8; 32])| {
+            let mut r = [0u8; 32];
+            r[..4].copy_from_slice(&tag.to_le_bytes());
+            f(&mut r);
+            r.to_vec()
+        };
+        let used = |access: u8, kind: u8, reg: u32, space: u32| rec(0x42, &move |r| {
+            r[8] = access;
+            r[10] = kind;
+            r[12..16].copy_from_slice(&reg.to_le_bytes());
+            r[16..20].copy_from_slice(&space.to_le_bytes());
+        });
+        let stage = [2u32.to_le_bytes().to_vec(), vec![0u8; 12], rec(0x41, &|_| {}), used(1, 2, 5, 1), used(1, 2, 300, 0), used(1, 0x0d, 4, 2), used(1, 2, 77, 0), used(2, 2, 0, 0), rec(0x43, &|r| r[4..20].copy_from_slice(&[7u8; 16]))].concat();
+        let other = vec![9u8; 20];
+        let mut c = b"PS\0\x09".to_vec();
+        c.resize(0x24, 0);
+        c.extend(b"930.048.020");
+        c.resize(0x50, 0);
+        for v in [1u32, 0, 2, 0, (other.len() + stage.len()) as u32, 0] {
+            c.extend(v.to_le_bytes());
+        }
+        c.resize(0x80, 0);
+        let mut g = vec![0u8; 0x70];
+        g[0x38..].fill(0xff);
+        g[0x3c..0x40].copy_from_slice(&1u32.to_le_bytes());
+        c.extend(g);
+        for (o, n) in [(0, other.len()), (other.len(), stage.len())] {
+            c.extend((o as u32).to_le_bytes());
+            c.extend((n as u32).to_le_bytes());
+        }
+        c.extend(other);
+        c.extend(stage);
+        let cache = read_cache(&c).unwrap();
+        assert_eq!((cache.version.as_str(), cache.graphics, cache.stages.len(), cache.stages[&1].pipelines, cache.stages[&1].locations), ("930.048.020", 1, 1, 1, 1));
+        let j = sh.compiled(&cache, &file);
+        let a = j[0].as_ref().unwrap();
+        assert_eq!((a.pipelines, a.read.as_slice(), a.unmatched_reads, a.writes.len()), (1, &[true, true, true, false][..], 1, 1));
+        assert!(j[1].is_none());
+        assert!(read_cache(&c[..c.len() - 1]).is_err());
     }
 }

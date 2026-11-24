@@ -48,6 +48,7 @@ pub mod lodlinks;
 pub mod bink;
 pub mod interiorents;
 pub mod pso;
+pub mod rbf;
 pub mod gfxfont;
 pub mod heightmap;
 pub mod ptfx;
