@@ -106,7 +106,7 @@ fn is_undecoded(fl: u8) -> bool {
 fn decode_bc1(comp: &[u8], blocks: usize) -> Option<Vec<u8>> {
     use bcpack::bc1::{QuadTable, Window};
     static TABLES: std::sync::OnceLock<(Window, QuadTable)> = std::sync::OnceLock::new();
-    let (w, q) = TABLES.get_or_init(|| (Window::default_table(), QuadTable::default_table()));
+    let (w, q) = TABLES.get_or_init(|| (crate::bc1pack::window(), QuadTable::default_table()));
     bcpack::bc1::decode(comp, blocks, w, q).ok().map(|o| o.blocks)
 }
 

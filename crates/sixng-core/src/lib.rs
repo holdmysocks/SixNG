@@ -37,6 +37,7 @@ pub mod gfx10;
 pub mod resource;
 pub mod texture;
 pub mod ttpf;
+pub mod bc1pack;
 pub mod bc3pack;
 pub mod bc45pack;
 pub mod bc6h;
