@@ -1455,11 +1455,11 @@ impl ModelView {
                     ui.end_row();
                 }
             });
-        // weapon finishes: the family's variant presets per part type
+        // weapon finishes: the variant presets of the weapon's finish mods, per part type
         let mut finish: Vec<(String, Option<String>)> = Vec::new();
         let mut finish_changed = false;
         if let Some(fs) = l.info["weapon_finishes"].as_array().filter(|a| !a.is_empty()) {
-            ui.label(egui::RichText::new("Finishes (the family's colour variants of a part type; their names are not recovered, so each is labelled by its colours)").weak());
+            ui.label(egui::RichText::new("Finishes (the colour variants a weapon's finish mods offer for this part; their names are not recovered, so each is labelled by its colours)").weak());
             let squares = |ui: &mut egui::Ui, o: &serde_json::Value| {
                 for c in o["colours"].as_array().into_iter().flatten().filter_map(|c| u32::from_str_radix(c.as_str()?, 16).ok()) {
                     ui.label(egui::RichText::new("\u{25a0}").color(egui::Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)));
@@ -5229,7 +5229,7 @@ fn load_query_sel(
                 o.insert("parts_without_mount".into(), serde_json::json!(loose));
                 if !finishes.is_empty() {
                     o.insert("weapon_finishes".into(), serde_json::json!(finishes));
-                    o.insert("weapon_finishes_note".into(), "finishes are the weapon family's variant presets for a part type (frame, slide, grip, barrel …); which one the game gives a weapon is not decoded, so the part's own preset is the default. Variant names are not recovered.".into());
+                    o.insert("weapon_finishes_note".into(), "finishes are the variant presets that the finish mods of a weapon list for the part type of this component (frame, slide, grip, barrel …). No finish mod is a weapon's default mod, so the default is the part's own preset. Variant names are not recovered.".into());
                 }
                 if !coloured.is_empty() {
                     o.insert("weapon_presets".into(), serde_json::json!(coloured));

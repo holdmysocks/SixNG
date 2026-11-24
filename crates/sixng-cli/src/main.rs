@@ -1555,7 +1555,8 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 })
             };
             let want: Vec<u32> = preset.iter().map(|p| u32::from_str_radix(p.trim_start_matches("0x"), 16).map_err(|_| anyhow!("bad preset {p}"))).collect::<Result<_>>()?;
-            let (mut index, mut shown) = (matlib::Index { version: matlib::VERSION, ..Default::default() }, serde_json::Map::new());
+            let (mut index, mut shown) = (matlib::Index::default(), serde_json::Map::new());
+            index.version = matlib::VERSION;
             for e in ix.entries.iter().filter(|e| e.kind == Kind::Pso) {
                 let Ok(b) = sixng_core::scan::read_entry(&a.path, e) else { continue };
                 let Some(p) = sixng_core::pso::parse(&b).filter(|p| p.structs.contains_key(&matlib::ROOT)) else { continue };
@@ -1603,7 +1604,8 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             out.print(&json!({"ok": true, "archive": a.id, "libraries": index.libraries.iter().map(|l| json!({"id": l.0, "base_materials": l.1, "presets": l.2})).collect::<Vec<_>>(), "presets": index.presets.len(),
                 "weapon_components": {"count": index.weapon_components.len(), "resolved": resolved(&index.weapon_components)}, "weapon_variants": {"count": index.weapon_variants.len(), "resolved": index.weapon_variants.values().filter(|p| index.presets.contains_key(&p.1)).count()},
-                "weapon_models": {"count": index.weapon_models.len(), "named": named.len()}, "weapons": weapons,
+                "weapon_models": {"count": index.weapon_models.len(), "named": named.len()},
+                "weapon_finishes": {"models": index.model_finishes.len(), "variants": index.model_finishes.values().flatten().flat_map(|s| &s.1).map(|f| &f.0).collect::<std::collections::BTreeSet<_>>().len()}, "weapons": weapons,
                 "index": matlib::path(&ws), "shown": shown, "seconds": t.elapsed().as_secs_f64()}));
         }
         Cmd::Handling { archive, out: po } => {
