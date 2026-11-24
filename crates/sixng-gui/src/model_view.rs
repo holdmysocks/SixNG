@@ -56,7 +56,7 @@ impl Caps {
         Caps {
             paint: m.materials.iter().any(|x| x.class == "car_paint" || x.parts),
             wheels: names.iter().any(|n| n.starts_with("wheel_") && !n.contains("dummy")),
-            doors: names.iter().any(|n| matches!(n.as_str(), "door_dside_f" | "door_dside_r" | "door_pside_f" | "door_pside_r")),
+            doors: names.iter().any(|n| matches!(n.as_str(), "door_dside_f" | "door_dside_r" | "door_pside_f" | "door_pside_r" | "door_dside_m" | "door_pside_m")),
             roof: names.iter().any(|n| n == "convertible_roof"),
             mounts: l.info["wheel_mounts"].as_array().is_some_and(|a| !a.is_empty()),
             joints: !m.joints.is_empty(),
@@ -425,7 +425,9 @@ pub struct ModelView {
     pub bonnet_open: f32,
     pub boot_open: f32,
     /// Hinged panels of the loaded model: joint index -> (0 = door, 1 =
-    /// bonnet, 2 = boot; rotation axis; sign that swings it open).
+    /// bonnet, 2 = boot; rotation axis; sign that swings it open). A sliding
+    /// door is 3, with its whole travel in the bone's own space in place of
+    /// the axis.
     hinges: HashMap<usize, (u8, Vec3, f32)>,
     /// What the configuration's parts without a model change on the wheels:
     /// [out from the centre line, tyre width], each per axle (front, rear).
@@ -2625,7 +2627,8 @@ impl ModelView {
                 self.roof_anim = (l.model.path.clone(), roof);
                 self.clip_pos = vec![self.clip_pos_all; all.len()];
                 self.clips = all;
-                self.hinges = find_hinges(&l.model);
+                let sliding: Vec<String> = l.info["sliding_doors"].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(|n| n.to_ascii_lowercase())).collect();
+                self.hinges = find_hinges(&l.model, &sliding);
                 self.aims = find_aims(&l.model);
                 self.steer_wheel = find_steering_wheel(&l.model);
                 self.window_movers = find_window_movers(&l.model);
@@ -2935,8 +2938,14 @@ impl ModelView {
             true => &l.model.joints,
         };
         // hinged panels: this frame's rotation per joint
-        let open = [self.door_open, self.bonnet_open, self.boot_open];
-        let swing: HashMap<usize, Mat4> = self.hinges.iter().filter(|(_, h)| open[h.0 as usize] != 0.0).map(|(i, h)| (*i, Mat4::from_quat(Quat::from_axis_angle(h.1, h.2 * open[h.0 as usize])))).collect();
+        // (a sliding door has made its whole travel at 1 on the doors slider)
+        let open = [self.door_open, self.bonnet_open, self.boot_open, self.door_open.min(1.0)];
+        let swing: HashMap<usize, Mat4> = self
+            .hinges
+            .iter()
+            .filter(|(_, h)| open[h.0 as usize] != 0.0)
+            .map(|(i, h)| (*i, if h.0 == 3 { Mat4::from_translation(h.1 * open[3]) } else { Mat4::from_quat(Quat::from_axis_angle(h.1, h.2 * open[h.0 as usize])) }))
+            .collect();
         // steering: the wheel_turn bones turn about the vertical, the
         // steering wheel about its own axis
         let mut swing = swing;
@@ -5963,9 +5972,19 @@ fn load_query_sel(
 /// where the panel's vertices lie relative to its bone (a front-hinged
 /// bonnet and a rear-hinged door open the right way); the opening angle is
 /// the slider's, not a stored limit.
-fn find_hinges(model: &glb::Model) -> HashMap<usize, (u8, Vec3, f32)> {
+///
+/// A door bone named in `sliding` (model.json `sliding_doors`, from the bone
+/// flags) slides along its bone's track instead: the bone's own forward
+/// axis, which the model turns a little about the vertical so that the door
+/// moves out of its opening as it moves back. It always moves towards the
+/// rear. How far is not stored: the door's front edge stops 5 cm short of
+/// the rear end of its opening at sill height (where a wheel arch cuts into
+/// the door the opening is shorter there), so that a roller bracket at the
+/// door's bottom front edge stays in the opening instead of running into
+/// the panel behind it; and never more than 0.9 of the door's length.
+fn find_hinges(model: &glb::Model, sliding: &[String]) -> HashMap<usize, (u8, Vec3, f32)> {
     let kind = |n: &str| match n.to_ascii_lowercase().as_str() {
-        "door_dside_f" | "door_dside_r" | "door_pside_f" | "door_pside_r" => Some(0u8),
+        "door_dside_f" | "door_dside_r" | "door_pside_f" | "door_pside_r" | "door_dside_m" | "door_pside_m" => Some(0u8),
         "bonnet" => Some(1),
         "boot" => Some(2),
         _ => None,
@@ -5983,13 +6002,26 @@ fn find_hinges(model: &glb::Model) -> HashMap<usize, (u8, Vec3, f32)> {
             k = model.joints[j].parent.filter(|p| *p != j && depth < 64);
         }
     }
+    // a sliding door's track in model space, pointing to the rear (+Z here;
+    // the bone's forward axis is its local Z after the change to Y-up)
+    let track = |h: usize| -> Option<Vec3> {
+        sliding.contains(&model.joints[h].name.to_ascii_lowercase()).then(|| {
+            let z = Mat4::from_cols_array(&model.joints[h].ibm).inverse().z_axis.truncate().normalize_or_zero();
+            if z.z < 0.0 { -z } else { z }
+        })
+    };
     let mut sum: HashMap<usize, (Vec3, f32)> = HashMap::new();
+    // a sliding door's own vertices: place along its track, height
+    let mut span: HashMap<usize, Vec<(f32, f32)>> = HashMap::new();
     for me in model.meshes.iter().filter(|m| m.skinned) {
         for v in &me.verts {
             if let Some(h) = owner.get(v.joints[0] as usize).copied().flatten() {
                 let e = sum.entry(h).or_insert((Vec3::ZERO, 0.0));
                 e.0 += Vec3::from(v.pos);
                 e.1 += 1.0;
+                if let Some(t) = track(h).filter(|_| v.joints[0] as usize == h) {
+                    span.entry(h).or_default().push((t.dot(Vec3::from(v.pos)), v.pos[1]));
+                }
             }
         }
     }
@@ -5999,6 +6031,20 @@ fn find_hinges(model: &glb::Model) -> HashMap<usize, (u8, Vec3, f32)> {
             let pivot = Mat4::from_cols_array(&model.joints[h].ibm).inverse().w_axis.truncate();
             let d = centre - pivot;
             let k = kind(&model.joints[h].name)?;
+            if let (Some(t), Some(s)) = (track(h), span.get(&h).filter(|s| s.len() >= 8)) {
+                let mut along: Vec<f32> = s.iter().map(|p| p.0).collect();
+                along.sort_by(|a, b| a.total_cmp(b));
+                // the panel's front edge: a bracket that reaches forward of
+                // it is a few vertices only (32 of 3,564 on the minivan)
+                let (front, rear) = (along[along.len() * 3 / 100], along[along.len() - 1]);
+                let (low, high) = s.iter().fold((f32::MAX, f32::MIN), |m, p| (m.0.min(p.1), m.1.max(p.1)));
+                // the rear end of the opening at sill height
+                let sill = s.iter().filter(|p| p.1 < low + 0.15 * (high - low)).map(|p| p.0).fold(f32::MIN, f32::max);
+                let travel = (sill - front - 0.05).min(0.9 * (rear - along[0])).max(0.0);
+                // the travel in the bone's own space (a swing is applied there)
+                let local = Mat4::from_cols_array(&model.joints[h].ibm).transform_vector3(t * travel);
+                return Some((h, (3, local, 1.0)));
+            }
             Some((
                 h,
                 if k == 0 {

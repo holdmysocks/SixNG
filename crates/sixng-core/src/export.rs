@@ -1344,6 +1344,11 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 "materials_note": "Textures come from the data/ttdb/*.ttpf stores by 64-bit hash and are written once to <out>/textures/ttpf/<hash>.png. Roles are guessed from the shader parameter hash and the format (sRGB = colour, BC5 / known normal slots = normal map). classification.class is one of opaque/alpha/cutout/decal/glass/window/emissive/water/terrain_multilayer/car_paint, from the shader record flags and known shader families. shader_name and param_name are joaat names from <work>/names/names.json (`sixng names`), null when unknown. slot_role names the PBR map a known parameter slot holds.",
             });
             let mut j = j;
+            let sliding: Vec<String> = info.skeleton.iter().filter(|b| crate::drawable::slides(b)).map(|b| b.name.clone()).collect::<Vec<_>>();
+            if !sliding.is_empty() {
+                j["sliding_doors"] = serde_json::json!(sliding);
+                j["sliding_doors_note"] = "Door bones that slide instead of turning: their bone flags allow a limited translation (0x80) and no limited rotation (0x08 clear), where a hinged door has 0x7f. The track is the bone's own Y axis (the bone is turned about the vertical so that the door moves out as it moves back). How far a door slides is not stored in the model.".into();
+            }
             if let Some((_, rec)) = head.as_ref().filter(|h| !h.1["preset"].is_null()) {
                 j["part_skin"] = rec.clone();
                 j["part_skin_note"] = "Animal parts: the colour texture comes from the part's material preset (packs.rpf meta, struct f795e8ba) when the drawable's own one is in no store or is a tint mask (cattle: R and B patch masks, G shading, coloured in game by the preset's tint bytes through a palette that is not decoded). preset: name hash of the preset used; slot_presets: how many presets (variations) the part has; replaced: the texture the drawable binds.".into();
