@@ -298,6 +298,7 @@ pub struct Map2D {
     pub hour: f32,
     pub show_interiors: bool,
     pub show_footprints: bool,
+    pub sectors: crate::sector_view::SectorView,
     tiles: HashMap<TileKey, TileState>,
     loader: Arc<Loader>,
     frame: u64,
@@ -318,7 +319,7 @@ pub struct Map2D {
 pub const ROAD_COLOURS: [&str; 3] = ["speed limit", "lane count", "road class"];
 
 impl Map2D {
-    pub fn new(work: &str) -> Self {
+    pub fn new(game: &str, work: &str) -> Self {
         let loader = Arc::new(Loader {
             queue: Mutex::new(Vec::new()),
             cv: Condvar::new(),
@@ -370,6 +371,7 @@ impl Map2D {
             hour: 22.0,
             show_interiors: false,
             show_footprints: true,
+            sectors: crate::sector_view::SectorView::new(game, work),
             tiles: HashMap::new(),
             loader,
             frame: 0,
@@ -857,6 +859,26 @@ impl Map2D {
         }
         // hover: footprints of what is under the cursor
         let mut hover_ent = None;
+        // sector grid
+        let sector_grid = self.sectors.grid();
+        if let Some((g, p)) = &sector_grid {
+            let g = &g[*p];
+            let px = g.cell_m / self.mpp;
+            let edge = px >= 4.0;
+            for (&(cx, cy), recs) in &g.cells {
+                let (x0, y0) = (cx as f32 * g.cell_m, cy as f32 * g.cell_m);
+                let (x1, y1) = (x0 + g.cell_m, y0 + g.cell_m);
+                if x1 < wx0 || x0 > wx1 || y1 < wy0 || y0 > wy1 {
+                    continue;
+                }
+                let c = g.colour(recs);
+                let r = Rect::from_two_pos(self.w2s(rect, x0, y1), self.w2s(rect, x1, y0));
+                painter.rect_filled(r, 0.0, c.gamma_multiply(0.22));
+                if edge {
+                    painter.rect_stroke(r, 0.0, Stroke::new(1.0_f32, c.gamma_multiply(0.8)), egui::StrokeKind::Inside);
+                }
+            }
+        }
         if let Some(hp) = resp.hover_pos() {
             let [x, y] = self.s2w(rect, hp);
             let mut best: Option<(f32, u32)> = None;
@@ -900,6 +922,14 @@ impl Map2D {
                 self.mpp,
                 hover_ent.map(|i| format!("   ·   {}", d.name(d.ents[i as usize].name))).unwrap_or_default()
             );
+            if let Some((g, p)) = &sector_grid {
+                let g = &g[*p];
+                let c = sixng_core::sectorgrid::cell_of(x, y, g.cell_m);
+                if let Some(t) = g.describe(c) {
+                    self.hover_info += &format!("
+{t}");
+                }
+            }
         }
         // tools
         match self.tool {
@@ -1130,6 +1160,7 @@ impl Map2D {
         });
         ui.checkbox(&mut self.show_interiors, "interiors");
         ui.checkbox(&mut self.show_footprints, "hover footprints");
+        self.sectors.ui(ui);
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.show_lights, "lights");
             ui.checkbox(&mut self.light_ext, "exterior");

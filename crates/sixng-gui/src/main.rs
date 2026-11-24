@@ -21,6 +21,7 @@ mod map2d;
 mod map3d;
 mod map_cells;
 mod mem;
+mod sector_view;
 mod world3d;
 
 /// Export cache for the viewers. Bumped when the export layout changes
@@ -54,6 +55,7 @@ mod vehicle_db;
 /// Command-line automation (verification screenshots):
 /// `sixng-gui --model <id|regex|glb> [--lod N] [--mode N] [--slot N] [--rma N] [--wire] [--skeleton]
 ///  [--tod H] [--paint r,g,b] [--finish N] [--pearl A] [--spin R] [--door R] [--yaw R] [--pitch R] [--zoom F]
+///  [--sector-grid [N]] (Map 2D / 3D: grid N of levels.rpf, default the world grid)
 ///  [--no-tint] [--hair hex,hex] [--hair-width MM] [--size WxH] --screenshot out.png --exit`
 #[derive(Default, Clone)]
 struct Cli {
@@ -448,7 +450,7 @@ impl App {
             thumb_budget_mb,
             setup_done: st.setup_done,
             model: model_view::ModelView::new(&game, &work),
-            map2d: map2d::Map2D::new(&work),
+            map2d: map2d::Map2D::new(&game, &work),
             map3d: map3d::Map3D::new(&game, &work),
             textures: texture_view::TextureView::new(&game, &work),
             texture_users_job: None,
@@ -1418,6 +1420,7 @@ impl App {
                 Tab::Library => self.library.idle() && self.model.picker.loaded(),
                 Tab::Status => self.status.sizes.lock().unwrap().is_some(),
                 Tab::Jobs | Tab::Settings => true,
+                Tab::Map2D => self.map2d.data.is_some() && self.map2d.sectors.idle(),
                 _ => self.map2d.data.is_some(),
             };
         if ready && frames < 100_000 {
@@ -1587,6 +1590,10 @@ impl App {
             m3.show_roads = c.has("roads");
             m3.show_lights = c.has("lights");
             m3.show_terrain = !c.has("no-terrain");
+            if let Some(v) = c.get("sector-grid") {
+                m3.sectors.on = true;
+                m3.sectors.pick = v.parse::<usize>().map_or(usize::MAX, |n| n.saturating_sub(1));
+            }
             if c.has("no-windows") {
                 m3.show_minimap = false;
                 m3.show_stats = false;
@@ -1639,6 +1646,10 @@ impl App {
             mp.show_lights = c.has("lights");
             mp.light_int = c.has("interior-lights");
             mp.show_interiors = c.has("interiors");
+            if let Some(v) = c.get("sector-grid") {
+                mp.sectors.on = true;
+                mp.sectors.pick = v.parse::<usize>().map_or(usize::MAX, |n| n.saturating_sub(1));
+            }
             if let Some(h) = c.f("hour") {
                 mp.hour = h;
             }

@@ -151,7 +151,7 @@ impl App {
     /// Rebuild the views that hold the game / work folders.
     pub(crate) fn rebuild_views(&mut self) {
         self.model = crate::model_view::ModelView::new(&self.game, &self.work);
-        self.map2d = crate::map2d::Map2D::new(&self.work);
+        self.map2d = crate::map2d::Map2D::new(&self.game, &self.work);
         self.map3d = crate::map3d::Map3D::new(&self.game, &self.work);
         self.map3d.load_settings();
         self.textures = crate::texture_view::TextureView::new(&self.game, &self.work);

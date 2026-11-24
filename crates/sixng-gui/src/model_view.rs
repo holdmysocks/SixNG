@@ -564,11 +564,12 @@ pub struct ModelView {
     /// bone it aims at).
     aims: Vec<(usize, usize)>,
     /// Brake disc and caliper models at the wheels.
-    brakes: Vec<(bool, GpuModel)>,
-    brake_pending: Arc<Mutex<Option<Vec<(bool, Loaded)>>>>,
+    /// (turns with the wheel, on the front / rear axle, model)
+    brakes: Vec<(bool, [bool; 2], GpuModel)>,
+    brake_pending: Arc<Mutex<Option<Vec<(bool, [bool; 2], Loaded)>>>>,
     brake_key: String,
     brake_loading: bool,
-    veh_brake: (Option<String>, Option<String>),
+    veh_brake: sixng_core::vehexport::AxleBrakes,
     pub paint_on: bool,
     /// Side-panel controls that apply to the loaded model, keyed by (GLB path, triangles).
     caps: Option<(PathBuf, usize, Caps)>,
@@ -892,7 +893,7 @@ impl ModelView {
             brake_pending: Arc::new(Mutex::new(None)),
             brake_key: String::new(),
             brake_loading: false,
-            veh_brake: (None, None),
+            veh_brake: Default::default(),
             paint_on: true,
             caps: None,
             material_sel: None,
@@ -2223,7 +2224,7 @@ impl ModelView {
                     let (rim, tyre) = self.plain_wheels();
                     self.wheel_rim = rim.into();
                     self.wheel_tyre = tyre.into();
-                    self.veh_brake = (None, None);
+                    self.veh_brake = Default::default();
                     self.wheel_scale = sc;
                     self.wheel_scale_rear = sc;
                 }
@@ -2252,7 +2253,7 @@ impl ModelView {
                 let (rim, tyre) = self.plain_wheels();
                 self.wheel_rim = rim.into();
                 self.wheel_tyre = tyre.into();
-                self.veh_brake = (None, None);
+                self.veh_brake = Default::default();
                 self.apply_scale(v);
             }
         }
@@ -2510,12 +2511,37 @@ impl ModelView {
             }
             .into();
         }
-        // like the tyre: a configuration without brake parts takes those of
-        // another configuration of the vehicle
-        self.veh_brake = (
-            c.brake_disc.clone().or_else(|| v.configs.iter().find_map(|x| x.brake_disc.clone())),
-            c.caliper.clone().or_else(|| v.configs.iter().find_map(|x| x.caliper.clone())),
-        );
+        // Brakes per axle: named by model, or the model of a part in a
+        // brake slot (drums come that way). Like the tyre, a configuration
+        // without any brake part takes those of another configuration.
+        let brake_names: HashMap<u32, String> = self
+            .indexes
+            .lock()
+            .unwrap()
+            .values()
+            .flat_map(|ix| ix.entries.iter())
+            .filter_map(|e| e.name.as_deref())
+            .filter(|n| ["brakedisc_", "drumbrake_", "caliper_"].iter().any(|w| n.starts_with(w)))
+            .map(|n| {
+                let s = n.strip_suffix("_hi").unwrap_or(n);
+                (sixng_core::meta7a::joaat(s), s.to_string())
+            })
+            .collect();
+        let axles = |c: &crate::vehicle_db::Config| {
+            let slot_models: Vec<(u32, String)> = v
+                .mods
+                .iter()
+                .filter(|m| sixng_core::vehexport::BRAKE_SLOTS.contains(&m.slot) && c.parts.contains(&m.name))
+                .filter_map(|m| Some((m.slot, m.models.iter().find_map(|h| brake_names.get(h))?.clone())))
+                .collect();
+            sixng_core::vehexport::brake_axles(c.brake_disc.as_deref(), c.caliper.as_deref(), &slot_models)
+        };
+        let none = |b: &sixng_core::vehexport::AxleBrakes| b.iter().all(|a| a.0.is_none() && a.1.is_none());
+        let mut brakes = axles(c);
+        if none(&brakes) {
+            brakes = v.configs.iter().map(axles).find(|b| !none(b)).unwrap_or_default();
+        }
+        self.veh_brake = brakes;
         self.veh_cfg = Some(i);
         self.apply_scale(v);
     }
@@ -2600,7 +2626,7 @@ impl ModelView {
         if let Some(ls) = self.brake_pending.lock().unwrap().take() {
             self.brake_loading = false;
             let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
-            self.brakes = ls.iter().map(|(disc, l)| (*disc, ren.upload(rs, &l.model, &[]))).collect();
+            self.brakes = ls.iter().map(|(disc, on, l)| (*disc, *on, ren.upload(rs, &l.model, &[]))).collect();
         }
         let spots: Vec<(String, Vec3, f32)> = self
             .loaded
@@ -2614,12 +2640,23 @@ impl ModelView {
                 Some((m["bone"].as_str()?.to_string(), Vec3::new(c[0], c[2], -c[1]), m["brake_radius"].as_f64()? as f32))
             })
             .collect();
-        let (disc, caliper) = if spots.is_empty() { (None, None) } else { self.veh_brake.clone() };
-        let key = format!("{disc:?}|{caliper:?}");
+        let axles = if spots.is_empty() { Default::default() } else { self.veh_brake.clone() };
+        let key = format!("{axles:?}");
         if key != self.brake_key {
             self.brake_key = key;
             self.brakes.clear();
-            let qs: Vec<(bool, String)> = [(true, disc), (false, caliper)].into_iter().filter_map(|(d, n)| n.map(|n| (d, format!("^{n}_hi$")))).collect();
+            // each distinct model once, with the axles it is on
+            let mut qs: Vec<(bool, [bool; 2], String)> = Vec::new();
+            for (axle, a) in axles.iter().enumerate() {
+                for (d, n) in [(true, &a.0), (false, &a.1)] {
+                    let Some(n) = n else { continue };
+                    let q = format!("^{n}_hi$");
+                    match qs.iter_mut().find(|x| x.0 == d && x.2 == q) {
+                        Some(x) => x.1[axle] = true,
+                        None => qs.push((d, std::array::from_fn(|i| i == axle), q)),
+                    }
+                }
+            }
             if !qs.is_empty() {
                 self.brake_loading = true;
                 let ws = Workspace::new(&self.game, &self.work);
@@ -2629,7 +2666,7 @@ impl ModelView {
                 let ctx = ctx.clone();
                 std::thread::spawn(move || {
                     // a part that does not load is left out
-                    let r: Vec<(bool, Loaded)> = qs.iter().filter_map(|(d, q)| load_query(&ws, &cache, q, 0, &idx).ok().map(|l| (*d, l))).collect();
+                    let r: Vec<(bool, [bool; 2], Loaded)> = qs.iter().filter_map(|(d, on, q)| load_query(&ws, &cache, q, 0, &idx).ok().map(|l| (*d, *on, l))).collect();
                     *slot.lock().unwrap() = Some(r);
                     ctx.request_repaint();
                 });
@@ -2639,10 +2676,11 @@ impl ModelView {
         let wheel_spin = self.wheel_spin;
         let brake_heat = self.brake_heat.clamp(0.0, 1.0);
         if let Some(ren) = &self.renderer {
-            for (is_disc, g) in self.brakes.iter_mut() {
+            for (is_disc, on, g) in self.brakes.iter_mut() {
                 let inst: Vec<render3d::Instance> = spots
                     .iter()
                     .zip(&steers)
+                    .filter(|((bone, _, _), _)| on[is_rear(bone) as usize])
                     .map(|((bone, p, r), steer)| {
                         let right = bone.strip_prefix("wheel_").map(|s| s.starts_with('r')).unwrap_or(false);
                         let mirror = if right { Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0)) } else { Mat4::IDENTITY };
@@ -3732,7 +3770,7 @@ impl ModelView {
         let mut models: Vec<&GpuModel> = self.gpu.iter().collect();
         if show_wheels {
             models.extend(self.wheels.iter());
-            models.extend(self.brakes.iter().map(|b| &b.1));
+            models.extend(self.brakes.iter().map(|b| &b.2));
         }
         if self.hair.show {
             models.extend(self.hair.gpu.iter());
