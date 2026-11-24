@@ -472,9 +472,34 @@ pub fn look(game_root: &Path, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -
     if let Some(r) = cache.lock().unwrap().get(&key) {
         return r.clone();
     }
-    let r = look_uncached(game_root, a, ix, &key);
+    let r = look_uncached(game_root, a, ix, &key).map(dressed_first);
     cache.lock().unwrap().insert(key, r.clone());
     r
+}
+
+/// The outfit list's order is kept, except that the first outfit (the one
+/// shown when a character is opened) is a dressed one when there is one:
+/// for about twenty characters the first listed outfit resolves to
+/// accessories and skin only while later ones have clothes.
+fn dressed_first(mut l: Look) -> Look {
+    let has = |o: &Outfit, s: &str| o.parts.iter().any(|p| p.slot == s);
+    // underwear alone is not a bottom
+    let bottom = |o: &Outfit| o.parts.iter().any(|p| p.slot == "bottom" && !item_word(&p.drawable).starts_with("undies"));
+    let dressed = |o: &Outfit| has(o, "full") || (has(o, "top") || has(o, "outer")) && bottom(o);
+    if l.outfits.first().is_some_and(|o| !dressed(o)) {
+        // of the dressed ones, the first with shoes when one has them
+        let pick = l.outfits.iter().position(|o| dressed(o) && has(o, "feet")).or_else(|| l.outfits.iter().position(dressed));
+        if let Some(i) = pick {
+            let o = l.outfits.remove(i);
+            l.outfits.insert(0, o);
+            let say = "The first listed outfit has no clothes in the data read here, so the first dressed one is shown first.";
+            l.note = Some(match l.note.take() {
+                Some(n) => format!("{n} {say}"),
+                None => say.to_string(),
+            });
+        }
+    }
+    l
 }
 
 fn look_uncached(game_root: &Path, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Result<Look, String> {
@@ -526,8 +551,28 @@ fn mesh_points(a: &ArchiveInfo, e: &crate::scan::Entry) -> Option<Vec<[f32; 3]>>
 /// the model's when it has them (`cs_jason` has none).
 fn look_by_alias(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Option<Look> {
     let short = model.split_once('_')?.1;
-    let [target] = t.aliases.get(&joaat(short))?.as_slice() else { return None };
-    let row = t.by_model.get(target)?;
+    // the one model the table names after the character; else the listed
+    // model this one is a variant of: a second head of the same person
+    // (`hc_cs_chuck` -> `cs_chuck`) or the same person under a crowd-style
+    // name (`u_f_o_rhonda` -> `cs_rhonda`)
+    let by_name = match t.aliases.get(&joaat(short)).map(Vec::as_slice) {
+        Some([target]) => Some((*target, short.to_string())),
+        _ => None,
+    };
+    let variant = || {
+        let words: Vec<&str> = model.split('_').collect();
+        let mut c = Vec::new();
+        if let Some(rest) = model.strip_prefix("hc_") {
+            c.push(rest.to_string());
+        }
+        if words.len() >= 4 && words[0].len() == 1 && words[1].len() == 1 && words[2].len() == 1 {
+            c.push(format!("cs_{}", words[3..].join("_")));
+        }
+        c.into_iter().find(|n| t.by_model.contains_key(&joaat(n))).map(|n| (joaat(&n), n))
+    };
+    let (target, short) = by_name.or_else(variant)?;
+    let short = short.as_str();
+    let row = t.by_model.get(&target)?;
     let mut l = look_row(a, ix, model, row, false).ok()?;
     let names: Vec<String> = ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| e.name.as_ref().map(|n| n.to_ascii_lowercase())).filter(|n| n.starts_with(&format!("{model}_head_"))).collect();
     let head = names.iter().filter(|n| !n.contains("_eye") && !n.contains("_earring")).min().cloned();
@@ -550,8 +595,8 @@ fn look_by_alias(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) ->
         }
     }
     l.note = Some(match head {
-        Some(_) => format!("{model} is not in the outfit list under its own name. The ped model table names one model after \"{short}\" ({was}); its outfits are shown with this character's own head."),
-        None => format!("{model} has no head of its own and is not in the outfit list. The ped model table names one model after \"{short}\" ({was}); that model's outfits and head are shown."),
+        Some(_) => format!("{model} is not in the outfit list under its own name. The outfits of the model named after \"{short}\" ({was}) are shown with this character's own head."),
+        None => format!("{model} has no head of its own and is not in the outfit list. The outfits and head of the model named after \"{short}\" ({was}) are shown."),
     });
     Some(l)
 }
@@ -709,6 +754,13 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
     if flat.is_empty() {
         return Err(format!("none of the {} outfits of {model} is in its wardrobe resource", row.outfits.len()));
     }
+    // The model's own head, for outfits whose head item does not resolve
+    // (`cs_maleek_rivers`: the item names nothing found, and the texture
+    // link then picked another head's eyes).
+    let self_head = names.iter().filter(|n| n.starts_with(&format!("{model}_head_")) && !n.contains("_eye") && !n.contains("_earring")).min().cloned();
+    if fit.is_none() {
+        fit = self_head.as_deref().and_then(|n| n.split('_').find(|t| crate::outfit::is_fit(t)).map(str::to_string));
+    }
     // garment preset colours (the clothing material library of data.rpf)
     static PRESETS: OnceLock<Option<crate::matlib::Index>> = OnceLock::new();
     let presets = PRESETS.get_or_init(|| crate::matlib::Index::load_or_build(&crate::export::Workspace::new(crate::export::game_root(a), &work)).ok()).as_ref();
@@ -748,6 +800,9 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
             }
         }
         let plain = |slot: &str, drawable: String, found_by: &'static str| LookPart { slot: slot.into(), drawable, item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by };
+        if let (false, Some(h)) = (parts.iter().any(|p| p.slot == "head"), &self_head) {
+            parts.push(plain("head", h.clone(), "own"));
+        }
         // The eyes that go with the head (`<head>_eyes_full`): the item's
         // textures are shared by every eye mesh, so the texture link can
         // pick another head's.
