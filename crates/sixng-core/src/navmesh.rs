@@ -133,7 +133,7 @@ impl NavMesh {
                 normals: None,
                 tangents: None,
                 uvs: vec![],
-                colors: None,
+                colors: None, colors1: None,
                 tint: None,
                 indices: idx,
                 material: Some(mats.len() - 1),
