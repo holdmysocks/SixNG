@@ -148,6 +148,16 @@ pub struct DrawableInfo {
 /// by pointers to the inverse bind matrices (+0x08, 4x4 f32, row-vector
 /// convention: p_bone = p_model · M), local bind matrices (+0x10) and u16
 /// parent indices (+0x18).
+/// A door bone that slides instead of turning. The low byte of the bone
+/// flags is the bone's freedom: 0x07 rotation about x, y, z, 0x08 that
+/// rotation is limited, 0x70 translation along x, y, z, 0x80 that
+/// translation is limited. A hinged door has 0x7f, a sliding one 0xf7 (a
+/// van's side door, a delivery van's cab doors). The names of the bits are
+/// a reading of which bones carry them.
+pub fn slides(b: &Bone) -> bool {
+    b.name.to_ascii_lowercase().starts_with("door_") && b.flags & 0x88 == 0x80
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bone {
     pub index: u16,
