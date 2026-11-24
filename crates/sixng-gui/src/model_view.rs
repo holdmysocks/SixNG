@@ -640,6 +640,8 @@ pub struct ModelView {
     pub picker: crate::model_picker::ModelPicker,
     /// Set when the user asks to open a material's texture in the Textures tab.
     pub view_texture: Option<u64>,
+    /// Set when the user asks for a character's cutscenes (outfit prefix).
+    pub open_scenes: Option<String>,
     pub show_picker: bool,
     pub hair: Hair,
 }
@@ -938,6 +940,7 @@ impl ModelView {
             view_texture: None,
             show_picker: true,
             hair: Hair::default(),
+            open_scenes: None,
         }
     }
 
@@ -1439,12 +1442,19 @@ impl ModelView {
             self.ped_clip.loading = true;
             self.ped_clip.status = format!("loading {want} …");
             let names: Vec<String> = l.model.joints.iter().map(|j| j.name.clone()).collect();
+            let model = l.base.split_once("#outfit:").map(|x| x.1.split('#').next().unwrap_or("").to_string()).unwrap_or_default();
             let (game, work, slot, ctx2) = (PathBuf::from(&self.game), PathBuf::from(&self.work), self.ped_clip.pending.clone(), ctx.clone());
             std::thread::spawn(move || {
                 let r = (|| -> anyhow::Result<(glb::Anim, Vec<sixng_core::anim::ClipTrack>, String)> {
                     // "<dictionary>/<clip>", or a dictionary alone: then its `move` or `idle` clip, else the first that binds an animation
                     let (dq, cq) = want.rsplit_once('/').unwrap_or((want.as_str(), ""));
-                    let (_, d) = sixng_core::anim::load_dictionary(&game, &work, dq)?;
+                    // a cutscene (`cin@<scene>[/<clip>]`): its sections joined; no clip = this character's own
+                    let (d, cq) = if crate::scenes_view::is_scene(dq) {
+                        crate::scenes_view::scene_clip(&game, &work, dq, cq, &model)?
+                    } else {
+                        (sixng_core::anim::load_dictionary(&game, &work, dq)?.1, cq.to_string())
+                    };
+                    let cq = cq.as_str();
                     let c = if cq.is_empty() {
                         let bound: Vec<&sixng_core::anim::Clip> = d.clips.iter().filter(|c| c.kind == 1 && !c.bindings.is_empty()).collect();
                         ["move", "idle"].iter().find_map(|n| bound.iter().find(|c| c.short_name() == *n).copied()).or(bound.first().copied()).ok_or_else(|| anyhow::anyhow!("{} holds no clip with animation data that is decoded (its {} clip(s) bind none here)", d.name, d.clips.len()))?
@@ -1637,7 +1647,14 @@ impl ModelView {
         let l = self.loaded.as_ref()?;
         let look = l.look.as_ref()?;
         let mut reload = None;
-        ui.heading("Character");
+        ui.horizontal(|ui| {
+            ui.heading("Character");
+            if let Some((_, p)) = l.base.split_once("#outfit:") {
+                if ui.button("🎬 Open in scenes").on_hover_text("The Scenes tab, filtered to every cutscene with this character in the cast").clicked() {
+                    self.open_scenes = Some(p.split('#').next().unwrap_or(p).to_string());
+                }
+            }
+        });
         egui::Grid::new("look_grid").num_columns(2).show(ui, |ui| {
             ui.label("Outfit");
             let text = |k: usize| format!("{}: {}", k + 1, look.labels.get(k).map(String::as_str).unwrap_or("?"));
@@ -1768,7 +1785,7 @@ impl ModelView {
             if !self.ped_clip.status.is_empty() {
                 ui.label(egui::RichText::new(&self.ped_clip.status).weak().small());
             }
-            ui.label(egui::RichText::new("A clip of anim.rpf on this skeleton (`sixng clips --name <regex>` lists them). The Pose angles are added on top.").weak().small());
+            ui.label(egui::RichText::new("A clip of anim.rpf on this skeleton (`sixng clips --name <regex>` lists them), or a cutscene: cin@<scene> plays this character's clip of that scene. The Pose angles are added on top.").weak().small());
         });
         for n in &look.notes {
             ui.label(egui::RichText::new(n).weak().small());

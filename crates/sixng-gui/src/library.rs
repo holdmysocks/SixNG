@@ -17,6 +17,8 @@ pub enum Action {
     /// queue `sixng <args>` as a job
     Job(String, Vec<String>),
     OpenJobs,
+    /// the Scenes tab filtered to a character (outfit prefix)
+    OpenScenes(String),
 }
 
 #[derive(Clone, PartialEq)]
@@ -605,6 +607,11 @@ impl Library {
                 ui.horizontal(|ui| {
                     if ui.button("🧊 Open in 3D viewer").clicked() {
                         *act = Some(Action::OpenModel(query.to_string()));
+                    }
+                    if let Some((_, p)) = id.split_once("#outfit:") {
+                        if ui.button("🎬 Open in scenes").on_hover_text("The Scenes tab, filtered to every cutscene with this character in the cast").clicked() {
+                            *act = Some(Action::OpenScenes(p.split('#').next().unwrap_or(p).to_string()));
+                        }
                     }
                     let fav = mv.picker.is_favourite(id);
                     if ui.button(if fav { "★ Favourite" } else { "☆ Add to favourites" }).clicked() {
