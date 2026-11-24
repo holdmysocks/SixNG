@@ -596,8 +596,25 @@ fn four_layer(name_hash: &str, tex: &dyn Fn(usize) -> Value) -> Value {
         "detail_uv": {"default": "each layer's uv_set, uv_scale and uv_offset come from the material's constants (4344d2cc = scale and offset of the first UV set, 9ecaaa1e of the second, 724bed95 = which set each layer uses); on most map section tiles that is TEXCOORD_0 * 128 (world-planar, one repeat per 4 m; 64 was assumed until 2026-11-24). Without the constants: `recommended` follows this material's measured mapping (`uv_fit`): set pieces and rock formations using these shaders have their own UV0 (about 35 m per unit on the street-trash grounds), usually with a planar TEXCOORD_1 at 3 m per unit", "alt_uv_set": alt_uv, "note": "TEXCOORD_1 (61e09df7, 360e396b) is world-planar / 8 m on flat ground and unwrapped elsewhere (probably slopes); constant on b21f1ba5 ('fixuv1'), so that variant tiles from position. 27e5c49d ('uv3'): TEXCOORD_1 is not a usable UV (spans >1000), TEXCOORD_2 is an unwrap (not world-planar), so the alternative set is TEXCOORD_2 (low confidence). The shader also has a branch that samples a layer again at another scale (constant 26cc8f94); not decoded"},
         "vertex_color_channels": {"_COLOR1": "rgb = layer weights for layers 0, 1, 2 (the remainder is layer 3), a = how much they replace the lookup texture's weights", "_COLOR0": "rgb = a vertex tint (stored sRGB), a = its blend amount; from the shader code, not applied by the exporter"},
         "texcoord_2": "a copy of TEXCOORD_0 on most 61e09df7 primitives, constant elsewhere",
-        "height_blend": "the shader names end in hbb (height-based blend): each layer's data map B channel looks like a height map; sharpen the weights by height for the game's look",
-        "data_map_channels": {"a": "tint mask of the layer: how much of the tint colour replaces the layer colour (the shader can use 1 - a instead, by a material constant)", "g": "read, use not traced", "b": "read, and used as 1 - b in a later step that was not traced", "r": "not read by the program that was read", "source": "shader code"},
+        "height_blend": {
+            "source": "shader code: the main deferred pixel program of standard_uber_4lyr_dpm_dm_hbb, read once; the constants' values on real materials fit (medium confidence)",
+            "height": "h[k] = B channel of layer k's data map, sampled with the layer's UV",
+            "steps": [
+                "a[k] = max(0.01, (h[k] - 03754af2[k]) * b2339a6c[k])        (per-layer height offset and scale; usually 0 and 1)",
+                "b[k] = saturate(a[k] * w[k] * fade)                            (w = the layer weights; fade is a distance term, 1 nearby)",
+                "c[k] = b[k] / max(b[0], b[1], b[2], b[3], extra)               (extra: a fifth term that was not traced; 0 when absent)",
+                "p[k] = 20 - 19 * saturate((blendsoftness[k] - 0.2) * 1.754)    (exponent: 20 at softness 0.2 or less, 1 at 0.77 or more)",
+                "d[k] = pow(c[k], p[k]) - 0.001",
+                "W[k] = saturate(d[k] / (d[0] + d[1] + d[2] + d[3] + d_extra))",
+                "final[k] = f24b51f2[k] * W[k] + (1 - sum over j of f24b51f2[j] * W[j]) * w[k]"
+            ],
+            "switch": "f24b51f2[k] is 0 or 1 per layer: with 0 on all four layers (the usual case: 49 of 57 materials on 14 tiles) the weights stay as they are and no height blend happens",
+            "constants": "per layer, in params.per_layer of this material: 03754af2, b2339a6c, blendsoftness, f24b51f2",
+            "not_read": "the fade term, the fifth term, and the other variants' programs"
+        },
+        "data_map_channels": {"a": "tint mask of the layer: how much of the tint colour replaces the layer colour (the shader can use 1 - a instead, by a material constant)", "b": "height, for the height-based blend (see height_blend); also overlay-blended with the detail array's blue channel into a scalar that is scaled and offset per layer", "g": "a scalar that is accumulated per layer beside the colour and changed by the detail array and a grazing-angle term: roughness-like, not confirmed", "r": "not read by the programs that were read", "source": "shader code"},
+        "detail_array": {"texture": tex(6), "use": "a texture array sampled once per layer after the layer's colour; the slice is a per-layer constant, red and green are a detail normal (x2 - 1), blue (around 0.5) brightens or darkens the layer colour and feeds the height and roughness-like scalars", "source": "shader code (standard_uber_4lyr); medium confidence"},
+        "tint": "not applied by the exporter. From the shader code, per layer: the layer colour is mixed towards a tinted colour by the data map's alpha (the tint mask); the tinted colour combines the vertex tint (_COLOR0 rgb, scaled by verttintintensity[k]) and the section's tint texture (macro.tint, scaled by tintintensity[k]) with the layer colour's luminance (weights 0.2125, 0.7154, 0.0721), blended by tintblendamount[k]. Several branches chosen by constants were not resolved, so there is no single formula to apply yet",
         "confidence": {"slots": "high (recovered names)", "data_map_pairing": "high (shader code: each data map is sampled with its layer's colour and normal map)", "weights_uv": "high", "channel_rgb_to_layer012": "high (shader code)", "layer3_remainder": "high (shader code)", "detail_uv_scale": "low"},
         "note": "Slots, pairing, channel order and the remainder rule are confirmed from shader code (one deferred pixel program); the UV scales and the height blend are still from recovered names and UV/seam statistics. Normal maps: DirectX green.",
     })
@@ -627,6 +644,8 @@ mod paint_tests {
         assert_eq!(l["layers"][3]["colour"]["param"], 13);
         assert_eq!(l["layers"][3]["colour"]["status"], "no texture bound");
         assert_eq!(l["weights"]["texture"]["png"], "t2.png");
+        assert_eq!((l["height_blend"]["steps"].as_array().map(Vec::len), l["detail_array"]["texture"]["param"].as_u64()), (Some(7), Some(6)));
+        assert!(l["data_map_channels"]["b"].as_str().unwrap().starts_with("height") && l["tint"].as_str().unwrap().starts_with("not applied"));
         // where the weights come from, measured on the material's vertices
         let mut v = l.clone();
         four_layer_vertex_weights(&mut v, [[10u8, 20, 30, 255], [0, 0, 0, 255]].into_iter());
