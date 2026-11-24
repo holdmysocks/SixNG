@@ -140,6 +140,10 @@ pub struct ModelPicker {
     /// Index into `filtered` of the current model.
     pub cursor: Option<usize>,
     scroll_to_cursor: bool,
+    /// Place of every item in the alphabetical order of the names shown
+    /// (not the raw model names), with whether the game's names were
+    /// loaded when it was worked out.
+    name_rank: Option<(bool, Arc<Vec<u32>>)>,
     counts: HashMap<Cat, usize>,
     by_id: HashMap<String, u32>,
     recents: Vec<String>,
@@ -173,6 +177,7 @@ impl ModelPicker {
             dirty: true,
             cursor: None,
             scroll_to_cursor: false,
+            name_rank: None,
             counts: HashMap::new(),
             by_id: HashMap::new(),
             recents: saved.recents,
@@ -451,6 +456,25 @@ impl ModelPicker {
             .filter(|(_, it)| !self.hide_variants || !it.variant)
             .map(|(i, _)| i as u32)
             .collect();
+        // The items come in the order of their raw model names. With the
+        // friendly names on show the list is in the order of those instead
+        // ("Bravado '19 Buffalo" under B, not under its model name).
+        if !self.raw_names {
+            let loaded = self.friendly.is_some();
+            if self.name_rank.as_ref().is_none_or(|r| r.0 != loaded || r.1.len() != items.len()) {
+                let mut order: Vec<(String, u32)> = items.iter().enumerate().map(|(i, it)| (self.shown(it).to_lowercase(), i as u32)).collect();
+                order.sort();
+                let mut rank = vec![0u32; items.len()];
+                for (place, (_, i)) in order.iter().enumerate() {
+                    rank[*i as usize] = place as u32;
+                }
+                self.name_rank = Some((loaded, Arc::new(rank)));
+            }
+            if let Some((_, rank)) = &self.name_rank {
+                let rank = rank.clone();
+                self.filtered.sort_by_key(|i| rank[*i as usize]);
+            }
+        }
         self.cursor = current.and_then(|c| {
             self.filtered
                 .iter()
@@ -679,6 +703,8 @@ impl ModelPicker {
                 .changed()
             {
                 self.save();
+                // the order follows the names on show
+                self.dirty = true;
             }
             if ui
                 .checkbox(&mut self.hide_variants, "hide LOD copies")
