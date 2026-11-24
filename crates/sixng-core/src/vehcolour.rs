@@ -60,9 +60,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// Version of what an export writes for part colours (model.json
 /// `part_colours_version`); the model viewer exports older vehicles again.
-pub const EXPORT_VERSION: u32 = 20;
+pub const EXPORT_VERSION: u32 = 21;
 /// Layout version of `<work>/index/vehicle_parts.json`.
-pub const FORMAT: u32 = 18;
+pub const FORMAT: u32 = 19;
 
 const PART_SET: u32 = 0xf142_44fd;
 const SET_COLOURS: u32 = 0x7847_6477;
@@ -127,6 +127,10 @@ const ASSIGN_COLOUR: u32 = 0x2c89_a8d2;
 /// first is taken.
 const OPTION_LIST: u32 = 0xf5e9_d7df;
 const OPTION_PARTS: u32 = 0xbf34_0aab;
+/// A modifier that names something else by type (`type.tag`): 5 is a
+/// library part whose modifiers come along. The other types (0 to 4) are
+/// not read.
+const PART_REF: u32 = 0x51aa_b7c1;
 /// The channel body panels are bound to (bonnet, boot, bumpers, doors, at
 /// priority 1 over a default); no record assigns it a colour, so it is taken
 /// as the body paint.
@@ -217,6 +221,12 @@ pub struct Tables {
     /// of their name hash).
     #[serde(default)]
     pub shared_parts: HashMap<String, String>,
+    /// Model (8 hex digits) -> one of its own parts (8 hex digits) -> what
+    /// fitting that part on top of the model's usual configuration changes:
+    /// (part id, its new colour and surface). A body kit's part rebinds the
+    /// ids of its panels to the body paint this way.
+    #[serde(default)]
+    pub part_patches: HashMap<String, HashMap<String, Vec<(u8, Part)>>>,
 }
 
 /// A key for a configuration: FNV-1a of its part list (the name hashes in
@@ -269,6 +279,10 @@ struct Library {
     assigns: HashMap<u32, (u32, u32, u32)>,
     /// modifier name -> the parts of an option list (`f5e9d7df.bf340aab`)
     options: HashMap<u32, Vec<u32>>,
+    /// modifier name -> the library part it brings along (`51aab7c1` with
+    /// type 5): a body kit's part names the colour scheme part that binds
+    /// the kit's panels to the body paint
+    refs: HashMap<u32, u32>,
     /// configuration part name -> the models of its elements (joaat)
     part_models: HashMap<u32, Vec<u32>>,
     id: Option<String>,
@@ -295,7 +309,7 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
             }
             let m = &m;
             let dump = |h: u32| m.objects(h).into_iter().filter_map(|o| m.object(h, o, 0)).collect::<Vec<_>>();
-            let mut l = Library { colours: HashMap::new(), surfaces: HashMap::new(), wear: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), options: HashMap::new(), part_models: HashMap::new(), id: Some(e.id.clone()) };
+            let mut l = Library { colours: HashMap::new(), surfaces: HashMap::new(), wear: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), options: HashMap::new(), refs: HashMap::new(), part_models: HashMap::new(), id: Some(e.id.clone()) };
             for o in dump(OPTION_LIST) {
                 if let Some(n) = num(&o, NAME) {
                     l.options.insert(n as u32, get(&o, OPTION_PARTS).and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()).unwrap_or_default());
@@ -313,6 +327,11 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
                             l.groups.insert(r.u32(o + name_off), b.to_vec());
                         }
                     }
+                }
+            }
+            for o in dump(PART_REF) {
+                if let (Some(n), Some(5), Some(p)) = (num(&o, NAME), o["type"]["tag"].as_u64(), o["data"].as_u64()) {
+                    l.refs.insert(n as u32, p as u32);
                 }
             }
             for g in dump(GROUP_DEF) {
@@ -530,17 +549,43 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
             let Some(base) = t.sets.get(&set).cloned() else { continue };
             // (result, the configurations that give it), in first-seen order
             let mut results: Vec<(Vec<Part>, Vec<String>)> = Vec::new();
+            // the part list of the first configuration that gave each result
+            let mut firsts: Vec<&Vec<u32>> = Vec::new();
             for parts in configs {
                 let mut out = base.clone();
                 apply_config(&lib, own, parts, &mut out);
                 let ck = config_key(parts);
                 match results.iter_mut().find(|r| r.0 == out) {
                     Some(r) => r.1.push(ck),
-                    None => results.push((out, vec![ck])),
+                    None => {
+                        results.push((out, vec![ck]));
+                        firsts.push(parts);
+                    }
                 }
             }
             let most = results.iter().map(|r| r.1.len()).max().unwrap_or(0);
             let best = results.iter().position(|r| r.1.len() == most);
+            // What one more of the vehicle's own parts changes when it is
+            // fitted on top of the usual configuration: a part's modifier
+            // list can define a group of part ids (a kit's panels) that the
+            // configuration's bindings then colour (with the body paint).
+            if let Some(b) = best {
+                let (usual, parts0) = (&results[b].0, firsts[b]);
+                let mut patches: HashMap<String, Vec<(u8, Part)>> = HashMap::new();
+                for (x, _) in own.iter().filter(|(x, list)| !parts0.contains(x) && list.iter().any(|m| lib.group_defs.contains_key(m) || lib.refs.contains_key(m))) {
+                    let mut parts = parts0.clone();
+                    parts.push(*x);
+                    let mut out = base.clone();
+                    apply_config(&lib, own, &parts, &mut out);
+                    let d: Vec<(u8, Part)> = out.iter().zip(usual.iter()).enumerate().filter(|(_, (a, b))| a != b).map(|(i, (a, _))| (i as u8, *a)).collect();
+                    if !d.is_empty() {
+                        patches.insert(format!("{x:08x}"), d);
+                    }
+                }
+                if !patches.is_empty() {
+                    t.part_patches.insert(key.clone(), patches);
+                }
+            }
             for (ri, (out, keys)) in results.into_iter().enumerate() {
                 // each distinct result is a set of its own; the most common one is the model's
                 let name = if out == base {
@@ -590,6 +635,9 @@ fn apply_config(lib: &Library, own: &HashMap<u32, Vec<u32>>, parts: &[u32], set:
             out.push(m);
             if let Some(first) = lib.options.get(&m).and_then(|o| o.first()).filter(|_| depth < 3) {
                 collect(lib, own, *first, depth + 1, out);
+            }
+            if let Some(part) = lib.refs.get(&m).filter(|_| depth < 3) {
+                collect(lib, own, *part, depth + 1, out);
             }
         }
     }
@@ -754,8 +802,25 @@ impl Tables {
         let rows: Vec<Value> = names.iter().map(|n| self.sets.get(*n).map_or(Value::Null, |p| Value::String(row_table(p)))).collect();
         let wear: Vec<Value> = names.iter().map(|n| self.sets.get(*n).map_or(Value::Null, |p| Value::String(wear_table(p, mat)))).collect();
         let index = |n: &String| names.iter().position(|x| *x == n);
+        // what fitting one more part changes, as look entries
+        let patches: serde_json::Map<String, Value> = self
+            .part_patches
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter_map(|(part, d)| {
+                let mut set = self.sets.get(default)?.clone();
+                for (i, p) in d {
+                    set[*i as usize] = *p;
+                }
+                let look = look_table(&set, palette, u, mat);
+                let rgba: String = d.iter().flat_map(|x| look[x.0 as usize]).map(|b| format!("{b:02x}")).collect();
+                Some((part.clone(), serde_json::json!({"ids": d.iter().map(|x| x.0).collect::<Vec<_>>(), "rgba": rgba})))
+            })
+            .collect();
         serde_json::json!({
             "looks": looks,
+            "part_patches": patches,
             "rows": rows,
             "wear": wear,
             "configs": by_config.iter().filter_map(|(k, n)| Some((k.clone(), Value::from(index(n)?)))).collect::<serde_json::Map<String, Value>>(),

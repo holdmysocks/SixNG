@@ -2319,7 +2319,27 @@ impl ModelView {
             return;
         };
         let idx = idx as usize;
-        let decode = |hex: &str| -> Arc<Vec<[u8; 4]>> { Arc::new((0..256).map(|i| std::array::from_fn(|k| u8::from_str_radix(&hex[i * 8 + k * 2..i * 8 + k * 2 + 2], 16).unwrap_or(255))).collect()) };
+        // What the fitted parts change in the look (a body kit's part
+        // rebinds the ids of its panels, mostly to the body paint): part id
+        // and its new entry.
+        let mut patched: Vec<(usize, [u8; 4])> = Vec::new();
+        for part in l.info["fitted_parts"].as_array().into_iter().flatten().filter_map(|p| p.as_str()) {
+            let d = &pc["part_patches"][part];
+            let rgba = d["rgba"].as_str().unwrap_or("");
+            for (k, id) in d["ids"].as_array().into_iter().flatten().filter_map(|x| x.as_u64()).enumerate() {
+                if let Some(h) = rgba.get(k * 8..k * 8 + 8) {
+                    patched.push((id as usize & 255, std::array::from_fn(|c| u8::from_str_radix(&h[c * 2..c * 2 + 2], 16).unwrap_or(255))));
+                }
+            }
+        }
+        let patched = &patched;
+        let decode = |hex: &str| -> Arc<Vec<[u8; 4]>> {
+            let mut t: Vec<[u8; 4]> = (0..256).map(|i| std::array::from_fn(|k| u8::from_str_radix(&hex[i * 8 + k * 2..i * 8 + k * 2 + 2], 16).unwrap_or(255))).collect();
+            for (id, e) in patched {
+                t[*id] = *e;
+            }
+            Arc::new(t)
+        };
         // a freshly loaded model shows the default look, but a fitted
         // library part (a truck bed or box) comes with the colours of
         // another vehicle and is coloured again
@@ -2367,7 +2387,8 @@ impl ModelView {
                         out2.chunks_exact_mut(4).for_each(|c| c[3] = byte(4).unwrap_or(128));
                         let metal1 = byte(6).unwrap_or(0);
                         let px = first;
-                        let row = usize::from_str_radix(&rows[id * 4..id * 4 + 4], 16).unwrap_or(0xffff);
+                        // a part id a fitted part recolours has that colour, not its old row
+                        let row = if patched.iter().any(|p| p.0 == id) { 0xffff } else { usize::from_str_radix(&rows[id * 4..id * 4 + 4], 16).unwrap_or(0xffff) };
                         let out = &mut px[id * 512..id * 512 + 512];
                         match pal.get(row * 512..row * 512 + 512).filter(|_| row != 0xffff) {
                             Some(src) => out.copy_from_slice(src),
@@ -5594,6 +5615,8 @@ fn load_query_sel(
                 }
                 info["wheel_fit_applied"] = serde_json::json!({"out": out, "width": wide});
             }
+            // the part names fitted: their colour changes are applied with the look
+            info["fitted_parts"] = serde_json::json!(fitted.iter().map(|p| format!("{p:08x}")).collect::<Vec<_>>());
             let stock: Vec<(u64, u32, Vec<u32>)> = v
                 .switches
                 .iter()
