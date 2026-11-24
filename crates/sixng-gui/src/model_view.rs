@@ -1866,10 +1866,10 @@ impl ModelView {
             // token value (0.05 to 0.08); their wheel bones mark the skids
             // (an electric scooter has the same token wheelScale and no rim,
             // but its wheels have collision discs)
-            self.veh_no_wheels = !v.configs.is_empty()
-                && v.configs.iter().all(|c| c.rim.is_none())
-                && v.wheel_scale.is_some_and(|w| w < 0.1)
-                && self.discs().iter().all(|d| d.is_none());
+            // boats: an airboat has wheel bones and an ordinary wheelScale,
+            // but it is a boat
+            self.veh_no_wheels = crate::vehicle_db::is_boat(v.vtype)
+                || (!v.configs.is_empty() && v.configs.iter().all(|c| c.rim.is_none()) && v.wheel_scale.is_some_and(|w| w < 0.1) && self.discs().iter().all(|d| d.is_none()));
             self.veh_cfg = None;
             if !v.configs.is_empty() {
                 self.apply_config(v, self.cfg_request.filter(|i| *i < v.configs.len()).unwrap_or(0));
