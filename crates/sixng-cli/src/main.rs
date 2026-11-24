@@ -759,7 +759,7 @@ enum Cmd {
         #[arg(short, long)]
         out: PathBuf,
     },
-    /// Audio banks (ADAT) in an archive: scan once (index in <work>/index/audio_<archive>.json), then list banks and streams. Stream ids are hashes. A bank shows its container (the bank name hash, from the sound files or the bank list; run `audio-meta` once to record them) and the container's name where the name dictionary has one (`sixng names`); a stream shows its name where it was recovered.
+    /// Audio banks (ADAT) in an archive: scan once (index in <work>/index/audio_<archive>.json), then list banks and streams. Stream ids are hashes. A bank shows its container (the bank name hash, from the sound files or the bank list; run `audio-meta` once to record them) and the container's name where the name dictionary has one (`sixng names`); a stream shows its index in the bank and, where it has a name, the name, where it came from (`stored`: the bank's own name tag; `search`: the name search) and its full joaat (`hash`).
     Audio {
         /// Archive (default audio).
         #[arg(default_value = "audio")]
@@ -2711,7 +2711,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 .take(if *limit == 0 { usize::MAX } else { *limit })
                 .map(|b| {
                     let (container, name) = bank_name(b.off).map_or((None, None), |(c, n)| (Some(c), n));
-                    json!({"bank": format!("{:x}", b.off), "container": container, "name": name, "size": b.size, "seconds": b.seconds(), "streams": b.streams.iter().filter(|s| s.layout != "none" && s.seconds() >= *min_seconds).map(|s| json!({"id": format!("{:08x}", s.id), "name": stream_names.get(&b.off).and_then(|m| m.get(&s.id)), "seconds": s.seconds(), "samples": s.samples, "rate": s.rate, "codec": s.codec, "channels": s.channels, "layout": s.layout})).collect::<Vec<_>>()})
+                    json!({"bank": format!("{:x}", b.off), "container": container, "name": name, "size": b.size, "seconds": b.seconds(), "streams": b.streams.iter().enumerate().filter(|(_, s)| s.layout != "none" && s.seconds() >= *min_seconds).map(|(i, s)| json!({"index": i, "id": format!("{:08x}", s.id), "name": stream_names.get(&b.off).and_then(|m| m.get(&s.id)), "name_from": if b.names.contains_key(&s.id) { Some("stored") } else { stream_names.get(&b.off).and_then(|m| m.get(&s.id)).map(|_| "search") }, "hash": stream_names.get(&b.off).and_then(|m| m.get(&s.id)).map(|n| format!("{:08x}", sixng_core::meta7a::joaat(n))), "seconds": s.seconds(), "samples": s.samples, "rate": s.rate, "codec": s.codec, "channels": s.channels, "layout": s.layout})).collect::<Vec<_>>()})
                 })
                 .collect();
             out.print(&json!({"ok": true, "archive": a.id, "index": audio::index_path(&ws.work, &a.id), "banks": ix.banks.len(), "banks_with_container": ix.banks.iter().filter(|b| containers.contains_key(&b.off)).count(), "banks_named": named, "streams_named": stream_names.values().map(|m| m.len()).sum::<usize>(), "streams_by_layout": layouts, "codec_bytes": codecs, "total_seconds": secs, "list": list, "seconds": t.elapsed().as_secs_f64(), "note": ix.note}));
