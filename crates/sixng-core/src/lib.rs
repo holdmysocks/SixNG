@@ -60,6 +60,7 @@ pub mod vehlights;
 pub mod weapon;
 pub mod rpf9;
 pub mod scan;
+pub mod sectorgrid;
 pub mod shaderfx;
 pub mod surface;
 pub mod timecycle;

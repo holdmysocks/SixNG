@@ -666,6 +666,25 @@ enum Cmd {
         #[arg(long, short)]
         out: Option<PathBuf>,
     },
+    /// World sector grids (the PSO files of levels.rpf with struct
+    /// 9c834886): cells of a 60 m world grid with cell x and y (cell =
+    /// floor(world / 60 m)), a group hash, the index in the group and a
+    /// 64-bit value (0, or a model asset id). levels.rpf holds eight: the
+    /// world grid of 26,212 cells and seven small ones; the largest is used
+    /// unless --entry picks another. Prints a summary of each (count, groups, cell
+    /// range, world box). With -o writes <out>/sector_grid/: sector_grid.csv (one line per
+    /// cell with its world box), sector_grid.json (summary and records) and
+    /// sector_grid.png (mask, one pixel per cell, north up).
+    SectorGrid {
+        /// Archive (default levels).
+        #[arg(default_value = "levels")]
+        archive: String,
+        /// Entry id of the grid to write (default: the one with most cells).
+        #[arg(long)]
+        entry: Option<String>,
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
     /// Fonts of the UI movies (Scaleform font libraries in data.rpf:
     /// DefineFont3 outlines, code table, layout). Lists them as JSON; with
     /// -o writes <out>/fonts/<name>.ttf (TrueType, for CSS @font-face) and
@@ -2211,6 +2230,45 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 res["out"] = json!(dir);
             }
             out.print(&json!({"ok": true, "result": res}));
+        }
+        Cmd::SectorGrid { archive, entry, out: po } => {
+            use sixng_core::sectorgrid as sg;
+            let grids = sg::load_all(&ws, archive)?;
+            if grids.is_empty() {
+                anyhow::bail!("no sector grid (PSO struct {:08x}) in {archive}", sg::RECORD);
+            }
+            let pick = match entry {
+                Some(id) => grids.iter().position(|(i, _)| i == id || i.ends_with(&format!("@{}", id.trim_start_matches("0x")))).ok_or_else(|| anyhow!("--entry {id}: not a sector grid"))?,
+                None => sg::largest(&grids).unwrap(),
+            };
+            let desc = |id: &str, g: &sg::SectorGrid| {
+                json!({
+                    "entry": id, "records": g.sectors.len(), "groups": g.groups(), "cell_m": sg::CELL_M,
+                    "cell_range": g.cell_range().map(|r| json!({"min_x": r[0], "min_y": r[1], "max_x": r[2], "max_y": r[3]})),
+                    "world_bounds_m": g.world_bounds().map(|(lo, hi)| json!({"min": lo, "max": hi})),
+                    "nonzero_zero_field": g.sectors.iter().filter(|s| s.zero != 0).count(),
+                    "nonzero_hash64": g.sectors.iter().filter(|s| s.hash64 != 0).count(),
+                })
+            };
+            let (id, g) = &grids[pick];
+            let mut summary = json!({
+                "grids": grids.iter().map(|(i, g)| desc(i, g)).collect::<Vec<_>>(), "selected": pick,
+                "cell_rule": "cell = floor(world / cell_m); cell (x, y) covers x*cell_m .. (x+1)*cell_m (measured, see sectorgrid.rs)",
+            });
+            if let Some(po) = po {
+                let dir = po.join("sector_grid");
+                std::fs::create_dir_all(&dir)?;
+                std::fs::write(dir.join("sector_grid.csv"), sg::to_csv(g))?;
+                sg::write_mask_png(g, &dir.join("sector_grid.png"))?;
+                let mut j = desc(id, g);
+                j["cell_rule"] = summary["cell_rule"].clone();
+                j["image"] = json!("sector_grid.png");
+                j["image_rows"] = json!("north to south: pixel (c, r) = cell (min_x + c, max_y - r)");
+                j["sectors"] = serde_json::to_value(&g.sectors)?;
+                std::fs::write(dir.join("sector_grid.json"), serde_json::to_vec(&j)?)?;
+                summary["out"] = json!(dir);
+            }
+            out.print(&json!({"ok": true, "result": summary}));
         }
         Cmd::Fonts { archive, name, out: po } => {
             let a = ws.resolve(archive)?;
