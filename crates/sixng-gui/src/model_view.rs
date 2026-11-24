@@ -1218,6 +1218,11 @@ impl ModelView {
 
     /// Car extras settled: vehicle data applied and the fitted wheels loaded.
     fn idle_for_shot(&self) -> bool {
+        self.idle_for_model() && !self.livery.ed.busy()
+    }
+
+    /// The loaded model is complete (a vehicle has its data, parts and wheels).
+    fn idle_for_model(&self) -> bool {
         if self.parts_request.is_some() || self.fit_parts_once.is_some() || self.random_parts_once || !self.hair.settled() || self.auto.then.is_some() || self.auto.find_hair || self.auto.export_hair || self.hair.fitting || self.ped_clip.loading || (!self.ped_clip.want.trim().is_empty() && self.ped_clip.anim.is_none() && self.ped_clip.status.starts_with("loading")) {
             return false;
         }
@@ -2550,13 +2555,31 @@ impl ModelView {
         self.apply_paint(rs);
     }
 
+    /// A vehicle is loaded: it has wheels, or part colours (boats, aircraft).
+    fn is_vehicle(&self) -> bool {
+        self.loaded.as_ref().is_some_and(|l| l.info["part_colours"].is_object() || l.info["wheel_mounts"].as_array().is_some_and(|a| !a.is_empty()))
+    }
+
+    /// The pointer on the model while the Liveries panel has a tool on.
+    /// True when the panel used it (the camera then leaves it alone).
+    fn livery_pointer(&mut self, ui: &egui::Ui, resp: &egui::Response, rect: egui::Rect) -> bool {
+        if !self.is_vehicle() || self.gpu.is_none() {
+            return false;
+        }
+        let cache = self.cache_dir();
+        self.livery.ed.ready = !self.loading && self.idle_for_model() && self.frames_since_load >= 3;
+        let Some(l) = &self.loaded else { return false };
+        let env = crate::livery_ui::Env { game: &self.game, work: &self.work, cache: &cache };
+        self.livery.pointer(ui, resp, rect, &self.cam, &l.model, &env)
+    }
+
     /// Keep the loaded vehicle's stickers (custom liveries) on the GPU.
     fn sync_livery(&mut self, rs: &egui_wgpu::RenderState) {
         let cache = self.cache_dir();
-        let (Some(l), Some(g)) = (&self.loaded, self.gpu.as_mut()) else { return };
-        if !l.info["part_colours"].is_object() && !l.info["wheel_mounts"].as_array().is_some_and(|a| !a.is_empty()) {
+        if !self.is_vehicle() {
             return;
         }
+        let (Some(l), Some(g)) = (&self.loaded, self.gpu.as_mut()) else { return };
         let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
         let parts: Vec<String> = l.info["assembled_from"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
         let key = crate::livery::vehicle_key(&crate::vehicle_db::model_key(&l.source));
@@ -3324,7 +3347,10 @@ impl ModelView {
         // viewport
         let avail = ui.available_size();
         let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
-        self.cam.handle(ui, &resp);
+        // the Liveries panel's tools take a click or drag on the model first
+        if !self.livery_pointer(ui, &resp, rect) {
+            self.cam.handle(ui, &resp);
+        }
         if resp.double_clicked() {
             if let Some(g) = &self.gpu {
                 self.cam.fly = false;
@@ -3337,6 +3363,12 @@ impl ModelView {
         let px = [(rect.width() * ppp) as u32, (rect.height() * ppp) as u32];
         self.size = px;
         self.update_wheels(rs, &ctx);
+        // the Liveries panel floats over the view
+        if self.is_vehicle() {
+            let cache = self.cache_dir();
+            let env = crate::livery_ui::Env { game: &self.game, work: &self.work, cache: &cache };
+            self.livery.panel(&ctx, rect, &env);
+        }
         self.sync_livery(rs);
         if self.rotor_speed > 0.0 && self.air.iter().any(|p| p.kind == AirKind::Spin) {
             // slow enough to see the blades below half speed; the blurred
@@ -3529,7 +3561,7 @@ impl ModelView {
             // then showed the car without wheels); 180 s is the last resort.
             let busy = self.wheel_loading || self.brake_loading || matches!(&*self.vehicles.state.lock().unwrap(), crate::vehicle_db::State::Loading(_));
             let ready = (self.gpu.is_some() && !self.loading && self.frames_since_load >= 3 && settled)
-                || (!self.loading && !self.hair.fitting && !self.auto.find_hair && !self.auto.export_hair && self.hair.settled() && self.auto.frames > 600 && (!busy || ctx.input(|i| i.time) > 180.0));
+                || (!self.loading && !self.hair.fitting && !self.auto.find_hair && !self.auto.export_hair && self.hair.settled() && self.auto.frames > 600 && !self.livery.ed.busy() && (!busy || ctx.input(|i| i.time) > 180.0));
             if ready {
                 if let Some((w, h, px)) = ren.read_back(rs) {
                     match render3d::save_png(&path, w, h, &px) {
@@ -3676,6 +3708,10 @@ impl ModelView {
         ui.add(egui::Slider::new(&mut self.look.emissive, 0.0..=12.0).text("emissive"));
         ui.add(egui::Slider::new(&mut self.look.wet, 0.0..=1.0).text("wet"));
         ui.separator();
+        if self.is_vehicle() {
+            ui.toggle_value(&mut self.livery.ed.open, "🎨 Liveries")
+                .on_hover_text("Place stickers (logos, lettering) on this vehicle by hand: pictures from the game's sticker textures or your own PNG files, on the panels you choose. Saved per vehicle.");
+        }
         self.vehicle_ui(ui);
         if self.part_ramp_done.is_some() && self.loaded.as_ref().is_some_and(|l| l.model.materials.iter().any(|m| m.ramp.is_some())) {
             ui.add(egui::Slider::new(&mut self.look.wear, 0.0..=1.0).text("wear"))

@@ -16,6 +16,7 @@ mod cells;
 mod fabric;
 mod glb;
 mod livery;
+mod livery_ui;
 mod map2d;
 mod map3d;
 mod map_cells;
@@ -1731,6 +1732,22 @@ impl App {
         }
         m.livery.open_once = c.get("livery").map(PathBuf::from);
         m.livery.info_once = c.get("livery-info").map(PathBuf::from);
+        // the Liveries panel, and scripted steps in it (checks without a mouse)
+        let pairs = |s: &str| -> Vec<[f32; 2]> { s.split(';').filter_map(|p| p.split_once(',').and_then(|(x, y)| Some([x.trim().parse().ok()?, y.trim().parse().ok()?]))).collect() };
+        m.livery.ed.open = c.has("livery-panel");
+        m.livery.ed.picker_open = c.has("livery-picker");
+        m.livery.ed.auto_select = c.get("livery-select").and_then(|s| s.parse().ok());
+        m.livery.ed.auto_add = c.get("livery-add").map(|s| s.split(',').map(str::to_string).collect()).unwrap_or_default();
+        m.livery.ed.auto_click = c.get("livery-click").map(pairs).unwrap_or_default();
+        m.livery.ed.auto_drag = c.get("livery-drag").map(pairs).and_then(|v| v.first().copied());
+        m.livery.ed.auto_save = c.has("livery-save");
+        if let Some(t) = c.get("livery-tool") {
+            m.livery.ed.tool = match t {
+                "zones" => crate::livery_ui::Tool::Zones,
+                "move" => crate::livery_ui::Tool::Move,
+                _ => crate::livery_ui::Tool::None,
+            };
+        }
         m.show_skeleton = c.has("skeleton");
         m.show_normals = c.has("normals");
         m.decal_bias = !c.has("no-decal-bias");
