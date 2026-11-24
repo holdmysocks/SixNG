@@ -229,7 +229,7 @@ fn readable_materials(model: &str, shaders: &[crate::drawable::Shader], mats: &s
             for t in m["textures"].as_array().into_iter().flatten() {
                 let hash = t["param_hash"].as_str().unwrap_or("");
                 let mut rec = serde_json::Map::new();
-                for (to, from) in [("file", "png"), ("role", "role_guess"), ("status", "status"), ("width", "width"), ("height", "height"), ("format", "format"), ("texture_hash", "hash64")] {
+                for (to, from) in [("file", "png"), ("role", "role_guess"), ("status", "status"), ("width", "width"), ("height", "height"), ("format", "format"), ("texture_hash", "hash64"), ("slices", "slices")] {
                     if !t[from].is_null() {
                         rec.insert(to.to_string(), t[from].clone());
                     }
@@ -269,7 +269,7 @@ fn readable_materials(model: &str, shaders: &[crate::drawable::Shader], mats: &s
         .collect();
     serde_json::json!({
         "model": model,
-        "note": "One record per material, in the order of the GLB's materials. shader and the keys of textures and parameters are names where the name is known, else the 8-digit hash (joaat of the lower-case name). A texture's file is relative to the export folder; base_color and normal are the paths the GLB uses, relative to this folder. role is a guess from the slot and the format. A parameter's value is the four floats the material stores for it (a scalar uses the first, a colour the first three); what each parameter does is not decoded, and the names are the game's own. parameters_not_read are parameters the shader lists whose values lie outside the material's constant block. Normal maps are DirectX style (green = +v down). model.json holds the same data with the full technical record.",
+        "note": "One record per material, in the order of the GLB's materials. shader and the keys of textures and parameters are names where the name is known, else the 8-digit hash (joaat of the lower-case name). A texture's file is relative to the export folder, and so are its slices when the texture is an array (file is slice 0); base_color and normal are the paths the GLB uses, relative to this folder. role is a guess from the slot and the format. A parameter's value is the four floats the material stores for it (a scalar uses the first, a colour the first three); what each parameter does is not decoded, and the names are the game's own. parameters_not_read are parameters the shader lists whose values lie outside the material's constant block. Normal maps are DirectX style (green = +v down). model.json holds the same data with the full technical record.",
         "materials": list,
     })
 }
@@ -3297,13 +3297,14 @@ mod dictionary_tests {
             ]
         }])).unwrap();
         let mats = serde_json::json!([{"classification": {"class": "opaque"}, "base_color": "a.png", "normal": null,
-            "textures": [{"param_hash": "33333333", "param_name": "diffusetex", "png": "a.png", "role_guess": "colour (sRGB)", "hash64": "00"},
+            "textures": [{"param_hash": "33333333", "param_name": "diffusetex", "png": "a.png", "role_guess": "colour (sRGB)", "hash64": "00", "slices": ["a.png", "a_1.png"]},
                          {"param_hash": "44444444", "param_name": null, "status": "missing"},
                          {"param_hash": "44444444", "param_name": null, "png": "b.png"}]}]);
         let j = readable_materials("m", &shaders, &mats);
         let m = &j["materials"][0];
         assert_eq!(m["shader"], "0badf00d");
         assert_eq!(m["textures"]["diffusetex"]["file"], "a.png");
+        assert_eq!(m["textures"]["diffusetex"]["slices"][1], "a_1.png");
         assert_eq!(m["textures"]["44444444"]["status"], "missing");
         assert_eq!(m["textures"]["44444444 #2"]["file"], "b.png");
         assert_eq!(m["parameters"]["11111111"], serde_json::json!([1.0, 0.5, 0.0, 0.0]));
