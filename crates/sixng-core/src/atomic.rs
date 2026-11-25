@@ -59,11 +59,12 @@ impl AtomicFile {
         &self.target
     }
 
-    /// Flush, sync and rename over the target.
+    /// Flush and rename over the target. There is no fsync: it costs
+    /// several ms a file, and a killed process loses nothing written
+    /// before the rename (only an OS crash could).
     pub fn commit(mut self) -> io::Result<()> {
         let w = self.w.take().expect("committed once");
         let r = w.into_inner().map_err(|e| e.into_error()).and_then(|f| {
-            f.sync_data()?;
             drop(f);
             rename_over(&self.temp, &self.target)
         });
