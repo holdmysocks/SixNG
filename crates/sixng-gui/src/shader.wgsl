@@ -1095,11 +1095,27 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             u = clamp(d.g, 0.004, 0.996);
             k = clamp(d.b * wear_amt * 2.0, 0.0, 1.0);
         }
-        if (wear_mask) {
-            let t = wear_threshold(wear_amt);
-            k = smoothstep(t, t + 0.08, textureSample(t_wear, samp, i.uv0 * WEAR_TILING).g);
-        }
         let id = floor(i.col.a * 255.0 + 0.5);
+        if (wear_mask) {
+            let m = textureSample(t_wear, samp, i.uv0 * WEAR_TILING).rgb;
+            if (F.jitter.w < 0.0) {
+                // the game's first wear layer: each mask channel scaled by
+                // the part's control term, then windowed (start, width), the
+                // windows summed (columns 16 to 24 of the part's coat row)
+                let row = 768 + i32(id);
+                var s = 0.0;
+                for (var c = 0; c < 3; c++) {
+                    let sc = textureLoad(t_em, vec2(16 + c, row), 0).a;
+                    let st = textureLoad(t_em, vec2(19 + c, row), 0).a;
+                    let wd = max(textureLoad(t_em, vec2(22 + c, row), 0).a, 1.0 / 255.0);
+                    s += clamp((clamp(m[c] * sc, 0.0, 1.0) - st) / wd, 0.0, 1.0);
+                }
+                k = clamp(s, 0.0, 1.0);
+            } else {
+                let t = wear_threshold(wear_amt);
+                k = smoothstep(t, t + 0.08, m.g);
+            }
+        }
         let w1 = textureSampleLevel(t_em, samp, vec2(u, (id + 256.5) / RAMP_ROWS), 0.0);
         let m1 = textureSampleLevel(t_em, samp, vec2(u, (id + 0.5) / RAMP_ROWS), 0.0).a;
         albedo = mix(albedo, w1.rgb, k);

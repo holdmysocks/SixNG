@@ -379,25 +379,45 @@ fn untile_mip(r: &Resource, t: &TexInfo, l: &crate::gfx10::Layout, m: usize) -> 
     Ok(l.untile(&r.gfx[start..end], m))
 }
 
-/// Linear data of every slice of an uncompressed texture with more than
-/// one, as `[mip][slice]`: the layers of a 2D array or cube (mip 0 only), or
-/// the depth slices of each mip of a volume (half as many per mip). `None`
-/// when the texture has one slice or its layout is not mapped (compressed
-/// formats, arrays with mips).
+/// Linear data of every slice of a texture with more than one, as
+/// `[mip][slice]`: the layers of a 2D array or cube, or the depth slices of
+/// each mip of a volume (half as many per mip). `None` when the texture has
+/// one slice or its layout is not mapped (uncompressed arrays with mips,
+/// block-compressed volumes).
+///
+/// Uncompressed arrays give mip 0 only. Block-compressed arrays and cubes
+/// give the mips of [`exportable_mips`]: in the texture dictionaries they are
+/// stored slice by slice, each slice's whole `SW_4KB_S` chain back to back
+/// (unlike the bulk stores, which store them level by level). Measured on
+/// the BC7 blood and crumple-normal arrays: mip 1 of every slice matches its
+/// mip 0 averaged 2 x 2 at 38 to 99 dB this way, against 11 to 16 dB level
+/// by level, and slice 0 equals the single-slice decode.
 pub fn slices_linear(r: &Resource, t: &TexInfo) -> Result<Option<(Fmt, Vec<Vec<Vec<u8>>>)>> {
     let fmt = Fmt::from_dxgi(t.dxgi_format);
     if t.depth <= 1 || fmt == Fmt::Unknown {
         return Ok(None);
     }
-    let Some(l) = uncompressed_layout(fmt, t) else { return Ok(None) };
+    let (l, nmips) = if fmt.block_dim() == 1 {
+        let Some(l) = uncompressed_layout(fmt, t) else { return Ok(None) };
+        if l.block_d == 1 && t.mips > 1 {
+            return Ok(None);
+        }
+        let n = l.mips.len();
+        (l, n)
+    } else {
+        if t.dimension == 3 {
+            return Ok(None);
+        }
+        let bd = fmt.block_dim();
+        let base = crate::gfx10::Layout::new(crate::gfx10::Swizzle::S4K, t.width.div_ceil(bd), t.height.div_ceil(bd), t.mips, fmt.bytes_per_elem());
+        let Some(l) = base.and_then(|l| l.with_cube_copies(t.depth, 1, Some(0))) else { return Ok(None) };
+        (l, exportable_mips(t) as usize)
+    };
     let volume = l.block_d > 1;
-    if !volume && t.mips > 1 {
-        return Ok(None);
-    }
     let start = t.data_off as usize;
     let end = start + l.total.max(l.block_bytes) as usize;
     let src = r.gfx.get(start..end).ok_or_else(|| anyhow!("texture data out of range"))?;
-    let mips = (0..l.mips.len())
+    let mips = (0..nmips)
         .map(|m| {
             let n = if volume { (l.slices >> m).max(1) } else { l.slices };
             (0..n).map(|sl| l.untile_slice(src, m, sl)).collect()
