@@ -774,13 +774,23 @@ again**).
   on the shared skeleton. Clothes and accessories follow the skin under
   them (each point moves with the nearest skin vertices), because the
   data the game shapes clothes with is not decoded. Small accessories
-  move as one piece.
+  move as one piece. A helper bone's scale shapes its own vertices but
+  does not carry into the bones under it (since 2026-11-25; before, the
+  rig's up-to-3x scales on the chest helpers pushed the bones below them
+  several centimetres out, which tore the chest of heavy male shapes;
+  `--body-shape` exports pose the same way).
+  This is inferred from the results, not read from the game. The game's
+  rig and its body-shape presets have no face controls, so the face does
+  not change with the sliders. Each rig also reads 14 inputs that no
+  known control drives; they stay at 0.
 - The viewer's **Parts** panel lists every part an animal or character
   has, grouped by slot (body, eye, crown, shirt, harness …; head, top,
   outer, bottom, feet, hat, glasses …). Pick one per group or "none";
   accessories (hats, harnesses, holsters …) and alternate sets start off.
   Animal sets that span several parts (`08 collarharness`: body + harness,
   `09 corpse roadkill`) have a button each, and **Defaults** goes back.
+  Only the parts shown hide skin under them: a garment switched off no
+  longer leaves its hole in the body (before 2026-11-25 it did).
   The camera stays put while parts change, and the item page's Export and
   Files follow the parts shown in the viewer.
 - **Head skins** (since 2026-11-21): ped heads bind no textures in the

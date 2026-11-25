@@ -5297,7 +5297,9 @@ fn load_parts(
                 continue;
             }
             by_distance.retain(|r| r != range);
-            let masks: Vec<&str> = fx.iter().filter(|(o, _)| *o != off).flat_map(|(_, f)| f.hides.iter()).filter(|h| h.0 == *layer).map(|h| h.1.as_str()).collect();
+            // only the items shown hide anything: a garment switched off
+            // in the Parts panel leaves the skin under it whole
+            let masks: Vec<&str> = fx.iter().filter(|(o, _)| *o != off && parts.iter().any(|e| e.off == **o)).flat_map(|(_, f)| f.hides.iter()).filter(|h| h.0 == *layer).map(|h| h.1.as_str()).collect();
             let hide: Vec<bool> = (0..256u32).map(|n| masks.iter().any(|k| sixng_core::wardrobe::mask_has(k, n))).collect();
             for i in range.clone() {
                 let Some(me) = m.meshes.get_mut(i) else { continue };

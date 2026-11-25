@@ -362,20 +362,33 @@ pub fn pose(bones: &[Bone], rig: &Rig, inputs: &HashMap<u32, f32>) -> Option<(Ve
             }
         }
     }
+    // A bone's scale shapes its own vertices but does not carry into its
+    // children: a child sits at its translation from the parent's unscaled
+    // frame. The rig scales helper bones by up to about 3x along one axis;
+    // passed down, that moves the child bones under them several
+    // centimetres further (torn chest folds and pointed chests on heavy
+    // shapes). Inferred from the results, not read from the game.
     let mut out = binds.clone();
+    // each bone's model transform without its own scale
+    let mut frame = binds.clone();
     for i in 0..bones.len() {
         // parents come before children in RAGE skeletons; fall back to bind
-        let local = if touched[i] { from_trs(trs[i].0, trs[i].1, trs[i].2) } else {
-            match bones[i].parent {
+        // untouched bones keep their bind offset (no scale) as it is
+        let (unscaled, s) = if touched[i] {
+            (from_trs(trs[i].0, trs[i].1, [1.0; 3]), trs[i].2)
+        } else {
+            let local = match bones[i].parent {
                 Some(p) => mul(&affine_inverse(&binds[p as usize]), &binds[i]),
                 None => binds[i],
-            }
+            };
+            (local, [1.0; 3])
         };
-        out[i] = match bones[i].parent {
-            Some(p) if (p as usize) < i => mul(&out[p as usize], &local),
+        frame[i] = match bones[i].parent {
+            Some(p) if (p as usize) < i => mul(&frame[p as usize], &unscaled),
             Some(_) => binds[i],
-            None => local,
+            None => unscaled,
         };
+        out[i] = if s == [1.0; 3] { frame[i] } else { mul(&frame[i], &from_trs([0.0; 3], [0.0, 0.0, 0.0, 1.0], s)) };
     }
     Some((out, applied))
 }
@@ -495,5 +508,28 @@ mod tests {
         let (t, q, s) = to_trs(&m);
         let m2 = from_trs(t, q, s);
         assert!(m.iter().zip(&m2).all(|(a, b)| (a - b).abs() < 1e-4));
+    }
+
+    #[test]
+    fn scale_does_not_carry_to_children() {
+        let bone = |i: u16, name: &str, parent: Option<u16>, z: f32| {
+            let mut b: Bone = serde_json::from_value(serde_json::json!({"index": i, "name": name, "parent": parent, "next_sibling": null, "flags": 0, "hash16": 0, "rotation": [0.0, 0.0, 0.0, 1.0], "translation": [0.0, 0.0, z], "scale": [1.0, 1.0, 1.0]})).unwrap();
+            b.bind_matrix = Some(from_trs([0.0, 0.0, z], [0.0, 0.0, 0.0, 1.0], [1.0; 3]));
+            b
+        };
+        // root at 0, parent at 1 m, child 0.1 m above the parent
+        let bones = vec![bone(0, "root", None, 0.0), bone(1, "parent", Some(0), 1.0), bone(2, "child", Some(1), 1.1)];
+        let rig = Rig {
+            registers: 4,
+            inputs: HashMap::from([(7, 0)]),
+            tracks: HashMap::from([(1, joaat("parent"))]),
+            blocks: vec![Block::Pass(vec![Op { track: 1, weight: 0, kind: Kind::Scale, delta: [0.0, 0.0, 2.0, 0.0] }])],
+        };
+        let (m, applied) = pose(&bones, &rig, &HashMap::from([(7, 1.0)])).unwrap();
+        assert_eq!(applied, 1);
+        // the parent is scaled 3x along z; the child keeps its 0.1 m offset
+        assert!((m[1][10] - 3.0).abs() < 1e-5);
+        assert!((m[2][14] - 1.1).abs() < 1e-5);
+        assert!((m[2][10] - 1.0).abs() < 1e-5);
     }
 }
