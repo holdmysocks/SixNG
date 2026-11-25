@@ -1351,7 +1351,7 @@ impl ModelView {
                         // reads as 1 in the normal state (its per-instance scale is not fully read), and drawing fewer
                         // strands does not widen the rest
                         let share_widen = 1.0f32;
-                        if std::env::var("SIXNG_DEBUG_HAIR").is_ok() { let mut h = [0usize; 4]; for s in 0..coat.guides.len() { h[var(s)] += 1; } let mut st: std::collections::BTreeMap<[u8; 4], usize> = Default::default(); for p in &g.pick_steps { *st.entry(*p).or_default() += 1; } eprintln!("coat {off:x}: stored {} k {} share {share:.3} width {:.2} mm (base {:.2} mm) tint weight {:.3} variants {h:?} thresholds {:?}", g.stored_strands(), k, w * 1000.0, base * 1000.0, g.tint_weight, st.iter().take(6).collect::<Vec<_>>()); }
+                        if std::env::var("SIXNG_DEBUG_HAIR").is_ok() { let mut h = [0usize; 4]; for s in 0..coat.guides.len() { h[var(s)] += 1; } let mut st: std::collections::BTreeMap<[u8; 4], usize> = Default::default(); for p in &g.pick_steps { *st.entry(*p).or_default() += 1; } eprintln!("coat {off:x}: stored {} k {} share {share:.3} width {:.2} mm (base {:.2} mm) tint weight {:.3} variants {h:?} thresholds {:?}", g.stored_strands(), k, w * 1000.0, base * 1000.0, g.tint_weight, st.iter().take(6).collect::<Vec<_>>()); eprintln!("  head +0x20 {:x} +0x24 {:x} clump {} styles {:?}", g.head.get(0x20..0x24).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap())), g.head.get(0x24..0x28).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap())), g.clump_type, g.styles.iter().map(|s| (s.lo, s.hi, s.samples.len())).collect::<Vec<_>>()); }
                         // the atlas colour is stored sRGB-encoded: the linear base colour is its sRGB decode
                         let lin8 = |c: [f32; 3], m: [u8; 3]| -> [u8; 4] { [0, 1, 2].map(|q| ({ let x = c[q].clamp(0.0, 1.0); if x < 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) } } * m[q] as f32 + 0.5) as u8).iter().copied().chain([255u8]).collect::<Vec<u8>>().try_into().unwrap() };
                         let blend = |s: usize| -> [u8; 3] {
@@ -6886,7 +6886,26 @@ fn load_query_sel(
                 }
                 look_info = Some(info);
             }
-            Err(e) => look_err = Some(e),
+            Err(e) => {
+                // Not in the game's outfit list (cutscene heads and the like):
+                // its own parts are drawn. Its hair parts are strand-hair
+                // placeholders, and their grooms are linked by the
+                // placeholder's name, so they are drawn the same way.
+                if let Ok(t) = sixng_core::hairlink::get(&ws.work, &a, &ix.entries) {
+                    let mut info = LookInfo { model: prefix.to_string(), labels: vec!["own parts (not in the game's outfit list)".into()], ..Default::default() };
+                    for o in opts.iter().filter(|o| o.default) {
+                        let Some(l) = t.by_placeholder(&o.name.to_ascii_lowercase()) else { continue };
+                        let slot = sixng_core::pedlook::slot_of(&l.placeholder);
+                        let shown = l.confidence >= 0.5 && slot != "body hair" && l.part != "body";
+                        info.hair.push(HairPick { slot, placeholder: l.placeholder.clone(), confidence: l.confidence, exact: t.exact, grooms: t.uncontested(l), off_head: 0, shown, colour: None, tone: None });
+                    }
+                    if !info.hair.is_empty() {
+                        info.notes.push("Not in the game's outfit list: its own parts, with the strand hair linked to its hair parts by name. No hair colour is stored for it here: the hair takes the picker's colour.".into());
+                        look_info = Some(info);
+                    }
+                }
+                look_err = Some(e);
+            }
         }
         if opts.is_empty() {
             return Err(anyhow::anyhow!("no parts found for {prefix}"));
