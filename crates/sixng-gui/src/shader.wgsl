@@ -834,7 +834,8 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             let m_h = max(0.001, (1.0 - g0h) * (1.0 - g0h));
             let nv_h = max(abs(dot(v, tube)), 0.0001);
             let rg_h = 1.0 - g0h;
-            let c4 = vec4(-1.0, -0.0275, -0.572, 0.022) * rg_h + vec4(1.0, 0.0425, 1.04, -0.04);
+            // the game reads its table at roughness 0.5 + 0.5 (1 - g0): the upper half of the axis
+            let c4 = vec4(-1.0, -0.0275, -0.572, 0.022) * (0.5 + 0.5 * rg_h) + vec4(1.0, 0.0425, 1.04, -0.04);
             let a004 = min(c4.x * c4.x, exp2(-9.28 * nv_h)) * c4.x + c4.y;
             let e_ab = vec2(-1.04, 1.04) * a004 + c4.zw;
             let e_r = max(e_ab.y, 0.0);
