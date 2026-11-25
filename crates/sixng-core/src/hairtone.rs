@@ -42,24 +42,41 @@ pub const TILING: &str = "a43cad33";
 /// Struct of a set: four references to presets, one per strand variant.
 pub const SET: u32 = 0xcb83_80c7;
 /// Struct of a painted hair layer of the head skin (the hair colour on the
-/// scalp under the strands, the brows under the brow strands): a mask
-/// texture, three more textures and numbers. 642 records in the appearance
-/// library.
+/// scalp under the strands, the brows under the brow strands): a mask, a
+/// direction map, a detail texture, a normal map and numbers. 642 records
+/// in the appearance library. The head's own pixel program draws the
+/// layers (read from the game's code by the shader archive work).
 pub const UNDER: u32 = 0x7fc5_6571;
-/// Struct of a layer set: four references to layers. A hair item's set has
-/// the name of its placeholder (joaat of the drawable name without
-/// `_full`); the third reference (`c13c74b5`) is the item's own layer.
+/// Struct of a layer set: four slots, each a reference to a layer. A hair
+/// item's set has the name of its placeholder (joaat of the drawable name
+/// without `_full`, the item's tag `023e5a2f`). Slot i is coloured by
+/// preset i of the item's colour preset set ([`SET`], tag `f7b14eb8`).
 pub const UNDER_SET: u32 = 0x1e87_5c1c;
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 
-/// The painted hair layer of a hair item: its mask texture (store hash)
-/// and the number that reads as its opacity (`0a43bed0`: 0.45 to 0.66 on
-/// scalp layers, 0.83 to 1 on brows; what the game does with it is not
-/// traced).
+/// One painted hair layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UnderLayer {
+    /// Slot of the layer set (0..3).
+    pub slot: usize,
+    /// Mask (green: density), direction map (red, green), detail texture
+    /// (red: colour mix, blue: alpha); store hashes.
     pub mask: u64,
+    pub direction: u64,
+    pub detail: u64,
+    /// Density runs from `lo` (`03a9e780`) to `hi` (`0a43bed0`) of the mask's green.
+    pub lo: f32,
+    pub hi: f32,
+    /// `ef2774fe`: how much the detail texture breaks the density up.
+    pub strength: f32,
+    /// `a025b3e6`: tiles of the detail texture's hex grid.
+    pub tile: f32,
+    /// `uvScale`: scale of the detail texture inside a tile.
+    pub detail_scale: f32,
+    /// `dc786517`: weight of the layer in the colour.
     pub opacity: f32,
+    /// `e7b37fd7`: the layer lies in the head's fourth texture coordinate set (scalp), not the third (face).
+    pub other_uv: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,9 +103,9 @@ pub struct Table {
     /// names of the presets; most name one or two distinct presets.
     #[serde(default)]
     pub sets: BTreeMap<String, [String; 4]>,
-    /// Layer set name hash (hex) -> the item's own painted hair layer.
+    /// Layer set name hash (hex) -> its painted hair layers.
     #[serde(default)]
-    pub under: BTreeMap<String, UnderLayer>,
+    pub under: BTreeMap<String, Vec<UnderLayer>>,
 }
 
 fn rgb(v: &Value) -> [u8; 3] {
@@ -115,12 +132,23 @@ impl Table {
         };
         let layers: std::collections::HashMap<u32, &Value> = of(UNDER).filter_map(|o| Some((o["name"].as_u64()? as u32, o))).collect();
         for s in of(UNDER_SET) {
-            let own = s[field_name(0xc13c_74b5)]["name"].as_u64().and_then(|n| layers.get(&(n as u32)));
-            let (Some(n), Some(l)) = (s["name"].as_u64(), own) else { continue };
-            let m = &l[field_name(crate::meta7a::joaat("mask"))];
-            let mask = m["name"].as_str().filter(|_| m["enable"].as_bool() == Some(true)).and_then(|x| u64::from_str_radix(x, 16).ok()).unwrap_or(0);
-            if mask != 0 {
-                self.under.insert(format!("{:08x}", n as u32), UnderLayer { mask, opacity: l[field_name(0x0a43_bed0)].as_f64().unwrap_or(0.9) as f32 });
+            let Some(n) = s["name"].as_u64() else { continue };
+            let mut v = Vec::new();
+            for (slot, h) in [0x115f_f942u32, 0xb308_b4a8, 0xc13c_74b5, 0xeda9_786c].into_iter().enumerate() {
+                let Some(l) = s[field_name(h)]["name"].as_u64().and_then(|n| layers.get(&(n as u32))) else { continue };
+                let tex = |k: String| {
+                    let m = &l[k];
+                    m["name"].as_str().filter(|_| m["enable"].as_bool() == Some(true)).and_then(|x| u64::from_str_radix(x, 16).ok()).unwrap_or(0)
+                };
+                let num = |h: u32, d: f32| l[field_name(h)].as_f64().map_or(d, |x| x as f32);
+                let (mask, direction, detail) = (tex(field_name(crate::meta7a::joaat("mask"))), tex(field_name(0x3395_c260)), tex(field_name(0x3804_9c16)));
+                // the game skips a layer without one of the three
+                if mask != 0 && direction != 0 && detail != 0 {
+                    v.push(UnderLayer { slot, mask, direction, detail, lo: num(0x03a9_e780, 0.1), hi: num(0x0a43_bed0, 0.9), strength: num(0xef27_74fe, 1.0), tile: num(0xa025_b3e6, 20.0), detail_scale: num(0x8391_6844, 10.0), opacity: num(0xdc78_6517, 1.0), other_uv: l[field_name(0xe7b3_7fd7)].as_bool().unwrap_or(false) });
+                }
+            }
+            if !v.is_empty() {
+                self.under.insert(format!("{:08x}", n as u32), v);
             }
         }
         for (k, objs) in pso_json["objects"].as_object().into_iter().flatten() {
@@ -143,9 +171,15 @@ impl Table {
         }
     }
 
-    /// The painted hair layer of a layer set (a hair item's placeholder name).
-    pub fn under_layer(&self, set: u32) -> Option<&UnderLayer> {
-        self.under.get(&format!("{set:08x}"))
+    /// The painted hair layers of a layer set (a hair item's placeholder name).
+    pub fn under_layers(&self, set: u32) -> &[UnderLayer] {
+        self.under.get(&format!("{set:08x}")).map_or(&[], |v| v.as_slice())
+    }
+
+    /// The colour preset of slot `slot` of a preset set (the set's own name where the set is missing).
+    pub fn slot_preset(&self, set: u32, slot: usize) -> Option<&Preset> {
+        let key = format!("{set:08x}");
+        self.sets.get(&key).and_then(|s| self.presets.get(&s[slot.min(3)])).or_else(|| self.presets.get(&key))
     }
 
     pub fn get(&self, name: u32) -> Option<&Preset> {
@@ -456,26 +490,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_layer_set_leads_to_the_mask_and_opacity_of_its_own_layer() {
-        let (own, mask, op) = (field_name(0xc13c_74b5), field_name(crate::meta7a::joaat("mask")), field_name(0x0a43_bed0));
-        let v = serde_json::json!({ "objects": {
-            "090e63b51e875c1c": [
-                { "name": 749565774u32, &own: {"name": 858404632u32}, "115ff942": {"name": 3839837909u32} },
-                { "name": 5u32, &own: {"name": 6u32} },
-                { "name": 8u32, &own: {"name": 9u32} }
-            ],
-            "9598b7e97fc56571": [
-                { "name": 858404632u32, &mask: {"enable": true, "name": "c909cb7bfd7916f7"}, &op: 0.451 },
-                { "name": 9u32, &mask: {"enable": false, "name": "0000000000000000"}, &op: 1.0 }
-            ]
-        }});
+    fn a_layer_set_leads_to_its_layers() {
+        let f = field_name;
+        let tex = |n: &str| serde_json::json!({"enable": true, "name": n});
+        let mut layer = serde_json::json!({ "name": 858404632u32 });
+        for (k, v) in [(f(crate::meta7a::joaat("mask")), tex("c909cb7bfd7916f7")), (f(0x3395_c260), tex("01c9309c47c734e3")), (f(0x3804_9c16), tex("e5a59757572bcafc")), (f(0x0a43_bed0), serde_json::json!(0.451)), (f(0x03a9_e780), serde_json::json!(0.0)), (f(0xdc78_6517), serde_json::json!(0.7)), (f(0xe7b3_7fd7), serde_json::json!(true))] {
+            layer[k] = v;
+        }
+        let mut bare = serde_json::json!({ "name": 9u32 });
+        bare[f(crate::meta7a::joaat("mask"))] = tex("0000000000000001");
+        let mut sets = vec![serde_json::json!({ "name": 749565774u32 }), serde_json::json!({ "name": 5u32 }), serde_json::json!({ "name": 8u32 })];
+        sets[0][f(0xc13c_74b5)] = serde_json::json!({"name": 858404632u32});
+        sets[0][f(0x115f_f942)] = serde_json::json!({"name": 3839837909u32});
+        sets[1][f(0xc13c_74b5)] = serde_json::json!({"name": 6u32});
+        sets[2][f(0xc13c_74b5)] = serde_json::json!({"name": 9u32});
+        let v = serde_json::json!({ "objects": { "090e63b51e875c1c": sets, "9598b7e97fc56571": [layer, bare] } });
         let mut t = Table::default();
         t.add(&v);
-        let l = t.under_layer(749565774).unwrap();
-        assert_eq!(l.mask, 0xc909_cb7b_fd79_16f7);
-        assert!((l.opacity - 0.451).abs() < 1e-6);
-        // a set whose layer is missing or has no mask has no layer
-        assert!(t.under_layer(5).is_none() && t.under_layer(8).is_none());
+        let l = t.under_layers(749565774);
+        assert_eq!(l.len(), 1);
+        assert_eq!((l[0].slot, l[0].mask, l[0].other_uv), (2, 0xc909_cb7b_fd79_16f7, true));
+        assert!((l[0].hi - 0.451).abs() < 1e-6 && l[0].lo == 0.0 && (l[0].opacity - 0.7).abs() < 1e-6);
+        // numbers the record leaves out take the game's defaults
+        assert_eq!((l[0].tile, l[0].detail_scale, l[0].strength), (20.0, 10.0, 1.0));
+        // a set whose layer is missing, or lacks the direction or detail texture, has none
+        assert!(t.under_layers(5).is_empty() && t.under_layers(8).is_empty());
     }
 
     #[test]
