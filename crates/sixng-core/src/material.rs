@@ -198,6 +198,91 @@ pub fn paint_block() -> Value {
     })
 }
 
+/// joaat("emissivemultiplier"): the material constant that scales how bright
+/// its emissive map (or lit colour map) is.
+pub const EMISSIVE_MULTIPLIER_PARAM: &str = "5eebed48";
+
+/// The game's `emissivemultiplier` per glTF unit of emissive strength. The
+/// values read like luminance in nits (5 on glass railings, about 600 on a
+/// bulb, about 3200 on an LED sign), so 1.0 in the glTF is 100 nits: about
+/// the white of a display, which a viewer without exposure control shows
+/// as full white.
+pub const EMISSIVE_NITS_PER_UNIT: f32 = 100.0;
+
+/// Highest glTF emissive strength written (10 000 nits).
+pub const EMISSIVE_MAX_STRENGTH: f32 = 100.0;
+
+/// How bright a lit material is in the glTF, from its `emissivemultiplier`
+/// (None when the material has none or it did not read).
+///
+/// `strength` = multiplier / [`EMISSIVE_NITS_PER_UNIT`], at most
+/// [`EMISSIVE_MAX_STRENGTH`]. Up to 1 it goes into `emissiveFactor`; above
+/// 1 the factor stays 1 and the rest goes into
+/// `KHR_materials_emissive_strength`, as that extension asks.
+///
+/// A multiplier of 0 (a traffic-light counter, among others) is a light the
+/// game switches on while it runs. It is kept lit at strength 1, like a
+/// material with no multiplier, so it does not export dark. A negative or
+/// non-finite value is treated as no multiplier.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EmissiveStrength {
+    /// The material's `emissivemultiplier`, as read.
+    pub multiplier: Option<f32>,
+    /// The glTF strength: emissiveFactor x KHR_materials_emissive_strength.
+    pub strength: f32,
+    /// `multiplier` (the multiplier divided by the unit), `default` (no
+    /// multiplier: strength 1), `runtime` (multiplier 0: strength 1) or
+    /// `capped` (over [`EMISSIVE_MAX_STRENGTH`]).
+    pub source: &'static str,
+}
+
+impl EmissiveStrength {
+    pub fn from_multiplier(multiplier: Option<f32>) -> Self {
+        let (strength, source) = match multiplier {
+            Some(m) if m.is_finite() && m > 0.0 => {
+                let s = m / EMISSIVE_NITS_PER_UNIT;
+                if s > EMISSIVE_MAX_STRENGTH {
+                    (EMISSIVE_MAX_STRENGTH, "capped")
+                } else {
+                    (s, "multiplier")
+                }
+            }
+            Some(m) if m == 0.0 => (1.0, "runtime"),
+            _ => (1.0, "default"),
+        };
+        EmissiveStrength { multiplier: multiplier.filter(|m| m.is_finite()), strength, source }
+    }
+
+    /// The glTF `emissiveFactor` (grey, at most 1).
+    pub fn factor(&self) -> f32 {
+        self.strength.min(1.0)
+    }
+
+    /// `KHR_materials_emissive_strength.emissiveStrength`, when above 1.
+    pub fn extension(&self) -> Option<f32> {
+        (self.strength > 1.0).then_some(self.strength)
+    }
+
+    /// Set the emissive factor and extension of a glTF material that lights.
+    pub fn apply(&self, m: &mut Value) {
+        let f = self.factor();
+        m["emissiveFactor"] = json!([f, f, f]);
+        match self.extension() {
+            Some(s) => m["extensions"]["KHR_materials_emissive_strength"] = json!({"emissiveStrength": s}),
+            None => {
+                if let Some(x) = m.get_mut("extensions").and_then(|x| x.as_object_mut()) {
+                    x.remove("KHR_materials_emissive_strength");
+                }
+            }
+        }
+    }
+
+    /// The record written to model.json, materials.json and the GLB extras.
+    pub fn json(&self) -> Value {
+        json!({"multiplier": self.multiplier, "strength": self.strength, "source": self.source})
+    }
+}
+
 /// glTF material fields for a classification: alpha mode and stand-in PBR
 /// factors so untextured classes (paint, glass) render sensibly.
 pub fn gltf_fields(c: &Value, has_base: bool) -> Value {
@@ -1050,6 +1135,47 @@ mod paint_tests {
         let m = gltf_fields(&json!({"class": "emissive", "alpha_mode": "OPAQUE"}), true);
         assert_eq!(m["emissiveTexture"], "base");
         assert_eq!(m["emissiveFactor"], json!([1.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn emissive_multiplier_hash() {
+        assert_eq!(format!("{:08x}", crate::names::joaat_exact("emissivemultiplier")), EMISSIVE_MULTIPLIER_PARAM);
+    }
+
+    #[test]
+    fn emissive_strength_from_multiplier() {
+        let lit = |m: Option<f32>| {
+            let mut g = gltf_fields(&json!({"class": "emissive", "alpha_mode": "OPAQUE"}), true);
+            let e = EmissiveStrength::from_multiplier(m);
+            e.apply(&mut g);
+            (e, g)
+        };
+        // glass railings (5): dim, all in the factor, no extension
+        let (e, g) = lit(Some(5.0));
+        assert_eq!((e.source, e.strength), ("multiplier", 0.05));
+        assert_eq!(g["emissiveFactor"], json!([0.05f32, 0.05f32, 0.05f32]));
+        assert!(g["extensions"].is_null());
+        // a bulb (628) and an LED sign (3225.8): factor 1, the rest in the extension
+        for (m, s) in [(628.0f32, 6.28f32), (3225.8, 32.258)] {
+            let (e, g) = lit(Some(m));
+            assert!((e.strength - s).abs() < 1e-4, "{m}");
+            assert_eq!(g["emissiveFactor"], json!([1.0, 1.0, 1.0]));
+            assert_eq!(g["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"], json!(e.strength));
+        }
+        // 0: switched on at run time, kept lit at strength 1
+        let (e, g) = lit(Some(0.0));
+        assert_eq!((e.source, e.strength, e.multiplier), ("runtime", 1.0, Some(0.0)));
+        assert_eq!(g["emissiveFactor"], json!([1.0, 1.0, 1.0]));
+        assert!(g["extensions"].is_null());
+        // none, negative or not finite: strength 1
+        for m in [None, Some(-3.0), Some(f32::NAN), Some(f32::INFINITY)] {
+            let e = EmissiveStrength::from_multiplier(m);
+            assert_eq!((e.source, e.strength), ("default", 1.0), "{m:?}");
+        }
+        // over 10 000 nits: capped
+        let e = EmissiveStrength::from_multiplier(Some(50_000.0));
+        assert_eq!((e.source, e.strength, e.extension()), ("capped", EMISSIVE_MAX_STRENGTH, Some(EMISSIVE_MAX_STRENGTH)));
+        assert_eq!(e.json()["multiplier"], json!(50_000.0));
     }
 
     #[test]
