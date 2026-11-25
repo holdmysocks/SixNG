@@ -42,6 +42,10 @@ pub struct SetOutfit {
     /// Items that resolved to no drawable.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unresolved: Vec<String>,
+    /// Items left out on purpose, with why (`Outfit::not_shown`): they are
+    /// not missing, so they do not make the set incomplete.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub not_shown: Vec<String>,
 }
 
 /// One wardrobe item on a drawable: a texture / colour variant of the part.
@@ -140,7 +144,7 @@ fn variant(p: &LookPart) -> SetVariant {
 /// variations, merged into one list of drawables.
 pub fn part_set(look: &Look, display: Option<String>) -> PartSet {
     let all: Vec<(&Outfit, bool)> = look.outfits.iter().map(|o| (o, true)).chain(look.other_variations.iter().map(|o| (o, false))).collect();
-    let outfits: Vec<SetOutfit> = all.iter().map(|(o, listed)| SetOutfit { id: o.id.clone(), label: o.label.clone(), listed: *listed, variations: o.variations.clone(), body_shape: o.body_shape.clone(), unresolved: o.unresolved.clone() }).collect();
+    let outfits: Vec<SetOutfit> = all.iter().map(|(o, listed)| SetOutfit { id: o.id.clone(), label: o.label.clone(), listed: *listed, variations: o.variations.clone(), body_shape: o.body_shape.clone(), unresolved: o.unresolved.clone(), not_shown: o.not_shown.clone() }).collect();
     let mut parts: Vec<SetPart> = Vec::new();
     for (oi, (o, _)) in all.iter().enumerate() {
         for p in &o.parts {
@@ -188,7 +192,7 @@ mod tests {
     }
 
     fn outfit(id: &str, parts: Vec<LookPart>, unresolved: Vec<String>) -> Outfit {
-        Outfit { id: id.into(), outfit_type: String::new(), scale: 0.0, label: id.into(), body_shape: None, parts, strand_colours: vec![], unresolved, variations: vec![id.into()] }
+        Outfit { id: id.into(), outfit_type: String::new(), scale: 0.0, label: id.into(), body_shape: None, parts, strand_colours: vec![], unresolved, not_shown: vec![], variations: vec![id.into()] }
     }
 
     #[test]

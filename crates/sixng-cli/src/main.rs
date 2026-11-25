@@ -1002,7 +1002,8 @@ enum Cmd {
     /// character) as JSON.
     PedParts {
         /// Model name (`cs_mandy`), or a regex starting with `^` for every
-        /// matching character.
+        /// matching character: those with parts of their own and the named
+        /// models of the outfit list.
         model: String,
         /// Folder for `<model>/parts.json`.
         #[arg(long, short)]
@@ -1781,15 +1782,27 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 let re = regex::RegexBuilder::new(model).case_insensitive(true).build()?;
                 let mut rows = Vec::new();
                 let (mut ok, mut complete) = (0, 0);
-                for c in sixng_core::outfit::characters(&ix).into_iter().filter(|c| c.kind == "character" && re.is_match(&c.name)) {
-                    rows.push(match sixng_core::pedset::of(&ws.game, &a, &ix, &c.name) {
+                // the characters with parts of their own, then the named
+                // models of the outfit list (`cs_mandy` has no drawable of
+                // its own: all of its parts are shared items)
+                let mut names: Vec<String> = sixng_core::outfit::characters(&ix).into_iter().filter(|c| c.kind == "character").map(|c| c.name).collect();
+                let own = names.len();
+                let mut seen: std::collections::HashSet<String> = names.iter().cloned().collect();
+                for m in sixng_core::pedlook::listed_models(&ws.game).unwrap_or_default().into_iter().filter(|m| m.named && !m.uncertain) {
+                    if seen.insert(m.name.clone()) {
+                        names.push(m.name);
+                    }
+                }
+                for (i, name) in names.iter().enumerate().filter(|(_, n)| re.is_match(n)) {
+                    let own_parts = i < own;
+                    rows.push(match sixng_core::pedset::of(&ws.game, &a, &ix, name) {
                         Ok(set) => {
                             ok += 1;
                             complete += set.complete as usize;
                             let variants: usize = set.parts.iter().map(|p| p.variants.len()).sum();
-                            json!({"model": set.model, "display": set.display, "outfits": set.outfits.iter().filter(|o| o.listed).count(), "other_variations": set.outfits.iter().filter(|o| !o.listed).count(), "parts": set.parts.len(), "variants": variants, "complete": set.complete, "unresolved": set.unresolved, "file": write(&set)?})
+                            json!({"model": set.model, "display": set.display, "own_parts": own_parts, "outfits": set.outfits.iter().filter(|o| o.listed).count(), "other_variations": set.outfits.iter().filter(|o| !o.listed).count(), "parts": set.parts.len(), "variants": variants, "complete": set.complete, "unresolved": set.unresolved, "file": write(&set)?})
                         }
-                        Err(e) => json!({"model": c.name, "error": e}),
+                        Err(e) => json!({"model": name, "own_parts": own_parts, "error": e}),
                     });
                 }
                 out.print(&json!({"ok": true, "count": rows.len(), "with_set": ok, "complete": complete, "characters": rows}));

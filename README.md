@@ -634,7 +634,12 @@ again**).
     a bottom (4 items of 3 characters stay unresolved); most of the 17 are stored that way (shirtless in shorts,
     costumes), and a garment whose model is found under no texture and
     no GUID is listed in the panel as not found instead of being left
-    out silently. `sixng ped-look "^"` lists every character
+    out silently. Items left out on purpose are listed apart, as
+    `not_shown` with the reason: the first-person arms (player Jason) and
+    the anatomical body layer, whose models are in a content pack and which
+    clothing covers. Across all 3,103 outfits of the 292 characters, 2
+    items stay unresolved (before 2026-11-25: 472, nearly all of them these
+    two kinds). `sixng ped-look "^"` lists every character
     with what its default outfit has. `sixng outfit <name> --look N`
     exports outfit N as one rigged GLB (parts, the face, stored tints;
     not the viewer's skin tone, colour words or hidden skin).
@@ -651,12 +656,15 @@ again**).
     the drawable names; the wardrobe stores none. Run
     `sixng ped-parts cs_mandy --out <dir>` to write `<dir>/cs_mandy/parts.json`, and
     `sixng ped-parts "^" --out <dir>` to write one for every character, with a
-    summary. Of the 292 characters with outfit data, 281 have every item
-    resolved. Nine of the other eleven miss only the anatomical body
-    layer that is always under clothing (category `2a7a13a4`). Mandy (9
-    outfits, 40 parts, 47 variants), Vicki (15, 48, 53) and Viper (3, 18,
-    18) are complete. Six characters have a wardrobe variation no outfit
-    uses; in all six it is a spare head set.
+    summary. That covers the 292 characters with parts of their own and the 457 other
+    named models of the outfit list (Mandy is one: all her parts are
+    shared items). Of these 749, 747 have every item resolved; Raina
+    (under both her model names) misses one. Items left out on purpose
+    (first-person arms, the anatomical body layer) are listed apart and
+    do not count as missing. Mandy (9 outfits, 40 parts, 47 variants),
+    Vicki (15, 48, 53) and Viper (3, 18, 18) are complete. 30
+    characters have a wardrobe variation that no outfit uses; in each case it
+    is a spare head set (head, eyes, teeth).
   - The first character opened builds `<work>/index/ped_models.json`
     (about a minute) and loads the texture-users index (about 10 s).
   - Watches and rings are modelled at their own root bone and moved onto

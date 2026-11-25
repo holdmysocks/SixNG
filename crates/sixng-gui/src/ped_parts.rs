@@ -93,6 +93,17 @@ pub fn ui(ui: &mut egui::Ui, set: &PartSet, current: usize) -> Option<usize> {
                 }
             });
         }
+        // the same item is left out of every outfit that has it: once each
+        let mut left: Vec<&String> = set.outfits.iter().flat_map(|o| &o.not_shown).collect();
+        left.sort();
+        left.dedup();
+        if !left.is_empty() {
+            egui::CollapsingHeader::new(format!("left out on purpose ({})", left.len())).id_salt("ped_set_not_shown").show(ui, |ui| {
+                for u in left {
+                    ui.label(egui::RichText::new(u).small());
+                }
+            });
+        }
     });
     open
 }
