@@ -438,9 +438,12 @@ impl Groom {
     ///   p is the 16-step pull profile at graphics header +0x90 (255 = on
     ///   the centre line). Read from the program's clump variant by the
     ///   shader archive work (medium confidence); the hashes and the offset
-    ///   table are the viewer's own, with the same spread. Not read: the
-    ///   per-axis scales of the offset, and the program's other branch
-    ///   taken when graphics header +0xA8 is 3.
+    ///   table are the viewer's own, with the same spread. Clumps are
+    ///   round: the game scales the two axes by bytes of its per-draw
+    ///   record, which is built at run time. With graphics header +0xA8 = 3
+    ///   the game takes the root normal from a per-vertex table at +0xBC
+    ///   when that offset is set; it does not change the clump shape, and
+    ///   the viewer keeps the triangle's normal.
     ///
     /// A piece without the clump bytes grows its clumped strands on their
     /// centre lines. `share` of each population is grown: the game's own
