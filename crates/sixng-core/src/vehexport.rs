@@ -129,6 +129,24 @@ pub fn brake_axles(named_disc: Option<&str>, named_caliper: Option<&str>, slot_m
     [(front_disc, front_caliper), (rear_disc, rear_caliper)]
 }
 
+/// The rim light slots, by joaat of their names: `lights_rims`,
+/// `lights_rims_rear`. A part in one of them has one element (bone 0) that
+/// names `caliper_rimlight` or `drumbrake_rimlight`: a ring of lights on
+/// the brake, modelled around the same unit disc as the discs and calipers
+/// (ring radius 0.607 for a disc of 0.5), the drum's one set further in.
+pub const RIM_LIGHT_SLOTS: [u32; 2] = [0x439f_ddac, 0x2ba6_699f];
+
+/// The rim light ring of a configuration per axle, `[front, rear]`, from
+/// the models of its parts in the rim light slots. The rear axle takes
+/// `lights_rims_rear`, else what the front has, as the brake discs do
+/// (not confirmed for the rings).
+pub fn rim_light_axles(slot_models: &[(u32, String)]) -> [Option<String>; 2] {
+    let of = |slot: u32| slot_models.iter().find(|(s, _)| *s == slot).map(|(_, n)| n.clone());
+    let front = of(RIM_LIGHT_SLOTS[0]);
+    let rear = of(RIM_LIGHT_SLOTS[1]).or_else(|| front.clone());
+    [front, rear]
+}
+
 fn hex32(v: &Value) -> Option<u32> {
     u32::from_str_radix(v.as_str()?, 16).ok()
 }
@@ -261,7 +279,7 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
         let Some(m) = mods.get(&part_hash(p)) else { continue };
         let slot = m["slot"].as_str().unwrap_or("");
         // (brake slots: fitted at the wheels, per axle)
-        if slot == SLOT_CHASSIS || hex32(&m["slot"]).is_some_and(|s| wheels && BRAKE_SLOTS.contains(&s)) {
+        if slot == SLOT_CHASSIS || hex32(&m["slot"]).is_some_and(|s| wheels && (BRAKE_SLOTS.contains(&s) || RIM_LIGHT_SLOTS.contains(&s))) {
             continue;
         }
         for e in m["elements"].as_array().into_iter().flatten() {
@@ -498,15 +516,17 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
             .filter(|p| hex_name(p))
             .filter_map(|p| mods.get(&part_hash(p)))
             .filter_map(|m| {
-                let slot = hex32(&m["slot"]).filter(|s| BRAKE_SLOTS.contains(s))?;
+                let slot = hex32(&m["slot"]).filter(|s| BRAKE_SLOTS.contains(s) || RIM_LIGHT_SLOTS.contains(s))?;
                 let n = m["elements"].as_array()?.iter().find_map(|e| resolve(e))?.name.clone()?.to_ascii_lowercase();
                 Some((slot, n.strip_suffix("_hi").unwrap_or(&n).to_string()))
             })
             .collect();
         let axle_brakes = brake_axles(part("brakedisc_").or_else(|| part("drumbrake_")).as_deref(), part("caliper_").as_deref(), &slot_models);
+        // the rim light rings go on the brakes the same way
+        let rim_lights = rim_light_axles(&slot_models);
         // each distinct model once, with the axles it is on
         let mut brake_models: Vec<(&Entry, [bool; 2])> = Vec::new();
-        for (axle, n) in axle_brakes.iter().enumerate().flat_map(|(i, a)| [(i, &a.0), (i, &a.1)]) {
+        for (axle, n) in axle_brakes.iter().enumerate().flat_map(|(i, a)| [(i, &a.0), (i, &a.1)]).chain(rim_lights.iter().enumerate()) {
             let Some(e) = n.as_ref().and_then(|n| stems.get(n).copied()) else { continue };
             match brake_models.iter_mut().find(|b| b.0.off == e.off) {
                 Some(b) => b.1[axle] = true,
@@ -644,6 +664,20 @@ mod tests {
         let b = brake_axles(Some("brakedisc_std_001"), None, &[(BRAKE_SLOTS[2], "caliper_2pot_001".into()), (BRAKE_SLOTS[1], "drumbrake_002".into())]);
         assert_eq!(b, [(s("brakedisc_std_001"), s("caliper_2pot_001")), (s("drumbrake_002"), None)]);
         assert_eq!(brake_axles(None, None, &[]), AxleBrakes::default());
+    }
+
+    #[test]
+    fn rim_lights_per_axle() {
+        let s = |x: &str| Some(x.to_string());
+        // one part: the same ring on both axles
+        assert_eq!(rim_light_axles(&[(RIM_LIGHT_SLOTS[0], "caliper_rimlight".into())]), [s("caliper_rimlight"), s("caliper_rimlight")]);
+        // a rear part of its own (rear drums)
+        let both = [(RIM_LIGHT_SLOTS[0], "caliper_rimlight".to_string()), (RIM_LIGHT_SLOTS[1], "drumbrake_rimlight".to_string())];
+        assert_eq!(rim_light_axles(&both), [s("caliper_rimlight"), s("drumbrake_rimlight")]);
+        // brake parts are not rings
+        assert_eq!(rim_light_axles(&[(BRAKE_SLOTS[3], "caliper_2pot_001".into())]), [None, None]);
+        // and a ring is not a brake
+        assert_eq!(brake_axles(None, None, &both), AxleBrakes::default());
     }
 
     #[test]
