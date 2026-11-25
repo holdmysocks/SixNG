@@ -2782,8 +2782,8 @@ impl ModelView {
         let idx = idx as usize;
         // each part id's wear amount under this configuration
         let wear_key = self.part_look_want.clone().unwrap_or_default();
-        let wear_amounts = part_wear_amounts(&pc["wear_records"], idx as usize, self.part_look_want.as_deref());
-        self.look.wear_levels = wear_amounts.is_some();
+        let part_wears = part_wear(&pc["wear_records"], idx as usize, self.part_look_want.as_deref());
+        self.look.wear_levels = part_wears.is_some();
         // the coat of this look's body paint (clear coat, flakes)
         let coat = &pc["coat"];
         let record = coat["paint_by_look"][idx].as_u64().map(|k| &coat["records"][k as usize]).filter(|r| r.is_object());
@@ -2863,9 +2863,15 @@ impl ModelView {
                         let own = coats.and_then(|s| usize::from_str_radix(&s[id * 2..id * 2 + 2], 16).ok()).and_then(record);
                         px[(768 + id) * 512..(769 + id) * 512].copy_from_slice(&coat_row(own));
                         // column 11 of the coat row: the part id's wear amount
-                        let a = wear_amounts.as_ref().map_or(0, |w| w[id]);
+                        let pw = part_wears.as_ref().map_or(PartWear::default(), |w| w[id]);
                         for x in (11..128).step_by(16) {
-                            px[(768 + id) * 512 + x * 4 + 3] = a;
+                            px[(768 + id) * 512 + x * 4 + 3] = pw.amount;
+                        }
+                        // columns 16 to 24 (read by textureLoad, not
+                        // repeated): per wear mask channel the scale, the
+                        // window start and the window width
+                        for (c, v) in pw.scale.iter().chain(&pw.start).chain(&pw.width).enumerate() {
+                            px[(768 + id) * 512 + (16 + c) * 4 + 3] = *v;
                         }
                         let stored = surfaces.and_then(|s| hex4(&s[id * 8..id * 8 + 8]));
                         let s = patched_surf.iter().rev().find(|p| p.0 == id).map(|p| p.1).or(stored).unwrap_or_else(|| surface_of_code(look[id][3]));
@@ -4226,7 +4232,7 @@ impl ModelView {
         if self.part_ramp_done.is_some() && self.loaded.as_ref().is_some_and(|l| l.model.materials.iter().any(|m| m.ramp.is_some() && m.ramp_u.is_some())) {
             if self.look.wear_levels {
                 ui.checkbox(&mut self.look.wear_from_config, "wear from the configuration")
-                    .on_hover_text("Each part shows as much wear as the vehicle's configuration gives it: its wear level (0 new to 5 worn out) picks a wear preset, whose age range (minWear to maxWear) sets the amount (the middle of the range; a preset without a range takes the average of its level). Where it shows: in patches of the game's tiling wear mask (the green channel above a threshold that falls as the amount rises) on parts whose material names one, else the blue channel of the parts' detail texture. How the game windows the mask's three channels is not decoded, so the patches are a stand-in.");
+                    .on_hover_text("Each part shows wear as the game works it out: the vehicle's configuration gives the part a wear level (0 new to 5 worn out), which picks a wear preset. Its age record sets the wear amount, and the preset's control intensities and rust windows say how much of each channel of the game's tiling wear mask turns to the worn layer (the game's packing of these values is read from its code). Not read: a per-part random sample and the vertex colours the game also multiplies in, and the per-vehicle pick within the age record's range (the middle is taken).");
             }
             if !(self.look.wear_levels && self.look.wear_from_config) {
                 ui.add(egui::Slider::new(&mut self.look.wear, 0.0..=1.0).text("wear"))
@@ -5033,14 +5039,44 @@ fn coat_row(r: Option<&serde_json::Value>) -> Vec<u8> {
 /// takes its level's value.
 const LEVEL_WEAR: [f32; 6] = [15.0, 150.0, 197.0, 211.0, 239.0, 239.0];
 
-/// Each part id's wear amount (0 to 255) under a configuration, from
-/// model.json `part_colours.wear_records`: the part's wear level
-/// (`levels_by_config`, or `levels_default` without a configuration) picks
-/// an entry of its ladder (`ladder_by_look` of this look); the entry's wear
-/// preset names an age record; an age range gives the middle of its
-/// `minWear` and `maxWear`, anything else `LEVEL_WEAR` of the level. None
-/// when the model has no wear levels; 0 for a part id without a level.
-fn part_wear_amounts(w: &serde_json::Value, look: usize, config: Option<&str>) -> Option<[u8; 256]> {
+/// The wear preset bytes (`cc518af0`) the game packs into a part's shader
+/// record for the first wear layer (packer at rva 0x37766a0): per mask
+/// channel A, B, C the control intensity, its activation start and end
+/// (`controlIntensityA`, b18a6db5, 1b6a3e09 / `controlIntensityB`,
+/// 1e688003, 1c58826f / `controlIntensityC`, f97f84c3, 4d46aee9) and the
+/// window on the scaled mask (`rustStart` / `rustEnd`, `B`, `C`).
+const WEAR_CONTROL: [[u32; 3]; 3] = [[0x262c_839d, 0xb18a_6db5, 0x1b6a_3e09], [0x9b82_6e47, 0x1e68_8003, 0x1c58_826f], [0xb770_a627, 0xf97f_84c3, 0x4d46_aee9]];
+const WEAR_WINDOW: [[u32; 2]; 3] = [[0x8f02_219f, 0x7a2d_3f04], [0x9d7c_73e7, 0x1170_352b], [0x39ab_ac47, 0x9970_c52a]];
+/// The age record's wear amount range (`fe5d32e7` +0x0c, +0x10): the game
+/// takes a per-vehicle value between them.
+const AGE_WEAR: [u32; 2] = [0x4e71_efc8, 0xb5fc_dec9];
+
+/// What the viewer draws of a part id's wear: the amount (0 to 255) and,
+/// per channel of the game's wear mask, the scale, window start and window
+/// width (0 to 255 each).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct PartWear {
+    amount: u8,
+    scale: [u8; 3],
+    start: [u8; 3],
+    width: [u8; 3],
+}
+
+/// Each part id's wear under a configuration, from model.json
+/// `part_colours.wear_records`: the part's wear level (`levels_by_config`,
+/// or `levels_default` without a configuration) picks an entry of its
+/// ladder (`ladder_by_look` of this look) and so a wear preset.
+/// - The amount v0: the middle of the preset's age record's wear range
+///   (`AGE_WEAR`; the game takes a per-vehicle value in it); for an age
+///   range record the middle of `minWear` and `maxWear`; else
+///   `LEVEL_WEAR` of the level.
+/// - Per mask channel, as the game packs it: scale = v0 x intensity x
+///   sat((v0 - start) / (end - start)) of `WEAR_CONTROL`, and the window
+///   start and width of `WEAR_WINDOW`. The game multiplies the scale by a
+///   per-part random sample and the vertex colours, which are not read.
+/// None when the model has no wear levels; all zero for a part id without
+/// a level.
+fn part_wear(w: &serde_json::Value, look: usize, config: Option<&str>) -> Option<Vec<PartWear>> {
     let levels = match config {
         Some(k) => w["levels_by_config"][k].as_str(),
         None => w["levels_default"].as_str(),
@@ -5048,9 +5084,10 @@ fn part_wear_amounts(w: &serde_json::Value, look: usize, config: Option<&str>) -
     if w["levels_by_config"].as_object().is_none_or(|m| m.is_empty()) {
         return None;
     }
-    let mut out = [0u8; 256];
+    let mut out = vec![PartWear::default(); 256];
     let Some(levels) = levels.filter(|s| s.len() == 1024) else { return Some(out) };
     let ladders = w["ladder_by_look"][look].as_str().filter(|s| s.len() == 512);
+    let field = |v: &serde_json::Value, h: u32| v[sixng_core::meta7a::field_name(h)].as_f64();
     for (id, o) in out.iter_mut().enumerate() {
         let Ok(level) = u8::from_str_radix(&levels[id * 4..id * 4 + 2], 16) else { continue };
         if level == 255 {
@@ -5058,13 +5095,22 @@ fn part_wear_amounts(w: &serde_json::Value, look: usize, config: Option<&str>) -
         }
         let level = level.min(5) as usize;
         let ladder = ladders.and_then(|s| usize::from_str_radix(&s[id * 2..id * 2 + 2], 16).ok()).filter(|l| *l != 255);
-        let range = ladder
-            .and_then(|l| w["ladders"][l]["wearPresets"][level].as_str())
-            .and_then(|p| w["presets"][p]["ageWearHash"].as_str())
-            .map(|a| &w["age_ranges"][a])
-            .and_then(|r| Some((r["minWear"].as_f64()?, r["maxWear"].as_f64()?)));
-        let a = range.map_or(LEVEL_WEAR[level], |(lo, hi)| ((lo + hi) * 0.5) as f32);
-        *o = (a.clamp(0.0, 255.0) + 0.5) as u8;
+        let preset = ladder.and_then(|l| w["ladders"][l]["wearPresets"][level].as_str()).map(|p| &w["presets"][p]).filter(|p| p.is_object());
+        let age = preset.and_then(|p| p["ageWearHash"].as_str());
+        let from_age = age.map(|a| &w["ages"][a]).and_then(|r| Some(((field(r, AGE_WEAR[0])? + field(r, AGE_WEAR[1])?) * 0.5) as f32));
+        let from_range = age.map(|a| &w["age_ranges"][a]).and_then(|r| Some(((r["minWear"].as_f64()? + r["maxWear"].as_f64()?) * 0.5 / 255.0) as f32));
+        let v0 = from_age.or(from_range).unwrap_or(LEVEL_WEAR[level] / 255.0).clamp(0.0, 1.0);
+        o.amount = (v0 * 255.0 + 0.5) as u8;
+        let Some(p) = preset else { continue };
+        let b = |h: u32| field(p, h).unwrap_or(0.0) as f32 / 255.0;
+        for c in 0..3 {
+            let [i, s, e] = WEAR_CONTROL[c].map(b);
+            let act = ((v0 - s) / (e - s).max(1.0e-4)).clamp(0.0, 1.0);
+            o.scale[c] = ((v0 * i * act).clamp(0.0, 1.0) * 255.0) as u8;
+            let [ws, we] = WEAR_WINDOW[c].map(b);
+            o.start[c] = (ws * 255.0 + 0.5) as u8;
+            o.width[c] = (((we - ws).max(0.0)) * 255.0 + 0.5) as u8;
+        }
     }
     Some(out)
 }
@@ -8193,9 +8239,10 @@ mod tests {
 
     #[test]
     fn part_wear_from_the_configuration() {
-        use super::part_wear_amounts;
+        use super::{part_wear, PartWear};
         // part 0: level 1 on ladder 0, whose entry 1 has an age range 100..200;
-        // part 1: level 4, a preset whose age is not a range; part 2: no level
+        // part 1: level 4, a preset whose age record gives the range 0.6..1.0
+        // and whose channel A turns on from 0.5; part 2: no level
         let mut levels = "ffff".repeat(256);
         levels.replace_range(0..8, "01010407");
         let mut ladder = "ff".repeat(256);
@@ -8205,18 +8252,20 @@ mod tests {
             "levels_default": levels,
             "ladder_by_look": [ladder],
             "ladders": [{"wearPresets": ["p0", "p1", "p1", "p1", "p4", "p4"]}],
-            "presets": {"p1": {"ageWearHash": "r1"}, "p4": {"ageWearHash": "a4"}},
+            "presets": {"p1": {"ageWearHash": "r1"}, "p4": {"ageWearHash": "a4", "controlIntensityA": 255, "b18a6db5": 127.5, "1b6a3e09": 255, "rustStart": 51, "rustEnd": 102}},
             "age_ranges": {"r1": {"minWear": 100, "maxWear": 200}},
-            "ages": {"a4": {}},
+            "ages": {"a4": {"4e71efc8": 0.6, "b5fcdec9": 1.0}},
         });
-        let a = part_wear_amounts(&w, 0, Some("k1")).unwrap();
-        assert_eq!((a[0], a[1], a[2]), (150, 239, 0));
-        assert_eq!(part_wear_amounts(&w, 0, None).unwrap()[0], 150);
+        let a = part_wear(&w, 0, Some("k1")).unwrap();
+        assert_eq!((a[0].amount, a[1].amount, a[2]), (150, 204, PartWear::default()));
+        // v0 0.8: activation (0.8 - 0.5) / 0.5 = 0.6, scale 0.8 x 1 x 0.6 = 0.48
+        assert_eq!((a[1].scale, a[1].start[0], a[1].width[0]), ([122, 0, 0], 51, 51));
+        assert_eq!(part_wear(&w, 0, None).unwrap()[0].amount, 150);
         // a configuration without levels: no wear; level 0 without a ladder: the level's value
-        assert_eq!(part_wear_amounts(&w, 0, Some("nope")).unwrap(), [0; 256]);
-        assert_eq!(part_wear_amounts(&w, 0, Some("k2")).unwrap()[5], 15);
+        assert_eq!(part_wear(&w, 0, Some("nope")).unwrap()[0], PartWear::default());
+        assert_eq!(part_wear(&w, 0, Some("k2")).unwrap()[5].amount, 15);
         // a model without wear levels
-        assert_eq!(part_wear_amounts(&serde_json::json!({"ladders": []}), 0, None), None);
+        assert_eq!(part_wear(&serde_json::json!({"ladders": []}), 0, None), None);
     }
 
     #[test]
