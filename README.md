@@ -974,7 +974,9 @@ baked map (`entities.bin`; bake first with `--bake-map`):
     colours, through the air to each point (so a low sun turns orange and
     fades); the moon likewise. The sky's own light is an ambient cube
     integrated from the sky table each frame, scaled by
-    `ambient_sky_intensity`. The timecycle's two height fog layers
+    `ambient_sky_intensity`, plus the sun's light bounced off lit
+    surroundings from every side (`ambient_bounce_intensity` times a 15 %
+    ground albedo, our choice). The timecycle's two height fog layers
     (`local_atmosphere_fog_*`, e.g. Misty and Fog) are drawn too.
   - The frame is HDR. An exposure meter sets the exposure: mostly the
     light falling at the camera (sun, moon and sky), partly a histogram of
