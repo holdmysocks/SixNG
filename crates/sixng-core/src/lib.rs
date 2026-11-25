@@ -23,6 +23,7 @@ pub mod batches;
 pub mod drawable;
 pub mod export;
 pub mod furlink;
+pub mod hairexport;
 pub mod hairgen;
 pub mod hairlight;
 pub mod hairlink;

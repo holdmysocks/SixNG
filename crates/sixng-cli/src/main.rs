@@ -975,9 +975,42 @@ enum Cmd {
         /// and teeth (`ped-look` lists the outfits). The head gets the face
         /// its outfit item names, and parts with a stored tint their tint.
         /// Stored flat colours, colour tags, the body skin tone and strand
-        /// hair are viewer features and are not in the export.
+        /// hair are viewer features and are not in the export (see --hair).
         #[arg(long)]
         look: Option<usize>,
+        /// Also write the character's strand hair to <out>.hair.glb, in the
+        /// same space as the model: per piece (hair, brows, lashes, beard
+        /// of the outfit --look picks, or the first) the full strand set
+        /// the game grows from the guide strands, as line strips with the
+        /// root UV (TEXCOORD_0), width (_WIDTH, metres), clump (_CLUMP, 0 =
+        /// none) and colour variant (_VARIANT) on every point, and the
+        /// guides as <piece>_guides. scripts/blender_hair_curves.py makes
+        /// Blender hair curves of it.
+        #[arg(long)]
+        hair: bool,
+        /// With --hair: share of the stored strands to write, 0 to 1.
+        #[arg(long, default_value_t = 1.0)]
+        hair_density: f32,
+        /// With --hair: at most this many strands per piece (0 = no cap).
+        #[arg(long, default_value_t = 0)]
+        hair_max: usize,
+        /// With --hair: points per strand, resampled along its length (0 =
+        /// as stored; fewer points make a smaller file).
+        #[arg(long, default_value_t = 0)]
+        hair_points: usize,
+        /// With --hair: the outfit's strand slots to write (hair, brows,
+        /// lashes, beard, and the body-hair slots such as chesthairfull).
+        /// `all` for every one.
+        #[arg(long, value_delimiter = ',', default_value = "hair,brows,lashes,beard")]
+        hair_slots: Vec<String>,
+        /// With --hair: also the grooms placed under hair placeholders
+        /// matching this regex (another hair style or beard of the
+        /// character, e.g. `cs_jason_beardstubble_.*_l04`).
+        #[arg(long)]
+        hair_style: Vec<String>,
+        /// With --hair: leave out the guide strands.
+        #[arg(long)]
+        hair_no_guides: bool,
     },
     /// The outfits of a character model, from the game's outfit list and the
     /// model's wardrobe resource (needs the `texture-users` index): per
@@ -1568,7 +1601,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 out.print(&json!({"ok": true, "results": v}));
             }
         }
-        Cmd::Outfit { character, out: glb, archive, parts, add, list, clip, anim_only, in_place, tex, body_shape, head_skin, tex_remap, tint, look } => {
+        Cmd::Outfit { character, out: glb, archive, parts, add, list, clip, anim_only, in_place, tex, body_shape, head_skin, tex_remap, tint, look, hair, hair_density, hair_max, hair_points, hair_slots, hair_style, hair_no_guides } => {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
             let prefix = character.to_ascii_lowercase();
@@ -1723,6 +1756,40 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 eo.ped_tints.insert(name, (pal, rows));
             }
             let mut r = sixng_core::outfit::export_outfit(&a, &sel, &prefix, &glb, &eo, &clip_refs, *anim_only, *in_place)?;
+            if *hair && !*anim_only {
+                // the strand pieces of the outfit, then the extra styles
+                let slots: Vec<String> = if hair_slots.iter().any(|s| s == "all") { Vec::new() } else { hair_slots.clone() };
+                let mut pieces = match sixng_core::pedlook::look(&ws.game, &a, &ix, &prefix) {
+                    Ok(l) => sixng_core::hairexport::character_grooms(&ws.work, &a, &ix.entries, &l, look.unwrap_or(0), &slots).map_err(|e| anyhow!(e))?,
+                    Err(_) if !hair_style.is_empty() => Vec::new(),
+                    Err(e) => bail!("--hair: no outfit list for {prefix}: {e}"),
+                };
+                for st in hair_style {
+                    let re = regex::RegexBuilder::new(st).case_insensitive(true).build()?;
+                    pieces.extend(sixng_core::hairexport::placeholder_grooms(&ws.work, &a, &ix.entries, &re).map_err(|e| anyhow!(e))?);
+                }
+                let cat = sixng_core::groom::catalog_cached(&ws.work, &a, &ix.entries)?;
+                let o = sixng_core::hairexport::Options { density: *hair_density, max_strands: *hair_max, points: *hair_points, guides: !*hair_no_guides };
+                let (mut prims, mut rows) = (Vec::new(), Vec::new());
+                for (slot, placeholder, grooms, confidence) in &pieces {
+                    for off in grooms {
+                        let g = sixng_core::groom::load(&a, &ix.entries, *off)?;
+                        let bones = cat.iter().find(|c| c.off == *off).map(|c| c.bones.clone()).unwrap_or_default();
+                        let name = format!("{}_{off:x}", slot.replace(' ', "_"));
+                        let (p, mut sum) = sixng_core::hairexport::piece(&g, &name, &o, json!({"slot": slot, "placeholder": placeholder, "groom": format!("{off:x}"), "bones": bones}));
+                        sum["slot"] = json!(slot);
+                        sum["placeholder"] = json!(placeholder);
+                        sum["confidence"] = json!(confidence);
+                        rows.push(sum);
+                        prims.extend(p);
+                    }
+                }
+                let file = glb.with_extension("hair.glb");
+                let bytes = sixng_core::gltf::strands_glb(&format!("{prefix}_hair"), &prims, json!({"character": prefix, "coordinate_system": "model space (Z-up metres) converted to glTF Y-up (x, z, -y), as the model"}));
+                let size = bytes.len();
+                sixng_core::atomic::write(&file, bytes)?;
+                r["hair"] = json!({"file": file, "bytes": size, "pieces": rows});
+            }
             r["seconds"] = t.elapsed().as_secs_f64().into();
             out.print(&json!({"ok": true, "result": r}));
         }
