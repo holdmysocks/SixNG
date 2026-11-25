@@ -681,6 +681,7 @@ mod tests {
             parts: false,
             occlusion_only: false,
             emissive_scale: 1.0,
+            lit: false,
             slots: vec![],
             gap: "ok".into(),
             shader_hash: String::new(),

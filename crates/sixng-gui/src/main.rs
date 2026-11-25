@@ -1699,7 +1699,14 @@ impl App {
                 m.hair.width_mm = w;
             }
         }
-        if let Some(h) = c.f("tod") {
+        if let Some(w) = c.get("weather") {
+            // the game's lighting for this weather type at --tod (default 13 h)
+            m.weather = w.trim().to_ascii_lowercase();
+            if let Some(h) = c.f("tod") {
+                m.tod = h;
+            }
+            m.apply_light();
+        } else if let Some(h) = c.f("tod") {
             m.tod = h;
             m.look.set_time_of_day(h);
         }

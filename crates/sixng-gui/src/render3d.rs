@@ -220,6 +220,42 @@ impl Default for Look {
 }
 
 impl Look {
+    /// The game's lighting for a weather at an hour (from the timecycle,
+    /// see `sixng_core::daylight::light`): sun or moon direction, its colour
+    /// and strength, sky tint and ambient, and exposure. Sunny at 12:00
+    /// gives the default look's sun strength and ambient.
+    pub fn set_game_light(&mut self, l: &sixng_core::daylight::Light) {
+        let def = Look::default();
+        self.sun_dir = Vec3::from_array(l.dir).try_normalize().unwrap_or(def.sun_dir);
+        self.sun_col = l.dir_col;
+        self.sun_intensity = l.dir_strength * def.sun_intensity;
+        let mul = |a: [f32; 3], b: [f32; 3]| [a[0] * b[0], a[1] * b[1], a[2] * b[2]];
+        let lerp = |a: [f32; 3], b: [f32; 3], t: f32| [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+        let grey = |c: [f32; 3]| {
+            let y = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+            [y; 3]
+        };
+        // daytime sky, tinted by the timecycle and greyed by cloud cover
+        let cloud = l.cloud_cover * 0.8;
+        let top = lerp(mul(def.sky_top, l.sky_col), grey(def.sky_top), cloud);
+        let hor = lerp(mul(def.sky_hor, l.sky_col), grey(def.sky_hor), cloud);
+        let hor = lerp(hor, [0.95, 0.55, 0.3], l.dusk * 0.7 * (1.0 - cloud));
+        // the sky's brightness carries part of the ambient (the shaders
+        // multiply the sky colours by `ambient`), the rest goes to `ambient`
+        let night = [0.01, 0.015, 0.04];
+        let b = l.day.sqrt();
+        self.sky_top = lerp(night, top, b);
+        self.sky_hor = lerp(lerp(night, [0.03, 0.04, 0.08], 0.5), hor, b);
+        let sky_l = (0.2126 * self.sky_hor[0] + 0.7152 * self.sky_hor[1] + 0.0722 * self.sky_hor[2])
+            / (0.2126 * def.sky_hor[0] + 0.7152 * def.sky_hor[1] + 0.0722 * def.sky_hor[2]);
+        self.ambient = (l.ambient * def.ambient / sky_l.max(0.05)).min(2.0);
+        self.emissive = 1.5 + 6.0 * (1.0 - l.day);
+        // a viewer's stand-in for eye adaptation: brighten dark scenes by
+        // part of their darkness, plus the timecycle's exposure offset
+        let key = (l.dir_strength * l.dir[1].max(0.0) + 0.5 * l.ambient) / (0.9 + 0.5);
+        self.exposure = ((1.0 / key.max(1e-3)).powf(0.5).clamp(1.0, 4.0) * 2f32.powf(l.exposure_ev)).clamp(0.2, 4.0);
+    }
+
     /// Time of day 0..24 h: sun direction, colours and sky.
     pub fn set_time_of_day(&mut self, hours: f32) {
         let a = (hours - 6.0) / 12.0 * std::f32::consts::PI; // 0 at 6h, pi at 18h
@@ -1746,6 +1782,7 @@ impl Uploader {
             parts: false,
             occlusion_only: false,
             emissive_scale: 1.0,
+            lit: false,
             slots: vec![],
             gap: "ok".into(),
             shader_hash: String::new(),
@@ -1795,6 +1832,9 @@ impl Uploader {
                 | if mt.parts || mt.shader_hash == "e68a4a98" { 0x400 } else { 0 }
                 // bit 11: a lamp's emissive mesh (standard_vehicle_emissive_animated_bones)
                 | if mt.name.ends_with("29648098") { 0x800 } else { 0 }
+                // bit 12: an emissive shader outside the emissive class
+                // (a bulb's emissive layer, a neon tube): lit like class 7
+                | if mt.lit && mt.class != "emissive" { 0x1000 } else { 0 }
                 // bit 13: the packed map is a vehicle material map, blue = occlusion
                 | if mt.occlusion_only { 0x2000 } else { 0 }
                 // bit 14: the emissive slot holds the part ramp image, whose
