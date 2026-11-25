@@ -62,6 +62,8 @@ pub mod vehcolour;
 pub mod vehlights;
 pub mod weapon;
 pub mod rpf9;
+pub mod rpf9toc;
+pub mod gamecipher;
 pub mod scan;
 pub mod sectorgrid;
 pub mod shaderfx;

@@ -1,26 +1,29 @@
 //! RPF9 archive header (GTA VI, Xbox Series build).
 //!
-//! Layout as reverse-engineered from the files themselves:
+//! The header is plain; the table of contents after it is encrypted and is
+//! read by [`crate::rpf9toc`], which also documents its layout. The struct
+//! below keeps the field names from before the table was understood:
 //!
 //! ```text
 //! 0x00 u32  magic        0x52504639 ("9FPR" on disk, "RPF9" read little-endian)
-//! 0x04 u32  toc_end      absolute end offset of the encrypted TOC block (starts at 0x40)
-//! 0x08 u32  toc_field_b  unknown size (< toc_end; entries table size?)
-//! 0x0C u32  names_size   probably name-table size (scales with entry count)
-//! 0x10 [8]  toc_hash     per-archive 8 bytes (hash / salt; not a CBC IV)
-//! 0x18 u32  0x00047A00   constant in every archive
-//! 0x1C u32  0x00000150   constant in every archive
-//! 0x20 u16  unk_a        3..7
-//! 0x22 u16  unk_b        always 1
-//! 0x24 u32  count        scales with archive size; probably top-level entry count
-//! 0x28 u32  key_id       one of 4 values; likely selects the TOC key
-//! 0x2C [4]  flags        01|02 0F 09 00
-//! 0x30 u32  0x10         constant
+//! 0x04 u32  toc_end      end offset of the table of contents (it starts at 0x40)
+//! 0x08 u32  toc_field_b  end of the encrypted part of the table
+//! 0x0C u32  names_size   unknown; scales with the entry count
+//! 0x10 [8]  toc_hash     per-archive 8 bytes
+//! 0x18 u32  const_18     low u16 unknown; high u16 (0x1a) = number of sections
+//! 0x1C u32  const_1c     size of the section block
+//! 0x20 u16  unk_a        number of columns
+//! 0x22 u16  unk_b        number of columns with one element per row
+//! 0x24 u32  count        number of rows (files)
+//! 0x28 u32  key_id       unknown (not the key id; that is in the section block)
+//! 0x2C [4]  flags        [0] width of a row index element, [2] crypto selector
+//! 0x30 u32  const_30     bytes at the end of the section block that are
+//!                        encrypted with the archive's own key
 //! 0x34..0x40             zero
-//! 0x40..toc_end          TOC, encrypted. 16-byte block cipher, chained
-//!                        (no repeated blocks, the first 32 bytes are identical in every archive).
-//! data                   16-byte aligned entries, NOT encrypted: zlib streams
-//!                        (single stream, or 64 KiB chunked streams).
+//! 0x40..toc_end          table of contents, encrypted (16-byte block cipher, chained)
+//! data                   16-byte aligned files: 64 KiB chunks, each a zlib
+//!                        stream or stored as is. Most are plain; a few
+//!                        hundred are partly encrypted (see rpf9toc).
 //! ```
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
