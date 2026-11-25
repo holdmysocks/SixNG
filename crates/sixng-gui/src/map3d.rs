@@ -2855,7 +2855,7 @@ impl Map3D {
                 Some(v) => serde_json::json!(v),
                 None => serde_json::Value::Null,
             };
-            let _ = std::fs::write(&p, serde_json::to_vec_pretty(&j).unwrap_or_default());
+            let _ = sixng_core::atomic::write(&p, serde_json::to_vec_pretty(&j).unwrap_or_default());
         }
     }
 
@@ -2885,7 +2885,7 @@ impl Map3D {
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_else(|| serde_json::json!({}));
         j[key] = v;
-        let _ = std::fs::write(&p, serde_json::to_vec_pretty(&j).unwrap_or_default());
+        let _ = sixng_core::atomic::write(&p, serde_json::to_vec_pretty(&j).unwrap_or_default());
     }
 
     fn ram_ui(&mut self, ui: &mut egui::Ui) {

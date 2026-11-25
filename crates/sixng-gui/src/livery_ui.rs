@@ -163,7 +163,7 @@ fn read_list(game: &str, work: &str, cache: &Path) -> Result<Vec<GameSticker>, S
         })
         .collect();
     let _ = std::fs::create_dir_all(cache);
-    let _ = std::fs::write(&file, serde_json::to_vec(&list).unwrap_or_default());
+    let _ = sixng_core::atomic::write(&file, serde_json::to_vec(&list).unwrap_or_default());
     Ok(list)
 }
 
