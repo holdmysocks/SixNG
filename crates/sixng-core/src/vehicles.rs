@@ -37,24 +37,24 @@ const HANDLING_ID: u32 = 0xec41_bd9c;
 pub const FORMAT: u32 = 18;
 /// The names of the mod slots, as far as they are known: the slot of a part
 /// is the joaat of one of these. Found by hashing likely names against the
-/// 166 slots the vehicles use; 139 of them answer, the rest stay a number.
-pub const MOD_SLOT_NAMES: [&str; 139] = [
-    "aerial_mounts", "aerials", "aerocover_motorbike_f", "aerocover_motorbike_r", "arch_covers", "badges", "bike_forks", "bike_handguards",
-    "bike_handlebars", "bike_mudguard_f", "bike_mudguard_r", "bike_nerfguards", "bike_rear_extras", "bike_sissybar", "bike_sumpguard",
-    "bike_windshield", "body_kit", "bodyshell", "bonnet", "bonnet_accessories", "bonnet_catches", "boot", "boot_accessories", "brakediscs",
-    "brakediscs_rear", "bullbars", "bumper_f", "bumper_f_accessories", "bumper_f_canards", "bumper_r", "bumper_r_accessories", "bumper_r_dangle",
-    "calipers", "calipers_front", "calipers_rear", "cargo", "chassis", "chassis_damage", "curbfeelers", "diffuser", "dirt", "doorcard", "doors",
-    "doors_front", "doors_rear", "drag_chute", "engine", "engine_boat", "exhaust", "flag", "fuel_tank", "grill", "headlights", "heli_body",
-    "heli_rotors", "induction", "intakes", "interior", "interior_accessories", "interior_boot", "interior_dashcam", "interior_extras",
-    "interior_rollcage", "interior_shifter_head", "kits", "lights_front", "lights_rims", "lights_rims_rear", "lights_roof", "lights_truckbed",
-    "lights_truckbed2", "livery", "mudflaps_f", "mudflaps_m", "mudflaps_r", "overlays_bodyshell", "overlays_chassis", "overlays_front",
-    "overlays_left", "overlays_rear", "overlays_right", "overlays_roof", "plaques", "plate_base", "plate_front_rear", "plate_reader",
-    "police_scanner", "rims", "rims_front", "rims_rear", "roof", "roof_accessories", "roof_attachments", "roof_extras", "roof_scoops", "roof_spoiler",
-    "searchlight", "seat_lf", "seat_rf", "seats", "sidestep_l", "sidestep_r", "sidesteps", "sign_mesh", "sirens_ext", "sirens_ext2",
-    "sirens_ext_bumper_f", "sirens_ext_grill", "sirens_roof", "skidplate", "skirt_splitter", "skirts", "snorkel", "snorkel_body", "spare_wheels",
-    "splitter", "spoiler", "sprocket", "steering", "sticker", "toolbox_l", "toolbox_r", "towing", "towing_front", "truckbed", "truckbed_accessories",
-    "truckbed_extras", "turret", "turret1", "tyres", "tyres_rear", "utility", "wheelie_bar", "wind_deflectors", "windows", "wing_l", "wing_mirrors",
-    "wing_r", "wings",
+/// 166 slots the vehicles use; 147 of them answer, the rest stay a number.
+pub const MOD_SLOT_NAMES: [&str; 147] = [
+    "aerial_mounts", "aerials", "aerocover_motorbike_f", "aerocover_motorbike_r", "arch_covers", "badges", "bike_fairing_front", "bike_fairing_rear",
+    "bike_forks", "bike_handguards", "bike_handlebars", "bike_mudguard_f", "bike_mudguard_r", "bike_nerfguards", "bike_rear_extras", "bike_sissybar",
+    "bike_sumpguard", "bike_windshield", "body_kit", "bodyshell", "bonnet", "bonnet_accessories", "bonnet_catches", "boot", "boot_accessories",
+    "brakediscs", "brakediscs_rear", "bullbars", "bumper_f", "bumper_f_accessories", "bumper_f_canards", "bumper_r", "bumper_r_accessories",
+    "bumper_r_dangle", "calipers", "calipers_front", "calipers_rear", "cargo", "chassis", "chassis_damage", "curbfeelers", "diffuser", "dirt",
+    "doorcard", "doors", "doors_front", "doors_rear", "drag_chute", "engine", "engine_boat", "exhaust", "flag", "fuel_tank", "grill", "headlights",
+    "heli_body", "heli_rotors", "induction", "intakes", "interior", "interior_accessories", "interior_boot", "interior_dashcam", "interior_extras",
+    "interior_rollcage", "interior_shifter_arm", "interior_shifter_head", "kits", "lights_front", "lights_rims", "lights_rims_rear", "lights_roof",
+    "lights_truckbed", "lights_truckbed2", "livery", "main_trim", "mudflaps_f", "mudflaps_m", "mudflaps_r", "overlays_bodyshell", "overlays_chassis",
+    "overlays_front", "overlays_left", "overlays_rear", "overlays_right", "overlays_roof", "plaques", "plate_base", "plate_front_rear",
+    "plate_reader", "police_scanner", "rims", "rims_front", "rims_rear", "roof", "roof_accessories", "roof_attachments", "roof_extras", "roof_scoops",
+    "roof_spoiler", "searchlight", "seat_lf", "seat_rf", "seats", "sidestep_l", "sidestep_r", "sidesteps", "sign_mesh", "sirens_ext", "sirens_ext2",
+    "sirens_ext_bumper_f", "sirens_ext_grill", "sirens_ext_misc_2", "sirens_roof", "sirens_roofbar1", "sirens_roofbar1_extras", "skidplate",
+    "skirt_splitter", "skirts", "snorkel", "snorkel_body", "spare_wheels", "splitter", "spoiler", "sprocket", "steering", "sticker", "toolbox_l",
+    "toolbox_r", "towing", "towing_front", "truckbed", "truckbed_accessories", "truckbed_crane_top", "truckbed_extras", "turret", "turret1", "tyres",
+    "tyres_rear", "utility", "wheelie_bar", "wind_deflectors", "windows", "wing_l", "wing_mirrors", "wing_r", "wings",
 ];
 
 /// The name of a mod slot, when it is one of [`MOD_SLOT_NAMES`].
@@ -73,6 +73,8 @@ mod slot_name_tests {
         assert_eq!(mod_slot_name(0x5fbd_8e4d), Some("rims"));
         assert_eq!(mod_slot_name(0xa239_ac32), Some("plate_front_rear"));
         assert_eq!(mod_slot_name(0x0b6b_e600), Some("bike_forks"));
+        assert_eq!(mod_slot_name(0x3b15_e7e2), Some("sirens_roofbar1"));
+        assert_eq!(mod_slot_name(0x2c78_798f), Some("bike_fairing_front"));
         assert_eq!(mod_slot_name(0x1234_5678), None);
         // no two names share a hash
         let distinct: std::collections::HashSet<u32> = MOD_SLOT_NAMES.iter().map(|s| meta7a::joaat(s)).collect();
