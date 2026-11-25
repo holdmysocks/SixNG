@@ -6,7 +6,7 @@ use sixng_core::export::Workspace;
 use sixng_core::game::ArchiveInfo;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Deserialize)]
@@ -90,20 +90,11 @@ fn write_index(path: &Path, value: &Value) -> Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
-    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-    let result = (|| {
-        let mut file = BufWriter::new(File::create(&temp)?);
-        serde_json::to_writer(&mut file, value)?;
-        writeln!(file)?;
-        file.flush()?;
-        drop(file);
-        fs::rename(&temp, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(temp);
-    }
-    result
+    let mut file = sixng_core::atomic::AtomicFile::create(path)?;
+    serde_json::to_writer(&mut file, value)?;
+    writeln!(file)?;
+    file.commit()?;
+    Ok(())
 }
 
 pub fn generate(ws: &Workspace, input: &Path, tables: &[PathBuf], output: &Path) -> Result<Value> {
@@ -178,7 +169,7 @@ mod tests {
         let result = (|| {
             let ws = Workspace::new(root.join("game"), root.join("work"));
             fs::create_dir_all(&ws.game)?;
-            fs::write(ws.game.join("fixture.rpf"), [0; 8192])?;
+            sixng_core::atomic::write(ws.game.join("fixture.rpf"), [0; 8192])?;
             let index: AudioIndex = serde_json::from_value(json!({
                 "version": audio::INDEX_VERSION, "archive": "fixture.rpf", "archive_size": 8192, "note": "",
                 "banks": [{"off":4096,"size":768,"flags":0,"streams":[

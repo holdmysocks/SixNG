@@ -874,7 +874,7 @@ impl Layer {
 }
 
 fn write_json(p: &std::path::Path, v: &Value) -> Result<()> {
-    std::fs::write(p, serde_json::to_vec_pretty(v)?)?;
+    crate::atomic::write(p, serde_json::to_vec_pretty(v)?)?;
     Ok(())
 }
 
@@ -884,7 +884,7 @@ pub fn write_f32(p: &std::path::Path, im: &Image) -> Result<()> {
     for v in &im.px {
         b.extend_from_slice(&v.to_le_bytes());
     }
-    std::fs::write(p, b)?;
+    crate::atomic::write(p, b)?;
     Ok(())
 }
 
@@ -892,7 +892,9 @@ pub fn write_f32(p: &std::path::Path, im: &Image) -> Result<()> {
 pub fn write_png16(p: &std::path::Path, im: &Image) -> Result<()> {
     let px: Vec<u16> = (0..im.w * im.h).map(|i| (im.px[i * im.ch].clamp(0.0, 1.0) * 65535.0).round() as u16).collect();
     let img = image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_raw(im.w as u32, im.h as u32, px).ok_or_else(|| anyhow!("image size"))?;
-    img.save(p)?;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::from_path(p)?)?;
+    crate::atomic::write(p, buf.into_inner())?;
     Ok(())
 }
 

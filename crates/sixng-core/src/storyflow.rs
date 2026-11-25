@@ -60,7 +60,7 @@ pub fn tags(ws: &Workspace) -> Result<Vec<String>> {
     let a = ws.resolve(crate::cutscene::STORY_ARCHIVE)?;
     let tags = read_tags(&ws.game, &a.path)?;
     std::fs::create_dir_all(ws.index_dir())?;
-    std::fs::write(&path, serde_json::to_vec(&Cache { version: CACHE_VERSION, tags: tags.clone() })?)?;
+    crate::atomic::write(&path, serde_json::to_vec(&Cache { version: CACHE_VERSION, tags: tags.clone() })?)?;
     Ok(tags)
 }
 

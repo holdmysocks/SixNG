@@ -243,7 +243,7 @@ impl ModelPicker {
             raw_names: self.raw_names,
         };
         if let Ok(b) = serde_json::to_vec_pretty(&s) {
-            let _ = std::fs::write(&self.settings, b);
+            let _ = sixng_core::atomic::write(&self.settings, b);
         }
     }
 

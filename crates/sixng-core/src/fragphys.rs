@@ -660,7 +660,7 @@ pub fn tunable_objects(ws: &crate::export::Workspace) -> &'static std::collectio
         }
         match build_tunable_objects(ws) {
             Ok(v) => {
-                let _ = std::fs::write(&path, serde_json::to_vec(&v).unwrap_or_default());
+                let _ = crate::atomic::write(&path, serde_json::to_vec(&v).unwrap_or_default());
                 parse(&v)
             }
             Err(_) => Default::default(),

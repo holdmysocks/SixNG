@@ -409,7 +409,7 @@ impl AudioView {
             if fmt == "awc" {
                 std::fs::create_dir_all(&dir)?;
                 let p = dir.join(format!("{:x}.awc", b.off));
-                std::fs::write(&p, &bytes)?;
+                sixng_core::atomic::write(&p, &bytes)?;
                 return Ok(vec![p.display().to_string()]);
             }
             let mut files = Vec::new();

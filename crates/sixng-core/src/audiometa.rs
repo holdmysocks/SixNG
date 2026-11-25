@@ -606,7 +606,7 @@ pub fn save_containers(work: &std::path::Path, archive: &str, c: &BankContainers
     let v: std::collections::BTreeMap<String, std::collections::BTreeMap<String, usize>> = c.iter().map(|(b, m)| (format!("{b:x}"), m.iter().map(|(h, n)| (format!("{h:08x}"), *n)).collect())).collect();
     let p = containers_path(work, archive);
     std::fs::create_dir_all(p.parent().unwrap())?;
-    std::fs::write(p, serde_json::to_vec(&v)?)?;
+    crate::atomic::write(p, serde_json::to_vec(&v)?)?;
     Ok(())
 }
 
@@ -625,7 +625,7 @@ pub fn save_groups(work: &std::path::Path, archive: &str, g: &std::collections::
     let v: std::collections::BTreeMap<String, String> = g.iter().map(|(c, g)| (format!("{c:08x}"), format!("{g:08x}"))).collect();
     let p = groups_path(work, archive);
     std::fs::create_dir_all(p.parent().unwrap())?;
-    std::fs::write(p, serde_json::to_vec(&v)?)?;
+    crate::atomic::write(p, serde_json::to_vec(&v)?)?;
     Ok(())
 }
 
@@ -644,7 +644,7 @@ pub fn objects_path(work: &std::path::Path, archive: &str) -> std::path::PathBuf
 pub fn save_objects(work: &std::path::Path, archive: &str, o: &std::collections::BTreeSet<u32>) -> Result<()> {
     let p = objects_path(work, archive);
     std::fs::create_dir_all(p.parent().unwrap())?;
-    std::fs::write(p, o.iter().flat_map(|h| h.to_le_bytes()).collect::<Vec<u8>>())?;
+    crate::atomic::write(p, o.iter().flat_map(|h| h.to_le_bytes()).collect::<Vec<u8>>())?;
     Ok(())
 }
 
@@ -704,7 +704,7 @@ pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], ban
                 objects.extend(m.objects.iter().filter_map(|o| u32::from_str_radix(&o.hash, 16).ok()));
                 ok += 1;
                 let file = format!("{:x}.json", e.off);
-                std::fs::write(dir.join(&file), serde_json::to_vec_pretty(&serde_json::json!({"id": e.id, "meta": m, "stitched": stitched}))?)?;
+                crate::atomic::write(dir.join(&file), serde_json::to_vec_pretty(&serde_json::json!({"id": e.id, "meta": m, "stitched": stitched}))?)?;
                 lines += &serde_json::json!({"id": e.id, "file": file, "schema": m.schema, "objects": m.objects.len(), "table_counts": m.table_counts, "classes": m.classes, "waves_linked": linked.map(|l| serde_json::json!({"in_bank": l.0, "waves": l.1})), "stitched": stitched}).to_string();
             }
             Err(x) => {
@@ -714,7 +714,7 @@ pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], ban
         }
         lines.push('\n');
     }
-    std::fs::write(dir.join("index.jsonl"), lines)?;
+    crate::atomic::write(dir.join("index.jsonl"), lines)?;
     if !list.is_empty() && !sizes.is_empty() {
         let anchors = bank_container(&containers);
         for (off, e) in align_bank_list(&list, sizes, &anchors) {

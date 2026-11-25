@@ -316,7 +316,7 @@ fn light_table(game_root: &Path, work: &Path, names: &HashSet<u32>, ids: &HashSe
         t.complete = true;
     }
     if let Ok(b) = serde_json::to_vec(&t) {
-        let _ = std::fs::write(&p, b);
+        let _ = crate::atomic::write(&p, b);
     }
     t
 }

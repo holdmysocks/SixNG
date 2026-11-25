@@ -140,6 +140,12 @@ pub struct Look {
     pub finish: u32,
     /// The vehicle's own paint finish (metalness, roughness), for finish 4.
     pub stored_finish: [f32; 2],
+    /// The coat of the vehicle's body paint, for finish 4: clear coat
+    /// intensity (0 = none) and roughness, flake orientation (0 = no
+    /// flakes) and flake size.
+    pub coat: [f32; 4],
+    /// The coat's base coat roughness, when the coat overrides it.
+    pub coat_base: Option<f32>,
     /// How much of the second layer of vehicle part surfaces shows (0 to 1).
     pub wear: f32,
     pub slot: u32,
@@ -173,6 +179,8 @@ impl Default for Look {
             rma_order: 3,
             finish: 0,
             stored_finish: [0.0, 0.12],
+            coat: [0.0; 4],
+            coat_base: None,
             wear: 0.0,
             slot: 0,
             paint: [0.55, 0.02, 0.02],
@@ -1875,14 +1883,16 @@ impl Renderer3D {
         let vp = cam.proj(aspect) * cam.view();
         let lin = |c: [f32; 3]| [c[0], c[1], c[2], 1.0];
         let mut paint1 = lin(look.paint);
-        paint1[3] = look.stored_finish[1];
+        paint1[3] = look.coat_base.unwrap_or(look.stored_finish[1]);
+        let mut sky_top = lin(look.sky_top);
+        sky_top[3] = look.coat[3];
         FrameU {
             view_proj: vp.to_cols_array_2d(),
             inv_view_proj: vp.inverse().to_cols_array_2d(),
             cam_pos: cam.eye().extend(1.0).to_array(),
             sun_dir: look.sun_dir.extend(look.sun_intensity).to_array(),
             sun_col: lin(look.sun_col),
-            sky_top: lin(look.sky_top),
+            sky_top,
             sky_hor: [
                 look.sky_hor[0],
                 look.sky_hor[1],
@@ -1911,8 +1921,8 @@ impl Renderer3D {
                 look.stored_finish[0],
             ],
             prev_view_proj: vp.to_cols_array_2d(),
-            // w: vehicle wear (0 to 1)
-            jitter: [0.0, 0.0, 0.0, look.wear],
+            // xyz: the body paint's coat; w: vehicle wear (0 to 1)
+            jitter: [look.coat[0], look.coat[1], look.coat[2], look.wear],
         }
     }
 

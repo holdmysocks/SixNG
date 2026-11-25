@@ -608,7 +608,7 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
     }
     let extras = json!({"vehicle": model, "configuration": config, "parts_key": cfg["parts_key"], "colour": cfg["colour"], "paint_coat": paint_coat, "coordinate_system": crate::export::COORDS});
     let glb = crate::gltf::mesh_glb_with(&model, &groups, &materials, &joints, extras, &crate::gltf::GlbOptions { animations: &[], trs_joints: true, skinned_meshes_at_root: true });
-    std::fs::write(out, &glb)?;
+    crate::atomic::write(out, &glb)?;
     Ok(json!({
         "glb": out, "bytes": glb.len(), "vehicle": model, "configuration": config, "configurations": configs.len(),
         "pieces": reports, "joints": joints.len(), "stock_triangles_replaced": dropped,

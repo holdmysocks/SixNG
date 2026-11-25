@@ -7,7 +7,7 @@ struct Frame {
     cam_pos: vec4<f32>,
     sun_dir: vec4<f32>,   // xyz towards the sun, w intensity
     sun_col: vec4<f32>,
-    sky_top: vec4<f32>,
+    sky_top: vec4<f32>,   // w flake size of the body paint's coat
     sky_hor: vec4<f32>,   // w exposure
     mode: vec4<u32>,      // x view mode, y packed channel order, z paint finish, w slot view
     paint1: vec4<f32>,    // primary paint colour (linear), w the vehicle's own paint roughness
@@ -16,7 +16,7 @@ struct Frame {
     misc2: vec4<f32>,     // x fog density, yzw secondary paint colour
     misc3: vec4<f32>,     // x tint palette on (1) / off (0), w the vehicle's own paint metalness
     prev_view_proj: mat4x4<f32>,
-    jitter: vec4<f32>,    // w vehicle wear (0 to 1)
+    jitter: vec4<f32>,    // body paint's coat: x clear coat intensity, y clear coat roughness, z flake orientation (0 = no flakes); w vehicle wear (0 to 1)
 };
 
 struct Mat {
@@ -315,13 +315,16 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
             rough = clamp((code - floor(code / 50.0) * 50.0) / 49.0, 0.04, 1.0);
         }
     }
+    // the body paint's coat record (the vehicle's own finish only): clear
+    // coat intensity and roughness, flake orientation
+    var coat = vec3(0.0);
     if (painted) {
         albedo = F.paint1.rgb;
         if ((has & 16u) != 0u) { albedo = F.misc2.yzw; }
         if (F.mode.z == 0u) { metal = 0.6; rough = 0.28; }
         else if (F.mode.z == 1u) { metal = 0.0; rough = 0.8; }
         else if (F.mode.z == 2u) { metal = 1.0; rough = 0.04; albedo = mix(vec3(0.95), albedo, 0.25); }
-        else if (F.mode.z == 4u) { metal = F.misc3.w; rough = clamp(F.paint1.w, 0.04, 1.0); }
+        else if (F.mode.z == 4u) { metal = F.misc3.w; rough = clamp(F.paint1.w, 0.04, 1.0); coat = F.jitter.xyz; }
         else { metal = 0.0; rough = 0.12; }
         pearl = F.paint2.rgb * F.paint2.w;
     }
@@ -441,7 +444,21 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let h = normalize(v + l);
     let ndl = max(dot(n, l), 0.0);
     let ndv = max(dot(n, v), 0.001);
-    let ndh = max(dot(n, h), 0.0);
+    // Metal flakes in the base coat: each flake (a cell of a grid in space,
+    // its size from the coat record) tilts the base coat's highlight by the
+    // record's orientation spread. Flakes smaller than a pixel widen the
+    // highlight instead of sparkling.
+    var nb = n;
+    if (coat.z > 0.0 && cls != 11u) {
+        let p = i.world / (0.0006 + 0.02 * F.sky_top.w);
+        let seen = clamp(1.5 - max(length(dpdx(p)), length(dpdy(p))), 0.0, 1.0);
+        let c = floor(p);
+        let q = fract(sin(vec3(dot(c, vec3(127.1, 311.7, 74.7)), dot(c, vec3(269.5, 183.3, 246.1)), dot(c, vec3(113.5, 271.9, 124.6)))) * 43758.5453) - 0.5;
+        let spread = coat.z * 6.0;
+        nb = normalize(n + q * (2.0 * spread * seen));
+        rough = clamp(sqrt(rough * rough + spread * spread * (1.0 - seen)), 0.04, 1.0);
+    }
+    let ndh = max(dot(nb, h), 0.0);
     let a2 = rough * rough * rough * rough;
     let dd = ndh * ndh * (a2 - 1.0) + 1.0;
     let D = a2 / (3.14159 * dd * dd);
@@ -457,6 +474,22 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let r = reflect(-v, n);
     let env = environment(r, rough) * F.misc.w;
     var col = direct * ao_direct + kd * albedo * amb_d * ao + env * fr_v * ao + emissive;
+    // Clear coat: a second, glossy layer over the base coat (a dielectric,
+    // 4 % at normal incidence). It mirrors the sun and the surroundings at
+    // its own roughness, and what it reflects does not reach the base coat.
+    if (coat.x > 0.0) {
+        let cr = clamp(coat.y, 0.03, 1.0);
+        let ca2 = cr * cr * cr * cr;
+        let cnh = max(dot(n, h), 0.0);
+        let cdd = cnh * cnh * (ca2 - 1.0) + 1.0;
+        let ck = (cr + 1.0) * (cr + 1.0) / 8.0;
+        let cG = (ndl / (ndl * (1.0 - ck) + ck)) * (ndv / (ndv * (1.0 - ck) + ck));
+        let cF = 0.04 + 0.96 * pow(1.0 - max(dot(h, v), 0.0), 5.0);
+        let cspec = ca2 / (3.14159 * cdd * cdd) * cG * cF / max(4.0 * ndl * ndv, 0.001);
+        let cfv = 0.04 + (max(1.0 - cr, 0.04) - 0.04) * pow(1.0 - ndv, 5.0);
+        col = (col - emissive) * (1.0 - coat.x * cfv) + emissive
+            + coat.x * (cspec * F.sun_col.rgb * F.sun_dir.w * ndl * 3.0 * ao_direct + environment(r, cr) * F.misc.w * cfv * ao);
+    }
     col += pearl * pow(1.0 - ndv, 2.0) * 0.6;
     if (cls == 11u) {
         // baked map tiles (already hill-shaded): soft diffuse, no sky reflection

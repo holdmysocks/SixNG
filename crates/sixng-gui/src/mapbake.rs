@@ -565,10 +565,11 @@ impl Baker {
         if want("collision") || !md.join("top.bin").exists() {
             self.collision_pass(&top)?;
             // cache the top surface for re-runs of the raster step
-            let mut f = std::io::BufWriter::new(std::fs::File::create(md.join("top.bin"))?);
+            let mut f = sixng_core::atomic::AtomicFile::create(md.join("top.bin"))?;
             for v in &top {
                 f.write_all(&v.load(Ordering::Relaxed).to_le_bytes())?;
             }
+            f.commit()?;
         } else {
             let b = std::fs::read(md.join("top.bin"))?;
             for (k, v) in top.iter().enumerate() {
@@ -682,9 +683,9 @@ impl Baker {
                 h8[y * cw + x] = m;
             }
         }
-        std::fs::write(md.join("heights_8m.bin"), bytemuck::cast_slice(&h8))?;
+        sixng_core::atomic::write(md.join("heights_8m.bin"), bytemuck::cast_slice(&h8))?;
         self.write_entities(&md, &ents, &kinds, &bounds, &strings, &files)?;
-        std::fs::write(md.join("interiors.json"), serde_json::to_vec(&interiors)?)?;
+        sixng_core::atomic::write(md.join("interiors.json"), serde_json::to_vec(&interiors)?)?;
         self.write_roads(&md)?;
         let nl = self.write_lights(&md, &interiors)?;
         log(
@@ -769,7 +770,7 @@ impl Baker {
             "entities": ents.len(),
             "seconds": t0.elapsed().as_secs_f64(),
         });
-        std::fs::write(md.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
+        sixng_core::atomic::write(md.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
         log(
             &self.work,
             &format!("bake done in {:.0}s", t0.elapsed().as_secs_f32()),
@@ -972,7 +973,7 @@ impl Baker {
                 );
                 known.extend(res);
             }
-            std::fs::write(&cache, serde_json::to_vec(&known)?)?;
+            sixng_core::atomic::write(&cache, serde_json::to_vec(&known)?)?;
         }
         Ok(need
             .into_iter()
@@ -1192,7 +1193,7 @@ impl Baker {
         strings: &Strings,
         files: &[String],
     ) -> Result<()> {
-        let mut f = std::io::BufWriter::new(std::fs::File::create(md.join("entities.bin"))?);
+        let mut f = sixng_core::atomic::AtomicFile::create(md.join("entities.bin"))?;
         for (e, &k) in ents.iter().zip(kinds) {
             let known = bounds.get(&e.model).copied();
             let b = known.unwrap_or([-0.5, -0.5, 0.0, 0.5, 0.5, 1.0]);
@@ -1225,7 +1226,8 @@ impl Baker {
             };
             f.write_all(bytemuck::bytes_of(&rec))?;
         }
-        std::fs::write(
+        f.commit()?;
+        sixng_core::atomic::write(
             md.join("strings.json"),
             serde_json::to_vec(&json!({"strings": strings.list, "files": files}))?,
         )?;
@@ -1279,7 +1281,7 @@ impl Baker {
                 n["street"]
             ]));
         }
-        std::fs::write(
+        sixng_core::atomic::write(
             md.join("roads.json"),
             serde_json::to_vec(
                 &json!({"links": links, "nodes": nflags, "flags_note": g["flags_note"]}),
@@ -1312,7 +1314,7 @@ impl Baker {
                 json!({"p": p, "entrances": entr, "stop": stop, "yield": yld, "phases": phases}),
             );
         }
-        std::fs::write(md.join("junctions.json"), serde_json::to_vec(&juncs)?)?;
+        sixng_core::atomic::write(md.join("junctions.json"), serde_json::to_vec(&juncs)?)?;
         Ok(())
     }
 
@@ -1368,7 +1370,7 @@ impl Baker {
             let g = glam::Quat::from_xyzw(q[0], q[1], q[2], q[3]).normalize();
             (g * glam::Vec3::from(v)).into()
         };
-        let mut out = std::io::BufWriter::new(std::fs::File::create(md.join("lights.bin"))?);
+        let mut out = sixng_core::atomic::AtomicFile::create(md.join("lights.bin"))?;
         let mut n = 0usize;
         let f = std::fs::File::open(dir.join("world.jsonl"))?;
         #[derive(Deserialize)]
@@ -1437,6 +1439,7 @@ impl Baker {
                 n += 1;
             }
         }
+        out.commit()?;
         Ok(n)
     }
 

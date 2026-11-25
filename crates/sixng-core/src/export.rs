@@ -215,24 +215,44 @@ pub fn in_region(min: [f32; 3], max: [f32; 3]) -> bool {
     }
 }
 
+/// One key per slot or parameter: its name, else its hash; a second use of
+/// a name gets its hash appended, and any key still taken gets a number, so
+/// no entry replaces another.
+fn unique_key(map: &serde_json::Map<String, serde_json::Value>, name: Option<String>, hash: &str) -> String {
+    let k = match name {
+        Some(n) if !map.contains_key(&n) => n,
+        Some(n) => format!("{n} ({hash})"),
+        None => hash.to_string(),
+    };
+    match (2..).map(|i| format!("{k} #{i}")).find(|c| !map.contains_key(c)) {
+        Some(c) if map.contains_key(&k) => c,
+        _ => k,
+    }
+}
+
+/// A material's constant values by parameter name (hash where the name is
+/// not known), with their real types: a scalar as a number, a vector as its
+/// own 2 to 4 components, integers and booleans as such. Second: the
+/// parameters whose values lie outside the material's constant block.
+fn parameter_values(s: &crate::drawable::Shader) -> (serde_json::Map<String, serde_json::Value>, Vec<String>) {
+    let (mut values, mut unread) = (serde_json::Map::new(), Vec::new());
+    for c in &s.constants {
+        match c.json() {
+            Some(v) => {
+                let k = unique_key(&values, crate::names::param(&c.hash), &c.hash);
+                values.insert(k, v);
+            }
+            None => unread.push(crate::names::param(&c.hash).unwrap_or_else(|| c.hash.clone())),
+        }
+    }
+    (values, unread)
+}
+
 /// `materials.json`, written beside a model: per material its shader, its
 /// textures by slot and its parameter values, keyed by name where the name
 /// is known and by hash where it is not. The same facts as model.json's
 /// `materials` and `drawable.shaders`, laid out to be read.
 fn readable_materials(model: &str, shaders: &[crate::drawable::Shader], mats: &serde_json::Value) -> serde_json::Value {
-    // one key per slot or parameter: its name, else its hash; a second use of a name gets its hash
-    // appended, and any key still taken gets a number, so no entry replaces another
-    fn key(map: &serde_json::Map<String, serde_json::Value>, name: Option<String>, hash: &str) -> String {
-        let k = match name {
-            Some(n) if !map.contains_key(&n) => n,
-            Some(n) => format!("{n} ({hash})"),
-            None => hash.to_string(),
-        };
-        match (2..).map(|i| format!("{k} #{i}")).find(|c| !map.contains_key(c)) {
-            Some(c) if map.contains_key(&k) => c,
-            _ => k,
-        }
-    }
     let list: Vec<serde_json::Value> = shaders
         .iter()
         .enumerate()
@@ -248,20 +268,10 @@ fn readable_materials(model: &str, shaders: &[crate::drawable::Shader], mats: &s
                     }
                 }
                 rec.insert("slot_hash".to_string(), hash.into());
-                let k = key(&textures, t["param_name"].as_str().map(str::to_string), hash);
+                let k = unique_key(&textures, t["param_name"].as_str().map(str::to_string), hash);
                 textures.insert(k, rec.into());
             }
-            let (mut values, mut unread) = (serde_json::Map::new(), Vec::new());
-            for c in &s.constants {
-                match c.json() {
-                    // a scalar as a number, a vector as its own 2 to 4 components; integers and booleans as such
-                    Some(v) => {
-                        let k = key(&values, crate::names::param(&c.hash), &c.hash);
-                        values.insert(k, v);
-                    }
-                    None => unread.push(crate::names::param(&c.hash).unwrap_or_else(|| c.hash.clone())),
-                }
-            }
+            let (values, unread) = parameter_values(s);
             let mut out = serde_json::json!({
                 "index": i,
                 "shader": crate::names::shader(&s.name_hash).unwrap_or_else(|| s.name_hash.clone()),
@@ -273,7 +283,7 @@ fn readable_materials(model: &str, shaders: &[crate::drawable::Shader], mats: &s
                 "parameters": values,
                 "parameters_not_read": unread,
             });
-            for k in ["paint", "multilayer", "stitches", "texture_fallback"] {
+            for k in ["emissive_source", "paint", "multilayer", "stitches", "texture_fallback"] {
                 if !m[k].is_null() {
                     out[k] = m[k].clone();
                 }
@@ -1005,11 +1015,52 @@ fn lit_by_alpha(st: &ShaderTextures, o: &ExportOptions, tdir: &Path) -> Option<P
         let img = image::open(&from).ok()?.to_rgba8();
         let (w, h) = img.dimensions();
         let lit = lit_map(img.as_raw())?;
-        let tmp = p.with_extension(format!("{:?}.tmp.png", std::thread::current().id()).replace(['(', ')'], ""));
-        texture::save_png(&tmp, &lit, w, h).ok()?;
-        fs::rename(&tmp, &p).ok()?;
+        texture::save_png(&p, &lit, w, h).ok()?;
     }
     Some(p)
+}
+
+/// What lights an emissive material in the glTF.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum EmissiveSource {
+    /// Its own emissive map (`emissivetex`, or a lit map made from the
+    /// colour map's alpha).
+    Map,
+    /// The colour map: shaders with no `emissivetex` input
+    /// (`signs_emissive`, `standard_emissive`, the LED strip).
+    ColourMap,
+    /// It has an `emissivetex` that did not decode: not lit.
+    Missing,
+}
+
+/// Whether a material lights: its class is `emissive`, or its shader is one
+/// of the emissive shaders by name (`standard_emissive`,
+/// `standard_emissive_layer` …), which sit in any render bucket. Hidden
+/// materials never light.
+fn is_lit(s: &crate::drawable::Shader, c: &serde_json::Value) -> bool {
+    c["stand_in"] != "hidden" && (c["class"] == "emissive" || crate::names::shader(&s.name_hash).is_some_and(|n| n.contains("emissive")))
+}
+
+/// `emissive_source` of a model.json material and of the GLB extras.
+fn emissive_source_json(s: &crate::drawable::Shader, st: &ShaderTextures, c: &serde_json::Value) -> serde_json::Value {
+    match emissive_source(st, is_lit(s, c)) {
+        Some(EmissiveSource::Map) => "emissive_map".into(),
+        Some(EmissiveSource::ColourMap) => "colour_map".into(),
+        Some(EmissiveSource::Missing) => "none".into(),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// `lit`: the material lights (`is_lit`). None for materials that do not.
+fn emissive_source(st: &ShaderTextures, lit: bool) -> Option<EmissiveSource> {
+    if !lit {
+        return None;
+    }
+    Some(match (&st.emissive, st.entries.iter().any(|e| e["param_hash"] == EMISSIVE_PARAM)) {
+        (Some(_), _) => EmissiveSource::Map,
+        (None, true) => EmissiveSource::Missing,
+        (None, false) => EmissiveSource::ColourMap,
+    })
 }
 
 /// Whether a shader lights where the alpha of its colour map says: the LED
@@ -1078,9 +1129,7 @@ fn bake_ped_tint(st: &ShaderTextures, part: Option<&str>, o: &ExportOptions, tdi
                 let g = t.0[1] as f32 / 125.0;
                 t.0 = [(c[0] as f32 * g).min(255.0) as u8, (c[1] as f32 * g).min(255.0) as u8, (c[2] as f32 * g).min(255.0) as u8, 255];
             }
-            let tmp = p.with_extension(format!("{:?}.tmp.png", std::thread::current().id()).replace(['(', ')'], ""));
-            texture::save_png(&tmp, img.as_raw(), w, h).ok()?;
-            fs::rename(&tmp, &p).ok()?;
+            texture::save_png(&p, img.as_raw(), w, h).ok()?;
         }
         let rec = serde_json::json!({"shade_texture": src["png"], "shade_source": source, "png": rel(&o.out, &p), "preset_colours": subs, "per_vertex": ids.is_none(),
             "applied": if ids.is_some() { "base colour = the garment preset's colour of each texel's sub-material (materialid texture, red x 63), times the fabric shade (G / 125); the preset's gradient stops and fabric weave are not applied" } else { "base colour = the fabric shade (G / 125) only; GLB COLOR_0 holds each vertex's garment preset colour (linear), multiplied in: this material has no materialid texture and its parts are numbered per vertex (raw vertex colour green = 4 x id + 2, kept in _COLOR0). The preset's gradient stops and fabric weave are not applied" }});
@@ -1099,9 +1148,7 @@ fn bake_ped_tint(st: &ShaderTextures, part: Option<&str>, o: &ExportOptions, tdi
     if !p.exists() {
         let img = image::open(&shade).ok()?.to_rgba8();
         let (w, h) = img.dimensions();
-        let tmp = p.with_extension(format!("{:?}.tmp.png", std::thread::current().id()).replace(['(', ')'], ""));
-        texture::save_png(&tmp, &crate::pedtint::bake(img.as_raw(), pal), w, h).ok()?;
-        fs::rename(&tmp, &p).ok()?;
+        texture::save_png(&p, &crate::pedtint::bake(img.as_raw(), pal), w, h).ok()?;
     }
     let mut rec = serde_json::json!({"shade_texture": src["png"], "shade_source": source, "png": rel(&o.out, &p)});
     match (tint, pal) {
@@ -1175,6 +1222,14 @@ pub fn export_base_name(e: &Entry) -> String {
     format!("{}_{:x}{}", sanitize(name), e.off, if member.is_some() { "_member" } else { "" })
 }
 
+/// Lock an export folder against other runs (and other threads of this
+/// one), then clear the temp files killed runs left in it.
+fn lock_export_dir(dir: &Path) -> Result<crate::atomic::DirLock> {
+    let lock = crate::atomic::lock_dir(dir)?;
+    crate::atomic::clean_temps(dir);
+    Ok(lock)
+}
+
 /// Export one entry. Returns the files written.
 pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<ExportedItem> {
     // Callers may pass a suffixed id directly on a cloned index entry.
@@ -1201,11 +1256,12 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
         (Kind::RageObj | Kind::Resource, Some("txd")) => {
             let dir = o.out.join("textures").join(&astem).join(&base_name);
             let marker = dir.join("dictionary.json");
-            if marker.exists() && !o.force {
+            // An unreadable marker (cut short or zero-filled) counts as missing.
+            if !o.force && crate::atomic::json_ok(&marker) {
                 item.status = "skipped".into();
                 return Ok(item);
             }
-            fs::create_dir_all(&dir)?;
+            let _lock = lock_export_dir(&dir)?;
             let r = Resource::load(&a.path, e)?;
             let texs = texture::find_textures(&r);
             let mut out_tex = Vec::new();
@@ -1223,7 +1279,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 "source": { "archive": a.id, "id": e.id, "offset": e.off },
                 "name": e.name, "textures": out_tex,
             });
-            fs::write(&marker, serde_json::to_vec_pretty(&j)?)?;
+            crate::atomic::write(&marker, serde_json::to_vec_pretty(&j)?)?;
             item.files.push(rel(&o.out, &marker));
         }
         (Kind::RageObj | Kind::Resource, Some(_)) => {
@@ -1234,11 +1290,16 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
             let missing_model = !dir.join("model.glb").exists() && (requested_member.is_some()
                 || fs::read(&marker).ok().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
                     .and_then(|meta| meta["meshes"].as_array().map(|meshes| !meshes.is_empty())).unwrap_or(false));
-            if marker.exists() && !o.force && !missing_model {
+            // An unreadable model.json (cut short, zero-filled, or a new file
+            // followed by an old one's tail) counts as missing.
+            if !o.force && !missing_model && crate::atomic::json_ok(&marker) {
                 item.status = "skipped".into();
                 return Ok(item);
             }
+            let _lock = lock_export_dir(&dir)?;
             fs::create_dir_all(dir.join("buffers"))?;
+            crate::atomic::clean_temps(&dir.join("buffers"));
+            crate::atomic::clean_temps(&dir.join("textures"));
             let r = Resource::load(&a.path, e)?;
             let mut info = crate::drawable::describe(&r);
             // each constant's type, from the shader archive's tables (the drawable does not store it)
@@ -1257,7 +1318,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
             for (i, b) in info.buffers.iter().enumerate() {
                 let end = (b.gfx_off + b.bytes).min(r.gfx.len() as u64) as usize;
                 let p = dir.join("buffers").join(format!("{:02}_{:x}.bin", i, b.gfx_off));
-                fs::write(&p, &r.gfx[b.gfx_off as usize..end])?;
+                crate::atomic::write(&p, &r.gfx[b.gfx_off as usize..end])?;
                 bufs.push(rel(&dir, &p));
                 item.files.push(rel(&o.out, &p));
             }
@@ -1272,7 +1333,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     }
                 }
             }
-            fs::write(dir.join("sys.bin"), &r.sys)?;
+            crate::atomic::write(dir.join("sys.bin"), &r.sys)?;
             item.files.push(rel(&o.out, &dir.join("sys.bin")));
             let BuiltDrawable { lod_groups, part_groups, materials: mats, joints, mesh_meta, shader_tex, part_looks, head } = build_drawable(a, e, &r, &info, &dir, requested_member.is_some(), o, &mut item);
             let all = || lod_groups.iter().flatten().chain(part_groups.iter()).flat_map(|g| &g.prims);
@@ -1306,7 +1367,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     let nm = format!("{}{}", e.name.as_deref().unwrap_or("model"), if lod == 0 { String::new() } else { format!("_lod{lod}") });
                     ex["roof_animation"] = roof_info.clone();
                     let opt = crate::gltf::GlbOptions { animations: &roof_anims, ..Default::default() };
-                    fs::write(&p, crate::gltf::mesh_glb_with(&nm, groups, &mats, &joints, ex, &opt))?;
+                    crate::atomic::write(&p, crate::gltf::mesh_glb_with(&nm, groups, &mats, &joints, ex, &opt))?;
                     item.files.push(rel(&o.out, &p));
                     if glb_file.is_none() {
                         glb_file = Some(rel(&dir, &p));
@@ -1317,7 +1378,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     let p = dir.join("model_parts.glb");
                     let mut ex = extras.clone();
                     ex["parts"] = serde_json::json!(true);
-                    fs::write(&p, crate::gltf::mesh_glb(&format!("{}_parts", e.name.as_deref().unwrap_or("model")), &part_groups, &mats, &joints, ex))?;
+                    crate::atomic::write(&p, crate::gltf::mesh_glb(&format!("{}_parts", e.name.as_deref().unwrap_or("model")), &part_groups, &mats, &joints, ex))?;
                     item.files.push(rel(&o.out, &p));
                     parts_file = Some(rel(&dir, &p));
                 }
@@ -1335,7 +1396,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
             let _ = fs::remove_file(dir.join("points.glb")); // stale from older runs
             if prims.iter().any(|p| !p.positions.is_empty()) {
                 let p = dir.join("points.glb");
-                fs::write(&p, crate::gltf::points_glb(e.name.as_deref().unwrap_or("model"), &prims, extras))?;
+                crate::atomic::write(&p, crate::gltf::points_glb(e.name.as_deref().unwrap_or("model"), &prims, extras))?;
                 item.files.push(rel(&o.out, &p));
                 points_file = Some(rel(&dir, &p));
             }
@@ -1408,6 +1469,10 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                         "base_color": if is_paint(s, st) { None } else { st.base.clone() }, "normal": st.normal, "normal_green": "directx (+Y down); invert G for glTF/OpenGL",
                         "textures": st.entries,
                     });
+                    let (values, unread) = parameter_values(s);
+                    m["parameters"] = values.into();
+                    m["parameters_not_read"] = unread.into();
+                    m["emissive_source"] = emissive_source_json(s, st, &c);
                     if let Some(fb) = &st.fallback {
                         m["texture_fallback"] = fb.clone();
                     }
@@ -1427,7 +1492,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     }
                     m
                 }).collect::<Vec<_>>(),
-                "materials_note": "Textures come from the data/ttdb/*.ttpf stores by 64-bit hash and are written once to <out>/textures/ttpf/<hash>.png. Roles are guessed from the shader parameter hash and the format (sRGB = colour, BC5 / known normal slots = normal map). classification.class is one of opaque/alpha/cutout/decal/glass/window/emissive/water/terrain_multilayer/car_paint, from the shader record flags and known shader families. shader_name and param_name are joaat names from <work>/names/names.json (`sixng names`), null when unknown. slot_role names the PBR map a known parameter slot holds.",
+                "materials_note": "parameters: every constant value of the material, keyed by the parameter's name (its 8-digit hash where the name is not known; a repeated name gets the hash appended), with the type from the shader archive (a scalar as a number, a vector as its 2 to 4 components, int and bool as such); drawable.shaders[].constants has the same values with buffer and byte offset. parameters_not_read: parameters whose values lie outside the material's constant block. emissive_source: what lights an emissive material in the GLB (emissive_map, colour_map, or none when the shader's emissivetex did not decode), null for materials that do not light. Textures come from the data/ttdb/*.ttpf stores by 64-bit hash and are written once to <out>/textures/ttpf/<hash>.png. Roles are guessed from the shader parameter hash and the format (sRGB = colour, BC5 / known normal slots = normal map). classification.class is one of opaque/alpha/cutout/decal/glass/window/emissive/water/terrain_multilayer/car_paint, from the shader record flags and known shader families. shader_name and param_name are joaat names from <work>/names/names.json (`sixng names`), null when unknown. slot_role names the PBR map a known parameter slot holds.",
             });
             let mut j = j;
             if physics.is_some() || archetype.is_some() {
@@ -1450,10 +1515,10 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 j["head_skin"] = rec.clone();
                 j["head_skin_note"] = "Heads bind no textures; the face comes from the material preset whose drawable tag lists this head (source \"linked\"), else from the faces of linked heads with the same sex, body type and ethnicity code (\"auto\"). index / count: the variant chosen with --head-skin. extra_textures: the keyed textures of the face's preset, its own before those of its template (the male or female base head); they are added to the material's textures under their key as param_hash. The key names are not recovered and no shader slot is known for them, so the GLB material does not use them.".into();
             }
-            fs::write(&marker, serde_json::to_vec_pretty(&j)?)?;
+            crate::atomic::write(&marker, serde_json::to_vec_pretty(&j)?)?;
             item.files.push(rel(&o.out, &marker));
             let mats = dir.join("materials.json");
-            fs::write(&mats, serde_json::to_vec_pretty(&readable_materials(&base_name, &info.shaders, &j["materials"]))?)?;
+            crate::atomic::write(&mats, serde_json::to_vec_pretty(&readable_materials(&base_name, &info.shaders, &j["materials"]))?)?;
             item.files.push(rel(&o.out, &mats));
         }
         _ => {
@@ -1465,7 +1530,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
             }
             fs::create_dir_all(&dir)?;
             let data = scan::read_entry(&a.path, e)?;
-            fs::write(&p, &data)?;
+            crate::atomic::write(&p, &data)?;
             item.files.push(rel(&o.out, &p));
         }
     }
@@ -1474,7 +1539,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
         fs::create_dir_all(&dir)?;
         let p = dir.join(format!("{base_name}.{}", e.ext));
         if !p.exists() || o.force {
-            fs::write(&p, scan::read_entry(&a.path, e)?)?;
+            crate::atomic::write(&p, scan::read_entry(&a.path, e)?)?;
         }
         item.files.push(rel(&o.out, &p));
     }
@@ -1769,9 +1834,18 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
                 g["emissiveTexture"] = serde_json::json!("base");
             }
             // A shader with its own emissive map lights only what that map
-            // shows (lamp bulbs, not the whole lamp unit).
-            if let (false, Some(u)) = (g["emissiveFactor"].is_null(), &st.emissive) {
-                g["emissiveTexture"] = serde_json::json!({"uri": u});
+            // shows (lamp bulbs, not the whole lamp unit). One whose
+            // `emissivetex` did not decode does not light at all: its colour
+            // map is not the light.
+            match emissive_source(st, is_lit(s, &classify_shader(s, st))) {
+                Some(EmissiveSource::Map) => g["emissiveTexture"] = serde_json::json!({"uri": st.emissive.clone()}),
+                Some(EmissiveSource::Missing) => {
+                    if let Some(o) = g.as_object_mut() {
+                        o.remove("emissiveFactor");
+                        o.remove("emissiveTexture");
+                    }
+                }
+                _ => {}
             }
             if let (Some(p), true) = (o.paint, is_paint(s, st)) {
                 g["pbrMetallicRoughness"]["baseColorFactor"] = serde_json::json!([p[0], p[1], p[2], 1.0]);
@@ -1787,7 +1861,8 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             g
         },
         extras: {
-            let mut x = serde_json::json!({"shader_name_hash": s.name_hash, "shader_name": crate::names::shader(&s.name_hash), "classification": classify_shader(s, st), "textures": st.entries, "texture_fallback": st.fallback});
+            let c = classify_shader(s, st);
+            let mut x = serde_json::json!({"shader_name_hash": s.name_hash, "shader_name": crate::names::shader(&s.name_hash), "emissive_source": emissive_source_json(s, st, &c), "classification": c, "textures": st.entries, "texture_fallback": st.fallback});
             if let Some(t) = &st.ped_tint {
                 x["ped_tint"] = t.clone();
             }
@@ -2149,7 +2224,7 @@ fn export_texture(r: &Resource, t: &texture::TexInfo, dir: &Path, o: &ExportOpti
         Err(err) => item.warnings.push(format!("{}: {err}", t.name)),
     }
     let p = dir.join(format!("{stem}.json"));
-    fs::write(&p, serde_json::to_vec_pretty(t)?)?;
+    crate::atomic::write(&p, serde_json::to_vec_pretty(t)?)?;
     files.push(rel(dir, &p));
     Ok(files)
 }
@@ -2307,7 +2382,7 @@ pub fn export_placements(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], ou
                 "group" => "position: GROUP-LOCAL space (named entity group; no map data places it), Z-up, right-handed, metres. rotation and gltf as for world files.",
                 _ => "position: RAGE world space, Z-up, right-handed, metres. rotation: quaternion (x, y, z, w) as stored = inverse of the entity rotation (rotation_world is the entity rotation). gltf: node transform to place this entity's model.glb in a Y-up glTF scene (translation = (x, z, -y)). Checked visually on two map files.",
             });
-            fs::write(&p, serde_json::to_vec(&doc).ok()?).ok()?;
+            crate::atomic::write(&p, serde_json::to_vec(&doc).ok()?).ok()?;
             let mut lo = [f32::MAX; 3];
             let mut hi = [f32::MIN; 3];
             for en in &mf.entities {
@@ -2342,7 +2417,7 @@ pub fn export_placements(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], ou
         s.push_str(&serde_json::to_string(x)?);
         s.push('\n');
     }
-    fs::write(dir.join("index.jsonl"), s)?;
+    crate::atomic::write(dir.join("index.jsonl"), s)?;
     Ok(v)
 }
 
@@ -2375,17 +2450,17 @@ pub fn export_batches(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: 
     let total = entries.len() as u64;
     let done = AtomicU64::new(0);
     struct W {
-        meta: std::io::BufWriter<fs::File>,
-        props: std::io::BufWriter<fs::File>,
-        grass: std::io::BufWriter<fs::File>,
+        meta: crate::atomic::AtomicFile,
+        props: crate::atomic::AtomicFile,
+        grass: crate::atomic::AtomicFile,
         np: usize,
         ng: usize,
         s: BatchSummary,
     }
     let w = std::sync::Mutex::new(W {
-        meta: std::io::BufWriter::new(fs::File::create(dir.join("batches.jsonl"))?),
-        props: std::io::BufWriter::new(fs::File::create(dir.join("batch_props.bin"))?),
-        grass: std::io::BufWriter::new(fs::File::create(dir.join("batch_grass.bin"))?),
+        meta: crate::atomic::AtomicFile::create(dir.join("batches.jsonl"))?,
+        props: crate::atomic::AtomicFile::create(dir.join("batch_props.bin"))?,
+        grass: crate::atomic::AtomicFile::create(dir.join("batch_grass.bin"))?,
         np: 0,
         ng: 0,
         s: BatchSummary::default(),
@@ -2445,10 +2520,10 @@ pub fn export_batches(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: 
             w.s.resolved_batches += h.is_some() as usize;
         }
     });
-    let mut w = w.into_inner().unwrap();
-    w.meta.flush()?;
-    w.props.flush()?;
-    w.grass.flush()?;
+    let w = w.into_inner().unwrap();
+    w.meta.commit()?;
+    w.props.commit()?;
+    w.grass.commit()?;
     Ok(w.s)
 }
 
@@ -2479,7 +2554,7 @@ pub fn export_meta(a: &ArchiveInfo, entries: &[&Entry], out: &Path, dump: bool, 
                 if instances {
                     doc["instances"] = m.instances(100_000);
                 }
-                fs::write(dir.join(format!("{:x}.json", e.off)), serde_json::to_vec(&doc).ok()?).ok()?;
+                crate::atomic::write(dir.join(format!("{:x}.json", e.off)), serde_json::to_vec(&doc).ok()?).ok()?;
             }
             let line = serde_json::json!({"id": e.id, "name": e.name, "size": e.usize, "root": root, "structs": structs});
             Some((e.id.clone(), line.to_string()))
@@ -2487,7 +2562,7 @@ pub fn export_meta(a: &ArchiveInfo, entries: &[&Entry], out: &Path, dump: bool, 
         .collect();
     lines.sort();
     let n = lines.len();
-    fs::write(dir.join("index.jsonl"), lines.into_iter().map(|x| x.1 + "\n").collect::<String>())?;
+    crate::atomic::write(dir.join("index.jsonl"), lines.into_iter().map(|x| x.1 + "\n").collect::<String>())?;
     Ok(n)
 }
 
@@ -2605,7 +2680,7 @@ pub fn export_collision(a: &ArchiveInfo, entries: &[&Entry], out: &Path, progres
             }
             let p = dir.join(format!("{:x}.glb", e.off));
             let extras = serde_json::json!({"source": e.id, "coordinate_system": "RAGE world space converted to glTF Y-up (x, z, -y); no node transform needed"});
-            fs::write(&p, c.glb(&format!("collision_{:x}", e.off), extras)).ok()?;
+            crate::atomic::write(&p, c.glb(&format!("collision_{:x}", e.off), extras)).ok()?;
             let line = serde_json::json!({
                 "id": e.id, "file": rel(out, &p), "bbox": c.bbox, "stats": c.stats,
                 "materials": mats, "primitives": c.primitives,
@@ -2620,9 +2695,9 @@ pub fn export_collision(a: &ArchiveInfo, entries: &[&Entry], out: &Path, progres
         s.push_str(&l);
         s.push('\n');
     }
-    fs::write(dir.join("index.jsonl"), s)?;
+    crate::atomic::write(dir.join("index.jsonl"), s)?;
     let census = census.into_inner().unwrap();
-    fs::write(dir.join("surfaces.json"), serde_json::to_vec_pretty(&serde_json::json!({
+    crate::atomic::write(dir.join("surfaces.json"), serde_json::to_vec_pretty(&serde_json::json!({
         "note": "surface id = u16 at +0 of each 8-byte bound material: 18 + elf(material name) % 32749, the material names being those of common.rpf's material XML (`sixng annotate` adds them as names_by_surface_id). Values: triangles using it.",
         "triangles_by_surface_id": census,
     }))?)?;
@@ -2652,7 +2727,7 @@ pub fn export_navmesh(a: &ArchiveInfo, entries: &[&Entry], out: &Path, roads_onl
             let extras = serde_json::json!({"source": e.id, "roads_only": roads_only, "coordinate_system": "RAGE world space converted to glTF Y-up (x, z, -y)"});
             let file = match nm.glb(&format!("navmesh_{:x}", e.off), roads_only, extras) {
                 Some(g) => {
-                    fs::write(&p, g).ok()?;
+                    crate::atomic::write(&p, g).ok()?;
                     Some(rel(out, &p))
                 }
                 None => None,
@@ -2669,7 +2744,7 @@ pub fn export_navmesh(a: &ArchiveInfo, entries: &[&Entry], out: &Path, roads_onl
         s.push_str(l);
         s.push('\n');
     }
-    fs::write(dir.join("index.jsonl"), s)?;
+    crate::atomic::write(dir.join("index.jsonl"), s)?;
     Ok((lines.len(), roads))
 }
 
@@ -2758,7 +2833,7 @@ pub fn export_interiors(a: &ArchiveInfo, entries: &[&Entry], all: &[Entry], out:
     let second = interior_second_pass(a, all, &by_name, &scan_by_id, &coll, &linked);
     let dir = out.join("placements").join(a.id.trim_end_matches(".rpf"));
     fs::create_dir_all(&dir)?;
-    let mut w = std::io::BufWriter::new(fs::File::create(dir.join("interiors.jsonl"))?);
+    let mut w = crate::atomic::AtomicFile::create(dir.join("interiors.jsonl"))?;
     let (mut n, mut ok) = (0, 0);
     for s in &scans {
         for (i, inst) in s.instances.iter().enumerate() {
@@ -2792,7 +2867,7 @@ pub fn export_interiors(a: &ArchiveInfo, entries: &[&Entry], all: &[Entry], out:
             writeln!(w, "{}", serde_json::to_string(&v)?)?;
         }
     }
-    w.flush()?;
+    w.commit()?;
     Ok((n, ok, by_name.len()))
 }
 
@@ -2954,7 +3029,7 @@ pub fn export_lights(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: &
     type Ent = (u32, [f32; 3], [f32; 4], f32, f32);
     let mut by_arch: std::collections::HashMap<u32, &LightSet> = std::collections::HashMap::new();
     let mut by_mlo = std::collections::HashMap::new();
-    let mut sets_out = std::io::BufWriter::new(fs::File::create(dir.join("sets.jsonl"))?);
+    let mut sets_out = crate::atomic::AtomicFile::create(dir.join("sets.jsonl"))?;
     let (mut n_sets, mut n_lights) = (0, 0);
     for sc in &scans {
         for m in &sc.mlos {
@@ -2977,8 +3052,8 @@ pub fn export_lights(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: &
             }
         }
     }
-    sets_out.flush()?;
-    let mut w = std::io::BufWriter::new(fs::File::create(dir.join("world.jsonl"))?);
+    sets_out.commit()?;
+    let mut w = crate::atomic::AtomicFile::create(dir.join("world.jsonl"))?;
     let mut placed = 0;
     // Entity-space point -> world, optionally through an interior instance.
     let place = |en: &Ent, inst: Option<&crate::meta7a::MloInstance>, l: [f32; 3]| -> [f32; 3] {
@@ -3010,7 +3085,7 @@ pub fn export_lights(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: &
             }
         }
     };
-    let mut emit = |w: &mut std::io::BufWriter<fs::File>, map: &str, ei: usize, en: &Ent, s: &LightSet, inst: Option<(&str, usize, &crate::meta7a::MloInstance)>, group: bool| -> Result<()> {
+    let mut emit = |w: &mut crate::atomic::AtomicFile, map: &str, ei: usize, en: &Ent, s: &LightSet, inst: Option<(&str, usize, &crate::meta7a::MloInstance)>, group: bool| -> Result<()> {
         for (li, l) in s.lights.iter().enumerate() {
             let wp = place(en, inst.map(|x| x.2), l.position);
             if !in_region(wp, wp) {
@@ -3061,7 +3136,7 @@ pub fn export_lights(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: &
             }
         }
     }
-    w.flush()?;
+    w.commit()?;
     let extra = export_map_lights(ws, &scans, &dir)?;
     Ok((n_sets, n_lights, placed, extra))
 }
@@ -3090,7 +3165,7 @@ pub fn export_map_lights(ws: &Workspace, scans: &[MetaScan], dir: &Path) -> Resu
     use crate::meta7a::field_name;
     use std::io::Write;
     let tc_names = tc_modifier_names(ws);
-    let file = |n: &str| -> Result<std::io::BufWriter<fs::File>> { Ok(std::io::BufWriter::new(fs::File::create(dir.join(n))?)) };
+    let file = |n: &str| -> Result<crate::atomic::AtomicFile> { Ok(crate::atomic::AtomicFile::create(dir.join(n))?) };
     let (mut tcw, mut dw, mut lw, mut gw) = (file("tc_modifiers.jsonl")?, file("distant.jsonl")?, file("lod.jsonl")?, file("distant_groups.jsonl")?);
     let (mut n_tc, mut n_d, mut n_l) = (0, 0, 0);
     let lod_of: std::collections::HashMap<u32, (&str, &serde_json::Value)> =
@@ -3196,8 +3271,8 @@ pub fn export_map_lights(ws: &Workspace, scans: &[MetaScan], dir: &Path) -> Resu
             n_l += 1;
         }
     }
-    for w in [&mut tcw, &mut dw, &mut lw, &mut gw] {
-        w.flush()?;
+    for w in [tcw, dw, lw, gw] {
+        w.commit()?;
     }
     Ok((n_tc, n_d, n_l))
 }
@@ -3254,7 +3329,7 @@ pub fn export_paths(a: &ArchiveInfo, entries: &[&Entry], out: &Path, progress: P
         "flags_note": "Node flag_names come from the PNF_ enum value hashes (34 of 51 recovered); unnamed bits are bitN. Link flag_names: GpsCanGoBothWays, ShortCut, LeadsToDeadEnd, LeadsFromDeadEnd are the game's PNLF_ names; [unpaved/track] (bit 5) and [two-way road] (bit 10) are inferred from geometry; [no ambient traffic?] (bit 6) is inferred from node traffic density (set on every link touching a density-0 node).",
         "nodes": nodes, "links": links, "junctions": junctions,
     });
-    fs::write(dir.join("graph.json"), serde_json::to_vec(&doc)?)?;
+    crate::atomic::write(dir.join("graph.json"), serde_json::to_vec(&doc)?)?;
     Ok((nodes.len(), links.len(), bad))
 }
 
@@ -3542,7 +3617,7 @@ pub fn link_archetypes(ws: &Workspace, a: &ArchiveInfo, metas: &[&Entry], candid
     let doc = serde_json::json!({"note": "Archetypes (struct 82d6fc83) with no named drawable, linked first by the name stored inside an unindexed drawable (joaat match), else to the one drawable (unnamed, or named but not matching its own archetype) whose bounds equal the archetype bbox (0.03 m; ambiguous and degenerate boxes are not linked); names guessed by joaat of sibling-name stems. Merged into model_id resolution (placements, lights, ...). Regenerate with `sixng link-archetypes` after re-indexing.",
         "stats": stats, "links": links});
     fs::create_dir_all(ws.index_dir())?;
-    fs::write(links_path(ws), serde_json::to_vec_pretty(&doc)?)?;
+    crate::atomic::write(links_path(ws), serde_json::to_vec_pretty(&doc)?)?;
     Ok(stats)
 }
 
@@ -3589,6 +3664,48 @@ mod dictionary_tests {
         // a lamp with its own emissive map keeps it; other shaders are left alone
         assert!(!lights_by_alpha(VEHICLE_LAMP_SHADER, &st(Some("a.png"), Some("b.png"))));
         assert!(!lights_by_alpha("0badf00d", &st(Some("a.png"), None)));
+    }
+
+    #[test]
+    fn emissive_materials_light_by_their_own_map() {
+        let slot = |h: &str| serde_json::json!({"param_hash": h});
+        let st = |emissive: Option<&str>, slots: &[&str]| ShaderTextures { base: Some("a.png".into()), emissive: emissive.map(str::to_string), entries: slots.iter().map(|h| slot(h)).collect(), ..Default::default() };
+        // an emissive layer lights by its emissivetex, never by the colour map
+        assert_eq!(emissive_source(&st(Some("e.png"), &[DIFFUSE_PARAM, EMISSIVE_PARAM]), true), Some(EmissiveSource::Map));
+        assert_eq!(emissive_source(&st(None, &[DIFFUSE_PARAM, EMISSIVE_PARAM]), true), Some(EmissiveSource::Missing));
+        // signs_emissive has only its colour map, which is the light
+        assert_eq!(emissive_source(&st(None, &[DIFFUSE_PARAM]), true), Some(EmissiveSource::ColourMap));
+        assert_eq!(emissive_source(&st(Some("e.png"), &[EMISSIVE_PARAM]), false), None);
+        // plain alpha shaders do not light (they were labelled emissive before)
+        for h in ["d9ec330c", "5b775918", "e3ba3129"] {
+            let c = crate::material::classify(h, &[0, 0, 0, 0, 2, 0, 0, 0]);
+            let s = crate::drawable::Shader { index: 0, record_off: 0, name_hash: h.into(), param_hashes: vec![], textures: vec![], flags: vec![], constants: vec![] };
+            assert_eq!(c["class"], "alpha", "{h}");
+            assert!(!is_lit(&s, &c), "{h}");
+            assert!(crate::material::gltf_fields(&c, true)["emissiveFactor"].is_null(), "{h}");
+        }
+    }
+
+    #[test]
+    fn every_constant_value_is_kept_with_its_type() {
+        let s: crate::drawable::Shader = serde_json::from_value(serde_json::json!({
+            "index": 0, "record_off": 0, "name_hash": "e3ba3129", "param_hashes": [], "textures": [], "flags": [],
+            "constants": [
+                {"hash": "0badf00d", "desc": "", "offset": 0, "values": [0.5, 0.0, 0.0, 0.0], "buffer": 3, "count": 1, "type": "float"},
+                {"hash": "0badf00e", "desc": "", "offset": 16, "values": [1.0, 2.0, 3.0, 4.0], "buffer": 3, "count": 4, "type": "float4"},
+                {"hash": "0badf00f", "desc": "", "offset": 32, "values": [f32::from_bits(7), 0.0, 0.0, 0.0], "buffer": 3, "count": 1, "type": "int"},
+                {"hash": "0badf00d", "desc": "", "offset": 36, "values": [0.25, 0.0, 0.0, 0.0], "buffer": 7, "count": 1, "type": "float"},
+                {"hash": "0badf010", "desc": "", "offset": 9999, "values": null, "buffer": 3, "count": 1}
+            ]
+        }))
+        .unwrap();
+        let (v, unread) = parameter_values(&s);
+        // the names dictionary is not loaded in tests: keyed by hash, a repeat gets a number
+        assert_eq!(v["0badf00d"], 0.5);
+        assert_eq!(v["0badf00d #2"], 0.25);
+        assert_eq!(v["0badf00e"], serde_json::json!([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(v["0badf00f"], 7);
+        assert_eq!(unread, vec!["0badf010".to_string()]);
     }
 
     #[test]
@@ -3690,14 +3807,14 @@ mod dictionary_tests {
             archive.extend(compressed);
         }
         let a = ArchiveInfo { id: "levels.rpf".into(), path: work.join("levels.rpf"), size: archive.len() as u64, container: "rpf9".into() };
-        fs::write(&a.path, archive).unwrap();
+        crate::atomic::write(&a.path, archive).unwrap();
         let o = ExportOptions { out: work.join("out"), png: false, dds: false, raw: false,
             force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default() };
         let dir = o.out.join("models/levels").join(export_base_name(&e));
         fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("model.json");
-        fs::write(&marker, br#"{"meshes":[{"lod":2}],"glb":null,"lod_glbs":["model_lod2.glb"]}"#).unwrap();
-        fs::write(dir.join("model_lod2.glb"), b"old layout").unwrap();
+        crate::atomic::write(&marker, br#"{"meshes":[{"lod":2}],"glb":null,"lod_glbs":["model_lod2.glb"]}"#).unwrap();
+        crate::atomic::write(dir.join("model_lod2.glb"), b"old layout").unwrap();
         let item = export_entry(&a, &e, &o).unwrap();
         assert_eq!(item.status, "ok");
         assert_eq!(&fs::read(dir.join("model.glb")).unwrap()[..4], b"glTF");
@@ -3710,14 +3827,14 @@ mod dictionary_tests {
         fs::remove_file(dir.join("model.glb")).unwrap();
         // Resources with no meshes must remain cached even without a GLB.
         for metadata in [br#"{"meshes":[]}"#.as_slice(), b"{}"] {
-            fs::write(&marker, metadata).unwrap();
+            crate::atomic::write(&marker, metadata).unwrap();
             assert_eq!(export_entry(&a, &e, &o).unwrap().status, "skipped");
             assert_eq!(fs::read(&marker).unwrap(), metadata);
         }
         e.rtype = Some("txd".into());
         let tdir = o.out.join("textures/levels").join(export_base_name(&e));
         fs::create_dir_all(&tdir).unwrap();
-        fs::write(tdir.join("dictionary.json"), b"{}").unwrap();
+        crate::atomic::write(tdir.join("dictionary.json"), b"{}").unwrap();
         assert_eq!(export_entry(&a, &e, &o).unwrap().status, "skipped");
         fs::remove_dir_all(work).unwrap();
     }
