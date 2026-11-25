@@ -656,6 +656,26 @@ enum Cmd {
     /// submodifiers they use). With -o writes <out>/timecycle/: modifiers,
     /// cycles, time_samples, weather, custom_clouds, variables, files and
     /// selected (.json).
+    /// Time of day and weather lighting from the timecycle (common.rpf):
+    /// per weather type and hour, the resolved timecycle values the viewer
+    /// uses (directional colour and multiplier, ambient intensity and tint,
+    /// exposure) and the light derived from them. Uses the cached table
+    /// (<work>/cache/daylight.json) or decodes common.rpf; --rebuild
+    /// decodes again.
+    Daylight {
+        /// Weather ids (sunny, clear, clouds, overcast, overcastdark, misty,
+        /// fog, drizzle, shower, rain, thunderstorm, hurricane); default all.
+        #[arg(long, value_delimiter = ',')]
+        weather: Vec<String>,
+        /// Hours (0-24), default the 13 time samples.
+        #[arg(long, value_delimiter = ',')]
+        hour: Vec<f32>,
+        /// Also print these timecycle variables.
+        #[arg(long, value_delimiter = ',')]
+        var: Vec<String>,
+        #[arg(long)]
+        rebuild: bool,
+    },
     Timecycle {
         /// Archive (default common).
         #[arg(default_value = "common")]
@@ -2579,6 +2599,27 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 sixng_core::atomic::write(dir.join("index.json"), serde_json::to_vec_pretty(&found.iter().map(|x| &x.0).collect::<Vec<_>>())?)?;
             }
             out.print(&json!({"ok": true, "archive": a.id, "count": found.len(), "dictionaries": found.iter().map(|x| &x.0).collect::<Vec<_>>()}));
+        }
+        Cmd::Daylight { weather, hour, var, rebuild } => {
+            use sixng_core::daylight as dl;
+            if *rebuild {
+                let _ = std::fs::remove_file(dl::cache_path(&ws));
+            }
+            let t = dl::load_or_build(&ws)?;
+            let hours = if hour.is_empty() { t.hours.clone() } else { hour.clone() };
+            const VARS: [&str; 12] = ["light_dir_mult", "light_dir_col_r", "light_dir_col_g", "light_dir_col_b", "light_dir_sun_mult", "light_dir_moon_mult", "sky_scattering_sun_intensity_multiplier", "ambient_sky_intensity", "ambient_sky_color_mult_r", "ambient_sky_color_mult_g", "ambient_sky_color_mult_b", "postfx_exposure"];
+            let mut rows = vec![];
+            for w in t.weathers.iter().filter(|w| weather.is_empty() || weather.iter().any(|x| x.eq_ignore_ascii_case(&w.id))) {
+                for &h in &hours {
+                    let mut vals = serde_json::Map::new();
+                    for k in VARS.iter().copied().chain(var.iter().map(String::as_str)) {
+                        vals.insert(k.to_string(), json!(t.value(w, k, h)));
+                    }
+                    rows.push(json!({"weather": w.id, "hour": h, "vars": vals, "light": dl::light(&t, w, h)}));
+                }
+            }
+            let weathers: Vec<_> = t.weathers.iter().map(|w| json!({"id": w.id, "type": w.kind, "cycle": w.cycle, "mods": w.mods, "cloud_cover": w.cloud_cover, "vars": w.vars.len()})).collect();
+            out.print(&json!({"ok": true, "hours": t.hours, "ease": t.ease, "weathers": weathers, "rows": rows}));
         }
         Cmd::Timecycle { archive, name, out: po } => {
             let a = ws.resolve(archive)?;

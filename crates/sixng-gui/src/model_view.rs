@@ -456,6 +456,11 @@ pub struct ModelView {
     pub cam: Camera,
     pub look: Look,
     pub tod: f32,
+    /// Weather type id for the game's lighting (`sixng_core::daylight`);
+    /// empty = the viewer's own light set-up.
+    pub weather: String,
+    /// The game's lighting for `weather` has been applied to `look`.
+    daylight_applied: bool,
     pub show_skeleton: bool,
     pub show_normals: bool,
     /// Depth-bias decal-bucket materials (off = raw z-fighting, for comparison).
@@ -844,6 +849,8 @@ impl ModelView {
             cam: Camera::default(),
             look: Look::default(),
             tod: 13.0,
+            weather: String::new(),
+            daylight_applied: false,
             show_skeleton: false,
             show_normals: false,
             decal_bias: true,
@@ -3569,6 +3576,14 @@ impl ModelView {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, render_state: Option<&egui_wgpu::RenderState>) {
+        if !self.weather.is_empty() && !self.daylight_applied {
+            // the weather's table arrives in the background
+            match daylight_table(&self.game, &self.work, true) {
+                DaylightState::Ready(_) => self.apply_light(),
+                DaylightState::Loading => ui.ctx().request_repaint_after(std::time::Duration::from_millis(200)),
+                DaylightState::Failed(_) => {}
+            }
+        }
         let ctx = ui.ctx().clone();
         let Some(rs) = render_state else {
             ui.label("The model viewer needs the wgpu renderer.");
@@ -4010,6 +4025,74 @@ impl ModelView {
         self.caps.as_ref().unwrap().2
     }
 
+    /// Weather choice for the game's time-of-day lighting. Returns true when
+    /// the light should be set again (weather picked, or the table arrived).
+    fn weather_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        let state = daylight_table(&self.game, &self.work, !self.weather.is_empty());
+        let label = |id: &str| {
+            sixng_core::daylight::WEATHERS.iter().find(|w| w.0 == id).map(|w| w.2).unwrap_or("viewer default")
+        };
+        let mut changed = false;
+        egui::ComboBox::from_label("weather")
+            .selected_text(label(&self.weather))
+            .show_ui(ui, |ui| {
+                changed |= ui.selectable_value(&mut self.weather, String::new(), "viewer default").on_hover_text("The viewer's own fixed light set-up").changed();
+                for (id, _, l) in sixng_core::daylight::WEATHERS {
+                    changed |= ui.selectable_value(&mut self.weather, id.to_string(), l).changed();
+                }
+            })
+            .response
+            .on_hover_text("Light the model as the game does for this weather at the chosen hour: sun or moon direction, sun colour and strength, sky tint and ambient from the game's timecycle (needs common.rpf indexed)");
+        if self.weather.is_empty() {
+            return changed;
+        }
+        match state {
+            DaylightState::Loading => {
+                ui.label("reading the game's timecycle…");
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                self.daylight_applied = false;
+            }
+            DaylightState::Failed(e) => {
+                ui.colored_label(egui::Color32::from_rgb(220, 140, 60), format!("no timecycle data, viewer light kept: {e}"));
+            }
+            DaylightState::Ready(t) => {
+                if let Some(w) = t.weather(&self.weather) {
+                    let l = sixng_core::daylight::light(&t, w, self.tod);
+                    ui.label(format!(
+                        "{} {:.0}°, light ×{:.2} (cycle ×{:.2}), ambient ×{:.2} (cycle ×{:.2}), clouds {:.0}%",
+                        if l.moon { "moon" } else { "sun" },
+                        if l.moon { l.dir[1].asin().to_degrees() } else { l.sun_elev },
+                        l.dir_strength,
+                        l.light_dir_mult,
+                        l.ambient,
+                        l.ambient_sky_intensity,
+                        l.cloud_cover * 100.0
+                    ));
+                }
+                if !self.daylight_applied {
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Set the light from the hour and weather (the game's lighting when a
+    /// weather is picked and its table is loaded, else the viewer's own).
+    pub fn apply_light(&mut self) {
+        if !self.weather.is_empty() {
+            if let DaylightState::Ready(t) = daylight_table(&self.game, &self.work, true) {
+                if let Some(w) = t.weather(&self.weather) {
+                    self.look.set_game_light(&sixng_core::daylight::light(&t, w, self.tod));
+                    self.daylight_applied = true;
+                    return;
+                }
+            }
+            self.daylight_applied = false;
+        }
+        self.look.set_time_of_day(self.tod);
+    }
+
     fn side_ui(&mut self, ui: &mut egui::Ui, rs: &egui_wgpu::RenderState) {
         let caps = self.caps();
         let seen = HEAD_SKIN_SEEN.lock().unwrap().clone();
@@ -4086,11 +4169,12 @@ impl ModelView {
         });
         ui.separator();
         ui.heading("Light");
-        if ui
+        let mut relight = ui
             .add(egui::Slider::new(&mut self.tod, 0.0..=24.0).text("time of day (h)"))
-            .changed()
-        {
-            self.look.set_time_of_day(self.tod);
+            .changed();
+        relight |= self.weather_ui(ui);
+        if relight {
+            self.apply_light();
         }
         ui.add(
             egui::Slider::new(&mut self.look.exposure, 0.2..=4.0)
@@ -4912,6 +4996,35 @@ fn sub_material_map(mat: &glb::Material, roots: &[&Path], w: u32, h: u32) -> Opt
         }
     }
     Some(out)
+}
+
+pub(crate) enum DaylightState {
+    Loading,
+    Failed(String),
+    Ready(Arc<sixng_core::daylight::Table>),
+}
+
+/// The game's time-of-day table (`sixng_core::daylight`), loaded or
+/// decoded once in the background when first wanted (`start`).
+pub(crate) fn daylight_table(game: &str, work: &str, start: bool) -> DaylightState {
+    type Slot = Mutex<Option<Result<Arc<sixng_core::daylight::Table>, String>>>;
+    static TABLE: std::sync::OnceLock<Arc<Slot>> = std::sync::OnceLock::new();
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let slot = TABLE.get_or_init(|| Arc::new(Mutex::new(None))).clone();
+    if let Some(r) = slot.lock().unwrap().as_ref() {
+        return match r {
+            Ok(t) => DaylightState::Ready(t.clone()),
+            Err(e) => DaylightState::Failed(e.clone()),
+        };
+    }
+    if start && !STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        let ws = Workspace::new(game, work);
+        std::thread::spawn(move || {
+            let r = sixng_core::daylight::load_or_build(&ws).map(Arc::new).map_err(|e| format!("{e:#}"));
+            *slot.lock().unwrap() = Some(r);
+        });
+    }
+    DaylightState::Loading
 }
 
 /// The layered-material index (`sixng materials`), loaded or built once.

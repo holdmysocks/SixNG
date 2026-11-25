@@ -72,6 +72,7 @@ pub mod storyflow;
 pub mod shaderfx;
 pub mod surface;
 pub mod timecycle;
+pub mod daylight;
 pub mod water;
 pub mod world;
 
