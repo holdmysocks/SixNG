@@ -14,6 +14,13 @@
 //! the blocks broke it and decoded with black holes. A slot is replaced only
 //! where a refit lowered the violations on held-out chunks and did not raise
 //! the error against plain child mips.
+//!
+//! A second set of slots is fitted on mip consistency: per 2x2 quadrant, a
+//! decoded block of mip m should match the pixels of mip m+1 it covers, with
+//! mip m+1 decoded from either plain or BCPack data. Blocks whose reference
+//! starts at the same slot are skipped, since both sides move together there.
+//! A slot is kept only where the fit gains on both even and odd chunks and a
+//! check over all textures shows no regression traced to it.
 
 use bcpack::bc1::Window;
 
