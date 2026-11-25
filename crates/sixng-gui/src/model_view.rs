@@ -1118,9 +1118,10 @@ impl ModelView {
                             // a character's hair without them: the appearance preset of each strand's variant
                             (Some(t), _) => g.coat_glb_with(&name, &coat, w, &|s, f| t.rgb(coat.variants.get(s).copied().unwrap_or(0), f), serde_json::json!({})),
                             // an animal's strands with the game's tables: the ramp of the variant times
-                            // the colour of the skin under the root (inferred: the game's source of an animal's coat colour is not found;
-                            // its strand resolve has a tint step of this form, mix(C, C x T, w) with T read at the root UV, but the
-                            // texture it reads is not identified)
+                            // the colour of the skin under the root. The game's strand resolve does this: colour = mix(C, C x T, w), T read
+                            // at the strand's root UV from the first texture of one of the ped's own components (with that
+                            // component's palette rows when it has them): wiring read from the game's code. That the texture is
+                            // the body's colour map is by fit (medium); w is not found and taken as 1; the palette case is not done here.
                             (None, Some(d)) if fur_sets.is_some_and(|f| d.colour_set(f.0).is_some() || d.param_set(f.1).is_some()) => {
                                 let (cn, pn) = fur_sets.unwrap();
                                 let (cs, ps) = (d.colour_set(cn), d.param_set(pn));
