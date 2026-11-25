@@ -1281,6 +1281,14 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 }
                 if any { serde_json::json!(g) } else { serde_json::Value::Null }
             };
+            // physics (SIX-188): a fragment's physics LOD, a drawable's embedded bound
+            let physics = match (e.rtype.as_deref(), requested_member) {
+                (Some("ft"), None) => crate::fragphys::decode(&r).map(|p| crate::fragphys::fragment_json(&p, &info.skeleton.iter().map(|b| b.name.clone()).collect::<Vec<_>>())),
+                (Some("dr"), None) => crate::fragphys::drawable_bound(&r).map(|b| serde_json::json!({"version": crate::fragphys::EXPORT_VERSION, "kind": "drawable", "bound": b,
+                    "note": "Embedded collision of the drawable (composite bound at root+0xC8): child types, local boxes, volumes (m^3) and placements, RAGE Z-up. Drawables carry no physics archetype: mass and inertia are not stored with them (see archetype.tunable for a per-model mass override)."})),
+                _ => None,
+            };
+            let archetype = if matches!(e.rtype.as_deref(), Some("ft" | "dr")) && requested_member.is_none() { e.name.as_deref().and_then(|n| crate::fragphys::archetype_json(a, n)) } else { None };
             let j = serde_json::json!({
                 "source": { "archive": a.id, "id": e.id, "offset": e.off, "streams": e.streams },
                 "name": e.name, "type": e.rtype,
@@ -1346,6 +1354,10 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 "materials_note": "Textures come from the data/ttdb/*.ttpf stores by 64-bit hash and are written once to <out>/textures/ttpf/<hash>.png. Roles are guessed from the shader parameter hash and the format (sRGB = colour, BC5 / known normal slots = normal map). classification.class is one of opaque/alpha/cutout/decal/glass/window/emissive/water/terrain_multilayer/car_paint, from the shader record flags and known shader families. shader_name and param_name are joaat names from <work>/names/names.json (`sixng names`), null when unknown. slot_role names the PBR map a known parameter slot holds.",
             });
             let mut j = j;
+            if physics.is_some() || archetype.is_some() {
+                j["physics"] = serde_json::json!(physics);
+                j["archetype"] = serde_json::json!(archetype);
+            }
             let sliding: Vec<String> = info.skeleton.iter().filter(|b| crate::drawable::slides(b)).map(|b| b.name.clone()).collect::<Vec<_>>();
             if !sliding.is_empty() {
                 j["sliding_doors"] = serde_json::json!(sliding);
