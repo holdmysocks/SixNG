@@ -420,7 +420,7 @@ pub struct UnderPaint {
 /// The game picks one of the three hex vertices per pixel by a dither that
 /// changes every frame; here the three are blended by their squared
 /// weights, which is its mean. Left out: the layer's normal map and
-/// material values, the mirror flags of the detail texture, mask overrides
+/// material values, mask overrides
 /// and the extra mask, and two skin-side sums whose use is not read. The
 /// fourth coordinate set holds the scalp in its first tile; triangles
 /// outside it are not painted (how the game's sampler treats them is not
@@ -499,7 +499,15 @@ fn bake_under(m: &mut glb::Model, layers: &[UnderPaint], game: &Path) -> usize {
                         (dx, dy) = (1.0, 0.0);
                     }
                     let (ox, oy) = (u - cx, v - cy);
-                    let t = det.at((ox * dx - oy * dy) * y.detail_scale + cx + r, (ox * dy + oy * dx) * y.detail_scale + cy + r, true);
+                    // the game's turn: direction (0, 1) is none; where the direction points to +x a flagged coordinate is mirrored
+                    let (mut tu, mut tv) = ((ox * dy + oy * dx) * y.detail_scale + cx + r, (oy * dy - ox * dx) * y.detail_scale + cy + r);
+                    if dx > 0.0 && y.mirror[0] {
+                        tu = 1.0 - tu;
+                    }
+                    if dx > 0.0 && y.mirror[1] {
+                        tv = 1.0 - tv;
+                    }
+                    let t = det.at(tu, tv, true);
                     d += wt * t[0];
                     kk += wt * t[2];
                 }

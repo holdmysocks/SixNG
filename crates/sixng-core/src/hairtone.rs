@@ -52,7 +52,7 @@ pub const UNDER: u32 = 0x7fc5_6571;
 /// without `_full`, the item's tag `023e5a2f`). Slot i is coloured by
 /// preset i of the item's colour preset set ([`SET`], tag `f7b14eb8`).
 pub const UNDER_SET: u32 = 0x1e87_5c1c;
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 
 /// One painted hair layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,6 +77,9 @@ pub struct UnderLayer {
     pub opacity: f32,
     /// `e7b37fd7`: the layer lies in the head's fourth texture coordinate set (scalp), not the third (face).
     pub other_uv: bool,
+    /// `d7096b7a`, `bc503608`: mirror the detail texture's U / V where the direction points to +x.
+    #[serde(default)]
+    pub mirror: [bool; 2],
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -144,7 +147,7 @@ impl Table {
                 let (mask, direction, detail) = (tex(field_name(crate::meta7a::joaat("mask"))), tex(field_name(0x3395_c260)), tex(field_name(0x3804_9c16)));
                 // the game skips a layer without one of the three
                 if mask != 0 && direction != 0 && detail != 0 {
-                    v.push(UnderLayer { slot, mask, direction, detail, lo: num(0x03a9_e780, 0.1), hi: num(0x0a43_bed0, 0.9), strength: num(0xef27_74fe, 1.0), tile: num(0xa025_b3e6, 20.0), detail_scale: num(0x8391_6844, 10.0), opacity: num(0xdc78_6517, 1.0), other_uv: l[field_name(0xe7b3_7fd7)].as_bool().unwrap_or(false) });
+                    v.push(UnderLayer { slot, mask, direction, detail, lo: num(0x03a9_e780, 0.1), hi: num(0x0a43_bed0, 0.9), strength: num(0xef27_74fe, 1.0), tile: num(0xa025_b3e6, 20.0), detail_scale: num(0x8391_6844, 10.0), opacity: num(0xdc78_6517, 1.0), other_uv: l[field_name(0xe7b3_7fd7)].as_bool().unwrap_or(false), mirror: [0xd709_6b7au32, 0xbc50_3608].map(|h| l[field_name(h)].as_bool().unwrap_or(false)) });
                 }
             }
             if !v.is_empty() {
