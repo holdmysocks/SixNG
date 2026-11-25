@@ -47,7 +47,7 @@ use crate::export::Progress;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 pub const CH_DATA: u8 = 0x55;
@@ -779,7 +779,7 @@ pub fn export_stream(bank_bytes: &[u8], b: &Bank, s: &Stream, out: &Path, fmt: &
             _ => (format!("{}.wav", stem(b, s)), pcm_wav(stream_data(bank_bytes, s)?, s)?),
         };
         let p = out.join(name);
-        std::fs::write(&p, bytes)?;
+        crate::atomic::write(&p, bytes)?;
         return Ok(vec![p.display().to_string()]);
     }
     if s.layout != "blocks" {
@@ -796,14 +796,13 @@ fn write_stream(pk: &[Vec<u8>], frames: u32, st: &str, out: &Path, fmt: &str) ->
     let mut files = Vec::new();
     if fmt == "opus" || fmt == "both" {
         let p = out.join(format!("{st}.opus"));
-        std::fs::write(&p, ogg_opus(pk, frames, st))?;
+        crate::atomic::write(&p, ogg_opus(pk, frames, st))?;
         files.push(p.display().to_string());
     }
     if fmt == "wav" || fmt == "both" {
         let (ch, pcm) = decode(pk, frames)?;
         let p = out.join(format!("{st}.wav"));
-        let mut f = File::create(&p)?;
-        f.write_all(&wav(ch, 48000, &pcm))?;
+        crate::atomic::write(&p, wav(ch, 48000, &pcm))?;
         files.push(p.display().to_string());
     }
     Ok(files)
@@ -925,23 +924,12 @@ pub fn load_index(work: &Path, archive: &str) -> Result<AudioIndex> {
 }
 
 pub fn save_index(work: &Path, ix: &AudioIndex) -> Result<()> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static NEXT_TEMP: AtomicUsize = AtomicUsize::new(0);
-
     let p = index_path(work, &ix.archive);
     std::fs::create_dir_all(p.parent().unwrap())?;
-    let temp = p.with_extension(format!("{}-{}.tmp", std::process::id(), NEXT_TEMP.fetch_add(1, Ordering::Relaxed)));
-    let result = (|| {
-        let mut z = flate2::write::GzEncoder::new(std::io::BufWriter::new(File::create(&temp)?), flate2::Compression::fast());
-        serde_json::to_writer(&mut z, ix)?;
-        z.finish()?.flush()?;
-        std::fs::rename(&temp, &p)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
-    result
+    let mut z = flate2::write::GzEncoder::new(crate::atomic::AtomicFile::create(&p)?, flate2::Compression::fast());
+    serde_json::to_writer(&mut z, ix)?;
+    z.finish()?.commit()?;
+    Ok(())
 }
 
 #[cfg(test)]

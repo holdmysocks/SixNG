@@ -826,13 +826,12 @@ pub fn texture_gaps(archives: &[(ArchiveInfo, Vec<Entry>)], inp: &GapInputs, pro
 /// Write the per-model records as gzip-compressed JSON lines.
 pub fn write_models_gz(path: &Path, models: &[Value]) -> Result<()> {
     use std::io::Write;
-    let f = std::fs::File::create(path)?;
-    let mut w = flate2::write::GzEncoder::new(std::io::BufWriter::new(f), flate2::Compression::default());
+    let mut w = flate2::write::GzEncoder::new(crate::atomic::AtomicFile::create(path)?, flate2::Compression::default());
     for m in models {
         serde_json::to_writer(&mut w, m)?;
         w.write_all(b"
 ")?;
     }
-    w.finish()?.flush()?;
+    w.finish()?.commit()?;
     Ok(())
 }

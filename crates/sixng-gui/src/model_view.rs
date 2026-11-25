@@ -1105,7 +1105,7 @@ impl ModelView {
                             .collect();
                         g.ribbon_glb_coloured(&format!("groom_{off:x}"), hw, &cols, serde_json::json!({}))
                     };
-                    std::fs::write(&p, glb_bytes)?;
+                    sixng_core::atomic::write(&p, glb_bytes)?;
                     let mut gm = glb::load(&p, &dir)?;
                     gm.materials.iter_mut().for_each(|x| x.mr = Some([0.0, 0.85]));
                     if let Some(r) = &rig {

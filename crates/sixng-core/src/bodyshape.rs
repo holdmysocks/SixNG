@@ -449,7 +449,7 @@ fn rig_dict(game_root: &Path) -> Result<&'static Resource, String> {
         for e in cand {
             if let Ok(r) = Resource::load_sys(&arch, e) {
                 if ok(&r) {
-                    let _ = std::fs::write(&cache, &e.id);
+                    let _ = crate::atomic::write(&cache, &e.id);
                     return Ok(r);
                 }
             }

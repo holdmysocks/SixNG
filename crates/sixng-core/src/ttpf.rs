@@ -624,9 +624,7 @@ pub fn write_png_slices(store: &Ttpf, t: &TtpfTex, dir: &Path) -> Result<Vec<Pat
     std::fs::create_dir_all(dir)?;
     for (sl, p) in paths.iter().enumerate() {
         let (rgba, w, h) = decode_rgba_slice(t, &data, 0, sl as u32)?;
-        let tmp = dir.join(format!("{:016x}_s{sl}.{:?}.tmp.png", t.hash, std::thread::current().id()).replace(['(', ')'], ""));
-        crate::texture::save_png(&tmp, &rgba, w, h)?;
-        std::fs::rename(&tmp, p)?;
+        crate::texture::save_png(p, &rgba, w, h)?;
     }
     Ok(paths)
 }
@@ -666,10 +664,8 @@ pub fn write_png(store: &Ttpf, t: &TtpfTex, dir: &Path, force: bool) -> Result<(
     st.mip = mip;
     st.mips = Some(t.mips());
     std::fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!("{:016x}.{:?}.tmp.png", t.hash, std::thread::current().id()).replace(['(', ')'], ""));
-    crate::texture::save_png(&tmp, &rgba, w, h)?;
-    std::fs::rename(&tmp, &p)?;
-    std::fs::write(&js, serde_json::to_vec(&st)?)?;
+    crate::texture::save_png(&p, &rgba, w, h)?;
+    crate::atomic::write(&js, serde_json::to_vec(&st)?)?;
     Ok((p, st))
 }
 

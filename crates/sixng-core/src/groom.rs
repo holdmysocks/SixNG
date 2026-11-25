@@ -731,7 +731,7 @@ pub fn catalog_cached(work: &std::path::Path, a: &crate::game::ArchiveInfo, all:
     }
     let v = catalog(a, all)?;
     std::fs::create_dir_all(p.parent().unwrap())?;
-    std::fs::write(&p, serde_json::to_vec(&v)?)?;
+    crate::atomic::write(&p, serde_json::to_vec(&v)?)?;
     Ok(v)
 }
 
@@ -788,7 +788,7 @@ pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], o
                 extras["full_strands"] = serde_json::json!({"written": c.guides.len(), "stored": c.stored,
                     "note": "strands grown between the guides from the stored per-triangle counts (barycentric blend of three guides); the game's placement, clumping, curl and noise are not decoded"});
             }
-            if full.is_some() && std::fs::write(dir.join(format!("{:x}.growth.json", e.off)), g.growth_json().to_string()).is_err() {
+            if full.is_some() && crate::atomic::write(dir.join(format!("{:x}.growth.json", e.off)), g.growth_json().to_string()).is_err() {
                 errors.fetch_add(1, Ordering::Relaxed);
             }
             let bytes = match (ribbons, &coat) {
@@ -804,7 +804,7 @@ pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], o
                 }
             };
             let file = dir.join(format!("{:x}.glb", e.off));
-            if std::fs::write(&file, bytes).is_err() {
+            if crate::atomic::write(&file, bytes).is_err() {
                 errors.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
@@ -822,7 +822,7 @@ pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], o
         text.push_str(&r.1);
         text.push('\n');
     }
-    std::fs::write(dir.join("index.jsonl"), text)?;
+    crate::atomic::write(dir.join("index.jsonl"), text)?;
     Ok((n, errors.into_inner()))
 }
 

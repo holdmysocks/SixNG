@@ -857,7 +857,7 @@ pub fn tables(game_root: &Path, work: &Path) -> Result<Arc<Tables>> {
             if let Some(d) = p.parent() {
                 let _ = std::fs::create_dir_all(d);
             }
-            let _ = std::fs::write(&p, serde_json::to_vec(&t)?);
+            let _ = crate::atomic::write(&p, serde_json::to_vec(&t)?);
             t
         }
     };

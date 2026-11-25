@@ -497,10 +497,8 @@ fn write_bc(sp: &Path, mips: &[(u32, u32, Vec<u8>)], bc: &crate::bc::Bc) {
         out.extend_from_slice(l);
     }
     let _ = std::fs::create_dir_all(sp.parent().unwrap());
-    let tmp = sp.with_extension("tmp");
-    if std::fs::write(&tmp, &out).is_ok() {
+    if sixng_core::atomic::write(sp, &out).is_ok() {
         BC64_BYTES.fetch_add(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        let _ = std::fs::rename(&tmp, sp);
     }
 }
 
@@ -521,23 +519,15 @@ fn reduce_to(mut img: (u32, u32, Vec<u8>), size: u32) -> (u32, u32, Vec<u8>) {
     img
 }
 
-/// Write a reduced copy (best effort, via a temporary file) and count its bytes.
+/// Write a reduced copy (best effort, temp file + rename) and count its bytes.
 fn write_small(sp: &Path, img: &(u32, u32, Vec<u8>), counter: &std::sync::atomic::AtomicU64) {
     let _ = std::fs::create_dir_all(sp.parent().unwrap());
-    let tmp = sp.with_extension("tmp");
-    if image::save_buffer_with_format(
-        &tmp,
-        &img.2,
-        img.0,
-        img.1,
-        image::ExtendedColorType::Rgba8,
-        image::ImageFormat::Png,
-    )
-    .is_ok()
+    let mut png = Vec::new();
+    let enc = image::codecs::png::PngEncoder::new(&mut png);
+    if image::ImageEncoder::write_image(enc, &img.2, img.0, img.1, image::ExtendedColorType::Rgba8).is_ok()
+        && sixng_core::atomic::write(sp, &png).is_ok()
     {
-        let n = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
-        counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-        let _ = std::fs::rename(&tmp, sp);
+        counter.fetch_add(png.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -769,8 +759,11 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                     occlusion_only = packed.is_some();
                 }
             }
+            // The colour map lights only shaders without an emissive map of
+            // their own (`emissive_source`; older exports do not say).
             if class == "emissive"
                 && emissive.is_none()
+                && !matches!(ex["emissive_source"].as_str(), Some("none" | "emissive_map"))
                 && (role == "colour" || role == "base_colour")
             {
                 if let Some(p) = &png {

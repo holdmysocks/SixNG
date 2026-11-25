@@ -920,7 +920,7 @@ impl ParamIndex {
             }
             if let Ok(b) = serde_json::to_vec(&t) {
                 let _ = std::fs::create_dir_all(work.join("index"));
-                let _ = std::fs::write(&cache, b);
+                let _ = crate::atomic::write(&cache, b);
             }
             Ok(t)
         })

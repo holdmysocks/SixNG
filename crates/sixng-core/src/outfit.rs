@@ -606,7 +606,7 @@ pub fn export_outfit(a: &ArchiveInfo, parts: &[&Entry], name: &str, out: &Path, 
     let extras = serde_json::json!({"outfit": name, "parts": parts.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), "coordinate_system": crate::export::COORDS, "anim_only": anim_only});
     let opt = crate::gltf::GlbOptions { animations: &anims, trs_joints: true, skinned_meshes_at_root: true };
     let glb = crate::gltf::mesh_glb_with(name, &groups, &materials, &joints, extras, &opt);
-    std::fs::write(out, &glb)?;
+    crate::atomic::write(out, &glb)?;
     // weighted influences whose bone is in no skeleton (weight moved by the writer)
     let unresolved_of = |p: &TriPrim| -> usize {
         let sets = [(&p.joints, &p.weights), (&p.joints1, &p.weights1)];
