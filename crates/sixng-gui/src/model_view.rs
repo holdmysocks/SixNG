@@ -2822,7 +2822,16 @@ impl ModelView {
                     // material map at each pixel
                     let surfaces = pc["surfaces"][idx].as_str().filter(|s| s.len() == 2048);
                     let mut px = vec![255u8; 128 * PART_RAMP_ROWS * 4];
+                    // rows 768..: each part id's coat record, and in row
+                    // 1024 the body paint's
+                    let coat = &pc["coat"];
+                    let coats = coat["by_look"][idx].as_str().filter(|s| s.len() == 512);
+                    let record = |k: usize| Some(&coat["records"][k]).filter(|r| r.is_object());
+                    let paint = coat["paint_by_look"][idx].as_u64().and_then(|k| record(k as usize));
+                    px[1024 * 512..1025 * 512].copy_from_slice(&coat_row(paint));
                     for id in 0..256 {
+                        let own = coats.and_then(|s| usize::from_str_radix(&s[id * 2..id * 2 + 2], 16).ok()).and_then(record);
+                        px[(768 + id) * 512..(769 + id) * 512].copy_from_slice(&coat_row(own));
                         let stored = surfaces.and_then(|s| hex4(&s[id * 8..id * 8 + 8]));
                         let s = patched_surf.iter().rev().find(|p| p.0 == id).map(|p| p.1).or(stored).unwrap_or_else(|| surface_of_code(look[id][3]));
                         px[(512 + id) * 512..(513 + id) * 512].copy_from_slice(&part_surface_row(s));
@@ -4862,8 +4871,43 @@ fn load_parts(
 /// texture (red x 63, as the clothing shader reads it), resampled to `w` x
 /// `h`. None when the material binds none or the file is not there.
 /// Rows of the part ramp image (128 wide): 256 of the first layer's palette
-/// rows, 256 of the second layer's, 256 of surfaces (`part_surface_row`).
-const PART_RAMP_ROWS: usize = 768;
+/// rows, 256 of the second layer's, 256 of surfaces (`part_surface_row`),
+/// 256 of the parts' coats and one of the body paint's coat (`coat_row`).
+const PART_RAMP_ROWS: usize = 1025;
+
+/// One row of the part ramp image for a coat record (model.json
+/// `part_colours.coat.records`), all zero without one: the values in the
+/// alpha of the columns 0 to 10 (repeated every 16 columns), as the shader
+/// reads them. 0 clear coat intensity, 1 clear coat roughness, 2 flake
+/// orientation x 4 (0 = no flakes), 3 flake size x 4, 4 the base coat
+/// roughness when the record overrides it (0 = not), 5 anisotropy, 6 sheen
+/// intensity, 7 sheen fade, 8 sheen reflectance x 4, 9 film IOR / 4,
+/// 10 film thickness.
+fn coat_row(r: Option<&serde_json::Value>) -> Vec<u8> {
+    let mut v = [0u8; 16];
+    if let Some(r) = r.filter(|r| r.is_object()) {
+        let f = |k: &str| r[k].as_f64().unwrap_or(0.0) as f32;
+        let on = |k: &str| r[k].as_bool().unwrap_or(false);
+        let q = |x: f32| (x.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        let ([clear, clear_rough, flakes, size], base) = paint_coat(r);
+        let sheen = f("sheen_intensity");
+        let film = f("film_thickness");
+        v[..11].copy_from_slice(&[
+            q(clear),
+            q(clear_rough),
+            if flakes > 0.0 { q(flakes * 4.0).max(1) } else { 0 },
+            q(size * 4.0),
+            base.map_or(0, |b| q(b).max(1)),
+            if on("use_anisotropy") { q(f("anisotropy_intensity")) } else { 0 },
+            q(sheen),
+            if sheen > 0.0 { q(f("sheen_fade")) } else { 0 },
+            if sheen > 0.0 { q(f("sheen_reflectance") * 4.0) } else { 0 },
+            if film > 0.0 { q(f("film_ior") / 4.0) } else { 0 },
+            q(film),
+        ]);
+    }
+    (0..128).flat_map(|x| [0, 0, 0, v[x & 15]]).collect()
+}
 
 /// Four bytes from 8 hex digits.
 fn hex4(h: &str) -> Option<[u8; 4]> {
@@ -7319,7 +7363,7 @@ impl Lamps {
 /// What the viewer draws of a coat record (model.json
 /// `part_colours.coat.records`): clear coat intensity and roughness, flake
 /// orientation and size, and the base coat roughness when the record
-/// overrides it. Film, sheen and anisotropy are not drawn.
+/// overrides it. Film, sheen and anisotropy go by `coat_row`.
 fn paint_coat(r: &serde_json::Value) -> ([f32; 4], Option<f32>) {
     let f = |k: &str| r[k].as_f64().unwrap_or(0.0) as f32;
     let on = |k: &str| r[k].as_bool().unwrap_or(false);
@@ -7882,6 +7926,34 @@ fn srgb32(c: [f32; 3]) -> egui::Color32 {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn coat_records_in_the_ramp_image() {
+        use super::coat_row;
+        // no record: all zero, so the shader draws no coat
+        assert!(coat_row(None).iter().all(|b| *b == 0));
+        let r = serde_json::json!({
+            "use_clear_coat": true, "clear_coat_intensity": 0.5, "clear_coat_roughness": 0.0,
+            "use_flakes": false, "flake_coverage": 0.0, "flake_orientation": 0.0, "flake_size": 0.0,
+            "override_base_coat_roughness": true, "base_coat_roughness": 0.7,
+            "use_anisotropy": true, "anisotropy_intensity": 0.55,
+            "sheen_intensity": 0.0, "sheen_fade": 1.0, "sheen_reflectance": 0.0,
+            "film_ior": 2.6, "film_thickness": 0.2,
+        });
+        let row = coat_row(Some(&r));
+        assert_eq!(row.len(), 128 * 4);
+        let a: Vec<u8> = row.chunks_exact(4).map(|c| c[3]).collect();
+        // columns: clear coat, its roughness, flakes (off), flake size, base
+        // roughness, anisotropy, sheen (off: no fade or reflectance), film IOR / 4, thickness
+        assert_eq!(&a[..11], &[128, 0, 0, 0, 179, 140, 0, 0, 0, 166, 51]);
+        // repeated every 16 columns, with zeros between
+        assert_eq!(a[16..27], a[..11]);
+        assert!(a[11..16].iter().all(|b| *b == 0));
+        // anisotropy without useAnisotropy is not drawn
+        let mut off = r.clone();
+        off["use_anisotropy"] = false.into();
+        assert_eq!(coat_row(Some(&off))[5 * 4 + 3], 0);
+    }
+
+    #[test]
     fn part_surfaces_in_the_ramp_image() {
         use super::{hex4, part_surface_row, surface_of_code, PART_RAMP_ROWS};
         assert_eq!(hex4("e6ff1a66"), Some([0xe6, 0xff, 0x1a, 0x66]));
@@ -7893,7 +7965,7 @@ mod tests {
         assert_eq!([row[3], row[7], row[11], row[15]], [1, 2, 3, 4]);
         assert_eq!(&row[..3], &[0, 0, 0]);
         // three blocks of 256 rows: the shader's row coordinates divide by this
-        assert_eq!(PART_RAMP_ROWS, 768);
+        assert_eq!(PART_RAMP_ROWS, 1025);
         // an export without surfaces: the look's code, low = high
         assert_eq!(surface_of_code(165), [255, 255, 78, 78]);
         assert_eq!(surface_of_code(49), [0, 0, 255, 255]);
