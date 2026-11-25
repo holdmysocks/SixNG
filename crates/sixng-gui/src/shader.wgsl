@@ -17,6 +17,8 @@ struct Frame {
     misc3: vec4<f32>,     // x tint palette on (1) / off (0), w the vehicle's own paint metalness
     prev_view_proj: mat4x4<f32>,
     jitter: vec4<f32>,    // body paint's coat: x clear coat intensity, y clear coat roughness, z flake orientation (0 = no flakes); w vehicle wear (0 to 1; < 0: each part's own amount, column 11 of its coat row)
+    frame: vec4<f32>,     // x strand dither index, y, z the target's width and height in pixels (1e9 in the sun shadow pass, x then the strand widening factor, w the accumulation frame)
+    light_vp: mat4x4<f32>, // the sun shadow map's view-projection (all zero: none)
 };
 
 struct Mat {
@@ -51,6 +53,15 @@ struct Sticker {
 @group(0) @binding(3) var<storage, read> ST: array<Sticker>;
 @group(0) @binding(4) var t_stick: texture_2d_array<f32>;
 @group(0) @binding(5) var samp_clamp: sampler;
+// the game's hair lighting tables (hairlight): lobes along the strand,
+// lobes around it, reflectance and path length, and the colour factor
+@group(0) @binding(15) var t_hair_m: texture_3d<f32>;
+@group(0) @binding(16) var t_hair_n: texture_3d<f32>;
+@group(0) @binding(17) var t_hair_a: texture_2d<f32>;
+@group(0) @binding(18) var t_hair_p: texture_3d<f32>;
+@group(0) @binding(19) var t_sun_map: texture_depth_2d;
+@group(0) @binding(20) var samp_sun_map: sampler_comparison;
+@group(0) @binding(21) var t_cam_depth: texture_depth_2d;
 
 // The 3D map's scene (atmo.rs, atmo_common.wgsl): the game's atmosphere
 // as look-up tables, the exposure and the sky's ambient light. The model
@@ -352,6 +363,13 @@ fn map_finish(col0: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
 @group(1) @binding(5) var t_tile: texture_2d<f32>;
 // vehicle parts: the game's tiling wear mask (flags.w bit 15)
 @group(1) @binding(6) var t_wear: texture_2d<f32>;
+// vehicle parts: the primer's mask (the wear mask when the model has none)
+@group(1) @binding(7) var t_primer: texture_2d<f32>;
+
+// The primer's colour: a stand-in grey (linear). The game takes a palette
+// gradient (column = the windowed mask) of a surface record the CPU builds
+// for the primer, which is not decoded.
+const PRIMER_COLOUR: vec3<f32> = vec3(0.2, 0.2, 0.2);
 
 // How often the wear mask repeats across a part's UV0 (the age records'
 // minTiling / maxTiling are about 4 to 6.5).
@@ -363,6 +381,12 @@ const WEAR_TILING: f32 = 5.0;
 // histogram (10 % of its texels are above 0.81, 20 % above 0.58, 30 % above
 // 0.43, 40 % above 0.32, 50 % above 0.27). A stand-in: the game's windows
 // on the three channels are not decoded to fields.
+// A wear mask level raised to the game's exponent 100 / max(0.001,
+// 100 g^2) for the gamma byte g (0 to 1).
+fn wear_gamma(l: f32, g: f32) -> f32 {
+    return pow(l, 100.0 / max(0.001, 100.0 * g * g));
+}
+
 fn wear_threshold(a: f32) -> f32 {
     let c = 0.45 * a * a;
     if (c < 0.05) { return mix(1.01, 0.98, c / 0.05); }
@@ -442,12 +466,48 @@ fn mesh_vertex(v: VIn) -> VOut {
     let w = m * vec4(v.pos, 1.0);
     var o: VOut;
     o.lamp = lamp;
-    o.clip = F.view_proj * w;
-    o.world = w.xyz;
+    var wp = w.xyz;
+    var edge = v.tan.w;
+    var uv1 = v.uv1;
+    // a strand ribbon stored closed (|tan.w| = 2 + its half width in mm): opened towards the eye as the
+    // game does, to at least its minimum drawn width, with the share of
+    // that width the strand really covers kept for the pixel shader (uv1.x) when it is lit as a standard surface
+    if (abs(v.tan.w) >= 2.0) {
+        let code = abs(v.tan.w) - 2.0;
+        let ti = floor(code / 16.0);
+        let r = (code - 16.0 * ti) * 0.001;
+        // the game's minimum drawn width: 2 pixels at the strand's distance, capped at 10 mm (read from its
+        // strand vertex program by the shader archive work); ti, the piece type, is kept for the strand count rule
+        let npx = 2.0;
+        edge = sign(v.tan.w);
+        let td = normalize((m * vec4(v.tan.xyz, 0.0)).xyz);
+        var side = cross(td, normalize(F.cam_pos.xyz - w.xyz));
+        side = side / max(length(side), 1e-5);
+        let c0 = F.view_proj * w;
+        let c1 = F.view_proj * vec4(w.xyz + side, 1.0);
+        let ppm = length((c1.xy / c1.w - c0.xy / c0.w) * 0.5 * F.frame.yz);
+        let rmin = min(0.5 * npx / max(ppm, 1e-3), 0.005);
+        // (a strand lit by the hair lighting keeps its profile in uv1.x: there the share rides on uv1.y, 1 .. 1.4)
+        if (uv1.y > 1.5) { uv1.x = clamp(r / rmin, 0.0, 1.0); } else if (uv1.y > 0.5) { uv1.y = 1.0 + 0.4 * clamp(r / rmin, 0.0, 1.0); }
+        wp = w.xyz + side * edge * max(r, rmin);
+        // the sun shadow pass (no target size) with a widening factor: the ribbon of the game's ray-traced passes,
+        // flat, turned by a random direction per strand (here a hash of the strand's root normal and the
+        // accumulation frame in F.frame.w, so a many-frame picture averages the turns the way the game's frames
+        // do; the game's own hash is not read) and the factor times its own width
+        if (F.frame.y > 1.0e8 && F.frame.x >= 1.0) {
+            let hn = v.nrm + vec3(F.frame.w * 0.618034, F.frame.w * 0.414214, F.frame.w * 0.732051);
+            let hsh = fract(sin(vec3(dot(hn, vec3(12.9898, 78.233, 37.719)), dot(hn, vec3(39.346, 11.135, 83.155)), dot(hn, vec3(73.156, 52.235, 9.151)))) * 43758.5453) * 2.0 - 1.0;
+            var rs = cross(td, normalize(hsh + vec3(1.0e-4, 0.0, 0.0)));
+            rs = rs / max(length(rs), 1e-5);
+            wp = w.xyz + rs * edge * r * F.frame.x;
+        }
+    }
+    o.clip = F.view_proj * vec4(wp, 1.0);
+    o.world = wp;
     o.nrm = (m * vec4(v.nrm, 0.0)).xyz;
-    o.tan = vec4((m * vec4(v.tan.xyz, 0.0)).xyz, v.tan.w);
+    o.tan = vec4((m * vec4(v.tan.xyz, 0.0)).xyz, edge);
     o.uv0 = v.uv0;
-    o.uv1 = v.uv1;
+    o.uv1 = uv1;
     o.col = v.col;
     o.extra = v.extra;
     // w: -1 on a mirrored instance (right-hand wheels): its triangles wind
@@ -551,8 +611,374 @@ fn weave_gain(g: f32) -> f32 {
     return 1.0 + 0.5 * (g - 0.5);
 }
 
+
+// Hair and fur strands (material class 12): a three-lobe fibre model.
+// R, TT and TRT lobes with a Gaussian along the strand and the published
+// fits around it (Karis, "Physically Based Hair Shading in Unreal"), plus
+// its multiple-scattering term. What is taken from the game's own hair
+// lighting program: the index of refraction (F0 = 0.046461) and the
+// absorption of the base colour, sigma = 0.0478501 ln(colour)^2 per
+// channel. The game weights its lobes with four lookup tables; those are
+// not used here yet, so the lobe shapes are the published fits.
+fn hair_g(b: f32, theta: f32) -> f32 {
+    return exp(-0.5 * theta * theta / (b * b)) / (2.5066283 * b);
+}
+
+fn hair_f(c: f32) -> f32 {
+    let f0 = 0.046461;
+    return f0 + (1.0 - f0) * pow(1.0 - c, 5.0);
+}
+
+// Transmittance of the fibre for a path of `p` fibre widths.
+fn hair_t(colour: vec3<f32>, p: f32) -> vec3<f32> {
+    let lc = log(max(colour, vec3(0.0001)));
+    return exp(-0.0478501 * lc * lc * p);
+}
+
+fn hair_light(colour: vec3<f32>, t: vec3<f32>, v: vec3<f32>, l: vec3<f32>, rough: f32, scatter: f32) -> vec3<f32> {
+    let vol = dot(v, l);
+    let sin_l = clamp(dot(t, l), -1.0, 1.0);
+    let sin_v = clamp(dot(t, v), -1.0, 1.0);
+    let cos_d = cos(0.5 * abs(asin(sin_v) - asin(sin_l)));
+    let lp = l - sin_l * t;
+    let vp = v - sin_v * t;
+    let cos_phi = dot(lp, vp) * inverseSqrt(dot(lp, lp) * dot(vp, vp) + 0.0001);
+    let cos_half = sqrt(clamp(0.5 + 0.5 * cos_phi, 0.0, 1.0));
+    let n_p = 1.19 / cos_d + 0.36 * cos_d;
+    let shift = 0.035;
+    let r2 = rough * rough;
+    var s = vec3(0.0);
+    // R: light reflected off the surface of the fibre
+    let m_r = hair_g(r2 * 1.4142135 * cos_half + 0.02, sin_l + sin_v + 2.0 * shift);
+    s += vec3(m_r * 0.25 * cos_half * hair_f(sqrt(clamp(0.5 + 0.5 * vol, 0.0, 1.0))));
+    // TT: light passing through the fibre
+    let a = 1.0 / n_p;
+    let h = cos_half * (1.0 + a * (0.6 - 0.8 * cos_phi));
+    let f_tt = hair_f(cos_d * sqrt(clamp(1.0 - h * h, 0.0, 1.0)));
+    let m_tt = hair_g(r2 * 0.5 + 0.02, sin_l + sin_v - shift);
+    let t_tt = hair_t(colour, 0.5 * sqrt(max(1.0 - h * h * a * a, 0.0)) / cos_d * 2.0);
+    s += m_tt * exp(-3.65 * cos_phi - 3.98) * (1.0 - f_tt) * (1.0 - f_tt) * t_tt;
+    // TRT: light reflected once inside the fibre
+    let f_trt = hair_f(cos_d * 0.5);
+    let m_trt = hair_g(r2 * 2.0 + 0.02, sin_l + sin_v - 4.0 * shift);
+    let t_trt = hair_t(colour, 0.8 / cos_d * 2.0);
+    s += m_trt * exp(17.0 * cos_phi - 16.78) * (1.0 - f_trt) * (1.0 - f_trt) * f_trt * t_trt;
+    // many fibres: light scattered between strands
+    let kajiya = 1.0 - abs(sin_l);
+    let fake_n = normalize(v - t * sin_v);
+    let ndl = clamp((dot(fake_n, l) + 1.0) * 0.25, 0.0, 1.0);
+    // (in full light the published model adds no tint to this term)
+    s += sqrt(colour) * (mix(ndl, kajiya, 0.33) * scatter / 3.14159);
+    return max(s, vec3(0.0));
+}
+
+// The light sum of the game's hair lighting program for one light,
+// transcribed from the compiled code (block 02564-027a8 of
+// TL_PS_PBR_MATERIAL_HAIR; read once by hand, medium confidence), with its
+// four lookup tables. Returns the light leaving towards the viewer per unit
+// of light colour. `t` strand direction, `n` the tube normal (perpendicular
+// to the strand), `v` to the eye, `l` to the light, `g0` and `y` the two
+// per-material values the game bakes (not decoded: fixed here).
+fn hair_game(colour: vec3<f32>, t: vec3<f32>, n: vec3<f32>, root: vec3<f32>, v: vec3<f32>, l: vec3<f32>, g0: f32, y: f32, e: f32) -> vec3<f32> {
+    let c = normalize(cross(n, t));
+    // (the view vector here points to the eye; the tables put the surface
+    // reflection where light and eye are on the same side of the strand)
+    let sin_o = clamp(dot(v, t), -1.0, 1.0);
+    let sin_i = clamp(dot(l, t), -1.0, 1.0);
+    let ln = dot(l, n);
+    let lc = dot(l, c);
+    let vn = dot(v, n);
+    let vc = dot(v, c);
+    let cos_phi = clamp((ln * vn + lc * vc) / sqrt(max((vn * vn + vc * vc) * (ln * ln + lc * lc), 0.000001)), -1.0, 1.0);
+    let h = clamp(vc / sqrt(max(0.000001, 1.0 - sin_o * sin_o)), -1.0, 1.0);
+    // reflectance and path length; absorption of the colour
+    let a = textureSampleLevel(t_hair_a, samp_clamp, vec2(clamp(sin_o * sin_o, 0.0, 1.0), 0.5), 0.0); // between its two rows: their mean
+    let f = a.r;
+    let lcol = log(max(colour, vec3(0.0000001)));
+    let tt0 = exp(-0.0478501 * lcol * lcol * a.a);
+    let tt = (1.0 - f) * (1.0 - f) * tt0;
+    let trt = (f * tt0) * tt;
+    let res = (f * tt0) * trt / max(vec3(0.0001), vec3(1.0) - f * tt0);
+    let pz = 1.0 - g0;
+    let pc = vec3(
+        textureSampleLevel(t_hair_p, samp_clamp, vec3(colour.r, y, pz), 0.0).r,
+        textureSampleLevel(t_hair_p, samp_clamp, vec3(colour.g, y, pz), 0.0).r,
+        textureSampleLevel(t_hair_p, samp_clamp, vec3(colour.b, y, pz), 0.0).r);
+    // roughness slice: z0 = k g0 + (1 - g0) with k the light's source term;
+    // the table is flat at z = 1, so a distant light takes k = 0
+    let z0 = 1.0 - g0;
+    let zb = 0.375 + 0.25 * z0;
+    let zc = 0.25 + 0.5 * z0;
+    let muv = vec2(0.5 + 0.5 * sin_i, 0.5 + 0.5 * sin_o);
+    let m0 = textureSampleLevel(t_hair_m, samp_clamp, vec3(muv, z0), 0.0);
+    let mb = textureSampleLevel(t_hair_m, samp_clamp, vec3(muv, zb), 0.0);
+    let mc = textureSampleLevel(t_hair_m, samp_clamp, vec3(muv, zc), 0.0);
+    let tphi = 0.5 + 0.5 * cos_phi;
+    let nx = clamp(abs(sin_o) * abs(sin_o) * abs(sin_o), 0.0, 1.0);
+    let n1 = textureSampleLevel(t_hair_n, samp_clamp, vec3(nx, 0.515873 + 0.484127 * tphi, 0.5 + 0.5 * h), 0.0).rgb;
+    let n2 = textureSampleLevel(t_hair_n, samp_clamp, vec3(nx, 0.484127 * tphi, 0.5 + 0.5 * h), 0.0).rgb;
+    let cos_i = sqrt(clamp(1.0 - sin_i * sin_i, 0.0, 1.0));
+    let nr = mix(n1.r, cos_i / 3.14159265, 0.333);
+    let ntrt = mix(n1.b, cos_i, 0.25);
+    let nr2 = mix(n2.r, nr, 0.333);
+    let ng2 = mix(n2.g, n1.g, 0.333);
+    let nb2 = mix(n2.b, ntrt, 0.25);
+    let q = tt * y;
+    let inv2pi = 0.15915494;
+    let s0 = tt * ng2 * m0.g + trt * nb2 * m0.b + res * m0.a * inv2pi;
+    let sc = vec3(f * nr * mc.r) + tt * n1.g * mc.g + trt * ntrt * mc.b + res * mc.a * inv2pi;
+    let sb = q * q * cos_i * inv2pi + (vec3(f * mb.r) + tt * mb.g + trt * mb.b + res * mb.a) * inv2pi;
+    // the program divides by the colour here and multiplies it back later
+    let coloured = pc * (s0 + q * sc + q * q * sb);
+    // the light's size factor a / (a + 0.25 s (3 (0.1 + m) + s)) scales both
+    // parts; s is the source size from the light's record, near 0 for the
+    // sun, so the factor is 1
+    let area = 1.0;
+    // visibility: the side of the head the light is on (the root normal)
+    // times the azimuth term sat(1 + cos phi), and a factor 1.5 - 0.5 e:
+    // W = ((1 - e) D A + e)(1.5 - 0.5 e) (read once from the program, medium
+    // confidence). The fill e of the unlit side is a stored alpha times a
+    // fade by depth and light (run-time values, not read); here the
+    // parameter ramp's blue value with the fade taken as 1
+    let w = (clamp(dot(root, l), 0.0, 1.0) * clamp(1.0 + cos_phi, 0.0, 1.0) * (1.0 - e) + e) * (1.5 - 0.5 * e);
+    return max(w * (coloured * colour / max(colour, vec3(0.000001)) + vec3(f * m0.r * nr2 * area)), vec3(0.0));
+}
+
+// The ambient part of the game's hair lighting (read once from the same
+// program, medium confidence): ambient light x base colour x this factor.
+// `o` (0..1) comes from the strand's profile value and a depth the program
+// reads; 1 is the outer hair. The environment reflection it also subtracts
+// and adds is left out (small).
+fn hair_ambient(t: vec3<f32>, v: vec3<f32>, g0: f32, o: f32) -> f32 {
+    let sin_o = clamp(dot(v, t), -1.0, 1.0);
+    let cos_o = sqrt(max(1.0 - sin_o * sin_o, 0.0));
+    let f = textureSampleLevel(t_hair_a, samp_clamp, vec2(clamp(sin_o * sin_o, 0.0, 1.0), 0.5), 0.0).r;
+    return (0.31831 + 0.68169 * exp(-7.21348 * g0 * (1.0 - 0.5 * ((1.0 - f) + cos_o)))) * (0.195 + 0.91 * o);
+}
+
+// The game's environment table (generated by the game at start-up, as read
+// by the shader archive work; recomputed here from its definition at 16 x 16
+// texel centres): x = N.V, y = perceptual roughness; r = the part weighted
+// by (F90 - F0), g = the total reflectance (scale + bias).
+const ENV_N: i32 = 16;
+const ENV_TAB: array<vec2<f32>, 256> = array<vec2<f32>, 256>(
+    vec2(0.8523, 0.9995), vec2(0.6112, 1.0000), vec2(0.4276, 1.0000), vec2(0.2910, 1.0000), vec2(0.1918, 1.0000), vec2(0.1217, 1.0000), vec2(0.0738, 1.0000), vec2(0.0423, 1.0000), vec2(0.0226, 1.0000), vec2(0.0111, 1.0000), vec2(0.0048, 1.0000), vec2(0.0018, 1.0000), vec2(0.0005, 1.0000), vec2(0.0001, 1.0000), vec2(0.0000, 1.0000), vec2(0.0000, 1.0000),
+    vec2(0.7874, 0.9554), vec2(0.6006, 0.9946), vec2(0.4239, 0.9981), vec2(0.2898, 0.9995), vec2(0.1913, 0.9995), vec2(0.1215, 0.9995), vec2(0.0739, 1.0000), vec2(0.0425, 1.0000), vec2(0.0228, 1.0000), vec2(0.0112, 1.0000), vec2(0.0049, 1.0000), vec2(0.0018, 1.0000), vec2(0.0005, 1.0000), vec2(0.0001, 1.0000), vec2(0.0000, 1.0000), vec2(0.0000, 1.0000),
+    vec2(0.6385, 0.8877), vec2(0.5464, 0.9605), vec2(0.4035, 0.9840), vec2(0.2820, 0.9932), vec2(0.1885, 0.9961), vec2(0.1206, 0.9967), vec2(0.0739, 0.9977), vec2(0.0430, 0.9992), vec2(0.0233, 0.9995), vec2(0.0115, 0.9995), vec2(0.0051, 0.9995), vec2(0.0019, 0.9995), vec2(0.0006, 0.9995), vec2(0.0001, 0.9994), vec2(0.0000, 1.0000), vec2(0.0000, 1.0000),
+    vec2(0.5192, 0.8964), vec2(0.4482, 0.9074), vec2(0.3549, 0.9482), vec2(0.2589, 0.9704), vec2(0.1784, 0.9815), vec2(0.1169, 0.9870), vec2(0.0734, 0.9916), vec2(0.0434, 0.9938), vec2(0.0241, 0.9959), vec2(0.0123, 0.9964), vec2(0.0056, 0.9970), vec2(0.0023, 0.9975), vec2(0.0008, 0.9981), vec2(0.0002, 0.9991), vec2(0.0000, 0.9987), vec2(0.0000, 0.9979),
+    vec2(0.4148, 0.9194), vec2(0.3520, 0.8836), vec2(0.2877, 0.9062), vec2(0.2201, 0.9328), vec2(0.1584, 0.9524), vec2(0.1081, 0.9660), vec2(0.0697, 0.9741), vec2(0.0426, 0.9802), vec2(0.0244, 0.9839), vec2(0.0130, 0.9862), vec2(0.0063, 0.9879), vec2(0.0027, 0.9873), vec2(0.0010, 0.9897), vec2(0.0003, 0.9911), vec2(0.0001, 0.9923), vec2(0.0000, 0.9929),
+    vec2(0.3255, 0.9367), vec2(0.2733, 0.8865), vec2(0.2245, 0.8835), vec2(0.1766, 0.8992), vec2(0.1321, 0.9181), vec2(0.0937, 0.9344), vec2(0.0630, 0.9462), vec2(0.0403, 0.9541), vec2(0.0242, 0.9599), vec2(0.0135, 0.9663), vec2(0.0070, 0.9718), vec2(0.0033, 0.9757), vec2(0.0013, 0.9774), vec2(0.0005, 0.9802), vec2(0.0001, 0.9818), vec2(0.0000, 0.9830),
+    vec2(0.2532, 0.9474), vec2(0.2112, 0.8970), vec2(0.1727, 0.8770), vec2(0.1371, 0.8760), vec2(0.1052, 0.8845), vec2(0.0771, 0.8927), vec2(0.0539, 0.9042), vec2(0.0359, 0.9175), vec2(0.0226, 0.9281), vec2(0.0132, 0.9350), vec2(0.0073, 0.9425), vec2(0.0037, 0.9479), vec2(0.0016, 0.9533), vec2(0.0006, 0.9575), vec2(0.0002, 0.9624), vec2(0.0000, 0.9643),
+    vec2(0.1969, 0.9531), vec2(0.1627, 0.9039), vec2(0.1323, 0.8734), vec2(0.1052, 0.8564), vec2(0.0814, 0.8468), vec2(0.0608, 0.8539), vec2(0.0438, 0.8628), vec2(0.0301, 0.8718), vec2(0.0197, 0.8831), vec2(0.0123, 0.8936), vec2(0.0071, 0.9036), vec2(0.0038, 0.9119), vec2(0.0019, 0.9192), vec2(0.0008, 0.9251), vec2(0.0003, 0.9303), vec2(0.0001, 0.9350),
+    vec2(0.1538, 0.9548), vec2(0.1257, 0.9040), vec2(0.1013, 0.8636), vec2(0.0802, 0.8312), vec2(0.0621, 0.8227), vec2(0.0470, 0.8192), vec2(0.0344, 0.8234), vec2(0.0243, 0.8300), vec2(0.0165, 0.8382), vec2(0.0107, 0.8461), vec2(0.0065, 0.8546), vec2(0.0037, 0.8614), vec2(0.0019, 0.8686), vec2(0.0009, 0.8766), vec2(0.0003, 0.8830), vec2(0.0001, 0.8895),
+    vec2(0.1212, 0.9533), vec2(0.0977, 0.8966), vec2(0.0777, 0.8456), vec2(0.0610, 0.8151), vec2(0.0472, 0.7979), vec2(0.0360, 0.7907), vec2(0.0266, 0.7875), vec2(0.0192, 0.7864), vec2(0.0133, 0.7891), vec2(0.0088, 0.7921), vec2(0.0056, 0.7965), vec2(0.0033, 0.8032), vec2(0.0018, 0.8096), vec2(0.0009, 0.8161), vec2(0.0004, 0.8223), vec2(0.0001, 0.8291),
+    vec2(0.0968, 0.9495), vec2(0.0766, 0.8830), vec2(0.0600, 0.8253), vec2(0.0468, 0.7947), vec2(0.0362, 0.7746), vec2(0.0275, 0.7598), vec2(0.0205, 0.7486), vec2(0.0148, 0.7417), vec2(0.0105, 0.7363), vec2(0.0071, 0.7353), vec2(0.0046, 0.7371), vec2(0.0028, 0.7383), vec2(0.0016, 0.7417), vec2(0.0008, 0.7456), vec2(0.0004, 0.7497), vec2(0.0001, 0.7547),
+    vec2(0.0784, 0.9437), vec2(0.0605, 0.8640), vec2(0.0468, 0.8066), vec2(0.0363, 0.7724), vec2(0.0278, 0.7460), vec2(0.0211, 0.7244), vec2(0.0157, 0.7076), vec2(0.0114, 0.6930), vec2(0.0082, 0.6854), vec2(0.0056, 0.6782), vec2(0.0037, 0.6729), vec2(0.0023, 0.6696), vec2(0.0014, 0.6687), vec2(0.0007, 0.6685), vec2(0.0003, 0.6695), vec2(0.0001, 0.6708),
+    vec2(0.0645, 0.9361), vec2(0.0485, 0.8407), vec2(0.0370, 0.7836), vec2(0.0283, 0.7447), vec2(0.0215, 0.7119), vec2(0.0162, 0.6853), vec2(0.0120, 0.6617), vec2(0.0088, 0.6459), vec2(0.0063, 0.6301), vec2(0.0043, 0.6179), vec2(0.0029, 0.6084), vec2(0.0019, 0.6008), vec2(0.0011, 0.5945), vec2(0.0006, 0.5895), vec2(0.0003, 0.5861), vec2(0.0001, 0.5835),
+    vec2(0.0539, 0.9270), vec2(0.0394, 0.8180), vec2(0.0296, 0.7591), vec2(0.0223, 0.7134), vec2(0.0168, 0.6754), vec2(0.0125, 0.6421), vec2(0.0093, 0.6175), vec2(0.0068, 0.5937), vec2(0.0048, 0.5746), vec2(0.0034, 0.5590), vec2(0.0023, 0.5442), vec2(0.0015, 0.5317), vec2(0.0009, 0.5215), vec2(0.0005, 0.5121), vec2(0.0003, 0.5044), vec2(0.0001, 0.4975),
+    vec2(0.0457, 0.9166), vec2(0.0324, 0.7979), vec2(0.0239, 0.7313), vec2(0.0178, 0.6790), vec2(0.0132, 0.6347), vec2(0.0098, 0.5997), vec2(0.0071, 0.5679), vec2(0.0052, 0.5417), vec2(0.0037, 0.5199), vec2(0.0026, 0.4989), vec2(0.0018, 0.4812), vec2(0.0012, 0.4658), vec2(0.0007, 0.4514), vec2(0.0004, 0.4391), vec2(0.0002, 0.4276), vec2(0.0001, 0.4174),
+    vec2(0.0393, 0.9050), vec2(0.0269, 0.7754), vec2(0.0194, 0.7023), vec2(0.0142, 0.6430), vec2(0.0104, 0.5938), vec2(0.0076, 0.5540), vec2(0.0056, 0.5196), vec2(0.0040, 0.4909), vec2(0.0029, 0.4641), vec2(0.0020, 0.4416), vec2(0.0014, 0.4215), vec2(0.0009, 0.4031), vec2(0.0006, 0.3867), vec2(0.0003, 0.3719), vec2(0.0002, 0.3580), vec2(0.0001, 0.3458)
+);
+
+fn env_tab(nv: f32, y: f32) -> vec2<f32> {
+    let n = f32(ENV_N);
+    let px = clamp(nv * n - 0.5, 0.0, n - 1.0);
+    let py = clamp(y * n - 0.5, 0.0, n - 1.0);
+    let x0 = i32(floor(px));
+    let y0 = i32(floor(py));
+    let x1 = min(x0 + 1, ENV_N - 1);
+    let y1 = min(y0 + 1, ENV_N - 1);
+    let fx = px - f32(x0);
+    let fy = py - f32(y0);
+    let a = mix(ENV_TAB[y0 * ENV_N + x0], ENV_TAB[y0 * ENV_N + x1], fx);
+    let b = mix(ENV_TAB[y1 * ENV_N + x0], ENV_TAB[y1 * ENV_N + x1], fx);
+    return mix(a, b, fy);
+}
+
+struct MeshOut {
+    @location(0) col: vec4<f32>,
+    @builtin(sample_mask) mask: u32,
+};
+
+// interleaved gradient noise, as the game's strand visibility pass uses it
+fn ign(p: vec2<f32>) -> f32 {
+    return fract(52.9829 * fract(0.0671106 * p.x + 0.00583715 * p.y));
+}
+
+// Share of the sun's light that reaches a point, from the sun shadow map (1 where there is none): 3 x 3 taps
+// of a linear comparison. A stand-in for the game's shadow filtering, which is not read.
+// The camera depth pre-pass at a pixel (reversed: nearer is larger; 0: nothing drawn).
+fn eye_depth(p: vec2<i32>) -> f32 {
+    let lim = vec2<i32>(F.frame.yz) - 1;
+    return textureLoad(t_cam_depth, clamp(p, vec2(0), lim), 0);
+}
+
+// The game's openness of a strand pixel (read from its hair lighting program
+// by the shader archive work): over 16 neighbours at (dx, dy), dx and dy in
+// -2, -1, 1, 2, the weighted share that is not in front of the pixel, by
+// depth. 1: the nearest thing in its block of pixels; towards 0: seen
+// through a gap.
+fn strand_openness(clip: vec4<f32>) -> f32 {
+    if (F.light_vp[3][3] == 0.0) { return 1.0; }
+    let p = vec2<i32>(clip.xy);
+    let z = clip.z * 1.0001 + 1.0e-7;
+    var s = 0.0;
+    for (var y = -2; y <= 2; y++) {
+        for (var x = -2; x <= 2; x++) {
+            if (x == 0 || y == 0) { continue; }
+            let far = abs(x) + abs(y);
+            let w = select(select(0.376603, 0.209611, far == 4), 0.676634, far == 2);
+            if (eye_depth(p + vec2(x, y)) <= z) { s += w; }
+        }
+    }
+    return clamp(0.15249 * s, 0.0, 1.0);
+}
+
+// Screen-space occlusion of the ambient light on an opaque surface, from the
+// camera depth pre-pass: the game's horizon occlusion pass (read in full from
+// its shader archive by the shader archive work). Two perpendicular slices
+// through the pixel at a random turn; on each side of a slice two depth taps
+// at (j/2)^2 R + 1.3 and ((1 + j)/2)^2 R + 1.3 pixels (j random, 0..1); R in pixels,
+// 0.625 x the target height, held to 64 near the eye. A tap's horizon is
+// blended towards the surface's own tangent plane by its depth difference in
+// pixel units ((0.15 dz)^2, so a tap 6.7 pixels or more away in depth counts
+// for nothing): the pass only sees fine contact occlusion. The larger
+// horizon per side is clamped to the normal's hemisphere and integrated the
+// usual way. The game's noise comes from a texture and temporal passes
+// follow; here the noise is a hash and the viewer's frame accumulation
+// averages it. The game's standard lighting programs (not its hair programs)
+// use the result on the specular ambient only, through a cone test against
+// the reflection vector; the viewer keeps no bent direction and uses the
+// plain visibility in place of that test's result (an approximation), with
+// the game's strength by roughness.
+// The game's diffuse ambient is darkened by its traced probe lighting, which
+// the viewer does not have.
+fn screen_occlusion(clip: vec4<f32>, wp: vec3<f32>, n: vec3<f32>) -> f32 {
+    if (F.light_vp[3][3] == 0.0) { return 1.0; }
+    let size = F.frame.yz;
+    let toeye = F.cam_pos.xyz - wp;
+    let v = toeye / max(length(toeye), 1.0e-6);
+    let c0 = F.view_proj * vec4(wp, 1.0);
+    let z = max(c0.w, 1.0e-4);
+    // pixels a metre covers at the pixel's depth: 0.5 H / tan(fov_y / 2) / z
+    var up = cross(v, cross(vec3(0.0, 1.0, 0.0), v));
+    up = up / max(length(up), 1.0e-5);
+    let c1 = F.view_proj * vec4(wp + up * 0.01, 1.0);
+    let ppm = length((c1.xy / c1.w - c0.xy / c0.w) * 0.5 * size) * 100.0;
+    let r0 = 0.625 * size.y;
+    let th = tanh(min(0.02 * z, 10.0));
+    let rad = mix(clamp(r0, 1.0, 64.0), r0, th * th);
+    let phi = ign(clip.xy + vec2(F.frame.x * 7.31, F.frame.x * 3.17)) * 1.5708;
+    let jit = ign(clip.xy * 1.37 + vec2(F.frame.x * 2.11, 17.0));
+    let ndc0 = c0.xy / c0.w;
+    var sum = 0.0;
+    for (var sl = 0; sl < 2; sl++) {
+        let ang = phi + f32(sl) * 1.5708;
+        let dir = vec2(cos(ang), sin(ang));
+        // the slice's direction in the world, at right angles to the view
+        let w1 = F.inv_view_proj * vec4(ndc0 + vec2(dir.x, -dir.y) * 0.01, c0.z / c0.w, 1.0);
+        var t = w1.xyz / w1.w - wp;
+        t = t - v * dot(t, v);
+        t = t / max(length(t), 1.0e-9);
+        let axis = cross(t, v);
+        let pn = n - axis * dot(n, axis);
+        let pl = length(pn);
+        let na = select(-1.0, 1.0, dot(pn, t) >= 0.0) * acos(clamp(dot(pn, v) / max(pl, 1.0e-5), -1.0, 1.0));
+        var hc = vec2(-1.0, -1.0);
+        for (var sd = 0; sd < 2; sd++) {
+            let sg = f32(sd) * 2.0 - 1.0;
+            // the tangent plane's own horizon on this side
+            let flat = -sg * sin(na);
+            var best = -1.0;
+            for (var k = 0; k < 2; k++) {
+                let d = 0.25 * (f32(k) + jit) * (f32(k) + jit) * rad + 1.3;
+                let q = floor(clip.xy) + round(dir * sg * d) + 0.5;
+                var h = flat;
+                if (q.x >= 0.0 && q.y >= 0.0 && q.x < size.x && q.y < size.y) {
+                    let dep = eye_depth(vec2<i32>(q));
+                    if (dep > 0.0) {
+                        let w4 = F.inv_view_proj * vec4(q.x / size.x * 2.0 - 1.0, 1.0 - q.y / size.y * 2.0, dep, 1.0);
+                        let pt = w4.xyz / w4.w;
+                        let dv = pt - wp;
+                        let zt = (F.view_proj * vec4(pt, 1.0)).w;
+                        let dz = abs(zt - z) * ppm;
+                        let w = clamp(0.0225 * dz * dz, 0.0, 1.0);
+                        h = mix(dot(dv, v) / max(length(dv), 1.0e-6), flat, w);
+                    }
+                }
+                best = max(best, h);
+            }
+            if (sd == 0) { hc.x = best; } else { hc.y = best; }
+        }
+        let h0 = na + max(-acos(clamp(hc.x, -1.0, 1.0)) - na, -1.5708);
+        let h1 = na + min(acos(clamp(hc.y, -1.0, 1.0)) - na, 1.5708);
+        let lw = pl + 0.15 * (1.0 - pl);
+        sum += lw * ((cos(na) + 2.0 * h0 * sin(na) - cos(2.0 * h0 - na)) + (cos(na) + 2.0 * h1 * sin(na) - cos(2.0 * h1 - na)));
+    }
+    return clamp(max(0.01, 0.125 * sum), 0.0, 1.0);
+}
+
+// One tap of the sun shadow map at a world position (1 outside the map).
+fn sun_shadow_tap(wp: vec3<f32>, r: i32) -> f32 {
+    let c = F.light_vp * vec4(wp, 1.0);
+    let uv = c.xy * vec2(0.5, -0.5) + 0.5;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || c.z > 1.0) { return 1.0; }
+    let px = 1.0 / f32(textureDimensions(t_sun_map).x);
+    var s = 0.0;
+    for (var y = -r; y <= r; y++) {
+        for (var x = -r; x <= r; x++) {
+            s += textureSampleCompareLevel(t_sun_map, samp_sun_map, uv + vec2(f32(x), f32(y)) * px, c.z - 0.0012);
+        }
+    }
+    let n = f32(2 * r + 1);
+    return s / (n * n);
+}
+
+// The sun's visibility at a pixel. The game's lighting programs average its
+// screen-space shadow buffer over 13 pixels (read from its hair and standard
+// lighting programs by the shader archive work): the pixel, its four
+// diagonal neighbours, and the pixels 2 and 4 to each side and above and
+// below, a neighbour counting only when its depth is within 0.275 % of the
+// pixel's. The viewer has no such buffer: each neighbour is taken on the
+// pixel's own surface (the world position moved by its screen derivatives
+// `dx`, `dy`), which is where a neighbour of nearly the same depth lies, and
+// read from the shadow map. The 3 x 3 map filter of the centre stands in for
+// whatever filters the game's buffer before this step (not read).
+fn model_sun_shadow(wp: vec3<f32>, dx: vec3<f32>, dy: vec3<f32>) -> f32 {
+    if (F.light_vp[3][3] == 0.0) { return 1.0; }
+    var s = sun_shadow_tap(wp, 1);
+    for (var k = 0; k < 4; k++) {
+        let a = f32(k & 1) * 2.0 - 1.0;
+        let b = f32(k >> 1u) * 2.0 - 1.0;
+        s += sun_shadow_tap(wp + dx * a + dy * b, 0);
+        // the cross: 2 and 4 pixels along x (k = 0, 1) and along y (k = 2, 3)
+        let d = select(dy, dx, k < 2) * a;
+        s += sun_shadow_tap(wp + d * 2.0, 0) + sun_shadow_tap(wp + d * 4.0, 0);
+    }
+    return s / 13.0;
+}
+
 @fragment
-fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
+fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {
+    var o: MeshOut;
+    o.col = mesh_colour(i, ff);
+    o.mask = 0xffffffffu;
+    // a strand thinner than its drawn width: the game keeps a pixel with a probability equal to the
+    // covered share (a dither it averages over frames); here each sample of the pixel is kept or not
+    let cov = select(clamp((i.uv1.y - 1.0) * 2.5, 0.0, 1.0), i.uv1.x, i.uv1.y > 1.5);
+    if (M.flags.y == 12u && i.uv1.y > 0.5 && cov < 0.999) {
+        let j = fract(dot(i.tint.rgb, vec3(12.9898, 78.233, 37.719))) * 64.0 + F.frame.x * 5.588238;
+        var mk = 0u;
+        for (var s = 0u; s < 4u; s++) {
+            if (cov >= ign(i.clip.xy + vec2(j + f32(s) * 5.588, j + f32(s) * 9.123))) { mk |= 1u << s; }
+        }
+        if (mk == 0u) { discard; }
+        o.mask = mk;
+    }
+    return o;
+}
+
+fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     let fp = footprint(i.world);
     let has = M.flags.x;
     let cls = M.flags.y;
@@ -780,8 +1206,13 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
             k = clamp(d.b * wear_amt * 2.0, 0.0, 1.0);
         }
         let id = floor(i.col.a * 255.0 + 0.5);
+        // the primer's weight (layer B) and its roughness and metalness
+        var w3 = 0.0;
+        var p_rough = 0.6;
+        var p_metal = 0.0;
         if (wear_mask) {
             let m = textureSample(t_wear, samp, i.uv0 * WEAR_TILING).rgb;
+            let pm = textureSample(t_primer, samp, i.uv0 * WEAR_TILING).rgb;
             if (F.jitter.w < 0.0) {
                 // the game's first wear layer: each mask channel scaled by
                 // the part's control term, then windowed (start, width), the
@@ -792,9 +1223,41 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
                     let sc = textureLoad(t_em, vec2(16 + c, row), 0).a;
                     let st = textureLoad(t_em, vec2(19 + c, row), 0).a;
                     let wd = max(textureLoad(t_em, vec2(22 + c, row), 0).a, 1.0 / 255.0);
-                    s += clamp((clamp(m[c] * sc, 0.0, 1.0) - st) / wd, 0.0, 1.0);
+                    // bias (column 34 + c) and gamma (37 + c): the level is
+                    // the vertex colour's channel (the game's per-vertex wear
+                    // multipliers, GLB _COLOR0 rgb) times (scale x mask +
+                    // bias), raised to (1 / gamma)^2, as the game does
+                    let bi = textureLoad(t_em, vec2(34 + c, row), 0).a;
+                    let lv = wear_gamma(clamp(i.col[c] * (m[c] * sc + bi), 0.0, 1.0), textureLoad(t_em, vec2(37 + c, row), 0).a);
+                    s += clamp((lv - st) / wd, 0.0, 1.0);
                 }
                 k = clamp(s, 0.0, 1.0);
+                // The game's second wear layer, the primer (columns 25 to
+                // 33): its mask (or the wear mask, column 31) per channel
+                // scaled, the first channel less the other two by the cross
+                // byte (the vertex colours, as for the first layer), summed,
+                // windowed, and
+                // only where the first layer is not.
+                // (only when the user turns it on: F.jitter.w = -2)
+                let t = select(pm, m, textureLoad(t_em, vec2(31, row), 0).a > 0.5);
+                let cross = textureLoad(t_em, vec2(28, row), 0).a;
+                // scale (25 + c), bias (40 + c), gamma (43 + c)
+                let pl = vec3(clamp(i.col.r - (i.col.g + i.col.b) * cross, 0.0, 1.0), i.col.g, i.col.b);
+                var lv = vec3(0.0);
+                for (var c = 0; c < 3; c++) {
+                    let sc = textureLoad(t_em, vec2(25 + c, row), 0).a;
+                    let bi = textureLoad(t_em, vec2(40 + c, row), 0).a;
+                    lv[c] = wear_gamma(clamp(pl[c] * (sc * t[c] + bi), 0.0, 1.0), textureLoad(t_em, vec2(43 + c, row), 0).a);
+                }
+                let lr = lv.x;
+                let lg = lv.y;
+                let lb = lv.z;
+                let pb = clamp(lr + lg + lb, 0.0, 1.0);
+                let ps = textureLoad(t_em, vec2(29, row), 0).a;
+                let pw = max(textureLoad(t_em, vec2(30, row), 0).a, 1.0 / 255.0);
+                w3 = select(0.0, (1.0 - k) * clamp((pb - ps) / pw, 0.0, 1.0), F.jitter.w < -1.5);
+                p_rough = textureLoad(t_em, vec2(32, row), 0).a;
+                p_metal = textureLoad(t_em, vec2(33, row), 0).a;
             } else {
                 let t = wear_threshold(wear_amt);
                 k = smoothstep(t, t + 0.08, m.g);
@@ -802,10 +1265,11 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
         }
         let w1 = textureSampleLevel(t_em, samp, vec2(u, (id + 256.5) / RAMP_ROWS), 0.0);
         let m1 = textureSampleLevel(t_em, samp, vec2(u, (id + 0.5) / RAMP_ROWS), 0.0).a;
-        albedo = mix(albedo, w1.rgb, k);
-        rough = clamp(mix(rough, w1.a, k), 0.04, 1.0);
-        metal = mix(metal, m1, k);
-        pearl = pearl * (1.0 - k);
+        let w0 = 1.0 - k - w3;
+        albedo = albedo * w0 + w1.rgb * k + PRIMER_COLOUR * w3;
+        rough = clamp(rough * w0 + w1.a * k + p_rough * w3, 0.04, 1.0);
+        metal = metal * w0 + m1 * k + p_metal * w3;
+        pearl = pearl * w0;
     }
     if (cls == 5u || cls == 6u) {
         rough = 0.04; metal = 0.0;
@@ -922,14 +1386,26 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let fr_v = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
     let r = reflect(-v, n);
     let env = environment(reflect(-v, n_env), rough) * F.misc.w;
-    var col = direct * ao_direct + kd * albedo * amb_d * ao + env * fr_v * ao + emissive;
+    // a strand's ribbon faces the camera, so its derivatives are screen pixel steps; the game temporally
+    // accumulates and spatially denoises its hair shadow buffer before this read (kernels not read): here the
+    // 13 taps reach three times as far on strands (12 pixels), which with the many-frame accumulation of the
+    // turned shadow ribbons stands in for that denoise
+    let sh_k = select(1.0, 3.0, cls == 12u && i.uv1.y > 0.5);
+    let sh = model_sun_shadow(i.world, dpdx(i.world) * sh_k, dpdy(i.world) * sh_k);
+    var ao_s = ao;
+    // strength = max(0, I - 2 x roughness), I = 1 (the game's value in every weather and hour): no effect from
+    // roughness 0.5 upward, so next to none on skin
+    let occ_k = max(0.0, 1.0 - 2.0 * rough);
+    if (cls != 12u && occ_k > 0.0) { ao_s = ao * (1.0 + occ_k * (screen_occlusion(i.clip, i.world, n) - 1.0)); }
+    // the game applies its horizon occlusion to the specular ambient only (never to diffuse ambient, never to hair)
+    var col = direct * sh * ao_direct + kd * albedo * amb_d * ao + env * fr_v * ao_s + emissive;
     // Sheen (velvet, suede): fibres standing on the surface catch light
     // towards the silhouette. The reflectance is the share seen head-on;
     // the fade sets how fast it grows towards the edge.
     if (fin.y > 0.0) {
         let edge = pow(1.0 - ndv, 1.0 + 4.0 * fin2.x);
         let sheen = fin.y * (fin2.y + (1.0 - fin2.y) * edge);
-        col += sheen * (sun_e(i.world) * ndl / 3.14159 * ao_direct + amb_d * ao);
+        col += sheen * (sun_e(i.world) * ndl / 3.14159 * sh * ao_direct + amb_d * ao);
     }
     // Clear coat: a second, glossy layer over the base coat (a dielectric,
     // 4 % at normal incidence). It mirrors the sun and the surroundings at
@@ -945,9 +1421,89 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
         let cspec = ca2 / (3.14159 * cdd * cdd) * cG * cF / max(4.0 * ndl * ndv, 0.001);
         let cfv = 0.04 + (max(1.0 - cr, 0.04) - 0.04) * pow(1.0 - ndv, 5.0);
         col = (col - emissive) * (1.0 - coat.x * cfv) + emissive
-            + coat.x * (cspec * sun_e(i.world) * ndl * ao_direct + environment(r, cr) * F.misc.w * cfv * ao);
+            + coat.x * (cspec * sun_e(i.world) * ndl * sh * ao_direct + environment(r, cr) * F.misc.w * cfv * ao_s);
     }
     col += pearl * pow(1.0 - ndv, 2.0) * 0.6;
+    if (cls == 12u) {
+        // strands: the fibre model on the strand's direction (the tangent)
+        let tdir = normalize(i.tan.xyz);
+        let sun = F.sun_col.rgb * F.sun_dir.w * 3.0;
+        let amb_h = sqrt(albedo) * 0.5 * (neutral(F.sky_top.rgb, 0.8) + neutral(F.sky_hor.rgb, 0.8) * 0.6) * 0.5 * F.misc.w;
+        col = hair_light(albedo, tdir, v, l, 0.33, 0.5) * sun * sh * ao_direct + amb_h * ao;
+        // with the game's tables: its own light sum
+        let dims = textureDimensions(t_hair_m);
+        if (dims.x > 1u) {
+            // the tube normal as the game builds it: a side vector S across the
+            // strand as seen from the eye, and the normal rounded across the
+            // ribbon by the position u (-1 .. 1, the tangent's w) between its edges
+            let side = normalize(cross(tdir, v));
+            // the position u across the tube, as the game's tiled G-buffer resolve takes it: interleaved gradient
+            // noise at the pixel with a per-frame offset 5.58824 (frame & 63), whatever the pixel's place in the
+            // drawn ribbon (high confidence, read from that program by the shader archive work); the game's
+            // temporal anti-aliasing averages it over the tube, here the shot's accumulation frames do. (Its
+            // pixel-shader G-buffer path takes the raster position across the ribbon instead; which pieces use
+            // that path is not known.)
+            let j_h = 5.58824 * f32(u32(F.frame.x) & 63u);
+            let u_h = 2.0 * ign(floor(i.clip.xy) + vec2(j_h)) - 1.0;
+            let tube = normalize(side * u_h + cross(side, tdir) * sqrt(max(1.0 - u_h * u_h, 0.0)));
+            // large-scale light and dark side from the head: the root normal
+            let root = normalize(i.nrm);
+            // the parameter ramp's values at this point of the strand, when the
+            // ribbon carries them (uv1.y = 1); else fixed stand-ins
+            let ramped = i.uv1.y > 0.5;
+            let g0h = select(0.33, clamp(i.uv0.x, 0.0, 1.0), ramped);
+            let eh = select(0.5, clamp(i.uv0.y, 0.0, 1.0), ramped);
+            // profile4 = 15 x (ramp profile x the strand's own profile, taken as 1); y = 0.5 + 0.0266667 profile4
+            let yh = select(0.6067, 0.5 + 0.4 * clamp(i.uv1.x, 0.0, 1.0), ramped);
+            let direct_h = hair_game(albedo, tdir, tube, root, v, l, g0h, yh, eh) * sun;
+            // ambient: the game's diffuse probe light for hair is a plain cosine (Lambert) lobe with the strand
+            // tangent in place of the normal (its final-gather pass; medium-high confidence). Here: the viewer's
+            // diffuse ambient around the tangent, with the game's factor
+            let sky_h = ambient(tdir);
+            // o = sqrt(profile4 / 15 x openness) (profile4: the ramp's profile value in 15 steps)
+            let o_h = sqrt(select(1.0, round(15.0 * clamp(i.uv1.x, 0.0, 1.0)) / 15.0, ramped) * strand_openness(i.clip));
+            // the reflection part of the game's hair ambient (read from its hair program, medium confidence):
+            // its reflection buffer x Fenv x an energy term, Fenv = (0.3 + 1.4 o) x a roughness factor x the
+            // environment table's Fresnel; the diffuse part keeps 1 - Fenv. Stand-ins here: the viewer's sky along
+            // the reflection about the tube normal for the game's traced reflection buffer, and a reflectance
+            // scale of 1.
+            let m_h = max(0.001, (1.0 - g0h) * (1.0 - g0h));
+            let nv_h = max(abs(dot(v, tube)), 0.0001);
+            let rg_h = 1.0 - g0h;
+            // the game reads its table at roughness 0.5 + 0.5 (1 - g0): the upper half of the axis
+            let e_h = env_tab(nv_h, 0.5 + 0.5 * rg_h);
+            let e_r = e_h.x;
+            let e_g = max(e_h.y, 0.001);
+            let f0_h = 0.046461;
+            let fenv = clamp((0.3 + 1.4 * o_h) * mix(0.55 + 0.65 * m_h, 1.4 + 0.16 * m_h, m_h) * (e_r * (1.0 - f0_h) + e_g * f0_h), 0.0, 1.0);
+            let refl_h = environment(reflect(-v, tube), clamp(rg_h, 0.0, 1.0)) * F.misc.w;
+            let spec_g = refl_h * fenv * (1.0 + (1.0 / e_g - 1.0) * f0_h);
+            let amb_g = sky_h * albedo * hair_ambient(tdir, v, g0h, o_h) * (1.0 - fenv) + spec_g;
+            // the game multiplies its light sum by the light's shadow (1 here without the sun shadow map)
+            col = direct_h * sh * ao_direct + amb_g * ao;
+            // a set with UseStandardBsdf (uv1.y = 2 + reflectance scale; nearly all hair and fur): the game
+            // lights the strand by its standard lighting, with the atlas colour as base colour, the ramp's
+            // roughness, the tube normal and F0 = 0.0465 x the scale
+            if (i.uv1.y > 1.5) {
+                let rs = clamp(g0h, 0.05, 1.0);
+                let f0s = vec3(0.0465 * clamp(i.uv1.y - 2.0, 0.5, 1.0));
+                let nls = max(dot(tube, l), 0.0);
+                let nvs = max(dot(tube, v), 0.001);
+                let hs = normalize(v + l);
+                let nhs = max(dot(tube, hs), 0.0);
+                let a2s = rs * rs * rs * rs;
+                let dds = nhs * nhs * (a2s - 1.0) + 1.0;
+                let ks = (rs + 1.0) * (rs + 1.0) / 8.0;
+                let gs = (nls / (nls * (1.0 - ks) + ks)) * (nvs / (nvs * (1.0 - ks) + ks));
+                let frs = f0s + (1.0 - f0s) * pow(1.0 - max(dot(hs, v), 0.0), 5.0);
+                let specs = a2s / (3.14159 * dds * dds) * gs * frs / max(4.0 * nls * nvs, 0.001);
+                // stand-in for the shadow the rest of the hair casts: the side of the head turned from the light
+                // (with the sun shadow map: its shadow instead)
+                let shade = select(smoothstep(-0.35, 0.35, dot(root, l)), sh, F.light_vp[3][3] != 0.0);
+                col = ((1.0 - frs) * albedo / 3.14159 + specs) * sun * nls * shade * ao_direct + sky_h * (albedo + f0s) * ao;
+            }
+        }
+    }
     if (cls == 11u) {
         // baked map tiles (already hill-shaded): soft diffuse, no sky reflection
         if (hdr()) {

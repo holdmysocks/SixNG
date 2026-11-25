@@ -62,6 +62,11 @@ pub struct Groom {
     /// strand's 2-bit variant, which its strand shader uses to choose among
     /// four colour ramps (`hairgen`). Most grooms store 64, 128, 191, so
     /// the four variants are equally likely. Empty when not stored.
+    /// System +0x12C (byte / 255): how far the strand colour is multiplied
+    /// by the tint read at the strand's root (the body's colour under it):
+    /// colour = mix(C, C x T, weight x the tint's alpha). Read from the
+    /// game's code by the shader archive work; 1 on most grooms.
+    pub tint_weight: f32,
     pub pick_steps: Vec<[u8; 4]>,
     /// Graphics header +0x7C: the groom's seed for strand generation.
     pub seed: u32,
@@ -74,6 +79,110 @@ pub struct Groom {
     /// into the per-instance record its strand generator reads, so it
     /// applies to every strand; no program read so far reads the second.
     pub curl: [crate::hairgen::Style; 2],
+    /// Graphics header bytes 0x00-0xBF as stored (clump settings live here).
+    pub head: Vec<u8>,
+    /// A0, one dword per guide strand: byte 0 density, byte 1 clump radius
+    /// in mm (shader archive reading). Empty when not stored.
+    pub corners: Vec<[u8; 4]>,
+    /// System +0x12A / +0x12B (byte / 255): how far a clump member's offset
+    /// reaches along the clump's two axes (heading, sideways). The game
+    /// copies them into its per-draw record; hair modifiers can change
+    /// them at run time.
+    pub clump_scale: [f32; 2],
+    /// Strand styles (graphics header +0x20, a byte offset; 0 = none): the
+    /// shape the game's style pass gives every generated strand. Empty for
+    /// most pieces.
+    pub styles: Vec<Style>,
+    /// System +0x12D: how the game places its clumped strands (shader
+    /// archive reading): 0 = hashed clump centres in the root triangle
+    /// (mode 2), 1 = one strand per thread around a guide strand's root
+    /// (mode 16), 2 = clump centre at the triangle's centroid (mode 4, not
+    /// grown here), other = no clumping.
+    pub clump_type: u8,
+    /// A1, per guide strand (low 16 bits): a root triangle (index into
+    /// `roots`) with the guide as a corner. Empty when absent.
+    pub guide_tri: Vec<u32>,
+}
+
+/// One strand style record: 2D offsets across the strand along its length.
+/// Stored as two half-float pairs (the x, y range) and samples of
+/// x (10 bits), y (10 bits) and the arc-length position z (12 bits), all
+/// unsigned fractions. Read from the game's style pass by the shader
+/// archive work (medium confidence).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Style {
+    pub lo: [f32; 2],
+    pub hi: [f32; 2],
+    pub samples: Vec<u32>,
+}
+
+impl Style {
+    /// (x, y, z) at `u` (0 root .. 1 tip): x, y in metres, z a fraction of
+    /// the strand's length.
+    pub fn at(&self, u: f32) -> [f32; 3] {
+        let n = self.samples.len();
+        if n == 0 {
+            return [0.0, 0.0, u];
+        }
+        let d = |v: u32| [(v & 1023) as f32 / 1023.0, ((v >> 10) & 1023) as f32 / 1023.0, (v >> 20) as f32 / 4095.0];
+        let x = u.clamp(0.0, 1.0) * (n - 1) as f32;
+        let i = (x as usize).min(n.saturating_sub(2));
+        let (a, b) = (d(self.samples[i]), d(self.samples[(i + 1).min(n - 1)]));
+        let f = (x - i as f32).clamp(0.0, 1.0);
+        let m = |q: usize| a[q] + (b[q] - a[q]) * f;
+        [self.lo[0] + (self.hi[0] - self.lo[0]) * m(0), self.lo[1] + (self.hi[1] - self.lo[1]) * m(1), m(2)]
+    }
+
+    /// Re-shape one strand (its points in order, root first): point j goes
+    /// to the strand's point at arc length z(u) L, u = j / (K - 1), plus the
+    /// style offset x along the strand's normal (`up` made square to the
+    /// strand) and y along normal x tangent (`swap` exchanges them). The
+    /// offset's length is 0.8 mm + k (|d| - 0.8 mm), capped at |d|: the
+    /// game's k is a per-point weight from its strand generator (not read)
+    /// times the per-instance style strength.
+    pub fn apply(&self, pts: &mut [[f32; 3]], up: [f32; 3], swap: bool, k_strength: f32) {
+        let k = pts.len();
+        if k < 2 || self.samples.is_empty() {
+            return;
+        }
+        let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let mut arc = vec![0.0f32; k];
+        for j in 1..k {
+            let e = sub(pts[j], pts[j - 1]);
+            arc[j] = arc[j - 1] + dot(e, e).sqrt();
+        }
+        let total = arc[k - 1];
+        if total <= 1e-6 {
+            return;
+        }
+        let src = pts.to_vec();
+        for j in 0..k {
+            let [x, y, z] = self.at(j as f32 / (k - 1) as f32);
+            let len = (x * x + y * y).sqrt();
+            let f = if len > 1e-9 { ((0.0008 + k_strength * (len - 0.0008)) / len).clamp(0.0, 1.0) } else { 0.0 };
+            let (x, y) = (x * f, y * f);
+            let s = z.clamp(0.0, 1.0) * total;
+            let i = arc.partition_point(|&a| a <= s).clamp(1, k - 1);
+            let seg = (arc[i] - arc[i - 1]).max(1e-9);
+            let f = ((s - arc[i - 1]) / seg).clamp(0.0, 1.0);
+            let e = sub(src[i], src[i - 1]);
+            let base = [src[i - 1][0] + e[0] * f, src[i - 1][1] + e[1] * f, src[i - 1][2] + e[2] * f];
+            let l = dot(e, e).sqrt().max(1e-9);
+            let t = [e[0] / l, e[1] / l, e[2] / l];
+            let d = dot(up, t);
+            let nn = [up[0] - t[0] * d, up[1] - t[1] * d, up[2] - t[2] * d];
+            let nl = dot(nn, nn).sqrt();
+            if nl < 1e-6 {
+                pts[j] = base;
+                continue;
+            }
+            let n = [nn[0] / nl, nn[1] / nl, nn[2] / nl];
+            let bv = [n[1] * t[2] - n[2] * t[1], n[2] * t[0] - n[0] * t[2], n[0] * t[1] - n[1] * t[0]];
+            let (a, b) = if swap { (y, x) } else { (x, y) };
+            pts[j] = [base[0] + n[0] * a + bv[0] * b, base[1] + n[1] * a + bv[1] * b, base[2] + n[2] * a + bv[2] * b];
+        }
+    }
 }
 
 /// A hat seen from a point inside the head: per direction, the distance to
@@ -317,6 +426,43 @@ pub fn parse(r: &Resource) -> Result<Groom> {
     let group_box = (gb[0][0] <= gb[1][0] && gb[0][0].is_finite() && gb[1][0].is_finite() && gb[0][0].abs() < 1e30).then_some(gb);
     let width = Some(f16(r.u16(0xF0))).filter(|w| w.is_finite() && *w > 0.0 && *w < 0.01).unwrap_or(0.0);
     let taper: [u8; 16] = r.sys.get(0x110..0x120).and_then(|b| b.try_into().ok()).unwrap_or([255; 16]);
+    // strand styles: records of 8 + 4N bytes from header +0x20 up to the
+    // next section; a record ends where the arc position starts again at 0
+    let st = gu32(0x20) as usize;
+    let mut styles = Vec::new();
+    if st > 0 {
+        let end = (0..0x50).step_by(4).map(|o| gu32(o) as usize).filter(|&o| o > st).min().unwrap_or(g.len()).min(g.len());
+        let mut o = st;
+        while o + 12 <= end && styles.len() < 4 {
+            let lo = [f16(gu16(o)), f16(gu16(o + 2))];
+            let hi = [f16(gu16(o + 4)), f16(gu16(o + 6))];
+            let mut samples = Vec::new();
+            let mut q = o + 8;
+            while q + 4 <= end {
+                let v = gu32(q);
+                if !samples.is_empty() && (v >> 20) < (samples[samples.len() - 1] >> 20) {
+                    break;
+                }
+                samples.push(v);
+                q += 4;
+            }
+            if !(lo.iter().chain(&hi).all(|x| x.is_finite())) || samples.len() < 2 {
+                break;
+            }
+            styles.push(Style { lo, hi, samples });
+            o = q;
+        }
+    }
+    let a0 = gu32(0x00) as usize;
+    let corners = match g.get(a0..a0 + s * 4) {
+        Some(p) if a0 > 0 => p.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect(),
+        _ => Vec::new(),
+    };
+    let a1 = gu32(0x04) as usize;
+    let guide_tri = match g.get(a1..a1 + s * 4) {
+        Some(p) if a1 > 0 => p.chunks_exact(4).map(|c| u16::from_le_bytes([c[0], c[1]]) as u32).collect(),
+        _ => Vec::new(),
+    };
     let a3 = gu32(0x0C) as usize;
     let pick_steps = match g.get(a3..a3 + s * 4) {
         Some(p) if a3 > 0 => p.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect(),
@@ -327,7 +473,7 @@ pub fn parse(r: &Resource) -> Result<Groom> {
         crate::hairgen::Style { bend: v(0), fade: v(1), noise: v(2), curl: v(3), noise_freq: v(4), curl_freq: v(5) }
     };
     let style = if r.sys.len() >= 0x110 { [style_at(0xF8), style_at(0x104)] } else { Default::default() };
-    Ok(Groom { strands: s, points_per_strand: k, points, w, roots, lengths, root_uv, bones, root_box, group_box, tri_counts, width, taper, pick_steps, seed: gu32(0x7C), length_var: [f16(gu16(0x60)), f16(gu16(0x62))], curl: style })
+    Ok(Groom { tint_weight: r.sys.get(0x12C).map_or(1.0, |b| *b as f32 / 255.0), strands: s, points_per_strand: k, points, w, roots, lengths, root_uv, bones, root_box, group_box, tri_counts, width, taper, pick_steps, seed: gu32(0x7C), length_var: [f16(gu16(0x60)), f16(gu16(0x62))], head: g.get(..0xC0).map_or(Vec::new(), |h| h.to_vec()), corners, clump_scale: [0x12A, 0x12B].map(|o| r.sys.get(o).map_or(1.0, |b| *b as f32 / 255.0)), curl: style, styles, clump_type: r.sys.get(0x12D).copied().unwrap_or(0), guide_tri })
 }
 
 impl Groom {
@@ -418,60 +564,235 @@ impl Groom {
     }
 
     /// The coat the game grows from the guides, by the arithmetic of its
-    /// strand generation program (`hairgen`): strand `i` picks its root
-    /// triangle by hash, weighted by the triangle's density byte, takes a
-    /// hashed point in it, and is the blend of the triangle's three guides
-    /// cut at its own length. `share` of the stored strand count is grown:
-    /// the game's own count is a run-time number, and so is the scale of
-    /// the density byte (here the densest triangle always takes a strand).
-    /// Noise and curl (`hairgen::apply_style`) follow from the groom's
-    /// first style group, with the root triangle's normal standing in for the
-    /// game's twist vector. Clumping is not decoded; a piece that stores
-    /// only clump strands (c0 = 0 everywhere) is grown from c1 the same
-    /// way, unclumped. Same strands for the same groom and share. Empty
-    /// without B6.
+    /// strand generation program (`hairgen`). Two populations:
+    ///
+    /// - Scattered strands (c0 per triangle): strand `i` picks its root
+    ///   triangle by hash, weighted by c0, takes a hashed point in it, and
+    ///   is the blend of the triangle's three guides cut at its own length.
+    /// - Clumped strands (c1 per triangle, in c2 clumps): each clump has a
+    ///   hashed centre point in the triangle whose guide blend G(t) is the
+    ///   clump's centre line. A member starts at a random offset T (uniform
+    ///   in the square [-1, 1]^2) of the clump radius R (per-guide byte 1,
+    ///   mm) in the root triangle's plane (axes: the centre line's heading
+    ///   and its cross with the normal, fixed for the whole strand), and is
+    ///   walked toward G(t) + (1 - p(t)) R T with the centre line's segment
+    ///   lengths, where
+    ///   p is the 16-step pull profile at graphics header +0x90 (255 = on
+    ///   the centre line). Read from the program's clump variant by the
+    ///   shader archive work (medium confidence); the hashes and the offset
+    ///   table are the viewer's own, with the same spread. The two axes
+    ///   are scaled by `clump_scale` (hair modifiers that change it at run
+    ///   time are not applied). With graphics header +0xA8 = 3
+    ///   the game takes the root normal from a per-vertex table at +0xBC
+    ///   when that offset is set; it does not change the clump shape, and
+    ///   the viewer keeps the triangle's normal.
+    ///
+    /// A piece without the clump bytes grows its clumped strands on their
+    /// centre lines. `share` of each population is grown: the game's own
+    /// count is a run-time number, and so is the scale of the density byte
+    /// (here the densest triangle always takes a strand). Same strands for
+    /// the same groom and share. Empty without B6.
+    ///
+    /// Every strand then gets the game's noise and curl
+    /// (`hairgen::apply_style`, the groom's first curl group) on its grown
+    /// or walked points, with its own seed and length draw; the root
+    /// triangle's normal stands in for the game's twist vector. The style
+    /// record pass comes after it.
     pub fn coat(&self, share: f32) -> Coat {
         use crate::hairgen;
         let k = self.points_per_strand;
         let mut c = Coat { k, points: Vec::new(), guides: Vec::new(), normals: Vec::new(), variants: Vec::new(), stored: self.stored_strands() };
-        let n = (c.stored as f32 * share.clamp(0.0, 1.0)).round() as usize;
-        let mut density: Vec<u8> = self.tri_counts.iter().map(|q| q[0]).collect();
-        // A piece whose strands are all clump strands (first byte 0 in every
-        // triangle, e.g. the top of a short men's cut) would grow nothing:
-        // its second count stands in, and the strands grow unclumped.
-        let style = self.curl[0];
-        if density.iter().all(|&d| d == 0) {
-            density = self.tri_counts.iter().map(|q| q[1]).collect();
-        }
-        let top = density.iter().copied().max().unwrap_or(0);
-        if n == 0 || top == 0 || density.len() != self.roots.len() {
+        let share = share.clamp(0.0, 1.0);
+        if share <= 0.0 || k == 0 || self.tri_counts.len() != self.roots.len() || self.roots.is_empty() {
             return c;
         }
         let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-        for i in 0..n as u32 {
-            let (ti, v20) = hairgen::pick(i, &density, 1.0 / top as f32);
-            let t = self.roots[ti];
+        let cross = |a: [f32; 3], b: [f32; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let scale = |a: [f32; 3], f: f32| [a[0] * f, a[1] * f, a[2] * f];
+        let unit = |a: [f32; 3], or: [f32; 3]| {
+            let l = dot(a, a).sqrt();
+            if l > 1e-12 { scale(a, 1.0 / l) } else { or }
+        };
+        // the triangle's normal and the blended guide curve at weights w
+        let normal = |t: [u32; 3]| {
             let g = t.map(|x| x as usize * k);
-            let (seed, w) = hairgen::seed_bary(ti as u32, self.seed, v20);
-            let mut draws = hairgen::Draws(seed);
-            let (d_len, _, d_var) = (draws.next(), draws.next(), draws.next());
-            let mix = |f: &dyn Fn(usize) -> f32| f(t[0] as usize) * w[0] + f(t[1] as usize) * w[1] + f(t[2] as usize) * w[2];
-            // without stored lengths the strand is not cut
-            let len = if self.lengths.len() == self.strands { hairgen::length(mix(&|s| self.lengths[s]), d_len, self.length_var) } else { f32::MAX };
-            let steps = [0usize, 1, 2].map(|q| mix(&|s| self.pick_steps.get(s).map_or([64u8, 128, 191][q], |b| b[q]) as f32) / 255.0);
-            let mut pts = hairgen::grow(k, len, |j| {
-                let (a, b, d) = (self.points[g[0] + j], self.points[g[1] + j], self.points[g[2] + j]);
-                [a[0] * w[0] + b[0] * w[1] + d[0] * w[2], a[1] * w[0] + b[1] * w[1] + d[1] * w[2], a[2] * w[0] + b[2] * w[1] + d[2] * w[2]]
-            });
-            let (e1, e2) = (sub(self.points[g[1]], self.points[g[0]]), sub(self.points[g[2]], self.points[g[0]]));
-            let nr = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
-            let l = (nr[0] * nr[0] + nr[1] * nr[1] + nr[2] * nr[2]).sqrt();
-            let normal = if l > 1e-12 { [nr[0] / l, nr[1] / l, nr[2] / l] } else { [0.0, 0.0, 1.0] };
-            hairgen::apply_style(&mut pts, &style, seed, d_len, normal);
-            c.points.extend(pts);
-            c.normals.push(normal);
-            c.guides.push((t, w));
-            c.variants.push(hairgen::variant(d_var, steps));
+            unit(cross(sub(self.points[g[1]], self.points[g[0]]), sub(self.points[g[2]], self.points[g[0]])), [0.0, 0.0, 1.0])
+        };
+        let blend = |t: [u32; 3], w: [f32; 3], j: usize| {
+            let g = t.map(|x| x as usize * k);
+            let (a, b, d) = (self.points[g[0] + j], self.points[g[1] + j], self.points[g[2] + j]);
+            [a[0] * w[0] + b[0] * w[1] + d[0] * w[2], a[1] * w[0] + b[1] * w[1] + d[1] * w[2], a[2] * w[0] + b[2] * w[1] + d[2] * w[2]]
+        };
+        let mix = |t: [u32; 3], w: [f32; 3], f: &dyn Fn(usize) -> f32| f(t[0] as usize) * w[0] + f(t[1] as usize) * w[1] + f(t[2] as usize) * w[2];
+        // without stored lengths the strand is not cut
+        let length = |t: [u32; 3], w: [f32; 3], d: f32| if self.lengths.len() == self.strands { hairgen::length(mix(t, w, &|s| self.lengths[s]), d, self.length_var) } else { f32::MAX };
+        let steps = |t: [u32; 3], w: [f32; 3]| [0usize, 1, 2].map(|q| mix(t, w, &|s| self.pick_steps.get(s).map_or([64u8, 128, 191][q], |b| b[q]) as f32) / 255.0);
+
+        // the style pass (research, SIXNG_STYLE=1): applied at full strength to
+        // the rest pose it doubles the waves the stored strands already have,
+        // so the game's strength term (not read) must hold it back there.
+        // The strand's style is picked by the generator (not read); here by
+        // its variant draw among the stored records.
+        let swap = std::env::var_os("SIXNG_STYLE_SWAP").is_some();
+        // SIXNG_STYLE=<k>: the strength (1 when not a number)
+        let k_style = std::env::var("SIXNG_STYLE").ok().map(|v| v.parse::<f32>().unwrap_or(1.0).clamp(0.0, 1.0));
+        let off = k_style.is_none();
+        // the generator's noise and curl (feature 128), on the output points
+        let curl = self.curl[0];
+        let style = |pts: &mut [[f32; 3]], up: [f32; 3], d: f32| {
+            if !off && !self.styles.is_empty() {
+                let i = ((d * self.styles.len() as f32) as usize).min(self.styles.len() - 1);
+                self.styles[i].apply(pts, up, swap, k_style.unwrap_or(1.0));
+            }
+        };
+        // scattered strands
+        let density: Vec<u8> = self.tri_counts.iter().map(|q| q[0]).collect();
+        let top = density.iter().copied().max().unwrap_or(0);
+        let n = (density.iter().map(|&d| d as f32).sum::<f32>() * share).round() as usize;
+        if top > 0 {
+            for i in 0..n as u32 {
+                let (ti, v20) = hairgen::pick(i, &density, 1.0 / top as f32);
+                let t = self.roots[ti];
+                let (seed, w) = hairgen::seed_bary(ti as u32, self.seed, v20);
+                let mut draws = hairgen::Draws(seed);
+                let (d_len, _, d_var) = (draws.next(), draws.next(), draws.next());
+                let at = c.points.len();
+                c.points.extend(hairgen::grow(k, length(t, w, d_len), |j| blend(t, w, j)));
+                hairgen::apply_style(&mut c.points[at..], &curl, seed, d_len, normal(t));
+                style(&mut c.points[at..], normal(t), d_var);
+                c.normals.push(normal(t));
+                c.guides.push((t, w));
+                c.variants.push(hairgen::variant(d_var, steps(t, w)));
+            }
+        }
+
+        // clumped strands
+        let profile: [f32; 16] = match self.head.get(0x90..0xA0) {
+            Some(b) => std::array::from_fn(|i| b[i] as f32 / 255.0),
+            None => [1.0; 16],
+        };
+        let pull = |f: f32| {
+            let x = f.clamp(0.0, 1.0) * 15.0;
+            let i = (x as usize).min(14);
+            profile[i] + (profile[i + 1] - profile[i]) * (x - i as f32)
+        };
+        // a member: starts at the centre line's root + (1 - p(0)) R T and is walked toward
+        // centre(s) + (1 - p(s)) R T with the centre line's segment lengths, cut at `len`
+        #[allow(clippy::too_many_arguments)]
+        let walk = |out: &mut Vec<[f32; 3]>, centre: &[[f32; 3]], fa: [f32; 3], fb: [f32; 3], radius: f32, tx: f32, ty: f32, len: f32, nr: [f32; 3]| {
+            let total: f32 = centre.windows(2).map(|p| { let e = sub(p[1], p[0]); dot(e, e).sqrt() }).sum::<f32>().max(1e-9);
+            // one world offset per member, scaled down the strand by the pull profile
+            let off = |f: f32| {
+                let r = (1.0 - pull(f)) * radius;
+                [r * (tx * fa[0] + ty * fb[0]), r * (tx * fa[1] + ty * fb[1]), r * (tx * fa[2] + ty * fb[2])]
+            };
+            let o = off(0.0);
+            let mut p = [centre[0][0] + o[0], centre[0][1] + o[1], centre[0][2] + o[2]];
+            out.push(p);
+            let (mut arc, mut used) = (0.0f32, 0.0f32);
+            for j in 1..centre.len() {
+                let e = sub(centre[j], centre[j - 1]);
+                let seg = dot(e, e).sqrt();
+                arc += seg;
+                let o = off(arc / total);
+                let target = [centre[j][0] + o[0], centre[j][1] + o[1], centre[j][2] + o[2]];
+                let step = seg.min((len - used).max(0.0));
+                let step = if step > 0.000_976_562_5 { step } else { 0.0 };
+                used += step;
+                let dir = unit(sub(target, p), unit(e, nr));
+                p = [p[0] + dir[0] * step, p[1] + dir[1] * step, p[2] + dir[2] * step];
+                out.push(p);
+            }
+        };
+        let clump_seed = self.head.get(0x80..0x84).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])) ^ self.seed;
+        let mode16 = self.clump_type == 1 && self.guide_tri.len() == self.strands && self.corners.len() == self.strands && self.strands > 0;
+        if mode16 {
+            // Mode 16: one strand per thread. Thread m picks guide idx by hash; its clump centre line is
+            // guide idx itself, so the strand starts at C = root(idx) + (1 - p(0)) R T and follows the guide's
+            // shape, pulled back toward it by the profile. The offset axes: A = the surface direction of the
+            // root triangle's u axis (from the corner guides' root UVs), B = A x N. R = the guide's byte 1 (mm).
+            let total: u32 = self.tri_counts.iter().map(|q| q[1] as u32).sum();
+            let n16 = (total as f32 * share).round() as u32;
+            for m in 0..n16 {
+                let mseed = clump_seed ^ m.wrapping_mul(0x9e37_79b9).wrapping_add(0x7f4a_7c15);
+                let mut draws = hairgen::Draws(mseed);
+                let idx = ((draws.next() * self.strands as f32) as usize).min(self.strands - 1);
+                let Some(&t) = self.roots.get(self.guide_tri[idx] as usize) else { continue };
+                let nr = normal(t);
+                let centre: Vec<[f32; 3]> = self.points[idx * k..idx * k + k].to_vec();
+                let head = sub(centre[1.min(k - 1)], centre[0]);
+                let in_plane = |a: [f32; 3]| sub(a, scale(nr, dot(a, nr)));
+                let u_axis = (self.root_uv.len() == self.strands)
+                    .then(|| {
+                        let (p0, p1, p2) = (self.points[t[0] as usize * k], self.points[t[1] as usize * k], self.points[t[2] as usize * k]);
+                        let (u0, u1, u2) = (self.root_uv[t[0] as usize], self.root_uv[t[1] as usize], self.root_uv[t[2] as usize]);
+                        let (e1, e2) = (sub(p1, p0), sub(p2, p0));
+                        let (du1, dv1, du2, dv2) = (u1[0] - u0[0], u1[1] - u0[1], u2[0] - u0[0], u2[1] - u0[1]);
+                        let det = du1 * dv2 - du2 * dv1;
+                        (det.abs() > 1e-12).then(|| in_plane(scale(sub(scale(e1, dv2), scale(e2, dv1)), 1.0 / det)))
+                    })
+                    .flatten();
+                let fa = unit(u_axis.unwrap_or_else(|| in_plane(head)), unit(in_plane(head), [1.0, 0.0, 0.0]));
+                let fb = unit(cross(fa, nr), [0.0, 1.0, 0.0]);
+                let radius = 0.001 * self.corners[idx][1] as f32;
+                let (tx, ty) = ((draws.next() * 2.0 - 1.0) * self.clump_scale[0], (draws.next() * 2.0 - 1.0) * self.clump_scale[1]);
+                let (d_len, d_var) = (draws.next(), draws.next());
+                let len = if self.lengths.len() == self.strands { hairgen::length(self.lengths[idx], d_len, self.length_var) } else { f32::MAX };
+                walk(&mut c.points, &centre, fa, fb, radius, tx, ty, len, nr);
+                let at = c.points.len() - k;
+                hairgen::apply_style(&mut c.points[at..], &curl, mseed, d_len, nr);
+                style(&mut c.points[at..], nr, d_var);
+                // the strand's guide weights: all on guide idx (its colour, UV and bones)
+                let w = match t.iter().position(|&x| x as usize == idx) {
+                    Some(0) => [1.0, 0.0, 0.0],
+                    Some(1) => [0.0, 1.0, 0.0],
+                    Some(_) => [0.0, 0.0, 1.0],
+                    None => [1.0 / 3.0; 3],
+                };
+                c.normals.push(nr);
+                c.guides.push((t, w));
+                c.variants.push(hairgen::variant(d_var, steps(t, w)));
+            }
+            return c;
+        }
+        let mut acc = 0.0f32;
+        for (ti, (&t, q)) in self.roots.iter().zip(&self.tri_counts).enumerate() {
+            let (members, clumps) = (q[1] as u32, q[2].max(1) as u32);
+            if members == 0 {
+                continue;
+            }
+            let nr = normal(t);
+            for ck in 0..clumps {
+                let (cseed, b) = hairgen::seed_bary(ti as u32, clump_seed, ck.wrapping_mul(0x9e37_79b9) ^ 0x5bd1_e995);
+                let radius = 0.001 * mix(t, b, &|s| self.corners.get(s).map_or(0.0, |c| c[1] as f32));
+                let centre: Vec<[f32; 3]> = (0..k).map(|j| blend(t, b, j)).collect();
+                // the member frame, fixed for the whole strand: A = the centre line's
+                // first segment carried into the root triangle's plane, B = A x N
+                let head = sub(centre[1.min(k - 1)], centre[0]);
+                let fa = unit(sub(head, scale(nr, dot(head, nr))), { let g0 = self.points[t[0] as usize * k]; unit(sub(self.points[t[1] as usize * k], g0), [1.0, 0.0, 0.0]) });
+                let fb = unit(cross(fa, nr), [0.0, 1.0, 0.0]);
+                let m = members / clumps + u32::from(ck < members % clumps);
+                for mi in 0..m {
+                    acc += share;
+                    if acc < 1.0 {
+                        continue;
+                    }
+                    acc -= 1.0;
+                    let mseed = cseed.wrapping_add(mi.wrapping_mul(0x2545_f491));
+                    let mut draws = hairgen::Draws(mseed);
+                    let (tx, ty) = ((draws.next() * 2.0 - 1.0) * self.clump_scale[0], (draws.next() * 2.0 - 1.0) * self.clump_scale[1]);
+                    let (d_len, d_var) = (draws.next(), draws.next());
+                    let len = length(t, b, d_len);
+                    walk(&mut c.points, &centre, fa, fb, radius, tx, ty, len, nr);
+                    let at = c.points.len() - k;
+                    hairgen::apply_style(&mut c.points[at..], &curl, mseed, d_len, nr);
+                    style(&mut c.points[at..], nr, d_var);
+                    c.normals.push(nr);
+                    c.guides.push((t, b));
+                    c.variants.push(hairgen::variant(d_var, steps(t, b)));
+                }
+            }
         }
         c
     }
@@ -535,11 +856,7 @@ impl Groom {
     /// each strand by its barycentric weights (COLOR_0 on a white
     /// material); strands are white where it is short.
     pub fn coat_glb(&self, name: &str, coat: &Coat, width: f32, guide_rgb: &[[u8; 3]], extras: serde_json::Value) -> Vec<u8> {
-        let k = coat.k;
-        let n = coat.guides.len();
-        let (mut pos, mut nrm, mut tint, mut idx) = (Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k.saturating_sub(1) * 6));
-        let flat_taper = self.taper.iter().all(|&b| b == 0);
-        for s in 0..n {
+        self.coat_glb_with(name, coat, width, &|s, _| {
             let (g, w) = coat.guides[s];
             let mut c = [255u8; 4];
             if let (Some(a), Some(b), Some(d)) = (guide_rgb.get(g[0] as usize), guide_rgb.get(g[1] as usize), guide_rgb.get(g[2] as usize)) {
@@ -547,22 +864,62 @@ impl Groom {
                     c[q] = (a[q] as f32 * w[0] + b[q] as f32 * w[1] + d[q] as f32 * w[2] + 0.5) as u8;
                 }
             }
+            c
+        }, extras)
+    }
+
+    /// `coat_glb` with the colour (linear) of strand `s` at `t` along it
+    /// (0 root, 1 tip) given by `colour`: for hair whose colour changes
+    /// from root to tip.
+    pub fn coat_glb_with(&self, name: &str, coat: &Coat, width: f32, colour: &dyn Fn(usize, f32) -> [u8; 4], extras: serde_json::Value) -> Vec<u8> {
+        self.coat_glb_ramped(name, coat, width, colour, None, extras)
+    }
+
+    /// `coat_glb_with`, and with `params` each vertex carries what the
+    /// game's strand shader reads from its parameter ramp at that point of
+    /// the strand: TEXCOORD_0 = (g0, fill of the unlit side), TEXCOORD_1 =
+    /// (profile scale, 1). Without it both are left out.
+    pub fn coat_glb_ramped(&self, name: &str, coat: &Coat, width: f32, colour: &dyn Fn(usize, f32) -> [u8; 4], params: Option<&dyn Fn(usize, f32) -> [f32; 6]>, extras: serde_json::Value) -> Vec<u8> {
+        let k = coat.k;
+        let n = coat.guides.len();
+        let (mut uv0, mut uv1): (Vec<[f32; 2]>, Vec<[f32; 2]>) = (Vec::new(), Vec::new());
+        let mut tan: Vec<[f32; 4]> = Vec::with_capacity(coat.guides.len() * coat.k * 2);
+        let (mut pos, mut nrm, mut tint, mut idx) = (Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k * 2), Vec::with_capacity(n * k.saturating_sub(1) * 6));
+        let flat_taper = self.taper.iter().all(|&b| b == 0);
+        for s in 0..n {
             let nr = coat.normals[s];
             let base = pos.len() as u32;
             for j in 0..k {
                 let p = coat.points[s * k + j];
                 let (a, b) = (coat.points[s * k + j.saturating_sub(1)], coat.points[s * k + (j + 1).min(k - 1)]);
                 let t = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                // the strand's direction, for the hair lighting
+                let tl = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt();
+                let dir = if tl > 1e-12 { [t[0] / tl, t[1] / tl, t[2] / tl, 1.0] } else { [0.0, 0.0, 1.0, 1.0] };
                 // across the strand, in the skin's plane
                 let mut side = [t[1] * nr[2] - t[2] * nr[1], t[2] * nr[0] - t[0] * nr[2], t[0] * nr[1] - t[1] * nr[0]];
                 let l = (side[0] * side[0] + side[1] * side[1] + side[2] * side[2]).sqrt();
                 side = if l > 1e-12 { [side[0] / l, side[1] / l, side[2] / l] } else { [1.0, 0.0, 0.0] };
                 let f = j as f32 / (k.max(2) - 1) as f32;
                 let tap = if flat_taper { 1.0 - 0.6 * f } else { (self.taper[((f * 15.0) as usize).min(15)] as f32 / 255.0).max(0.15) };
-                let r = width * 0.5 * tap;
+                let c = colour(s, f);
+                let pv = params.map(|p| p(s, f));
+                // with parameters: their own width at this point (metres), in place of the groom's width and taper
+                let r = pv.map_or(width * 0.5 * tap, |v| v[3] * 0.5);
                 for sg in [-1.0f32, 1.0] {
-                    pos.push([p[0] + side[0] * r * sg, p[1] + side[1] * r * sg, p[2] + side[2] * r * sg]);
+                    // with parameters the ribbon is left closed: the viewer opens it towards the eye, at least a pixel wide
+                    let rr = if pv.is_some() { 0.0 } else { r };
+                    pos.push([p[0] + side[0] * rr * sg, p[1] + side[1] * rr * sg, p[2] + side[2] * rr * sg]);
                     nrm.push(nr);
+                    // w: which edge of the ribbon (-1 / +1), so the shader can round the normal across it
+                    // with parameters: the magnitude carries the half width, 2 + millimetres (under 16), plus 16 x the
+                    // index of the piece's minimum drawn width (the viewer's list of the LOD presets' TargetThickness)
+                    tan.push([dir[0], dir[1], dir[2], match pv { Some(v) => sg * (2.0 + (r * 1000.0).min(15.9) + 16.0 * v[5]), None => sg }]);
+                    if let Some(pv) = pv {
+                        uv0.push([pv[0], pv[1]]);
+                        // y: 1 = lit by the hair lighting; 2 + reflectance scale = by the standard lighting
+                        uv1.push([pv[2], pv[4]]);
+                    }
                     tint.push(c);
                 }
             }
@@ -571,13 +928,13 @@ impl Groom {
                 idx.extend_from_slice(&[v0, v0 + 1, v0 + 3, v0, v0 + 3, v0 + 2]);
             }
         }
-        let prim = crate::gltf::TriPrim { name: name.to_string(), positions: pos, normals: Some(nrm), tangents: None, uvs: vec![], colors: None, colors1: None, regions: None, tint: Some(tint), indices: idx, material: Some(0), joints: None, weights: None, joints1: None, weights1: None };
+        let prim = crate::gltf::TriPrim { name: name.to_string(), positions: pos, normals: Some(nrm), tangents: Some(tan), uvs: if uv0.is_empty() { vec![] } else { vec![uv0, uv1] }, colors: None, colors1: None, regions: None, tint: Some(tint), indices: idx, material: Some(0), joints: None, weights: None, joints1: None, weights1: None };
         let mat = crate::gltf::Material {
             name: "fur".into(),
             base_color_uri: None,
             normal_uri: None,
             gltf: serde_json::json!({"doubleSided": true, "pbrMetallicRoughness": {"baseColorFactor": [1.0, 1.0, 1.0, 1.0], "metallicFactor": 0.0, "roughnessFactor": 0.85}}),
-            extras: serde_json::json!({"note": "interpolated coat: the stored per-triangle strand counts, strands blended from the three guides; noise and curl from the first style group; clumping is not the game's. COLOR_0 = skin colour under the root (a display choice)"}),
+            extras: serde_json::json!({"classification": {"class": "hair"}, "note": "interpolated coat: the stored per-triangle strand counts, strands blended from the three guides; noise and curl from the first curl group; placement and clumping follow the game's program with the viewer's own hashes. COLOR_0 = skin colour under the root (a display choice)"}),
         };
         crate::gltf::mesh_glb(name, &[crate::gltf::NodeGroup { name: name.to_string(), prims: vec![prim] }], &[mat], &[], extras)
     }
@@ -860,7 +1217,7 @@ mod tests {
     #[test]
     fn full_strand_set_follows_the_stored_counts() {
         // three guides of two points each, one root triangle that stores 5 + 2 strands
-        let g = Groom {
+        let g = Groom { tint_weight: 1.0,
             strands: 3,
             points_per_strand: 2,
             points: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [1.0, 0.0, 1.0], [0.0, 1.0, 0.0], [0.0, 1.0, 1.0]],
@@ -878,6 +1235,12 @@ mod tests {
             seed: 0,
             length_var: [0.0, 1.0],
             curl: Default::default(),
+            head: vec![],
+            corners: vec![],
+            clump_scale: [1.0; 2],
+            styles: vec![],
+            clump_type: 0,
+            guide_tri: vec![],
         };
         let c = g.coat(1.0);
         assert_eq!(c.guides.len(), 7);
@@ -921,6 +1284,18 @@ mod tests {
     }
 
     #[test]
+    fn style_samples_and_reshape() {
+        // x 0 -> 1023 over the range -0.01 .. 0.01, y fixed at the middle, z 0 -> 4095
+        let st = Style { lo: [-0.01, -0.01], hi: [0.01, 0.01], samples: vec![512 << 10, 1023 | (512 << 10) | (4095 << 20)] };
+        let a = st.at(0.5);
+        assert!((a[0] - 0.0).abs() < 1e-4 && a[1].abs() < 1e-4 && (a[2] - 0.5).abs() < 1e-3, "{a:?}");
+        // a straight strand along -z with up = +x: the tip moves 1 cm along +x
+        let mut pts = [[0.0, 0.0, 0.0], [0.0, 0.0, -0.5], [0.0, 0.0, -1.0]];
+        st.apply(&mut pts, [1.0, 0.0, 0.0], false, 1.0);
+        assert!((pts[2][0] - 0.01).abs() < 1e-4 && (pts[2][2] + 1.0).abs() < 1e-4 && (pts[0][0] + 0.01).abs() < 1e-4, "{pts:?}");
+    }
+
+    #[test]
     fn half() {
         assert_eq!(f16(0x3C00), 1.0);
         assert_eq!(f16(0xC000), -2.0);
@@ -928,7 +1303,7 @@ mod tests {
     }
     #[test]
     fn segments() {
-        let g = Groom { strands: 2, points_per_strand: 3, points: vec![[0.0; 3]; 6], w: vec![0.0; 6], roots: vec![[0, 1, 1]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], curl: Default::default() };
+        let g = Groom { tint_weight: 1.0, strands: 2, points_per_strand: 3, points: vec![[0.0; 3]; 6], w: vec![0.0; 6], roots: vec![[0, 1, 1]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![], curl: Default::default() };
         assert_eq!(g.segments(), vec![0, 1, 1, 2, 3, 4, 4, 5]);
         assert_eq!(g.root_indices(), vec![0, 3, 3]);
     }
@@ -936,7 +1311,7 @@ mod tests {
     fn coat_from_strand_counts() {
         // one root triangle of three 2-point guides, 40 + 10 stored strands
         let pts = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.1], [1.0, 0.0, 0.0], [1.0, 0.0, 0.1], [0.0, 1.0, 0.0], [0.0, 1.0, 0.1]];
-        let g = Groom { strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![[40, 10, 1, 0]], width: 0.0003, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], curl: Default::default() };
+        let g = Groom { tint_weight: 1.0, strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![[40, 10, 1, 0]], width: 0.0003, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![], curl: Default::default() };
         assert_eq!(g.stored_strands(), 50);
         let c = g.coat(1.0);
         assert_eq!((c.guides.len(), c.points.len(), c.stored), (50, 100, 50));

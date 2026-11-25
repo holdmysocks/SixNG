@@ -639,7 +639,7 @@ mod tests {
             srgb: true,
             bc: None,
         };
-        let mesh = glb::Mesh {
+        let mesh = glb::Mesh { strand_lod: None,
             name: String::new(),
             verts: vec![
                 glb::Vertex {
@@ -678,6 +678,7 @@ mod tests {
             detail: None,
             ramp_u: None,
             wear_mask: None,
+            primer_mask: None,
             ramp: None,
             parts: false,
             occlusion_only: false,
