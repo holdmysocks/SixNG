@@ -986,7 +986,14 @@ impl ModelView {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let r = index_for(&ws, "packs", &idx)
-                .and_then(|(a, ix)| sixng_core::groom::catalog_cached(&work, &a, &ix.entries))
+                .and_then(|(a, ix)| {
+                    let mut cat = sixng_core::groom::catalog_cached(&work, &a, &ix.entries)?;
+                    // LOD chains by the files' names where the table of contents is readable
+                    if let Ok(t) = sixng_core::hairlink::get(&work, &a, &ix.entries) {
+                        t.relabel(&mut cat);
+                    }
+                    Ok(cat)
+                })
                 .map_err(|e| format!("{e:#}"));
             *slot.lock().unwrap() = Some(r);
             ctx.request_repaint();
