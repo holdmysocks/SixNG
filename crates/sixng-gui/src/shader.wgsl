@@ -910,7 +910,12 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     let fr_v = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
     let r = reflect(-v, n);
     let env = environment(r, rough) * F.misc.w;
-    let sh = sun_shadow(i.world, dpdx(i.world), dpdy(i.world));
+    // a strand's ribbon faces the camera, so its derivatives are screen pixel steps; the game temporally
+    // accumulates and spatially denoises its hair shadow buffer before this read (kernels not read): here the
+    // 13 taps reach three times as far on strands (12 pixels), which with the many-frame accumulation of the
+    // turned shadow ribbons stands in for that denoise
+    let sh_k = select(1.0, 3.0, cls == 12u && i.uv1.y > 0.5);
+    let sh = sun_shadow(i.world, dpdx(i.world) * sh_k, dpdy(i.world) * sh_k);
     var ao_s = ao;
     // strength = max(0, I - 2 x roughness), I = 1 (the game's value in every weather and hour): no effect from
     // roughness 0.5 upward, so next to none on skin
