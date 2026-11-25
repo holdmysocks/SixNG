@@ -23,6 +23,7 @@ struct Mat {
     base: vec4<f32>,
     flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask, bit 13 = the packed map is a vehicle material map, bit 14 = the emissive slot holds the part ramp image with the parts' surfaces
     tile: vec4<f32>,      // fabric detail tile: x UV scale, y rotation, z mean grey value, w bound
+    emis: vec4<f32>,      // x emissive scale of the material (from the GLB's emissive strength)
 };
 
 // rows of the part ramp image: 256 each of the first layer's palette rows,
@@ -468,7 +469,7 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     } else if (cls == 7u) {
         var e = albedo;
         if ((has & 8u) != 0u) { e = textureSample(t_em, samp, i.uv0).rgb; }
-        emissive = e * F.misc.y;
+        emissive = e * F.misc.y * M.emis.x;
     }
     // vehicle lamps: a lamp's own emissive mesh (bit 11) is lit only while
     // its bone is; reflectors and lenses on a lit lamp bone glow in its colour

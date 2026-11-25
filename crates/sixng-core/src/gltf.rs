@@ -383,6 +383,12 @@ pub fn mesh_glb_with(name: &str, groups: &[NodeGroup], materials: &[Material], s
                         let o = mat.as_object_mut().unwrap();
                         o.remove("emissiveTexture");
                         o.remove("emissiveFactor");
+                        if let Some(x) = o.get_mut("extensions").and_then(|x| x.as_object_mut()) {
+                            x.remove("KHR_materials_emissive_strength");
+                        }
+                        if o.get("extensions").and_then(|x| x.as_object()).is_some_and(|x| x.is_empty()) {
+                            o.remove("extensions");
+                        }
                     }
                 }
             }
@@ -553,6 +559,10 @@ pub fn mesh_glb_with(name: &str, groups: &[NodeGroup], materials: &[Material], s
     if let Some(sk) = skin {
         doc["skins"] = json!([sk]);
     }
+    let used = extensions_used(&doc["materials"]);
+    if !used.is_empty() {
+        doc["extensionsUsed"] = json!(used);
+    }
     if !anims.is_empty() {
         doc["animations"] = json!(anims);
     }
@@ -565,6 +575,15 @@ pub fn mesh_glb_with(name: &str, groups: &[NodeGroup], materials: &[Material], s
         }
     }
     pack(&doc, b.bin)
+}
+
+/// The glTF extensions the materials use (`KHR_materials_emissive_strength`),
+/// sorted, for `extensionsUsed`.
+fn extensions_used(materials: &Value) -> Vec<String> {
+    let mut used: Vec<String> = materials.as_array().into_iter().flatten().filter_map(|m| m["extensions"].as_object()).flat_map(|x| x.keys().cloned()).collect();
+    used.sort();
+    used.dedup();
+    used
 }
 
 /// Build a line GLB: one node with line segments (mode 1, `segments` =
@@ -631,4 +650,20 @@ pub fn points_glb(name: &str, prims: &[PointPrim], extras: Value) -> Vec<u8> {
         "buffers": [{"byteLength": b.bin.len()}],
     });
     pack(&doc, b.bin)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extensions_used_lists_material_extensions_once() {
+        let mats = json!([
+            {"name": "a", "extensions": {"KHR_materials_emissive_strength": {"emissiveStrength": 6.28}}},
+            {"name": "b"},
+            {"name": "c", "extensions": {"KHR_materials_emissive_strength": {"emissiveStrength": 32.3}}},
+        ]);
+        assert_eq!(extensions_used(&mats), vec!["KHR_materials_emissive_strength".to_string()]);
+        assert!(extensions_used(&json!([{"name": "a"}])).is_empty());
+    }
 }

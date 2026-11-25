@@ -46,6 +46,9 @@ struct MatU {
     /// Fabric detail tile: UV scale, rotation, the tile's mean grey value,
     /// 1 = bound.
     tile: [f32; 4],
+    /// x: how bright an emissive material lights, times the frame's
+    /// emissive level (`glb::emissive_scale`); y, z, w unused.
+    emis: [f32; 4],
 }
 
 #[repr(C)]
@@ -1489,6 +1492,7 @@ impl Uploader {
             ramp: None,
             parts: false,
             occlusion_only: false,
+            emissive_scale: 1.0,
             slots: vec![],
             gap: "ok".into(),
             shader_hash: String::new(),
@@ -1555,6 +1559,7 @@ impl Uploader {
                     (None, Some(_)) => [0.0, 0.0, 0.0, 2.0],
                     _ => [0.0; 4],
                 },
+                emis: [mt.emissive_scale, 0.0, 0.0, 0.0],
             };
             let o = k * MAT_STRIDE as usize;
             mat_bytes[o..o + std::mem::size_of::<MatU>()].copy_from_slice(bytemuck::bytes_of(&u));
