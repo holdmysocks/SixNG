@@ -138,8 +138,9 @@ fn mesh_vertex(v: VIn) -> VOut {
         let code = abs(v.tan.w) - 2.0;
         let ti = floor(code / 16.0);
         let r = (code - 16.0 * ti) * 0.001;
-        // minimum drawn width in pixels by piece type, capped at 10 mm as the game's strand vertex program does
-        let npx = select(select(0.25, 0.5, ti < 1.5), 1.5, ti < 0.5);
+        // the game's minimum drawn width: 2 pixels at the strand's distance, capped at 10 mm (read from its
+        // strand vertex program by the shader archive work); ti, the piece type, is kept for the strand count rule
+        let npx = 2.0;
         edge = sign(v.tan.w);
         let td = normalize((m * vec4(v.tan.xyz, 0.0)).xyz);
         var side = cross(td, normalize(F.cam_pos.xyz - w.xyz));
