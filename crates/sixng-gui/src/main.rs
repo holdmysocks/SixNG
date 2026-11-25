@@ -1736,6 +1736,9 @@ impl App {
             // a set amount instead of the configuration's wear levels
             m.look.wear_from_config = false;
         }
+        if c.has("primer") {
+            m.look.primer = true;
+        }
         if let Some(v) = c.get("fit-parts") {
             m.fit_parts_once = Some(v.to_string());
         }
