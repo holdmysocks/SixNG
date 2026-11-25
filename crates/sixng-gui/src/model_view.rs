@@ -1292,7 +1292,7 @@ impl ModelView {
                         // Long hair has many points per strand: keep one groom
                         // under about 1.5 million ribbon vertices (a vertex
                         // buffer may not exceed 256 MiB).
-                        let share = share.min(375_000.0 / (g.stored_strands() * k).max(1) as f32);
+                        let share = share.min(750_000.0 / (g.stored_strands() * k).max(1) as f32);
                         let coat = g.coat(share);
                         drawn += coat.guides.len();
                         // fewer strands than stored: wider ones, for the same cover

@@ -350,12 +350,12 @@ fn hair_game(colour: vec3<f32>, t: vec3<f32>, n: vec3<f32>, root: vec3<f32>, v: 
     // sun, so the factor is 1
     let area = 1.0;
     // visibility: the side of the head the light is on (the root normal)
-    // times the azimuth term, which reaches 2 for light from the eye's side;
-    // the program also fades this towards 1 by a depth value (not decoded)
-    // the fill e of the unlit side is the parameter ramp's blue value times
-    // a distance fade of the light (run-time data, taken as 1). The last
-    // factor is read as 1 - 0.5 e (low confidence)
-    let w = (clamp(dot(root, l), 0.0, 1.0) * clamp(1.0 + cos_phi, 0.0, 2.0) * (1.0 - e) + e) * (1.0 - 0.5 * e);
+    // times the azimuth term sat(1 + cos phi), and a factor 1.5 - 0.5 e:
+    // W = ((1 - e) D A + e)(1.5 - 0.5 e) (read once from the program, medium
+    // confidence). The fill e of the unlit side is a stored alpha times a
+    // fade by depth and light (run-time values, not read); here the
+    // parameter ramp's blue value with the fade taken as 1
+    let w = (clamp(dot(root, l), 0.0, 1.0) * clamp(1.0 + cos_phi, 0.0, 1.0) * (1.0 - e) + e) * (1.5 - 0.5 * e);
     return max(w * (coloured * colour / max(colour, vec3(0.000001)) + vec3(f * m0.r * nr2 * area)), vec3(0.0));
 }
 
