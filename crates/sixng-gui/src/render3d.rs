@@ -100,6 +100,8 @@ pub struct Look {
     pub pearl: [f32; 3],
     pub pearl_amount: f32,
     pub sun_dir: Vec3,
+    /// Degrees the light is turned about the vertical from where the time of day puts it.
+    pub sun_turn: f32,
     pub sun_intensity: f32,
     pub sun_col: [f32; 3],
     pub sky_top: [f32; 3],
@@ -132,6 +134,7 @@ impl Default for Look {
             pearl: [0.9, 0.8, 0.3],
             pearl_amount: 0.0,
             sun_dir: Vec3::new(0.45, 0.75, 0.35).normalize(),
+            sun_turn: std::env::var("SIXNG_SUN_TURN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0),
             sun_intensity: 1.0,
             sun_col: [1.0, 0.95, 0.88],
             sky_top: [0.25, 0.45, 0.85],
@@ -182,6 +185,17 @@ impl Look {
             self.sun_col = [0.45, 0.55, 0.85];
             self.ambient = 0.6;
         }
+        // the light turned about the vertical (the model views' sun direction slider)
+        let t = std::mem::take(&mut self.sun_turn);
+        self.turn_sun(t);
+    }
+
+    /// Turns the light about the vertical to `deg` degrees from where the time of day puts it.
+    pub fn turn_sun(&mut self, deg: f32) {
+        let (s, c) = (deg - self.sun_turn).to_radians().sin_cos();
+        let d = self.sun_dir;
+        self.sun_dir = Vec3::new(d.x * c + d.z * s, d.y, d.z * c - d.x * s);
+        self.sun_turn = deg;
     }
 }
 

@@ -4280,6 +4280,14 @@ impl ModelView {
         {
             self.look.set_time_of_day(self.tod);
         }
+        let mut turn = self.look.sun_turn;
+        if ui
+            .add(egui::Slider::new(&mut turn, -180.0..=180.0).suffix("°").text("sun direction"))
+            .on_hover_text("Turns the sun (or moon) around the model, at the height the time of day gives it.")
+            .changed()
+        {
+            self.look.turn_sun(turn);
+        }
         ui.add(
             egui::Slider::new(&mut self.look.exposure, 0.2..=4.0)
                 .logarithmic(true)
