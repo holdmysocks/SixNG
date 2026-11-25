@@ -54,7 +54,7 @@ use serde::Serialize;
 pub const GROUP_SIZE: usize = 0x70;
 pub const CHILD_SIZE: usize = 0x50;
 /// Version of the `physics` block in model.json.
-pub const EXPORT_VERSION: u32 = 1;
+pub const EXPORT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Archetype {
@@ -69,8 +69,9 @@ pub struct Archetype {
     pub buoyancy_factor: f32,
     /// Damping constants: linear C, V, V2, angular C, V, V2 (x, y, z).
     pub damping: [[f32; 3]; 6],
-    pub type_flags: u32,
-    pub include_flags: u32,
+    /// Collision layers (`LAYERS`) the object is in / collides with.
+    pub type_flags: u64,
+    pub include_flags: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -130,8 +131,9 @@ pub struct Child {
     pub inertia: [f32; 3],
     pub rotation: [f32; 4],
     pub offset: [f32; 3],
-    pub type_flags: u32,
-    pub include_flags: u32,
+    /// Collision layers (`LAYERS`) the child's bound is in / collides with.
+    pub type_flags: u64,
+    pub include_flags: u64,
     pub bound: Option<BoundInfo>,
     /// Translation of the composite's transform for this child (model space).
     pub position: Option<[f32; 3]>,
@@ -197,8 +199,8 @@ pub fn archetype(r: &Resource, o: usize) -> Option<Archetype> {
         max_ang_speed: r.f32(o + 0x68),
         buoyancy_factor: r.f32(o + 0x6C),
         damping,
-        type_flags: r.u32(o + 0x28),
-        include_flags: r.u32(o + 0x30),
+        type_flags: r.u64(o + 0x28),
+        include_flags: r.u64(o + 0x30),
     })
 }
 
@@ -251,8 +253,8 @@ pub fn try_decode(r: &Resource) -> Result<FragPhysics, &'static str> {
             inertia: v3(r, o + 0x20),
             rotation,
             offset: v3(r, o + 0x10),
-            type_flags: r.u32(o + 0x38),
-            include_flags: r.u32(o + 0x40),
+            type_flags: r.u64(o + 0x38),
+            include_flags: r.u64(o + 0x40),
             bound: r.sys_off(r.u64(o + 0x30)).and_then(|b| bound_info(r, b)),
             position: xforms.map(|t| v3(r, t + 64 * i + 48)),
         });
@@ -435,6 +437,75 @@ pub fn root_flag_names(v: u32) -> (Vec<&'static str>, Vec<u32>) {
     (named.iter().filter_map(|b| ROOT_FLAGS.iter().find(|f| f.0 == *b).map(|f| f.1)).collect(), rest)
 }
 
+/// Collision layer bits of the type / include masks (u64: the object is in
+/// the `type` layers and collides with the `include` layers), as (bit,
+/// name, checked). Bits 0..32 follow GTA V's layer order. Checked against
+/// the map collision of levels (composite child masks at +0x88, 16 bytes
+/// each) and the fragments, where the masks fit the names: the plain map
+/// mesh is in layers 1-5 (0x3e) and collides with peds, ragdolls,
+/// animals, objects, projectiles and the test layers; the weapon-only
+/// mesh (0x2) collides only with projectile, test_weapon and test_camera;
+/// map_cover (0x10 alone) only with test_ai; map_vehicle (0x20 alone,
+/// road reflectors and submerged rock) only with vehicle_not_bvh and
+/// test_vehicle_wheel; map_stairs (bit 30) only with peds, animals and
+/// the test layers; map_river (bit 27) is all LIQ_WATER; map_deep_surface
+/// (bit 31) is the DEFORM_* sand, mud and gravel; foliage (bit 19) is the
+/// VEG_* leaves and twigs, and only on vegetation fragments. The bits not
+/// checked are placed by the same order only. Bit 0 is set on every
+/// fragment archetype (the OR of its children's masks plus bit 0, on all
+/// 40,705 level fragments). Bits 32 and up are layers the older engine did
+/// not have and are not named (`layer_<bit>`): most include masks have 37;
+/// fragment children use 35 (bushes, colliding with test_camera only), 41
+/// (trees), 42 (light bulbs, colliding with explosion and test_weapon), 46
+/// (shop shelf rows), 36 and 40 (colliding with the test layers only), 34
+/// and 43; map collision uses 34, 35, 41, 43 and 47.
+pub const LAYERS: &[(u32, &str, bool)] = &[
+    (1, "map_weapon", true),
+    (2, "map_dynamic", false),
+    (3, "map_animal", false),
+    (4, "map_cover", true),
+    (5, "map_vehicle", true),
+    (6, "vehicle_not_bvh", true),
+    (7, "vehicle_bvh", false),
+    (8, "vehicle_box", false),
+    (9, "ped", true),
+    (10, "ragdoll", false),
+    (11, "animal", true),
+    (12, "animal_ragdoll", false),
+    (13, "object", false),
+    (14, "object_env_cloth", false),
+    (15, "plant", false),
+    (16, "projectile", true),
+    (17, "explosion", false),
+    (18, "pickup", false),
+    (19, "foliage", true),
+    (20, "forklift_forks", false),
+    (21, "test_weapon", true),
+    (22, "test_camera", true),
+    (23, "test_ai", true),
+    (24, "test_script", false),
+    (25, "test_vehicle_wheel", true),
+    (26, "glass", false),
+    (27, "map_river", true),
+    (28, "smoke", false),
+    (29, "unsmashed", false),
+    (30, "map_stairs", true),
+    (31, "map_deep_surface", true),
+];
+
+/// Layer names of a type / include mask: "all" for an all-ones mask, else
+/// each set bit's name (`layer_<bit>` where the bit has none).
+pub fn layer_names(mask: u64) -> serde_json::Value {
+    if mask == u64::MAX {
+        return serde_json::json!(["all"]);
+    }
+    let names: Vec<String> = (0..64)
+        .filter(|b| mask >> b & 1 == 1)
+        .map(|b| LAYERS.iter().find(|l| l.0 == b).map(|l| l.1.to_string()).unwrap_or_else(|| format!("layer_{b}")))
+        .collect();
+    serde_json::json!(names)
+}
+
 fn bound_kind_name(k: u8) -> Option<&'static str> {
     Some(match k {
         1 => "capsule",
@@ -461,6 +532,7 @@ pub fn drawable_bound(r: &Resource) -> Option<serde_json::Value> {
     let count = r.u16(b + 0x98) as usize;
     let kids = r.sys_off(r.u64(b + 0x70))?;
     let xf = r.sys_off(r.u64(b + 0x78));
+    let fl = r.sys_off(r.u64(b + 0x88)).filter(|f| f + 16 * count <= n);
     if count == 0 || count > 4096 || kids + 8 * count > n {
         return None;
     }
@@ -468,7 +540,15 @@ pub fn drawable_bound(r: &Resource) -> Option<serde_json::Value> {
         .map(|i| {
             let c = r.sys_off(r.u64(kids + 8 * i)).and_then(|o| bound_info(r, o));
             let pos = xf.filter(|t| t + 64 * (i + 1) <= n).map(|t| v3(r, t + 64 * i + 48));
-            serde_json::json!({"bound": c.as_ref().map(bound_json), "position": pos})
+            let mut j = serde_json::json!({"bound": c.as_ref().map(bound_json), "position": pos});
+            if let Some(f) = fl {
+                let (t, inc) = (r.u64(f + 16 * i), r.u64(f + 16 * i + 8));
+                j["type_flags"] = format!("{t:016x}").into();
+                j["include_flags"] = format!("{inc:016x}").into();
+                j["type_layers"] = layer_names(t);
+                j["include_layers"] = layer_names(inc);
+            }
+            j
         })
         .collect();
     Some(serde_json::json!({"composite": bound_json(&root), "children": children}))
@@ -510,7 +590,8 @@ pub fn fragment_json(p: &FragPhysics, bones: &[String]) -> serde_json::Value {
                 "index": c.index, "number": c.number, "in_use": c.in_use, "group": c.group, "bone": bone, "bone_name": bone.and_then(|b| bones.get(b as usize)),
                 "mass": c.mass, "inertia": c.inertia, "rotation": c.rotation, "offset": c.offset, "position": c.position,
                 "bound": c.bound.as_ref().map(bound_json),
-                "type_flags": format!("{:08x}", c.type_flags), "include_flags": format!("{:08x}", c.include_flags),
+                "type_flags": format!("{:016x}", c.type_flags), "include_flags": format!("{:016x}", c.include_flags),
+                "type_layers": layer_names(c.type_flags), "include_layers": layer_names(c.include_flags),
             })
         })
         .collect();
@@ -525,13 +606,14 @@ pub fn fragment_json(p: &FragPhysics, bones: &[String]) -> serde_json::Value {
         "root_flag_names": root_flag_names(p.root_tail[0].to_bits()).0,
         "root_flag_bits_unnamed": root_flag_names(p.root_tail[0].to_bits()).1,
         "root_tail": &p.root_tail[2..7],
-        "archetype_type_flags": format!("{:08x}", a.type_flags), "archetype_include_flags": format!("{:08x}", a.include_flags),
+        "archetype_type_flags": format!("{:016x}", a.type_flags), "archetype_include_flags": format!("{:016x}", a.include_flags),
+        "archetype_type_layers": layer_names(a.type_flags), "archetype_include_layers": layer_names(a.include_flags),
         "groups": groups, "children": children,
         "note": NOTE,
     })
 }
 
-pub const NOTE: &str = "Units: kg, metres, kg m^2; model space is RAGE Z-up. Confirmed: mass (= sum of in-use child masses on every fragment), inertia (= child mass x bound volume distribution), centre_of_gravity, bounding_sphere, the group tree (parent, child_groups, children, bone; name = the bone whose joaat is name_hash), child mass, bound and position (= bone pivot + offset). tuning: names matched against the game's fragment tuning presets (see TUNING_NAMES in the source for which are pinned); tuning_raw keeps all 36 half floats. strength -1 = never breaks off its parent; on group 0 it plausibly frees the whole object from the world (guess). min_move_force (root +0xBC): -1 on trees, gates, signs and poles, small on loose props, 0 on vehicle parts (guess: force needed to start moving, -1 = fixed until broken). gravity_factor, max_speed, max_ang_speed, buoyancy_factor and damping are read in the GTA V archetype order (likely). Group flags (flags = word 0, flags2 = word 1) and root_flags are named in flag_names / root_flag_names from the presets' booleans (see GROUP_FLAGS and ROOT_FLAGS in the source for which are confirmed); bits not named are listed in flag_bits_unnamed. made_of_glass is set on the glass panes of windows and doors. Type/include flags are collision layer masks: the archetype's type flags are the OR of its children's plus bit 0 on every fragment, and type bit 19 is only on vegetation (foliage, likely); layers are not named. root_tail is raw. Damaged masses and joint limits are not in the fragment as far as decoded.";
+pub const NOTE: &str = "Units: kg, metres, kg m^2; model space is RAGE Z-up. Confirmed: mass (= sum of in-use child masses on every fragment), inertia (= child mass x bound volume distribution), centre_of_gravity, bounding_sphere, the group tree (parent, child_groups, children, bone; name = the bone whose joaat is name_hash), child mass, bound and position (= bone pivot + offset). tuning: names matched against the game's fragment tuning presets (see TUNING_NAMES in the source for which are pinned); tuning_raw keeps all 36 half floats. strength -1 = never breaks off its parent; on group 0 it plausibly frees the whole object from the world (guess). min_move_force (root +0xBC): -1 on trees, gates, signs and poles, small on loose props, 0 on vehicle parts (guess: force needed to start moving, -1 = fixed until broken). gravity_factor, max_speed, max_ang_speed, buoyancy_factor and damping are read in the GTA V archetype order (likely). Group flags (flags = word 0, flags2 = word 1) and root_flags are named in flag_names / root_flag_names from the presets' booleans (see GROUP_FLAGS and ROOT_FLAGS in the source for which are confirmed); bits not named are listed in flag_bits_unnamed. made_of_glass is set on the glass panes of windows and doors. Type/include flags are 64-bit collision layer masks (the layers an object is in / collides with), named in type_layers / include_layers after GTA V's layer order (see LAYERS in the source for which bits were checked against the map collision); the archetype's type mask is the OR of its children's plus bit 0. root_tail is raw. Damaged masses and joint limits are not in the fragment as far as decoded.";
 
 /// Facts about a model's map archetype definition, from
 /// `<work>/index/archetype_lod.jsonl` (`sixng lod-links`), joined with the
