@@ -2436,7 +2436,8 @@ impl Renderer3D {
                 // strand ribbons open towards the light at their own width: the game's sun shadow pass draws strands
                 // solid and has no minimum width (a target size this large makes the minimum vanish)
                 f.cam_pos = (c + l * 1000.0).extend(1.0).to_array();
-                f.frame = [0.0, 1.0e9, 1.0e9, 0.0];
+                // w: the accumulation frame, which turns the shadow ribbons (see the vertex program)
+                f.frame = [0.0, 1.0e9, 1.0e9, self.dither_frame];
                 shadow_fu = Some(f);
             }
         }

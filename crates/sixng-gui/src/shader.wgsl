@@ -159,10 +159,12 @@ fn mesh_vertex(v: VIn) -> VOut {
         if (uv1.y > 1.5) { uv1.x = clamp(r / rmin, 0.0, 1.0); } else if (uv1.y > 0.5) { uv1.y = 1.0 + 0.4 * clamp(r / rmin, 0.0, 1.0); }
         wp = w.xyz + side * edge * max(r, rmin);
         // the sun shadow pass (no target size) with a widening factor: the ribbon of the game's ray-traced passes,
-        // flat, turned by a random direction per strand (here a hash of the strand's root normal; the game's own
-        // hash is not read) and the factor times its own width
+        // flat, turned by a random direction per strand (here a hash of the strand's root normal and the
+        // accumulation frame in F.frame.w, so a many-frame picture averages the turns the way the game's frames
+        // do; the game's own hash is not read) and the factor times its own width
         if (F.frame.y > 1.0e8 && F.frame.x >= 1.0) {
-            let hsh = fract(sin(vec3(dot(v.nrm, vec3(12.9898, 78.233, 37.719)), dot(v.nrm, vec3(39.346, 11.135, 83.155)), dot(v.nrm, vec3(73.156, 52.235, 9.151)))) * 43758.5453) * 2.0 - 1.0;
+            let hn = v.nrm + vec3(F.frame.w * 0.618034, F.frame.w * 0.414214, F.frame.w * 0.732051);
+            let hsh = fract(sin(vec3(dot(hn, vec3(12.9898, 78.233, 37.719)), dot(hn, vec3(39.346, 11.135, 83.155)), dot(hn, vec3(73.156, 52.235, 9.151)))) * 43758.5453) * 2.0 - 1.0;
             var rs = cross(td, normalize(hsh + vec3(1.0e-4, 0.0, 0.0)));
             rs = rs / max(length(rs), 1e-5);
             wp = w.xyz + rs * edge * r * F.frame.x;
