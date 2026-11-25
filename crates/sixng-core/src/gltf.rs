@@ -626,6 +626,62 @@ pub fn lines_glb(name: &str, positions: &[[f32; 3]], width: &[f32], uv: &[[f32; 
     pack(&doc, b.bin)
 }
 
+/// One strand piece of `strands_glb`: `positions` are n strands of `k`
+/// points each, strand-major (RAGE space). `uv` (TEXCOORD_0) and every
+/// `attrs` entry (custom attributes, names starting with `_`) hold one
+/// value per point when not empty.
+pub struct StrandPrim {
+    pub name: String,
+    pub k: usize,
+    pub positions: Vec<[f32; 3]>,
+    pub uv: Vec<[f32; 2]>,
+    pub attrs: Vec<(String, Vec<f32>)>,
+    pub extras: Value,
+}
+
+/// Build a strand GLB: one node and mesh per piece, the strands as line
+/// segments (mode 1) along each strand, so `k - 1` segments per strand and
+/// no segment between strands. Points stay in strand order, so point `i`
+/// is point `i % k` of strand `i / k`.
+pub fn strands_glb(name: &str, prims: &[StrandPrim], extras: Value) -> Vec<u8> {
+    let mut b = Builder::default();
+    let (mut nodes, mut meshes) = (Vec::new(), Vec::new());
+    for p in prims.iter().filter(|p| p.k >= 2 && !p.positions.is_empty() && p.positions.len() % p.k == 0) {
+        let n = p.positions.len();
+        let pos: Vec<[f32; 3]> = p.positions.iter().map(|&v| yup(v)).collect();
+        let mut attrs = json!({"POSITION": b.vec3(&pos, true)});
+        if p.uv.len() == n {
+            attrs["TEXCOORD_0"] = json!(b.vec2(&p.uv));
+        }
+        for (key, v) in p.attrs.iter().filter(|a| a.1.len() == n) {
+            attrs[key.as_str()] = json!(b.scalar(v));
+        }
+        let mut seg = Vec::with_capacity(n / p.k * (p.k - 1) * 2);
+        for s in 0..(n / p.k) as u32 {
+            for j in 0..p.k as u32 - 1 {
+                let i = s * p.k as u32 + j;
+                seg.extend_from_slice(&[i, i + 1]);
+            }
+        }
+        let li = b.indices(&seg);
+        meshes.push(json!({"name": p.name, "primitives": [{"attributes": attrs, "indices": li, "mode": 1}], "extras": p.extras}));
+        nodes.push(json!({"name": p.name, "mesh": meshes.len() - 1, "extras": p.extras}));
+    }
+    let n = nodes.len();
+    nodes.push(json!({"name": name, "children": (0..n).collect::<Vec<_>>()}));
+    let doc = json!({
+        "asset": {"version": "2.0", "generator": "sixng-extractor (strands)"},
+        "scene": 0,
+        "scenes": [{"name": name, "nodes": [n], "extras": extras}],
+        "nodes": nodes,
+        "meshes": meshes,
+        "accessors": b.accessors,
+        "bufferViews": b.views,
+        "buffers": [{"byteLength": b.bin.len()}],
+    });
+    pack(&doc, b.bin)
+}
+
 /// Build a point-cloud GLB (mode 0), one node per primitive.
 pub fn points_glb(name: &str, prims: &[PointPrim], extras: Value) -> Vec<u8> {
     let mut b = Builder::default();

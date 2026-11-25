@@ -304,9 +304,14 @@ pub struct LookInfo {
     pub hats: Vec<String>,
     /// The hat of the outfit shown, to keep the hair under it.
     pub hat: Option<Arc<sixng_core::groom::Shell>>,
+    /// The character's head, body and garments, which the strand style
+    /// pass is damped against.
+    pub collide: Option<Arc<sixng_core::groom::Colliders>>,
     /// The colours of the game's hair palette (`ped_tint_hair`, each row at
     /// mid shade, sRGB), to pick from.
     pub hair_swatches: Vec<[u8; 3]>,
+    /// Every part of the character's outfits and wardrobe (`pedset`).
+    pub parts: Option<Arc<sixng_core::pedset::PartSet>>,
 }
 
 /// The grooms of one hair asset of an outfit.
@@ -886,6 +891,7 @@ pub struct Hair {
     /// The hat worn and the grooms it presses down (the scalp hair).
     hat: Option<Arc<sixng_core::groom::Shell>>,
     under_hat: Vec<u64>,
+    collide: Option<Arc<sixng_core::groom::Colliders>>,
     /// Animals: the skinned vertices and joints of the model shown, so the
     /// fur can be bound to the skin under it and move with a clip.
     rig: Option<Arc<FurRig>>,
@@ -942,6 +948,7 @@ impl Default for Hair {
             selected: Vec::new(),
             hat: None,
             under_hat: Vec::new(),
+            collide: None,
             rig: None,
             export_full: true,
             exporting: false,
@@ -976,7 +983,7 @@ impl Hair {
     fn want_key(&self) -> String {
         let mut tones: Vec<(u64, u32)> = self.tones.iter().filter(|_| self.stored_colours).map(|(k, t)| (*k, t.name)).collect();
         tones.sort();
-        format!("{tones:?}|{:?}|{}|{:?}|{}|{}|{}|{:?}|{:?}", self.selected, self.width_mm, self.colour, self.skin_colour && !self.skin.is_empty(), self.full_coat, self.density, self.hat.as_ref().map(|h| h.id), self.rig.as_ref().map(|r| (r.verts.len(), r.joints.len())))
+        format!("{tones:?}|{:?}|{}|{:?}|{}|{}|{}|{:?}|{:?}|{:?}", self.selected, self.width_mm, self.colour, self.skin_colour && !self.skin.is_empty(), self.full_coat, self.density, self.hat.as_ref().map(|h| h.id), self.collide.as_ref().map(|c| c.id), self.rig.as_ref().map(|r| (r.verts.len(), r.joints.len())))
     }
     pub fn settled(&self) -> bool {
         !self.loading && !self.listing && !self.exporting && self.key == self.want_key()
@@ -1270,6 +1277,7 @@ impl ModelView {
         let (density, width_scale) = (self.hair.density.clamp(0.05, 1.0), self.hair.width_mm / 3.0);
         let note = self.hair.coat_note.clone();
         let (hat, under_hat) = (self.hair.hat.clone(), self.hair.under_hat.clone());
+        let collide = self.hair.collide.clone();
         let rig = self.hair.rig.clone();
         let tones = if self.hair.stored_colours { self.hair.tones.clone() } else { HashMap::new() };
         // research, until the game's ramp files are read by SixNG itself: SIXNG_HAIR_DATA=<json of the four
@@ -1328,7 +1336,12 @@ impl ModelView {
                         // under about 1.5 million ribbon vertices (a vertex
                         // buffer may not exceed 256 MiB).
                         let share = share.min(750_000.0 / (g.stored_strands() * k).max(1) as f32);
-                        let coat = g.coat(share);
+                        let mut coat = g.coat_with(share, collide.as_deref());
+                        // noise, curl and clumping move grown strands off the
+                        // pressed guides: press them again
+                        if let Some(h) = hat.as_ref().filter(|_| under_hat.contains(&off)) {
+                            h.press(&mut coat.points, 0.003);
+                        }
                         drawn += coat.guides.len();
                         // fewer strands than stored: wider ones, for the same cover
                         let base = if g.width > 0.0 { g.width } else { 0.0003 };
@@ -1338,7 +1351,7 @@ impl ModelView {
                         // reads as 1 in the normal state (its per-instance scale is not fully read), and drawing fewer
                         // strands does not widen the rest
                         let share_widen = 1.0f32;
-                        if std::env::var("SIXNG_DEBUG_HAIR").is_ok() { let mut h = [0usize; 4]; for s in 0..coat.guides.len() { h[var(s)] += 1; } let mut st: std::collections::BTreeMap<[u8; 4], usize> = Default::default(); for p in &g.pick_steps { *st.entry(*p).or_default() += 1; } eprintln!("coat {off:x}: stored {} k {} share {share:.3} width {:.2} mm (base {:.2} mm) tint weight {:.3} variants {h:?} thresholds {:?}", g.stored_strands(), k, w * 1000.0, base * 1000.0, g.tint_weight, st.iter().take(6).collect::<Vec<_>>()); }
+                        if std::env::var("SIXNG_DEBUG_HAIR").is_ok() { let mut h = [0usize; 4]; for s in 0..coat.guides.len() { h[var(s)] += 1; } let mut st: std::collections::BTreeMap<[u8; 4], usize> = Default::default(); for p in &g.pick_steps { *st.entry(*p).or_default() += 1; } eprintln!("coat {off:x}: stored {} k {} share {share:.3} width {:.2} mm (base {:.2} mm) tint weight {:.3} variants {h:?} thresholds {:?}", g.stored_strands(), k, w * 1000.0, base * 1000.0, g.tint_weight, st.iter().take(6).collect::<Vec<_>>()); eprintln!("  head +0x20 {:x} +0x24 {:x} clump {} styles {:?}", g.head.get(0x20..0x24).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap())), g.head.get(0x24..0x28).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap())), g.clump_type, g.styles.iter().map(|s| (s.lo, s.hi, s.samples.len())).collect::<Vec<_>>()); }
                         // the atlas colour is stored sRGB-encoded: the linear base colour is its sRGB decode
                         let lin8 = |c: [f32; 3], m: [u8; 3]| -> [u8; 4] { [0, 1, 2].map(|q| ({ let x = c[q].clamp(0.0, 1.0); if x < 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) } } * m[q] as f32 + 0.5) as u8).iter().copied().chain([255u8]).collect::<Vec<u8>>().try_into().unwrap() };
                         let blend = |s: usize| -> [u8; 3] {
@@ -2003,6 +2016,10 @@ impl ModelView {
             ui.end_row();
         });
         ui.label(egui::RichText::new("The outfits the game lists for this character, in its order. The first one is shown by default.").weak().small());
+        if let Some(k) = look.parts.as_deref().and_then(|set| crate::ped_parts::ui(ui, set, look.current)) {
+            let base = l.base.split("#look=").next().unwrap_or(&l.base);
+            reload = Some(format!("{base}#look={k}"));
+        }
         let mut shape = *BODY_SHAPE.lock().unwrap();
         let before = shape;
         let mut released = false;
@@ -2464,6 +2481,7 @@ impl ModelView {
                 }
                 if let Some(look) = &l.look {
                     self.hair.hat = look.hat.clone();
+                    self.hair.collide = look.collide.clone();
                     self.hair.under_hat = look.hair.iter().filter(|h| h.slot == "hair").flat_map(|h| h.grooms.iter().copied()).collect();
                     // a character: its confident hair, grown to full density
                     let key = format!("{}#{}", look.model, look.current);
@@ -2492,6 +2510,7 @@ impl ModelView {
                 } else if !self.hair.look_key.is_empty() {
                     self.hair.look_key.clear();
                     self.hair.hat = None;
+                    self.hair.collide = None;
                     if self.hair.fur.is_none() {
                         self.hair.selected.clear();
                     }
@@ -6746,6 +6765,8 @@ fn load_query_sel(
                 opts.iter_mut().for_each(|o| o.default = false);
                 let mut info = LookInfo { model: look.model.clone(), labels: look.outfits.iter().map(|o| o.label.clone()).collect(), current: k, ..Default::default() };
                 info.notes.extend(look.note.clone());
+                let display = sixng_core::pedlook::model_names(&ws.game).ok().and_then(|n| n.display.get(&sixng_core::pedlook::model_hash(&look.model)).cloned());
+                info.parts = Some(Arc::new(sixng_core::pedset::part_set(&look, display)));
                 info.hats = look.outfits[k].parts.iter().filter(|p| p.slot == "hat").map(|p| p.drawable.to_ascii_lowercase()).collect();
                 for (oi, o) in look.outfits.iter().enumerate() {
                     for p in &o.parts {
@@ -6867,7 +6888,26 @@ fn load_query_sel(
                 }
                 look_info = Some(info);
             }
-            Err(e) => look_err = Some(e),
+            Err(e) => {
+                // Not in the game's outfit list (cutscene heads and the like):
+                // its own parts are drawn. Its hair parts are strand-hair
+                // placeholders, and their grooms are linked by the
+                // placeholder's name, so they are drawn the same way.
+                if let Ok(t) = sixng_core::hairlink::get(&ws.work, &a, &ix.entries) {
+                    let mut info = LookInfo { model: prefix.to_string(), labels: vec!["own parts (not in the game's outfit list)".into()], ..Default::default() };
+                    for o in opts.iter().filter(|o| o.default) {
+                        let Some(l) = t.by_placeholder(&o.name.to_ascii_lowercase()) else { continue };
+                        let slot = sixng_core::pedlook::slot_of(&l.placeholder);
+                        let shown = l.confidence >= 0.5 && slot != "body hair" && l.part != "body";
+                        info.hair.push(HairPick { slot, placeholder: l.placeholder.clone(), confidence: l.confidence, exact: t.exact, grooms: t.uncontested(l), off_head: 0, shown, colour: None, tone: None });
+                    }
+                    if !info.hair.is_empty() {
+                        info.notes.push("Not in the game's outfit list: its own parts, with the strand hair linked to its hair parts by name. No hair colour is stored for it here: the hair takes the picker's colour.".into());
+                        look_info = Some(info);
+                    }
+                }
+                look_err = Some(e);
+            }
         }
         if opts.is_empty() {
             return Err(anyhow::anyhow!("no parts found for {prefix}"));
@@ -6897,6 +6937,16 @@ fn load_query_sel(
                 let head: Vec<[f32; 3]> = skin.iter().filter(|(n, _)| is_head(n)).flat_map(|(_, p)| p.iter().copied()).collect();
                 l.hat = Some(Arc::new(sixng_core::groom::Shell::new([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, top - 0.10], &hat, &head)));
                 l.notes.push("Hat: the scalp hair is pressed under the hat's lining (strand points beyond it are pulled in to 3 mm under it), so the hair does not come through the hat; an opening the hat encloses (over a cap's strap) counts as closed. A stand-in, not the game's method: the outfit asks for the plain hair, and no stored rule says how the game keeps it under the hat.".to_string());
+            }
+            // The style pass is damped near the head, body and garments
+            // (hats press the hair on their own; strand and card hair are
+            // not colliders).
+            if !l.hair.is_empty() {
+                let hairy = ["hair", "brows", "beard", "lashes", "body hair", "eyes", "eyecaps", "teeth", "teeth accessory"];
+                let pts: Vec<[f32; 3]> = skin.iter().filter(|(n, _)| !l.hats.contains(&n.to_ascii_lowercase()) && !hairy.contains(&sixng_core::pedlook::slot_of(&n.to_ascii_lowercase()).as_str())).flat_map(|(_, p)| p.iter().copied()).collect();
+                if !pts.is_empty() {
+                    l.collide = Some(Arc::new(sixng_core::groom::Colliders::new(&pts)));
+                }
             }
             // Strand roots of an inferred link must lie on this character:
             // pieces that do not (another head shape, a neighbour's piece)
@@ -8548,6 +8598,8 @@ fn export_load_shaped(
     // placeholder palette (entry 0 pure red) was left unapplied.
     let stale_tyre = std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| j.contains("b994d670") && j.contains("GLB COLOR_0 = palette entry"));
     let stale_cloth = std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| j.contains("739e3d0d") && !j.contains("shade_source"));
+    // Cached character glow layers from before they stopped lighting by their colour map.
+    let stale_glow = std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| (j.contains("b8916043") || j.contains("2e920e9f")) && j.contains("\"colour_map\""));
     // Cached animal parts from before part skins (eyes, tint-mask coats).
     let stale_animal = e.name.as_deref().is_some_and(|n| sixng_core::partskin::animal_root(n).is_some())
         && std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| !j.contains("\"part_skin\""));
@@ -8556,7 +8608,7 @@ fn export_load_shaped(
         png: true,
         dds: false,
         raw: false,
-        force: head || shaped || !skins.is_empty() || stale_tint || stale_vehicle || stale_animal || stale_cloth || stale_tyre,
+        force: head || shaped || !skins.is_empty() || stale_tint || stale_vehicle || stale_animal || stale_cloth || stale_tyre || stale_glow,
         skip_embedded_textures: false,
         body_shape,
         head_skin: HEAD_SKIN.load(std::sync::atomic::Ordering::Relaxed),

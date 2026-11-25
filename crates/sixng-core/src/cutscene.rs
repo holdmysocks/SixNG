@@ -511,6 +511,34 @@ impl Models {
     pub fn name(&self, id: u64) -> Option<&str> {
         self.by_id.get(&id).map(|s| s.as_str())
     }
+    /// The named models of the game's outfit list, as characters: the viewer
+    /// puts them together from their outfits, also those made of shared
+    /// parts only (`cs_mandy`), which no drawable prefix names.
+    pub fn add_outfit_list(&mut self, game_root: &Path) {
+        if let Ok(m) = crate::pedlook::listed_models(game_root) {
+            self.add_characters(m.iter().filter(|m| m.named && !crate::outfit::is_animal(&m.name)).map(|m| m.name.as_str()));
+        }
+    }
+    /// Every source of model names: the recovered names of the indexed
+    /// archives, the characters of packs.rpf, the outfit list and the name
+    /// dictionary.
+    pub fn of_workspace(ws: &crate::export::Workspace) -> Models {
+        let mut models = Models::default();
+        for a in ws.archives() {
+            if !ws.is_indexed(&a) {
+                continue;
+            }
+            let Ok(ix) = ws.load_index(&a) else { continue };
+            if a.id == "packs.rpf" {
+                let ch = crate::outfit::characters(&ix);
+                models.add_characters(ch.iter().filter(|c| c.kind == "character").map(|c| c.name.as_str()));
+            }
+            models.add_index(&ix);
+        }
+        models.add_outfit_list(&ws.game);
+        models.add_name_dict(&ws.work);
+        models
+    }
 }
 
 /// One animated object of a scene.

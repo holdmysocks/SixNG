@@ -64,19 +64,7 @@ pub fn scene_clip(game: &Path, work: &Path, dict: &str, clip: &str, model: &str)
 fn load_scenes(ws: &Workspace, progress: Progress) -> anyhow::Result<Vec<Scene>> {
     let c = catalog(ws, progress.clone())?;
     progress("model names", 0, 1);
-    let mut models = Models::default();
-    for a in ws.archives() {
-        if !ws.is_indexed(&a) {
-            continue;
-        }
-        let Ok(ix) = ws.load_index(&a) else { continue };
-        if a.id == "packs.rpf" {
-            let ch = sixng_core::outfit::characters(&ix);
-            models.add_characters(ch.iter().filter(|c| c.kind == "character").map(|c| c.name.as_str()));
-        }
-        models.add_index(&ix);
-    }
-    models.add_name_dict(&ws.work);
+    let models = Models::of_workspace(ws);
     Ok(cutscene::scenes(&c, &models))
 }
 

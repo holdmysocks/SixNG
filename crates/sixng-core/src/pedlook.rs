@@ -240,7 +240,45 @@ pub struct ModelNames {
     pub display: BTreeMap<u32, String>,
 }
 
-const NAMES_VERSION: u32 = 3;
+const NAMES_VERSION: u32 = 4;
+
+/// The cached story cutscene catalog (`sixng cutscenes` or the Scenes tab
+/// builds it), when there is one.
+fn cutscene_catalog(work: &Path) -> Option<crate::cutscene::Catalog> {
+    let b = std::fs::read(catalog_path(work)).ok()?;
+    serde_json::from_slice::<crate::cutscene::Catalog>(&b).ok().filter(|c| c.version == crate::cutscene::CATALOG_VERSION)
+}
+
+fn catalog_path(work: &Path) -> std::path::PathBuf {
+    crate::cutscene::cache_path(&work.join("index"), crate::cutscene::STORY_ARCHIVE)
+}
+
+/// Model names from the handles of cutscene clips (`arnold_rubio`,
+/// `chart_bachelor2`): the handle, or the handle without its number, with or
+/// without `cs_`, names a listed model (`listed(joaat)`) that has no name yet.
+/// A name whose 64-bit id is also a scene file's ped model is certain; the
+/// others go to `uncertain`.
+fn names_from_scenes(c: &crate::cutscene::Catalog, listed: impl Fn(u32) -> bool, names: &mut BTreeMap<u32, String>, uncertain: &mut std::collections::BTreeSet<u32>) {
+    let peds: HashSet<u64> = c.files.iter().flat_map(|f| &f.objects).filter(|o| o.kind == "ped").filter_map(|o| o.model).collect();
+    let mut handles: Vec<String> = c.dicts.iter().flat_map(|d| &d.clips).map(|cl| crate::cutscene::split_clip_name(cl).0.to_ascii_lowercase()).collect();
+    handles.sort();
+    handles.dedup();
+    for h in &handles {
+        let base = h.trim_end_matches(|c: char| c.is_ascii_digit()).trim_end_matches('_');
+        for stem in [h.as_str(), base] {
+            for cand in [stem.to_string(), format!("cs_{stem}")] {
+                let j = joaat(&cand);
+                if !cand.contains('_') || !listed(j) || names.contains_key(&j) {
+                    continue;
+                }
+                if !peds.contains(&crate::meta7a::asset_id(&cand)) {
+                    uncertain.insert(j);
+                }
+                names.insert(j, cand);
+            }
+        }
+    }
+}
 const CHARACTER: u32 = 0x691f_01d2;
 const DISPLAY_LABEL: u32 = 0xf249_cb70;
 
@@ -313,6 +351,10 @@ fn build_names(game_root: &Path, work: &Path, t: &Models, ix: &ArchiveIndex) -> 
             }
         }
     }
+    let mut uncertain = std::collections::BTreeSet::new();
+    if let Some(c) = cutscene_catalog(work) {
+        names_from_scenes(&c, |h| keys.contains_key(&h), &mut names, &mut uncertain);
+    }
     // the name dictionary
     for &h in keys.keys() {
         if !names.contains_key(&h) {
@@ -338,7 +380,6 @@ fn build_names(game_root: &Path, work: &Path, t: &Models, ix: &ArchiveIndex) -> 
     }
     let numbered: Vec<String> = (0..10).map(|n| format!("_{n:02}")).collect();
     let mut display: BTreeMap<u32, String> = BTreeMap::new();
-    let mut uncertain = std::collections::BTreeSet::new();
     let mut grouped = |stems: &HashSet<String>, names: &mut BTreeMap<u32, String>, with_cs: bool, keep_single: bool| {
         let found: Vec<(String, u32, String, bool)> = stems
             .par_iter()
@@ -490,7 +531,7 @@ pub fn model_names(game_root: &Path) -> Result<&'static ModelNames, String> {
         let stamp = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
         if let Ok(b) = std::fs::read(&cache) {
             if let Ok(n) = serde_json::from_slice::<ModelNames>(&b) {
-                if n.version == NAMES_VERSION && stamp(&cache) >= stamp(&ixp) && stamp(&cache) >= stamp(&dxp) {
+                if n.version == NAMES_VERSION && stamp(&cache) >= stamp(&ixp) && stamp(&cache) >= stamp(&dxp) && stamp(&cache) >= stamp(&catalog_path(&work)) {
                     return Ok(n);
                 }
             }
@@ -845,6 +886,33 @@ pub struct Outfit {
     /// Items of the outfit that resolved to no drawable (item id, slot hash).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unresolved: Vec<String>,
+    /// Items left out on purpose (item id, why): first-person-only meshes
+    /// and the anatomical body layer, which clothing always covers.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub not_shown: Vec<String>,
+    /// The wardrobe variations this outfit is made of (hex): the outfit's
+    /// own first, then those it includes (head set, body set, brows …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variations: Vec<String>,
+}
+
+/// Why an item that resolved to no shown drawable is left out on purpose:
+/// the first-person arms (its GUID or every texture match is an `_fp`
+/// drawable) or the anatomical body layer (category `2a7a13a4`).
+fn not_shown_reason(p: &Part, by_guid: &HashMap<u64, &String>) -> Option<&'static str> {
+    let fp = |n: &str| n.ends_with("_fp") || n.contains("_fp_");
+    let named = p.guid.as_deref().and_then(|g| u64::from_str_radix(g, 16).ok()).and_then(|g| by_guid.get(&g));
+    if named.is_some_and(|n| fp(n)) || (named.is_none() && !p.candidates.is_empty() && p.candidates.keys().all(|n| fp(n))) {
+        return Some("first-person view only");
+    }
+    // The four items of this category in the named characters' wardrobes
+    // (2026-11-25) name by GUID `bodygenitalsgen_mr1_000_regular_ws00_full`,
+    // its `_alt_00` and a hidden placeholder: drawables of a content pack
+    // (core_restofworld), not of packs.rpf. Clothing covers them.
+    if p.category.as_deref() == Some("2a7a13a4") {
+        return Some("anatomical body layer, always under clothing");
+    }
+    None
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -856,6 +924,11 @@ pub struct Look {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fit: Option<String>,
     pub outfits: Vec<Outfit>,
+    /// Variations of the model's wardrobe that no listed outfit reaches,
+    /// with their resolved parts (head, eyes and the default skin are not
+    /// added to them). Empty when the wardrobe is another character's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub other_variations: Vec<Outfit>,
     /// How the outfits were found when no stored link names this model: a
     /// head-shape match or a wardrobe that names its hair.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1003,7 +1076,7 @@ fn dressed_first(mut l: Look) -> Look {
 fn look_uncached(game_root: &Path, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Result<Look, String> {
     let t = models(game_root)?;
     if let Some(row) = t.by_model.get(&model_hash(model)) {
-        return look_row(a, ix, model, row, false);
+        return look_row(t, a, ix, model, row, false);
     }
     // listed under another model name: the models whose wardrobe names this
     // character's head, and of their outfits those that wear it
@@ -1011,7 +1084,7 @@ fn look_uncached(game_root: &Path, a: &ArchiveInfo, ix: &ArchiveIndex, model: &s
     let mut out: Option<Look> = None;
     let mut last_err = None;
     for row in rows {
-        match look_row(a, ix, model, row, true) {
+        match look_row(t, a, ix, model, row, true) {
             Ok(l) => match &mut out {
                 Some(o) => o.outfits.extend(l.outfits.into_iter().filter(|x| !o.outfits.iter().any(|y| y.id == x.id)).collect::<Vec<_>>()),
                 None => out = Some(l),
@@ -1072,7 +1145,7 @@ fn look_by_alias(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) ->
     let (target, short) = by_name.or_else(variant)?;
     let short = short.as_str();
     let row = t.by_model.get(&target)?;
-    let mut l = look_row(a, ix, model, row, false).ok()?;
+    let mut l = look_row(t, a, ix, model, row, false).ok()?;
     let names: Vec<String> = ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| e.name.as_ref().map(|n| n.to_ascii_lowercase())).filter(|n| n.starts_with(&format!("{model}_head_"))).collect();
     let head = names.iter().filter(|n| !n.contains("_eye") && !n.contains("_earring")).min().cloned();
     let eyes = head.as_ref().and_then(|h| [format!("{}_eyes_full", h.trim_end_matches("_full")), format!("{}_eyes", h.trim_end_matches("_full"))].into_iter().find(|n| names.contains(n)));
@@ -1158,6 +1231,7 @@ fn look_by_head_shape(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &st
                 }
             }
         }
+        l.other_variations.clear();
         l.note = Some(format!("{model} is not in the outfit data. Its head is nearest in shape to the head of {other} ({:.1} mm mean distance; the median over {} heads of that kind is {:.1} mm), so that character's outfits are shown with this head. A shape match, not a stored link.", d * 1000.0, dist.len(), median * 1000.0));
         l.model = model.to_string();
         return Some(l);
@@ -1169,9 +1243,9 @@ fn look_by_head_shape(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &st
 /// wardrobe that names its head).
 fn look_uncached_listed(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Result<Look, String> {
     if let Some(row) = t.by_model.get(&joaat(model)) {
-        return look_row(a, ix, model, row, false);
+        return look_row(t, a, ix, model, row, false);
     }
-    rows_by_head(t, ix, model).into_iter().find_map(|row| look_row(a, ix, model, row, true).ok()).ok_or_else(|| "no outfits".to_string())
+    rows_by_head(t, ix, model).into_iter().find_map(|row| look_row(t, a, ix, model, row, true).ok()).ok_or_else(|| "no outfits".to_string())
 }
 
 /// A look made of a character's own drawables, for models the outfit data
@@ -1210,12 +1284,12 @@ fn own_look(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Option<Look> {
         }
     }
     let main: Vec<String> = parts.iter().filter(|p| ["full", "outer", "top", "bottom"].contains(&p.slot.as_str())).map(|p| pretty(item_word(&p.drawable))).collect();
-    Some(Look { model: model.to_string(), resource: format!("{} (own parts: the outfit data does not cover this model)", a.id), fit, outfits: vec![Outfit { id: String::new(), outfit_type: String::new(), scale: 0.0, label: format!("own parts: {}", main.join(", ")), body_shape: None, parts, strand_colours: vec![], unresolved: vec![] }], note: Some("The outfit data does not cover this model: it is shown in its own parts.".into()) })
+    Some(Look { model: model.to_string(), resource: format!("{} (own parts: the outfit data does not cover this model)", a.id), fit, outfits: vec![Outfit { id: String::new(), outfit_type: String::new(), scale: 0.0, label: format!("own parts: {}", main.join(", ")), body_shape: None, parts, strand_colours: vec![], unresolved: vec![], not_shown: vec![], variations: vec![] }], other_variations: vec![], note: Some("The outfit data does not cover this model: it is shown in its own parts.".into()) })
 }
 
 /// The outfits of one model row. `own_head`: keep only the outfits whose
 /// head is a drawable of `model` (the row was found through that head).
-fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own_head: bool) -> Result<Look, String> {
+fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own_head: bool) -> Result<Look, String> {
     static PRE: OnceLock<HashMap<u32, (String, String)>> = OnceLock::new();
     let work = crate::names::work_dir().ok_or("no work directory")?;
     let tu = tex_users(&work)?;
@@ -1269,12 +1343,25 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
     let presets = PRESETS.get_or_init(|| crate::matlib::Index::load_or_build(&crate::export::Workspace::new(crate::export::game_root(a), &work)).ok()).as_ref();
     // Items whose own textures find no model: the answer of another
     // wardrobe's item with the same asset GUID. Built only when needed.
+    // The wardrobe's variations that no listed outfit reaches (alternative
+    // garments, unused sets), each on its own. Not when the wardrobe was
+    // found through this character's head: it is another model's.
+    let reached: HashSet<&str> = flat.iter().flat_map(|(_, vs)| vs.iter()).map(|v| v.id.as_str()).collect();
+    // Nor when another listed model keeps its outfits in the same resource.
+    let shared = t.by_model.values().filter(|r| r.resource == row.resource).count() > 1;
+    let extra: Vec<&Variation> = if own_head || shared { vec![] } else { vars.iter().filter(|v| !reached.contains(v.id.as_str())).collect() };
+    let n_listed = flat.len();
+    let mut flat: Vec<(Option<&(u32, u32, f32)>, Vec<&Variation>)> = flat.into_iter().map(|(o, vs)| (Some(o), vs)).collect();
+    flat.extend(extra.into_iter().map(|v| (None, vec![v])));
     let needs_assets = flat.iter().flat_map(|(_, vs)| vs.iter()).flat_map(|v| &v.parts).any(|p| p.guid.is_some() && choose(p, fit.as_deref(), &exists).is_none());
     let assets = if needs_assets { asset_drawables(a, ix).ok() } else { None };
     let mut outfits = Vec::new();
+    let mut other_variations = Vec::new();
     for (o, vs) in flat {
+        let listed = o.is_some();
         let mut parts: Vec<LookPart> = Vec::new();
         let mut unresolved = Vec::new();
+        let mut not_shown = Vec::new();
         let mut body_shape = None;
         let mut strand_colours: Vec<(String, String)> = Vec::new();
         for v in &vs {
@@ -1303,7 +1390,9 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
                     // a garment that names a model by GUID is a part whose
                     // model was not found
                     let garment = p.guid.as_ref().and(p.category.as_deref()).and_then(garment_category);
-                    if let Some(g) = garment {
+                    if let Some(why) = not_shown_reason(p, &by_guid) {
+                        not_shown.push(format!("{} ({why})", p.item));
+                    } else if let Some(g) = garment {
                         unresolved.push(format!("{} ({g}: its model is not found)", p.item));
                     } else if p.named.is_some() || !p.candidates.is_empty() {
                         unresolved.push(format!("{} ({})", p.item, p.category.clone().unwrap_or_default()));
@@ -1330,6 +1419,16 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
             }
         }
         let plain = |slot: &str, drawable: String, found_by: &'static str| LookPart { slot: slot.into(), drawable, item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by, category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, state_guids: vec![] };
+        // another variation of the wardrobe: only what it holds itself
+        if !listed {
+            let main: Vec<String> = parts.iter().filter(|p| ["full", "outer", "top", "bottom"].contains(&p.slot.as_str())).map(|p| pretty(item_word(&p.drawable))).collect();
+            let v = vs[0];
+            if !parts.is_empty() || !unresolved.is_empty() || !not_shown.is_empty() {
+                other_variations.push(Outfit { id: v.id.clone(), outfit_type: String::new(), scale: 0.0, label: if main.is_empty() { format!("variation {}", v.id) } else { main.join(", ") }, body_shape, parts, strand_colours, unresolved, not_shown, variations: vec![v.id.clone()] });
+            }
+            continue;
+        }
+        let o = o.expect("listed");
         if let (false, Some(h)) = (parts.iter().any(|p| p.slot == "head"), &self_head) {
             parts.push(plain("head", h.clone(), "own"));
         }
@@ -1384,8 +1483,11 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
             parts,
             strand_colours,
             unresolved,
+            not_shown,
+            variations: vs.iter().map(|v| v.id.clone()).collect(),
         });
     }
+    debug_assert_eq!(outfits.len(), n_listed);
     if own_head {
         let p = format!("{model}_");
         outfits.retain(|o| o.parts.iter().any(|x| x.slot == "head" && x.drawable.starts_with(&p)));
@@ -1393,12 +1495,32 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
             return Err(format!("{model} is not in the game's outfit list, and no listed outfit of the wardrobe that names its head wears that head"));
         }
     }
-    Ok(Look { model: model.to_string(), resource: format!("{}@{:x}", a.id, row.resource), fit, outfits, note: None })
+    Ok(Look { model: model.to_string(), resource: format!("{}@{:x}", a.id, row.resource), fit, outfits, other_variations, note: None })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_names_from_scene_handles() {
+        use crate::cutscene::{Catalog, FileObject, SceneDict, SceneFile, CATALOG_VERSION};
+        use crate::meta7a::asset_id;
+        let d = SceneDict { name: "cin@x_p1_t01".into(), id: "a.rpf@10".into(), clips: ["boss_face", "guard2", "lucia"].map(String::from).to_vec(), sections: 0, section_ids: vec![], adopted_sections: 0, streamed: vec![], unjoined: vec![], windows_streamed: 0, windows_missing: 0 };
+        // the scene file records the boss's model; the guard's is not recorded
+        let f = SceneFile { id: "a.rpf@20".into(), states: vec![], objects: vec![FileObject { key: joaat("boss"), kind: "ped".into(), model: Some(asset_id("cs_boss")) }] };
+        let c = Catalog { version: CATALOG_VERSION, archive: "a.rpf".into(), dicts: vec![d], files: vec![f] };
+        let listed: HashSet<u32> = ["cs_boss", "cs_guard", "player_story000_00"].iter().map(|n| joaat(n)).collect();
+        let (mut names, mut uncertain) = (BTreeMap::new(), std::collections::BTreeSet::new());
+        names.insert(joaat("player_story000_00"), "player_story000_00".to_string());
+        names_from_scenes(&c, |h| listed.contains(&h), &mut names, &mut uncertain);
+        assert_eq!(names.get(&joaat("cs_boss")).map(String::as_str), Some("cs_boss"));
+        // `guard2` without its number
+        assert_eq!(names.get(&joaat("cs_guard")).map(String::as_str), Some("cs_guard"));
+        assert_eq!(uncertain.iter().copied().collect::<Vec<_>>(), vec![joaat("cs_guard")]);
+        // `lucia` names no listed model
+        assert_eq!(names.len(), 3);
+    }
 
     #[test]
     fn model_names_from_text_and_hashes() {
