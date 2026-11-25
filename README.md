@@ -1155,7 +1155,7 @@ loader times) go to stderr and `<work>/map3d_perf.log`.
 Screenshots from the command line (for checks and docs):
 
 ```powershell
-.\target\release\sixng-gui.exe --model levels.rpf@10f266d010 --mode 5 --yaw 2.4 --pitch 0.25 --screenshot car.png --exit
+.\target\release\sixng-gui.exe --model levels.rpf@10f266d010 --mode 0 --yaw 2.4 --pitch 0.25 --screenshot car.png --exit
 ```
 
 Options: `--lod N`, `--mode 0-7` (shaded, albedo, normals, UV, slot,
