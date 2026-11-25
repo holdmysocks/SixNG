@@ -96,6 +96,11 @@ pub struct Groom {
     /// A1, per guide strand (low 16 bits): a root triangle (index into
     /// `roots`) with the guide as a corner. Empty when absent.
     pub guide_tri: Vec<u32>,
+    /// Per guide: four angles (byte x 2 pi / 255 - pi) at 0, 1/3, 2/3 and 1
+    /// of the strand, by which the style pass's frame is turned about the
+    /// strand (graphics header +0x24, a byte offset; 0 = none). Read from
+    /// the game's strand generator.
+    pub twist: Vec<[u8; 4]>,
 }
 
 /// One strand style record: 2D offsets across the strand along its length.
@@ -129,13 +134,13 @@ impl Style {
 
     /// Re-shape one strand (its points in order, root first): point j goes
     /// to the strand's point at arc length z(u) L, u = j / (K - 1), plus the
-    /// style offset x along the strand's normal (`up` made square to the
-    /// strand) and y along normal x tangent (`swap` exchanges them). The
+    /// style offset x along the frame axis `up(z)` (made square to the
+    /// strand) and y along axis x tangent (`swap` exchanges them). The
     /// offset's length is 0.8 mm + k (|d| - 0.8 mm), capped at |d|: the
     /// game's k is a per-point weight from the collider damping, capped by
     /// the per-instance style strength (`k` of the point's place on the
     /// strand before the re-shape).
-    pub fn apply(&self, pts: &mut [[f32; 3]], up: [f32; 3], swap: bool, k: &dyn Fn([f32; 3]) -> f32) {
+    pub fn apply(&self, pts: &mut [[f32; 3]], up: &dyn Fn(f32) -> [f32; 3], swap: bool, k: &dyn Fn([f32; 3]) -> f32) {
         let k_strength = k;
         let k = pts.len();
         if k < 2 || self.samples.is_empty() {
@@ -166,6 +171,7 @@ impl Style {
             let (x, y) = (x * f, y * f);
             let l = dot(e, e).sqrt().max(1e-9);
             let t = [e[0] / l, e[1] / l, e[2] / l];
+            let up = up(z.clamp(0.0, 1.0));
             let d = dot(up, t);
             let nn = [up[0] - t[0] * d, up[1] - t[1] * d, up[2] - t[2] * d];
             let nl = dot(nn, nn).sqrt();
@@ -499,6 +505,10 @@ pub fn parse(r: &Resource) -> Result<Groom> {
             if !(lo.iter().chain(&hi).all(|x| x.is_finite())) || samples.len() < 2 {
                 break;
             }
+            // every record of a piece has the same sample count
+            if styles.first().is_some_and(|f: &Style| f.samples.len() != samples.len()) {
+                break;
+            }
             styles.push(Style { lo, hi, samples });
             o = q;
         }
@@ -518,7 +528,10 @@ pub fn parse(r: &Resource) -> Result<Groom> {
         Some(p) if a3 > 0 => p.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect(),
         _ => Vec::new(),
     };
-    Ok(Groom { tint_weight: r.sys.get(0x12C).map_or(1.0, |b| *b as f32 / 255.0), strands: s, points_per_strand: k, points, w, roots, lengths, root_uv, bones, root_box, group_box, tri_counts, width, taper, pick_steps, seed: gu32(0x7C), length_var: [f16(gu16(0x60)), f16(gu16(0x62))], head: g.get(..0xC0).map_or(Vec::new(), |h| h.to_vec()), corners, clump_scale: [0x12A, 0x12B].map(|o| r.sys.get(o).map_or(1.0, |b| *b as f32 / 255.0)), styles, clump_type: r.sys.get(0x12D).copied().unwrap_or(0), guide_tri })
+    // style frame angles: 4 bytes per guide
+    let tw = gu32(0x24) as usize;
+    let twist: Vec<[u8; 4]> = if tw > 0 { g.get(tw..tw + s * 4).map_or(Vec::new(), |b| b.chunks_exact(4).map(|q| [q[0], q[1], q[2], q[3]]).collect()) } else { Vec::new() };
+    Ok(Groom { tint_weight: r.sys.get(0x12C).map_or(1.0, |b| *b as f32 / 255.0), strands: s, points_per_strand: k, points, w, roots, lengths, root_uv, bones, root_box, group_box, tri_counts, width, taper, pick_steps, seed: gu32(0x7C), length_var: [f16(gu16(0x60)), f16(gu16(0x62))], head: g.get(..0xC0).map_or(Vec::new(), |h| h.to_vec()), corners, clump_scale: [0x12A, 0x12B].map(|o| r.sys.get(o).map_or(1.0, |b| *b as f32 / 255.0)), styles, clump_type: r.sys.get(0x12D).copied().unwrap_or(0), guide_tri, twist })
 }
 
 impl Groom {
@@ -673,26 +686,56 @@ impl Groom {
         let length = |t: [u32; 3], w: [f32; 3], d: f32| if self.lengths.len() == self.strands { hairgen::length(mix(t, w, &|s| self.lengths[s]), d, self.length_var) } else { f32::MAX };
         let steps = |t: [u32; 3], w: [f32; 3]| [0usize, 1, 2].map(|q| mix(t, w, &|s| self.pick_steps.get(s).map_or([64u8, 128, 191][q], |b| b[q]) as f32) / 255.0);
 
-        // the style pass (research, SIXNG_STYLE=1): applied at full strength to
-        // the rest pose it doubles the waves the stored strands already have,
-        // so the game's strength term (not read) must hold it back there.
-        // The strand's style is picked by the generator (not read); here by
+        // the style pass: the stored style shape laid over every generated
+        // strand in a frame that turns along it. The strand's style is picked by the generator (not read); here by
         // its variant draw among the stored records. The collider damping
-        // (`Colliders`) keeps the offsets small near the skin, but even
-        // damped the pass throws strands across the face at full strength,
-        // so it stays off until the records' frame is known.
+        // (`Colliders`) keeps the offsets small near the skin.
         let swap = std::env::var_os("SIXNG_STYLE_SWAP").is_some();
-        // SIXNG_STYLE=<k>: the strength (1 when not a number)
+        // On by default where the piece stores its frame angles (header
+        // +0x24), at the game's normal strength 1. SIXNG_STYLE=<k> sets the
+        // strength (0 = off) and also applies it to pieces without the
+        // table (frame: the root normal, not the game's).
         let k_style = std::env::var("SIXNG_STYLE").ok().map(|v| v.parse::<f32>().unwrap_or(1.0).clamp(0.0, 1.0));
-        let off = k_style.is_none();
         let strength = k_style.unwrap_or(1.0);
+        let off = strength <= 0.0 || (k_style.is_none() && self.twist.len() != self.strands);
         // per point: damped near the colliders (none: the strength alone)
         let weight = |p: [f32; 3]| colliders.map_or(strength, |c| c.weight(p, strength));
-        let style = |pts: &mut [[f32; 3]], up: [f32; 3], d: f32| {
-            if !off && !self.styles.is_empty() {
-                let i = ((d * self.styles.len() as f32) as usize).min(self.styles.len() - 1);
-                self.styles[i].apply(pts, up, swap, &weight);
+        // The frame axis, as the game's generator writes it into every
+        // strand point: a direction in the root triangle's plane (the game
+        // takes one of its 64 clump offsets by a strand hash; here an angle
+        // from the strand's draw), turned about the strand by an angle
+        // interpolated at 3u between four knots, each the root guides'
+        // blend of their +0x24 bytes. Without the table: the root normal.
+        // SIXNG_STYLE_TWIST=-1 turns the other way.
+        let twist_sign = std::env::var("SIXNG_STYLE_TWIST").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
+        let style = |pts: &mut [[f32; 3]], nr: [f32; 3], d: f32, guides: &[(usize, f32)]| {
+            if off || self.styles.is_empty() {
+                return;
             }
+            let i = ((d * self.styles.len() as f32) as usize).min(self.styles.len() - 1);
+            if self.twist.len() != self.strands {
+                self.styles[i].apply(pts, &|_| nr, swap, &weight);
+                return;
+            }
+            let knots = [0usize, 1, 2, 3].map(|q| guides.iter().map(|&(g, w)| w * (self.twist[g][q] as f32 * (std::f32::consts::TAU / 255.0) - std::f32::consts::PI)).sum::<f32>());
+            let e1 = unit(cross(nr, if nr[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0] }), [1.0, 0.0, 0.0]);
+            let e2 = cross(nr, e1);
+            let phi = (d * 7919.0).fract() * std::f32::consts::TAU;
+            let r0 = [e1[0] * phi.cos() + e2[0] * phi.sin(), e1[1] * phi.cos() + e2[1] * phi.sin(), e1[2] * phi.cos() + e2[2] * phi.sin()];
+            let tangents: Vec<[f32; 3]> = {
+                let n = pts.len();
+                (0..n).map(|j| unit(sub(pts[(j + 1).min(n - 1)], pts[j.saturating_sub(1)]), nr)).collect()
+            };
+            let axis = |z: f32| {
+                let x = z * 3.0;
+                let s = (x as usize).min(2);
+                let th = twist_sign * (knots[s] + (knots[s + 1] - knots[s]) * (x - s as f32));
+                let t = tangents[((z * (tangents.len() - 1) as f32).round() as usize).min(tangents.len() - 1)];
+                let n = unit(sub(r0, scale(t, dot(r0, t))), nr);
+                let b = cross(t, n);
+                [n[0] * th.cos() + b[0] * th.sin(), n[1] * th.cos() + b[1] * th.sin(), n[2] * th.cos() + b[2] * th.sin()]
+            };
+            self.styles[i].apply(pts, &axis, swap, &weight);
         };
         // scattered strands
         let density: Vec<u8> = self.tri_counts.iter().map(|q| q[0]).collect();
@@ -707,7 +750,7 @@ impl Groom {
                 let (d_len, _, d_var) = (draws.next(), draws.next(), draws.next());
                 let at = c.points.len();
                 c.points.extend(hairgen::grow(k, length(t, w, d_len), |j| blend(t, w, j)));
-                style(&mut c.points[at..], normal(t), d_var);
+                style(&mut c.points[at..], normal(t), d_var, &[(t[0] as usize, w[0]), (t[1] as usize, w[1]), (t[2] as usize, w[2])]);
                 c.normals.push(normal(t));
                 c.guides.push((t, w));
                 c.variants.push(hairgen::variant(d_var, steps(t, w)));
@@ -787,7 +830,7 @@ impl Groom {
                 let len = if self.lengths.len() == self.strands { hairgen::length(self.lengths[idx], d_len, self.length_var) } else { f32::MAX };
                 walk(&mut c.points, &centre, fa, fb, radius, tx, ty, len, nr);
                 let at = c.points.len() - k;
-                style(&mut c.points[at..], nr, d_var);
+                style(&mut c.points[at..], nr, d_var, &[(idx, 1.0)]);
                 // the strand's guide weights: all on guide idx (its colour, UV and bones)
                 let w = match t.iter().position(|&x| x as usize == idx) {
                     Some(0) => [1.0, 0.0, 0.0],
@@ -830,7 +873,7 @@ impl Groom {
                     let len = length(t, b, d_len);
                     walk(&mut c.points, &centre, fa, fb, radius, tx, ty, len, nr);
                     let at = c.points.len() - k;
-                    style(&mut c.points[at..], nr, d_var);
+                    style(&mut c.points[at..], nr, d_var, &[(t[0] as usize, b[0]), (t[1] as usize, b[1]), (t[2] as usize, b[2])]);
                     c.normals.push(nr);
                     c.guides.push((t, b));
                     c.variants.push(hairgen::variant(d_var, steps(t, b)));
@@ -1281,6 +1324,7 @@ mod tests {
             styles: vec![],
             clump_type: 0,
             guide_tri: vec![],
+            twist: vec![],
         };
         let c = g.coat(1.0);
         assert_eq!(c.guides.len(), 7);
@@ -1332,14 +1376,14 @@ mod tests {
         // a straight strand along -z with up = +x: the tip moves 1 cm along +x
         let mut pts = [[0.0, 0.0, 0.0], [0.0, 0.0, -0.5], [0.0, 0.0, -1.0]];
         let src = pts;
-        st.apply(&mut pts, [1.0, 0.0, 0.0], false, &|_| 1.0);
+        st.apply(&mut pts, &|_| [1.0, 0.0, 0.0], false, &|_| 1.0);
         assert!((pts[2][0] - 0.01).abs() < 1e-4 && (pts[2][2] + 1.0).abs() < 1e-4 && (pts[0][0] + 0.01).abs() < 1e-4, "{pts:?}");
         // a collider on the root: the root's offset is damped to 0.8 mm, the tip's is not
         let c = Colliders::new(&[[0.0, 0.0, 0.0]]);
         assert_eq!(c.weight([0.0, 0.0, 0.0], 1.0), 0.0);
         assert_eq!(c.weight([0.0, 0.0, -0.5], 0.7), 0.7);
         let mut pts = src;
-        st.apply(&mut pts, [1.0, 0.0, 0.0], false, &|p| c.weight(p, 1.0));
+        st.apply(&mut pts, &|_| [1.0, 0.0, 0.0], false, &|p| c.weight(p, 1.0));
         assert!((pts[0][0] + 0.0008).abs() < 1e-5 && (pts[2][0] - 0.01).abs() < 1e-4, "{pts:?}");
     }
 
@@ -1351,7 +1395,7 @@ mod tests {
     }
     #[test]
     fn segments() {
-        let g = Groom { tint_weight: 1.0, strands: 2, points_per_strand: 3, points: vec![[0.0; 3]; 6], w: vec![0.0; 6], roots: vec![[0, 1, 1]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![] };
+        let g = Groom { tint_weight: 1.0, strands: 2, points_per_strand: 3, points: vec![[0.0; 3]; 6], w: vec![0.0; 6], roots: vec![[0, 1, 1]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![], twist: vec![] };
         assert_eq!(g.segments(), vec![0, 1, 1, 2, 3, 4, 4, 5]);
         assert_eq!(g.root_indices(), vec![0, 3, 3]);
     }
@@ -1359,7 +1403,7 @@ mod tests {
     fn coat_from_strand_counts() {
         // one root triangle of three 2-point guides, 40 + 10 stored strands
         let pts = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.1], [1.0, 0.0, 0.0], [1.0, 0.0, 0.1], [0.0, 1.0, 0.0], [0.0, 1.0, 0.1]];
-        let g = Groom { tint_weight: 1.0, strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![[40, 10, 1, 0]], width: 0.0003, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![] };
+        let g = Groom { tint_weight: 1.0, strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![[40, 10, 1, 0]], width: 0.0003, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![], twist: vec![] };
         assert_eq!(g.stored_strands(), 50);
         let c = g.coat(1.0);
         assert_eq!((c.guides.len(), c.points.len(), c.stored), (50, 100, 50));
