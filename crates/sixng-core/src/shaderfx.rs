@@ -1,18 +1,28 @@
 //! Shader programs and effects of `shaders.rpf` (its uncompressed part):
 //! which resources and constants each compiled program declares, and which
-//! textures and constants each effect (a material's shader) has.
+//! textures, constants, states, techniques and passes each effect (a
+//! material's shader) has.
 //!
 //! Layout, all little-endian (decoded from the data; counts are from one
-//! install):
+//! install). Everything is read in sequence; nothing is searched for but
+//! the databases themselves.
 //!
-//! * Six program sections follow one another, one per stage class: vertex
-//!   and mesh, pixel, geometry, two empty ones, compute. A section is
-//!   `u32 count` and `count` program records.
+//! * The archive holds shader databases (two in the install: 24,804
+//!   programs and 910 effects, then 1,699 programs and 22 effects). A
+//!   database: magic `SGD5`, `u64 id`, `u32 n` and `n` shared parameter
+//!   blocks (`u32 size`, bytes; the `u32` at 16 of a block is the key that
+//!   effects refer to it by), a variable table shared by the effects, six
+//!   program sections, `u32 count` and the effect records.
+//! * The six program sections follow one another, one per stage class:
+//!   vertex and mesh, pixel, geometry, two empty ones, compute. A section
+//!   is `u32 count` and `count` program records.
 //! * A program record: `u8 n`, a name of `n - 1` bytes, NUL, `u8 kind`,
 //!   `u32 size`, `u32 0x000ddce7`, `u32 size`, `u32 unpacked size`, then
 //!   `size` bytes (a raw deflate stream that inflates to the compiled
 //!   program, and a 12-byte trailer: `u64 id`, `u32 mask`), a 140-byte state
-//!   block (not decoded) and a variable table.
+//!   block (not decoded) and a variable table. The kind byte takes the
+//!   values 50, 60, 64, 65 and 66, which reads as a shader model times ten
+//!   (not checked against anything else).
 //! * A variable table: `u32 size` (of what follows), `u16 resources`,
 //!   `u16 members`, `u16 ?`, `u16 size again`, then 24-byte records and a
 //!   name table. A record is `u8 kind, u8 dimension, u16 index`, `u32 a`,
@@ -23,27 +33,43 @@
 //!   constant buffer's `a` holds its member count (low byte) and the byte
 //!   distance from its own record to its first member (high half); `c` is
 //!   its size. A member's `a` is its byte offset in the buffer.
-//! * After the sections: `u32 count` and the effect records. An effect
-//!   record: `u8 n`, name, NUL, `u32 ?`, six program lists (`u32 n`, n
-//!   program numbers within the section of the same order), a body whose
-//!   first part is not decoded, a variable table for the whole effect
-//!   (preceded by `u32 0x80000000`), and last a name table (`u32 size`,
-//!   strings) with technique and pass names. In the effect's table a
-//!   material texture is a resource with flag 0x80: the low byte of its
-//!   index is its slot in the material's texture list, and a sampler's `b`
-//!   is the distance from its record to its name in the table's name table.
-//!
-//! Techniques and passes of an effect sit in the part of the body that is
-//! otherwise not decoded: `u32 techniques`, one `u32` per technique (bits
-//! 0..14 = offset of its name in the effect's last name table, bits 15..23
-//! = index of its first pass, bits 24..31 = number of passes), `u32
-//! passes`, then 24 bytes per pass: six bytes with the pass's program per
-//! section (1-based into the effect's program list of that section, 0 =
-//! none), eight flag bytes, `u16` name offset, and six bytes that are not
-//! understood. The table is found by these rules (the first name offset is
-//! 1, offsets rise, each technique's first pass follows the previous one's
-//! passes, the pass count is their sum, program numbers are in range), not
-//! by decoding what precedes it.
+//! * An effect record, in order:
+//!   - `u8 n`, name, NUL, `u32 loaded size`, six program lists (`u32 n`, n
+//!     program numbers within the database's section of the same order);
+//!   - 0x50 bytes (not decoded);
+//!   - four state tables, each `u32 count` and fixed-size items: rasterizer
+//!     (16 bytes), depth-stencil (24), blend (0x44), sampler (0x24). The
+//!     items' fields are not decoded;
+//!   - `u32 techniques` and one `u32` per technique: bits 0..14 = offset of
+//!     its name in the record's name table, bits 15..23 = index of its
+//!     first pass, bits 24..31 = number of passes;
+//!   - `u32 passes` and 24 bytes per pass: six bytes with the pass's
+//!     program per section (1-based into the effect's program list of that
+//!     section, 0 = none); bytes 6, 7, 8 = index of its rasterizer,
+//!     depth-stencil and blend state; byte 9 = stencil reference; byte 10 =
+//!     which of those the pass sets (bit 1 rasterizer, 2 depth-stencil, 4
+//!     blend, 8 stencil reference; 0x10 is also seen and not understood);
+//!     byte 11 (0, 1 or 255) and bytes 12, 13 (0); `u16` name offset; eight
+//!     bytes that are not decoded. Over all 28,798 passes an index is in
+//!     range when its bit is set and zero when it is clear. What the states
+//!     hold was not compared with the pipeline cache;
+//!   - `u32 count` and that many `u32` (not decoded);
+//!   - `u32 0x80000000` (in every effect; another value would be the size
+//!     of a block stored here);
+//!   - the effect's variable table. A material texture is a resource with
+//!     flag 0x80: the low byte of its index is its slot in the material's
+//!     texture list, and a sampler's `b` is the distance from its record to
+//!     its name in the table's name table;
+//!   - a second sized block (`u32 size`, bytes; not decoded);
+//!   - `u32` whose low 24 bits count the parameter blocks that follow (the
+//!     high byte is not decoded). A block is `u32 size` and bytes, or `u32
+//!     0x80000000` and the key of a shared block of the database;
+//!   - a name table (`u32 size`, strings) with technique and pass names.
+//! * The loaded size equals 8 x (the program numbers, plus one per list) +
+//!   8 x techniques + 32 x passes + 4 x the `u32` list + the sizes of the
+//!   table and the second block, then, when there are parameter blocks,
+//!   rounded up to 8 and 8 x blocks + the sizes of the stored ones, + the
+//!   size of the name table. This holds for all 932 effects.
 //!
 //! The archive's one compressed entry is a pipeline cache (magic
 //! `PS\0\x09`): a 0x80-byte header with a version string at 0x24 and six
@@ -62,14 +88,8 @@
 //!
 //! A read record's (space, register) is the declared resource with flags
 //! 0x40 = space 1, 0x80 = space 2, else space 0, and register = index, plus
-//! 256 when the kind has bit 0x80. This holds for every read record of
-//! every joined stage (333,965). Write records use another numbering that
+//! 256 when the kind has bit 0x80. Write records use another numbering that
 //! was not worked out.
-//!
-//! Effect records have no length field that was understood, so the next
-//! record is found by trying each position: its header must parse with
-//! program numbers in range, and the bytes before it must be a name table
-//! that ends exactly there.
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -77,6 +97,8 @@ use std::collections::BTreeMap;
 
 const MAGIC: [u8; 4] = [0xe7, 0xdc, 0x0d, 0x00];
 const STATE: usize = 140;
+const DATABASE: &[u8] = b"SGD5";
+const SHARED: u32 = 0x8000_0000;
 
 /// One record of a variable table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -208,8 +230,34 @@ pub struct Pass {
     /// Per section the pass's program: an index into the effect's
     /// `programs` list of that section.
     pub programs: [Option<u8>; 6],
-    /// The eight flag bytes (not decoded).
+    /// Bytes 6..14 of the record: three state indices, the stencil
+    /// reference, the bits that say which of them the pass sets (see the
+    /// methods), one byte that is 0, 1 or 255 and two that are 0.
     pub flags: [u8; 8],
+    /// The last eight bytes of the record (not decoded).
+    pub tail: [u8; 8],
+}
+
+impl Pass {
+    fn state(&self, bit: u8, at: usize) -> Option<u8> {
+        (self.flags[4] & bit != 0).then_some(self.flags[at])
+    }
+    /// Index into the effect's rasterizer states, when the pass sets one.
+    pub fn rasterizer(&self) -> Option<u8> {
+        self.state(1, 0)
+    }
+    /// Index into the effect's depth-stencil states, when the pass sets one.
+    pub fn depth_stencil(&self) -> Option<u8> {
+        self.state(2, 1)
+    }
+    /// Index into the effect's blend states, when the pass sets one.
+    pub fn blend(&self) -> Option<u8> {
+        self.state(4, 2)
+    }
+    /// The stencil reference value, when the pass sets one.
+    pub fn stencil_ref(&self) -> Option<u8> {
+        self.state(8, 3)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -218,24 +266,115 @@ pub struct Technique {
     pub passes: Vec<Pass>,
 }
 
+/// The state tables of an effect: raw items (their fields are not decoded).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct States {
+    /// 16 bytes each.
+    pub rasterizer: Vec<Vec<u8>>,
+    /// 24 bytes each.
+    pub depth_stencil: Vec<Vec<u8>>,
+    /// 0x44 bytes each.
+    pub blend: Vec<Vec<u8>>,
+    /// 0x24 bytes each.
+    pub samplers: Vec<Vec<u8>>,
+}
+
+/// A parameter block of an effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Block {
+    /// File offset and length of a block stored in the effect record.
+    Inline(usize, usize),
+    /// Key of one of the database's shared blocks: see
+    /// [`Database::shared_block`].
+    Shared(u32),
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Effect {
     pub name: String,
-    /// Program numbers per section (same order as the sections).
+    /// Index into [`Shaders::databases`].
+    pub database: usize,
+    /// Program numbers per section (same order as the sections), counted
+    /// within the effect's database: see [`Shaders::program`].
     pub programs: [Vec<u32>; 6],
+    /// None when the effect's table has no records.
     pub table: Option<Table>,
-    /// Empty when the effect has no programs or its tables were not found.
+    /// Empty when the effect has no passes.
     pub techniques: Vec<Technique>,
+    /// The `u32` after the name: the record's size once loaded.
+    pub loaded_size: u32,
+    /// That size worked out from the record's parts (see the module text);
+    /// equal to `loaded_size` for every effect of the install it was
+    /// checked on.
+    pub loaded_size_computed: u32,
+    /// The 0x50 bytes before the state tables (not decoded).
+    #[serde(skip)]
+    pub header: Vec<u8>,
+    pub states: States,
+    /// The `u32` list after the passes (not decoded).
+    #[serde(skip)]
+    pub extra: Vec<u32>,
+    pub blocks: Vec<Block>,
+    /// The high byte of the block count word (not decoded).
+    pub block_flags: u8,
+}
+
+/// One shader database of the archive.
+#[derive(Debug, Clone, Default)]
+pub struct Database {
+    /// File offset of its magic.
+    pub offset: usize,
+    /// The `u64` after the magic.
+    pub id: u64,
+    /// File offset and length of each shared parameter block.
+    pub shared_blocks: Vec<(usize, usize)>,
+    /// The key of each shared block (its `u32` at 16).
+    pub shared_keys: Vec<u32>,
+    /// The variable table shared by the database's effects.
+    pub table: Option<Table>,
+    /// Index of each section's first program in [`Shaders::programs`], and
+    /// its count.
+    pub sections: [(usize, usize); 6],
+    /// Index of the database's first effect in [`Shaders::effects`], and
+    /// how many were read.
+    pub effects: (usize, usize),
+    /// The effect count the database states.
+    pub effects_stated: usize,
+}
+
+impl Database {
+    /// The shared block an effect refers to by key: index into
+    /// `shared_blocks`.
+    pub fn shared_block(&self, key: u32) -> Option<usize> {
+        self.shared_keys.iter().position(|&k| k == key)
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct Shaders {
+    /// The programs of every database, in file order.
     pub programs: Vec<Program>,
-    /// Index of each section's first program in `programs`, and its count.
-    pub sections: [(usize, usize); 6],
+    pub databases: Vec<Database>,
+    /// The effects of every database, in file order.
     pub effects: Vec<Effect>,
-    /// The effect count the file states.
-    pub effects_stated: usize,
+}
+
+impl Shaders {
+    /// Program number `n` of section `section` of the effect's database:
+    /// its index in `programs` and the program.
+    pub fn program(&self, e: &Effect, section: usize, n: u32) -> Option<(usize, &Program)> {
+        let (first, count) = self.databases.get(e.database)?.sections[section];
+        let i = first + n as usize;
+        ((n as usize) < count).then(|| self.programs.get(i).map(|p| (i, p))).flatten()
+    }
+    /// Programs of a section over all databases.
+    pub fn section_total(&self, section: usize) -> usize {
+        self.databases.iter().map(|d| d.sections[section].1).sum()
+    }
+    /// The effect count the databases state.
+    pub fn effects_stated(&self) -> usize {
+        self.databases.iter().map(|d| d.effects_stated).sum()
+    }
 }
 
 fn u16_at(b: &[u8], p: usize) -> Option<u16> {
@@ -288,12 +427,14 @@ fn program_at(b: &[u8], p: usize, section: u8) -> Option<(Program, usize)> {
     Some((Program { section, name: name.to_string(), kind, id, mask: u32_at(b, end - 4)?, data: (data, size - 12), table }, next))
 }
 
-/// Effect header at `p`: name, six program lists, offset of the body.
-fn effect_header(b: &[u8], p: usize, counts: &[usize; 6]) -> Option<(String, [Vec<u32>; 6], usize)> {
+/// Effect header at `p`: name, loaded size, six program lists, offset of
+/// the body.
+fn effect_header(b: &[u8], p: usize, counts: &[usize; 6]) -> Option<(String, u32, [Vec<u32>; 6], usize)> {
     let (name, mut q) = name_at(b, p)?;
     if name.contains(':') {
         return None;
     }
+    let loaded = u32_at(b, q)?;
     q += 4;
     let mut lists: [Vec<u32>; 6] = Default::default();
     for (k, l) in lists.iter_mut().enumerate() {
@@ -311,104 +452,156 @@ fn effect_header(b: &[u8], p: usize, counts: &[usize; 6]) -> Option<(String, [Ve
         }
         q += 4 * n;
     }
-    Some((name.to_string(), lists, q))
+    Some((name.to_string(), loaded, lists, q))
 }
 
-/// True when a name table (`u32 size`, NUL-separated strings) ends at `p`.
-fn name_table_ends_at(b: &[u8], p: usize, floor: usize) -> bool {
-    if p == 0 || b[p - 1] != 0 {
-        return false;
+/// A read position in the file.
+struct Cur<'a> {
+    b: &'a [u8],
+    p: usize,
+}
+
+impl<'a> Cur<'a> {
+    fn u32(&mut self) -> Option<u32> {
+        let v = u32_at(self.b, self.p)?;
+        self.p += 4;
+        Some(v)
     }
-    (1..=0x10000usize).take_while(|l| p >= floor + 4 + l).any(|l| u32_at(b, p - 4 - l) == Some(l as u32) && b[p - l..p].iter().all(|&c| c == 0 || (0x20..0x7f).contains(&c)))
-}
-
-/// The effect's own variable table inside its body.
-fn effect_table(body: &[u8]) -> Option<Table> {
-    (0..body.len().saturating_sub(16)).filter(|&k| body[k..k + 4] == [0, 0, 0, 0x80]).find_map(|k| {
-        let (t, _) = table_at(body, k + 4)?;
-        let all: Vec<&Var> = t.resources.iter().chain(&t.members).collect();
-        (!all.is_empty() && all.iter().filter(|v| v.name == v.alias).count() * 2 >= all.len()).then_some(t)
-    })
-}
-
-/// The technique and pass tables inside an effect's body, named from the
-/// name table that follows them.
-fn techniques(body: &[u8], lists: &[Vec<u32>; 6]) -> Vec<Technique> {
-    let ident = |at: usize| body.get(at).is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_');
-    for q in 0..body.len().saturating_sub(12) {
-        let Some(nt) = u32_at(body, q).map(|n| n as usize).filter(|n| (1..=400).contains(n)) else { continue };
-        let Some(ents) = (0..nt).map(|k| u32_at(body, q + 4 + 4 * k)).collect::<Option<Vec<u32>>>() else { continue };
-        let (off, first, count) = (|e: u32| (e & 0x7fff) as usize, |e: u32| ((e >> 15) & 0x1ff) as usize, |e: u32| (e >> 24) as usize);
-        let np = ents.iter().map(|&e| count(e)).sum::<usize>();
-        let mut next = 0;
-        let in_order = ents.iter().all(|&e| {
-            let ok = first(e) == next & 0x1ff;
-            next += count(e);
-            ok
-        });
-        if off(ents[0]) != 1 || !in_order || np == 0 || ents.windows(2).any(|w| off(w[1]) <= off(w[0])) || u32_at(body, q + 4 + 4 * nt) != Some(np as u32) {
-            continue;
-        }
-        let pq = q + 8 + 4 * nt;
-        let Some(passes) = body.get(pq..pq + 24 * np) else { continue };
-        if passes.chunks_exact(24).any(|x| (0..6).any(|j| x[j] as usize > lists[j].len())) || !passes.chunks_exact(24).any(|x| x[..6].iter().any(|&b| b != 0)) {
-            continue;
-        }
-        // the name table: `u32 size`, strings; every name offset must start an identifier right after a NUL
-        let mut need: Vec<usize> = ents.iter().map(|&e| off(e)).chain(passes.chunks_exact(24).map(|x| u16::from_le_bytes([x[14], x[15]]) as usize)).collect();
-        need.sort_unstable();
-        let Some(names) = (pq + 24 * np + 4..body.len()).find_map(|st| {
-            let l = u32_at(body, st - 4)? as usize;
-            let t = body.get(st..st + l)?;
-            (t.first() == Some(&0) && *need.last()? < l && need.iter().all(|&o| o >= 1 && t[o - 1] == 0 && ident(st + o))).then_some(t)
-        }) else { continue };
-        let name = |o: usize| String::from_utf8_lossy(&names[o..o + names[o..].iter().position(|&c| c == 0).unwrap_or(0)]).into_owned();
-        let mut it = passes.chunks_exact(24);
-        return ents
-            .iter()
-            .map(|&e| Technique {
-                name: name(off(e)),
-                passes: it
-                    .by_ref()
-                    .take(count(e))
-                    .map(|x| Pass { name: name(u16::from_le_bytes([x[14], x[15]]) as usize), programs: std::array::from_fn(|j| x[j].checked_sub(1)), flags: x[6..14].try_into().unwrap() })
-                    .collect(),
-            })
-            .collect();
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let s = self.b.get(self.p..self.p.checked_add(n)?)?;
+        self.p += n;
+        Some(s)
     }
-    Vec::new()
+    /// `u32 count` and `count` items of `size` bytes.
+    fn items(&mut self, size: usize) -> Option<&'a [u8]> {
+        let n = self.u32()? as usize;
+        self.take(n.checked_mul(size)?)
+    }
+    /// `u32 size` and `size` bytes.
+    fn sized(&mut self) -> Option<&'a [u8]> {
+        let n = self.u32()? as usize;
+        self.take(n)
+    }
 }
 
-/// Reads the program sections and the effect records from the bytes of
-/// `shaders.rpf`.
-pub fn read(b: &[u8]) -> Result<Shaders> {
-    // the first program record: its magic, then back to its name length; the section count is the u32 before it
-    let first = b.windows(4).position(|w| w == MAGIC).ok_or_else(|| anyhow!("no shader program record found"))?;
-    let start = (first.saturating_sub(262)..first.saturating_sub(6)).rev().find(|&s| b[s] as usize + 6 == first - s && name_at(b, s).is_some()).ok_or_else(|| anyhow!("first program record does not parse"))?;
-    let mut out = Shaders::default();
-    let mut p = start.checked_sub(4).ok_or_else(|| anyhow!("no section count"))?;
+/// An effect record at `p`: the effect and the offset after it.
+fn effect_at(b: &[u8], p: usize, counts: &[usize; 6], database: usize) -> Option<(Effect, usize)> {
+    let (name, loaded_size, programs, body) = effect_header(b, p, counts)?;
+    let mut c = Cur { b, p: body };
+    let header = c.take(0x50)?.to_vec();
+    let split = |s: &[u8], n: usize| s.chunks_exact(n).map(<[u8]>::to_vec).collect::<Vec<_>>();
+    let states = States { rasterizer: split(c.items(16)?, 16), depth_stencil: split(c.items(24)?, 24), blend: split(c.items(0x44)?, 0x44), samplers: split(c.items(0x24)?, 0x24) };
+    let word = |s: &[u8]| s.chunks_exact(4).map(|x| u32::from_le_bytes(x.try_into().unwrap())).collect::<Vec<u32>>();
+    let (ents, passes, extra) = (word(c.items(4)?), c.items(24)?, word(c.items(4)?));
+    let mut loaded = 8 * programs.iter().map(|l| l.len() + 1).sum::<usize>() + 8 * ents.len() + 32 * (passes.len() / 24) + 4 * extra.len();
+    // a block that every effect of the install leaves to the database (`0x80000000`)
+    let first = c.u32()?;
+    if first != SHARED {
+        loaded += c.take(first as usize)?.len();
+    }
+    let at = c.p;
+    loaded += c.sized()?.len();
+    let table = table_at(b, at).filter(|(t, end)| *end == c.p && !(t.resources.is_empty() && t.members.is_empty())).map(|x| x.0);
+    loaded += c.sized()?.len();
+    let count = c.u32()?;
+    let n = (count & 0xff_ffff) as usize;
+    if n > 0 {
+        loaded = loaded.next_multiple_of(8) + 8 * n;
+    }
+    let mut blocks = Vec::new();
+    for _ in 0..n {
+        let size = c.u32()?;
+        if size == SHARED {
+            blocks.push(Block::Shared(c.u32()?));
+        } else {
+            blocks.push(Block::Inline(c.p, c.take(size as usize)?.len()));
+            loaded += size as usize;
+        }
+    }
+    let names = c.sized()?;
+    loaded += names.len();
+    let name_of = |o: usize| -> Option<String> {
+        let s = names.get(o..)?;
+        Some(String::from_utf8_lossy(&s[..s.iter().position(|&x| x == 0)?]).into_owned())
+    };
+    // a technique: bits 0..14 name offset, 15..23 index of its first pass (it wraps: the passes simply follow one another), 24..31 pass count
+    let mut it = passes.chunks_exact(24);
+    let techniques = ents
+        .iter()
+        .map(|&e| {
+            let passes = it
+                .by_ref()
+                .take((e >> 24) as usize)
+                .map(|x| Some(Pass { name: name_of(u16::from_le_bytes([x[14], x[15]]) as usize)?, programs: std::array::from_fn(|j| x[j].checked_sub(1)), flags: x[6..14].try_into().unwrap(), tail: x[16..24].try_into().unwrap() }))
+                .collect::<Option<Vec<_>>>()?;
+            Some(Technique { name: name_of((e & 0x7fff) as usize)?, passes })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((Effect { name, database, programs, table, techniques, loaded_size, loaded_size_computed: loaded as u32, header, states, extra, blocks, block_flags: (count >> 24) as u8 }, c.p))
+}
+
+/// A database at `p` (its magic): reads its programs and effects into
+/// `out` and gives the offset after it. None when `p` is not a database; an
+/// error when one starts there and a program record does not parse.
+fn database_at(b: &[u8], p: usize, out: &mut Shaders) -> Option<Result<usize>> {
+    let mut c = Cur { b, p };
+    if c.take(4)? != DATABASE {
+        return None;
+    }
+    let mut db = Database { offset: p, id: u64::from_le_bytes(c.take(8)?.try_into().ok()?), ..Default::default() };
+    for _ in 0..c.u32()? {
+        let at = c.p + 4;
+        let s = c.sized()?;
+        db.shared_blocks.push((at, s.len()));
+        db.shared_keys.push(u32_at(s, 16)?);
+    }
+    let at = c.p;
+    c.sized()?;
+    db.table = table_at(b, at).filter(|x| x.1 == c.p).map(|x| x.0);
+    // it is a database when its first section count and, if there is one, its first program parse
+    let n0 = u32_at(b, c.p)? as usize;
+    if n0 > 0 {
+        program_at(b, c.p + 4, 0)?;
+    }
+    let mut p = c.p;
     for s in 0..6 {
-        let n = u32_at(b, p).ok_or_else(|| anyhow!("section {s}: truncated"))? as usize;
+        let Some(n) = u32_at(b, p).map(|n| n as usize) else { return Some(Err(anyhow!("database at {:#x}: section {s} is cut short", db.offset))) };
         p += 4;
-        out.sections[s] = (out.programs.len(), n);
+        db.sections[s] = (out.programs.len(), n);
         for i in 0..n {
-            let (prog, next) = program_at(b, p, s as u8).ok_or_else(|| anyhow!("section {s}: program {i} at {p:#x} does not parse"))?;
+            let Some((prog, next)) = program_at(b, p, s as u8) else { return Some(Err(anyhow!("database at {:#x}: section {s} program {i} at {p:#x} does not parse", db.offset))) };
             out.programs.push(prog);
             p = next;
         }
     }
-    let counts = out.sections.map(|s| s.1);
-    out.effects_stated = u32_at(b, p).ok_or_else(|| anyhow!("no effect count"))? as usize;
+    let counts = db.sections.map(|s| s.1);
+    let Some(stated) = u32_at(b, p) else { return Some(Err(anyhow!("database at {:#x}: no effect count", db.offset))) };
     p += 4;
-    let mut cur = effect_header(b, p, &counts).map(|h| (p, h));
-    while let Some((_, (name, programs, body))) = cur.take() {
-        // the next record: the nearest position after this body whose header parses and that a name table ends at
-        let limit = (body + (64 << 20)).min(b.len());
-        let next = if out.effects.len() + 1 >= out.effects_stated { None } else { (body + 1..limit).find_map(|q| if b[q - 1] == 0 && b[q] >= 2 { effect_header(b, q, &counts).filter(|_| name_table_ends_at(b, q, body)).map(|h| (q, h)) } else { None }) };
-        let end = next.as_ref().map_or(limit.min(body + (4 << 20)), |n| n.0);
-        let techniques = if programs.iter().all(Vec::is_empty) { Vec::new() } else { techniques(&b[body..end], &programs) };
-        out.effects.push(Effect { name, table: effect_table(&b[body..end]), techniques, programs });
-        cur = next;
+    db.effects_stated = stated as usize;
+    db.effects.0 = out.effects.len();
+    // an effect that does not parse ends the list: `effects.1` then stays below `effects_stated`
+    for _ in 0..db.effects_stated {
+        let Some((e, next)) = effect_at(b, p, &counts, out.databases.len()) else { break };
+        out.effects.push(e);
+        p = next;
+    }
+    db.effects.1 = out.effects.len() - db.effects.0;
+    out.databases.push(db);
+    Some(Ok(p))
+}
+
+/// Reads every shader database from the bytes of `shaders.rpf`.
+pub fn read(b: &[u8]) -> Result<Shaders> {
+    let mut out = Shaders::default();
+    let mut p = 0;
+    while let Some(at) = b.get(p..).and_then(|s| s.windows(4).position(|w| w == DATABASE)).map(|i| p + i) {
+        p = match database_at(b, at, &mut out) {
+            Some(end) => end?.max(at + 4),
+            None => at + 4,
+        };
+    }
+    if out.databases.is_empty() {
+        return Err(anyhow!("no shader database found"));
     }
     Ok(out)
 }
@@ -424,7 +617,7 @@ pub struct ParamIndex {
     pub effects: BTreeMap<String, BTreeMap<String, (u8, String)>>,
 }
 
-const PARAM_INDEX_VERSION: u32 = 1;
+const PARAM_INDEX_VERSION: u32 = 2;
 
 impl ParamIndex {
     pub fn build(sh: &Shaders) -> ParamIndex {
@@ -663,45 +856,118 @@ mod tests {
         v.extend(t);
         v
     }
-    fn effect(name: &str, lists: [&[u32]; 6], body: &[u8], names: &[u8]) -> Vec<u8> {
+    /// What follows an effect's program lists.
+    struct Body<'a> {
+        states: [(usize, usize); 4],
+        techniques: &'a [u32],
+        passes: &'a [Vec<u8>],
+        extra: &'a [u32],
+        table: &'a [u8],
+        second: &'a [u8],
+        blocks: &'a [Result<&'a [u8], u32>],
+        names: &'a [u8],
+    }
+    fn effect(name: &str, loaded: u32, lists: [&[u32]; 6], x: &Body) -> Vec<u8> {
         let mut v = vec![name.len() as u8 + 1];
         v.extend(name.bytes());
-        v.extend([0, 1, 2, 3, 4]);
+        v.push(0);
+        v.extend(loaded.to_le_bytes());
         for l in lists {
             v.extend((l.len() as u32).to_le_bytes());
             v.extend(l.iter().flat_map(|x| x.to_le_bytes()));
         }
-        v.extend(body);
-        v.extend((names.len() as u32).to_le_bytes());
-        v.extend(names);
+        v.extend([9u8; 0x50]);
+        for (k, (n, size)) in x.states.iter().enumerate() {
+            v.extend((*n as u32).to_le_bytes());
+            v.extend((0..n * size).map(|i| (k * 16 + i / size) as u8));
+        }
+        v.extend((x.techniques.len() as u32).to_le_bytes());
+        v.extend(x.techniques.iter().flat_map(|t| t.to_le_bytes()));
+        v.extend((x.passes.len() as u32).to_le_bytes());
+        v.extend(x.passes.iter().flatten());
+        v.extend((x.extra.len() as u32).to_le_bytes());
+        v.extend(x.extra.iter().flat_map(|t| t.to_le_bytes()));
+        v.extend(SHARED.to_le_bytes());
+        v.extend(x.table);
+        v.extend((x.second.len() as u32).to_le_bytes());
+        v.extend(x.second);
+        v.extend((x.blocks.len() as u32 | 4 << 24).to_le_bytes());
+        for b in x.blocks {
+            match b {
+                Ok(bytes) => {
+                    v.extend((bytes.len() as u32).to_le_bytes());
+                    v.extend(*bytes);
+                }
+                Err(key) => {
+                    v.extend(SHARED.to_le_bytes());
+                    v.extend(key.to_le_bytes());
+                }
+            }
+        }
+        v.extend((x.names.len() as u32).to_le_bytes());
+        v.extend(x.names);
+        v
+    }
+    fn database(id: u64, shared: &[u32], sections: [&[Vec<u8>]; 6], effects: &[Vec<u8>]) -> Vec<u8> {
+        let mut v = DATABASE.to_vec();
+        v.extend(id.to_le_bytes());
+        v.extend((shared.len() as u32).to_le_bytes());
+        for key in shared {
+            v.extend(24u32.to_le_bytes());
+            v.extend([0u8; 16]);
+            v.extend(key.to_le_bytes());
+            v.extend([0u8; 4]);
+        }
+        v.extend(table(&[var(0x23, 4, 1, 0, 0, 0, 0x91, 0x91)], &[], &[0]));
+        for s in sections {
+            v.extend((s.len() as u32).to_le_bytes());
+            v.extend(s.iter().flatten());
+        }
+        v.extend((effects.len() as u32).to_le_bytes());
+        v.extend(effects.iter().flatten());
         v
     }
 
     #[test]
-    fn programs_effects_and_their_tables() {
+    fn databases_programs_effects_and_their_tables() {
         // a pixel program: one texture, one constant buffer of 0x20 bytes with two members (its record is 1 before the first member)
         let t = table(&[var(0x02, 1, 237, 0x200, 0, 0, 0x11, 0x11), var(0x30, 4, 4, 2 | 0x82 << 8 | 24 << 16, 0, 0x20, 0x22, 0x22)], &[var(0x09, 0, 0, 0, 0, 0, 0x31, 0x31), var(0x0c, 0, 0, 0x10, 0, 0, 0x32, 0x32)], &[0]);
         let empty = table(&[], &[], &[0]);
         // the effect's table: a material texture in slot 3 (an array) whose parameter name differs, and a named sampler
         let et = table(&[var(0x42, 1, 0x203, 0x8000, 0, 0, 0x41, 0x42), var(0x23, 4, 5, 0x4000, 25, 0, 0x51, 0x51)], &[], b"\0DiffuseSampler\0");
-        let mut b = vec![0xffu8; 7];
-        b.extend(1u32.to_le_bytes());
-        b.extend(program("VS_A_00000001_Wrapped", &empty));
-        b.extend(2u32.to_le_bytes());
-        b.extend(program("PS_A_00000001_Wrapped", &t));
-        b.extend(program("PS_B_00000002_Wrapped", &empty));
-        for _ in 0..4 {
-            b.extend(0u32.to_le_bytes());
-        }
-        b.extend(2u32.to_le_bytes());
+        // a pass: six program bytes, three state indices, stencil reference, the bits that say which are set, three more bytes, name offset, eight bytes
+        let pass = |progs: [u8; 6], state: [u8; 5], name: u16| [progs.to_vec(), state.to_vec(), vec![0xff, 0, 0], name.to_le_bytes().to_vec(), vec![3u8; 8]].concat();
         // two techniques: `draw` (one pass, vertex 1 + pixel 2) and `depth` (two passes)
-        let pass = |progs: [u8; 6], name: u16| [progs.to_vec(), vec![0, 0, 0, 0, 0, 0xff, 0, 0], name.to_le_bytes().to_vec(), vec![0u8; 8]].concat();
-        let tech = [2u32.to_le_bytes().to_vec(), (1u32 | 0 << 15 | 1 << 24).to_le_bytes().to_vec(), (6u32 | 1 << 15 | 2 << 24).to_le_bytes().to_vec(), 3u32.to_le_bytes().to_vec(), pass([1, 2, 0, 0, 0, 0], 12), pass([1, 0, 0, 0, 0, 0], 12), pass([0, 1, 0, 0, 0, 0], 15)].concat();
-        let body = [vec![9u8; 40], tech, 0x8000_0000u32.to_le_bytes().to_vec(), et].concat();
-        b.extend(effect("standard", [&[0], &[0, 1], &[], &[], &[], &[]], &body, b"\0draw\0depth\0p0\0p1\0"));
-        b.extend(effect("stub", [&[], &[1], &[], &[], &[], &[]], &[0u8; 30], b"\0"));
+        let standard = effect(
+            "standard",
+            306,
+            [&[0], &[0, 1], &[], &[], &[], &[]],
+            &Body {
+                states: [(2, 16), (1, 24), (3, 0x44), (1, 0x24)],
+                techniques: &[1 | 0 << 15 | 1 << 24, 6 | 1 << 15 | 2 << 24],
+                passes: &[pass([1, 2, 0, 0, 0, 0], [1, 0, 2, 7, 1 | 4 | 8], 12), pass([1, 0, 0, 0, 0, 0], [0, 0, 0, 0, 2], 12), pass([0, 1, 0, 0, 0, 0], [0; 5], 15)],
+                extra: &[5],
+                table: &et,
+                second: &[1, 2, 3],
+                blocks: &[Err(0xabcd), Ok(&[7u8; 8][..])],
+                names: b"\0draw\0depth\0p0\0p1\0",
+            },
+        );
+        let none = Body { states: [(0, 16), (0, 24), (0, 0x44), (0, 0x24)], techniques: &[], passes: &[], extra: &[], table: &empty, second: &[], blocks: &[], names: b"\0" };
+        let stub = effect("stub", 0, [&[], &[1], &[], &[], &[], &[]], &none);
+        let mut b = vec![0xffu8; 7];
+        b.extend(database(0x1122, &[0x99, 0xabcd], [&[program("VS_A_00000001_Wrapped", &empty)], &[program("PS_A_00000001_Wrapped", &t), program("PS_B_00000002_Wrapped", &empty)], &[], &[], &[], &[]], &[standard, stub]));
+        // the magic alone is not a database
+        b.extend(DATABASE);
+        b.extend([0xffu8; 40]);
+        // a second database: its effects count programs from its own sections
+        let one = Body { techniques: &[1 | 1 << 24], passes: &[pass([0, 1, 0, 0, 0, 0], [0; 5], 6)], names: b"\0draw\0p0\0", ..none };
+        b.extend(database(0x3344, &[], [&[], &[program("PS_C_00000003_Wrapped", &empty)], &[], &[], &[], &[]], &[effect("im", 0, [&[], &[0], &[], &[], &[], &[]], &one)]));
         let s = read(&b).unwrap();
-        assert_eq!((s.programs.len(), s.sections[1], s.effects_stated, s.effects.len()), (3, (1, 2), 2, 2));
+        assert_eq!((s.programs.len(), s.databases.len(), s.effects_stated(), s.effects.len(), s.section_total(1)), (4, 2, 3, 3, 3));
+        let d = &s.databases;
+        assert_eq!((d[0].offset, d[0].id, d[0].sections[1], d[0].effects, d[1].id, d[1].sections[1], d[1].effects), (7, 0x1122, (1, 2), (0, 2), 0x3344, (3, 1), (2, 1)));
+        assert_eq!((d[0].shared_block(0xabcd), d[0].shared_block(1), d[0].shared_blocks[1].1, d[0].table.as_ref().unwrap().resources[0].name), (Some(1), None, 24, 0x91));
         let p = &s.programs[1];
         assert_eq!((p.name.as_str(), p.section, p.id, p.mask, p.data.1), ("PS_A_00000001_Wrapped", 1, 7, 1, 5));
         assert_eq!((p.table.resources[0].resource_kind().as_str(), p.table.resources[0].index, p.table.resources[1].is_cbuffer(), p.table.resources[1].c), ("texture", 237, true, 0x20));
@@ -719,15 +985,28 @@ mod tests {
         assert_eq!((ix.kind(&e, "00000072"), ix.kind(&e, "00000071"), ix.kind(&e, "00000073"), ix.kind(&e, "00000099"), ix.kind("00000000", "00000072")), (Some(1), Some(1), Some(0x0c), None, None));
         assert!(p.table.members_of(0).is_empty());
         let e = &s.effects[0];
-        assert_eq!((e.name.as_str(), e.programs[1].as_slice(), s.effects[1].name.as_str(), s.effects[1].table.is_none()), ("standard", &[0u32, 1][..], "stub", true));
+        assert_eq!((e.name.as_str(), e.database, e.programs[1].as_slice(), s.effects[1].name.as_str(), s.effects[1].table.is_none()), ("standard", 0, &[0u32, 1][..], "stub", true));
+        assert_eq!((e.loaded_size, e.loaded_size_computed, e.header.len(), e.extra.as_slice(), e.block_flags), (306, 306, 0x50, &[5u32][..], 4));
+        assert_eq!((e.states.rasterizer.len(), e.states.depth_stencil[0].len(), e.states.blend[2][0], e.states.samplers.len()), (2, 24, 34, 1));
+        assert_eq!((e.blocks[0], matches!(e.blocks[1], Block::Inline(at, 8) if b[at..at + 8] == [7u8; 8])), (Block::Shared(0xabcd), true));
         let et = e.table.as_ref().unwrap();
         assert_eq!((et.resources[0].material_texture(), et.resources[0].name, et.resources[0].alias, et.resources[1].material_texture()), (Some((3, true)), 0x41, 0x42, None));
         assert_eq!((et.sampler_name(1), et.sampler_name(0)), (Some("DiffuseSampler"), None));
         let t = &e.techniques;
         assert_eq!((t.len(), t[0].name.as_str(), t[0].passes.len(), t[1].name.as_str(), t[1].passes.len()), (2, "draw", 1, "depth", 2));
-        assert_eq!((t[0].passes[0].name.as_str(), t[0].passes[0].programs, t[0].passes[0].flags[5]), ("p0", [Some(0), Some(1), None, None, None, None], 0xff));
-        assert_eq!((t[1].passes[1].name.as_str(), t[1].passes[1].programs[1]), ("p1", Some(0)));
+        let ps = &t[0].passes[0];
+        assert_eq!((ps.name.as_str(), ps.programs, ps.flags[5], ps.tail), ("p0", [Some(0), Some(1), None, None, None, None], 0xff, [3; 8]));
+        assert_eq!((ps.rasterizer(), ps.depth_stencil(), ps.blend(), ps.stencil_ref()), (Some(1), None, Some(2), Some(7)));
+        assert_eq!((t[1].passes[0].rasterizer(), t[1].passes[0].depth_stencil(), t[1].passes[1].name.as_str(), t[1].passes[1].programs[1]), (None, Some(0), "p1", Some(0)));
         assert!(s.effects[1].techniques.is_empty());
+        // a program number is counted within the effect's own database
+        let im = &s.effects[2];
+        assert_eq!((im.database, s.program(im, 1, 0).map(|x| (x.0, x.1.name.as_str())), s.program(im, 1, 1).is_none(), s.program(e, 1, 1).map(|x| x.1.name.as_str())), (1, Some((3, "PS_C_00000003_Wrapped")), true, Some("PS_B_00000002_Wrapped")));
+        assert_eq!(im.techniques[0].passes[0].name, "p0");
+        // a record that is cut short ends its database's effects, and an archive without a database is an error
+        let cut = read(&b[..b.len() - 3]).unwrap();
+        assert_eq!((cut.effects.len(), cut.databases[1].effects, cut.databases[1].effects_stated), (2, (2, 0), 1));
+        assert!(read(&[0u8; 64]).is_err());
     }
 
     #[test]
