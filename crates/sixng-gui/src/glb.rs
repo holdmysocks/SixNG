@@ -107,6 +107,9 @@ pub struct Material {
     /// emissive material lights, from the GLB's emissive strength
     /// (`emissive_scale`); 1 when the export does not say.
     pub emissive_scale: f32,
+    /// The material lights: its class is `emissive`, or the GLB gives it
+    /// an emissive texture (emissive shaders of other classes).
+    pub lit: bool,
     pub slots: Vec<Slot>,
     /// worst slot status: ok / lowmip / flat
     pub gap: String,
@@ -732,7 +735,11 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
         let mut packed = None;
         let mut occlusion_only = false;
         // The export names the emissive map when the shader has its own.
-        let mut emissive = if class == "emissive" {
+        // Emissive shaders sit in any class (a bulb's emissive layer is
+        // cutout, a neon tube opaque): those light by the GLB's emissive
+        // texture too.
+        let lit = lights(&class, &m);
+        let mut emissive = if lit {
             uri_of(&m["emissiveTexture"]).and_then(|p| add_img(p, true, &mut images))
         } else {
             None
@@ -839,6 +846,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             parts: ex["classification"]["stand_in"] == "parts",
             occlusion_only,
             emissive_scale,
+            lit,
             slots,
             gap: gap.into(),
             shader_hash: ex["shader_name_hash"].as_str().unwrap_or("").into(),
@@ -1233,6 +1241,13 @@ pub fn gltf_emissive_strength(m: &Value) -> f32 {
     (f * x) as f32
 }
 
+/// Whether a material lights: class `emissive`, or any class with an
+/// emissive texture in the GLB (the export sets one only on materials whose
+/// shader lights).
+pub fn lights(class: &str, m: &Value) -> bool {
+    class == "emissive" || m["emissiveTexture"]["index"].is_u64()
+}
+
 /// The viewer's scale for an emissive material, from its glTF strength
 /// (1.0 = 100 nits, from the game's `emissivemultiplier`). The game's
 /// range (a glass railing at 0.05, a bulb at 6, an LED sign at 32) is far
@@ -1342,5 +1357,18 @@ mod emissive_tests {
         assert!((bulb - 6.28f32.sqrt()).abs() < 1e-5);
         assert_eq!(emissive_scale(&m(1.0, Some(32.3))), 3.0);
         assert!((gltf_emissive_strength(&m(1.0, Some(32.3))) - 32.3).abs() < 1e-4);
+    }
+
+    #[test]
+    fn emissive_shaders_of_any_class_light() {
+        let with_map = serde_json::json!({"emissiveFactor": [1.0, 1.0, 1.0], "emissiveTexture": {"index": 2}});
+        let plain = serde_json::json!({"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}});
+        // a bulb's emissive layer is cutout, a neon tube opaque: lit by their map
+        assert!(lights("cutout", &with_map));
+        assert!(lights("opaque", &with_map));
+        // the emissive class lights by its colour map without one
+        assert!(lights("emissive", &plain));
+        assert!(!lights("cutout", &plain));
+        assert!(!lights("alpha", &serde_json::json!({"emissiveTexture": "base"})));
     }
 }

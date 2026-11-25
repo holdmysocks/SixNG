@@ -1493,6 +1493,7 @@ impl Uploader {
             parts: false,
             occlusion_only: false,
             emissive_scale: 1.0,
+            lit: false,
             slots: vec![],
             gap: "ok".into(),
             shader_hash: String::new(),
@@ -1542,6 +1543,9 @@ impl Uploader {
                 | if mt.parts || mt.shader_hash == "e68a4a98" { 0x400 } else { 0 }
                 // bit 11: a lamp's emissive mesh (standard_vehicle_emissive_animated_bones)
                 | if mt.name.ends_with("29648098") { 0x800 } else { 0 }
+                // bit 12: an emissive shader outside the emissive class
+                // (a bulb's emissive layer, a neon tube): lit like class 7
+                | if mt.lit && mt.class != "emissive" { 0x1000 } else { 0 }
                 // bit 13: the packed map is a vehicle material map, blue = occlusion
                 | if mt.occlusion_only { 0x2000 } else { 0 }
                 // bit 14: the emissive slot holds the part ramp image, whose
