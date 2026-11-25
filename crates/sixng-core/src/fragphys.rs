@@ -5,7 +5,11 @@
 //! ```text
 //! root
 //!   +0x10 ptr  archetype (phArchetypeDamp-like, below)
-//!   +0x18 ptr  main drawable
+//!   +0x18 ptr  main drawable; its +0x90 points at the joint limits:
+//!              +0x28 u16 count, +0x2C u16 count again, +0x30 ptr rotation
+//!              limits; +0x38 / +0x3C / +0x40 the same for translation
+//!              limits. Each limit is 0x30 bytes: vec4 min, vec4 max,
+//!              u32 joaat of the bone name, padding (`JointLimit`).
 //!   +0x20 ptr  groups: count x 0x70-byte records (u64 count at ptr - 8)
 //!   +0x28 ptr  children: count x 0x50-byte records (u64 count at ptr - 0x10)
 //!   +0x30 u16  ?, u16 ?, u16 group count, u16 child count
@@ -54,7 +58,7 @@ use serde::Serialize;
 pub const GROUP_SIZE: usize = 0x70;
 pub const CHILD_SIZE: usize = 0x50;
 /// Version of the `physics` block in model.json.
-pub const EXPORT_VERSION: u32 = 2;
+pub const EXPORT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Archetype {
@@ -139,6 +143,47 @@ pub struct Child {
     pub position: Option<[f32; 3]>,
 }
 
+/// One bone's joint limit (drawable +0x90), per axis of the bone's own
+/// frame. Rotation limits are radians: 99.2% of the level values are whole
+/// degrees, and a door's hinge bone has z -pi/2..pi/2. Translation limits
+/// are metres: a 2.09 m sliding door slides 2.09 m, and a 3 m garage door
+/// lifts 3.24 m. The frame is the bone's: the left panels of two-panel
+/// elevator doors have bones turned 180 degrees about z and the same +x
+/// limit as the right panels, so both open outwards (in model axes the
+/// left panel would cross the middle). Rotation w is always -pi / pi and
+/// translation w always 0; neither is exported.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct JointLimit {
+    /// joaat of the bone name.
+    pub bone_hash: u32,
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+}
+
+pub const JOINT_LIMIT_SIZE: usize = 0x30;
+
+/// Rotation and translation limits behind a fragment drawable at `d`.
+/// Empty when the drawable has no joint data or it does not check out.
+pub fn joint_limits(r: &Resource, d: usize) -> (Vec<JointLimit>, Vec<JointLimit>) {
+    let n = r.sys.len();
+    let Some(j) = r.sys_off(r.u64(d + 0x90)).filter(|&j| j + 0x48 <= n) else { return Default::default() };
+    let read = |co: usize, po: usize| -> Vec<JointLimit> {
+        let count = r.u16(j + co) as usize;
+        let Some(t) = r.sys_off(r.u64(j + po)) else { return Vec::new() };
+        if count > 1024 || t + JOINT_LIMIT_SIZE * count > n {
+            return Vec::new();
+        }
+        let v: Vec<JointLimit> = (0..count)
+            .map(|i| {
+                let o = t + JOINT_LIMIT_SIZE * i;
+                JointLimit { bone_hash: r.u32(o + 0x20), min: v3(r, o), max: v3(r, o + 0x10) }
+            })
+            .collect();
+        if v.iter().all(|l| finite(&l.min) && finite(&l.max)) { v } else { Vec::new() }
+    };
+    (read(0x28, 0x30), read(0x38, 0x40))
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct FragPhysics {
     pub archetype: Archetype,
@@ -148,6 +193,8 @@ pub struct FragPhysics {
     pub children: Vec<Child>,
     /// Root floats +0xB8..+0xD8 (meaning unknown; see notes).
     pub root_tail: Vec<f32>,
+    pub rotation_limits: Vec<JointLimit>,
+    pub translation_limits: Vec<JointLimit>,
 }
 
 fn v3(r: &Resource, o: usize) -> [f32; 3] {
@@ -293,6 +340,7 @@ pub fn try_decode(r: &Resource) -> Result<FragPhysics, &'static str> {
     if groups.iter().any(|g| g.parent.is_some_and(|p| p as usize >= ngroups)) || children.iter().any(|c| c.group as usize >= ngroups) {
         return Err("links");
     }
+    let (rotation_limits, translation_limits) = r.sys_off(r.u64(0x18)).filter(|&d| d + 0x98 <= n).map(|d| joint_limits(r, d)).unwrap_or_default();
     Ok(FragPhysics {
         archetype,
         centre_of_gravity: v3(r, 0x60),
@@ -300,6 +348,8 @@ pub fn try_decode(r: &Resource) -> Result<FragPhysics, &'static str> {
         groups,
         children,
         root_tail: (0..9).map(|k| r.f32(0xB8 + 4 * k)).collect(),
+        rotation_limits,
+        translation_limits,
     })
 }
 
@@ -360,6 +410,16 @@ pub const TUNING_NAMES: &[(usize, &str, bool)] = &[
 /// groups are rub_litter roots), 17 (reeds, cattails, corn stalks), 21
 /// (safe keypads only), 25 (bending poles and leaves); word 1 bits 1, 2
 /// and 5 (wooden fences, pickets, crates, cardboard).
+///
+/// Checked against the joint data, bone flags and all 36 tuning values
+/// too, with no exact match for any unnamed bit. Patterns:
+/// - Passed down the group tree: word 0 bits 4, 6, 10, 13, 19, 27, 31 and
+///   word 1 bits 2 and 5 are set on 44-95% of the groups whose parent has
+///   them, and on at most 0.8% of the others.
+/// - Subsets of joints: word 0 bit 21 is on 36 groups, all translation-
+///   limited keypad buttons (1,172 other groups have translation limits);
+///   bit 17 is on 86 groups, 84 with motor_max_torque > 0; bit 25 is on 242
+///   groups, 223 rotation-limited.
 pub const GROUP_FLAGS: &[(usize, u32, &str, bool)] = &[
     (0, 0, "break_when_damaged", true),
     // no preset says true; 91% of the 1,186 groups with it are named
@@ -403,10 +463,16 @@ pub const ROOT_FLAGS: &[(u32, &str, bool)] = &[
     (8, "vegetation", false),
     // only on vehicle fragments
     (10, "vehicle", false),
-    // 99% of the fragments with it have a jointed group (stiffness > 0),
-    // 5% of the others do
-    (20, "has_joints", false),
+    // set on all 11,950 fragments with more than one group and a group that
+    // can break (strength >= 0), and on 80 of the 1,921 multi-group ones
+    // with none; never on single-group fragments. Bits 16 and 24 are set
+    // together on all but one fragment and share the name.
+    (16, "has_breakable_groups", false),
+    // = some group has joint_angle_plastic_deflection (tuning 16) > 0, on
+    // all 40,705 level fragments (1,066 set)
+    (20, "any_group_joint_angle_plastic_deflection", true),
     (21, "any_group_obliterate_at_high_speed", true),
+    (24, "has_breakable_groups", false),
     (22, "any_group_obliterate_at_very_high_speed", true),
     (23, "any_group_break_when_tilted", true),
     (28, "any_group_flag2_1", true),
@@ -434,7 +500,13 @@ pub fn group_flag_names(w: [u32; 2]) -> (Vec<&'static str>, Vec<[u32; 2]>) {
 pub fn root_flag_names(v: u32) -> (Vec<&'static str>, Vec<u32>) {
     let bits = (0..32).filter(|b| v >> b & 1 == 1);
     let (named, rest): (Vec<u32>, Vec<u32>) = bits.partition(|b| ROOT_FLAGS.iter().any(|f| f.0 == *b));
-    (named.iter().filter_map(|b| ROOT_FLAGS.iter().find(|f| f.0 == *b).map(|f| f.1)).collect(), rest)
+    let mut names = Vec::new();
+    for n in named.iter().filter_map(|b| ROOT_FLAGS.iter().find(|f| f.0 == *b).map(|f| f.1)) {
+        if !names.contains(&n) {
+            names.push(n);
+        }
+    }
+    (names, rest)
 }
 
 /// Collision layer bits of the type / include masks (u64: the object is in
@@ -558,6 +630,7 @@ pub fn drawable_bound(r: &Resource) -> Option<serde_json::Value> {
 /// skeleton's bone names by index.
 pub fn fragment_json(p: &FragPhysics, bones: &[String]) -> serde_json::Value {
     let a = &p.archetype;
+    let limits = |v: &[JointLimit]| limits_json(p, bones, v);
     let groups: Vec<serde_json::Value> = p
         .groups
         .iter()
@@ -609,11 +682,23 @@ pub fn fragment_json(p: &FragPhysics, bones: &[String]) -> serde_json::Value {
         "archetype_type_flags": format!("{:016x}", a.type_flags), "archetype_include_flags": format!("{:016x}", a.include_flags),
         "archetype_type_layers": layer_names(a.type_flags), "archetype_include_layers": layer_names(a.include_flags),
         "groups": groups, "children": children,
+        "rotation_limits": limits(&p.rotation_limits), "translation_limits": limits(&p.translation_limits),
         "note": NOTE,
     })
 }
 
-pub const NOTE: &str = "Units: kg, metres, kg m^2; model space is RAGE Z-up. Confirmed: mass (= sum of in-use child masses on every fragment), inertia (= child mass x bound volume distribution), centre_of_gravity, bounding_sphere, the group tree (parent, child_groups, children, bone; name = the bone whose joaat is name_hash), child mass, bound and position (= bone pivot + offset). tuning: names matched against the game's fragment tuning presets (see TUNING_NAMES in the source for which are pinned); tuning_raw keeps all 36 half floats. strength -1 = never breaks off its parent; on group 0 it plausibly frees the whole object from the world (guess). min_move_force (root +0xBC): -1 on trees, gates, signs and poles, small on loose props, 0 on vehicle parts (guess: force needed to start moving, -1 = fixed until broken). gravity_factor, max_speed, max_ang_speed, buoyancy_factor and damping are read in the GTA V archetype order (likely). Group flags (flags = word 0, flags2 = word 1) and root_flags are named in flag_names / root_flag_names from the presets' booleans (see GROUP_FLAGS and ROOT_FLAGS in the source for which are confirmed); bits not named are listed in flag_bits_unnamed. made_of_glass is set on the glass panes of windows and doors. Type/include flags are 64-bit collision layer masks (the layers an object is in / collides with), named in type_layers / include_layers after GTA V's layer order (see LAYERS in the source for which bits were checked against the map collision); the archetype's type mask is the OR of its children's plus bit 0. root_tail is raw. Damaged masses and joint limits are not in the fragment as far as decoded.";
+/// The joint limits of a fragment's bones.
+fn limits_json(p: &FragPhysics, bones: &[String], v: &[JointLimit]) -> serde_json::Value {
+    v.iter()
+        .map(|l| {
+            let name = bones.iter().find(|b| crate::meta7a::joaat(b) == l.bone_hash);
+            let group = p.groups.iter().find(|g| g.name_hash == format!("{:08x}", l.bone_hash)).map(|g| g.index);
+            serde_json::json!({"bone_name": name, "bone_hash": format!("{:08x}", l.bone_hash), "group": group, "min": l.min, "max": l.max})
+        })
+        .collect()
+}
+
+pub const NOTE: &str = "Units: kg, metres, kg m^2; model space is RAGE Z-up. Confirmed: mass (= sum of in-use child masses on every fragment), inertia (= child mass x bound volume distribution), centre_of_gravity, bounding_sphere, the group tree (parent, child_groups, children, bone; name = the bone whose joaat is name_hash), child mass, bound and position (= bone pivot + offset). tuning: names matched against the game's fragment tuning presets (see TUNING_NAMES in the source for which are pinned); tuning_raw keeps all 36 half floats. strength -1 = never breaks off its parent; on group 0 it plausibly frees the whole object from the world (guess). min_move_force (root +0xBC): -1 on trees, gates, signs and poles, small on loose props, 0 on vehicle parts (guess: force needed to start moving, -1 = fixed until broken). gravity_factor, max_speed, max_ang_speed, buoyancy_factor and damping are read in the GTA V archetype order (likely). Group flags (flags = word 0, flags2 = word 1) and root_flags are named in flag_names / root_flag_names from the presets' booleans (see GROUP_FLAGS and ROOT_FLAGS in the source for which are confirmed); bits not named are listed in flag_bits_unnamed. made_of_glass is set on the glass panes of windows and doors. Type/include flags are 64-bit collision layer masks (the layers an object is in / collides with), named in type_layers / include_layers after GTA V's layer order (see LAYERS in the source for which bits were checked against the map collision); the archetype's type mask is the OR of its children's plus bit 0. root_tail is raw. rotation_limits / translation_limits: per-bone joint limits from the main drawable (min / max per axis of the bone frame; rotation in radians, translation in metres; checked on doors, sliding doors and elevator doors); the bone is the group whose name_hash matches (on 98% of level limits), and a fragment has one rotation limit per bone flagged rotation-limited in the skeleton (96%). Damaged masses are not in the fragment as far as decoded.";
 
 /// Facts about a model's map archetype definition, from
 /// `<work>/index/archetype_lod.jsonl` (`sixng lod-links`), joined with the
@@ -811,6 +896,18 @@ mod tests {
             ptr(&mut r, c + 0x30, [0x900, 0x980, 0xA00][i]);
             h(&mut r, c + 0x48, &[group, index]);
         }
+        // main drawable with joint data: the arm turns about z, slides along x
+        ptr(&mut r, 0x18, 0xC00);
+        ptr(&mut r, 0xC90, 0xD00);
+        h(&mut r, 0xD28, &[1, 0, 1]);
+        ptr(&mut r, 0xD30, 0xE00);
+        h(&mut r, 0xD38, &[1, 0, 1]);
+        ptr(&mut r, 0xD40, 0xE40);
+        let pi = std::f32::consts::PI;
+        f(&mut r, 0xE00, &[0.0, 0.0, -1.5708, -pi, 0.0, 0.0, 1.5708, pi]);
+        put(&mut r, 0xE20, &crate::meta7a::joaat("arm").to_le_bytes());
+        f(&mut r, 0xE40, &[0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0]);
+        put(&mut r, 0xE60, &crate::meta7a::joaat("arm").to_le_bytes());
         r
     }
 
@@ -849,6 +946,11 @@ mod tests {
         assert_eq!(j["groups"][1]["children"], serde_json::json!([2]));
         assert_eq!(j["groups"][0]["children"], serde_json::json!([0]));
         assert_eq!(j["children"][0]["bound"]["type_name"], "box");
+        assert_eq!(p.rotation_limits, vec![JointLimit { bone_hash: crate::meta7a::joaat("arm"), min: [0.0, 0.0, -1.5708], max: [0.0, 0.0, 1.5708] }]);
+        assert_eq!(p.translation_limits[0].max, [0.5, 0.0, 0.0]);
+        assert_eq!(j["rotation_limits"][0]["bone_name"], "arm");
+        assert_eq!(j["rotation_limits"][0]["group"], 1);
+        assert_eq!(j["translation_limits"][0]["max"], serde_json::json!([0.5, 0.0, 0.0]));
         // a group whose name hash does not match its bone gets no name
         assert!(fragment_json(&p, &["other".into(), "arm".into()])["groups"][0]["name"].is_null());
     }
@@ -860,9 +962,10 @@ mod tests {
         assert_eq!(n, ["disable_map_collision_until_break", "collide_convex_against_ground_or_larger_bounds"]);
         assert_eq!(rest, [[0, 13]]);
         // a fallen-log fragment's root flags
-        let (n, rest) = root_flag_names(0x4103_0169);
-        assert_eq!(n, ["any_group_disable_map_collision_until_break", "vegetation"]);
-        assert_eq!(rest, [0, 5, 6, 16, 17, 24, 30]);
+        let (n, rest) = root_flag_names(0x4113_0169);
+        // bits 16 and 24 share one name, given once
+        assert_eq!(n, ["any_group_disable_map_collision_until_break", "vegetation", "has_breakable_groups", "any_group_joint_angle_plastic_deflection"]);
+        assert_eq!(rest, [0, 5, 6, 17, 30]);
     }
 
     #[test]
