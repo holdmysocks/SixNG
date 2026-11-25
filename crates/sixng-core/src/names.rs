@@ -1008,20 +1008,29 @@ fn pack_search(packs: &[String], words: &[String], banks: &BTreeMap<u64, u32>, g
 }
 
 /// Replace the `banks` names of `d` with the bank names of `banks` (bank
-/// offset -> container hash). Returns (banks with a container, banks named).
+/// offset -> container hash) and add the names of the bank-list groups.
+/// Returns counts, and each named group with its bank-list entries.
 pub fn set_bank_names(d: &mut Dict, extra: &[String], banks: &BTreeMap<u64, u32>, stream_names: &BTreeMap<u64, BTreeMap<u32, String>>, groups: &BTreeMap<u32, u32>) -> serde_json::Value {
     for v in d.names.values_mut() {
         v.retain(|(_, s)| s != "banks");
     }
     d.names.retain(|_, v| !v.is_empty());
     let found = find_bank_names(d, extra, banks, stream_names, groups);
-    for (_, h, n) in &found {
+    // the bank-list groups, by name, with their entry counts
+    let (packs, words) = audio_words(d, extra);
+    let gnames = find_group_names(&packs, &words, &groups.values().copied().collect());
+    let mut entries: BTreeMap<u32, usize> = BTreeMap::new();
+    for g in groups.values() {
+        *entries.entry(*g).or_default() += 1;
+    }
+    let named_groups: BTreeMap<&str, usize> = gnames.iter().map(|(h, n)| (n.as_str(), entries.get(h).copied().unwrap_or(0))).collect();
+    for (h, n) in gnames.iter().map(|(h, n)| (*h, n.clone())).chain(found.iter().map(|(_, h, n)| (*h, n.clone()))).collect::<Vec<_>>() {
         let e = d.names.entry(format!("{h:08x}")).or_default();
-        if !e.iter().any(|(x, s)| x == n && s == "banks") {
-            e.push((n.clone(), "banks".into()));
+        if !e.iter().any(|(x, s)| *x == n && s == "banks") {
+            e.push((n, "banks".into()));
         }
     }
-    serde_json::json!({"banks": banks.len(), "named": found.len(), "banks_with_stream_names": stream_names.len(), "stream_names": stream_names.values().map(|m| m.len()).sum::<usize>()})
+    serde_json::json!({"banks": banks.len(), "named": found.len(), "banks_with_stream_names": stream_names.len(), "stream_names": stream_names.values().map(|m| m.len()).sum::<usize>(), "groups": entries.len(), "groups_named": named_groups})
 }
 
 /// `<work>/index/audio_stream_names_<archive>.json`: bank offset (hex) ->
@@ -1174,6 +1183,10 @@ mod tests {
         let found: Vec<(u64, String)> = find_bank_names(&d, &[], &banks, &BTreeMap::new(), &groups).into_iter().map(|(o, _, n)| (o, n)).collect();
         // `lone_07` has no second suffix and no plain bank: not kept
         assert_eq!(found, [(0x1000, "core.pack/bell".into()), (0x3000, "core.pack/horn_01".into()), (0x5000, "core.pack/horn_02".into()), (0x8000, "core.pack/bell_b".into())]);
+        // the group's name is reported with its entries and joins the dictionary
+        let r = set_bank_names(&mut d, &[], &banks, &BTreeMap::new(), &groups);
+        assert_eq!((r["groups"].as_u64(), r["groups_named"]["pack.sub"].as_u64()), (Some(1), Some(8)));
+        assert_eq!(d.names[&format!("{g:08x}")], [("pack.sub".to_string(), "banks".to_string())]);
     }
     #[test]
     fn text_word_forms() {
