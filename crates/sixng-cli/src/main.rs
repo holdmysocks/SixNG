@@ -176,6 +176,20 @@ enum Cmd {
         #[arg(long)]
         no_names: bool,
     },
+    /// Read an archive's table of contents: columns and file entries; archives stored inside it are followed. Windows x64 only; needs the game executable in the game folder. No index needed.
+    Toc {
+        archive: String,
+        /// List every file entry (offset, sizes, flags, key id).
+        #[arg(long)]
+        files: bool,
+    },
+    /// Extract the files the carving index cannot read (a few hundred metadata files), using the table of contents: <out>/toc_files/<archive>[@offset]/<offset>.<ext> + index.jsonl. Each file is checked against its zlib checksums and the size in the table. Same requirements as `toc`. Without archives, all of them.
+    TocExtract {
+        archives: Vec<String>,
+        /// Output directory.
+        #[arg(long, short)]
+        out: PathBuf,
+    },
     /// List entries of an indexed archive.
     List {
         archive: String,
@@ -1120,6 +1134,85 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 res.push(json!({"archive": a.id, "seconds": t.elapsed().as_secs_f64(), "stats": ix.stats, "named_entries": named}));
             }
             out.print(&json!({"ok": true, "indexed": res}));
+        }
+        Cmd::Toc { archive, files } => {
+            let a = ws.resolve(archive)?;
+            let mut cipher = sixng_core::gamecipher::open(&game)?;
+            let mut f = std::fs::File::open(&a.path)?;
+            let mut list = Vec::new();
+            toc_walk(cipher.as_mut(), &mut f, 0, &mut |_, _, base, toc, entries| {
+                let enc: Vec<_> = entries.iter().filter(|e| e.crypto.is_some()).collect();
+                let mut v = json!({
+                    "base": base, "rows": toc.rows, "index_width": toc.index_width, "selector": toc.selector,
+                    "columns": toc.columns, "known_entry_column": toc.has_entries(),
+                    "files": entries.len(), "protected": enc.len(),
+                    "protected_stored_bytes": enc.iter().map(|e| e.stored).sum::<u64>(),
+                });
+                if *files {
+                    v["entries"] = entries.iter().map(|e| json!({
+                        "row": e.row, "offset": e.offset, "stored": e.stored, "unpacked": e.unpacked, "flags": e.flags,
+                        "key_id": e.crypto.as_ref().map(|c| format!("{:08x}", c.key_id)),
+                        "pattern": e.crypto.as_ref().map(|c| c.pattern),
+                    })).collect();
+                }
+                list.push(v);
+                Ok(())
+            })?;
+            out.print(&json!({"ok": true, "archive": a.id, "tables": list}));
+        }
+        Cmd::TocExtract { archives, out: po } => {
+            let list = if archives.is_empty() {
+                ws.archives().into_iter().filter(|a| a.container == "rpf9").collect::<Vec<_>>()
+            } else {
+                archives.iter().map(|q| ws.resolve(q)).collect::<Result<Vec<_>>>()?
+            };
+            let mut cipher = sixng_core::gamecipher::open(&game)?;
+            let t = Instant::now();
+            let mut res = Vec::new();
+            let (mut total, mut failed) = (0usize, 0usize);
+            for (n, a) in list.iter().enumerate() {
+                pr(&format!("toc-extract:{}", a.id), n as u64, list.len() as u64);
+                let mut f = std::fs::File::open(&a.path)?;
+                let stem = sixng_core::game::index_stem(&a.id);
+                toc_walk(cipher.as_mut(), &mut f, 0, &mut |cipher, f, base, _, entries| {
+                    let enc: Vec<_> = entries.iter().filter(|e| e.crypto.is_some()).collect();
+                    if enc.is_empty() {
+                        return Ok(());
+                    }
+                    let name = if base == 0 { stem.clone() } else { format!("{stem}@{base:x}") };
+                    let dir = po.join("toc_files").join(&name);
+                    std::fs::create_dir_all(&dir)?;
+                    let mut index = std::io::BufWriter::new(std::fs::File::create(dir.join("index.jsonl"))?);
+                    let mut errors = Vec::new();
+                    let mut bytes = 0u64;
+                    for e in &enc {
+                        let c = e.crypto.as_ref().unwrap();
+                        let mut rec = json!({"row": e.row, "offset": e.offset, "stored": e.stored, "unpacked": e.unpacked,
+                            "flags": e.flags, "key_id": format!("{:08x}", c.key_id)});
+                        match sixng_core::rpf9toc::read_file(cipher, f, base, e) {
+                            Ok((data, check)) => {
+                                let file = format!("{:09x}.{}", e.offset, sixng_core::rpf9toc::sniff_ext(&data));
+                                std::fs::write(dir.join(&file), &data)?;
+                                bytes += data.len() as u64;
+                                rec["file"] = json!(file);
+                                rec["check"] = json!(check);
+                            }
+                            Err(err) => {
+                                rec["error"] = json!(format!("{err:#}"));
+                                errors.push(json!({"offset": e.offset, "error": format!("{err:#}")}));
+                            }
+                        }
+                        writeln!(index, "{rec}")?;
+                    }
+                    index.flush()?;
+                    total += enc.len();
+                    failed += errors.len();
+                    res.push(json!({"archive": a.id, "base": base, "dir": dir, "files": enc.len() - errors.len(), "bytes": bytes, "errors": errors}));
+                    Ok(())
+                })?;
+            }
+            pr("toc-extract", list.len() as u64, list.len() as u64);
+            out.print(&json!({"ok": failed == 0, "files": total - failed, "failed": failed, "seconds": t.elapsed().as_secs_f64(), "archives": res}));
         }
         Cmd::List { archive, filter, ndjson, streams } => {
             let a = ws.resolve(archive)?;
@@ -2789,6 +2882,22 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             out.print(&json!({"ok": true, "entry": v}));
         }
+    }
+    Ok(())
+}
+
+type TocVisit<'a> = dyn FnMut(&mut dyn sixng_core::rpf9toc::ArchiveCipher, &mut std::fs::File, u64, &sixng_core::rpf9toc::Toc, &[sixng_core::rpf9toc::FileEntry]) -> Result<()> + 'a;
+
+/// Visit the table of contents at `base` and those of the archives stored
+/// inside it. An archive without the known file entry column is visited with
+/// no entries.
+fn toc_walk(cipher: &mut dyn sixng_core::rpf9toc::ArchiveCipher, f: &mut std::fs::File, base: u64, visit: &mut TocVisit) -> Result<()> {
+    use sixng_core::rpf9toc;
+    let toc = rpf9toc::open_toc(cipher, f, base).map_err(|e| anyhow!("table of contents at {base:#x}: {e:#}"))?;
+    let entries = if toc.has_entries() { toc.files()? } else { Vec::new() };
+    visit(cipher, f, base, &toc, &entries)?;
+    for off in rpf9toc::nested_archives(f, base, &entries) {
+        toc_walk(cipher, f, base + off, visit)?;
     }
     Ok(())
 }
