@@ -1030,8 +1030,9 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   and the body colour comes from `water_clip_scattering_*` and
   `water_clip_extinction_*` (a third of the single-scattering albedo).
   The map tiles' painted water (their water and no-data colour, which
-  also covers some land cells) is shaded as water where it shows, blending
-  at the shore, and a water plane under the terrain reaches the horizon. Our choices: the scale from the timecycle's water
+  also covers some land cells) is shaded as water where the terrain lies
+  at sea level (up to about 0.5 m above it; higher up the same paint marks
+  wet sand), blending at the shore, and a water plane under the terrain reaches the horizon. Our choices: the scale from the timecycle's water
   units to coefficients per metre (0.03), the wind direction, and the
   share of the slope drawn as waves (60 %). Not yet: shallow water over
   the seabed, foam, shore waves, refraction and underwater fog.
