@@ -970,6 +970,16 @@ enum Cmd {
         #[arg(long, default_value_t = 200)]
         limit: usize,
     },
+    /// Mission and arc names for the story scenes, from the story-flow tags
+    /// in the story pack's protected rule files. Each tag that a mission id
+    /// shortens (letters left out) names that mission; the tags are cached in
+    /// <work>/index/story_flow_tags.json. Needs the cutscene catalog and, the
+    /// first time, the game executable (Windows x64) for the table of contents.
+    StoryNames {
+        /// Print the flow tags as well.
+        #[arg(long)]
+        tags: bool,
+    },
     /// Cutscenes of the story pack: per scene its cast (scene handles with
     /// the ped model each one is, and whether `outfit` can assemble it),
     /// props, cameras, the clip names of each object and the set-dressing
@@ -1682,6 +1692,18 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     out.print(&json!({"ok": true, "dictionary": de.name, "id": de.id, "clip_count": d.clips.len(), "animations": d.animations.len(), "clips": clips}));
                 }
             }
+        }
+        Cmd::StoryNames { tags } => {
+            use sixng_core::cutscene;
+            let c = cutscene::catalog(&ws, cutscene::STORY_ARCHIVE, false, pr.clone())?;
+            let ids = cutscene::mission_ids(c.dicts.iter().filter_map(|d| cutscene::parse_dict_name(&d.name)).map(|(s, _)| s));
+            let t = sixng_core::storyflow::tags(&ws)?;
+            let n = sixng_core::storyflow::match_names(&t, &ids);
+            let mut v = json!({"ok": true, "missions_in_scenes": ids.len(), "named_missions": n.missions.len(), "named_arcs": n.arcs.len(), "arcs": n.arcs, "missions": n.missions});
+            if *tags {
+                v["tags"] = json!(t);
+            }
+            out.print(&v);
         }
         Cmd::Cutscenes { scene, name, cast, archive, rescan, summary, limit } => {
             use sixng_core::cutscene;
