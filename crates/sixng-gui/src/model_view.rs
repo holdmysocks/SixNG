@@ -389,6 +389,11 @@ pub struct PartFx {
     /// A shoe with a heel (name token `sh`, `mh` or `hh`; flat ones have
     /// `fh`): the feet are posed into it.
     pub heel: bool,
+    /// The layer the item's vertex regions belong to (upper body skin
+    /// `b4d9d470`, lower body skin `e0622b84`, …); 0 when not known.
+    pub region_layer: u32,
+    /// The item's hide masks: layer -> 256-bit region set (hex).
+    pub hides: Vec<(u32, String)>,
 }
 
 /// A finished load, tagged with the request it answers.
@@ -629,6 +634,8 @@ pub struct ModelView {
     veh_no_wheels: bool,
     /// Bounding boxes of the loaded wheel models (rim, tyre).
     wheel_boxes: Vec<[[f32; 3]; 2]>,
+    /// Height of the lowest point of the fitted wheels (None without wheels).
+    wheel_floor: Option<f32>,
     /// Width factor per wheel mount (two-wheelers), and what it was made for.
     /// and the arch-fit factor on the whole wheel: [width, fit].
     wheel_xs: (String, Vec<[f32; 2]>),
@@ -934,6 +941,7 @@ impl ModelView {
             veh_applied: String::new(),
             veh_no_wheels: false,
             wheel_boxes: Vec::new(),
+            wheel_floor: None,
             wheel_xs: (String::new(), Vec::new()),
             veh_cfg: None,
             wheel_pending: Arc::new(Mutex::new(Vec::new())),
@@ -3048,6 +3056,7 @@ impl ModelView {
             }
         }
         let mounts = self.mounts();
+        self.wheel_floor = None;
         if !self.wheels_on || self.veh_no_wheels || mounts.is_empty() {
             return;
         }
@@ -3146,6 +3155,17 @@ impl ModelView {
             self.wheel_xs = (xs_key, v);
         }
         let xs = self.wheel_xs.1.clone();
+        // where the tyres touch the ground
+        if let Some((tr, _)) = tyre_size(&self.wheel_boxes).filter(|_| !self.wheels.is_empty()) {
+            self.wheel_floor = mounts
+                .iter()
+                .enumerate()
+                .map(|(mi, (bone, p))| {
+                    let sc = xs.get(mi).map_or(1.0, |x| x[1]) * if is_rear(bone) { self.wheel_scale_rear } else { self.wheel_scale };
+                    (self.gear_at(bone) * self.steer_at(bone)).transform_point3(*p).y - tr * sc
+                })
+                .reduce(f32::min);
+        }
         let inst: Vec<render3d::Instance> = mounts
             .iter()
             .enumerate()
@@ -3429,6 +3449,13 @@ impl ModelView {
         (gl, skin)
     }
 
+    /// Height of the ground under a model whose own lowest point is at
+    /// `floor`: fitted wheels reach lower than the body they are fitted to.
+    fn ground_y(&self, floor: f32) -> f32 {
+        let on_wheels = self.wheels_on && !self.veh_no_wheels;
+        self.wheel_floor.filter(|_| on_wheels).map_or(floor, |w| w.min(floor))
+    }
+
     fn lines(&self, globals: &[Mat4]) -> (Vec<LineV>, Vec<LineV>) {
         let mut under = Vec::new();
         let mut top = Vec::new();
@@ -3487,9 +3514,10 @@ impl ModelView {
                 budget = budget.saturating_sub(m.verts.len() / step);
             }
         }
-        // ground grid
-        let lo = Vec3::from(l.model.bbox[0]);
+        // ground grid, under the tyres of a vehicle on its wheels
+        let mut lo = Vec3::from(l.model.bbox[0]);
         let hi = Vec3::from(l.model.bbox[1]);
+        lo.y = self.ground_y(lo.y);
         let ext = (hi - lo).max_element().max(1.0);
         let step = 10f32.powf((ext / 4.0).log10().floor()).max(0.1);
         let n = ((ext * 0.75) / step).ceil() as i32;
@@ -3755,6 +3783,19 @@ impl ModelView {
             }
         }
         let show_wheels = self.wheels_on && !self.veh_no_wheels && !self.mounts().is_empty();
+        // a soft shadow on the ground the grid lies on, under the model
+        // (not under big pieces of scenery, which bring their own ground)
+        let ground = self.loaded.as_ref().and_then(|l| {
+            let mut lo = Vec3::from(l.model.bbox[0]);
+            let hi = Vec3::from(l.model.bbox[1]);
+            lo.y = self.ground_y(lo.y);
+            let size = hi - lo;
+            (size.x.max(size.z) <= 40.0 && size.min_element() > 0.0).then(|| crate::render3d::GroundShadow {
+                centre: Vec3::new((lo.x + hi.x) * 0.5, lo.y, (lo.z + hi.z) * 0.5) + Vec3::new(self.ped_clip.travel.x, 0.0, self.ped_clip.travel.z),
+                half: [size.x * 0.5, size.z * 0.5],
+                height: size.y,
+            })
+        });
         let (under, top) = self.lines(&globals);
         let settled = self.idle_for_shot();
         let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
@@ -3791,6 +3832,7 @@ impl ModelView {
             models.extend(self.hair.gpu.iter());
         }
         ren.decal_bias = self.decal_bias;
+        ren.ground = ground;
         let tid = ren.render(rs, px, &self.cam, &self.look, &models, &under, &top);
         ui.painter().image(
             tid,
@@ -4581,6 +4623,8 @@ fn load_parts(
     let mut coloured = 0;
     // mesh ranges of the skin meshes and of the garments that cover skin
     let mut skin_meshes: Vec<std::ops::Range<usize>> = Vec::new();
+    // parts whose item names a region layer: meshes, layer, archive offset
+    let mut region_parts: Vec<(std::ops::Range<usize>, u32, u64)> = Vec::new();
     let mut cover_meshes: Vec<std::ops::Range<usize>> = Vec::new();
     let mut heel_meshes: Vec<std::ops::Range<usize>> = Vec::new();
     // per outfit part: its meshes, its joint list and the joint an attached
@@ -4668,6 +4712,9 @@ fn load_parts(
                 if f.is_some_and(|f| f.body) {
                     skin_meshes.push(mesh0..mesh0 + m.meshes.len());
                 }
+                if let Some(f) = f.filter(|f| f.region_layer != 0) {
+                    region_parts.push((mesh0..mesh0 + m.meshes.len(), f.region_layer, e.off));
+                }
                 if f.is_some_and(|f| f.covers) {
                     cover_meshes.push(mesh0..mesh0 + m.meshes.len());
                 }
@@ -4722,10 +4769,46 @@ fn load_parts(
             notes.push(format!("Heeled shoes: the feet are tilted {deg:.0} degrees at the ankle with the toes bent back level, the angle that puts most of the foot's skin on the shoe. (The game poses the foot for the shoe's heel class; that pose is not decoded.)"));
         }
     }
-    if let (Some(m), false, false) = (&mut model, skin_meshes.is_empty(), cover_meshes.is_empty()) {
-        let hidden = hide_covered_skin(m, &skin_meshes, &cover_meshes);
+    // Hiding what is worn under something, the game's way: every vertex of
+    // a part carries a region of the part's layer, and every worn item
+    // lists per layer the regions it hides. A triangle goes when all its
+    // vertices are in hidden regions. Skin meshes without regions fall back
+    // to hiding what lies right under a garment.
+    let mut by_distance: Vec<std::ops::Range<usize>> = skin_meshes.clone();
+    if let Some(m) = &mut model {
+        let (mut skin_hidden, mut cloth_hidden) = (0, 0);
+        for (range, layer, off) in &region_parts {
+            let has_regions = range.clone().filter_map(|i| m.meshes.get(i)).any(|me| me.verts.iter().any(|v| v.zone[3] != 0));
+            if !has_regions {
+                continue;
+            }
+            // Clothes under clothes stay with the distance test below: the
+            // `_full` garment meshes carry no regions (their `_cull_00`
+            // twins do) and part of those masks sits in a second list whose
+            // key is not decoded.
+            let is_skin = skin_meshes.contains(range);
+            if !is_skin {
+                continue;
+            }
+            by_distance.retain(|r| r != range);
+            let masks: Vec<&str> = fx.iter().filter(|(o, _)| *o != off).flat_map(|(_, f)| f.hides.iter()).filter(|h| h.0 == *layer).map(|h| h.1.as_str()).collect();
+            let hide: Vec<bool> = (0..256u32).map(|n| masks.iter().any(|k| sixng_core::wardrobe::mask_has(k, n))).collect();
+            for i in range.clone() {
+                let Some(me) = m.meshes.get_mut(i) else { continue };
+                let before = me.indices.len() / 3;
+                me.indices = me.indices.chunks_exact(3).filter(|t| !t.iter().all(|&i| hide[me.verts[i as usize].zone[3] as usize])).flatten().copied().collect();
+                *(if is_skin { &mut skin_hidden } else { &mut cloth_hidden }) += before - me.indices.len() / 3;
+            }
+        }
+        m.triangles = m.triangles.saturating_sub(skin_hidden + cloth_hidden);
+        if skin_hidden + cloth_hidden > 0 {
+            notes.push(format!("Worn under something: {skin_hidden} skin triangles and {cloth_hidden} triangles of clothes are hidden by the hide masks of the worn items (each item lists per layer the regions it covers; every vertex carries its region)."));
+        }
+    }
+    if let (Some(m), false, false) = (&mut model, by_distance.is_empty(), cover_meshes.is_empty()) {
+        let hidden = hide_covered_skin(m, &by_distance, &cover_meshes);
         if hidden > 0 {
-            notes.push(format!("Skin under clothes: {hidden} skin triangles that lie right under a garment are hidden, so skin does not show through it. (The game uses skin meshes cut to the garment; which cut goes with which garment is not decoded.)"));
+            notes.push(format!("Skin under clothes: {hidden} triangles of a skin mesh without regions that lie right under a garment are hidden, so skin does not show through it (by distance, not the game's masks)."));
         }
     }
     if let (Some(m), false, false) = (&mut model, under_meshes.is_empty(), outer_meshes.is_empty()) {
@@ -5862,7 +5945,7 @@ fn load_query_sel(
                         }
                         if oi == k {
                             let body = p.slot == "body upper" || p.slot == "body lower";
-                            fx.insert(e.off, PartFx { tint: p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t.rows[0]))).filter(|t| t.1 != 255), colour: p.colour.map(|c| [c[1], c[2], c[3]]), tag: p.colour_tag, subs: p.preset_colours.clone(), preset: p.preset.as_deref().and_then(|h| u32::from_str_radix(h, 16).ok()), head: p.slot == "head", body, skeletal: body || matches!(p.slot.as_str(), "head" | "eyes" | "teeth" | "teeth accessory"), covers: matches!(p.slot.as_str(), "top" | "outer" | "bottom" | "full" | "feet" | "gloves"), layer: match p.slot.as_str() { "outer" => 2, "top" | "bottom" | "full" => 1, _ => 0 }, heel: p.slot == "feet" && p.drawable.split('_').any(|t| matches!(t, "sh" | "mh" | "hh")), skins: if p.slot == "head" { p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect() } else { Vec::new() } });
+                            fx.insert(e.off, PartFx { tint: p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t.rows[0]))).filter(|t| t.1 != 255), colour: p.colour.map(|c| [c[1], c[2], c[3]]), tag: p.colour_tag, subs: p.preset_colours.clone(), preset: p.preset.as_deref().and_then(|h| u32::from_str_radix(h, 16).ok()), head: p.slot == "head", body, skeletal: body || matches!(p.slot.as_str(), "head" | "eyes" | "teeth" | "teeth accessory"), covers: matches!(p.slot.as_str(), "top" | "outer" | "bottom" | "full" | "feet" | "gloves"), layer: match p.slot.as_str() { "outer" => 2, "top" | "bottom" | "full" => 1, _ => 0 }, heel: p.slot == "feet" && p.drawable.split('_').any(|t| matches!(t, "sh" | "mh" | "hh")), region_layer: p.layer.as_deref().and_then(|l| u32::from_str_radix(l, 16).ok()).unwrap_or(match p.slot.as_str() { "body upper" => 0xb4d9_d470, "body lower" => 0xe062_2b84, _ => 0 }), hides: p.hides.iter().filter_map(|(l, m)| Some((u32::from_str_radix(l, 16).ok()?, m.clone()))).collect(), skins: if p.slot == "head" { p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect() } else { Vec::new() } });
                         }
                     }
                 }

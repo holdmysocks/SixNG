@@ -24,22 +24,31 @@
 //!   values 50, 60, 64, 65 and 66, which reads as a shader model times ten
 //!   (not checked against anything else).
 //! * A variable table: `u32 size` (of what follows), `u16 resources`,
-//!   `u16 members`, `u16 ?`, `u16 size again`, then 24-byte records and a
-//!   name table. A record is `u8 kind, u8 dimension, u16 index`, `u32 a`,
+//!   `u16 members`, `u16 entries`, `u16 size again`, then 24-byte records,
+//!   `entries` 8-byte entries (`u32 name`, `u32`) and a name table that
+//!   also holds default values. A record is `u8 kind, u8 dimension, u16 index`, `u32 a`,
 //!   `u32 b`, `u32 c`, `u32 name`, `u32 alias` (both joaat hashes; the alias
 //!   differs only where a material parameter is named differently from the
 //!   shader variable: variable `SpecTexture`, parameter `speculartex`).
 //!   Resources come first, then the members of the constant buffers. A
 //!   constant buffer's `a` holds its member count (low byte) and the byte
 //!   distance from its own record to its first member (high half); `c` is
-//!   its size. A member's `a` is its byte offset in the buffer.
+//!   its size. A member's `a` is its byte offset in the buffer, and the
+//!   high half of its `b` is the distance from its record to its default
+//!   value (0 = none; 30,319 members have one). The high half of a
+//!   resource's `c` is the distance from its record to one of the 8-byte
+//!   entries (5,036 resources, textures and constant buffers; the entry's
+//!   `u32` is 1 for all of them). What the entries are for is not known.
 //! * An effect record, in order:
 //!   - `u8 n`, name, NUL, `u32 loaded size`, six program lists (`u32 n`, n
 //!     program numbers within the database's section of the same order);
 //!   - 0x50 bytes (not decoded);
 //!   - four state tables, each `u32 count` and fixed-size items: rasterizer
-//!     (16 bytes), depth-stencil (24), blend (0x44), sampler (0x24). The
-//!     items' fields are not decoded;
+//!     (16 bytes), depth-stencil (24), blend (0x44), sampler (0x24). Their
+//!     leading fields read as the Direct3D 11 state descriptions with one
+//!     byte per field (see the readers below): all 3,184 blend targets
+//!     hold values inside those ranges. This was not compared with the
+//!     pipeline cache;
 //!   - `u32 techniques` and one `u32` per technique: bits 0..14 = offset of
 //!     its name in the record's name table, bits 15..23 = index of its
 //!     first pass, bits 24..31 = number of passes;
@@ -49,27 +58,43 @@
 //!     depth-stencil and blend state; byte 9 = stencil reference; byte 10 =
 //!     which of those the pass sets (bit 1 rasterizer, 2 depth-stencil, 4
 //!     blend, 8 stencil reference; 0x10 is also seen and not understood);
-//!     byte 11 (0, 1 or 255) and bytes 12, 13 (0); `u16` name offset; eight
-//!     bytes that are not decoded. Over all 28,798 passes an index is in
+//!     byte 11 (0, 1 or 255) and bytes 12, 13 (0); `u16` name offset; a
+//!     `u16` that, added to the address of the record's byte 4, gives the
+//!     address of the pass's entry in the list below; byte 18 (0..11 or
+//!     255, not decoded); bytes 19, 20 = two indices into the parameter
+//!     blocks (`ff` = none); byte 21 = `ff`; byte 22 = 0; byte 23 (0..3,
+//!     not decoded). Over all 28,798 passes an index is in
 //!     range when its bit is set and zero when it is clear. What the states
 //!     hold was not compared with the pipeline cache;
-//!   - `u32 count` and that many `u32` (not decoded);
+//!   - `u32 count` and that many `u32`: one entry per pass, the entries
+//!     filling the list exactly (in the 913 effects that have one). An
+//!     entry is four lists (`u32 n`, n name hashes): resources the pass
+//!     reads, resources it writes, a list that is always empty, constant
+//!     buffers; then one more `u32` in 23,656 of the 28,798 passes
+//!     (`0x101` in most; not decoded);
 //!   - `u32 0x80000000` (in every effect; another value would be the size
 //!     of a block stored here);
 //!   - the effect's variable table. A material texture is a resource with
 //!     flag 0x80: the low byte of its index is its slot in the material's
 //!     texture list, and a sampler's `b` is the distance from its record to
 //!     its name in the table's name table;
-//!   - a second sized block (`u32 size`, bytes; not decoded);
+//!   - a second sized block (`u32 size`, bytes): a variable table with
+//!     one constant buffer (`e435592b`) and no members, in all 932;
 //!   - `u32` whose low 24 bits count the parameter blocks that follow (the
 //!     high byte is not decoded). A block is `u32 size` and bytes, or `u32
-//!     0x80000000` and the key of a shared block of the database;
+//!     0x80000000` and the key of a shared block of the database. A
+//!     block's bytes: `u64 id`, `u16 n`, 14 bytes (not decoded), `n`
+//!     entries of `u32 name`, two kind bytes, `u16 slot` (all 10,432
+//!     stored blocks have the size 24 + 8 x n). What a block is for is not
+//!     known;
 //!   - a name table (`u32 size`, strings) with technique and pass names.
 //! * The loaded size equals 8 x (the program numbers, plus one per list) +
 //!   8 x techniques + 32 x passes + 4 x the `u32` list + the sizes of the
 //!   table and the second block, then, when there are parameter blocks,
 //!   rounded up to 8 and 8 x blocks + the sizes of the stored ones, + the
 //!   size of the name table. This holds for all 932 effects.
+//! * After a database's last effect: `u32 1` and zeros up to the next
+//!   multiple of 4096 (not read here).
 //!
 //! The archive's one compressed entry is a pipeline cache (magic
 //! `PS\0\x09`): a 0x80-byte header with a version string at 0x24 and six
@@ -187,6 +212,11 @@ pub fn member_type(kind: u8) -> String {
 pub struct Table {
     pub resources: Vec<Var>,
     pub members: Vec<Var>,
+    /// The 8-byte entries after the records: a name hash and a `u32` (1
+    /// for the entries that a resource points at; others not decoded).
+    pub entries: Vec<(u32, u32)>,
+    /// Everything after the records: the entries, the strings and the
+    /// members' default values.
     #[serde(skip)]
     pub names: Vec<u8>,
 }
@@ -198,6 +228,28 @@ impl Table {
         let (n, first) = ((r.a & 0xff) as usize, i + (r.a >> 16) as usize / 24);
         let Some(first) = first.checked_sub(self.resources.len()) else { return &[] };
         self.members.get(first..first + n).unwrap_or(&[])
+    }
+    /// The stored default value of `members[i]`: the high half of its `b`
+    /// is the distance from its own record to the value (0 = none). The
+    /// length is not stored: the bytes run to the next member's value, or
+    /// to the end of the table.
+    pub fn member_default(&self, i: usize) -> Option<&[u8]> {
+        let n = self.resources.len() + self.members.len();
+        let at = |i: usize| -> Option<usize> {
+            let d = (self.members.get(i)?.b >> 16) as usize;
+            (d != 0).then(|| (24 * (self.resources.len() + i) + d).checked_sub(24 * n)).flatten()
+        };
+        let start = at(i)?;
+        let end = (0..self.members.len()).filter_map(at).filter(|&x| x > start).min().unwrap_or(self.names.len());
+        self.names.get(start..end)
+    }
+    /// The entry that `resources[i]` points at (the high half of its `c` is
+    /// the distance from its own record; 0 = none): textures and a few
+    /// constant buffers have one.
+    pub fn resource_entry(&self, i: usize) -> Option<(u32, u32)> {
+        let d = (self.resources.get(i)?.c >> 16) as usize;
+        let at = (24 * i + d).checked_sub(24 * (self.resources.len() + self.members.len()))?;
+        (d != 0 && at % 8 == 0).then(|| self.entries.get(at / 8).copied()).flatten()
     }
     /// The name of the sampler at `resources[i]`, from the table's name
     /// table (effect tables): its `b` is the distance from its own record
@@ -234,8 +286,62 @@ pub struct Pass {
     /// reference, the bits that say which of them the pass sets (see the
     /// methods), one byte that is 0, 1 or 255 and two that are 0.
     pub flags: [u8; 8],
-    /// The last eight bytes of the record (not decoded).
+    /// The last eight bytes of the record: a `u16` that locates the
+    /// pass's [`Bindings`], a byte that is not decoded, two block indices
+    /// (see [`Pass::blocks`]), `ff`, 0 and a byte that is not decoded.
     pub tail: [u8; 8],
+    /// What the pass's programs bind. None when the effect has no list.
+    pub bindings: Option<Bindings>,
+}
+
+/// The resources a pass binds, as name hashes of the effect's (or the
+/// database's) variable table.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Bindings {
+    /// Resources the pass reads (textures, buffers).
+    pub read: Vec<u32>,
+    /// Resources the pass writes.
+    pub written: Vec<u32>,
+    /// A third list, empty in every pass of the install.
+    pub third: Vec<u32>,
+    /// Constant buffers.
+    pub cbuffers: Vec<u32>,
+    /// One more word that most passes have (not decoded).
+    pub word: Option<u32>,
+}
+
+/// One parameter block of an effect or a database: an id and entries that
+/// name resources. What a block is for was not worked out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Layout {
+    pub id: u64,
+    /// The 14 bytes of the header after the entry count (not decoded; the
+    /// `u32` at 6 of them is the key that effects refer to a shared block
+    /// by).
+    pub header: Vec<u8>,
+    pub entries: Vec<LayoutEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct LayoutEntry {
+    /// Name hash of a resource.
+    pub name: u32,
+    /// Two bytes that look like the resource's kind and dimension.
+    pub kind: [u8; 2],
+    pub slot: u16,
+}
+
+impl Layout {
+    /// A block's bytes: `u64 id`, `u16 n`, 14 bytes, `n` entries of 8
+    /// bytes. None when the size is not 24 + 8 x n.
+    pub fn read(s: &[u8]) -> Option<Layout> {
+        let n = u16_at(s, 8)? as usize;
+        (s.len() == 24 + 8 * n).then(|| Layout {
+            id: u64::from_le_bytes(s[..8].try_into().unwrap()),
+            header: s[10..24].to_vec(),
+            entries: s[24..].chunks_exact(8).map(|e| LayoutEntry { name: u32::from_le_bytes(e[..4].try_into().unwrap()), kind: [e[4], e[5]], slot: u16::from_le_bytes([e[6], e[7]]) }).collect(),
+        })
+    }
 }
 
 impl Pass {
@@ -258,6 +364,12 @@ impl Pass {
     pub fn stencil_ref(&self) -> Option<u8> {
         self.state(8, 3)
     }
+    /// Two indices into the effect's `blocks` (bytes 19 and 20 of the
+    /// record; `ff` = none). Always in range; what they select was not
+    /// worked out.
+    pub fn blocks(&self) -> [Option<u8>; 2] {
+        [self.tail[3], self.tail[4]].map(|x| (x != 0xff).then_some(x))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -266,7 +378,111 @@ pub struct Technique {
     pub passes: Vec<Pass>,
 }
 
-/// The state tables of an effect: raw items (their fields are not decoded).
+/// One render target's part of a blend state. The values are those of
+/// the Direct3D 11 blend description: see [`blend_factor`] and
+/// [`blend_op`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct BlendTarget {
+    pub enable: bool,
+    pub src: u8,
+    pub dst: u8,
+    pub op: u8,
+    pub src_alpha: u8,
+    pub dst_alpha: u8,
+    pub op_alpha: u8,
+    /// Write mask: 1 red, 2 green, 4 blue, 8 alpha.
+    pub mask: u8,
+}
+
+/// A blend state item (0x44 bytes) read as: alpha to coverage,
+/// independent blend, two bytes that are 0, eight targets of eight bytes.
+/// Every target of the install holds values inside the Direct3D 11 ranges;
+/// the reading was not checked against the pipeline cache.
+pub fn blend_state(item: &[u8]) -> Option<(bool, bool, [BlendTarget; 8])> {
+    let t = item.get(4..0x44)?;
+    Some((item[0] != 0, item[1] != 0, std::array::from_fn(|i| {
+        let x = &t[8 * i..8 * i + 8];
+        BlendTarget { enable: x[0] != 0, src: x[1], dst: x[2], op: x[3], src_alpha: x[4], dst_alpha: x[5], op_alpha: x[6], mask: x[7] }
+    })))
+}
+
+/// Name of a blend factor value (Direct3D 11 numbering).
+pub fn blend_factor(v: u8) -> &'static str {
+    ["?", "zero", "one", "src_color", "inv_src_color", "src_alpha", "inv_src_alpha", "dest_alpha", "inv_dest_alpha", "dest_color", "inv_dest_color", "src_alpha_sat", "?", "?", "blend_factor", "inv_blend_factor", "src1_color", "inv_src1_color", "src1_alpha", "inv_src1_alpha"].get(v as usize).copied().unwrap_or("?")
+}
+
+/// Name of a blend operation value (Direct3D 11 numbering).
+pub fn blend_op(v: u8) -> &'static str {
+    ["?", "add", "subtract", "rev_subtract", "min", "max"].get(v as usize).copied().unwrap_or("?")
+}
+
+/// Name of a comparison value (Direct3D 11 numbering). The depth buffer is
+/// reversed: the usual depth test is `greater_equal`.
+pub fn comparison(v: u8) -> &'static str {
+    ["?", "never", "less", "equal", "less_equal", "greater", "not_equal", "greater_equal", "always"].get(v as usize).copied().unwrap_or("?")
+}
+
+/// Name of a stencil operation value (Direct3D 11 numbering).
+pub fn stencil_op(v: u8) -> &'static str {
+    ["?", "keep", "zero", "replace", "incr_sat", "decr_sat", "invert", "incr", "decr"].get(v as usize).copied().unwrap_or("?")
+}
+
+/// A depth-stencil state item (24 bytes) read as the Direct3D 11
+/// description: its last ten bytes are the same in every item of the
+/// install and are not decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DepthStencil {
+    pub depth: bool,
+    pub depth_write: bool,
+    pub depth_func: u8,
+    pub stencil: bool,
+    pub stencil_read_mask: u8,
+    pub stencil_write_mask: u8,
+    /// Front and back faces: fail, depth fail, pass (see [`stencil_op`])
+    /// and function (see [`comparison`]).
+    pub faces: [[u8; 4]; 2],
+}
+
+pub fn depth_stencil_state(item: &[u8]) -> Option<DepthStencil> {
+    let x = item.get(..14)?;
+    Some(DepthStencil { depth: x[0] != 0, depth_write: x[1] != 0, depth_func: x[2], stencil: x[3] != 0, stencil_read_mask: x[4], stencil_write_mask: x[5], faces: [x[6..10].try_into().unwrap(), x[10..14].try_into().unwrap()] })
+}
+
+/// A rasterizer state item (16 bytes): fill mode (3 = solid in every item)
+/// and cull mode (1 none, 2 front, 3 back, Direct3D 11 numbering; which
+/// winding is the front was not checked). The other 14 bytes are the same
+/// in every item of the install and are not decoded.
+pub fn rasterizer_state(item: &[u8]) -> Option<(u8, u8)> {
+    Some((*item.first()?, *item.get(1)?))
+}
+
+/// A sampler state item (0x24 bytes), read as: address modes (1 wrap, 2
+/// mirror, 3 clamp, 4 border), level bias, a byte whose low nibble reads as
+/// the anisotropy (1, 4 or 8), comparison (1 in every item), filter
+/// (Direct3D 11 values: 0x14 and 0x15 are the two linear ones, 0x55
+/// anisotropic), four floats taken to be the border colour (not checked),
+/// lowest and highest level (0 and 12 in every item). Byte 0 and bit 0x20
+/// of byte 8 are not decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Sampler {
+    pub address: [u8; 3],
+    pub lod_bias: f32,
+    pub anisotropy: u8,
+    pub comparison: u8,
+    pub filter: u8,
+    pub border: [f32; 4],
+    pub min_lod: f32,
+    pub max_lod: f32,
+}
+
+pub fn sampler_state(item: &[u8]) -> Option<Sampler> {
+    let f = |p: usize| Some(f32::from_le_bytes(item.get(p..p + 4)?.try_into().ok()?));
+    Some(Sampler { address: [*item.get(1)?, *item.get(2)?, *item.get(3)?], lod_bias: f(4)?, anisotropy: item[8] & 0xf, comparison: item[9], filter: item[10], border: [f(12)?, f(16)?, f(20)?, f(24)?], min_lod: f(28)?, max_lod: f(32)? })
+}
+
+/// The state tables of an effect: raw items. [`blend_state`],
+/// [`depth_stencil_state`], [`rasterizer_state`] and [`sampler_state`] read
+/// their fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct States {
     /// 16 bytes each.
@@ -311,10 +527,17 @@ pub struct Effect {
     #[serde(skip)]
     pub header: Vec<u8>,
     pub states: States,
-    /// The `u32` list after the passes (not decoded).
+    /// The `u32` list after the passes: the passes' [`Bindings`], one
+    /// after another.
     #[serde(skip)]
     pub extra: Vec<u32>,
+    /// The second variable table: one constant buffer (`e435592b`) and no
+    /// members in every effect of the install.
+    pub second: Option<Table>,
     pub blocks: Vec<Block>,
+    /// The blocks stored in the record, read (None for a shared one or one
+    /// that does not read).
+    pub layouts: Vec<Option<Layout>>,
     /// The high byte of the block count word (not decoded).
     pub block_flags: u8,
 }
@@ -330,6 +553,8 @@ pub struct Database {
     pub shared_blocks: Vec<(usize, usize)>,
     /// The key of each shared block (its `u32` at 16).
     pub shared_keys: Vec<u32>,
+    /// Each shared block, read (None when it does not read).
+    pub shared_layouts: Vec<Option<Layout>>,
     /// The variable table shared by the database's effects.
     pub table: Option<Table>,
     /// Index of each section's first program in [`Shaders::programs`], and
@@ -388,9 +613,9 @@ fn u32_at(b: &[u8], p: usize) -> Option<u32> {
 /// after it.
 fn table_at(b: &[u8], p: usize) -> Option<(Table, usize)> {
     let size = u32_at(b, p)? as usize;
-    let (na, nb, size2) = (u16_at(b, p + 4)? as usize, u16_at(b, p + 6)? as usize, u16_at(b, p + 10)? as usize);
+    let (na, nb, ne, size2) = (u16_at(b, p + 4)? as usize, u16_at(b, p + 6)? as usize, u16_at(b, p + 8)? as usize, u16_at(b, p + 10)? as usize);
     let recs = 12 + 24 * (na + nb);
-    if size2 != size & 0xffff || size < recs - 4 {
+    if size2 != size & 0xffff || size < recs - 4 + 8 * ne {
         return None;
     }
     let end = p + 4 + size;
@@ -401,7 +626,8 @@ fn table_at(b: &[u8], p: usize) -> Option<(Table, usize)> {
     };
     let resources = (0..na).map(var).collect::<Option<Vec<_>>>()?;
     let members = (na..na + nb).map(var).collect::<Option<Vec<_>>>()?;
-    Some((Table { resources, members, names: b.get(p + recs..end)?.to_vec() }, end))
+    let entries = (0..ne).map(|i| Some((u32_at(b, p + recs + 8 * i)?, u32_at(b, p + recs + 8 * i + 4)?))).collect::<Option<Vec<_>>>()?;
+    Some((Table { resources, members, entries, names: b.get(p + recs..end)?.to_vec() }, end))
 }
 
 /// `u8 n`, name, NUL at `p`: the name and the offset after the NUL.
@@ -502,19 +728,24 @@ fn effect_at(b: &[u8], p: usize, counts: &[usize; 6], database: usize) -> Option
     let at = c.p;
     loaded += c.sized()?.len();
     let table = table_at(b, at).filter(|(t, end)| *end == c.p && !(t.resources.is_empty() && t.members.is_empty())).map(|x| x.0);
+    let at = c.p;
     loaded += c.sized()?.len();
+    let second = table_at(b, at).filter(|x| x.1 == c.p).map(|x| x.0);
     let count = c.u32()?;
     let n = (count & 0xff_ffff) as usize;
     if n > 0 {
         loaded = loaded.next_multiple_of(8) + 8 * n;
     }
-    let mut blocks = Vec::new();
+    let (mut blocks, mut layouts) = (Vec::new(), Vec::new());
     for _ in 0..n {
         let size = c.u32()?;
         if size == SHARED {
             blocks.push(Block::Shared(c.u32()?));
+            layouts.push(None);
         } else {
-            blocks.push(Block::Inline(c.p, c.take(size as usize)?.len()));
+            let s = c.take(size as usize)?;
+            blocks.push(Block::Inline(c.p - s.len(), s.len()));
+            layouts.push(Layout::read(s));
             loaded += size as usize;
         }
     }
@@ -524,6 +755,30 @@ fn effect_at(b: &[u8], p: usize, counts: &[usize; 6], database: usize) -> Option
         let s = names.get(o..)?;
         Some(String::from_utf8_lossy(&s[..s.iter().position(|&x| x == 0)?]).into_owned())
     };
+    // a pass's bindings: the `u16` at 16 of its record is the distance from the record's byte 4 to its entry in the list after the passes
+    // (the count word of that list lies between). An entry is four lists (`u32 n`, n hashes) and runs to the next entry or the end.
+    let (np, words) = (passes.len() / 24, extra.len());
+    let entry = |i: usize| -> Option<usize> {
+        let d = (24 * i + 4 + u16::from_le_bytes([passes[24 * i + 16], passes[24 * i + 17]]) as usize).checked_sub(24 * np + 4)?;
+        (d % 4 == 0 && d / 4 < words).then_some(d / 4)
+    };
+    let mut starts: Vec<usize> = (0..np).filter_map(entry).collect();
+    starts.sort_unstable();
+    starts.dedup();
+    let bindings = |i: usize| -> Option<Bindings> {
+        let at = entry(i)?;
+        let end = starts.iter().copied().find(|&x| x > at).unwrap_or(words);
+        let mut q = at;
+        let mut lists: [Vec<u32>; 4] = Default::default();
+        for l in lists.iter_mut() {
+            let n = *extra.get(q).filter(|_| q < end)? as usize;
+            *l = extra.get(q + 1..q + 1 + n).filter(|_| q + 1 + n <= end)?.to_vec();
+            q += 1 + n;
+        }
+        let [read, written, third, cbuffers] = lists;
+        Some(Bindings { read, written, third, cbuffers, word: (q < end).then(|| extra[q]) })
+    };
+    let mut index = 0..np;
     // a technique: bits 0..14 name offset, 15..23 index of its first pass (it wraps: the passes simply follow one another), 24..31 pass count
     let mut it = passes.chunks_exact(24);
     let techniques = ents
@@ -532,12 +787,12 @@ fn effect_at(b: &[u8], p: usize, counts: &[usize; 6], database: usize) -> Option
             let passes = it
                 .by_ref()
                 .take((e >> 24) as usize)
-                .map(|x| Some(Pass { name: name_of(u16::from_le_bytes([x[14], x[15]]) as usize)?, programs: std::array::from_fn(|j| x[j].checked_sub(1)), flags: x[6..14].try_into().unwrap(), tail: x[16..24].try_into().unwrap() }))
+                .map(|x| Some(Pass { name: name_of(u16::from_le_bytes([x[14], x[15]]) as usize)?, programs: std::array::from_fn(|j| x[j].checked_sub(1)), flags: x[6..14].try_into().unwrap(), tail: x[16..24].try_into().unwrap(), bindings: index.next().and_then(&bindings) }))
                 .collect::<Option<Vec<_>>>()?;
             Some(Technique { name: name_of((e & 0x7fff) as usize)?, passes })
         })
         .collect::<Option<Vec<_>>>()?;
-    Some((Effect { name, database, programs, table, techniques, loaded_size, loaded_size_computed: loaded as u32, header, states, extra, blocks, block_flags: (count >> 24) as u8 }, c.p))
+    Some((Effect { name, database, programs, table, techniques, loaded_size, loaded_size_computed: loaded as u32, header, states, extra, second, blocks, layouts, block_flags: (count >> 24) as u8 }, c.p))
 }
 
 /// A database at `p` (its magic): reads its programs and effects into
@@ -554,6 +809,7 @@ fn database_at(b: &[u8], p: usize, out: &mut Shaders) -> Option<Result<usize>> {
         let s = c.sized()?;
         db.shared_blocks.push((at, s.len()));
         db.shared_keys.push(u32_at(s, 16)?);
+        db.shared_layouts.push(Layout::read(s));
     }
     let at = c.p;
     c.sized()?;
@@ -1031,7 +1287,7 @@ mod tests {
             Var { name: 2, alias: 2, kind: 0x82, dim: 1, index: 44, a: 0x0200, b: 0, c: 0 },
             Var { name: 3, alias: 3, kind: 0x30, dim: 4, index: 4, a: 0x8200, b: 0, c: 0x10 },
             Var { name: 4, alias: 4, kind: 0x02, dim: 1, index: 9, a: 0x0200, b: 0, c: 0 },
-        ], members: vec![], names: vec![] };
+        ], members: vec![], entries: vec![], names: vec![] };
         let file = [vec![0u8; 3], deflated.clone()].concat();
         let sh = Shaders { programs: vec![
             Program { section: 1, name: "PS_A".into(), kind: 0x32, id: 1, mask: 0, data: (3, deflated.len()), table: t },
@@ -1078,5 +1334,58 @@ mod tests {
         assert_eq!((a.pipelines, a.read.as_slice(), a.unmatched_reads, a.writes.len()), (1, &[true, true, true, false][..], 1, 1));
         assert!(j[1].is_none());
         assert!(read_cache(&c[..c.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn pass_bindings_blocks_and_state_items() {
+        let empty = table(&[], &[], &[0]);
+        let second = table(&[var(0x30, 4, 0, 0, 0, 0, 0xe435592b, 0xe435592b)], &[], &[]);
+        // two passes whose records point at their entries in the list: `u16` = entry address - address of the record's byte 4
+        let pass = |tail: [u8; 8]| [vec![0u8; 11], vec![0xff, 0, 0], 6u16.to_le_bytes().to_vec(), tail.to_vec()].concat();
+        let block = [0x1122u64.to_le_bytes().to_vec(), 1u16.to_le_bytes().to_vec(), vec![5u8; 14], 0xaau32.to_le_bytes().to_vec(), vec![2, 1], 3u16.to_le_bytes().to_vec()].concat();
+        let body = Body {
+            states: [(0, 16), (0, 24), (0, 0x44), (0, 0x24)],
+            techniques: &[1 | 2 << 24],
+            passes: &[pass([48, 0, 0, 0, 0xff, 0xff, 0, 0]), pass([52, 0, 0, 0xff, 0, 0xff, 0, 0])],
+            // entry 0: reads a, writes nothing, nothing, constant buffer c, one more word; entry 1: writes d and e
+            extra: &[1, 0xa, 0, 0, 1, 0xc, 0x101, 0, 2, 0xd, 0xe, 0, 0],
+            table: &empty,
+            // the helper writes the size word itself
+            second: &second[4..],
+            blocks: &[Ok(&block[..]), Ok(&[7u8; 8][..])],
+            names: b"\0draw\0p0\0",
+        };
+        let b = database(1, &[0xabcd], [&[], &[], &[], &[], &[], &[]], &[effect("fx", 0, [&[], &[], &[], &[], &[], &[]], &body)]);
+        let s = read(&b).unwrap();
+        let e = &s.effects[0];
+        let ps = &e.techniques[0].passes;
+        assert_eq!(ps[0].bindings, Some(Bindings { read: vec![0xa], cbuffers: vec![0xc], word: Some(0x101), ..Default::default() }));
+        assert_eq!(ps[1].bindings, Some(Bindings { written: vec![0xd, 0xe], ..Default::default() }));
+        assert_eq!((ps[0].blocks(), ps[1].blocks()), ([Some(0), None], [None, Some(0)]));
+        assert_eq!(e.second.as_ref().map(|t| (t.resources.len(), t.resources[0].name, t.members.len())), Some((1, 0xe435592b, 0)));
+        assert_eq!(e.layouts, vec![Some(Layout { id: 0x1122, header: vec![5; 14], entries: vec![LayoutEntry { name: 0xaa, kind: [2, 1], slot: 3 }] }), None]);
+        assert_eq!(s.databases[0].shared_layouts, vec![Some(Layout { id: 0, header: [vec![0u8; 6], 0xabcdu32.to_le_bytes().to_vec(), vec![0u8; 4]].concat(), entries: vec![] })]);
+        // a pass whose `u16` points outside the list has no bindings
+        let out = Body { passes: &[pass([200, 0, 0, 0xff, 0xff, 0xff, 0, 0])], techniques: &[1 | 1 << 24], ..body };
+        let s = read(&database(1, &[], [&[], &[], &[], &[], &[], &[]], &[effect("fx", 0, [&[], &[], &[], &[], &[], &[]], &out)])).unwrap();
+        assert_eq!(s.effects[0].techniques[0].passes[0].bindings, None);
+        // state items
+        let mut blend = vec![0u8; 0x44];
+        blend[1] = 1;
+        blend[4..12].copy_from_slice(&[1, 5, 6, 1, 2, 6, 1, 15]);
+        let (a2c, independent, t) = blend_state(&blend).unwrap();
+        assert_eq!((a2c, independent, t[0], t[1].enable), (false, true, BlendTarget { enable: true, src: 5, dst: 6, op: 1, src_alpha: 2, dst_alpha: 6, op_alpha: 1, mask: 15 }, false));
+        assert_eq!((blend_factor(5), blend_factor(6), blend_factor(2), blend_op(1), blend_factor(200), blend_state(&blend[..0x43])), ("src_alpha", "inv_src_alpha", "one", "add", "?", None));
+        let ds = depth_stencil_state(&[1, 0, 7, 1, 0xff, 0x0f, 1, 1, 3, 8, 1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1]).unwrap();
+        assert_eq!((ds.depth, ds.depth_write, comparison(ds.depth_func), ds.stencil, ds.stencil_read_mask, ds.stencil_write_mask, ds.faces), (true, false, "greater_equal", true, 0xff, 0x0f, [[1, 1, 3, 8], [1, 2, 3, 4]]));
+        assert_eq!((stencil_op(3), comparison(8), rasterizer_state(&[3, 2, 1, 0]), rasterizer_state(&[3])), ("replace", "always", Some((3, 2)), None));
+        let mut sm = vec![64u8, 1, 3, 3, 0, 0, 0, 0, 0x28, 1, 0x55, 0];
+        sm.extend([0f32, 0., 0., 1., 0., 12.].iter().flat_map(|f| f.to_le_bytes()));
+        let x = sampler_state(&sm).unwrap();
+        assert_eq!((x.address, x.lod_bias, x.anisotropy, x.comparison, x.filter, x.border, x.min_lod, x.max_lod, sampler_state(&sm[..35])), ([1, 3, 3], 0., 8, 1, 0x55, [0., 0., 0., 1.], 0., 12., None));
+        // a table's default values and entries: found through the high half of a member's `b` and of a resource's `c`
+        let m = |b: u32| Var { name: 1, alias: 1, kind: 0x0c, dim: 0, index: 0, a: 0, b, c: 0 };
+        let t = Table { resources: vec![Var { name: 2, alias: 2, kind: 0x02, dim: 1, index: 0, a: 0, b: 0, c: 104 << 16 }], members: vec![m(88 << 16), m(0), m(44 << 16)], entries: vec![(7, 0), (2, 1)], names: (0u8..24).collect() };
+        assert_eq!((t.member_default(0), t.member_default(1), t.member_default(2), t.resource_entry(0)), (Some(&[16u8, 17, 18, 19][..]), None, Some(&[20u8, 21, 22, 23][..]), Some((2, 1))));
     }
 }

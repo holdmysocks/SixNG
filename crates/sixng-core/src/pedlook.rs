@@ -780,6 +780,49 @@ pub struct LookPart {
     /// named after the head) or "default" (the whole skin mesh of the fit,
     /// added when the outfit resolves no body).
     pub found_by: &'static str,
+    /// The item's category (plural word or hex), when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    /// Layer of the item's state (hex): the layer its own vertex regions
+    /// belong to (`wardrobe::Part::layer`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+    /// Hide masks of the item's state: layer id (hex) -> 256-bit set over
+    /// that layer's regions (`wardrobe::Part::hides`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hides: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hides_sub: Vec<(String, u32, String)>,
+    /// Hair only: the item state used because of the outfit's headwear
+    /// (`hathairalt`, `helmethairalt` …; `guid` is that state's asset), and
+    /// the headwear that asked for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hair_state: Option<String>,
+    /// Hair only: the asset of each state the item has (state name hex ->
+    /// GUID).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state_guids: Vec<(String, String)>,
+}
+
+/// The hair states to try, in order, under a piece of headwear, from the
+/// item word of its drawable (`hatbeanie…`, `helmetmotor`, `masksdiving`,
+/// `wrapbandana`). The state names are the game's (joaat of each is a state
+/// of hair items); that this headwear picks that state is read from the
+/// names, not from a rule in the data.
+pub fn hair_states_under(word: &str) -> &'static [&'static str] {
+    if word.starts_with("helmet") {
+        &["helmethairalt", "hairhidden"]
+    } else if word.contains("beanie") {
+        &["beaniehairalt", "hathairalt"]
+    } else if word.contains("bandana") {
+        &["bandanahairalt"]
+    } else if word.starts_with("hat") {
+        &["hathairalt"]
+    } else if word.starts_with("mask") {
+        &["maskhairalt"]
+    } else {
+        &[]
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -885,13 +928,22 @@ fn choose(p: &Part, fit: Option<&str>, exists: &dyn Fn(&str) -> bool) -> Option<
     if is_strand_word(item_word(best.0)) {
         return None;
     }
+    // Body skin: the `nude_cull` mesh of the same fit carries the region of
+    // every vertex (mesh stream 13), which the hide masks of the clothes
+    // address; the `_full` mesh has none.
+    if matches!(item_word(best.0), "hand" | "feet") {
+        if let Some(cull) = best.0.strip_suffix("_full").map(|b| format!("{b}_nude_cull")).filter(|n| exists(n)) {
+            return Some((cull, "textures"));
+        }
+    }
     Some((best.0.clone(), "textures"))
 }
 
 /// The whole skin mesh of a fit (`hand` = upper body, `feet` = lower body):
-/// `_full`, else the nude one (male fits only have `nude_cull`).
+/// the `nude_cull` one, whose vertices carry the regions that clothes hide,
+/// else `_full`.
 fn whole_body(word: &str, fit: &str, exists: &dyn Fn(&str) -> bool) -> Option<String> {
-    ["full", "nude_full", "nude_cull"].iter().map(|s| format!("{word}_{fit}_000_{s}")).find(|n| exists(n))
+    ["nude_cull", "full", "nude_full"].iter().map(|s| format!("{word}_{fit}_000_{s}")).find(|n| exists(n))
 }
 
 fn pretty(word: &str) -> String {
@@ -1128,7 +1180,7 @@ fn own_look(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Option<Look> {
     let names: HashSet<String> = ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| e.name.as_ref().map(|n| n.to_ascii_lowercase())).collect();
     let exists = |n: &str| names.contains(n);
     let mut parts: Vec<LookPart> = Vec::new();
-    let plain = |slot: String, drawable: String, found_by: &'static str| LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: String::new(), guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by };
+    let plain = |slot: String, drawable: String, found_by: &'static str| LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: String::new(), guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by, category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, state_guids: vec![] };
     for o in opts.iter().filter(|o| o.default || is_strand_word(item_word(&o.name))) {
         let slot = slot_of(&o.name);
         // one hair, one beard …: the first of each
@@ -1248,10 +1300,11 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
                 if slot == "eyecaps" || slot.contains("hiddenpoly") || parts.iter().any(|x| x.drawable == drawable) {
                     continue;
                 }
-                parts.push(LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: p.item.clone(), guid: p.guid.clone(), tint: p.tint.clone(), colour: p.colour, colour_tag: p.colour_tag, hair_preset: p.hair_preset.clone(), preset: p.preset.clone(), preset_colours: p.preset.as_deref().and_then(|h| presets?.colours(h)).map(|v| v.into_iter().map(|c| c.map(|c| [c[0], c[1], c[2]])).collect()).unwrap_or_default(), tex_remap: p.tex_remap.clone(), skins: p.skins.clone(), found_by });
+                let slot_is_hair = slot == "hair";
+                parts.push(LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: p.item.clone(), guid: p.guid.clone(), tint: p.tint.clone(), colour: p.colour, colour_tag: p.colour_tag, hair_preset: p.hair_preset.clone(), preset: p.preset.clone(), preset_colours: p.preset.as_deref().and_then(|h| presets?.colours(h)).map(|v| v.into_iter().map(|c| c.map(|c| [c[0], c[1], c[2]])).collect()).unwrap_or_default(), tex_remap: p.tex_remap.clone(), skins: p.skins.clone(), found_by, category: p.category.clone(), layer: p.layer.clone(), hides: p.hides.clone(), hides_sub: p.hides_sub.clone(), hair_state: None, state_guids: if slot_is_hair { p.state_guids.clone() } else { vec![] } });
             }
         }
-        let plain = |slot: &str, drawable: String, found_by: &'static str| LookPart { slot: slot.into(), drawable, item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by };
+        let plain = |slot: &str, drawable: String, found_by: &'static str| LookPart { slot: slot.into(), drawable, item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by, category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, state_guids: vec![] };
         if let (false, Some(h)) = (parts.iter().any(|p| p.slot == "head"), &self_head) {
             parts.push(plain("head", h.clone(), "own"));
         }
@@ -1270,6 +1323,19 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
                 }
                 Some(_) => {}
                 None => parts.push(plain("eyes", n, "head")),
+            }
+        }
+        // Headwear: the hair item's state for it names the hair asset worn
+        // under it (a flattened or shortened one, or the hidden one).
+        let wanted: Vec<(&'static str, String)> = parts.iter().flat_map(|p| hair_states_under(item_word(&p.drawable)).iter().map(|s| (*s, p.drawable.clone()))).collect();
+        for h in parts.iter_mut().filter(|p| p.slot == "hair") {
+            let found = wanted.iter().find_map(|(s, by)| {
+                let key = format!("{:08x}", joaat(s));
+                h.state_guids.iter().find(|g| g.0 == key).map(|g| (*s, by.clone(), g.1.clone()))
+            });
+            if let Some((s, by, g)) = found {
+                h.hair_state = Some(format!("{s} (under {by})"));
+                h.guid = Some(g);
             }
         }
         // No body set resolved (it is in a shared resource for many
@@ -1365,13 +1431,15 @@ mod tests {
 
     #[test]
     fn choose_prefers_name_then_fit() {
-        let mut p = Part { item: "1".into(), category: None, name: None, drawable: None, tex_remap: vec![], tags: Default::default(), tint: None, named: None, guid: None, colour: None, colour_tag: None, hair_preset: None, preset: None, state: String::new(), skins: vec![], candidates: Default::default() };
+        let mut p = Part { item: "1".into(), category: None, name: None, drawable: None, tex_remap: vec![], tags: Default::default(), tint: None, named: None, guid: None, colour: None, colour_tag: None, hair_preset: None, preset: None, state: String::new(), skins: vec![], candidates: Default::default(), layer: None, hides: vec![], hides_sub: vec![], state_guids: vec![] };
         p.candidates.insert("hand_fc1_000_full".into(), 3);
         p.candidates.insert("hand_fr1_000_full".into(), 3);
         p.candidates.insert("hand_fr1_000_nude_cull".into(), 3);
         p.candidates.insert("hand_fr1_000_tshirt_a02".into(), 3);
         let all = |_: &str| true;
-        assert_eq!(choose(&p, Some("fr1"), &all).unwrap().0, "hand_fr1_000_full");
+        assert_eq!(choose(&p, Some("fr1"), &all).unwrap().0, "hand_fr1_000_nude_cull");
+        let no_cull = |n: &str| !n.contains("_cull");
+        assert_eq!(choose(&p, Some("fr1"), &no_cull).unwrap().0, "hand_fr1_000_full");
         p.named = Some("x_head_fr1_000_full".into());
         assert_eq!(choose(&p, Some("fr1"), &all).unwrap(), ("x_head_fr1_000_full".to_string(), "name"));
         // strand placeholders are found by name only

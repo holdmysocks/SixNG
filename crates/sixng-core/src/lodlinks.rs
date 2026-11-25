@@ -52,6 +52,12 @@ pub struct ArchLod {
     pub hd_texture_dist: f32,
     pub bs_radius: f32,
     pub bs_centre: [f32; 3],
+    /// `flags` (+0x68; +0x30 holds a copy). None when read from an
+    /// archetype_lod.jsonl written before it was recorded.
+    pub flags: Option<u32>,
+    /// The 64-bit keys at +0x08, +0x10 and +0x28 (0 = none); one of them
+    /// keys the archetype's entry in the tunable-object table of data.
+    pub tuning_keys: [u64; 3],
 }
 
 pub struct Ent {
@@ -119,7 +125,7 @@ pub fn read_file(a: &ArchiveInfo, e: &Entry) -> Option<FileRec> {
     let archs = arch_o
         .iter()
         .map(|&o| {
-            (r.u32(o + 0x74), ArchLod { lod_dist: r.f32(o + 0x38), hd_texture_dist: r.f32(o + 0x70), bs_radius: r.f32(o + 0x64), bs_centre: [r.f32(o + 0x58), r.f32(o + 0x5C), r.f32(o + 0x60)] })
+            (r.u32(o + 0x74), ArchLod { lod_dist: r.f32(o + 0x38), hd_texture_dist: r.f32(o + 0x70), bs_radius: r.f32(o + 0x64), bs_centre: [r.f32(o + 0x58), r.f32(o + 0x5C), r.f32(o + 0x60)], flags: Some(r.u32(o + 0x68)), tuning_keys: [r.u64(o + 0x08), r.u64(o + 0x10), r.u64(o + 0x28)] })
         })
         .collect();
     let mut props = Vec::new();
@@ -195,7 +201,8 @@ pub fn build(ws: &Workspace, a: &ArchiveInfo, metas: &[&Entry], progress: Progre
             let (l, n, vals) = &arch[&h];
             let nm = names.get(&h);
             let mut v = json!({"archetype": format!("{h:08x}"), "name": nm.map(|x| &x.0), "model_id": nm.map(|x| &x.1),
-                "lod_dist": l.lod_dist, "hd_texture_dist": l.hd_texture_dist, "bs_radius": l.bs_radius, "bs_centre": l.bs_centre, "definitions": n});
+                "lod_dist": l.lod_dist, "hd_texture_dist": l.hd_texture_dist, "bs_radius": l.bs_radius, "bs_centre": l.bs_centre, "definitions": n,
+                "flags": l.flags, "tuning_keys": l.tuning_keys.iter().map(|k| format!("{k:016x}")).collect::<Vec<_>>()});
             if vals.len() > 1 {
                 v["lod_dist_values"] = json!(vals);
             }
@@ -473,7 +480,8 @@ pub fn load_archetype_lod_from(index_dir: &std::path::Path) -> HashMap<u32, Arch
         let Some(h) = v["archetype"].as_str().and_then(|x| u32::from_str_radix(x, 16).ok()) else { continue };
         let f = |k: &str| v[k].as_f64().unwrap_or(-1.0) as f32;
         let c = |i: usize| v["bs_centre"][i].as_f64().unwrap_or(0.0) as f32;
-        m.insert(h, ArchLod { lod_dist: f("lod_dist"), hd_texture_dist: f("hd_texture_dist"), bs_radius: f("bs_radius"), bs_centre: [c(0), c(1), c(2)] });
+        let k = |i: usize| v["tuning_keys"][i].as_str().and_then(|x| u64::from_str_radix(x, 16).ok()).unwrap_or(0);
+        m.insert(h, ArchLod { lod_dist: f("lod_dist"), hd_texture_dist: f("hd_texture_dist"), bs_radius: f("bs_radius"), bs_centre: [c(0), c(1), c(2)], flags: v["flags"].as_u64().map(|x| x as u32), tuning_keys: [k(0), k(1), k(2)] });
     }
     m
 }

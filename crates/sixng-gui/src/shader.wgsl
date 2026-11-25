@@ -1,5 +1,5 @@
 // sixng viewer shaders: PBR-lite meshes (skinned, instanced), wireframe,
-// debug lines and a procedural sky.
+// debug lines, procedural surroundings (sky, sun, ground) and a ground shadow.
 
 struct Frame {
     view_proj: mat4x4<f32>,
@@ -139,15 +139,57 @@ fn mesh_vertex(v: VIn) -> VOut {
     return o;
 }
 
+// The ground the surroundings show under the horizon: a plain of asphalt,
+// lit by the sun and the sky like a diffuse surface facing up. Kept darker
+// than the sky at the horizon (moonlight on it would outshine a night sky),
+// so the horizon always reads.
+fn ground_col() -> vec3<f32> {
+    let sun = F.sun_col.rgb * (F.sun_dir.w * max(normalize(F.sun_dir.xyz).y, 0.0) * 3.0 / 3.14159);
+    let g = vec3(0.185, 0.19, 0.20) * (sun + neutral(F.sky_top.rgb, 0.8) * F.misc.w);
+    let w = vec3(0.2126, 0.7152, 0.0722);
+    return g * min(1.0, 0.6 * dot(F.sky_hor.rgb, w) / max(dot(g, w), 0.00001));
+}
+
+// A glow around the sun, pow(s, n) * amp, widened by a reflection lobe of
+// width a (roughness squared): the two widths add in quadrature and the
+// peak drops by the same factor, so the glow keeps its energy.
+fn sun_glow(s: f32, n: f32, amp: f32, a: f32) -> f32 {
+    let k = 1.0 / (1.0 + 0.5 * n * a * a);
+    return amp * k * pow(s, n * k);
+}
+
+// The surroundings along d (unit length): sky from horizon to zenith with
+// the glow of the sun, and the ground under the horizon. `blur` is the
+// roughness of the surface that reflects them (0 = as seen directly): the
+// horizon line, the sky gradient and the glow widen with it. The sun's disc
+// is not part of it: the direct specular term is its reflection.
+fn environment(d: vec3<f32>, blur: f32) -> vec3<f32> {
+    let a = blur * blur;
+    let y = clamp(d.y, -1.0, 1.0);
+    let t = mix(max(y, 0.0), 0.35, min(a * 1.5, 1.0));
+    var c = mix(F.sky_hor.rgb, F.sky_top.rgb, pow(t, 0.6));
+    let s = max(dot(d, normalize(F.sun_dir.xyz)), 0.0);
+    c += F.sun_col.rgb * ((sun_glow(s, 8.0, 0.15, a) + sun_glow(s, 160.0, 0.45, a)) * F.sun_dir.w);
+    // the ground pales a little into the haze towards the horizon
+    let g = mix(ground_col(), F.sky_hor.rgb, 0.1 * exp(min(y, 0.0) * 12.0) * (1.0 - min(a * 1.5, 1.0)));
+    let w = 0.006 + 1.5 * a;
+    return mix(g, c, smoothstep(-w, w, y));
+}
+
+// The surroundings as the camera sees them: with the sun's disc.
 fn sky(d: vec3<f32>) -> vec3<f32> {
-    let t = clamp(d.y, -1.0, 1.0);
-    var c = mix(F.sky_hor.rgb, F.sky_top.rgb, pow(max(t, 0.0), 0.6));
-    if (t < 0.0) {
-        c = mix(F.sky_hor.rgb * 0.55, F.sky_hor.rgb * 0.25, min(-t * 3.0, 1.0));
-    }
-    let s = max(dot(normalize(d), normalize(F.sun_dir.xyz)), 0.0);
-    c += F.sun_col.rgb * (pow(s, 600.0) * 30.0 + pow(s, 8.0) * 0.15) * F.sun_dir.w;
-    return c;
+    let s = max(dot(d, normalize(F.sun_dir.xyz)), 0.0);
+    let disc = smoothstep(0.99972, 0.99984, s) * smoothstep(-0.006, 0.006, d.y);
+    return environment(d, 0.0) + F.sun_col.rgb * (disc * 40.0 * F.sun_dir.w);
+}
+
+// Diffuse light from the surroundings on a surface facing n: the sky,
+// mostly desaturated (its full colour tinted every shaded surface
+// blue-white), and on surfaces that face down the light the ground sends
+// back.
+fn ambient(n: vec3<f32>) -> vec3<f32> {
+    let sky_d = mix(neutral(F.sky_hor.rgb, 0.8) * 0.6, neutral(F.sky_top.rgb, 0.8), n.y * 0.5 + 0.5);
+    return mix(sky_d, ground_col(), 0.8 * smoothstep(0.0, 1.0, -n.y)) * F.misc.w;
 }
 
 fn aces(x: vec3<f32>) -> vec3<f32> {
@@ -410,12 +452,10 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let spec = D * G * Fr / max(4.0 * ndl * ndv, 0.001);
     let kd = (1.0 - Fr) * (1.0 - metal);
     let direct = (kd * albedo / 3.14159 + spec) * F.sun_col.rgb * F.sun_dir.w * ndl * 3.0;
-    // diffuse ambient from a mostly desaturated sky: the full sky colour tinted
-    // every shaded surface blue-white
-    let amb_d = mix(neutral(F.sky_hor.rgb, 0.8) * 0.6, neutral(F.sky_top.rgb, 0.8), n.y * 0.5 + 0.5) * F.misc.w;
+    let amb_d = ambient(n);
     let fr_v = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
     let r = reflect(-v, n);
-    let env = mix(sky(r), (F.sky_top.rgb + F.sky_hor.rgb) * 0.5, rough) * F.misc.w;
+    let env = environment(r, rough) * F.misc.w;
     var col = direct * ao_direct + kd * albedo * amb_d * ao + env * fr_v * ao + emissive;
     col += pearl * pow(1.0 - ndv, 2.0) * 0.6;
     if (cls == 11u) {
@@ -530,6 +570,38 @@ fn fs_sky(i: SOut) -> @location(0) vec4<f32> {
     return vec4(aces(sky(d) * F.sky_hor.w), 1.0);
 }
 
+// ground shadow: soft dark blobs on the ground under a model (no shadow map;
+// rounded boxes from the model's bounds, see `GroundShadow`)
+struct GIn {
+    @location(0) pos: vec3<f32>,
+    @location(1) box: vec4<f32>,  // xy place in the blob (m from its centre), zw its half size
+    @location(2) k: vec2<f32>,    // softness (m), darkness
+};
+struct GOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) box: vec4<f32>,
+    @location(1) k: vec2<f32>,
+};
+
+@vertex
+fn vs_ground(v: GIn) -> GOut {
+    var o: GOut;
+    o.clip = F.view_proj * vec4(v.pos, 1.0);
+    o.box = v.box;
+    o.k = v.k;
+    return o;
+}
+
+@fragment
+fn fs_ground(i: GOut) -> @location(0) vec4<f32> {
+    // signed distance to the rounded box, then a smooth step across its edge
+    let r = min(i.box.z, i.box.w) * 0.6;
+    let q = abs(i.box.xy) - (i.box.zw - vec2(r));
+    let d = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - r;
+    let t = clamp(0.5 - d / (2.0 * i.k.x), 0.0, 1.0);
+    return vec4(0.0, 0.0, 0.0, i.k.y * t * t * (3.0 - 2.0 * t));
+}
+
 // map cells: many placements merged per area (see cells.rs). Base colour
 // only, from a 64 px texture array; each vertex carries its placement's
 // centre and distance range, outside which the placement is dropped.
@@ -642,9 +714,9 @@ fn fs_cell(i: COut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let spec = D * G * Fr / max(4.0 * ndl * ndv, 0.001);
     let kd = 1.0 - Fr;
     let direct = (kd * albedo / 3.14159 + spec) * F.sun_col.rgb * F.sun_dir.w * ndl * 3.0;
-    let amb_d = mix(neutral(F.sky_hor.rgb, 0.8) * 0.6, neutral(F.sky_top.rgb, 0.8), n.y * 0.5 + 0.5) * F.misc.w;
+    let amb_d = ambient(n);
     let fr_v = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
-    let env = mix(sky(reflect(-v, n)), (F.sky_top.rgb + F.sky_hor.rgb) * 0.5, rough) * F.misc.w;
+    let env = environment(reflect(-v, n), rough) * F.misc.w;
     var col = direct + kd * albedo * amb_d + env * fr_v + emissive;
     let mode = F.mode.x;
     if (mode == 1u) { col = albedo; }
