@@ -16,6 +16,7 @@ pub mod pedtint;
 pub mod paths;
 pub mod outfit;
 pub mod pedlook;
+pub mod pedset;
 pub mod pedskel;
 pub mod bodyshape;
 pub mod headskin;
