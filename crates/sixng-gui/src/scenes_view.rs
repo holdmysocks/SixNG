@@ -2,10 +2,13 @@
 //! them by name and by cast, and shows a scene's cast, props and cameras;
 //! a cast member's scene clip plays on that character in the model viewer.
 
+use crate::audio_view::SceneAudio;
 use eframe::egui;
+use serde::Deserialize;
 use sixng_core::anim::ClipDictionary;
 use sixng_core::cutscene::{self, Catalog, Models, Scene};
 use sixng_core::export::{Progress, Workspace};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -110,9 +113,46 @@ pub fn step(shown: &[usize], sel: Option<usize>, by: isize) -> Option<usize> {
 pub enum Action {
     /// Open the character (outfit prefix) and play the clip (`cin@…/<clip>`).
     Play { model: String, clip: String },
+    OpenAudio(SceneAudio),
 }
 
-type Loaded = Option<Result<Arc<Vec<Scene>>, String>>;
+#[derive(Deserialize)]
+struct DialogueRow {
+    speaker: String,
+    speaker_hash: u32,
+    subtitle_key: u32,
+    text: String,
+    audio: Option<SceneAudio>,
+}
+
+type DialogueRows = BTreeMap<String, Vec<DialogueRow>>;
+
+#[derive(Deserialize)]
+struct DialogueFile {
+    schema_version: u32,
+    scenes: DialogueRows,
+}
+
+fn parse_dialogue(bytes: &[u8]) -> anyhow::Result<DialogueRows> {
+    let file: DialogueFile = serde_json::from_slice(bytes)?;
+    anyhow::ensure!(file.schema_version == 1, "unsupported schema version {}", file.schema_version);
+    Ok(file.scenes)
+}
+
+fn load_dialogue(work: &Path) -> anyhow::Result<DialogueRows> {
+    match std::fs::read(work.join("scene_dialogue.json")) {
+        Ok(bytes) => parse_dialogue(&bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+struct LoadedScenes {
+    scenes: Arc<Vec<Scene>>,
+    dialogue: Result<DialogueRows, String>,
+}
+
+type Loaded = Option<Result<LoadedScenes, String>>;
 
 pub struct ScenesView {
     game: String,
@@ -121,6 +161,7 @@ pub struct ScenesView {
     pending: Arc<Mutex<Loaded>>,
     progress: Arc<Mutex<(String, u64, u64)>>,
     scenes: Option<Arc<Vec<Scene>>>,
+    dialogue: Result<DialogueRows, String>,
     error: Option<String>,
     pub name_q: String,
     pub cast_q: String,
@@ -139,6 +180,7 @@ impl ScenesView {
             pending: Default::default(),
             progress: Default::default(),
             scenes: None,
+            dialogue: Ok(BTreeMap::new()),
             error: None,
             name_q: String::new(),
             cast_q: String::new(),
@@ -176,7 +218,12 @@ impl ScenesView {
                 *prog.lock().unwrap() = (s.to_string(), d, t);
                 c2.request_repaint();
             });
-            let r = load_scenes(&ws, p).map(Arc::new).map_err(|e| format!("{e:#}"));
+            let r = load_scenes(&ws, p)
+                .map(|scenes| LoadedScenes {
+                    scenes: Arc::new(scenes),
+                    dialogue: load_dialogue(&ws.work).map_err(|e| format!("{e:#}")),
+                })
+                .map_err(|e| format!("{e:#}"));
             *slot.lock().unwrap() = Some(r);
             ctx.request_repaint();
         });
@@ -188,7 +235,10 @@ impl ScenesView {
         }
         if let Some(r) = self.pending.lock().unwrap().take() {
             match r {
-                Ok(s) => self.scenes = Some(s),
+                Ok(loaded) => {
+                    self.scenes = Some(loaded.scenes);
+                    self.dialogue = loaded.dialogue;
+                }
                 Err(e) => self.error = Some(e),
             }
         }
@@ -282,13 +332,18 @@ impl ScenesView {
                 ui.label("No scene matches.");
                 return;
             };
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| act = scene_ui(ui, s));
+            let dialogue = self.dialogue.as_ref().map(|rows| {
+                rows.get(&s.name).map(Vec::as_slice).unwrap_or_default()
+            });
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                act = scene_ui(ui, s, dialogue.map_err(String::as_str));
+            });
         });
         act
     }
 }
 
-fn scene_ui(ui: &mut egui::Ui, s: &Scene) -> Option<Action> {
+fn scene_ui(ui: &mut egui::Ui, s: &Scene, dialogue: Result<&[DialogueRow], &str>) -> Option<Action> {
     let mut act = None;
     ui.heading(&s.name);
     egui::Grid::new("scene_facts").num_columns(2).show(ui, |ui| {
@@ -344,6 +399,40 @@ fn scene_ui(ui: &mut egui::Ui, s: &Scene) -> Option<Action> {
     });
     ui.label(egui::RichText::new("Each clip starts at the character's own origin: where the characters stand in the scene relative to each other is not known.").weak().small());
     ui.add_space(6.0);
+    match dialogue {
+        Ok(rows) if !rows.is_empty() => {
+            egui::CollapsingHeader::new(format!("Dialogue ({})", rows.len()))
+                .default_open(true)
+                .show(ui, |ui| {
+                    egui::Grid::new("scene_dialogue").striped(true).show(ui, |ui| {
+                        ui.strong("Speaker");
+                        ui.strong("Subtitle key");
+                        ui.strong("Dialogue");
+                        ui.strong("Audio");
+                        ui.end_row();
+                        for row in rows {
+                            ui.label(&row.speaker)
+                                .on_hover_text(format!("Native speaker hash {:08x}", row.speaker_hash));
+                            ui.monospace(format!("{:08x}", row.subtitle_key));
+                            ui.add(egui::Label::new(&row.text).wrap());
+                            if let Some(address) = &row.audio {
+                                let label = if address.stem.is_some() { "Open voice excerpt" } else { "Open in Audio" };
+                                if ui.button(label).clicked() {
+                                    act = Some(Action::OpenAudio(address.clone()));
+                                }
+                            } else {
+                                ui.weak("Unresolved");
+                            }
+                            ui.end_row();
+                        }
+                    });
+                });
+        }
+        Err(e) => {
+            ui.colored_label(ui.visuals().error_fg_color, format!("Could not load scene_dialogue.json: {e}"));
+        }
+        Ok(_) => {}
+    }
     egui::CollapsingHeader::new(format!("Props ({})", s.props.len())).default_open(true).show(ui, |ui| {
         for o in &s.props {
             ui.label(match &o.model {
@@ -380,6 +469,33 @@ fn scene_ui(ui: &mut egui::Ui, s: &Scene) -> Option<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_dialogue_preserves_occurrences_with_and_without_audio() {
+        let rows = parse_dialogue(br#"{
+            "schema_version": 1,
+            "scenes": {
+                "fixture_scene": [
+                    {"speaker": "Guide", "speaker_hash": 1, "subtitle_key": 3,
+                     "text": "The lights are on.",
+                     "audio": {"archive": "local/fixture.rpf", "bank_offset": 4096,
+                               "stream_index": 1, "stream_id": 66, "data_offset": 4352, "data_size": 512,
+                               "stem": {"channel_id": 52, "start_frame": 120, "end_frame": 240}}},
+                    {"speaker": "Guide", "speaker_hash": 2, "subtitle_key": 3,
+                     "text": "The lights are on."}
+                ]
+            }
+        }"#).unwrap();
+        let rows = &rows["fixture_scene"];
+        assert_eq!(rows.len(), 2);
+        let audio = rows[0].audio.as_ref().unwrap();
+        assert_eq!(audio.address.stream_index, 1);
+        assert_eq!(audio.stem.unwrap().channel_id, 52);
+        assert!(rows[1].audio.is_none());
+        assert_ne!(rows[0].speaker_hash, rows[1].speaker_hash);
+        assert_eq!(rows[0].subtitle_key, rows[1].subtitle_key);
+        assert!(parse_dialogue(br#"{"schema_version":2,"scenes":{}}"#).is_err());
+    }
     use sixng_core::cutscene::SceneObject;
 
     fn obj(handle: &str, kind: &'static str, model: Option<&str>) -> SceneObject {
