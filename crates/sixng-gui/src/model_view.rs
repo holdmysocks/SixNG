@@ -304,6 +304,9 @@ pub struct LookInfo {
     pub hats: Vec<String>,
     /// The hat of the outfit shown, to keep the hair under it.
     pub hat: Option<Arc<sixng_core::groom::Shell>>,
+    /// The character's head, body and garments, which the strand style
+    /// pass is damped against.
+    pub collide: Option<Arc<sixng_core::groom::Colliders>>,
     /// The colours of the game's hair palette (`ped_tint_hair`, each row at
     /// mid shade, sRGB), to pick from.
     pub hair_swatches: Vec<[u8; 3]>,
@@ -886,6 +889,7 @@ pub struct Hair {
     /// The hat worn and the grooms it presses down (the scalp hair).
     hat: Option<Arc<sixng_core::groom::Shell>>,
     under_hat: Vec<u64>,
+    collide: Option<Arc<sixng_core::groom::Colliders>>,
     /// Animals: the skinned vertices and joints of the model shown, so the
     /// fur can be bound to the skin under it and move with a clip.
     rig: Option<Arc<FurRig>>,
@@ -942,6 +946,7 @@ impl Default for Hair {
             selected: Vec::new(),
             hat: None,
             under_hat: Vec::new(),
+            collide: None,
             rig: None,
             export_full: true,
             exporting: false,
@@ -976,7 +981,7 @@ impl Hair {
     fn want_key(&self) -> String {
         let mut tones: Vec<(u64, u32)> = self.tones.iter().filter(|_| self.stored_colours).map(|(k, t)| (*k, t.name)).collect();
         tones.sort();
-        format!("{tones:?}|{:?}|{}|{:?}|{}|{}|{}|{:?}|{:?}", self.selected, self.width_mm, self.colour, self.skin_colour && !self.skin.is_empty(), self.full_coat, self.density, self.hat.as_ref().map(|h| h.id), self.rig.as_ref().map(|r| (r.verts.len(), r.joints.len())))
+        format!("{tones:?}|{:?}|{}|{:?}|{}|{}|{}|{:?}|{:?}|{:?}", self.selected, self.width_mm, self.colour, self.skin_colour && !self.skin.is_empty(), self.full_coat, self.density, self.hat.as_ref().map(|h| h.id), self.collide.as_ref().map(|c| c.id), self.rig.as_ref().map(|r| (r.verts.len(), r.joints.len())))
     }
     pub fn settled(&self) -> bool {
         !self.loading && !self.listing && !self.exporting && self.key == self.want_key()
@@ -1270,6 +1275,7 @@ impl ModelView {
         let (density, width_scale) = (self.hair.density.clamp(0.05, 1.0), self.hair.width_mm / 3.0);
         let note = self.hair.coat_note.clone();
         let (hat, under_hat) = (self.hair.hat.clone(), self.hair.under_hat.clone());
+        let collide = self.hair.collide.clone();
         let rig = self.hair.rig.clone();
         let tones = if self.hair.stored_colours { self.hair.tones.clone() } else { HashMap::new() };
         // research, until the game's ramp files are read by SixNG itself: SIXNG_HAIR_DATA=<json of the four
@@ -1328,7 +1334,7 @@ impl ModelView {
                         // under about 1.5 million ribbon vertices (a vertex
                         // buffer may not exceed 256 MiB).
                         let share = share.min(750_000.0 / (g.stored_strands() * k).max(1) as f32);
-                        let coat = g.coat(share);
+                        let coat = g.coat_with(share, collide.as_deref());
                         drawn += coat.guides.len();
                         // fewer strands than stored: wider ones, for the same cover
                         let base = if g.width > 0.0 { g.width } else { 0.0003 };
@@ -2464,6 +2470,7 @@ impl ModelView {
                 }
                 if let Some(look) = &l.look {
                     self.hair.hat = look.hat.clone();
+                    self.hair.collide = look.collide.clone();
                     self.hair.under_hat = look.hair.iter().filter(|h| h.slot == "hair").flat_map(|h| h.grooms.iter().copied()).collect();
                     // a character: its confident hair, grown to full density
                     let key = format!("{}#{}", look.model, look.current);
@@ -2492,6 +2499,7 @@ impl ModelView {
                 } else if !self.hair.look_key.is_empty() {
                     self.hair.look_key.clear();
                     self.hair.hat = None;
+                    self.hair.collide = None;
                     if self.hair.fur.is_none() {
                         self.hair.selected.clear();
                     }
@@ -6895,6 +6903,16 @@ fn load_query_sel(
                 let head: Vec<[f32; 3]> = skin.iter().filter(|(n, _)| is_head(n)).flat_map(|(_, p)| p.iter().copied()).collect();
                 l.hat = Some(Arc::new(sixng_core::groom::Shell::new([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, top - 0.10], &hat, &head)));
                 l.notes.push("Hat: the scalp hair is pressed under the hat's lining (strand points beyond it are pulled in to 3 mm under it), so the hair does not come through the hat; an opening the hat encloses (over a cap's strap) counts as closed. A stand-in, not the game's method: the outfit asks for the plain hair, and no stored rule says how the game keeps it under the hat.".to_string());
+            }
+            // The style pass is damped near the head, body and garments
+            // (hats press the hair on their own; strand and card hair are
+            // not colliders).
+            if !l.hair.is_empty() {
+                let hairy = ["hair", "brows", "beard", "lashes", "body hair", "eyes", "eyecaps", "teeth", "teeth accessory"];
+                let pts: Vec<[f32; 3]> = skin.iter().filter(|(n, _)| !l.hats.contains(&n.to_ascii_lowercase()) && !hairy.contains(&sixng_core::pedlook::slot_of(&n.to_ascii_lowercase()).as_str())).flat_map(|(_, p)| p.iter().copied()).collect();
+                if !pts.is_empty() {
+                    l.collide = Some(Arc::new(sixng_core::groom::Colliders::new(&pts)));
+                }
             }
             // Strand roots of an inferred link must lie on this character:
             // pieces that do not (another head shape, a neighbour's piece)

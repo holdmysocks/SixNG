@@ -845,6 +845,29 @@ pub struct Outfit {
     /// Items of the outfit that resolved to no drawable (item id, slot hash).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unresolved: Vec<String>,
+    /// Items left out on purpose (item id, why): first-person-only meshes
+    /// and the anatomical body layer, which clothing always covers.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub not_shown: Vec<String>,
+}
+
+/// Why an item that resolved to no shown drawable is left out on purpose:
+/// the first-person arms (its GUID or every texture match is an `_fp`
+/// drawable) or the anatomical body layer (category `2a7a13a4`).
+fn not_shown_reason(p: &Part, by_guid: &HashMap<u64, &String>) -> Option<&'static str> {
+    let fp = |n: &str| n.ends_with("_fp") || n.contains("_fp_");
+    let named = p.guid.as_deref().and_then(|g| u64::from_str_radix(g, 16).ok()).and_then(|g| by_guid.get(&g));
+    if named.is_some_and(|n| fp(n)) || (named.is_none() && !p.candidates.is_empty() && p.candidates.keys().all(|n| fp(n))) {
+        return Some("first-person view only");
+    }
+    // The four items of this category in the named characters' wardrobes
+    // (2026-11-25) name by GUID `bodygenitalsgen_mr1_000_regular_ws00_full`,
+    // its `_alt_00` and a hidden placeholder: drawables of a content pack
+    // (core_restofworld), not of packs.rpf. Clothing covers them.
+    if p.category.as_deref() == Some("2a7a13a4") {
+        return Some("anatomical body layer, always under clothing");
+    }
+    None
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1210,7 +1233,7 @@ fn own_look(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Option<Look> {
         }
     }
     let main: Vec<String> = parts.iter().filter(|p| ["full", "outer", "top", "bottom"].contains(&p.slot.as_str())).map(|p| pretty(item_word(&p.drawable))).collect();
-    Some(Look { model: model.to_string(), resource: format!("{} (own parts: the outfit data does not cover this model)", a.id), fit, outfits: vec![Outfit { id: String::new(), outfit_type: String::new(), scale: 0.0, label: format!("own parts: {}", main.join(", ")), body_shape: None, parts, strand_colours: vec![], unresolved: vec![] }], note: Some("The outfit data does not cover this model: it is shown in its own parts.".into()) })
+    Some(Look { model: model.to_string(), resource: format!("{} (own parts: the outfit data does not cover this model)", a.id), fit, outfits: vec![Outfit { id: String::new(), outfit_type: String::new(), scale: 0.0, label: format!("own parts: {}", main.join(", ")), body_shape: None, parts, strand_colours: vec![], unresolved: vec![], not_shown: vec![] }], note: Some("The outfit data does not cover this model: it is shown in its own parts.".into()) })
 }
 
 /// The outfits of one model row. `own_head`: keep only the outfits whose
@@ -1275,6 +1298,7 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
     for (o, vs) in flat {
         let mut parts: Vec<LookPart> = Vec::new();
         let mut unresolved = Vec::new();
+        let mut not_shown = Vec::new();
         let mut body_shape = None;
         let mut strand_colours: Vec<(String, String)> = Vec::new();
         for v in &vs {
@@ -1303,7 +1327,9 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
                     // a garment that names a model by GUID is a part whose
                     // model was not found
                     let garment = p.guid.as_ref().and(p.category.as_deref()).and_then(garment_category);
-                    if let Some(g) = garment {
+                    if let Some(why) = not_shown_reason(p, &by_guid) {
+                        not_shown.push(format!("{} ({why})", p.item));
+                    } else if let Some(g) = garment {
                         unresolved.push(format!("{} ({g}: its model is not found)", p.item));
                     } else if p.named.is_some() || !p.candidates.is_empty() {
                         unresolved.push(format!("{} ({})", p.item, p.category.clone().unwrap_or_default()));
@@ -1384,6 +1410,7 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
             parts,
             strand_colours,
             unresolved,
+            not_shown,
         });
     }
     if own_head {

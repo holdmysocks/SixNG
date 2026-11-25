@@ -706,7 +706,12 @@ again**).
     a bottom (4 items of 3 characters stay unresolved); most of the 17 are stored that way (shirtless in shorts,
     costumes), and a garment whose model is found under no texture and
     no GUID is listed in the panel as not found instead of being left
-    out silently. `sixng ped-look "^"` lists every character
+    out silently. Items left out on purpose are listed apart, as
+    `not_shown` with the reason: the first-person arms (player Jason) and
+    the anatomical body layer, whose models are in a content pack and which
+    clothing covers. Across all 3,103 outfits of the 292 characters, 2
+    items stay unresolved (before 2026-11-25: 472, nearly all of them these
+    two kinds). `sixng ped-look "^"` lists every character
     with what its default outfit has. `sixng outfit <name> --look N`
     exports outfit N as one rigged GLB (parts, the face, stored tints;
     not the viewer's skin tone, colour words or hidden skin).
