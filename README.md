@@ -992,7 +992,7 @@ baked map (`entities.bin`; bake first with `--bake-map`):
 - **Sun and moon shadows** (HDR map, on by default; **sun and moon
   shadows** turns them off): four cascaded shadow maps, 2048² each, over
   the nearest 900 m (the timecycle's `dir_shadow_num_cascades`), split
-  between even and logarithmic spacing, snapped to whole texels so they
+  logarithmically (to about 12, 52, 216 and 900 m), snapped to whole texels so they
   do not shimmer, and filtered over 4×4 compares with a blend between
   cascades. The two near cascades are drawn every frame and the two far
   ones in turn; the far ones skip models smaller than two of their

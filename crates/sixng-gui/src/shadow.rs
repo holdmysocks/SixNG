@@ -1,8 +1,9 @@
 //! Sun and moon shadows for the 3D map: cascaded shadow maps.
 //!
 //! Four cascades (the timecycle's `dir_shadow_num_cascades`) split the
-//! distance from the camera to the shadow range with the usual blend of
-//! even and logarithmic spacing. Each cascade is an orthographic view from
+//! distance from the camera to the shadow range logarithmically (from
+//! 3 m: about 12, 52, 216 and 900 m), so each holds the same detail per
+//! pixel on screen. Each cascade is an orthographic view from
 //! the light over the bounding sphere of its slice of the view, snapped to
 //! whole texels so shadows do not shimmer while the camera moves. The two
 //! near cascades are drawn every frame, the two far ones on alternate
@@ -15,8 +16,9 @@ pub const RES: u32 = 2048;
 pub const FMT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Distance (m) the shadows reach.
 pub const RANGE: f32 = 900.0;
-/// How much of the split spacing is logarithmic (rest even).
-const LAMBDA: f32 = 0.8;
+/// Where the logarithmic split spacing starts (m): nearer than this the
+/// first cascade is no sharper on screen.
+const SPLIT_NEAR: f32 = 3.0;
 /// Room behind a cascade's sphere towards the light for casters (m).
 const BACK: f32 = 1500.0;
 
@@ -46,14 +48,13 @@ pub struct Cascade {
     pub min_radius: f32,
 }
 
-/// Split distances: from `near` to `range`.
+/// Split distances: logarithmic from `near` (at least `SPLIT_NEAR`) to `range`.
 pub fn splits(near: f32, range: f32) -> [f32; CASCADES] {
+    let near = near.max(SPLIT_NEAR);
     let mut out = [0.0; CASCADES];
     for (i, o) in out.iter_mut().enumerate() {
         let f = (i + 1) as f32 / CASCADES as f32;
-        let log = near * (range / near).powf(f);
-        let lin = near + (range - near) * f;
-        *o = LAMBDA * log + (1.0 - LAMBDA) * lin;
+        *o = near * (range / near).powf(f);
     }
     out
 }
@@ -125,7 +126,7 @@ mod tests {
         let s = splits(0.5, RANGE);
         assert!(s.windows(2).all(|w| w[0] < w[1]));
         assert!((s[CASCADES - 1] - RANGE).abs() < 1e-3);
-        assert!(s[0] < 20.0);
+        assert!(s[0] > 8.0 && s[0] < 20.0, "{s:?}");
     }
 
     #[test]
