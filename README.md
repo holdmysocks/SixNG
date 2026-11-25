@@ -1110,9 +1110,37 @@ Screenshots from the command line (for checks and docs):
 
 Options: `--lod N`, `--mode 0-7` (shaded, albedo, normals, UV, slot,
 gaps, vertex colour, lighting), `--slot 0-3`, `--rma 0-3`, `--wire`,
-`--skeleton`, `--normals`, `--tod H`, `--paint r,g,b`, `--finish 0-3`,
+`--skeleton`, `--normals`, `--tod H`, `--weather W` (the game's lighting for
+that weather type at `--tod`, see below), `--paint r,g,b`, `--finish 0-3`,
 `--pearl A`, `--wet A`, `--exposure E`, `--spin R`, `--door R`, `--yaw R`,
 `--pitch R`, `--zoom F`, `--size WxH`.
+
+**Time of day and weather.** The model view's Light section has the
+hour slider and a **weather** list: *viewer default* keeps the viewer's own
+light set-up (the default, so screenshots and checks are unchanged); any of
+the game's 12 weather types (Sunny, Clear, Clouds, Overcast, Overcast dark,
+Misty, Fog, Drizzle, Shower, Rain, Thunderstorm, Hurricane) lights the model
+from the game's timecycle at the chosen hour (`sixng daylight` prints the
+same numbers). A weather is built as the game's weather list does: the
+weather type's base cycle (`GLOBAL` region, 13 time samples) with its eight
+modifiers and their submodifiers applied in order, and interpolated between
+the two time samples around the hour, eased with the earlier sample's
+easing (linear, or quartic in-out at 04, 20, 21 and 22 h; which sample's
+easing applies is our reading). From the timecycle: the directional
+colour and multiplier (`light_dir_col_*`, `light_dir_mult`, with the sun's
+`light_dir_sun_mult`, `sky_scattering_sun_intensity_multiplier`,
+`sky_scattering_sun_col_*` or the moon's `light_dir_moon_mult`,
+`sky_moon_col_*`), the ambient (`ambient_sky_intensity`,
+`indirect_light_sky_multiplier`, tint `ambient_sky_color_mult_*` x
+`sky_scattering_sky_col_*`), `postfx_exposure` and the high-level cloud
+cover. The game feeds these into a physical sky and eye adaptation that are
+not decoded, so the rest is our own simple model: sun path at the equinox
+at 25.8° N, a full moon opposite the sun, Rayleigh/aerosol air-mass tint of
+the sun near the horizon, sky brightness over the day, the sun dimmed by
+85 % of the cloud cover, and an exposure that brightens dark scenes.
+Directional and ambient strength are scaled so that Sunny at 12:00 matches
+the viewer default. The table is decoded from `common.rpf` (needs its
+index) on first use, ~once, and cached in `<work>/cache/daylight.json`.
 
 ### Textures
 
