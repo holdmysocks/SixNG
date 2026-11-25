@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod bench;
+mod scene_dialogue;
 
 #[derive(Parser)]
 #[command(name = "sixng", version, about = "GTA VI (RPF9 / Xbox Series) asset extractor")]
@@ -1000,6 +1001,18 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         limit: usize,
     },
+    /// Build the Scenes dialogue index from verified local occurrences and GXT tables.
+    SceneDialogue {
+        /// Local JSON with verified occurrence records.
+        #[arg(long)]
+        input: PathBuf,
+        /// A JSON table from `sixng text --out`. Repeat for tables in one locale.
+        #[arg(long, required = true)]
+        text_table: Vec<PathBuf>,
+        /// Output file (default <work>/scene_dialogue.json).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Inspect a ttpf texture store: list its textures, or decode some to PNG.
     Ttpf {
         /// Store id or substring (e.g. vehicles/ttdb_vehicles.ttpf).
@@ -1728,6 +1741,10 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 o["scenes"] = json!(sel.iter().take(take).collect::<Vec<_>>());
             }
             out.print(&o);
+        }
+        Cmd::SceneDialogue { input, text_table, out: path } => {
+            let default = ws.work.join("scene_dialogue.json");
+            out.print(&scene_dialogue::generate(&ws, input, text_table, path.as_deref().unwrap_or(&default))?);
         }
         Cmd::Ttpf { store, hash, first, mip, all_slices, float, all, out: tout } => {
             let a = ws.resolve(store)?;
