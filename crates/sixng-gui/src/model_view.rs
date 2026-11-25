@@ -2738,15 +2738,21 @@ impl ModelView {
     fn sync_part_look(&mut self, rs: &egui_wgpu::RenderState) {
         let Some(l) = self.loaded.as_mut() else {
             self.part_look_table = None;
+            (self.look.coat, self.look.coat_base) = ([0.0; 4], None);
             return;
         };
         let pc = &l.info["part_colours"];
         let default = pc["default"].as_u64();
         let Some(idx) = self.part_look_want.as_ref().and_then(|k| pc["configs"][k.as_str()].as_u64()).or(default) else {
             self.part_look_table = None;
+            (self.look.coat, self.look.coat_base) = ([0.0; 4], None);
             return;
         };
         let idx = idx as usize;
+        // the coat of this look's body paint (clear coat, flakes)
+        let coat = &pc["coat"];
+        let record = coat["paint_by_look"][idx].as_u64().map(|k| &coat["records"][k as usize]).filter(|r| r.is_object());
+        (self.look.coat, self.look.coat_base) = record.map_or(([0.0; 4], None), paint_coat);
         // What the fitted parts change in the look (a body kit's part
         // rebinds the ids of its panels, mostly to the body paint): part id
         // and its new entry.
@@ -7213,6 +7219,21 @@ impl Lamps {
         let has = |k: &str| s.split(',').any(|x| x.trim().eq_ignore_ascii_case(k));
         Lamps { head: has("head"), high: has("high"), day: has("day"), tail: has("tail"), brake: has("brake"), reverse: has("reverse"), left: has("left"), right: has("right"), hazard: has("hazard"), interior: has("interior") }
     }
+}
+
+/// What the viewer draws of a coat record (model.json
+/// `part_colours.coat.records`): clear coat intensity and roughness, flake
+/// orientation and size, and the base coat roughness when the record
+/// overrides it. Film, sheen and anisotropy are not drawn.
+fn paint_coat(r: &serde_json::Value) -> ([f32; 4], Option<f32>) {
+    let f = |k: &str| r[k].as_f64().unwrap_or(0.0) as f32;
+    let on = |k: &str| r[k].as_bool().unwrap_or(false);
+    let clear = if on("use_clear_coat") { f("clear_coat_intensity").clamp(0.0, 1.0) } else { 0.0 };
+    let flakes = on("use_flakes") && f("flake_coverage") > 0.0;
+    (
+        [clear, f("clear_coat_roughness").clamp(0.0, 1.0), if flakes { f("flake_orientation").max(0.001) } else { 0.0 }, f("flake_size").max(0.0)],
+        on("override_base_coat_roughness").then(|| f("base_coat_roughness").clamp(0.04, 1.0)),
+    )
 }
 
 /// Outer radius and width of the tyre among the wheel models (the one with
