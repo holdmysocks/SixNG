@@ -1,0 +1,104 @@
+{
+  "scene": "training_room",
+  "speaker_label": "Operator",
+  "subscenes_in_playback_order": ["door", "console"],
+  "events": [
+    {
+      "subscene": "console",
+      "local_ms": 120,
+      "speaker_hashes": [286326786],
+      "subtitle_key": 3489660930,
+      "stem": {"channel_id": 178, "start_frame": 7000, "end_frame": 9900}
+    },
+    {
+      "subscene": "door",
+      "local_ms": 900,
+      "speaker_hashes": [286326785],
+      "subtitle_key": 3489660929,
+      "stem": {"channel_id": 161, "start_frame": 1000, "end_frame": 4300}
+    },
+    {
+      "subscene": "console",
+      "local_ms": 190,
+      "speaker_hashes": [286326785, 286326786],
+      "subtitle_key": 3489660931
+    },
+    {
+      "subscene": "console",
+      "local_ms": 230,
+      "speaker_hashes": [286326786],
+      "subtitle_key": 3489660932
+    }
+  ],
+  "localized_strings": {
+    "en": {
+      "d0000001": "Test the door.",
+      "d0000002": "The indicator is steady.",
+      "d0000003": "Check complete.",
+      "d0000004": "Keep the cover open."
+    },
+    "es": {
+      "d0000001": "Comprueba la puerta.",
+      "d0000002": "El indicador está fijo.",
+      "d0000003": "Comprobación terminada.",
+      "d0000004": "Deja abierta la tapa."
+    },
+    "fr": {
+      "d0000001": "Vérifie la porte.",
+      "d0000002": "Le voyant est stable.",
+      "d0000003": "Vérification terminée.",
+      "d0000004": "Laisse le capot ouvert."
+    },
+    "de": {
+      "d0000001": "Prüf die Tür.",
+      "d0000002": "Die Anzeige ist stabil.",
+      "d0000003": "Prüfung abgeschlossen.",
+      "d0000004": "Lass die Abdeckung offen."
+    },
+    "pt": {
+      "d0000001": "Verifica a porta.",
+      "d0000002": "A luz indicadora está estável.",
+      "d0000003": "Verificação concluída.",
+      "d0000004": "Deixa a tampa aberta."
+    }
+  },
+  "expected": {
+    "playback_clock_ms": [900, 120, 230],
+    "review_subtitle_keys": [3489660931],
+    "rows": [
+      {
+        "speaker": "Operator",
+        "speaker_hash": 286326785,
+        "subtitle_key": 3489660929,
+        "audio": {
+          "archive": "synthetic.rpf",
+          "bank_offset": 4096,
+          "stream_index": 0,
+          "stream_id": 85,
+          "data_offset": 4178,
+          "data_size": 6144,
+          "stem": {"channel_id": 161, "start_frame": 1000, "end_frame": 4300}
+        }
+      },
+      {
+        "speaker": "Operator",
+        "speaker_hash": 286326786,
+        "subtitle_key": 3489660930,
+        "audio": {
+          "archive": "synthetic.rpf",
+          "bank_offset": 4096,
+          "stream_index": 0,
+          "stream_id": 85,
+          "data_offset": 4178,
+          "data_size": 6144,
+          "stem": {"channel_id": 178, "start_frame": 7000, "end_frame": 9900}
+        }
+      },
+      {
+        "speaker": "Operator",
+        "speaker_hash": 286326786,
+        "subtitle_key": 3489660932
+      }
+    ]
+  }
+}
