@@ -1152,9 +1152,13 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 let p2 = pr.clone();
                 let id = a.id.clone();
                 let pa: Progress = Arc::new(move |s, d, tot| p2(&format!("{id}:{s}"), d, tot));
-                let ix = ws.ensure_index(&a, *force, !*no_names, pa)?;
+                let (ix, how) = ws.ensure_index_report(&a, *force, !*no_names, pa)?;
                 let named = ix.entries.iter().filter(|e| e.name.is_some()).count();
-                res.push(json!({"archive": a.id, "seconds": t.elapsed().as_secs_f64(), "stats": ix.stats, "named_entries": named}));
+                if !cli.quiet {
+                    eprintln!("{}: {}", a.id, how.summary());
+                }
+                res.push(json!({"archive": a.id, "status": how.status, "summary": how.summary(), "outcome": how,
+                    "seconds": t.elapsed().as_secs_f64(), "stats": ix.stats, "named_entries": named}));
             }
             out.print(&json!({"ok": true, "indexed": res}));
         }

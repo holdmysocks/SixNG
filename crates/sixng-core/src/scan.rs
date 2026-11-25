@@ -229,6 +229,12 @@ fn raw_run(f: &mut File, pos: u64) -> Option<Vec<RawStream>> {
 /// Scan one segment `[start, end)` of the file. Streams that start inside the
 /// segment are returned, even if they run past its end.
 pub fn scan_segment(path: &Path, start: u64, end: u64, progress: &AtomicU64) -> Result<Vec<RawStream>> {
+    scan_segment_with(path, start, end, progress, true)
+}
+
+/// [`scan_segment`]; `follow_raw` false is scan 1, which did not follow
+/// stored 64 KiB chunks (kept for the upgrade tests).
+fn scan_segment_with(path: &Path, start: u64, end: u64, progress: &AtomicU64, follow_raw: bool) -> Result<Vec<RawStream>> {
     let mut f = File::open(path)?;
     let mut f2 = File::open(path)?;
     let mut res = Vec::new();
@@ -270,7 +276,7 @@ pub fn scan_segment(path: &Path, start: u64, end: u64, progress: &AtomicU64) -> 
                 res.push(s);
                 Some(next)
             }
-            None if pos == chunk_end => {
+            None if follow_raw && pos == chunk_end => {
                 chunk_end = u64::MAX;
                 raw_run(&mut f2, pos).map(|run| {
                     let last = run.last().unwrap();
@@ -444,6 +450,162 @@ pub fn archive_stem(path: &Path) -> String {
 
 /// Progress callback: (bytes_done, bytes_total).
 pub type ProgressFn = dyn Fn(u64, u64) + Sync + Send;
+/// Progress callback with a stage: (stage, bytes_done, bytes_total). The
+/// stage is "scan", or "upgrade" while an older index is brought up to date.
+pub type StageProgressFn = dyn Fn(&str, u64, u64) + Sync + Send;
+
+/// What an `INDEX_VERSION` step changed, so what an index written before it
+/// needs to become current.
+///
+/// Entries are always grouped again from the saved segment streams (that is
+/// cheap), so a change to grouping or classification needs no rescan. The
+/// raw stream scan has its own version, [`SCAN_VERSION`], in the segment file
+/// names: a segment from an older scan is either upgraded in place (see
+/// [`scan1_segment_is_current`]) or scanned again. What is left for a step to
+/// say is whether the saved names can be kept, or whether nothing old can be
+/// trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepNeeds {
+    /// Entries come from the segments again; a name, type and member list
+    /// is kept for an entry whose streams are unchanged.
+    Regroup,
+    /// As `Regroup`, but names recovered from a "<name>.#<tag>" string may
+    /// change, so those entries get their names again. Texture dictionary
+    /// names and entries without a name are kept.
+    RenameTagged,
+    /// Nothing old is reused: segments are scanned again and every name is
+    /// recovered again.
+    Rescan,
+}
+
+/// Every `INDEX_VERSION` step, oldest first: (from, to, needs, what changed).
+/// A version bump adds its step here (a test checks the chain ends at the
+/// current version); an index older than the first step is rebuilt from its
+/// segments with every name recovered again.
+pub const INDEX_STEPS: &[(&str, &str, StepNeeds, &str)] = &[
+    ("5", "6", StepNeeds::Regroup, "a resource whose system page continues on a resource boundary stays one entry"),
+    ("6", "7", StepNeeds::Regroup, "stored (uncompressed) 64 KiB chunks join their chunked entry; scan 1 -> 2"),
+    ("7", "8", StepNeeds::RenameTagged, "a resource name starts where its pointer points"),
+];
+
+/// What an index written by `from` needs to become current: the steps in
+/// order, folded to the strongest need. `None` when `from` is not in the
+/// chain (too old, or unknown): entries come from the segments again and
+/// every name is recovered again.
+pub fn upgrade_needs(from: &str) -> Option<StepNeeds> {
+    if from == crate::INDEX_VERSION {
+        return Some(StepNeeds::Regroup);
+    }
+    let mut at = INDEX_STEPS.iter().position(|s| s.0 == from)?;
+    let mut needs = StepNeeds::Regroup;
+    loop {
+        let (_, to, n, _) = INDEX_STEPS[at];
+        needs = match (needs, n) {
+            (StepNeeds::Rescan, _) | (_, StepNeeds::Rescan) => StepNeeds::Rescan,
+            (StepNeeds::RenameTagged, _) | (_, StepNeeds::RenameTagged) => StepNeeds::RenameTagged,
+            _ => StepNeeds::Regroup,
+        };
+        if to == crate::INDEX_VERSION {
+            return Some(needs);
+        }
+        at = INDEX_STEPS.iter().position(|s| s.0 == to)?;
+    }
+}
+
+/// True when the saved name of an entry from an older index can be kept
+/// under `needs` (the entry's streams being unchanged).
+fn name_kept(needs: StepNeeds, old: &Entry) -> bool {
+    match needs {
+        StepNeeds::Regroup => true,
+        StepNeeds::RenameTagged => old.rtype.is_none() || old.rtype.as_deref() == Some("txd"),
+        StepNeeds::Rescan => false,
+    }
+}
+
+/// A scan 1 segment (before stored 64 KiB chunks were followed) is what scan
+/// 2 finds as well, unless scan 2 follows a run of stored chunks somewhere in
+/// it. Scan 2 only does something different at the aligned end of a stream
+/// that inflated to exactly 64 KiB when no stream starts there: it tries
+/// [`raw_run`]. Up to the first such place both scans take the same path, and
+/// where `raw_run` finds nothing both go on the same way. So the segment is
+/// current when `raw_run` finds nothing at each of those places (a few
+/// 64 KiB reads, not a rescan). `streams` is the segment's scan 1 result in
+/// the order found, `end` the segment's end.
+pub fn scan1_segment_is_current(f: &mut File, streams: &[RawStream], end: u64) -> bool {
+    for (k, s) in streams.iter().enumerate() {
+        if s.usize != CHUNK {
+            continue;
+        }
+        let p = (s.off + s.csize + 15) & !15;
+        if p >= end || streams.get(k + 1).is_some_and(|n| n.off == p) {
+            continue;
+        }
+        if raw_run(f, p).is_some() {
+            return false;
+        }
+    }
+    true
+}
+
+/// How `build_index` got an archive's index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IndexStatus {
+    /// The saved index was current; nothing was read.
+    Reused,
+    /// An index of an older version was brought up to date from its saved
+    /// segments, scanning again only the segments the scan change touched.
+    Upgraded,
+    /// An interrupted scan went on from its saved segments.
+    Resumed,
+    /// The whole archive was scanned (`--force`, the archive changed, or an
+    /// old index whose scan cannot be upgraded).
+    Rescanned,
+    /// First index of this archive.
+    New,
+}
+
+/// What `build_index` did for one archive.
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexOutcome {
+    pub status: IndexStatus,
+    /// INDEX_VERSION of the index found, when there was one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_version: Option<String>,
+    /// Segments taken as saved, upgraded from an older scan, scanned.
+    pub segments_reused: u64,
+    pub segments_upgraded: u64,
+    pub segments_scanned: u64,
+    /// Entries whose names were kept from the older index.
+    pub names_kept: u64,
+    /// Entries (indices into `entries`) that still need the name pass when
+    /// the rest was kept. Empty with `names_done` false: all need it.
+    #[serde(skip)]
+    pub names_todo: Vec<usize>,
+}
+
+impl IndexOutcome {
+    /// Short text for logs and the viewer, e.g. "upgraded from 6 (3 of 284
+    /// segments scanned)".
+    pub fn summary(&self) -> String {
+        let segs = self.segments_reused + self.segments_upgraded + self.segments_scanned;
+        match self.status {
+            IndexStatus::Reused => "reused".into(),
+            IndexStatus::Upgraded => format!(
+                "upgraded from {} ({} of {} segments scanned)",
+                self.from_version.as_deref().unwrap_or("?"),
+                self.segments_scanned,
+                segs
+            ),
+            IndexStatus::Resumed => format!("resumed ({} of {} segments scanned)", self.segments_scanned, segs),
+            IndexStatus::Rescanned => match &self.from_version {
+                Some(v) if v != crate::INDEX_VERSION => format!("rescanned (was version {v})"),
+                _ => "rescanned".into(),
+            },
+            IndexStatus::New => "new".into(),
+        }
+    }
+}
 
 /// Build (or resume) the index for one archive. Segment results are cached
 /// under `work/index/<stem>.segs/`, the final index is `work/index/<stem>.json`.
@@ -454,6 +616,43 @@ pub fn build_index(
     force: bool,
     progress: Option<Arc<ProgressFn>>,
 ) -> Result<ArchiveIndex> {
+    let p = progress.map(|p| Arc::new(move |_: &str, d, t| p(d, t)) as Arc<StageProgressFn>);
+    Ok(build_index_report(archive, archive_id, index_dir, force, p)?.0)
+}
+
+fn seg_path(seg_dir: &Path, i: u64, size: u64, mtime: u64, scan: u32) -> PathBuf {
+    if scan == 1 {
+        // scan 1 had no version in the name
+        seg_dir.join(format!("{:05}_{}_{}.json", i, size, mtime))
+    } else {
+        seg_dir.join(format!("{:05}_{}_{}_s{}.json", i, size, mtime, scan))
+    }
+}
+
+/// Where one segment's streams came from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SegFrom {
+    Empty,
+    Saved,
+    Upgraded,
+    Scanned,
+}
+
+/// [`build_index`], also saying whether the index was reused, upgraded from
+/// an older version or scanned (see [`IndexStatus`]).
+///
+/// An index of an older `INDEX_VERSION` is upgraded where [`INDEX_STEPS`]
+/// allows: entries are grouped again from the saved segments (an older scan's
+/// segments are upgraded or scanned again one by one), and the names of
+/// unchanged entries are kept, so only the rest needs the name pass
+/// ([`IndexOutcome::names_todo`]).
+pub fn build_index_report(
+    archive: &Path,
+    archive_id: &str,
+    index_dir: &Path,
+    force: bool,
+    progress: Option<Arc<StageProgressFn>>,
+) -> Result<(ArchiveIndex, IndexOutcome)> {
     let stem = crate::game::index_stem(archive_id);
     let meta = fs::metadata(archive)?;
     let size = meta.len();
@@ -464,13 +663,33 @@ pub fn build_index(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let final_path = index_dir.join(format!("{stem}.json"));
+    // The saved index, when it is of this archive as it is now.
+    let mut old: Option<ArchiveIndex> = None;
+    let mut found_version = None;
     if !force {
         if let Ok(ix) = load_index(&final_path) {
-            if ix.size == size && ix.mtime == mtime && ix.tool_version == crate::INDEX_VERSION {
-                return Ok(ix);
+            found_version = Some(ix.tool_version.clone());
+            if ix.size == size && ix.mtime == mtime {
+                if ix.tool_version == crate::INDEX_VERSION {
+                    let outcome = IndexOutcome {
+                        status: IndexStatus::Reused,
+                        from_version: found_version,
+                        segments_reused: 0,
+                        segments_upgraded: 0,
+                        segments_scanned: 0,
+                        names_kept: 0,
+                        names_todo: vec![],
+                    };
+                    return Ok((ix, outcome));
+                }
+                old = Some(ix);
             }
         }
     }
+    let needs = old.as_ref().map(|ix| upgrade_needs(&ix.tool_version));
+    // Segments can be trusted unless a step says nothing old can.
+    let reuse_segments = !force && needs != Some(Some(StepNeeds::Rescan));
+    let stage = if old.is_some() && reuse_segments { "upgrade" } else { "scan" };
     let header = crate::rpf9::read_header(archive).ok();
     let container = if header.is_some() { "rpf9".to_string() } else { crate::game::container_kind(archive) };
     let seg_dir = index_dir.join(format!("{stem}.segs"));
@@ -485,36 +704,51 @@ pub fn build_index(
         let stop = stop.clone();
         std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                p(done.load(Ordering::Relaxed).min(size), size);
+                p(stage, done.load(Ordering::Relaxed).min(size), size);
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
         })
     });
+    let save = |cp: &Path, v: &Vec<RawStream>| -> Result<()> {
+        let tmp = cp.with_extension("tmp");
+        fs::write(&tmp, serde_json::to_vec(v)?)?;
+        fs::rename(&tmp, cp)?;
+        Ok(())
+    };
+    let read_seg = |p: &Path| fs::read(p).ok().and_then(|t| serde_json::from_slice::<Vec<RawStream>>(&t).ok());
     let segs: Vec<u64> = (0..nseg).collect();
-    let results: Vec<Result<Vec<RawStream>>> = segs
+    let results: Vec<Result<(SegFrom, Vec<RawStream>)>> = segs
         .par_iter()
         .map(|&i| {
             let s = (i * SEGMENT).max(data_start);
             let e = ((i + 1) * SEGMENT).min(size);
-            let cp = seg_dir.join(format!("{:05}_{}_{}_s{}.json", i, size, mtime, SCAN_VERSION));
-            if !force {
-                if let Ok(txt) = fs::read(&cp) {
-                    if let Ok(v) = serde_json::from_slice::<Vec<RawStream>>(&txt) {
-                        done.fetch_add(e.saturating_sub(i * SEGMENT), Ordering::Relaxed);
-                        return Ok(v);
+            let cp = seg_path(&seg_dir, i, size, mtime, SCAN_VERSION);
+            let span = e.saturating_sub(i * SEGMENT);
+            if reuse_segments {
+                if let Some(v) = read_seg(&cp) {
+                    done.fetch_add(span, Ordering::Relaxed);
+                    return Ok((SegFrom::Saved, v));
+                }
+                // A scan 1 segment (SCAN_VERSION 2 only follows stored chunks
+                // in addition) is current unless scan 2 would follow one.
+                if s < e {
+                    if let Some(v) = read_seg(&seg_path(&seg_dir, i, size, mtime, 1)) {
+                        if scan1_segment_is_current(&mut File::open(archive)?, &v, e) {
+                            save(&cp, &v)?;
+                            done.fetch_add(span, Ordering::Relaxed);
+                            return Ok((SegFrom::Upgraded, v));
+                        }
                     }
                 }
             }
             if s >= e {
-                done.fetch_add(e.saturating_sub(i * SEGMENT), Ordering::Relaxed);
-                return Ok(vec![]);
+                done.fetch_add(span, Ordering::Relaxed);
+                return Ok((SegFrom::Empty, vec![]));
             }
             done.fetch_add(s - i * SEGMENT, Ordering::Relaxed);
             let v = scan_segment(archive, s, e, &done)?;
-            let tmp = cp.with_extension("tmp");
-            fs::write(&tmp, serde_json::to_vec(&v)?)?;
-            fs::rename(&tmp, &cp)?;
-            Ok(v)
+            save(&cp, &v)?;
+            Ok((SegFrom::Scanned, v))
         })
         .collect();
     stop.store(true, Ordering::Relaxed);
@@ -522,14 +756,56 @@ pub fn build_index(
         let _ = h.join();
     }
     let mut all = Vec::new();
+    let (mut n_saved, mut n_upgraded, mut n_scanned) = (0u64, 0u64, 0u64);
     for r in results {
-        all.extend(r?);
+        let (from, v) = r?;
+        match from {
+            SegFrom::Saved => n_saved += 1,
+            SegFrom::Upgraded => n_upgraded += 1,
+            SegFrom::Scanned => n_scanned += 1,
+            SegFrom::Empty => {}
+        }
+        all.extend(v);
     }
     let nstreams = all.len() as u64;
     let mut entries = group_streams(archive_id, all);
     for e in entries.iter_mut() {
         crate::classify::refine(e);
     }
+    // Names of entries that did not change, where the steps allow it.
+    let mut names_kept = 0u64;
+    let mut names_todo = Vec::new();
+    let mut names_done = false;
+    if let (Some(o), Some(Some(n))) = (old.as_ref(), needs) {
+        if o.names_done && n != StepNeeds::Rescan {
+            let by_off: std::collections::HashMap<u64, &Entry> = o.entries.iter().map(|e| (e.off, e)).collect();
+            for (i, e) in entries.iter_mut().enumerate() {
+                if !matches!(e.kind, Kind::RageObj | Kind::Resource) {
+                    continue;
+                }
+                match by_off.get(&e.off) {
+                    Some(oe) if oe.streams == e.streams && oe.kind == e.kind && name_kept(n, oe) => {
+                        e.name = oe.name.clone();
+                        e.rtype = oe.rtype.clone();
+                        e.members = oe.members.clone();
+                        names_kept += 1;
+                    }
+                    _ => names_todo.push(i),
+                }
+            }
+            names_done = names_todo.is_empty();
+        }
+    }
+    let partial = n_scanned < n_saved + n_upgraded + n_scanned;
+    let status = if old.is_some() && partial {
+        IndexStatus::Upgraded
+    } else if old.is_none() && partial {
+        IndexStatus::Resumed
+    } else if found_version.is_none() && !force {
+        IndexStatus::New
+    } else {
+        IndexStatus::Rescanned
+    };
     let mut stats = IndexStats { streams: nstreams, entries: entries.len() as u64, ..Default::default() };
     for e in &entries {
         stats.compressed_bytes += e.csize;
@@ -549,13 +825,22 @@ pub fn build_index(
         container,
         entries,
         stats,
-        names_done: false,
+        names_done,
     };
     fs::create_dir_all(index_dir)?;
     let tmp = final_path.with_extension("tmp");
     fs::write(&tmp, serde_json::to_vec(&ix)?)?;
     fs::rename(&tmp, &final_path)?;
-    Ok(ix)
+    let outcome = IndexOutcome {
+        status,
+        from_version: found_version,
+        segments_reused: n_saved,
+        segments_upgraded: n_upgraded,
+        segments_scanned: n_scanned,
+        names_kept,
+        names_todo: if names_done || names_kept == 0 { vec![] } else { names_todo },
+    };
+    Ok((ix, outcome))
 }
 
 pub fn load_index(path: &Path) -> Result<ArchiveIndex> {
@@ -719,5 +1004,247 @@ mod group_tests {
         assert_eq!(e.len(), 1);
         assert_eq!(e[0].usize, 2 * CHUNK);
         assert!(e[0].streams.iter().all(|s| !is_raw(s)));
+    }
+}
+
+#[cfg(test)]
+mod upgrade_tests {
+    use super::*;
+
+    #[test]
+    fn steps_reach_the_current_version() {
+        // A version bump must add its step to INDEX_STEPS.
+        assert_eq!(INDEX_STEPS.last().unwrap().1, crate::INDEX_VERSION);
+        for w in INDEX_STEPS.windows(2) {
+            assert_eq!(w[0].1, w[1].0);
+        }
+        assert_eq!(upgrade_needs(crate::INDEX_VERSION), Some(StepNeeds::Regroup));
+        assert_eq!(upgrade_needs("7"), Some(StepNeeds::RenameTagged));
+        assert_eq!(upgrade_needs("6"), Some(StepNeeds::RenameTagged));
+        assert_eq!(upgrade_needs("5"), Some(StepNeeds::RenameTagged));
+        assert_eq!(upgrade_needs("4"), None);
+        assert_eq!(upgrade_needs("x"), None);
+    }
+
+    fn zlib(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(data).unwrap();
+        z.finish().unwrap()
+    }
+
+    fn noise(n: usize, mut x: u64) -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    fn text(n: usize, seed: u8) -> Vec<u8> {
+        (0..n).map(|i| b"PSIN chunk text "[i % 16].wrapping_add(seed * (i % 3 == 0) as u8)).collect()
+    }
+
+    /// A RAGE object system page of 0x200 bytes (page map at 0x100), with
+    /// "<name>.#dr" at 0x40 behind a pointer when `name` is set.
+    fn page(name: Option<&str>) -> Vec<u8> {
+        let mut p = vec![0u8; 0x200];
+        p[8..16].copy_from_slice(&0x5000_0100u64.to_le_bytes());
+        if let Some(n) = name {
+            p[0x18..0x20].copy_from_slice(&0x5000_0040u64.to_le_bytes());
+            // a name character in front, as in the name pointer step
+            p[0x3f] = b'd';
+            let s = format!("{n}.#dr");
+            p[0x40..0x40 + s.len()].copy_from_slice(s.as_bytes());
+        }
+        p
+    }
+
+    /// Put `bytes` at `at` (zero fill up to it).
+    fn put(f: &mut Vec<u8>, at: usize, bytes: &[u8]) {
+        assert!(f.len() <= at);
+        f.resize(at, 0);
+        f.extend_from_slice(bytes);
+    }
+
+    /// A named and an unnamed resource, then a chunked entry of exactly two
+    /// 64 KiB chunks followed by padding (scan 2 probes there and finds
+    /// nothing), then a PSO; with `raw`, also a chunked entry with a stored
+    /// chunk (scan 2 joins it, scan 1 did not).
+    fn archive_bytes(raw: bool) -> Vec<u8> {
+        let c = CHUNK as usize;
+        let mut f = Vec::new();
+        put(&mut f, 0x1010, &zlib(&page(Some("propa"))));
+        put(&mut f, 0x2010, &zlib(&page(None)));
+        put(&mut f, 0x3010, &zlib(&text(c, 1)));
+        let at = (f.len() + 15) & !15;
+        put(&mut f, at, &zlib(&text(c, 2)));
+        let at = ((f.len() + 4095) & !4095) + 0x10;
+        put(&mut f, at, &zlib(&text(5000, 3)));
+        if raw {
+            let at = ((f.len() + 4095) & !4095) + 0x10;
+            put(&mut f, at, &zlib(&text(c, 4)));
+            let at = (f.len() + 15) & !15;
+            put(&mut f, at, &noise(c, 7));
+            let at = (f.len() + 15) & !15;
+            put(&mut f, at, &zlib(&text(777, 5)));
+        }
+        f.resize(((f.len() + 4095) & !4095) + 64, 0);
+        f
+    }
+
+    struct Case {
+        archive: PathBuf,
+        dir: PathBuf,
+        size: u64,
+        mtime: u64,
+    }
+
+    fn case(name: &str, raw: bool) -> Case {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/index-upgrade-test").join(name);
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let archive = root.join("t.rpf");
+        fs::write(&archive, archive_bytes(raw)).unwrap();
+        let m = fs::metadata(&archive).unwrap();
+        let mtime = m.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        Case { archive, dir: root.join("index"), size: m.len(), mtime }
+    }
+
+    /// The index as an older version left it: its segment (scan 1 or the
+    /// current scan) and an index of version `v` grouped from it.
+    fn write_old(c: &Case, v: &str, scan1: bool) -> ArchiveIndex {
+        let segs = c.dir.join("t.segs");
+        fs::create_dir_all(&segs).unwrap();
+        let streams = scan_segment_with(&c.archive, 0, c.size, &AtomicU64::new(0), !scan1).unwrap();
+        let sv = if scan1 { 1 } else { SCAN_VERSION };
+        fs::write(seg_path(&segs, 0, c.size, c.mtime, sv), serde_json::to_vec(&streams).unwrap()).unwrap();
+        let mut entries = group_streams("t.rpf", streams);
+        for e in entries.iter_mut() {
+            crate::classify::refine(e);
+        }
+        let ix = ArchiveIndex {
+            tool_version: v.into(),
+            archive: "t.rpf".into(),
+            path: c.archive.display().to_string(),
+            size: c.size,
+            mtime: c.mtime,
+            header: None,
+            container: "other".into(),
+            stats: IndexStats::default(),
+            entries,
+            names_done: false,
+        };
+        save_index(&c.dir, &ix).unwrap();
+        ix
+    }
+
+    fn fresh(c: &Case) -> ArchiveIndex {
+        let dir = c.dir.with_file_name("fresh");
+        let _ = fs::remove_dir_all(&dir);
+        build_index_report(&c.archive, "t.rpf", &dir, true, None).unwrap().0
+    }
+
+    fn same(a: &ArchiveIndex, b: &ArchiveIndex) {
+        assert_eq!(serde_json::to_value(a).unwrap(), serde_json::to_value(b).unwrap());
+    }
+
+    #[test]
+    fn scan1_segment_without_stored_chunks_is_upgraded_in_place() {
+        let c = case("noraw", false);
+        let s1 = scan_segment_with(&c.archive, 0, c.size, &AtomicU64::new(0), false).unwrap();
+        assert!(s1.iter().any(|s| s.usize == CHUNK), "a 64 KiB chunk for the probe");
+        assert!(scan1_segment_is_current(&mut File::open(&c.archive).unwrap(), &s1, c.size));
+        write_old(&c, "6", true);
+        let (ix, how) = build_index_report(&c.archive, "t.rpf", &c.dir, false, None).unwrap();
+        assert_eq!(how.status, IndexStatus::Upgraded);
+        assert_eq!(how.from_version.as_deref(), Some("6"));
+        assert_eq!((how.segments_reused, how.segments_upgraded, how.segments_scanned), (0, 1, 0));
+        same(&ix, &fresh(&c));
+        // the upgraded segment is saved under the current scan version
+        assert!(seg_path(&c.dir.join("t.segs"), 0, c.size, c.mtime, SCAN_VERSION).exists());
+        // and the next run reuses the index
+        let (_, how) = build_index_report(&c.archive, "t.rpf", &c.dir, false, None).unwrap();
+        assert_eq!(how.status, IndexStatus::Reused);
+    }
+
+    #[test]
+    fn scan1_segment_with_stored_chunks_is_scanned_again() {
+        let c = case("raw", true);
+        let s1 = scan_segment_with(&c.archive, 0, c.size, &AtomicU64::new(0), false).unwrap();
+        assert!(!scan1_segment_is_current(&mut File::open(&c.archive).unwrap(), &s1, c.size));
+        write_old(&c, "6", true);
+        let (ix, how) = build_index_report(&c.archive, "t.rpf", &c.dir, false, None).unwrap();
+        assert_eq!(how.status, IndexStatus::Rescanned);
+        assert_eq!((how.segments_upgraded, how.segments_scanned), (0, 1));
+        assert!(ix.entries.iter().any(|e| e.streams.iter().any(is_raw)));
+        same(&ix, &fresh(&c));
+    }
+
+    #[test]
+    fn force_rescans_and_unknown_versions_keep_no_names() {
+        let c = case("force", false);
+        write_old(&c, "7", false);
+        let (_, how) = build_index_report(&c.archive, "t.rpf", &c.dir, true, None).unwrap();
+        assert_eq!(how.status, IndexStatus::Rescanned);
+        assert_eq!(how.segments_scanned, 1);
+        // An index from before the first step: entries come from the
+        // segments, every name is recovered again.
+        let mut old = write_old(&c, "3", false);
+        old.names_done = true;
+        old.entries[0].name = Some("kept?".into());
+        save_index(&c.dir, &old).unwrap();
+        let (ix, how) = build_index_report(&c.archive, "t.rpf", &c.dir, false, None).unwrap();
+        assert_eq!(how.status, IndexStatus::Upgraded);
+        assert_eq!(how.names_kept, 0);
+        assert!(!ix.names_done && ix.entries.iter().all(|e| e.name.is_none()));
+    }
+
+    #[test]
+    fn version_7_names_from_a_tag_are_recovered_again_others_kept() {
+        let c = case("names", false);
+        let mut old = write_old(&c, "7", false);
+        assert_eq!((old.entries[0].off, old.entries[0].kind), (0x1010, Kind::RageObj));
+        assert_eq!((old.entries[1].off, old.entries[1].kind), (0x2010, Kind::RageObj));
+        // version 7 took the name character in front along
+        old.entries[0].name = Some("dpropa".into());
+        old.entries[0].rtype = Some("dr".into());
+        // a texture dictionary name stays
+        old.entries[1].rtype = Some("txd".into());
+        old.entries[1].name = Some("dict_b".into());
+        old.names_done = true;
+        save_index(&c.dir, &old).unwrap();
+        let (mut ix, how) = build_index_report(&c.archive, "t.rpf", &c.dir, false, None).unwrap();
+        assert_eq!(how.status, IndexStatus::Upgraded);
+        assert_eq!((how.segments_reused, how.segments_scanned), (1, 0));
+        assert_eq!(how.names_kept, 1);
+        assert_eq!(how.names_todo, vec![0]);
+        assert!(!ix.names_done);
+        assert_eq!(ix.entries[1].name.as_deref(), Some("dict_b"));
+        crate::export::recover_names_of(&c.archive, &mut ix, Some(&how.names_todo), crate::export::no_progress()).unwrap();
+        assert_eq!(ix.entries[0].name.as_deref(), Some("propa"));
+        assert_eq!(ix.entries[1].name.as_deref(), Some("dict_b"));
+        assert!(ix.names_done);
+    }
+
+    #[test]
+    fn regroup_keeps_names_only_of_unchanged_entries() {
+        let c = case("regroup", false);
+        let mut old = write_old(&c, "6", true);
+        // an untagged name is kept through 6 -> 8; a changed entry's is not
+        old.entries[0].rtype = Some("txd".into());
+        old.entries[0].name = Some("dict_a".into());
+        old.entries[1].streams[0][1] += 1;
+        old.entries[1].name = Some("stale".into());
+        old.names_done = true;
+        save_index(&c.dir, &old).unwrap();
+        let (ix, how) = build_index_report(&c.archive, "t.rpf", &c.dir, false, None).unwrap();
+        assert_eq!(how.names_kept, 1);
+        assert_eq!(how.names_todo, vec![1]);
+        assert_eq!(ix.entries[0].name.as_deref(), Some("dict_a"));
+        assert!(ix.entries[1].name.is_none());
     }
 }
