@@ -5215,6 +5215,11 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
         let first = f.subs.iter().flatten().next().copied().unwrap_or([128; 3]);
         let shaped = cache.join("shaped");
         let mut done = std::collections::HashSet::new();
+        // clothing whose textures are not in the install: the preset colour
+        // per vertex (part number in the vertex colour's green, as below)
+        if bare_tint(m, |col| f.subs.get(((col[1] >> 2) & 7) as usize).copied().flatten().or(f.subs[0]).unwrap_or(first)) {
+            done.insert(usize::MAX);
+        }
         for mi in 0..m.materials.len() {
             if !m.materials[mi].ped_shade {
                 continue;
@@ -5303,6 +5308,11 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
         (None, None, None) => return false,
     };
     let mut done = std::collections::HashSet::new();
+    // clothing whose textures are not in the install: the colour of plain
+    // cloth (shade 125) per vertex
+    if bare_tint(m, |_| lut[125]) {
+        done.insert(usize::MAX);
+    }
     for mat in m.materials.iter().filter(|x| x.ped_shade) {
         let Some(i) = mat.base else { continue };
         if !done.insert(i) {
@@ -5320,6 +5330,29 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
         im.key = format!("{}#{:?}{:?}", im.key, f.colour, f.tint);
     }
     !done.is_empty()
+}
+
+/// Colour the ped clothing materials that have no base texture (their
+/// textures are not in the install; `glb` marks them `ped_shade`) with a
+/// vertex tint, `colour(raw vertex colour)` in sRGB. Returns whether any
+/// was coloured.
+fn bare_tint(m: &mut glb::Model, colour: impl Fn([u8; 4]) -> [u8; 3]) -> bool {
+    let lin = |v: u8| {
+        let x = v as f32 / 255.0;
+        ((if x <= 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) }) * 255.0 + 0.5) as u8
+    };
+    let bare: Vec<usize> = (0..m.materials.len()).filter(|&k| m.materials[k].ped_shade && m.materials[k].base.is_none()).collect();
+    for &k in &bare {
+        let a = m.materials[k].base_factor[3];
+        m.materials[k].base_factor = [1.0, 1.0, 1.0, a];
+    }
+    for me in m.meshes.iter_mut().filter(|me| me.material.is_some_and(|k| bare.contains(&k))) {
+        for v in &mut me.verts {
+            let c = colour(v.col);
+            v.tint = [lin(c[0]), lin(c[1]), lin(c[2]), 255];
+        }
+    }
+    !bare.is_empty()
 }
 
 /// Attached accessories (a watch, a ring) are modelled at their own root
