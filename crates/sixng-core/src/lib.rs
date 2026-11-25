@@ -71,6 +71,7 @@ pub mod storyflow;
 pub mod shaderfx;
 pub mod surface;
 pub mod timecycle;
+pub mod water;
 pub mod world;
 
 pub const INDEX_VERSION: &str = "8";

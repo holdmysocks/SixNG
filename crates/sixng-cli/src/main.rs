@@ -691,6 +691,35 @@ enum Cmd {
         #[arg(long, short)]
         out: Option<PathBuf>,
     },
+    /// Water system export: the water fog atlas (scattering and extinction,
+    /// textures.rpf), the water height map and the shoreline wave grid
+    /// (levels.rpf), each placed on its 32 x 66 grid of 512 m cells; the
+    /// grid definitions, ocean and shore-wave settings of common.rpf as
+    /// JSON; and every water_* timecycle key. Tiles are placed by aligning
+    /// their stored order with the decimal-string order of the cell numbers
+    /// against each grid's fallback texture, then checked by edge
+    /// continuity. Prints the counts and checks. With -o writes
+    /// <out>/water/: grids.json, timecycle_water.json, settings/*.json,
+    /// fog/ (scattering.f32, extinction.f32, cells.json with the terms per
+    /// cell, previews), height/ (height.png, cells.json) and shore/
+    /// (tiles/<cell>.png, mosaic.png, cells.json). Needs the common,
+    /// textures and levels indexes.
+    Water {
+        /// Fog mosaic texels per cell (tiles have 128).
+        #[arg(long, default_value_t = 32)]
+        fog_px: usize,
+        /// Height mosaic texels per cell (tiles have 512, 1 m each).
+        #[arg(long, default_value_t = 128)]
+        height_px: usize,
+        /// Shore mosaic texels per cell (tiles have 256).
+        #[arg(long, default_value_t = 32)]
+        shore_px: usize,
+        /// Also write each height tile at full resolution (height/tiles/).
+        #[arg(long)]
+        height_tiles: bool,
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
     /// World sector grids (the PSO files of levels.rpf with struct
     /// 9c834886). levels.rpf holds eight, in three cell sizes (1024, 512
     /// and 60 m, measured; cell = floor(world / size)). Each size has a
@@ -2630,6 +2659,16 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 res["out"] = json!(dir);
             }
             out.print(&json!({"ok": true, "result": res}));
+        }
+        Cmd::Water { fog_px, height_px, shore_px, height_tiles, out: po } => {
+            for (n, v, max) in [("--fog-px", *fog_px, 128), ("--height-px", *height_px, 512), ("--shore-px", *shore_px, 256)] {
+                if v == 0 || max % v != 0 {
+                    anyhow::bail!("{n} {v}: must divide {max}");
+                }
+            }
+            let o = sixng_core::water::Options { fog_px: *fog_px, height_px: *height_px, shore_px: *shore_px, height_tiles: *height_tiles };
+            let r = sixng_core::water::export(&ws, po.as_deref(), &o)?;
+            out.print(&json!({"ok": true, "result": r}));
         }
         Cmd::SectorGrid { archive, entry, cell_m, out: po } => {
             use sixng_core::sectorgrid as sg;
