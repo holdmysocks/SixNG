@@ -38,8 +38,9 @@
 //! texture, skinning, the twist value written per vertex (the style
 //! offset's frame uses it: here the root triangle's normal stands in)
 //! and clumping (bits 2 / 4 / 8 / 16, only partly
-//! read). Both amplitudes are scaled by `1 - m`, `m` a per-guide value not yet
-//! found: taken as 0.
+//! read). Both amplitudes are scaled by `1 - m`, `m` the root corners'
+//! collider-proximity value (run time, blended at the root; 0 at rest
+//! without colliders): taken as 0.
 //! The acceptance scale of step 1 is a run-time number; here the densest
 //! triangle is always taken.
 
