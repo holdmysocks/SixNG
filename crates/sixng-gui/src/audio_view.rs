@@ -6,7 +6,8 @@
 //! output device.
 
 use eframe::egui;
-use sixng_core::audio::{self, AudioIndex, Bank, Stream};
+use serde::Deserialize;
+use sixng_core::audio::{self, AudioIndex, Bank, StemWindow, Stream, StreamAddress};
 use sixng_core::export::Workspace;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -14,8 +15,15 @@ use std::time::Duration;
 
 type Slot<T> = Arc<Mutex<Option<Result<T, String>>>>;
 
+#[derive(Clone, Deserialize)]
+pub struct SceneAudio {
+    #[serde(flatten)]
+    pub address: StreamAddress,
+    pub stem: Option<StemWindow>,
+}
+
 struct Decoded {
-    key: (u64, u32),
+    key: (u64, u32, usize),
     ch: u8,
     pcm: Vec<i16>,
 }
@@ -23,7 +31,7 @@ struct Decoded {
 struct Player {
     _stream: rodio::OutputStream,
     sink: rodio::Sink,
-    key: (u64, u32),
+    key: (u64, u32, usize),
     len: f64,
 }
 
@@ -31,6 +39,7 @@ pub struct AudioView {
     game: String,
     work: String,
     ix: Option<Arc<AudioIndex>>,
+    archive_id: String,
     archive: Option<sixng_core::game::ArchiveInfo>,
     loading: Slot<Arc<AudioIndex>>,
     load_started: bool,
@@ -43,7 +52,7 @@ pub struct AudioView {
     search: String,
     sel: Option<usize>,
     decode: Slot<Decoded>,
-    decoding: Option<(u64, u32)>,
+    decoding: Option<(u64, u32, usize)>,
     player: Option<Player>,
     volume: f32,
     muted: bool,
@@ -52,6 +61,10 @@ pub struct AudioView {
     last_export: Option<PathBuf>,
     pending_bank: Option<u64>,
     pending_play: Option<u32>,
+    pending_stream: Option<SceneAudio>,
+    focused_stream: Option<usize>,
+    focused_stem: Option<StemWindow>,
+    scroll_to_stream: bool,
     /// bank offset -> name (`core.resident/gun_pistol`), from the containers
     /// `sixng audio-meta` records and the name dictionary
     bank_names: std::collections::HashMap<u64, String>,
@@ -79,6 +92,7 @@ impl AudioView {
             game: game.into(),
             work: work.into(),
             ix: None,
+            archive_id: "audio.rpf".into(),
             archive: None,
             loading: Arc::new(Mutex::new(None)),
             load_started: false,
@@ -99,6 +113,10 @@ impl AudioView {
             last_export: None,
             pending_bank: None,
             pending_play: None,
+            pending_stream: None,
+            focused_stream: None,
+            focused_stem: None,
+            scroll_to_stream: false,
             bank_names: Default::default(),
             stream_names: Default::default(),
         }
@@ -108,6 +126,56 @@ impl AudioView {
     pub fn select_bank(&mut self, off: u64, play: Option<u32>) {
         self.pending_bank = Some(off);
         self.pending_play = play;
+    }
+
+    /// Open an exact scene audio address once its archive index is available.
+    pub fn select_stream(&mut self, target: SceneAudio) {
+        self.switch_archive(&target.address.archive);
+        self.stop();
+        self.decode = Default::default();
+        self.decoding = None;
+        self.pending_bank = None;
+        self.pending_play = None;
+        self.pending_stream = Some(target);
+        self.error = None;
+    }
+
+    fn switch_archive(&mut self, archive: &str) {
+        if self.archive_id == archive {
+            return;
+        }
+        self.stop();
+        *self = Self {
+            archive_id: archive.to_owned(),
+            volume: self.volume,
+            muted: self.muted,
+            ..Self::new(&self.game, &self.work)
+        };
+    }
+
+    fn focus_stream(&mut self, index: &AudioIndex) {
+        let Some(SceneAudio { address, stem }) = self.pending_stream.take() else { return };
+        self.sel = address.bank_index(index);
+        if let (Some(bi), Some(window)) = (self.sel, stem) {
+            if index.banks[bi].streams[address.stream_index].layout != "music"
+                || window.start_frame >= window.end_frame
+            {
+                self.sel = None;
+            }
+        }
+        self.focused_stream = self.sel.map(|_| address.stream_index);
+        self.focused_stem = self.sel.and(stem);
+        self.scroll_to_stream = self.sel.is_some();
+        if self.sel.is_some() {
+            self.search.clear();
+            self.min_seconds = 0.0;
+            self.dirty = true;
+        } else {
+            self.error = Some(format!(
+                "Scene audio address does not match the index for {}. Rescan the archive or refresh scene_dialogue.json.",
+                address.archive
+            ));
+        }
     }
 
     /// Ready for a scripted screenshot.
@@ -128,12 +196,9 @@ impl AudioView {
         self.load_started = true;
         self.error = None;
         let ws = Workspace::new(&self.game, &self.work);
-        let a = match ws.resolve("audio") {
-            Ok(a) => a,
-            Err(e) => {
-                self.error = Some(format!("No audio archive in the game folder: {e}"));
-                return;
-            }
+        let Some(a) = ws.archives().into_iter().find(|a| a.id == self.archive_id) else {
+            self.error = Some(format!("Archive {} was not found in the game folder.", self.archive_id));
+            return;
         };
         self.archive = Some(a.clone());
         let slot = self.loading.clone();
@@ -146,6 +211,10 @@ impl AudioView {
             let id = a.id.clone();
             std::thread::spawn(move || {
                 let r = audio::load_index(&work, &id)
+                    .and_then(|ix| {
+                        anyhow::ensure!(ix.archive == id && ix.archive_size == a.size, "The index no longer matches {id}. Rescan the archive.");
+                        Ok(ix)
+                    })
                     .map(Arc::new)
                     .map_err(|e| e.to_string());
                 *slot.lock().unwrap() = Some(r);
@@ -235,24 +304,27 @@ impl AudioView {
             .collect();
     }
 
-    fn play(&mut self, b: &Bank, s: &Stream) {
+    fn play(&mut self, b: &Bank, stream_index: usize, stem: Option<StemWindow>) {
         self.stop();
         self.error = None;
         let Some(a) = self.archive.clone() else {
             return;
         };
-        let key = (b.off, s.id);
+        let Some(s) = b.streams.get(stream_index) else { return };
+        let key = (b.off, s.id, stream_index);
         self.decoding = Some(key);
         let (b, s) = (b.clone(), s.clone());
         let slot = self.decode.clone();
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<Decoded> {
                 let bytes = audio::read_bank(&a.path, &b)?;
-                let pk = audio::packets(&bytes, &s);
-                if pk.is_empty() {
-                    anyhow::bail!("no Opus packets in this stream");
-                }
-                let (ch, pcm) = audio::decode(&pk, s.frames())?;
+                let (ch, pcm) = if let Some(window) = stem {
+                    window.decode(&bytes, &b, &s)?
+                } else {
+                    let pk = audio::packets(&bytes, &s);
+                    anyhow::ensure!(!pk.is_empty(), "no Opus packets in this stream");
+                    audio::decode(&pk, s.frames())?
+                };
                 Ok(Decoded { key, ch, pcm })
             })();
             *slot.lock().unwrap() = Some(r.map_err(|e| e.to_string()));
@@ -341,12 +413,12 @@ impl AudioView {
                 return Ok(vec![p.display().to_string()]);
             }
             let mut files = Vec::new();
-            for st in b
-                .streams
-                .iter()
-                .filter(|st| s.map_or(st.exportable(), |x| x.id == st.id))
-            {
+            if let Some(st) = s {
                 files.extend(audio::export_stream(&bytes, b, st, &dir, fmt)?);
+            } else {
+                for st in b.streams.iter().filter(|st| st.exportable()) {
+                    files.extend(audio::export_stream(&bytes, b, st, &dir, fmt)?);
+                }
             }
             Ok(files)
         })();
@@ -364,14 +436,26 @@ impl AudioView {
             self.start_load(false);
         }
         self.poll(ui.ctx());
+        let mut main_archive = false;
         ui.horizontal(|ui| {
             ui.heading("🔊 Audio");
-            ui.weak("Banks in audio.rpf, by offset and, where recovered, name (run `sixng names` and `sixng audio-meta audio` once). Streams are listed by id and name where one was found.");
+            ui.weak(&self.archive_id);
+            if self.archive_id != "audio.rpf" {
+                main_archive = ui.small_button("Back to audio.rpf").clicked();
+            }
         });
+        if main_archive {
+            self.switch_archive("audio.rpf");
+            return;
+        }
+        let index = self.ix.clone();
+        if let Some(ix) = index.as_deref() {
+            self.focus_stream(ix);
+        }
         if let Some(e) = &self.error {
             ui.colored_label(ui.visuals().error_fg_color, e);
         }
-        let Some(ix) = self.ix.clone() else {
+        let Some(ix) = index else {
             ui.add_space(12.0);
             if self.scanning {
                 let (d, t) = *self.scan_progress.lock().unwrap();
@@ -383,15 +467,15 @@ impl AudioView {
                     });
                     return;
                 }
-                ui.label("Scanning audio.rpf for audio banks (reads the whole archive once, a few minutes)…");
+                ui.label(format!("Scanning {} for audio banks…", self.archive_id));
                 ui.add(
                     egui::ProgressBar::new(f)
                         .show_percentage()
                         .desired_width(420.0),
                 );
             } else if self.archive.is_some() {
-                ui.label("audio.rpf has not been scanned yet. The scan reads the archive once and saves an index to <work>/index.");
-                if ui.button("Scan audio.rpf").clicked() {
+                ui.label(format!("{} has no usable audio index. The scan reads the archive once and saves an index to <work>/index.", self.archive_id));
+                if ui.button(format!("Scan {}", self.archive_id)).clicked() {
                     self.start_load(true);
                 }
             }
@@ -402,10 +486,11 @@ impl AudioView {
         }
         if let Some(off) = self.pending_bank.take() {
             self.sel = ix.banks.iter().position(|b| b.off == off);
+            self.focused_stream = None;
             if let (Some(bi), Some(id)) = (self.sel, self.pending_play.take()) {
-                let b = ix.banks[bi].clone();
-                if let Some(st) = b.streams.iter().find(|st| st.id == id).cloned() {
-                    self.play(&b, &st);
+                let b = &ix.banks[bi];
+                if let Some(i) = b.streams.iter().position(|st| st.id == id) {
+                    self.play(b, i, None);
                 }
             }
         }
@@ -447,10 +532,12 @@ impl AudioView {
             ));
             if ui
                 .small_button("Rescan")
-                .on_hover_text("Scan audio.rpf again")
+                .on_hover_text("Scan this archive again")
                 .clicked()
             {
                 self.ix = None;
+                self.sel = None;
+                self.focused_stream = None;
                 self.start_load(true);
             }
         });
@@ -503,6 +590,7 @@ impl AudioView {
                         };
                         if r.clicked() {
                             self.sel = Some(bi);
+                            self.focused_stream = None;
                         }
                     }
                 });
@@ -532,7 +620,10 @@ impl AudioView {
                     }
                 });
                 let min = self.min_seconds as f64;
-                let streams: Vec<Stream> = b.streams.iter().filter(|s| s.layout != "none" && s.seconds() >= min).cloned().collect();
+                let streams: Vec<_> = b.streams.iter().enumerate()
+                    .filter(|(_, s)| s.layout != "none" && s.seconds() >= min)
+                    .collect();
+                let scroll_to_stream = std::mem::take(&mut self.scroll_to_stream);
                 egui::ScrollArea::vertical().id_salt("audio_streams").auto_shrink([false, false]).show(ui, |ui| {
                     let names = self.stream_names.get(&b.off).cloned().unwrap_or_default();
                     egui::Grid::new("audio_stream_grid").striped(true).num_columns(7).show(ui, |ui| {
@@ -544,13 +635,40 @@ impl AudioView {
                         ui.strong("");
                         ui.strong("Export");
                         ui.end_row();
-                        for s in &streams {
-                            let key = (b.off, s.id);
-                            ui.monospace(format!("{:08x}", s.id));
+                        for &(i, s) in &streams {
+                            let key = (b.off, s.id, i);
+                            let id = egui::RichText::new(format!("{:08x}", s.id)).monospace();
+                            let focused = self.focused_stream == Some(i);
+                            let stem = self.focused_stem.filter(|_| focused);
+                            let id = if focused {
+                                id.background_color(ui.visuals().selection.bg_fill)
+                            } else {
+                                id
+                            };
+                            let row = ui.label(id).on_hover_text(if let Some(window) = stem {
+                                format!("Stream {i}, voice stem {:08x}, frames {}–{} at 48 kHz",
+                                    window.channel_id, window.start_frame, window.end_frame)
+                            } else {
+                                format!("Stream index {i}")
+                            });
+                            if focused && scroll_to_stream {
+                                row.scroll_to_me(Some(egui::Align::Center));
+                            }
                             ui.label(names.get(&s.id).map(|n| n.as_str()).unwrap_or(""));
-                            ui.label(fmt_secs(s.seconds()));
-                            ui.label(format!("{} Hz", s.rate)).on_hover_text("Rate field of the stream. Opus always decodes at 48 kHz; this is likely the source rate.");
+                            if let Some(window) = stem {
+                                ui.label(format!("{:.3}–{:.3} s", f64::from(window.start_frame) / 48000.0,
+                                    f64::from(window.end_frame) / 48000.0))
+                                    .on_hover_text(format!("Full stream length: {}", fmt_secs(s.seconds())));
+                                ui.label("48000 Hz").on_hover_text("Decoded excerpt sample rate");
+                            } else {
+                                ui.label(fmt_secs(s.seconds()));
+                                ui.label(format!("{} Hz", s.rate)).on_hover_text("Rate field of the stream. Opus always decodes at 48 kHz; this is likely the source rate.");
+                            }
                             match s.layout.as_str() {
+                                "music" if stem.is_some() => {
+                                    ui.label(format!("voice stem, {} in bank", s.channels))
+                                        .on_hover_text("The excerpt uses one sub-stream. Export still writes one file per sub-stream.");
+                                }
                                 "music" => {
                                     ui.label(format!("music, {} ch", s.channels)).on_hover_text("Music with several sub-streams (stems): exported as one file per sub-stream. Not playable here.");
                                 }
@@ -576,8 +694,12 @@ impl AudioView {
                                 if ui.button("⏹ Stop").clicked() {
                                     self.stop();
                                 }
-                            } else if ui.add_enabled(s.layout == "blocks" && self.decoding.is_none(), egui::Button::new("▶ Play")).clicked() {
-                                self.play(&b, s);
+                            } else {
+                                let label = if stem.is_some() { "▶ Play excerpt" } else { "▶ Play" };
+                                let playable = stem.is_some() || s.layout == "blocks";
+                                if ui.add_enabled(playable && self.decoding.is_none(), egui::Button::new(label)).clicked() {
+                                    self.play(&b, i, stem);
+                                }
                             }
                             ui.horizontal(|ui| match s.layout.as_str() {
                                 "pcm16" | "pcmf32" => {
@@ -609,5 +731,38 @@ impl AudioView {
                 });
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opening_a_scene_address_selects_the_exact_stream_without_playing() {
+        let mut view = AudioView::new("", "");
+        let address: SceneAudio = serde_json::from_value(serde_json::json!({
+            "archive": "local/fixture.rpf", "bank_offset": 4096,
+            "stream_index": 1, "stream_id": 66, "data_offset": 4352, "data_size": 512,
+        })).unwrap();
+        let index: AudioIndex = serde_json::from_value(serde_json::json!({
+            "archive": "local/fixture.rpf", "archive_size": 8192, "note": "",
+            "banks": [{"off": 4096, "size": 768, "flags": 0, "streams": [
+                [66, 48, 48000, 0, 1, 4, 128, 128],
+                [66, 240, 48000, 0, 1, 4, 256, 512]
+            ]}]
+        })).unwrap();
+        view.select_stream(address);
+        assert_eq!(view.archive_id, index.archive);
+        assert!(view.pending_stream.is_some());
+        view.search = "old filter".into();
+        view.min_seconds = 5.0;
+        view.focus_stream(&index);
+        assert_eq!(view.sel, Some(0));
+        assert_eq!(view.focused_stream, Some(1));
+        assert!(view.scroll_to_stream);
+        assert!(view.search.is_empty());
+        assert_eq!(view.min_seconds, 0.0);
+        assert!(view.player.is_none() && view.decoding.is_none());
     }
 }

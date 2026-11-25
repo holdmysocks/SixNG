@@ -2,10 +2,13 @@
 //! them by name and by cast, and shows a scene's cast, props and cameras;
 //! a cast member's scene clip plays on that character in the model viewer.
 
+use crate::audio_view::SceneAudio;
 use eframe::egui;
+use serde::Deserialize;
 use sixng_core::anim::ClipDictionary;
 use sixng_core::cutscene::{self, Catalog, Models, Scene};
 use sixng_core::export::{Progress, Workspace};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -94,6 +97,63 @@ pub fn filter(all: &[Scene], name: &str, cast: &str) -> Vec<usize> {
     all.iter().enumerate().filter(|(_, s)| matches(s, &n, &c)).map(|(i, _)| i).collect()
 }
 
+/// A scene name's mission and its place in that mission, from the name:
+/// `<arc>_<mission>_<stage>_…`, where the stage is the intro (`int`,
+/// `int1a`, `intro`), a mid scene (`mcs1`, `mcs2` …) or the outro (`ext`).
+/// Returns (mission, stage rank 0 intro / 1 mid / 2 outro, stage number).
+/// Names with no stage word count as mid scenes of their first two words.
+pub fn mission_stage(name: &str) -> (String, u8, u64) {
+    let t: Vec<&str> = name.split('_').collect();
+    let num = |s: &str| s.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect::<String>().parse::<u64>().unwrap_or(0);
+    let stage = |w: &str| -> Option<(u8, u64)> {
+        let (head, tail) = w.split_at(w.find(|c: char| c.is_ascii_digit()).unwrap_or(w.len()));
+        let tail_ok = tail.is_empty() || tail.trim_start_matches(|c: char| c.is_ascii_digit()).chars().all(|c| c.is_ascii_lowercase());
+        match head {
+            "intro" if tail.is_empty() => Some((0, 0)),
+            "int" if tail_ok => Some((0, num(w))),
+            "mcs" | "rs" if !tail.is_empty() && tail_ok => Some((1, num(w))),
+            "ext" if tail_ok => Some((2, num(w))),
+            _ => None,
+        }
+    };
+    for i in 2..t.len().min(5) {
+        if let Some((r, n)) = stage(t[i]) {
+            return (t[..i].join("_"), r, n);
+        }
+    }
+    (t[..t.len().min(2)].join("_"), 1, 0)
+}
+
+/// Text with its digit runs compared as numbers (`p2` before `p10`).
+fn natural(s: &str) -> Vec<(u64, String)> {
+    let mut out = Vec::new();
+    let mut it = s.chars().peekable();
+    while let Some(&c) = it.peek() {
+        let digit = c.is_ascii_digit();
+        let mut run = String::new();
+        while let Some(&c) = it.peek() {
+            if c.is_ascii_digit() != digit {
+                break;
+            }
+            run.push(c);
+            it.next();
+        }
+        out.push(if digit { (run.parse().unwrap_or(u64::MAX), String::new()) } else { (u64::MAX, run) });
+    }
+    out
+}
+
+/// Sort scene indexes in mission order: missions by name, and in each
+/// mission the intro, the mid scenes by number, then the outro; parts,
+/// takes and variants in number order after that.
+pub fn sort_mission_order(all: &[Scene], shown: &mut [usize]) {
+    shown.sort_by_cached_key(|&i| {
+        let n = all[i].name.to_ascii_lowercase();
+        let (m, r, k) = mission_stage(&n);
+        (m, r, k, natural(&n))
+    });
+}
+
 /// The next selection when stepping `by` through the filtered list.
 pub fn step(shown: &[usize], sel: Option<usize>, by: isize) -> Option<usize> {
     if shown.is_empty() {
@@ -110,9 +170,46 @@ pub fn step(shown: &[usize], sel: Option<usize>, by: isize) -> Option<usize> {
 pub enum Action {
     /// Open the character (outfit prefix) and play the clip (`cin@…/<clip>`).
     Play { model: String, clip: String },
+    OpenAudio(SceneAudio),
 }
 
-type Loaded = Option<Result<Arc<Vec<Scene>>, String>>;
+#[derive(Deserialize)]
+struct DialogueRow {
+    speaker: String,
+    speaker_hash: u32,
+    subtitle_key: u32,
+    text: String,
+    audio: Option<SceneAudio>,
+}
+
+type DialogueRows = BTreeMap<String, Vec<DialogueRow>>;
+
+#[derive(Deserialize)]
+struct DialogueFile {
+    schema_version: u32,
+    scenes: DialogueRows,
+}
+
+fn parse_dialogue(bytes: &[u8]) -> anyhow::Result<DialogueRows> {
+    let file: DialogueFile = serde_json::from_slice(bytes)?;
+    anyhow::ensure!(file.schema_version == 1, "unsupported schema version {}", file.schema_version);
+    Ok(file.scenes)
+}
+
+fn load_dialogue(work: &Path) -> anyhow::Result<DialogueRows> {
+    match std::fs::read(work.join("scene_dialogue.json")) {
+        Ok(bytes) => parse_dialogue(&bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+struct LoadedScenes {
+    scenes: Arc<Vec<Scene>>,
+    dialogue: Result<DialogueRows, String>,
+}
+
+type Loaded = Option<Result<LoadedScenes, String>>;
 
 pub struct ScenesView {
     game: String,
@@ -121,11 +218,14 @@ pub struct ScenesView {
     pending: Arc<Mutex<Loaded>>,
     progress: Arc<Mutex<(String, u64, u64)>>,
     scenes: Option<Arc<Vec<Scene>>>,
+    dialogue: Result<DialogueRows, String>,
     error: Option<String>,
     pub name_q: String,
     pub cast_q: String,
+    /// List scenes in mission order instead of by name.
+    pub mission_order: bool,
     shown: Vec<usize>,
-    shown_key: (String, String, usize),
+    shown_key: (String, String, usize, bool),
     sel: Option<usize>,
     scroll_to_sel: bool,
 }
@@ -139,9 +239,11 @@ impl ScenesView {
             pending: Default::default(),
             progress: Default::default(),
             scenes: None,
+            dialogue: Ok(BTreeMap::new()),
             error: None,
             name_q: String::new(),
             cast_q: String::new(),
+            mission_order: false,
             shown: Vec::new(),
             shown_key: Default::default(),
             sel: None,
@@ -176,7 +278,12 @@ impl ScenesView {
                 *prog.lock().unwrap() = (s.to_string(), d, t);
                 c2.request_repaint();
             });
-            let r = load_scenes(&ws, p).map(Arc::new).map_err(|e| format!("{e:#}"));
+            let r = load_scenes(&ws, p)
+                .map(|scenes| LoadedScenes {
+                    scenes: Arc::new(scenes),
+                    dialogue: load_dialogue(&ws.work).map_err(|e| format!("{e:#}")),
+                })
+                .map_err(|e| format!("{e:#}"));
             *slot.lock().unwrap() = Some(r);
             ctx.request_repaint();
         });
@@ -188,7 +295,10 @@ impl ScenesView {
         }
         if let Some(r) = self.pending.lock().unwrap().take() {
             match r {
-                Ok(s) => self.scenes = Some(s),
+                Ok(loaded) => {
+                    self.scenes = Some(loaded.scenes);
+                    self.dialogue = loaded.dialogue;
+                }
                 Err(e) => self.error = Some(e),
             }
         }
@@ -215,14 +325,17 @@ impl ScenesView {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
             return None;
         };
-        let key = (self.name_q.clone(), self.cast_q.clone(), all.len());
+        let key = (self.name_q.clone(), self.cast_q.clone(), all.len(), self.mission_order);
         if key != self.shown_key {
             self.shown = filter(&all, &self.name_q, &self.cast_q);
+            if self.mission_order {
+                sort_mission_order(&all, &mut self.shown);
+            }
             self.shown_key = key;
             if self.sel.is_none_or(|s| !self.shown.contains(&s)) {
                 self.sel = self.shown.first().copied();
-                self.scroll_to_sel = true;
             }
+            self.scroll_to_sel = true;
         }
         let mut act = None;
         egui::Panel::left("scenes_list").resizable(true).default_size(380.0).show(ui, |ui| {
@@ -233,6 +346,12 @@ impl ScenesView {
                 ui.end_row();
                 ui.label("Cast");
                 ui.add(egui::TextEdit::singleline(&mut self.cast_q).hint_text("lucia, player_story000_01 …").desired_width(250.0)).on_hover_text("Scenes whose cast has every word: each is part of a cast member's scene handle (lucia) or model (player_story000_00 is Lucia, player_story000_01 is Jason).");
+                ui.end_row();
+                ui.label("Order");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.mission_order, false, "A–Z");
+                    ui.selectable_value(&mut self.mission_order, true, "Mission order").on_hover_text("Missions by name; in each mission the intro (int), the mid scenes (mcs1, mcs2 …), then the outro (ext), with parts and takes in number order. This is read from the scene names: the order of the missions in the story is not known yet.");
+                });
                 ui.end_row();
             });
             ui.horizontal(|ui| {
@@ -282,13 +401,18 @@ impl ScenesView {
                 ui.label("No scene matches.");
                 return;
             };
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| act = scene_ui(ui, s));
+            let dialogue = self.dialogue.as_ref().map(|rows| {
+                rows.get(&s.name).map(Vec::as_slice).unwrap_or_default()
+            });
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                act = scene_ui(ui, s, dialogue.map_err(String::as_str));
+            });
         });
         act
     }
 }
 
-fn scene_ui(ui: &mut egui::Ui, s: &Scene) -> Option<Action> {
+fn scene_ui(ui: &mut egui::Ui, s: &Scene, dialogue: Result<&[DialogueRow], &str>) -> Option<Action> {
     let mut act = None;
     ui.heading(&s.name);
     egui::Grid::new("scene_facts").num_columns(2).show(ui, |ui| {
@@ -300,6 +424,17 @@ fn scene_ui(ui: &mut egui::Ui, s: &Scene) -> Option<Action> {
             ui.label(v);
             ui.end_row();
         }
+        let (m, r, k) = mission_stage(&s.name.to_ascii_lowercase());
+        ui.label("Mission");
+        ui.label(format!("{m}, {}", match (r, k) {
+            (0, 0) => "intro".to_string(),
+            (0, k) => format!("intro {k}"),
+            (2, 0) => "outro".to_string(),
+            (2, k) => format!("outro {k}"),
+            (_, 0) => "scene".to_string(),
+            (_, k) => format!("mid scene {k}"),
+        }));
+        ui.end_row();
         ui.label("Sections");
         ui.label(if s.windows_missing > 0 { format!("{} (joined; {} clip windows not found)", s.sections, s.windows_missing) } else { format!("{} (joined)", s.sections) });
         ui.end_row();
@@ -344,6 +479,40 @@ fn scene_ui(ui: &mut egui::Ui, s: &Scene) -> Option<Action> {
     });
     ui.label(egui::RichText::new("Each clip starts at the character's own origin: where the characters stand in the scene relative to each other is not known.").weak().small());
     ui.add_space(6.0);
+    match dialogue {
+        Ok(rows) if !rows.is_empty() => {
+            egui::CollapsingHeader::new(format!("Dialogue ({})", rows.len()))
+                .default_open(true)
+                .show(ui, |ui| {
+                    egui::Grid::new("scene_dialogue").striped(true).show(ui, |ui| {
+                        ui.strong("Speaker");
+                        ui.strong("Subtitle key");
+                        ui.strong("Dialogue");
+                        ui.strong("Audio");
+                        ui.end_row();
+                        for row in rows {
+                            ui.label(&row.speaker)
+                                .on_hover_text(format!("Native speaker hash {:08x}", row.speaker_hash));
+                            ui.monospace(format!("{:08x}", row.subtitle_key));
+                            ui.add(egui::Label::new(&row.text).wrap());
+                            if let Some(address) = &row.audio {
+                                let label = if address.stem.is_some() { "Open voice excerpt" } else { "Open in Audio" };
+                                if ui.button(label).clicked() {
+                                    act = Some(Action::OpenAudio(address.clone()));
+                                }
+                            } else {
+                                ui.weak("Unresolved");
+                            }
+                            ui.end_row();
+                        }
+                    });
+                });
+        }
+        Err(e) => {
+            ui.colored_label(ui.visuals().error_fg_color, format!("Could not load scene_dialogue.json: {e}"));
+        }
+        Ok(_) => {}
+    }
     egui::CollapsingHeader::new(format!("Props ({})", s.props.len())).default_open(true).show(ui, |ui| {
         for o in &s.props {
             ui.label(match &o.model {
@@ -380,6 +549,33 @@ fn scene_ui(ui: &mut egui::Ui, s: &Scene) -> Option<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_dialogue_preserves_occurrences_with_and_without_audio() {
+        let rows = parse_dialogue(br#"{
+            "schema_version": 1,
+            "scenes": {
+                "fixture_scene": [
+                    {"speaker": "Guide", "speaker_hash": 1, "subtitle_key": 3,
+                     "text": "The lights are on.",
+                     "audio": {"archive": "local/fixture.rpf", "bank_offset": 4096,
+                               "stream_index": 1, "stream_id": 66, "data_offset": 4352, "data_size": 512,
+                               "stem": {"channel_id": 52, "start_frame": 120, "end_frame": 240}}},
+                    {"speaker": "Guide", "speaker_hash": 2, "subtitle_key": 3,
+                     "text": "The lights are on."}
+                ]
+            }
+        }"#).unwrap();
+        let rows = &rows["fixture_scene"];
+        assert_eq!(rows.len(), 2);
+        let audio = rows[0].audio.as_ref().unwrap();
+        assert_eq!(audio.address.stream_index, 1);
+        assert_eq!(audio.stem.unwrap().channel_id, 52);
+        assert!(rows[1].audio.is_none());
+        assert_ne!(rows[0].speaker_hash, rows[1].speaker_hash);
+        assert_eq!(rows[0].subtitle_key, rows[1].subtitle_key);
+        assert!(parse_dialogue(br#"{"schema_version":2,"scenes":{}}"#).is_err());
+    }
     use sixng_core::cutscene::SceneObject;
 
     fn obj(handle: &str, kind: &'static str, model: Option<&str>) -> SceneObject {
@@ -439,6 +635,30 @@ mod tests {
         assert_eq!(filter(&all, "", "prop_cup"), Vec::<usize>::new());
         // name and cast together
         assert_eq!(filter(&all, "beach", "lucia"), vec![1]);
+    }
+
+    #[test]
+    fn mission_stage_from_the_name() {
+        assert_eq!(mission_stage("air_cater_ext_p1a1_t05_x1"), ("air_cater".into(), 2, 0));
+        assert_eq!(mission_stage("mtl_mont_mcs1_arrive_at_diner_p1_t05"), ("mtl_mont".into(), 1, 1));
+        assert_eq!(mission_stage("com_cbo_cbint_mcs12_meet"), ("com_cbo_cbint".into(), 1, 12));
+        assert_eq!(mission_stage("com_cbo_cbint_int"), ("com_cbo_cbint".into(), 0, 0));
+        assert_eq!(mission_stage("bil_x_int1a_p1_t01"), ("bil_x".into(), 0, 1));
+        assert_eq!(mission_stage("bil_x_intro_p1"), ("bil_x".into(), 0, 0));
+        assert_eq!(mission_stage("bil_x_ext2_p1"), ("bil_x".into(), 2, 2));
+        // words that only start like a stage are not one
+        assert_eq!(mission_stage("ban_interior_mcs2_p1"), ("ban_interior".into(), 1, 2));
+        assert_eq!(mission_stage("collehunt_a_b"), ("collehunt_a".into(), 1, 0));
+    }
+
+    #[test]
+    fn mission_order_puts_intro_mid_scenes_and_outro_in_turn() {
+        let names = ["air_x_ext_p1_t01", "air_x_mcs10_a_p1_t01", "air_x_mcs2_a_p10_t01", "air_x_mcs2_a_p2_t01", "air_x_int_p1_t01", "air_x_int_p1_t01_x1", "air_w_ext_p1_t01", "air_x_mcs2_a_p2_t01_x1"];
+        let all: Vec<Scene> = names.iter().map(|n| scene(n, vec![])).collect();
+        let mut shown: Vec<usize> = (0..all.len()).collect();
+        sort_mission_order(&all, &mut shown);
+        let got: Vec<&str> = shown.iter().map(|&i| all[i].name.as_str()).collect();
+        assert_eq!(got, ["air_w_ext_p1_t01", "air_x_int_p1_t01", "air_x_int_p1_t01_x1", "air_x_mcs2_a_p2_t01", "air_x_mcs2_a_p2_t01_x1", "air_x_mcs2_a_p10_t01", "air_x_mcs10_a_p1_t01", "air_x_ext_p1_t01"]);
     }
 
     #[test]

@@ -208,6 +208,69 @@ pub struct AudioIndex {
     pub note: String,
 }
 
+/// A stream in a specific archive index, with its encoded byte range for validation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamAddress {
+    pub archive: String,
+    pub bank_offset: u64,
+    /// Zero-based position in the bank header.
+    pub stream_index: usize,
+    pub stream_id: u32,
+    /// Absolute byte offset in the archive.
+    pub data_offset: u64,
+    pub data_size: u32,
+}
+
+impl StreamAddress {
+    /// Return the bank position only if the indexed stream matches the whole address.
+    pub fn bank_index(&self, index: &AudioIndex) -> Option<usize> {
+        if self.archive != index.archive {
+            return None;
+        }
+        let bank_index = index.banks.iter().position(|bank| bank.off == self.bank_offset)?;
+        self.matches_bank(&index.banks[bank_index], index.archive_size).then_some(bank_index)
+    }
+
+    /// Validate the address against a bank found by its archive and offset.
+    pub fn matches_bank(&self, bank: &Bank, archive_size: u64) -> bool {
+        let Some(stream) = bank.streams.get(self.stream_index) else { return false };
+        let Some(data_end) = self.data_offset.checked_add(u64::from(self.data_size)) else { return false };
+        bank.off == self.bank_offset
+            && stream.id == self.stream_id
+            && stream.layout != "none"
+            && self.data_size > 0
+            && stream.data.1 == self.data_size
+            && self.bank_offset.checked_add(u64::from(stream.data.0)) == Some(self.data_offset)
+            && bank.off.checked_add(bank.size).is_some_and(|end| data_end <= end)
+            && data_end <= archive_size
+    }
+}
+
+/// An excerpt from one channel of an interleaved audio stream, at 48 kHz.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct StemWindow {
+    pub channel_id: u32,
+    pub start_frame: u32,
+    pub end_frame: u32,
+}
+
+impl StemWindow {
+    pub fn decode(self, bytes: &[u8], bank: &Bank, stream: &Stream) -> Result<(u8, Vec<i16>)> {
+        anyhow::ensure!(self.start_frame < self.end_frame, "empty voice-stem window");
+        let mut channels = music_channels(bytes, bank.off, stream)?
+            .into_iter()
+            .filter(|channel| channel.id == self.channel_id);
+        let channel = channels.next().ok_or_else(|| anyhow!("voice stem {:08x} is missing", self.channel_id))?;
+        anyhow::ensure!(channels.next().is_none(), "voice stem {:08x} is ambiguous", self.channel_id);
+        anyhow::ensure!(self.end_frame <= channel.frames, "voice-stem window exceeds the channel length");
+        let (count, pcm) = decode(&channel.packets, channel.frames)?;
+        let start = self.start_frame as usize * count as usize;
+        let end = self.end_frame as usize * count as usize;
+        let excerpt = pcm.get(start..end).ok_or_else(|| anyhow!("voice-stem window exceeds the decoded samples"))?;
+        Ok((count, excerpt.to_vec()))
+    }
+}
+
 fn u16le(b: &[u8], o: usize) -> Option<u32> {
     b.get(o..o + 2).map(|x| u16::from_le_bytes([x[0], x[1]]) as u32)
 }
@@ -483,7 +546,10 @@ pub struct MusicChannel {
 /// Split a music stream into its sub-streams. `bank` = the whole bank.
 pub fn music_channels(bank: &[u8], bank_off: u64, s: &Stream) -> Result<Vec<MusicChannel>> {
     let hb = parse_header(bank, bank_off).ok_or_else(|| anyhow!("bank header"))?;
-    let hs = hb.streams.iter().find(|x| x.id == s.id).ok_or_else(|| anyhow!("stream {:08x} not in the bank header", s.id))?;
+    let hs = hb.streams.iter().find(|x| {
+        x.id == s.id && x.chunk(CH_DATA).is_some_and(|c| (c.off, c.size) == s.data)
+    })
+        .ok_or_else(|| anyhow!("stream {:08x} and its data range are not in the bank header", s.id))?;
     let sf = hs.chunk(CH_STREAM_FORMAT).ok_or_else(|| anyhow!("stream {:08x}: no stream-format chunk", s.id))?;
     let dc = hs.chunk(CH_DATA).ok_or_else(|| anyhow!("stream {:08x}: no data chunk", s.id))?;
     let f = bank.get(sf.off as usize..(sf.off + sf.size) as usize).ok_or_else(|| anyhow!("stream-format chunk outside the bank"))?;
@@ -847,12 +913,23 @@ pub fn load_index(work: &Path, archive: &str) -> Result<AudioIndex> {
 }
 
 pub fn save_index(work: &Path, ix: &AudioIndex) -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT_TEMP: AtomicUsize = AtomicUsize::new(0);
+
     let p = index_path(work, &ix.archive);
     std::fs::create_dir_all(p.parent().unwrap())?;
-    let mut z = flate2::write::GzEncoder::new(std::io::BufWriter::new(File::create(p)?), flate2::Compression::fast());
-    serde_json::to_writer(&mut z, ix)?;
-    z.finish()?.flush()?;
-    Ok(())
+    let temp = p.with_extension(format!("{}-{}.tmp", std::process::id(), NEXT_TEMP.fetch_add(1, Ordering::Relaxed)));
+    let result = (|| {
+        let mut z = flate2::write::GzEncoder::new(std::io::BufWriter::new(File::create(&temp)?), flate2::Compression::fast());
+        serde_json::to_writer(&mut z, ix)?;
+        z.finish()?.flush()?;
+        std::fs::rename(&temp, &p)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -898,6 +975,44 @@ mod tests {
     }
     fn stream(layout: &str, samples: u32, rate: u32, channels: u32, size: u32) -> Stream {
         Stream { id: 0x42, chunks: Vec::new(), data: (0, size), samples, rate, codec: 0, channels, layout: layout.into() }
+    }
+    #[test]
+    fn stream_address_checks_archive_and_range_with_duplicate_ids() {
+        let first = Stream { data: (128, 128), ..stream("blocks", 960, 48000, 1, 128) };
+        let second = Stream { data: (256, 512), ..first.clone() };
+        let index = AudioIndex {
+            archive: "local/fixture.rpf".into(),
+            archive_size: 8192,
+            banks: vec![Bank {
+                off: 4096,
+                size: 768,
+                flags: 0,
+                names: Default::default(),
+                streams: vec![first, second],
+            }],
+            ..Default::default()
+        };
+        let address = StreamAddress {
+            archive: index.archive.clone(),
+            bank_offset: 4096,
+            stream_index: 1,
+            stream_id: 0x42,
+            data_offset: 4352,
+            data_size: 512,
+        };
+        assert_eq!(address.bank_index(&index), Some(0));
+        for invalid in [
+            StreamAddress { stream_index: 0, ..address.clone() },
+            StreamAddress { stream_id: 0x43, ..address.clone() },
+            StreamAddress { bank_offset: 2048, ..address.clone() },
+            StreamAddress { data_offset: 4353, ..address.clone() },
+            StreamAddress { data_size: 511, ..address.clone() },
+            StreamAddress { archive: "another.rpf".into(), ..address.clone() },
+        ] {
+            assert_eq!(invalid.bank_index(&index), None);
+        }
+        let truncated = AudioIndex { archive_size: 4608, ..index };
+        assert_eq!(address.bank_index(&truncated), None);
     }
     #[test]
     fn index_tuple_layouts() {
@@ -995,9 +1110,22 @@ mod tests {
         let b = parse_header(&h, 0).unwrap();
         let mut st = b.streams[0].clone();
         st.layout = "music".into();
+        st.data = (d0 as u32, data_len as u32);
         let c = music_channels(&h, 0, &st).unwrap();
         assert_eq!(c.len(), 2);
         assert_eq!((c[0].id, c[0].frames), (0xAA, 960));
         assert_eq!(c[1].packets, vec![vec![0xF8, 2, 2]]);
+        let window = StemWindow { channel_id: 0xBB, start_frame: 10, end_frame: 20 };
+        assert!(StemWindow { channel_id: 0xCC, ..window }.decode(&h, &b, &st).is_err());
+        assert!(StemWindow { end_frame: 961, ..window }.decode(&h, &b, &st).is_err());
+        assert!(StemWindow { start_frame: 20, ..window }.decode(&h, &b, &st).is_err());
+        #[cfg(feature = "opus-decode")]
+        {
+            // Replace the second stem's test packet with valid Opus silence.
+            h[d0 + 2 * BLOCK + 3..d0 + 2 * BLOCK + 5].copy_from_slice(&[0xFF, 0xFE]);
+            let (channels, pcm) = window.decode(&h, &b, &st).unwrap();
+            assert_eq!(channels, 1);
+            assert_eq!(pcm, vec![0; 10]);
+        }
     }
 }
