@@ -411,7 +411,7 @@ fn two_layer_blend_text() -> Value {
     json!({
         "inputs": {
             "c": "_COLOR1.r / 255 (the second vertex colour set)",
-            "M": "the blend mask: slot 11 (extra_data), rgba, on the pixel input TEXCOORD0's first UV pair when mask_uv_pair is 1, else its second (2 on 6 to 26 % of sampled materials)",
+            "M": "the blend mask: slot 11 (extra_data), rgba, on TEXCOORD_0 when mask_uv_pair is 1, else TEXCOORD_1 (2 on 6 to 26 % of sampled materials; the mesh program packs mesh UV sets 0 and 1 into the pixel input TEXCOORD0)",
             "b": "a per-instance value (byte 3 of the instance's record; batch props: an instance input). Not exported; 1 (byte 255) is assumed, which makes m = blendintensity",
         },
         "steps": [
@@ -427,7 +427,7 @@ fn two_layer_blend_text() -> Value {
         ],
         "simple": "with b = 1 and the mask ignored (h = 0): w = saturate(sharpen(c) x blendintensity + blendoffset), sharpen(c) = c / (c + k (1 - c)); blendsoftness 1 gives sharpen(c) = c",
         "source": "shader code: the deferred pixel programs of standard_2lyr and prop_2lyr_batch read in full, the pxm and decal ground ones compared; the mesh programs' export of _COLOR1.r to the pixel input checked. Not compared with a rendered image",
-        "not_read": "where the per-instance value comes from in the placements; what the TEXCOORD0 pairs are in mesh UV sets; the normal and material-map blend (they use max(0, w - _COLOR1.g))",
+        "not_read": "where the per-instance value comes from in the placements; the normal and material-map blend (they use max(0, w - _COLOR1.g))",
     })
 }
 
@@ -466,7 +466,7 @@ fn two_layer_blend(l: &mut Value, consts: &[crate::drawable::ShaderConst]) {
         "k": g(k),
         "s": if (k - 1.0).abs() < 1e-6 { "t".to_string() } else { format!("saturate(t / max(0.01, t + {} x (1 - t)))", g(k)) },
         "w": w,
-        "mask_uv": if one("f50070cc") == Some(1.0) { "first pair of TEXCOORD0" } else { "second pair of TEXCOORD0" },
+        "mask_uv": if one("f50070cc") == Some(1.0) { "TEXCOORD_0" } else { "TEXCOORD_1" },
         "assumes": "instance value b = 1",
     });
 }
@@ -1114,7 +1114,7 @@ mod paint_tests {
         assert_eq!((b["params"]["blendintensity"].as_f64().map(|x| (x * 10.0).round()), b["params"]["mask_weights"][2].as_f64()), (Some(4.0), Some(1.0)));
         let r = &b["resolved"];
         assert_eq!((r["h"].as_str(), r["k"].as_str(), r["w"].as_str()), (Some("1 - (M.b)"), Some("11.1111"), Some("saturate(s x 0.4 + 0.3)")));
-        assert_eq!(r["mask_uv"], "second pair of TEXCOORD0");
+        assert_eq!(r["mask_uv"], "TEXCOORD_1");
         // softness 1: no sharpening; the layer-2 alpha switch multiplies in lyr1diffusetex.a
         let sh = crate::drawable::Shader { constants: vec![s1("cbc6c5b3", 1.0), s1("ba3b95db", 1.0), s1("29265d05", 0.0), s1("d6de9e14", 1.0)], ..sh };
         let r = &multilayer(&sh, &[], || Value::Null).unwrap()["blend"]["resolved"];
