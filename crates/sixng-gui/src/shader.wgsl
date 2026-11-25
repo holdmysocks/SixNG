@@ -16,7 +16,7 @@ struct Frame {
     misc2: vec4<f32>,     // x fog density, yzw secondary paint colour
     misc3: vec4<f32>,     // x tint palette on (1) / off (0), w the vehicle's own paint metalness
     prev_view_proj: mat4x4<f32>,
-    jitter: vec4<f32>,    // body paint's coat: x clear coat intensity, y clear coat roughness, z flake orientation (0 = no flakes); w vehicle wear (0 to 1)
+    jitter: vec4<f32>,    // body paint's coat: x clear coat intensity, y clear coat roughness, z flake orientation (0 = no flakes); w vehicle wear (0 to 1; < 0: each part's own amount, column 11 of its coat row)
 };
 
 struct Mat {
@@ -440,14 +440,19 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     // under bare metal): rows 256..512 of the part ramp image hold its colour
     // and roughness (alpha); its metalness is the alpha of the first rows.
     // Shown where the layer detail texture's blue is high (taken as the
-    // wear mask), by the amount the user sets.
-    if (M.tile.w > 1.5 && F.jitter.w > 0.0) {
+    // wear mask), by the amount the user sets, or by each part's own amount
+    // from the vehicle's configuration (its wear level).
+    var wear_amt = F.jitter.w;
+    if (M.tile.w > 1.5 && wear_amt < 0.0) {
+        wear_amt = textureLoad(t_em, vec2(11, 768 + i32(floor(i.col.a * 255.0 + 0.5))), 0).a;
+    }
+    if (M.tile.w > 1.5 && wear_amt > 0.0) {
         let d = textureSample(t_tile, samp, i.uv0);
         let id = floor(i.col.a * 255.0 + 0.5);
         let u = clamp(d.g, 0.004, 0.996);
         let w1 = textureSampleLevel(t_em, samp, vec2(u, (id + 256.5) / RAMP_ROWS), 0.0);
         let m1 = textureSampleLevel(t_em, samp, vec2(u, (id + 0.5) / RAMP_ROWS), 0.0).a;
-        let k = clamp(d.b * F.jitter.w * 2.0, 0.0, 1.0);
+        let k = clamp(d.b * wear_amt * 2.0, 0.0, 1.0);
         albedo = mix(albedo, w1.rgb, k);
         rough = clamp(mix(rough, w1.a, k), 0.04, 1.0);
         metal = mix(metal, m1, k);
