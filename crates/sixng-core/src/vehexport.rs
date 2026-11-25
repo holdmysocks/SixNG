@@ -345,6 +345,13 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
         .and_then(|i| piece.part_looks["looks"][i as usize].as_str())
         .filter(|h| h.len() == 2048)
         .map(|h| (0..256).map(|i| std::array::from_fn(|k| u8::from_str_radix(&h[i * 8 + k * 2..i * 8 + k * 2 + 2], 16).unwrap_or(255))).collect());
+    // the coat record (clear coat, flakes, film, sheen) of the configuration's body paint
+    let paint_coat = cfg["parts_key"]
+        .as_str()
+        .and_then(|k| piece.part_looks["configs"][k].as_u64())
+        .or(piece.part_looks["default"].as_u64())
+        .and_then(|i| piece.part_looks["paint_coats"][i as usize].as_u64())
+        .map_or(Value::Null, |c| piece.part_looks["coat_records"][c as usize].clone());
     // parts fitted on top of the configuration change the look (a body
     // kit's panels take the body paint)
     if let Some(l) = look.as_mut() {
@@ -599,14 +606,14 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
     if groups.iter().all(|g| g.prims.is_empty()) {
         bail!("nothing to export for {model}");
     }
-    let extras = json!({"vehicle": model, "configuration": config, "parts_key": cfg["parts_key"], "colour": cfg["colour"], "coordinate_system": crate::export::COORDS});
+    let extras = json!({"vehicle": model, "configuration": config, "parts_key": cfg["parts_key"], "colour": cfg["colour"], "paint_coat": paint_coat, "coordinate_system": crate::export::COORDS});
     let glb = crate::gltf::mesh_glb_with(&model, &groups, &materials, &joints, extras, &crate::gltf::GlbOptions { animations: &[], trs_joints: true, skinned_meshes_at_root: true });
     std::fs::write(out, &glb)?;
     Ok(json!({
         "glb": out, "bytes": glb.len(), "vehicle": model, "configuration": config, "configurations": configs.len(),
         "pieces": reports, "joints": joints.len(), "stock_triangles_replaced": dropped,
         "part_colours": if look.is_some() { "the configuration's" } else { "as exported (the vehicle has no part colours per configuration)" },
-        "paint": paint, "wheels": wheel_report, "repeated_elements_skipped": repeated, "not_fitted": skipped, "left_out": unresolved, "warnings": warnings,
+        "paint": paint, "paint_coat": paint_coat, "wheels": wheel_report, "repeated_elements_skipped": repeated, "not_fitted": skipped, "left_out": unresolved, "warnings": warnings,
     }))
 }
 
