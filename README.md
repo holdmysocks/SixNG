@@ -694,6 +694,22 @@ again**).
   with no scene of its own (`cin@mtl_mont_int_p0l_t01fixme-<N>`); they
   join the scene whose name starts theirs. Not
   decoded: the scene files' timing, events and state transitions.
+- **Story names** (`sixng story-names [--tags]`): arc and mission names
+  for the scenes. The story pack's protected ambient-rule files (read
+  through the table of contents, so Windows x64 with the game executable)
+  name the content tags the story flow sets, one per finished mission:
+  `Flow<arc words><mission words>Complete`. A scene's mission id
+  (`<arc>_<mission>`) is a short form of those words, so the two are paired
+  by that rule: the arc parts shorten the first words, the mission part a
+  later run of words, and when several ids fit a tag, the one whose letters
+  fall in the fewest words wins. Ids that start other ids are arcs. A tag
+  that still fits two ids, or an id with two tags, names nothing. An arc's
+  words end where its tags' shared words end, or for an arc with one tag,
+  where the mission part starts. Measured: 25 of the 324 mission ids in the
+  scene names and 12 arcs get names. The tags are cached in
+  `<work>/index/story_flow_tags.json`. The Scenes tab shows the names as
+  the scene's **Story** and its name search finds them. The tags do not
+  give the order of the missions in the story.
 - **Body sliders** (weight −1…1, muscle 0…1; `--body <w>,<m>` for
   screenshots): the skin and head are posed with the game's body-shape rig
   on the shared skeleton. Clothes and accessories follow the skin under
