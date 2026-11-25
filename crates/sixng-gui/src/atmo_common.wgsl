@@ -38,6 +38,14 @@ struct Scene {
     flags: vec4<u32>,     // x 1 = map HDR frame, y frame index, z width, w height
     inv_vp: mat4x4<f32>,  // camera clip to world
     cam: vec4<f32>,       // camera position (world m), w unused
+    // water: extinction / m (rgb), peak wavelength (m); scattering / m,
+    // slope variance; phase, wave speed scale; body tint, glint roughness;
+    // Fresnel rescale, min, max, time (s)
+    water0: vec4<f32>,
+    water1: vec4<f32>,
+    water2: vec4<f32>,
+    water3: vec4<f32>,
+    water4: vec4<f32>,
 };
 
 // State the GPU keeps between frames: [0] x exposure (multiplier on

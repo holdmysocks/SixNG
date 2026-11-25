@@ -84,6 +84,40 @@ pub struct SceneU {
     pub flags: [u32; 4],
     pub inv_vp: [[f32; 4]; 4],
     pub cam: [f32; 4],
+    /// Water (`water_*` timecycle values, see `Water`): extinction per m
+    /// (rgb), w peak wavelength (m).
+    pub water0: [f32; 4],
+    /// Scattering per m (rgb), w slope variance of the sea surface.
+    pub water1: [f32; 4],
+    /// Phase (rgb, the game's underwater fog; not used yet), w wave speed scale.
+    pub water2: [f32; 4],
+    /// Body colour tint times brightness (rgb), w added sun-glint roughness.
+    pub water3: [f32; 4],
+    /// Fresnel rescale, its min and max; w time (s) for the waves.
+    pub water4: [f32; 4],
+}
+
+/// Scale from the timecycle's `water_clip_*` scattering and extinction
+/// values to coefficients per metre (our choice: open-sea red extinction
+/// 0.34 / m, blue 0.2 / m).
+const K_WATER: f32 = 0.03;
+
+/// Waves of a sea surface for a Beaufort number and a fetch (km): the
+/// peak wavelength (m) and the slope variance.
+///
+/// Wind speed from the Beaufort scale, `U = 0.836 B^1.5` m/s. The peak
+/// frequency is the fetch-limited JONSWAP one, `22 (g² / (U F))^⅓`, but
+/// no lower than a fully developed sea's (Pierson-Moskowitz, `0.877 g / U`).
+/// The slope variance is the Cox-Munk clean-surface fit, `0.003 + 0.00512 U`.
+pub fn sea_waves(beaufort: f32, fetch_km: f32) -> (f32, f32) {
+    const G: f32 = 9.81;
+    let u = (0.836 * beaufort.max(0.0).powf(1.5)).max(0.5);
+    let f = fetch_km.max(1.0) * 1000.0;
+    let w_fetch = 22.0 * (G * G / (u * f)).powf(1.0 / 3.0);
+    let w_pm = 0.877 * G / u;
+    let w = w_fetch.max(w_pm);
+    let lambda = (2.0 * std::f32::consts::PI * G / (w * w)).clamp(2.0, 400.0);
+    (lambda, 0.003 + 0.00512 * u)
 }
 
 /// The sky and light of one weather and hour, from the timecycle.
@@ -195,6 +229,22 @@ impl Sky {
             g("ambient_bounce_intensity", 0.5).clamp(0.0, 4.0),
             0.0,
         ];
+        let (lambda, slope) = sea_waves(g("water_ocean_beaufort_scale", 4.0), g("water_ocean_fetch", 400.0));
+        let ext = g("water_clip_extinction_scale", 1.0) * K_WATER;
+        let sca = g("water_clip_scattering_scale", 1.0) * K_WATER;
+        u.water0 = v4(scale3(rgb("water_clip_extinction"), ext), lambda);
+        u.water1 = v4(scale3(rgb("water_clip_scattering"), sca), slope);
+        u.water2 = v4(rgb("water_clip_phase"), g("water_ripple_speed_scale", 1.0).clamp(0.0, 4.0));
+        u.water3 = v4(
+            scale3(rgb("water_clip_fog_color_tint"), g("water_clip_fog_brightness", 1.0)),
+            g("water_direct_light_roughness_mod", 0.0).clamp(0.0, 1.0),
+        );
+        u.water4 = [
+            g("water_fresnel_rescale", 0.0),
+            g("water_fresnel_rescale_min", -0.2),
+            g("water_fresnel_rescale_max", 0.1),
+            0.0,
+        ];
         u.flags = [1, 0, 0, 0];
         // the light that shades surfaces: the sun until it is a little under
         // the horizon (the twilight sky still lights), then the moon
@@ -231,6 +281,13 @@ impl Sky {
         u.expo2 = [0.3, 0.3, 0.1797, 0.016];
         u.post = [0.25 * 0.1498, 1.0, 0.1797, 1.0];
         u.post2 = [0.0, 1.0, 0.5, 0.0];
+        // the Sunny water
+        let (lambda, slope) = sea_waves(4.0, 400.0);
+        u.water0 = v4(scale3([11.1875, 6.5977, 6.5977], K_WATER), lambda);
+        u.water1 = v4(scale3([0.06, 0.12, 0.3997], K_WATER), slope);
+        u.water2 = v4([0.7188, 0.8184, 0.9185], 1.0);
+        u.water3 = v4([1.0; 3], 0.0);
+        u.water4 = [0.0, -0.2, 0.1, 0.0];
         u.flags = [1, 0, 0, 0];
         let key_is_moon = sun.y < -0.02;
         Sky {
@@ -402,6 +459,8 @@ pub struct Atmosphere {
     frame: u32,
     /// Frames left that snap the exposure to the metered value.
     pub reset: u32,
+    /// Start of the scene's clock (the waves).
+    t0: std::time::Instant,
 }
 
 fn storage_tex_entry(b: u32, dim: wgpu::TextureViewDimension) -> wgpu::BindGroupLayoutEntry {
@@ -645,6 +704,7 @@ impl Atmosphere {
         let fs_up = rp("fs_up", HDR_FMT);
         let fs_tonemap = rp("fs_tonemap", DISPLAY_FMT);
         Atmosphere {
+            t0: std::time::Instant::now(),
             binds: SceneBinds {
                 scene_ub,
                 trans,
@@ -694,6 +754,7 @@ impl Atmosphere {
         };
         let mut u = sky.u;
         u.radii[2] = (cam.y * 0.001).max(0.0);
+        u.water4[3] = self.t0.elapsed().as_secs_f32();
         u.radii[3] = ap_depth(u.radii[0], u.radii[2]);
         u.expo2[3] = dt.clamp(0.0, 0.25);
         u.post2[0] = if self.reset > 0 { 1.0 } else { 0.0 };
@@ -852,7 +913,7 @@ mod tests {
     #[test]
     fn scene_layout() {
         // 20 vec4, flags, a matrix, the camera
-        assert_eq!(std::mem::size_of::<super::SceneU>(), 21 * 16 + 64 + 16);
+        assert_eq!(std::mem::size_of::<super::SceneU>(), 21 * 16 + 64 + 16 + 5 * 16);
     }
 
     #[test]
@@ -861,6 +922,16 @@ mod tests {
         // from 3 km up the horizon is about 195 km away
         let d = super::ap_depth(6360.0, 3.0);
         assert!(d > 195.0 && d < 400.0, "{d}");
+    }
+
+    #[test]
+    fn sea_waves_grow_with_wind() {
+        let (l4, s4) = super::sea_waves(4.0, 400.0);
+        let (l5, s5) = super::sea_waves(5.0, 100.0);
+        // Beaufort 4: about 6.7 m/s, a fully developed sea of ~37 m waves
+        assert!(l4 > 30.0 && l4 < 45.0, "{l4}");
+        assert!(l5 > l4 && s5 > s4);
+        assert!((s4 - (0.003 + 0.00512 * 6.7)).abs() < 0.002, "{s4}");
     }
 
     #[test]

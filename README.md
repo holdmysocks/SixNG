@@ -1023,6 +1023,26 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   models smaller than three of their texels. Models and map cells cast (opaque and cut-out surfaces);
   skinned, see-through and decal surfaces do not. Only what the camera
   draws casts: a caster just outside the view leaves no shadow.
+- **Water** (HDR map): the sea and the game's water meshes are shaded
+  from the timecycle's `water_*` values. Wind waves set the normal: the
+  peak wavelength comes from `water_ocean_beaufort_scale` and
+  `water_ocean_fetch` (Beaufort wind speed, fetch-limited JONSWAP peak, no
+  lower than a fully developed sea), and the slope variance from the
+  Cox-Munk fit. Ten waves are drawn, and those shorter than about eight
+  pixels (from the screen derivatives, so grazing views too) become
+  roughness. The sky is mirrored by Fresnel
+  (`water_fresnel_rescale*`), the sun or moon glints (with the shadows),
+  and the body colour comes from `water_clip_scattering_*` and
+  `water_clip_extinction_*` (a third of the single-scattering albedo).
+  The map tiles' painted water (their water and no-data colour, which
+  also covers some land cells) is shaded as water on the terrain's sea
+  cells (no height, or deeper than 4.5 m below sea level), blending over
+  one cell at the shore; on higher cells the same paint is left as ground
+  (wet sand, beaches). A water plane under the terrain reaches the
+  horizon. Our choices: the scale from the timecycle's water
+  units to coefficients per metre (0.03), the wind direction, and the
+  share of the slope drawn as waves (60 %). Not yet: shallow water over
+  the seabed, foam, shore waves, refraction and underwater fog.
 - **Map cells** (far placements merged per area): a placement more than
   0.6× the HD distance from the camera can be drawn from its cell instead
   of one by one. A cell holds one LOD level's placements in one square of
