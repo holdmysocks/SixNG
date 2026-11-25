@@ -24,7 +24,7 @@ pub const ARCHETYPE: u32 = 0x82d6_fc83;
 pub const LIGHT_EXT: u32 = 0x2792_2c43;
 pub const LIGHT: u32 = 0xf54b_227b;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Light {
     /// Local position (archetype / entity space, Z-up, metres).
     pub position: [f32; 3],
@@ -66,6 +66,9 @@ pub struct Light {
     pub time_flags: String,
     /// On between 07:00 and 19:59 at no hour (night-only lamp).
     pub night_only: bool,
+    /// `extents` (`2d3f79c0`, an inline array of three floats): the capsule
+    /// size.
+    pub extents: [f32; 3],
     /// Every scalar field by hash.
     pub fields: BTreeMap<String, serde_json::Value>,
 }
@@ -95,7 +98,12 @@ fn rgb(r: &Resource, o: usize) -> String {
 /// fields are picked by member hash, never by resolved name.
 fn light_at(m: &Meta, o: usize) -> Light {
     let r = m.r;
-    let f = m.scalars_by_hash(LIGHT, o, &[0, 0x120]);
+    let mut f = m.scalars_by_hash(LIGHT, o, &[0, 0x120]);
+    let extents = m.member_value(LIGHT, o, 0x2d3f_79c0).and_then(|v| serde_json::from_value::<[f32; 3]>(v).ok());
+    if let Some(e) = extents {
+        f.insert(0x2d3f_79c0, serde_json::json!(e));
+    }
+    let extents = extents.unwrap_or_default();
     Light {
         position: [r.f32(o + 0x120), r.f32(o + 0x124), r.f32(o + 0x128)],
         colour: rgb(r, o + 0x288),
@@ -118,6 +126,7 @@ fn light_at(m: &Meta, o: usize) -> Light {
         cone_outer: num(&f, 0xf8d9_e344) as f32,
         time_flags: format!("{:06x}", r.u32(o + 0x144) & 0xFF_FFFF),
         night_only: { let t = r.u32(o + 0x144) & 0xFF_FFFF; t != 0 && t & 0x0F_FF80 == 0 },
+        extents,
         fields: f.into_iter().map(|(h, v)| (crate::meta7a::field_name(h), v)).collect(),
     }
 }
@@ -349,19 +358,19 @@ fn half(h: u16) -> f32 {
 /// placed-light field; `time_multiplier` is the same for a given light of
 /// an archetype (98.5 %), so it comes from the light's definition, not the
 /// entity. `intensity` is the placed intensity converted for a light seen
-/// from far away: points keep it (88 %); a spot's is multiplied by
+/// from far away: points keep it; a spot's is multiplied by
 /// `F + (1 - F) * p`, with `F = 2 / ((1 - cos inner) + (cos inner - cos
 /// outer) / 3)` (4 pi over the solid angle of a cone with a squared falloff
 /// from inner to outer) and `p` the placed field `47d5d47a` (0 on most
 /// spots: full conversion; 1: none); a capsule's is divided by
-/// `(1 + L)^2`, with `L` growing with the capsule extent (its source field
-/// is not found). LOD record: `direction`, `falloff` (the range),
+/// `(1 + L)^2`, `L` being `extents` x, when bit 0x20000 of `684c08c5` is
+/// set (see [`distant_intensity`]). LOD record: `direction`, `falloff` (the range),
 /// `falloffExponent`, cone angles as u8 = degrees x 255 / 180 (for
 /// capsules, the outer one is the capsule extent), `8e6f0ba9` (the tangent,
 /// octahedral-encoded as two half floats in 0..1; matches the placed
-/// tangent on 99.8 %), `0e852fda` (two u16: a first / last index, the
-/// second equal to the first or one more, rising with the light index, 0 /
-/// 0 on 47 %; what it indexes is not known), and the u8 fields not
+/// tangent on 99.8 %; 0x7fff7fff on 370 lights: none), `0e852fda` (two u16, the
+/// second one more than the first: a per-file id shared by the lights of
+/// one object, 95 % of them from one source entity; 0 / 0 on 47 %), and the u8 fields not
 /// identified yet.
 pub fn distant_row(d: &serde_json::Map<String, serde_json::Value>, l: Option<&serde_json::Map<String, serde_json::Value>>) -> serde_json::Value {
     use crate::meta7a::field_name;
@@ -391,7 +400,10 @@ pub fn distant_row(d: &serde_json::Map<String, serde_json::Value>, l: Option<&se
         let (a, b) = (n(l, 0x8e6f_0ba9) as u32, n(l, 0x0e85_2fda) as u32);
         let (u, w) = (half(a as u16), half((a >> 16) as u16));
         v["halves_8e6f0ba9"] = serde_json::json!([u, w]);
-        v["tangent"] = serde_json::json!(octa_decode(u, w));
+        // 0x7fff7fff (both halves NaN, 370 lights) stores no tangent.
+        if u.is_finite() && w.is_finite() {
+            v["tangent"] = serde_json::json!(octa_decode(u, w));
+        }
         v["u16_0e852fda"] = serde_json::json!([b & 0xffff, b >> 16]);
         v["lod_raw"] = serde_json::Value::Object(l.clone());
     }
@@ -421,6 +433,21 @@ pub fn distant_spot_factor(inner: f32, outer: f32, p: f32) -> f32 {
     let (ci, co) = (inner.to_radians().cos(), outer.to_radians().cos());
     let f = 2.0 / ((1.0 - ci) + (ci - co) / 3.0);
     f + (1.0 - f) * p
+}
+
+/// Intensity of the distant light the game bakes from a placed light.
+/// Points keep theirs; spots are scaled by [`distant_spot_factor`] with
+/// `47d5d47a`; capsules whose `684c08c5` has bit 0x20000 are divided by
+/// (1 + capsule length)^2, the length being `extents` x. Matches 92.5 % of
+/// sampled points, 97.3 % of spots and 93.4 % of capsules (the rest sit
+/// where several placed lights overlap).
+pub fn distant_intensity(l: &Light) -> f32 {
+    let field = |h: u32| l.fields.get(&crate::meta7a::field_name(h)).and_then(|x| x.as_f64()).unwrap_or(0.0);
+    match l.light_type {
+        2 => l.intensity * distant_spot_factor(l.cone_inner, l.cone_outer, field(0x47d5_d47a) as f32),
+        4 if (field(0x684c_08c5) as u32) & 0x2_0000 != 0 => l.intensity / (1.0 + l.extents[0]).powi(2),
+        _ => l.intensity,
+    }
 }
 
 /// Rotate `v` by quaternion `q` (x, y, z, w).
@@ -541,5 +568,16 @@ mod tests {
         assert!((distant_spot_factor(10.0, 40.0, 0.0) - 22.698).abs() < 0.01);
         assert!((distant_spot_factor(20.0, 68.0, 0.25) - 6.282).abs() < 0.01);
         assert_eq!(distant_spot_factor(20.0, 68.0, 1.0), 1.0);
+    }
+    #[test]
+    fn distant_intensity_by_type() {
+        let mut l = Light { light_type: 4, intensity: 2.0, extents: [1.0, 0.0, 0.0], ..Default::default() };
+        assert_eq!(distant_intensity(&l), 2.0);
+        l.fields.insert(crate::meta7a::field_name(0x684c_08c5), serde_json::json!(0x2_0200));
+        assert_eq!(distant_intensity(&l), 0.5);
+        l.light_type = 1;
+        assert_eq!(distant_intensity(&l), 2.0);
+        l = Light { light_type: 2, intensity: 1.0, cone_inner: 40.0, cone_outer: 65.0, ..Default::default() };
+        assert!((distant_intensity(&l) - 5.739).abs() < 0.01);
     }
 }
