@@ -64,6 +64,9 @@ struct Sticker {
 
 fn hdr() -> bool { return S.flags.x == 1u; }
 
+// share of a baked map tile's colour taken as the ground's reflectance
+const TILE_ALBEDO: f32 = 0.6;
+
 // radius (km from the planet centre) of a world point (m, y up)
 fn point_r(p: vec3<f32>) -> f32 {
     return S.radii.x + max(p.y * 0.001, 0.002);
@@ -724,7 +727,9 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     if (cls == 11u) {
         // baked map tiles (already hill-shaded): soft diffuse, no sky reflection
         if (hdr()) {
-            col = albedo * (sun_e(i.world) * ndl / 3.14159 + amb_d);
+            // the tiles carry the map's own light and hill shading: taken
+            // down to a ground's reflectance, half of the slope shading kept
+            col = albedo * TILE_ALBEDO * (sun_e(i.world) * (0.5 + 0.5 * ndl) / 3.14159 + amb_d);
         } else {
             col = albedo * (0.55 * F.sun_col.rgb * F.sun_dir.w * (0.35 + 0.65 * ndl) + 0.7 * amb_d);
         }

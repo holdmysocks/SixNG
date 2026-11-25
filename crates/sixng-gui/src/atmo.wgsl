@@ -277,6 +277,9 @@ fn cs_histogram(@builtin(global_invocation_id) id: vec3<u32>) {
 
 var<workgroup> wh: array<u32, 128>;
 
+// share of the incident meter in the exposure (rest: the histogram)
+const INCIDENT: f32 = 0.75;
+
 @compute @workgroup_size(128)
 fn cs_exposure(@builtin(local_invocation_index) li: u32) {
     wh[li] = atomicLoad(&HIST[li]);
@@ -303,7 +306,19 @@ fn cs_exposure(@builtin(local_invocation_index) li: u32) {
     var avg = 0.0;
     if (wsum > 0.0) { avg = sum / wsum; } else { avg = ST.v[0].z; }
     // EV100 of the metered luminance (calibration constant 12.5)
-    let ev100 = avg + log2(100.0 / 12.5);
+    let ev_seen = avg + log2(100.0 / 12.5);
+    // incident meter: the light falling on a level surface at the camera
+    // (sun or moon through the air plus the sky), read as the luminance of
+    // an 18 % grey card there. It keeps a large dark or bright area (water,
+    // a white wall) from swinging the exposure; the histogram trims it.
+    let w3 = vec3(0.2126, 0.7152, 0.0722);
+    let e_dir = dot(S.sun_dir_e.rgb * ST.v[7].rgb, w3) * max(S.sun.y, 0.0)
+        + dot(S.moon_dir_e.rgb * ST.v[8].rgb, w3) * max(S.moon.y, 0.0);
+    let e_sky = PI * dot(ST.v[3].rgb, w3);
+    let l_card = max(0.18 * (e_dir + e_sky) / PI, 1e-6);
+    let ev_inc = log2(l_card * 100.0 / 12.5);
+    var ev100 = ev_inc;
+    if (wsum > 0.0) { ev100 = mix(ev_seen, ev_inc, INCIDENT); }
     // darker scenes are kept darker than mid grey (own rule, not decoded):
     // up to 3 stops under EV100 9
     let night = clamp((ev100 - 9.0) / 2.5, -3.0, 0.0);
