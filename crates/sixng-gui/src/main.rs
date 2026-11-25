@@ -253,6 +253,10 @@ fn wgpu_options(no_vsync: bool, gpu: Option<String>) -> eframe::egui_wgpu::WgpuC
             let mut d = base(adapter);
             d.required_features |= adapter.features()
                 & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::DEPTH32FLOAT_STENCIL8);
+            // the mesh shaders read more than wgpu's default 16 textures per stage (sky, shadow cascades, hair
+            // lighting tables, materials); ask for what the adapter has, up to 32
+            d.required_limits.max_sampled_textures_per_shader_stage =
+                d.required_limits.max_sampled_textures_per_shader_stage.max(adapter.limits().max_sampled_textures_per_shader_stage.min(32));
             // smaller device-memory blocks: the 3D map frees and allocates
             // many buffers and textures of mixed sizes while it streams
             d.memory_hints = wgpu::MemoryHints::MemoryUsage;

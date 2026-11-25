@@ -39,7 +39,48 @@ pub const PRESET: u32 = 0x6f03_dd54;
 pub const TAG: u32 = 0xf7b1_4eb8;
 /// The number that looks like the tiling of the noise texture (1 to 10).
 pub const TILING: &str = "a43cad33";
-const VERSION: u32 = 1;
+/// Struct of a set: four references to presets, one per strand variant.
+pub const SET: u32 = 0xcb83_80c7;
+/// Struct of a painted hair layer of the head skin (the hair colour on the
+/// scalp under the strands, the brows under the brow strands): a mask, a
+/// direction map, a detail texture, a normal map and numbers. 642 records
+/// in the appearance library. The head's own pixel program draws the
+/// layers (read from the game's code by the shader archive work).
+pub const UNDER: u32 = 0x7fc5_6571;
+/// Struct of a layer set: four slots, each a reference to a layer. A hair
+/// item's set has the name of its placeholder (joaat of the drawable name
+/// without `_full`, the item's tag `023e5a2f`). Slot i is coloured by
+/// preset i of the item's colour preset set ([`SET`], tag `f7b14eb8`).
+pub const UNDER_SET: u32 = 0x1e87_5c1c;
+const VERSION: u32 = 5;
+
+/// One painted hair layer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnderLayer {
+    /// Slot of the layer set (0..3).
+    pub slot: usize,
+    /// Mask (green: density), direction map (red, green), detail texture
+    /// (red: colour mix, blue: alpha); store hashes.
+    pub mask: u64,
+    pub direction: u64,
+    pub detail: u64,
+    /// Density runs from `lo` (`03a9e780`) to `hi` (`0a43bed0`) of the mask's green.
+    pub lo: f32,
+    pub hi: f32,
+    /// `ef2774fe`: how much the detail texture breaks the density up.
+    pub strength: f32,
+    /// `a025b3e6`: tiles of the detail texture's hex grid.
+    pub tile: f32,
+    /// `uvScale`: scale of the detail texture inside a tile.
+    pub detail_scale: f32,
+    /// `dc786517`: weight of the layer in the colour.
+    pub opacity: f32,
+    /// `e7b37fd7`: the layer lies in the head's fourth texture coordinate set (scalp), not the third (face).
+    pub other_uv: bool,
+    /// `d7096b7a`, `bc503608`: mirror the detail texture's U / V where the direction points to +x.
+    #[serde(default)]
+    pub mirror: [bool; 2],
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Preset {
@@ -59,6 +100,15 @@ pub struct Table {
     version: u32,
     /// Preset name hash (hex) -> preset.
     pub presets: BTreeMap<String, Preset>,
+    /// Set name hash (hex) -> the preset names (hex) of strand variants 0..3.
+    /// The game's strand generation gives every strand a 2-bit variant
+    /// (`hairgen`), and a set names the colour ramp of each. Sets have the
+    /// names of the presets; most name one or two distinct presets.
+    #[serde(default)]
+    pub sets: BTreeMap<String, [String; 4]>,
+    /// Layer set name hash (hex) -> its painted hair layers.
+    #[serde(default)]
+    pub under: BTreeMap<String, Vec<UnderLayer>>,
 }
 
 fn rgb(v: &Value) -> [u8; 3] {
@@ -78,8 +128,41 @@ pub fn preset(v: &Value) -> Preset {
 impl Table {
     /// The presets of a decoded PSO (`Pso::to_json`).
     pub fn add(&mut self, pso_json: &Value) {
-        let suffix = format!("{PRESET:08x}");
+        let (suffix, set) = (format!("{PRESET:08x}"), format!("{SET:08x}"));
+        let of = |s: u32| {
+            let end = format!("{s:08x}");
+            pso_json["objects"].as_object().into_iter().flatten().filter(move |(k, _)| k.ends_with(&end)).flat_map(|(_, v)| v.as_array().into_iter().flatten())
+        };
+        let layers: std::collections::HashMap<u32, &Value> = of(UNDER).filter_map(|o| Some((o["name"].as_u64()? as u32, o))).collect();
+        for s in of(UNDER_SET) {
+            let Some(n) = s["name"].as_u64() else { continue };
+            let mut v = Vec::new();
+            for (slot, h) in [0x115f_f942u32, 0xb308_b4a8, 0xc13c_74b5, 0xeda9_786c].into_iter().enumerate() {
+                let Some(l) = s[field_name(h)]["name"].as_u64().and_then(|n| layers.get(&(n as u32))) else { continue };
+                let tex = |k: String| {
+                    let m = &l[k];
+                    m["name"].as_str().filter(|_| m["enable"].as_bool() == Some(true)).and_then(|x| u64::from_str_radix(x, 16).ok()).unwrap_or(0)
+                };
+                let num = |h: u32, d: f32| l[field_name(h)].as_f64().map_or(d, |x| x as f32);
+                let (mask, direction, detail) = (tex(field_name(crate::meta7a::joaat("mask"))), tex(field_name(0x3395_c260)), tex(field_name(0x3804_9c16)));
+                // the game skips a layer without one of the three
+                if mask != 0 && direction != 0 && detail != 0 {
+                    v.push(UnderLayer { slot, mask, direction, detail, lo: num(0x03a9_e780, 0.1), hi: num(0x0a43_bed0, 0.9), strength: num(0xef27_74fe, 1.0), tile: num(0xa025_b3e6, 20.0), detail_scale: num(0x8391_6844, 10.0), opacity: num(0xdc78_6517, 1.0), other_uv: l[field_name(0xe7b3_7fd7)].as_bool().unwrap_or(false), mirror: [0xd709_6b7au32, 0xbc50_3608].map(|h| l[field_name(h)].as_bool().unwrap_or(false)) });
+                }
+            }
+            if !v.is_empty() {
+                self.under.insert(format!("{:08x}", n as u32), v);
+            }
+        }
         for (k, objs) in pso_json["objects"].as_object().into_iter().flatten() {
+            if k.ends_with(&set) {
+                for o in objs.as_array().into_iter().flatten() {
+                    let r = [0x115f_f942u32, 0xb308_b4a8, 0xc13c_74b5, 0xeda9_786c].map(|h| format!("{:08x}", o[field_name(h)]["name"].as_u64().unwrap_or(0) as u32));
+                    if let Some(n) = o["name"].as_u64() {
+                        self.sets.insert(format!("{:08x}", n as u32), r);
+                    }
+                }
+            }
             if !k.ends_with(&suffix) {
                 continue;
             }
@@ -91,8 +174,27 @@ impl Table {
         }
     }
 
+    /// The painted hair layers of a layer set (a hair item's placeholder name).
+    pub fn under_layers(&self, set: u32) -> &[UnderLayer] {
+        self.under.get(&format!("{set:08x}")).map_or(&[], |v| v.as_slice())
+    }
+
+    /// The colour preset of slot `slot` of a preset set (the set's own name where the set is missing).
+    pub fn slot_preset(&self, set: u32, slot: usize) -> Option<&Preset> {
+        let key = format!("{set:08x}");
+        self.sets.get(&key).and_then(|s| self.presets.get(&s[slot.min(3)])).or_else(|| self.presets.get(&key))
+    }
+
     pub fn get(&self, name: u32) -> Option<&Preset> {
         self.presets.get(&format!("{name:08x}"))
+    }
+
+    /// The presets of strand variants 0..3 of a hair item's set (the
+    /// preset of the same name where the set or a reference is missing).
+    pub fn variants(&self, name: u32) -> Option<[Preset; 4]> {
+        let own = self.get(name)?;
+        let key = format!("{name:08x}");
+        Some([0, 1, 2, 3].map(|i| self.sets.get(&key).and_then(|s| self.presets.get(&s[i])).unwrap_or(own).clone()))
     }
 
     /// The table, read from the work directory, or built from the data.rpf
@@ -173,6 +275,210 @@ pub fn strand(p: &Preset, n: f32) -> [u8; 3] {
     [0, 1, 2].map(|i| (a[i] as f32 * n + b[i] as f32 * (1.0 - n) + 0.5) as u8)
 }
 
+/// The colour of a ramp at `t` (0 root, 1 tip), 0..1 per channel: the two
+/// colours blended the way the game's ramp bake blends its colour stops
+/// (raised to 2.4, mixed, back by 1 / 2.4; read from the game's code by
+/// the shader archive work). The bake takes four colours and a curve from
+/// a record that was not found; `color1` at the root to `color2` at the
+/// tip, on a straight line, is a stand-in.
+pub fn ramp(a: [u8; 3], b: [u8; 3], t: f32) -> [f32; 3] {
+    let t = t.clamp(0.0, 1.0);
+    [0, 1, 2].map(|i| {
+        let (x, y) = ((a[i] as f32 / 255.0).powf(2.4), (b[i] as f32 / 255.0).powf(2.4));
+        (x + (y - x) * t).powf(1.0 / 2.4)
+    })
+}
+
+/// A parameter ramp of the game's hair ramp files (binary XML in the packs
+/// archive; found and parsed by the shader archive work): four numbers and
+/// four curves along the strand. The game bakes one row of its parameter
+/// atlas from it, and the strand shader reads that row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParamRamp {
+    /// First number: about 0.0001 to 0.0003, read as the strand width in metres.
+    pub width: f32,
+    /// Numbers 2, 3, 4: the multipliers of curves B, C and D.
+    pub mul: [f32; 3],
+    /// Curves A, B, C, D: ten (x, y) pairs each.
+    pub curves: [[f32; 20]; 4],
+}
+
+/// A ramp curve at `x` (0 root, 1 tip): its ten points are three cubic
+/// Bezier segments sharing end points, evaluated as y at x. Unused trailing
+/// segments are stored as (1, 1) points.
+pub fn curve(c: &[f32; 20], x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    let p = |i: usize| (c[2 * i], c[2 * i + 1]);
+    let bez = |a: f32, b: f32, d: f32, e: f32, t: f32| {
+        let u = 1.0 - t;
+        u * u * u * a + 3.0 * u * u * t * b + 3.0 * u * t * t * d + t * t * t * e
+    };
+    for s in 0..3 {
+        let (p0, p1, p2, p3) = (p(3 * s), p(3 * s + 1), p(3 * s + 2), p(3 * s + 3));
+        if x > p3.0 && s < 2 && p(3 * s + 6).0 > p3.0 {
+            continue;
+        }
+        // x(t) by bisection (the x control points do not always rise)
+        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        for _ in 0..24 {
+            let m = 0.5 * (lo + hi);
+            if bez(p0.0, p1.0, p2.0, p3.0, m) < x {
+                lo = m;
+            } else {
+                hi = m;
+            }
+        }
+        return bez(p0.1, p1.1, p2.1, p3.1, 0.5 * (lo + hi));
+    }
+    c[19]
+}
+
+impl ParamRamp {
+    /// What the strand shader gets at `t` along the strand: the roughness
+    /// value g0 (number 2 x curve B), the fill of the unlit side (number 3 x
+    /// curve C), the profile scale (number 4 x curve D) and the coverage
+    /// (curve A).
+    pub fn at(&self, t: f32) -> [f32; 4] {
+        [self.mul[0] * curve(&self.curves[1], t), self.mul[1] * curve(&self.curves[2], t), self.mul[2] * curve(&self.curves[3], t), curve(&self.curves[0], t)]
+    }
+
+    /// One record of a parsed ramp file as JSON: `fields` 05..08 and `curves`.
+    pub fn from_json(v: &Value) -> Option<ParamRamp> {
+        let f = |k: &str| v["fields"][k].as_f64().map(|x| x as f32);
+        let cs = v["curves"].as_array()?;
+        let mut curves = [[1.0f32; 20]; 4];
+        for (i, c) in cs.iter().take(4).enumerate() {
+            for (j, x) in c.as_array()?.iter().take(20).enumerate() {
+                curves[i][j] = x.as_f64()? as f32;
+            }
+        }
+        Some(ParamRamp { width: f("05")?, mul: [f("06")?, f("07")?, f("08")?], curves })
+    }
+}
+
+/// A colour ramp of the game's hair ramp files: four colour stops and one
+/// curve. The game bakes 16 texels of its colour atlas from it per strand
+/// variant (the bake is read from the game's code by the shader archive
+/// work): v = curve(t); the stops, raised to 2.4, are mixed as a four-stop
+/// gradient over v; the result goes back by 1 / 2.4.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColourRamp {
+    /// The four stops, 0..1 per channel as stored.
+    pub stops: [[f32; 3]; 4],
+    pub curve: [f32; 20],
+}
+
+impl ColourRamp {
+    /// The atlas colour at `t` along the strand (0 root, 1 tip).
+    pub fn at(&self, t: f32) -> [f32; 3] {
+        let v = curve(&self.curve, t).clamp(0.0, 1.0);
+        let w = [(3.0 * v).clamp(0.0, 1.0), (3.0 * v - 1.0).clamp(0.0, 1.0), (3.0 * v - 2.0).clamp(0.0, 1.0)];
+        [0, 1, 2].map(|c| {
+            let g = |i: usize| self.stops[i][c].max(0.0).powf(2.4);
+            let x = g(0) + (g(1) - g(0)) * w[0];
+            let x = x + (g(2) - x) * w[1];
+            let x = x + (g(3) - x) * w[2];
+            x.powf(1.0 / 2.4)
+        })
+    }
+
+    /// One record of a parsed colour ramp file as JSON: `colours` (four
+    /// RGB triples, 0..1) and `curve` (ten (x, y) pairs).
+    pub fn from_json(v: &Value) -> Option<ColourRamp> {
+        let mut stops = [[0.0f32; 3]; 4];
+        for (i, c) in v["colours"].as_array()?.iter().take(4).enumerate() {
+            for (j, x) in c.as_array()?.iter().take(3).enumerate() {
+                stops[i][j] = x.as_f64()? as f32;
+            }
+        }
+        let mut curve = [1.0f32; 20];
+        for (i, p) in v["curve"].as_array()?.iter().take(10).enumerate() {
+            curve[2 * i] = p[0].as_f64()? as f32;
+            curve[2 * i + 1] = p[1].as_f64()? as f32;
+        }
+        Some(ColourRamp { stops, curve })
+    }
+}
+
+/// The game's hair and fur strand tables as parsed from its four ramp files
+/// (colour ramps, colour sets, parameter ramps, parameter sets), from one
+/// JSON of those four maps keyed by name.
+///
+/// A hair or fur asset names a colour set and a parameter set (asset
+/// catalogue properties 960033653 and 2259149558: the joaat of the set's
+/// lower-case name); a wardrobe hair item names a colour set with tag
+/// `f7b14eb8`. A set gives one ramp to each of the four strand variants.
+/// Field names of a parameter ramp, with what the game's bake puts in its
+/// parameter atlas: Roughness x its curve (red: the roughness value g0),
+/// BinormalRoughness x its curve (green: the profile), Translucency x its
+/// curve (blue: the fill of the unlit side), the Thickness curve (alpha);
+/// Thickness is the strand width in metres.
+#[derive(Debug, Clone, Default)]
+pub struct StrandData {
+    colour_sets: std::collections::HashMap<u32, [ColourRamp; 4]>,
+    param_sets: std::collections::HashMap<u32, [ParamRamp; 4]>,
+    param_flags: std::collections::HashMap<u32, (bool, f32)>,
+}
+
+fn pairs20(v: &Value) -> Option<[f32; 20]> {
+    let mut c = [1.0f32; 20];
+    for (i, p) in v.as_array()?.iter().take(10).enumerate() {
+        c[2 * i] = p[0].as_f64()? as f32;
+        c[2 * i + 1] = p[1].as_f64()? as f32;
+    }
+    Some(c)
+}
+
+impl StrandData {
+    /// From the JSON of the four tables. Sets with a slot whose ramp has
+    /// no record are left out.
+    pub fn from_json(v: &Value) -> StrandData {
+        let hash = |r: &Value| r["hash"].as_str().and_then(|h| u32::from_str_radix(h, 16).ok());
+        let pramp = |r: &Value| -> Option<ParamRamp> {
+            let f = |k: &str| r[k].as_f64().map(|x| x as f32);
+            Some(ParamRamp { width: f("Thickness")?, mul: [f("Roughness")?, f("Translucency")?, f("BinormalRoughness")?], curves: [pairs20(&r["ThicknessCurve"])?, pairs20(&r["RoughnessCurve"])?, pairs20(&r["TranslucencyCurve"])?, pairs20(&r["BinormalRoughnessCurve"])?] })
+        };
+        let mut d = StrandData::default();
+        for s in v["colour_sets"].as_object().into_iter().flat_map(|m| m.values()) {
+            let ramps: Vec<ColourRamp> = s["colours"].as_array().into_iter().flatten().filter_map(|n| ColourRamp::from_json(&v["colour_ramps"][n.as_str()?])).collect();
+            if let (Some(h), Ok(r)) = (hash(s), <[ColourRamp; 4]>::try_from(ramps)) {
+                d.colour_sets.insert(h, r);
+            }
+        }
+        for s in v["parameter_sets"].as_object().into_iter().flat_map(|m| m.values()) {
+            let ramps: Vec<ParamRamp> = s["materials"].as_array().into_iter().flatten().filter_map(|n| pramp(&v["parameter_ramps"][n.as_str()?])).collect();
+            if let (Some(h), Ok(r)) = (hash(s), <[ParamRamp; 4]>::try_from(ramps)) {
+                d.param_sets.insert(h, r);
+                d.param_flags.insert(h, (s["UseStandardBsdf"].as_bool().unwrap_or(false), (s["FresnelScale"].as_f64().unwrap_or(255.0) as f32 / 255.0).max(0.5)));
+            }
+        }
+        d
+    }
+
+    /// The colour ramps of the four strand variants of a colour set, by the
+    /// set's name hash.
+    pub fn colour_set(&self, name: u32) -> Option<&[ColourRamp; 4]> {
+        self.colour_sets.get(&name)
+    }
+
+    /// The parameter ramps of the four strand variants of a parameter set.
+    pub fn param_set(&self, name: u32) -> Option<&[ParamRamp; 4]> {
+        self.param_sets.get(&name)
+    }
+
+    /// Of a parameter set: whether its strands are lit by the standard
+    /// lighting (UseStandardBsdf: lighting type 0; else the hair lighting,
+    /// type 6), and its reflectance scale max(0.5, FresnelScale / 255) on
+    /// F0 = 0.0465.
+    pub fn param_flags(&self, name: u32) -> Option<(bool, f32)> {
+        self.param_flags.get(&name).copied()
+    }
+
+    pub fn counts(&self) -> (usize, usize) {
+        (self.colour_sets.len(), self.param_sets.len())
+    }
+}
+
 /// A value in 0..1 for strand `i`, for presets that name no noise texture.
 pub fn scatter(i: usize) -> f32 {
     let mut x = (i as u32).wrapping_mul(0x9e37_79b9) ^ 0x85eb_ca6b;
@@ -185,6 +491,34 @@ pub fn scatter(i: usize) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_layer_set_leads_to_its_layers() {
+        let f = field_name;
+        let tex = |n: &str| serde_json::json!({"enable": true, "name": n});
+        let mut layer = serde_json::json!({ "name": 858404632u32 });
+        for (k, v) in [(f(crate::meta7a::joaat("mask")), tex("c909cb7bfd7916f7")), (f(0x3395_c260), tex("01c9309c47c734e3")), (f(0x3804_9c16), tex("e5a59757572bcafc")), (f(0x0a43_bed0), serde_json::json!(0.451)), (f(0x03a9_e780), serde_json::json!(0.0)), (f(0xdc78_6517), serde_json::json!(0.7)), (f(0xe7b3_7fd7), serde_json::json!(true))] {
+            layer[k] = v;
+        }
+        let mut bare = serde_json::json!({ "name": 9u32 });
+        bare[f(crate::meta7a::joaat("mask"))] = tex("0000000000000001");
+        let mut sets = vec![serde_json::json!({ "name": 749565774u32 }), serde_json::json!({ "name": 5u32 }), serde_json::json!({ "name": 8u32 })];
+        sets[0][f(0xc13c_74b5)] = serde_json::json!({"name": 858404632u32});
+        sets[0][f(0x115f_f942)] = serde_json::json!({"name": 3839837909u32});
+        sets[1][f(0xc13c_74b5)] = serde_json::json!({"name": 6u32});
+        sets[2][f(0xc13c_74b5)] = serde_json::json!({"name": 9u32});
+        let v = serde_json::json!({ "objects": { "090e63b51e875c1c": sets, "9598b7e97fc56571": [layer, bare] } });
+        let mut t = Table::default();
+        t.add(&v);
+        let l = t.under_layers(749565774);
+        assert_eq!(l.len(), 1);
+        assert_eq!((l[0].slot, l[0].mask, l[0].other_uv), (2, 0xc909_cb7b_fd79_16f7, true));
+        assert!((l[0].hi - 0.451).abs() < 1e-6 && l[0].lo == 0.0 && (l[0].opacity - 0.7).abs() < 1e-6);
+        // numbers the record leaves out take the game's defaults
+        assert_eq!((l[0].tile, l[0].detail_scale, l[0].strength), (20.0, 10.0, 1.0));
+        // a set whose layer is missing, or lacks the direction or detail texture, has none
+        assert!(t.under_layers(5).is_empty() && t.under_layers(8).is_empty());
+    }
 
     #[test]
     fn a_preset_reads_its_two_colours_texture_and_numbers() {
@@ -200,12 +534,81 @@ mod tests {
         });
         let mut t = Table::default();
         t.add(&v);
+        t.add(&serde_json::json!({"objects": {"84df66adcb8380c7": [{"115ff942": {"name": 333928843u32}, "b308b4a8": {"name": 7u32}, "c13c74b5": {"name": 99u32}, "eda9786c": {"name": 333928843u32}, "name": 333928843u32}]}}));
+        // variants through the set; a reference to a missing preset falls back
+        let var = t.variants(333928843).unwrap();
+        assert_eq!((var[0].a, var[1].a, var[2].a, var[3].a), ([19, 13, 10], [255; 3], [19, 13, 10], [19, 13, 10]));
+        assert!(t.variants(7).is_some() && t.variants(1234).is_none());
+        let r = ramp([255, 0, 128], [0, 0, 128], 0.0);
+        assert!((r[0] - 1.0).abs() < 1e-6 && r[1] == 0.0 && (r[2] - 128.0 / 255.0).abs() < 1e-5);
+        let m = ramp([255, 0, 0], [0, 0, 0], 0.5);
+        assert!((m[0] - 0.5f32.powf(1.0 / 2.4)).abs() < 1e-5);
         assert_eq!(t.presets.len(), 2);
         let p = t.get(333928843).unwrap();
         assert_eq!((p.a, p.b, p.texture, p.flag), ([19, 13, 10], [1, 1, 1], 0xb79e27e80e2c837d, false));
         assert!((p.values[TILING] - 8.283).abs() < 1e-4 && p.values.len() == 3);
         let q = t.get(7).unwrap();
         assert_eq!((q.a, q.texture, q.flag), ([255; 3], 0, true));
+    }
+
+    #[test]
+    fn a_colour_ramp_runs_through_its_four_stops() {
+        // a medium brown of the game's ramp file: straight curve
+        let v = serde_json::json!({"colours": [[0.149, 0.137, 0.125], [0.259, 0.2, 0.153], [0.478, 0.396, 0.341], [0.443, 0.384, 0.341]],
+            "curve": [[0.0, 0.0], [0.5, 0.5], [0.5, 0.5], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]]});
+        let r = ColourRamp::from_json(&v).unwrap();
+        let near = |a: [f32; 3], b: [f32; 3]| (0..3).all(|i| (a[i] - b[i]).abs() < 2e-3);
+        // the stops sit at v = 0, 1/3, 2/3 and 1
+        assert!(near(r.at(0.0), r.stops[0]) && near(r.at(1.0), r.stops[3]), "{:?} {:?}", r.at(0.0), r.at(1.0));
+        assert!(near(r.at(1.0 / 3.0), r.stops[1]) && near(r.at(2.0 / 3.0), r.stops[2]));
+        // between two stops: between their values, mixed in the 2.4 space (above the plain mean of the lower pair is not required, only inside)
+        let m = r.at(0.5);
+        assert!(m[0] > r.stops[1][0] && m[0] < r.stops[2][0]);
+    }
+
+    #[test]
+    fn strand_tables_give_each_variant_its_ramps() {
+        let curve = serde_json::json!([[0.0, 0.0], [0.5, 0.5], [0.5, 0.5], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]]);
+        let flat = serde_json::json!([[0.0, 1.0], [0.5, 1.0], [0.5, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]]);
+        let v = serde_json::json!({
+            "colour_ramps": {"A": {"colours": [[0.1, 0.1, 0.1], [0.2, 0.2, 0.2], [0.3, 0.3, 0.3], [0.4, 0.4, 0.4]], "curve": curve}, "B": {"colours": [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]], "curve": curve}},
+            "colour_sets": {"S": {"hash": "0000000a", "colours": ["A", "B", "A", "A"]}, "Broken": {"hash": "0000000b", "colours": ["A", "Missing", "A", "A"]}},
+            "parameter_ramps": {"P": {"Thickness": 0.00025, "ThicknessCurve": flat, "Roughness": 0.5, "RoughnessCurve": flat, "Translucency": 0.25, "TranslucencyCurve": flat, "BinormalRoughness": 0.9, "BinormalRoughnessCurve": flat}},
+            "parameter_sets": {"PS": {"hash": "0000000c", "materials": ["P", "P", "P", "P"], "UseStandardBsdf": true, "FresnelScale": 102}}
+        });
+        let d = StrandData::from_json(&v);
+        assert_eq!(d.counts(), (1, 1));
+        let s = d.colour_set(10).unwrap();
+        assert!((s[0].at(0.0)[0] - 0.1).abs() < 2e-3 && (s[1].at(0.3)[0] - 1.0).abs() < 1e-4 && (s[0].at(1.0)[0] - 0.4).abs() < 2e-3);
+        assert!(d.colour_set(11).is_none());
+        assert_eq!(d.param_flags(12), Some((true, 0.5)));
+        // roughness, fill (translucency), profile (binormal roughness), coverage
+        let p = d.param_set(12).unwrap()[3].at(0.5);
+        assert!((p[0] - 0.5).abs() < 1e-4 && (p[1] - 0.25).abs() < 1e-4 && (p[2] - 0.9).abs() < 1e-4 && (p[3] - 1.0).abs() < 1e-4, "{p:?}");
+    }
+
+    #[test]
+    fn a_parameter_ramp_is_read_along_the_strand() {
+        // the feral cat's high-gloss ramp, from the game's ramp file
+        let v = serde_json::json!({"fields": {"05": 0.00024, "06": 0.85, "07": 1, "08": 1}, "curves": [
+            [0.0, 0.494, 0.022, 0.556, 0.108, 0.997, 0.2, 0.997, 0.4, 0.997, 0.49, 1.0, 0.69, 1.0, 0.89, 1.0, 0.959, 0.29, 1.0, 0.0],
+            [0.0, 1.0, 0.014, 0.61, 0.195, 0.66, 0.548, 0.595, 1.001, 0.561, 1.016, 0.262, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            [0.0, 0.0, 0.5, 0.0, 1.0, 0.037, 1.0, 0.537, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            [0.0, 1.0, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]]});
+        let r = ParamRamp::from_json(&v).unwrap();
+        assert!((r.width - 0.00024).abs() < 1e-7 && r.mul == [0.85, 1.0, 1.0]);
+        // end points of the curves
+        assert!((curve(&r.curves[0], 0.0) - 0.494).abs() < 1e-3 && curve(&r.curves[0], 1.0).abs() < 2e-3);
+        assert!((curve(&r.curves[1], 0.0) - 1.0).abs() < 1e-3);
+        // the profile curve is flat 1, the coverage is full along the middle
+        assert!((curve(&r.curves[3], 0.37) - 1.0).abs() < 1e-4 && (curve(&r.curves[0], 0.5) - 1.0).abs() < 0.01);
+        // g0 falls from the root towards about 0.5 mid-strand; the fill stays near 0 until the tip
+        let (a, m) = (r.at(0.0), r.at(0.5));
+        assert!((a[0] - 0.85).abs() < 1e-3 && m[0] > 0.45 && m[0] < 0.6, "{a:?} {m:?}");
+        assert!(m[1] < 0.05 && m[2] > 0.99);
+        // a straight line as a curve gives its own x
+        let line: [f32; 20] = [0.0, 0.0, 0.5, 0.5, 0.5, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        assert!((curve(&line, 0.3) - 0.3).abs() < 1e-3);
     }
 
     #[test]

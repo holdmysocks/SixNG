@@ -11,6 +11,10 @@ use wgpu::util::DeviceExt;
 
 pub const COLOR_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 pub const DEPTH_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// Side of the sun shadow map in texels.
+const SHADOW_SIZE: u32 = 4096;
+/// Side of the camera depth pre-pass texture (the view is drawn into its top-left corner).
+const CAM_DEPTH_SIZE: u32 = 4096;
 /// Depth with stencil (needs the DEPTH32FLOAT_STENCIL8 feature): the stencil
 /// marks pixels covered by a real surface, so coarse fallback LODs fill only
 /// the pixels nothing else covers.
@@ -36,6 +40,11 @@ pub struct FrameU {
     pub misc3: [f32; 4],
     pub prev_view_proj: [[f32; 4]; 4],
     pub jitter: [f32; 4],
+    /// x: strand dither index, y, z: the target's width and height in pixels
+    /// (1e9 in the sun shadow pass, with x the strand widening factor)
+    pub frame: [f32; 4],
+    /// The sun shadow map's view-projection (all zero: no shadow map).
+    pub light_view_proj: [[f32; 4]; 4],
 }
 
 #[repr(C)]
@@ -168,6 +177,8 @@ pub struct Look {
     pub pearl: [f32; 3],
     pub pearl_amount: f32,
     pub sun_dir: Vec3,
+    /// Degrees the light is turned about the vertical from where the time of day puts it.
+    pub sun_turn: f32,
     pub sun_intensity: f32,
     pub sun_col: [f32; 3],
     pub sky_top: [f32; 3],
@@ -205,6 +216,7 @@ impl Default for Look {
             pearl: [0.9, 0.8, 0.3],
             pearl_amount: 0.0,
             sun_dir: Vec3::new(0.45, 0.75, 0.35).normalize(),
+            sun_turn: std::env::var("SIXNG_SUN_TURN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0),
             sun_intensity: 1.0,
             sun_col: [1.0, 0.95, 0.88],
             sky_top: [0.25, 0.45, 0.85],
@@ -256,6 +268,9 @@ impl Look {
         // part of their darkness, plus the timecycle's exposure offset
         let key = (l.dir_strength * l.dir[1].max(0.0) + 0.5 * l.ambient) / (0.9 + 0.5);
         self.exposure = ((1.0 / key.max(1e-3)).powf(0.5).clamp(1.0, 4.0) * 2f32.powf(l.exposure_ev)).clamp(0.2, 4.0);
+        // keep the viewer's sun turn (the sun direction slider) across weather and hour changes
+        let t = std::mem::take(&mut self.sun_turn);
+        self.turn_sun(t);
     }
 
     /// Time of day 0..24 h: sun direction, colours and sky.
@@ -291,6 +306,17 @@ impl Look {
             self.sun_col = [0.45, 0.55, 0.85];
             self.ambient = 0.6;
         }
+        // the light turned about the vertical (the model views' sun direction slider)
+        let t = std::mem::take(&mut self.sun_turn);
+        self.turn_sun(t);
+    }
+
+    /// Turns the light about the vertical to `deg` degrees from where the time of day puts it.
+    pub fn turn_sun(&mut self, deg: f32) {
+        let (s, c) = (deg - self.sun_turn).to_radians().sin_cos();
+        let d = self.sun_dir;
+        self.sun_dir = Vec3::new(d.x * c + d.z * s, d.y, d.z * c - d.x * s);
+        self.sun_turn = deg;
     }
 }
 
@@ -439,6 +465,14 @@ pub struct GpuMesh {
     pub skinned: bool,
     pub centre: Vec3,
     pub visible: bool,
+    /// Strand hair that follows the game's strand count rule, and the
+    /// indices of it to draw this frame.
+    pub strand_lod: Option<glb::StrandLod>,
+    pub n_draw: std::sync::atomic::AtomicU32,
+    /// The same for the sun shadow map.
+    pub n_shadow: std::sync::atomic::AtomicU32,
+    /// Which of the shadow pass's frame groups the mesh is drawn with (0: the plain one).
+    pub shadow_slot: std::sync::atomic::AtomicU32,
 }
 
 pub struct GpuModel {
@@ -549,6 +583,7 @@ pub fn class_id(c: &str) -> u32 {
         "terrain_multilayer" => 9,
         "car_paint" => 10,
         "map_tile" => 11,
+        "hair" => 12,
         _ => 1,
     }
 }
@@ -575,10 +610,29 @@ pub struct Renderer3D {
     white: wgpu::TextureView,
     dummy_joints: wgpu::Buffer,
     stickers: StickerDefaults,
+    /// The game's four hair lighting tables (1-texel stand-ins until loaded).
+    hair_luts: Vec<wgpu::TextureView>,
+    /// Whether the game's tables were tried (once per renderer).
+    hair_tried: bool,
     pub default_frame_bg: wgpu::BindGroup,
     target: Option<Target>,
     /// Draw calls in the last frame.
     pub draws: u32,
+    /// The sun shadow map and its sampler (a 1-texel map when shadows are off).
+    sun_map: (wgpu::TextureView, wgpu::Sampler, wgpu::TextureView),
+    pub sun_maps: bool,
+    shadow_ub: wgpu::Buffer,
+    shadow_frame_bg: wgpu::BindGroup,
+    /// More frame groups for the shadow pass: one per strand piece, each with the piece's widening factor.
+    shadow_extra: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
+    /// Strands enter the shadow map by the rule of the game's ray-traced sun shadows (fewer, wider ribbons);
+    /// off: by the rule of its cascade shadow pass (SIXNG_SHADOWS=map).
+    pub shadow_traced: bool,
+    pipe_sun_map: wgpu::RenderPipeline,
+    depth_ub: wgpu::Buffer,
+    depth_frame_bg: wgpu::BindGroup,
+    pipe_cam_depth: wgpu::RenderPipeline,
+    light_vp: [[f32; 4]; 4],
     /// Map cells: opaque, decal, decal blend, blend pipelines.
     pipe_cell: [wgpu::RenderPipeline; 4],
     /// Coverage fallbacks (models, cells): depth-tested, drawn only where
@@ -591,6 +645,10 @@ pub struct Renderer3D {
     pub cells: Vec<(std::sync::Arc<CellGpu>, Vec<u16>)>,
     /// LOD distance scale of the cell ranges (detail setting).
     pub lod_k: f32,
+    /// Index of the strand dither pattern (0 in the live view; screenshots
+    /// that average several frames step it, as the game's dither changes
+    /// every frame and its temporal filter averages it).
+    pub dither_frame: f32,
     /// Map view: building glass drawn dark and mostly opaque (misc3.z).
     pub map_glass: bool,
     /// Draw calls of the coverage fallbacks in the last frame: models, cells.
@@ -639,6 +697,43 @@ struct StickerDefaults {
     sampler: wgpu::Sampler,
 }
 
+/// Layout entry of one hair lighting table.
+fn hair_entry(binding: u32, view_dimension: wgpu::TextureViewDimension) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension, multisampled: false },
+        count: None,
+    }
+}
+
+/// A float table as a texture (RGBA half floats): 3D when `d3`, else 2D.
+fn hair_texture(device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, d: u32, d3: bool, rgba16: &[u8]) -> wgpu::TextureView {
+    let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: if d3 { d } else { 1 } };
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("hair table"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: if d3 { wgpu::TextureDimension::D3 } else { wgpu::TextureDimension::D2 },
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        rgba16,
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
+        size,
+    );
+    tex.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// 1-texel stand-ins for the hair tables, until the game's are loaded.
+fn hair_blank(device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<wgpu::TextureView> {
+    [true, true, false, true].iter().map(|&d3| hair_texture(device, queue, 1, 1, 1, d3, &[0u8; 8])).collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn frame_bind_group(
     device: &wgpu::Device,
@@ -650,6 +745,8 @@ fn frame_bind_group(
     sticker_view: &wgpu::TextureView,
     sticker_sampler: &wgpu::Sampler,
     scene: &crate::atmo::SceneBinds,
+    hair: &[wgpu::TextureView],
+    shadow: &(wgpu::TextureView, wgpu::Sampler, wgpu::TextureView),
 ) -> wgpu::BindGroup {
     let mut entries = vec![
         wgpu::BindGroupEntry { binding: 0, resource: frame_ub.as_entire_binding() },
@@ -660,6 +757,12 @@ fn frame_bind_group(
         wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(sticker_sampler) },
     ];
     entries.extend(scene.entries());
+    for (k, v) in hair.iter().enumerate() {
+        entries.push(wgpu::BindGroupEntry { binding: 15 + k as u32, resource: wgpu::BindingResource::TextureView(v) });
+    }
+    entries.push(wgpu::BindGroupEntry { binding: 19, resource: wgpu::BindingResource::TextureView(&shadow.0) });
+    entries.push(wgpu::BindGroupEntry { binding: 20, resource: wgpu::BindingResource::Sampler(&shadow.1) });
+    entries.push(wgpu::BindGroupEntry { binding: 21, resource: wgpu::BindingResource::TextureView(&shadow.2) });
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("frame bg"),
         layout,
@@ -878,6 +981,31 @@ impl Renderer3D {
                     binding: 5,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // the four lookup tables of the game's hair lighting (M, N, A, P)
+                hair_entry(15, wgpu::TextureViewDimension::D3),
+                hair_entry(16, wgpu::TextureViewDimension::D3),
+                hair_entry(17, wgpu::TextureViewDimension::D2),
+                hair_entry(18, wgpu::TextureViewDimension::D3),
+                // the sun shadow map and its comparison sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 19,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 20,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+                // the camera depth pre-pass (opaque surfaces and strands as the eye sees them)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 21,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
                     count: None,
                 },
             ]
@@ -1232,12 +1360,92 @@ impl Renderer3D {
                 ..Default::default()
             }),
         };
-        let default_frame_bg = frame_bind_group(device, &bgl_frame, &frame_ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &atmo.binds);
+        let hair_luts = hair_blank(device, &rs.queue);
+        // The sun shadow map (SIXNG_SHADOWS=1, research: one map over the models, strands drawn into it as the
+        // game draws its strands into its shadow maps; the game's own cascades, bias and filter are not read).
+        let shadow_tex = |size: u32| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("sun shadow"),
+                    size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Depth32Float,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("sun shadow"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
+        let sun_maps = std::env::var("SIXNG_SHADOWS").is_ok();
+        let sun_map = (shadow_tex(if sun_maps { SHADOW_SIZE } else { 1 }), shadow_sampler.clone(), shadow_tex(if sun_maps { CAM_DEPTH_SIZE } else { 1 }));
+        let shadow_ub = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shadow frame ub"),
+            size: std::mem::size_of::<FrameU>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // the shadow pass's own frame group: the light's matrices, and a 1-texel map in place of the one it draws
+        let shadow_frame_bg = frame_bind_group(device, &bgl_frame, &shadow_ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &atmo.binds, &hair_luts, &(shadow_tex(1), shadow_sampler.clone(), shadow_tex(1)));
+        let shadow_extra: Vec<(wgpu::Buffer, wgpu::BindGroup)> = (0..if sun_maps { 15 } else { 0 })
+            .map(|_| {
+                let ub = device.create_buffer(&wgpu::BufferDescriptor { label: Some("shadow frame ub"), size: std::mem::size_of::<FrameU>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+                let bg = frame_bind_group(device, &bgl_frame, &ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &atmo.binds, &hair_luts, &(shadow_tex(1), shadow_sampler.clone(), shadow_tex(1)));
+                (ub, bg)
+            })
+            .collect();
+        let pipe_sun_map = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sun shadow"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_mesh"), compilation_options: Default::default(), buffers: &vbufs },
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: wgpu::DepthBiasState { constant: 2, slope_scale: 2.0, clamp: 0.0 },
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: None,
+            multiview_mask: None,
+            cache: None,
+        });
+        // The camera depth pre-pass (with the sun shadow map): the same depth-only draw from the eye, read by the
+        // lighting for the game's strand openness test and a screen-space occlusion of the ambient light.
+        let depth_ub = device.create_buffer(&wgpu::BufferDescriptor { label: Some("depth pre-pass frame ub"), size: std::mem::size_of::<FrameU>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let depth_frame_bg = frame_bind_group(device, &bgl_frame, &depth_ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &atmo.binds, &hair_luts, &(shadow_tex(1), shadow_sampler.clone(), shadow_tex(1)));
+        let pipe_cam_depth = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("camera depth pre-pass"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_mesh"), compilation_options: Default::default(), buffers: &vbufs },
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                // the viewer's depth is reversed: nearer is larger
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: None,
+            multiview_mask: None,
+            cache: None,
+        });
+        let default_frame_bg = frame_bind_group(device, &bgl_frame, &frame_ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &atmo.binds, &hair_luts, &sun_map);
         let stand_in = crate::atmo::SceneBinds { shadow: shadow.stand_in.clone(), ..atmo.binds.clone() };
         let shadow_bgs = shadow
             .frame_ubs
             .iter()
-            .map(|ub| frame_bind_group(device, &bgl_frame, ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &stand_in))
+            .map(|ub| frame_bind_group(device, &bgl_frame, ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &stand_in, &hair_luts, &(shadow_tex(1), shadow_sampler.clone(), shadow_tex(1))))
             .collect();
         std::mem::forget(wt); // the 1x1 white texture lives for the process
                               // map cells
@@ -1403,6 +1611,19 @@ impl Renderer3D {
             white,
             dummy_joints,
             stickers,
+            hair_luts,
+            sun_map,
+            sun_maps,
+            shadow_ub,
+            shadow_frame_bg,
+            shadow_extra,
+            shadow_traced: std::env::var("SIXNG_SHADOWS").map_or(true, |v| v != "map"),
+            pipe_sun_map,
+            depth_ub,
+            depth_frame_bg,
+            pipe_cam_depth,
+            light_vp: [[0.0; 4]; 4],
+            hair_tried: false,
             default_frame_bg,
             target: None,
             draws: 0,
@@ -1410,6 +1631,7 @@ impl Renderer3D {
             bgl_cell,
             cells: Vec::new(),
             lod_k: 1.0,
+            dither_frame: 0.0,
             map_glass: false,
             fb_draws: [0, 0],
             atmo,
@@ -1420,6 +1642,35 @@ impl Renderer3D {
     }
 
     /// Upload a CPU model (meshes, materials, textures, skeleton).
+    /// Load the game's hair lighting tables, once. Models uploaded after
+    /// this are lit with them; without the tables (not a float texture
+    /// store, or not found) hair keeps the stand-in fibre model. Returns
+    /// what happened, for the status line.
+    pub fn load_hair_luts(&mut self, rs: &egui_wgpu::RenderState, game: &std::path::Path) -> Option<String> {
+        if self.hair_tried {
+            return None;
+        }
+        self.hair_tried = true;
+        match sixng_core::hairlight::load(game) {
+            Ok(l) if l.len() == 4 => {
+                self.hair_luts = l.iter().enumerate().map(|(i, t)| hair_texture(&rs.device, &rs.queue, t.w, t.h, t.d, i != 2, &t.rgba16())).collect();
+                // models without joints of their own are drawn with the shared frame group
+                self.default_frame_bg = frame_bind_group(&rs.device, &self.bgl_frame, &self.frame_ub, &self.dummy_joints, &self.sampler, &self.stickers.none, &self.stickers.view, &self.stickers.sampler, &self.atmo.binds, &self.hair_luts, &self.sun_map);
+                if std::env::var_os("SIXNG_DEBUG_HAIR").is_some() {
+                    eprintln!("[hair] lighting tables: {:?}", l.iter().map(|t| (t.w, t.h, t.d, t.ch, t.v.iter().cloned().fold(0.0f32, f32::max))).collect::<Vec<_>>());
+                }
+                None
+            }
+            Ok(_) => Some("hair lighting tables: not all four found".into()),
+            Err(e) => Some(format!("hair lighting tables: {e}")),
+        }
+    }
+
+    /// Whether the game's hair lighting tables are loaded.
+    pub fn hair_luts_loaded(&self) -> bool {
+        self.hair_tried && self.hair_luts.len() == 4
+    }
+
     pub fn upload(
         &self,
         rs: &egui_wgpu::RenderState,
@@ -1471,6 +1722,8 @@ impl Renderer3D {
             white: self.white.clone(),
             bgl_cell: self.bgl_cell.clone(),
             stickers: self.stickers.clone(),
+            hair_luts: self.hair_luts.clone(),
+            sun_map: self.sun_map.clone(),
             scene: self.atmo.binds.clone(),
         }
     }
@@ -1495,6 +1748,8 @@ pub struct Uploader {
     white: wgpu::TextureView,
     bgl_cell: wgpu::BindGroupLayout,
     stickers: StickerDefaults,
+    hair_luts: Vec<wgpu::TextureView>,
+    sun_map: (wgpu::TextureView, wgpu::Sampler, wgpu::TextureView),
     scene: crate::atmo::SceneBinds,
 }
 
@@ -1849,6 +2104,10 @@ impl Uploader {
                     skinned: me.skinned,
                     centre: Vec3::from(me.centre),
                     visible: true,
+                    strand_lod: me.strand_lod,
+                    n_draw: std::sync::atomic::AtomicU32::new(me.indices.len() as u32),
+                    n_shadow: std::sync::atomic::AtomicU32::new(me.indices.len() as u32),
+                    shadow_slot: std::sync::atomic::AtomicU32::new(0),
                 });
             }
         }
@@ -1865,7 +2124,7 @@ impl Uploader {
             .flat_map(|_| Mat4::IDENTITY.to_cols_array())
             .collect();
         queue.write_buffer(&joints_buf, 0, bytemuck::cast_slice(&ident));
-        let frame_bg = frame_bind_group(device, &self.bgl_frame, &self.frame_ub, &joints_buf, &self.sampler, &self.stickers.none, &self.stickers.view, &self.stickers.sampler, &self.scene);
+        let frame_bg = frame_bind_group(device, &self.bgl_frame, &self.frame_ub, &joints_buf, &self.sampler, &self.stickers.none, &self.stickers.view, &self.stickers.sampler, &self.scene, &self.hair_luts, &self.sun_map);
         let inst = [Instance::new(Mat4::IDENTITY, !m.joints.is_empty())];
         let instances = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("inst"),
@@ -1970,7 +2229,7 @@ impl Renderer3D {
         if n > 0 {
             rs.queue.write_buffer(buf, 0, bytemuck::cast_slice(&recs[..n]));
         }
-        gm.frame_bg = frame_bind_group(&rs.device, &self.bgl_frame, &self.frame_ub, &gm.joints_buf, &self.sampler, buf, pictures.unwrap_or(&self.stickers.view), &self.stickers.sampler, &self.atmo.binds);
+        gm.frame_bg = frame_bind_group(&rs.device, &self.bgl_frame, &self.frame_ub, &gm.joints_buf, &self.sampler, buf, pictures.unwrap_or(&self.stickers.view), &self.stickers.sampler, &self.atmo.binds, &self.hair_luts, &self.sun_map);
     }
 
     pub fn set_joints(&self, rs: &egui_wgpu::RenderState, gm: &GpuModel, mats: &[Mat4]) {
@@ -2141,11 +2400,54 @@ impl Renderer3D {
             // w < 0: each part's own wear amount from the part ramp image
             // -2: the same, and the primer layer too
             jitter: [look.coat[0], look.coat[1], look.coat[2], if look.wear_from_config && look.wear_levels { if look.primer { -2.0 } else { -1.0 } } else { look.wear }],
+            frame: [self.dither_frame, self.target.as_ref().map_or(aspect * 1080.0, |t| t.size[0] as f32), self.target.as_ref().map_or(1080.0, |t| t.size[1] as f32), 0.0],
+            light_view_proj: self.light_vp,
         }
     }
 
     /// Render models (each with its own instances) and lines into the
     /// offscreen target; returns the egui texture to show.
+    /// Depth of the opaque surfaces as the sun sees them (the sun shadow
+    /// map). Strand pieces with the count rule draw ShadowLodScale of their
+    /// main share, as the game's sun shadow pass does. Models skinned on the GPU are left out (their joints are bound
+    /// with the main pass's frame group); the character viewer poses its
+    /// parts on the CPU.
+    /// `eye`: the camera depth pre-pass instead (the strands of the main pass, one frame group).
+    fn record_sun_map(pipe: &wgpu::RenderPipeline, frame_bg: &wgpu::BindGroup, extra: &[(wgpu::Buffer, wgpu::BindGroup)], be: &mut wgpu::RenderPass<'_>, models: &[&GpuModel], eye: bool) {
+        be.set_pipeline(pipe);
+        be.set_bind_group(0, Some(frame_bg), &[]);
+        let mut slot = 0usize;
+        for gm in models {
+            if gm.n_normal() == 0 || gm.meshes.iter().any(|m| m.skinned) {
+                continue;
+            }
+            be.set_vertex_buffer(1, Some(gm.instances.slice(..)));
+            let mut bound: Option<&wgpu::Buffer> = None;
+            for me in gm.meshes.iter().filter(|m| m.visible && m.n_idx > 0) {
+                if gm.mat_alpha[me.material] == 2 || matches!(gm.mat_class[me.material], 5 | 6 | 8) || gm.mat_decal[me.material].is_some() {
+                    continue;
+                }
+                let want = if eye { 0 } else { (me.shadow_slot.load(std::sync::atomic::Ordering::Relaxed) as usize).min(extra.len()) };
+                if want != slot {
+                    be.set_bind_group(0, Some(if want == 0 { frame_bg } else { &extra[want - 1].1 }), &[]);
+                    slot = want;
+                }
+                be.set_bind_group(1, Some(&gm.mat_bg[me.material]), &[]);
+                if bound != Some(&me.vb) {
+                    be.set_vertex_buffer(0, Some(me.vb.slice(..)));
+                    be.set_index_buffer(me.ib.slice(..), wgpu::IndexFormat::Uint32);
+                    bound = Some(&me.vb);
+                }
+                let first = (me.ib_range.start / 4) as u32;
+                let base = (me.vb_range.start / std::mem::size_of::<glb::Vertex>() as u64) as i32;
+                let cnt = if me.strand_lod.is_some() { if eye { &me.n_draw } else { &me.n_shadow }.load(std::sync::atomic::Ordering::Relaxed).min(me.n_idx) } else { me.n_idx };
+                if cnt > 0 {
+                    be.draw_indexed(first..first + cnt, base, 0..gm.n_normal());
+                }
+            }
+        }
+    }
+
     /// Opaque and cutout draws of `models` into a render pass.
     /// `fb`: draw the coverage-fallback instances instead of the normal ones.
     fn record_opaque(
@@ -2211,7 +2513,12 @@ impl Renderer3D {
                 }
                 let first = (me.ib_range.start / 4) as u32;
                 let base = (me.vb_range.start / std::mem::size_of::<glb::Vertex>() as u64) as i32;
-                be.draw_indexed(first..first + me.n_idx, base, range.clone());
+                // strand hair: the first strands the game's count rule keeps at this distance
+                let cnt = if me.strand_lod.is_some() { me.n_draw.load(std::sync::atomic::Ordering::Relaxed).min(me.n_idx) } else { me.n_idx };
+                if cnt == 0 {
+                    continue;
+                }
+                be.draw_indexed(first..first + cnt, base, range.clone());
                 n += 1;
             }
         }
@@ -2405,8 +2712,69 @@ impl Renderer3D {
         let device = &rs.device;
         let queue = &rs.queue;
         let aspect = size[0] as f32 / size[1] as f32;
+        // the sun shadow map: one orthographic view from the sun over the models
+        let mut shadow_fu = None;
+        self.light_vp = [[0.0; 4]; 4];
+        if self.sun_maps && !models.is_empty() && models.len() < 64 {
+            let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for me in models.iter().flat_map(|gm| gm.meshes.iter()).filter(|m| m.visible) {
+                lo = lo.min(me.centre);
+                hi = hi.max(me.centre);
+            }
+            if lo.x <= hi.x {
+                let (c, r) = ((lo + hi) * 0.5, (hi - lo).length() * 0.5 + 0.7);
+                let l = look.sun_dir.normalize();
+                let up = if l.y.abs() > 0.95 { Vec3::X } else { Vec3::Y };
+                let vp = Mat4::orthographic_rh(-r, r, -r, r, 0.1, 2.0 * r + 2.0) * Mat4::look_at_rh(c + l * (r + 1.0), c, up);
+                self.light_vp = vp.to_cols_array_2d();
+                let mut f = self.frame_uniform(cam, look, aspect, 0.0);
+                f.view_proj = vp.to_cols_array_2d();
+                f.inv_view_proj = vp.inverse().to_cols_array_2d();
+                // strand ribbons open towards the light at their own width: the game's sun shadow pass draws strands
+                // solid and has no minimum width (a target size this large makes the minimum vanish)
+                f.cam_pos = (c + l * 1000.0).extend(1.0).to_array();
+                // w: the accumulation frame, which turns the shadow ribbons (see the vertex program)
+                f.frame = [0.0, 1.0e9, 1.0e9, self.dither_frame];
+                shadow_fu = Some(f);
+            }
+        }
         let fu = self.frame_uniform(cam, look, aspect, 0.0);
         queue.write_buffer(&self.frame_ub, 0, bytemuck::bytes_of(&fu));
+        if let Some(f) = &shadow_fu {
+            queue.write_buffer(&self.shadow_ub, 0, bytemuck::bytes_of(f));
+        }
+        // strand count by distance (from the eye to the piece's centre; the model's own placement is taken as none)
+        let eye = cam.eye();
+        let mut slots = 0u32;
+        for me in models.iter().flat_map(|gm| gm.meshes.iter()) {
+            if let Some(l) = me.strand_lod {
+                let d = (eye - me.centre).length();
+                let f = l.share(d, size[1] as f32, (cam.fov * 0.5).tan());
+                me.n_draw.store(l.indices(me.n_idx, f), std::sync::atomic::Ordering::Relaxed);
+                me.n_shadow.store(l.indices(me.n_idx, l.shadow_share(d, size[1] as f32, (cam.fov * 0.5).tan())), std::sync::atomic::Ordering::Relaxed);
+                me.shadow_slot.store(0, std::sync::atomic::Ordering::Relaxed);
+                // the ray-traced rule: the first n of the m drawn strands, each m / n times as wide (a piece of its own
+                // frame group carries the factor; pieces beyond the groups share the last one)
+                if let (true, Some(sf)) = (self.shadow_traced && !self.shadow_extra.is_empty(), shadow_fu.as_ref()) {
+                    let m = (l.stored as f32 * f).round();
+                    let n = l.traced_strands(m, d, (cam.fov * 0.5).tan());
+                    me.n_shadow.store(l.indices(me.n_idx, n / (l.stored as f32).max(1.0)), std::sync::atomic::Ordering::Relaxed);
+                    if n > 0.0 {
+                        slots = (slots + 1).min(self.shadow_extra.len() as u32);
+                        me.shadow_slot.store(slots, std::sync::atomic::Ordering::Relaxed);
+                        let mut g = *sf;
+                        g.frame[0] = m / n;
+                        queue.write_buffer(&self.shadow_extra[slots as usize - 1].0, 0, bytemuck::bytes_of(&g));
+                    }
+                }
+                if std::env::var("SIXNG_DEBUG_HAIR").is_ok() {
+                    static ONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if ONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+                        eprintln!("strand piece (rule version {}) at {d:.2} m: share {f:.3}", l.version);
+                    }
+                }
+            }
+        }
         let lb = (!lines.is_empty()).then(|| {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("lines"),
@@ -2448,6 +2816,42 @@ impl Renderer3D {
         self.render_shadows(queue, &mut enc, cam, look, &fu, aspect, models);
         let t = self.target.as_ref().unwrap();
         let mut draws = 0u32;
+        if shadow_fu.is_some() {
+            let mut sp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sun shadow pass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.sun_map.0,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            Self::record_sun_map(&self.pipe_sun_map, &self.shadow_frame_bg, &self.shadow_extra, &mut sp, models, false);
+        }
+        if shadow_fu.is_some() {
+            // the camera depth pre-pass, into the corner of its texture (cleared to far; a view larger than the texture
+            // leaves it so, which reads as nothing in front anywhere)
+            queue.write_buffer(&self.depth_ub, 0, bytemuck::bytes_of(&fu));
+            let mut dp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("camera depth pre-pass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.sun_map.2,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if size[0] <= CAM_DEPTH_SIZE && size[1] <= CAM_DEPTH_SIZE {
+                dp.set_viewport(0.0, 0.0, size[0] as f32, size[1] as f32, 0.0, 1.0);
+                Self::record_sun_map(&self.pipe_cam_depth, &self.depth_frame_bg, &[], &mut dp, models, true);
+            }
+        }
         {
             let c = if self.hdr { [0.0; 3] } else { look.clear };
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
