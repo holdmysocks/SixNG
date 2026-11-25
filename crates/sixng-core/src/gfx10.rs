@@ -51,9 +51,8 @@ fn equation(sw: Swizzle, bpe: u32) -> Option<&'static [(u8, u8)]> {
 /// texture, low bit first. From AMD addrlib (Gfx10 swizzle patterns, MIT):
 /// the `SW_4K_S3` pattern (non-XOR, so no pipe/bank bits), with the
 /// byte-within-element bits dropped. Only the element sizes measured on the
-/// install are mapped: 2 bytes (R16F volume, 8x16x16 elements per block) and
-/// 8 bytes (R16G16B16A16F volumes, 8x8x8). The pattern exists for 1, 4 and
-/// 16 bytes too, but no volume in the stores uses them, so they are rejected.
+/// install are mapped: 1, 2, 4 and 8 bytes. No volume in the stores uses
+/// 16-byte elements, so they are rejected.
 fn equation_3d(sw: Swizzle, bpe: u32) -> Option<&'static [(u8, u8)]> {
     Some(match (sw, bpe) {
         (Swizzle::S4K, 2) => &[(X, 0), (Z, 0), (Y, 0), (Z, 1), (Y, 1), (X, 1), (Z, 2), (Y, 2), (X, 2), (Z, 3), (Y, 3)],
@@ -167,13 +166,57 @@ impl Layout {
     /// `None` for element sizes without a measured 3D equation, and for
     /// `SW_64KB_D` (no volume in the stores uses it).
     pub fn new_3d(sw: Swizzle, w: u32, h: u32, d: u32, bpe: u32) -> Option<Layout> {
+        Layout::new_3d_mips(sw, w, h, d, 1, bpe)
+    }
+
+    /// Layout of a 3D texture with `mips` levels. Each z-layer of bricks
+    /// (`block_d` deep) holds its own chain, smallest first: the mip-tail
+    /// block, then that layer of every mip too large for the tail, mip 0
+    /// last. Layers are `slice_bytes` apart; a mip with fewer layers leaves
+    /// its place in the later layers empty. Tail mips (at most half a brick
+    /// wide) sit at 256-byte slots of the tail block, largest first: bytes
+    /// 2048, 768, 512 and 256, each at the element those bytes address.
+    ///
+    /// Measured on the one volume with mips in the install (R8 32x32x32,
+    /// 6 mips): mip 0 is as smooth across the layer seam as inside a brick,
+    /// mip 1 matches mip 0 averaged 2x2x2 at 35 dB, mips 2 to 4 match the
+    /// mip above at 33 to 43 dB in their slots, and the tail's nonzero bytes
+    /// are exactly those slots. Chains are only mapped for 1-byte elements
+    /// and up to 4 tail mips; `None` otherwise.
+    pub fn new_3d_mips(sw: Swizzle, w: u32, h: u32, d: u32, mips: u32, bpe: u32) -> Option<Layout> {
+        const TAIL_SLOTS: [u64; 4] = [2048, 768, 512, 256];
         let eq = equation_3d(sw, bpe)?;
         let n = |a: u8| eq.iter().filter(|e| e.0 == a).count() as u32;
         let (bw, bh, bd) = (1u32 << n(X), 1u32 << n(Y), 1u32 << n(Z));
         let bs = (bw * bh * bd * bpe) as u64;
-        let total = w.div_ceil(bw) as u64 * h.div_ceil(bh) as u64 * d.max(1).div_ceil(bd) as u64 * bs;
-        let mips = vec![MipPlace { w, h, offset: 0, tail: None }];
-        Some(Layout { eq, bpe, block_w: bw, block_h: bh, block_d: bd, block_bytes: bs, mips, slices: d.max(1), slice_major: false, slice_bytes: total, base: 0, total })
+        let (nm, d) = (mips.max(1) as usize, d.max(1));
+        if nm > 1 && bpe != 1 {
+            return None;
+        }
+        let dims: Vec<(u32, u32, u32)> = (0..nm).map(|i| ((w >> i).max(1), (h >> i).max(1), (d >> i).max(1))).collect();
+        let first = if nm == 1 { 1 } else { dims.iter().position(|&(mw, mh, md)| mw <= bw / 2 && mh <= bh && md <= bd).unwrap_or(nm) };
+        if nm - first > TAIL_SLOTS.len() {
+            return None;
+        }
+        let mut place: Vec<MipPlace> = dims.iter().map(|&(mw, mh, _)| MipPlace { w: mw, h: mh, offset: 0, tail: None }).collect();
+        let mut off = if first < nm { bs } else { 0 };
+        for i in (0..first).rev() {
+            place[i].offset = off;
+            off += dims[i].0.div_ceil(bw) as u64 * dims[i].1.div_ceil(bh) as u64 * bs;
+        }
+        for (k, p) in place.iter_mut().enumerate().skip(first) {
+            let e = TAIL_SLOTS[k - first] / bpe as u64;
+            let mut c = [0u32; 3];
+            for (bit, &(axis, b)) in eq.iter().enumerate() {
+                c[axis as usize] |= (((e >> bit) & 1) as u32) << b;
+            }
+            if c[Z as usize] != 0 {
+                return None;
+            }
+            p.tail = Some((c[X as usize], c[Y as usize]));
+        }
+        let total = off * d.div_ceil(bd) as u64;
+        Some(Layout { eq, bpe, block_w: bw, block_h: bh, block_d: bd, block_bytes: bs, mips: place, slices: d, slice_major: false, slice_bytes: off, base: 0, total })
     }
 
     /// The same layout for an array of `n` slices. Arrays are stored level by
@@ -271,9 +314,15 @@ impl Layout {
     pub fn addr(&self, m: usize, s: u32, x: u32, y: u32) -> u64 {
         let p = &self.mips[m];
         if self.block_d > 1 {
-            let (pitch, rows) = (p.w.div_ceil(self.block_w) as u64, p.h.div_ceil(self.block_h) as u64);
-            let blk = (s / self.block_d) as u64 * pitch * rows + (y / self.block_h) as u64 * pitch + (x / self.block_w) as u64;
-            return blk * self.block_bytes + self.inblock(x % self.block_w, y % self.block_h, s % self.block_d) * self.bpe as u64;
+            // `s` is the depth within mip `m`; each brick layer holds a whole chain.
+            let base = (s / self.block_d) as u64 * self.slice_bytes + p.offset;
+            let z = s % self.block_d;
+            if let Some((cx, cy)) = p.tail {
+                return base + self.inblock(x + cx, y + cy, z) * self.bpe as u64;
+            }
+            let pitch = p.w.div_ceil(self.block_w) as u64;
+            let blk = (y / self.block_h) as u64 * pitch + (x / self.block_w) as u64;
+            return base + blk * self.block_bytes + self.inblock(x % self.block_w, y % self.block_h, z) * self.bpe as u64;
         }
         let base = self.level_start(m, s);
         match p.tail {
@@ -426,5 +475,22 @@ mod tests {
             assert!(Layout::new_3d(Swizzle::S4K, 32, 32, 32, bpe).is_none());
         }
         assert!(Layout::new_3d(Swizzle::D64K, 32, 32, 32, 8).is_none());
+    }
+
+    #[test]
+    fn volume_mip_chain_per_brick_layer() {
+        // R8 32x32x32 with 6 mips, as measured: per 16-deep brick layer the
+        // tail block, mip 1, then mip 0's four bricks; 6 blocks a layer.
+        let l = Layout::new_3d_mips(Swizzle::S4K, 32, 32, 32, 6, 1).unwrap();
+        assert_eq!((l.slice_bytes, l.total), (6 * 4096, 12 * 4096));
+        assert_eq!((l.addr(0, 0, 0, 0), l.addr(0, 16, 0, 0), l.addr(1, 0, 0, 0)), (2 * 4096, 8 * 4096, 4096));
+        let tails: Vec<_> = l.mips[2..].iter().map(|p| p.tail.unwrap()).collect();
+        assert_eq!(tails, [(0, 8), (8, 4), (8, 0), (0, 4)]);
+        // the tail origins are the 256-byte slots 2048, 768, 512, 256
+        assert_eq!([2, 3, 4, 5].map(|m| l.addr(m, 0, 0, 0)), [2048, 768, 512, 256]);
+        // chains are only mapped for 1-byte elements
+        assert!(Layout::new_3d_mips(Swizzle::S4K, 32, 32, 32, 6, 2).is_none());
+        // single mip: unchanged
+        assert_eq!(Layout::new_3d_mips(Swizzle::S4K, 32, 32, 32, 1, 1).unwrap().total, 8 * 4096);
     }
 }

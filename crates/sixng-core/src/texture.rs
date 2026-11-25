@@ -350,7 +350,9 @@ pub fn deswizzle(src: &[u8], ew: u32, eh: u32, bpe: u32) -> Vec<u8> {
 /// * Volumes (dimension byte 3): the 3D pattern of [`crate::gfx10::Layout::new_3d`].
 ///   The 33 x 33 x 33 RGBA16 float identity LUT decodes exactly.
 ///   The 1-, 2- and 4-byte patterns were found by search on texture dictionary
-///   volumes and checked at the brick seams. Volumes with mips read as 2D.
+///   volumes and checked at the brick seams. The mip chain of the one 1-byte
+///   volume with mips is in [`crate::gfx10::Layout::new_3d_mips`]; other
+///   volumes with mips read as 2D.
 fn uncompressed_layout(fmt: Fmt, t: &TexInfo) -> Option<crate::gfx10::Layout> {
     use crate::gfx10::{Layout, Swizzle};
     let bpe = fmt.bytes_per_elem();
@@ -358,11 +360,11 @@ fn uncompressed_layout(fmt: Fmt, t: &TexInfo) -> Option<crate::gfx10::Layout> {
         return None;
     }
     if t.dimension == 3 && t.depth > 1 {
+        if let Some(l) = Layout::new_3d_mips(Swizzle::S4K, t.width, t.height, t.depth, t.mips, bpe) {
+            return Some(l);
+        }
         if t.mips != 1 {
             return None;
-        }
-        if let Some(l) = Layout::new_3d(Swizzle::S4K, t.width, t.height, t.depth, bpe) {
-            return Some(l);
         }
     }
     Layout::new(Swizzle::S4K, t.width, t.height, t.mips, bpe).map(|l| l.with_slices(t.depth))
@@ -375,6 +377,33 @@ fn untile_mip(r: &Resource, t: &TexInfo, l: &crate::gfx10::Layout, m: usize) -> 
     }
     let end = (start + l.total.max(l.block_bytes) as usize).min(r.gfx.len());
     Ok(l.untile(&r.gfx[start..end], m))
+}
+
+/// Linear data of every slice of an uncompressed texture with more than
+/// one, as `[mip][slice]`: the layers of a 2D array or cube (mip 0 only), or
+/// the depth slices of each mip of a volume (half as many per mip). `None`
+/// when the texture has one slice or its layout is not mapped (compressed
+/// formats, arrays with mips).
+pub fn slices_linear(r: &Resource, t: &TexInfo) -> Result<Option<(Fmt, Vec<Vec<Vec<u8>>>)>> {
+    let fmt = Fmt::from_dxgi(t.dxgi_format);
+    if t.depth <= 1 || fmt == Fmt::Unknown {
+        return Ok(None);
+    }
+    let Some(l) = uncompressed_layout(fmt, t) else { return Ok(None) };
+    let volume = l.block_d > 1;
+    if !volume && t.mips > 1 {
+        return Ok(None);
+    }
+    let start = t.data_off as usize;
+    let end = start + l.total.max(l.block_bytes) as usize;
+    let src = r.gfx.get(start..end).ok_or_else(|| anyhow!("texture data out of range"))?;
+    let mips = (0..l.mips.len())
+        .map(|m| {
+            let n = if volume { (l.slices >> m).max(1) } else { l.slices };
+            (0..n).map(|sl| l.untile_slice(src, m, sl)).collect()
+        })
+        .collect();
+    Ok(Some((fmt, mips)))
 }
 
 /// Linear (deswizzled) mip-0 bytes of slice 0, in the texture's own format.
@@ -708,17 +737,51 @@ pub fn save_dds(path: &Path, t: &TexInfo, fmt: Fmt, data: &[u8]) -> Result<()> {
     save_dds_n(path, t, fmt, data, 1, data.len())
 }
 
+/// Write a DDS holding every slice (`mips` as `[mip][slice]` from
+/// [`slices_linear`]): a 3D texture for volumes (mip by mip), a cube map
+/// (array) for cubes whose slice count is a multiple of 6, otherwise a 2D
+/// array (slice by slice).
+pub fn save_dds_slices(path: &Path, t: &TexInfo, fmt: Fmt, mips: &[Vec<Vec<u8>>]) -> Result<()> {
+    let _ = fmt;
+    let n = mips.first().map_or(0, |m| m.len()) as u32;
+    let mip0_len = mips.first().and_then(|m| m.first()).map_or(0, |s| s.len());
+    let mut h = dds_header(t, mips.len() as u32, mip0_len, n);
+    if t.dimension == 3 {
+        h.extend(mips.iter().flatten().flatten());
+    } else {
+        for s in 0..n as usize {
+            h.extend(mips.iter().flat_map(|m| &m[s]));
+        }
+    }
+    crate::atomic::write(path, h)?;
+    Ok(())
+}
+
 fn save_dds_n(path: &Path, t: &TexInfo, fmt: Fmt, data: &[u8], nmips: u32, mip0_len: usize) -> Result<()> {
-    let mut h = Vec::with_capacity(148 + data.len());
+    let _ = fmt;
+    let mut h = dds_header(t, nmips, mip0_len, 1);
+    h.extend_from_slice(data);
+    crate::atomic::write(path, h)?;
+    Ok(())
+}
+
+/// DDS + DX10 header. `slices` > 1 makes a volume (dimension 3), a cube map
+/// (dimension 2, multiple of 6) or a 2D array.
+fn dds_header(t: &TexInfo, nmips: u32, mip0_len: usize, slices: u32) -> Vec<u8> {
+    let volume = slices > 1 && t.dimension == 3;
+    let cube = slices > 1 && t.dimension == 2 && slices % 6 == 0;
+    let complex = nmips > 1 || slices > 1;
+    let mut h = Vec::with_capacity(148);
     let w32 = |v: &mut Vec<u8>, x: u32| v.extend_from_slice(&x.to_le_bytes());
     h.extend_from_slice(b"DDS ");
     w32(&mut h, 124);
     let mipflag = if nmips > 1 { 0x20000 } else { 0 };
-    w32(&mut h, 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000 | mipflag); // caps|height|width|pixelformat|linearsize|mipcount
+    let depthflag = if volume { 0x800000 } else { 0 };
+    w32(&mut h, 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000 | mipflag | depthflag); // caps|height|width|pixelformat|linearsize|mipcount|depth
     w32(&mut h, t.height);
     w32(&mut h, t.width);
     w32(&mut h, mip0_len as u32);
-    w32(&mut h, 0);
+    w32(&mut h, if volume { slices } else { 0 });
     w32(&mut h, nmips);
     for _ in 0..11 {
         w32(&mut h, 0);
@@ -730,20 +793,19 @@ fn save_dds_n(path: &Path, t: &TexInfo, fmt: Fmt, data: &[u8], nmips: u32, mip0_
     for _ in 0..5 {
         w32(&mut h, 0);
     }
-    w32(&mut h, if nmips > 1 { 0x1000 | 0x400000 | 0x8 } else { 0x1000 }); // caps: texture (+mipmap|complex)
-    for _ in 0..4 {
+    let mipcaps = if nmips > 1 { 0x400000 } else { 0 };
+    w32(&mut h, 0x1000 | mipcaps | if complex { 0x8 } else { 0 }); // caps: texture (+mipmap, complex)
+    w32(&mut h, if volume { 0x200000 } else if cube { 0xFE00 } else { 0 }); // caps2: volume, or cube map with all faces
+    for _ in 0..3 {
         w32(&mut h, 0);
     }
     // DX10 header
-    let _ = fmt;
     w32(&mut h, t.dxgi_format);
-    w32(&mut h, 3); // TEXTURE2D
+    w32(&mut h, if volume { 4 } else { 3 }); // TEXTURE3D or TEXTURE2D
+    w32(&mut h, if cube { 0x4 } else { 0 }); // TEXTURECUBE
+    w32(&mut h, if volume { 1 } else if cube { slices / 6 } else { slices.max(1) }); // array size
     w32(&mut h, 0);
-    w32(&mut h, 1);
-    w32(&mut h, 0);
-    h.extend_from_slice(data);
-    crate::atomic::write(path, h)?;
-    Ok(())
+    h
 }
 
 fn u32at(s: &[u8]) -> u32 {
