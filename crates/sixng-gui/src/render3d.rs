@@ -80,6 +80,58 @@ pub struct LineV {
     pub col: [u8; 4],
 }
 
+/// Vertex of the ground shadow (shader `GIn`).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GroundV {
+    pos: [f32; 3],
+    /// place in the blob (m from its centre), its half size
+    rect: [f32; 4],
+    /// softness (m), darkness
+    k: [f32; 2],
+}
+
+/// A soft shadow on the ground under a model. Not a shadow map: two blurred
+/// rounded boxes from the model's bounds, a dark one right under it (what
+/// the model hides of the sky) and a wider, lighter one pushed away from
+/// the sun.
+#[derive(Clone, Copy)]
+pub struct GroundShadow {
+    /// Centre of the model's footprint, on the ground.
+    pub centre: Vec3,
+    /// Half size of the footprint along x and z.
+    pub half: [f32; 2],
+    /// Height of the model over the ground.
+    pub height: f32,
+}
+
+impl GroundShadow {
+    fn verts(&self, sun: Vec3, sun_intensity: f32) -> Vec<GroundV> {
+        let m = self.half[0].min(self.half[1]);
+        // away from the sun, by a part of the model's height (most of a
+        // model's bulk is low; a low sun must not throw the blob far off)
+        let off = -Vec3::new(sun.x, 0.0, sun.z) / sun.y.max(0.4) * self.height * 0.22;
+        let mut out = Vec::with_capacity(12);
+        let mut quad = |c: Vec3, half: [f32; 2], soft: f32, dark: f32| {
+            let (ex, ez) = (half[0] + soft, half[1] + soft);
+            let v = |sx: f32, sz: f32| GroundV {
+                pos: [c.x + sx * ex, c.y, c.z + sz * ez],
+                rect: [sx * ex, sz * ez, half[0], half[1]],
+                k: [soft, dark],
+            };
+            out.extend([v(-1.0, -1.0), v(1.0, -1.0), v(1.0, 1.0), v(-1.0, -1.0), v(1.0, 1.0), v(-1.0, 1.0)]);
+        };
+        quad(
+            self.centre + off,
+            [self.half[0] + off.x.abs() * 0.5, self.half[1] + off.z.abs() * 0.5],
+            0.5 * m + 0.15 * self.height,
+            0.45 * sun_intensity.clamp(0.0, 1.0),
+        );
+        quad(self.centre, self.half, 0.35 * m, 0.65);
+        out
+    }
+}
+
 /// Lighting and view settings for one frame.
 #[derive(Clone)]
 pub struct Look {
@@ -424,6 +476,9 @@ pub struct Renderer3D {
     pipe_lines: wgpu::RenderPipeline,
     pipe_lines_top: wgpu::RenderPipeline,
     pipe_sky: wgpu::RenderPipeline,
+    pipe_ground: wgpu::RenderPipeline,
+    /// Shadow to draw on the ground under the model (shaded mode only).
+    pub ground: Option<GroundShadow>,
     bgl_frame: wgpu::BindGroupLayout,
     bgl_mat: wgpu::BindGroupLayout,
     frame_ub: wgpu::Buffer,
@@ -980,6 +1035,21 @@ impl Renderer3D {
             None,
             depth(false, wgpu::CompareFunction::Always),
         );
+        let gattrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x2];
+        let pipe_ground = mk(
+            "ground shadow",
+            &layout_frame,
+            "vs_ground",
+            "fs_ground",
+            &[Some(wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<GroundV>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &gattrs,
+            })],
+            wgpu::PrimitiveTopology::TriangleList,
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+            depth(false, wgpu::CompareFunction::Greater),
+        );
         let frame_ub = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("frame ub"),
             size: std::mem::size_of::<FrameU>() as u64,
@@ -1145,6 +1215,8 @@ impl Renderer3D {
             pipe_lines,
             pipe_lines_top,
             pipe_sky,
+            pipe_ground,
+            ground: None,
             bgl_frame,
             bgl_mat,
             frame_ub,
@@ -1992,6 +2064,18 @@ impl Renderer3D {
                 usage: wgpu::BufferUsages::VERTEX,
             })
         });
+        // the ground shadow: shaded view, seen from above the ground
+        let gv = self
+            .ground
+            .filter(|g| look.mode == 0 && cam.eye().y > g.centre.y)
+            .map(|g| g.verts(look.sun_dir, look.sun_intensity));
+        let gb = gv.as_ref().map(|v| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("ground shadow"),
+                contents: bytemuck::cast_slice(v),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        });
         let t = self.target.as_ref().unwrap();
         let mut draws = 0u32;
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2080,6 +2164,14 @@ impl Renderer3D {
             );
             self.fb_draws = [fm, fc];
             draws += fm + fc;
+            // on the far ground behind the model, under everything see-through
+            if let (Some(gb), Some(gv)) = (&gb, &gv) {
+                pass.set_pipeline(&self.pipe_ground);
+                pass.set_bind_group(0, &self.default_frame_bg, &[]);
+                pass.set_vertex_buffer(0, gb.slice(..));
+                pass.draw(0..gv.len() as u32, 0..1);
+                draws += 1;
+            }
             if self.decal_bias {
                 draws += Self::draw_cells(
                     &mut pass,
