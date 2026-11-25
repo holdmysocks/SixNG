@@ -604,7 +604,16 @@ again**).
     own head (`cs_maleek_rivers`). The outfit shown first is the first
     listed one, unless it has no clothes in the data read here and a
     later one has (about twenty characters): then the first dressed one,
-    with shoes when one has them; the panel says so. An item whose own
+    with shoes when one has them; the panel says so. Each item is found
+    by its asset GUID first: the GUID is the name id of the item's own
+    drawable, `_full` included (`shortswork_mr1_001_regular_mw_long_full`),
+    as for hair. Before 2026-11-25 items were matched by name and
+    textures only, which picked a sibling variant for about one item in
+    eight (a closed jacket for an open one, hood down for hood up, a
+    combined piercing set) and found no model for 148 items, most of them
+    shoes and beards. A head item's GUID names the base head template, so
+    the head stays the one the item names. An item whose GUID names no
+    drawable and whose own
     textures lead to no model takes the model another wardrobe's item
     with the same asset GUID resolved to (`found_by: asset id`; the table
     is built once, a few minutes, as `<work>/index/asset_drawables.json`).
@@ -612,9 +621,9 @@ again**).
     half of the rest share a GUID with one that does. One-piece swimwear
     and bodysuits count as a one-piece garment and the sports base layers
     as a top or a bottom, so such an outfit is dressed (and hides the
-    skin under it). Of the 292 characters, 225 now open with head, body,
-    clothes and shoes, 50 dressed without shoes and 17 without a top and
-    a bottom; most of the 17 are stored that way (shirtless in shorts,
+    skin under it). Of the 292 characters, 266 now open with head, body,
+    clothes and shoes, 12 dressed without shoes and 14 without a top and
+    a bottom (4 items of 3 characters stay unresolved); most of the 17 are stored that way (shirtless in shorts,
     costumes), and a garment whose model is found under no texture and
     no GUID is listed in the panel as not found instead of being left
     out silently. `sixng ped-look "^"` lists every character
