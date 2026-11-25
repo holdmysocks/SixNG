@@ -1336,7 +1336,12 @@ impl ModelView {
                         // under about 1.5 million ribbon vertices (a vertex
                         // buffer may not exceed 256 MiB).
                         let share = share.min(750_000.0 / (g.stored_strands() * k).max(1) as f32);
-                        let coat = g.coat_with(share, collide.as_deref());
+                        let mut coat = g.coat_with(share, collide.as_deref());
+                        // noise, curl and clumping move grown strands off the
+                        // pressed guides: press them again
+                        if let Some(h) = hat.as_ref().filter(|_| under_hat.contains(&off)) {
+                            h.press(&mut coat.points, 0.003);
+                        }
                         drawn += coat.guides.len();
                         // fewer strands than stored: wider ones, for the same cover
                         let base = if g.width > 0.0 { g.width } else { 0.0003 };
