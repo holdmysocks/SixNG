@@ -220,6 +220,84 @@ fn height_fog(p: vec3<f32>) -> f32 {
     return exp(-tau * len / f32(n));
 }
 
+// ---- water ------------------------------------------------------------
+// The sea and the game's water meshes on the map: a sum of wind waves for
+// the normal (wavelengths from the timecycle's Beaufort number and fetch,
+// atmo.rs `sea_waves`), the sky mirrored by Fresnel, the sun's glint, and
+// the water body's colour from its scattering and extinction.
+const WAVES: u32 = 12u;
+// share of the sea's slope variance drawn as waves (the rest is roughness)
+const WAVE_SHARE: f32 = 0.6;
+
+fn wave_rand(i: u32, k: f32) -> f32 {
+    return fract(sin(f32(i) * 12.9898 + k * 78.233) * 43758.5453);
+}
+
+// Surface normal of the sea at p (world), and the slope variance of the
+// waves too small to draw at this distance (added to the roughness).
+fn sea_normal(p: vec3<f32>, dist: f32) -> vec4<f32> {
+    let lp = max(S.water0.w, 2.0);
+    let var_all = max(S.water1.w, 0.003);
+    let s = sqrt(2.0 * WAVE_SHARE * var_all / f32(WAVES));
+    // world size of a pixel here (m), for a typical view
+    let fp = dist * 0.0012 + 0.002;
+    let t = S.water4.w * S.water2.w;
+    var g = vec2(0.0);
+    var lost = 0.0;
+    var lam = lp;
+    for (var i = 0u; i < WAVES; i++) {
+        let a = 0.6 + (wave_rand(i, 1.0) - 0.5) * 2.2;
+        let d = vec2(cos(a), sin(a));
+        let k = 2.0 * PI / lam;
+        let w = sqrt(9.81 * k);
+        let ph = k * dot(d, p.xz) - w * t + wave_rand(i, 2.0) * 2.0 * PI;
+        // fade out waves shorter than a few pixels
+        let keep = smoothstep(2.0 * fp, 8.0 * fp, lam);
+        g += keep * s * d * cos(ph);
+        lost += (1.0 - keep * keep) * s * s * 0.5;
+        lam *= 0.62;
+    }
+    return vec4(normalize(vec3(-g.x, 1.0, -g.y)), lost);
+}
+
+// Radiance leaving the water surface at p towards the camera.
+fn water_shade(p: vec3<f32>) -> vec3<f32> {
+    let o = F.cam_pos.xyz;
+    let dist = length(o - p);
+    let v = (o - p) / max(dist, 1e-3);
+    let sn = sea_normal(p, dist);
+    var n = sn.xyz;
+    if (dot(n, v) < 0.02) { n = normalize(n + v * (0.02 - dot(n, v))); }
+    let var_micro = (1.0 - WAVE_SHARE) * max(S.water1.w, 0.003) + sn.w;
+    let a = clamp(sqrt(2.0 * var_micro) + S.water3.w, 0.02, 0.8);
+    let ndv = max(dot(n, v), 1e-3);
+    var fr = 0.02 + 0.98 * pow(1.0 - ndv, 5.0);
+    fr = clamp(fr + clamp(S.water4.x, S.water4.y, S.water4.z), 0.0, 1.0);
+    // the sky in the mirror direction (kept above the horizon)
+    var r = reflect(-v, n);
+    r.y = abs(r.y);
+    let refl = environment(r, sqrt(a));
+    // the sun's (or moon's) glint
+    let l = normalize(F.sun_dir.xyz);
+    let ndl = max(dot(n, l), 0.0);
+    let h = normalize(l + v);
+    let ndh = max(dot(n, h), 0.0);
+    let a2 = a * a;
+    let dd = ndh * ndh * (a2 - 1.0) + 1.0;
+    let D = a2 / (PI * dd * dd);
+    let kk = a2 * 0.5;
+    let G = (ndl / (ndl * (1.0 - kk) + kk)) * (ndv / (ndv * (1.0 - kk) + kk));
+    let fh = 0.02 + 0.98 * pow(1.0 - max(dot(h, v), 0.0), 5.0);
+    let sun = sun_e(p);
+    let glint = D * G * fh / max(4.0 * ndl * ndv, 1e-3) * sun * ndl;
+    // the water body: light going down, scattered back up (a third of
+    // the single-scattering albedo, the usual ocean-colour rule)
+    let ssa = S.water1.rgb / max(S.water0.rgb, vec3(1e-5));
+    let e_down = sun * max(l.y, 0.0) * 0.98 + PI * sky_ambient(vec3(0.0, 1.0, 0.0));
+    let body = 0.33 * ssa * e_down / PI * S.water3.rgb;
+    return fr * refl + glint + (1.0 - fr) * body;
+}
+
 // The map's frame: aerial perspective (froxel volume), height fog, then
 // the exposure; `col0` is the radiance leaving the surface at `p`.
 fn map_finish(col0: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
@@ -846,6 +924,11 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
         }
     }
 
+    if (hdr() && cls == 8u && F.mode.x == 0u) {
+        // the map's water (the sea plane is opaque)
+        col = water_shade(i.world);
+        alpha = select(0.92, 1.0, M.flags.z == 0u);
+    }
     let mode = F.mode.x;
     if (mode == 1u) { col = albedo; }
     else if (mode == 2u) { return vec4(n * 0.5 + 0.5, 1.0); }
@@ -1118,6 +1201,10 @@ fn fs_cell(i: COut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let fr_v = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
     let env = environment(reflect(-v, n), rough) * F.misc.w;
     var col = direct + kd * albedo * amb_d + env * fr_v + emissive;
+    if (hdr() && cls == 8u && F.mode.x == 0u) {
+        col = water_shade(i.world);
+        alpha = select(0.92, 1.0, amode != 2u);
+    }
     let mode = F.mode.x;
     if (mode == 1u) { col = albedo; }
     else if (mode == 2u) { return vec4(n * 0.5 + 0.5, 1.0); }
