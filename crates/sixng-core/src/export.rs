@@ -419,6 +419,12 @@ const NOT_BODY_BONES: [&str; 22] = [
 ];
 /// `emissivetex`: the lit parts of a lamp or panel.
 const EMISSIVE_PARAM: &str = "8e0d63ee";
+/// `standard_vehicle_2lyr_emissive_brakedisc_inst`: the LED strip of a rim
+/// light ring. It has no `emissivetex`; the alpha of its `diffusetex` is 255
+/// on the LED packages and 0 on the board between them.
+const LED_STRIP_SHADER: &str = "f3ad0561";
+/// `diffusetex`.
+const DIFFUSE_PARAM: &str = "c8e8c282";
 /// The texture the game draws vehicle screens into while it runs (dials,
 /// needles, navigation): bound as the colour and emissive map of a second
 /// `standard_vehicle_emissive_layer` mesh that lies about 1 mm in front of
@@ -866,6 +872,11 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                     st.base_alpha = srgb_alpha;
                 }
             }
+            // An LED strip lights where its colour map's alpha says, not
+            // the whole board.
+            if s.name_hash == LED_STRIP_SHADER && st.emissive.is_none() && o.png {
+                st.emissive = lit_by_alpha(&st, o, &tdir).map(|p| uri_of(&p));
+            }
             if st.normal.is_none() {
                 st.normal = normal_fallback;
             }
@@ -962,6 +973,35 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
 /// part has no tint. Writes `<shade>_tint_<palette>_<row>.png` or
 /// `<shade>_shade.png` next to the store textures; returns its path and the
 /// model.json record.
+/// The colour map times its alpha (see `lit_map`), written next to it as
+/// `<hash>_lit.png`. None when the map is not there or its alpha is one
+/// value all over.
+fn lit_by_alpha(st: &ShaderTextures, o: &ExportOptions, tdir: &Path) -> Option<PathBuf> {
+    let src = st.entries.iter().find(|x| x["param_hash"] == DIFFUSE_PARAM && x["status"].as_str().is_some_and(|s| s.starts_with("ok")) && x["png"].is_string())?;
+    let from = o.out.join(src["png"].as_str()?);
+    let p = tdir.join(format!("{}_lit.png", from.file_stem()?.to_string_lossy()));
+    if !p.exists() {
+        let img = image::open(&from).ok()?.to_rgba8();
+        let (w, h) = img.dimensions();
+        let lit = lit_map(img.as_raw())?;
+        let tmp = p.with_extension(format!("{:?}.tmp.png", std::thread::current().id()).replace(['(', ')'], ""));
+        texture::save_png(&tmp, &lit, w, h).ok()?;
+        fs::rename(&tmp, &p).ok()?;
+    }
+    Some(p)
+}
+
+/// RGBA pixels with the colour scaled by the alpha, opaque: what an
+/// emissive map made of a colour map and its alpha mask looks like. None
+/// when the alpha is the same everywhere (no mask in it).
+fn lit_map(rgba: &[u8]) -> Option<Vec<u8>> {
+    let first = rgba.get(3).copied()?;
+    if rgba.chunks_exact(4).all(|c| c[3] == first) {
+        return None;
+    }
+    Some(rgba.chunks_exact(4).flat_map(|c| [0, 1, 2].map(|i| ((c[i] as u32 * c[3] as u32 + 127) / 255) as u8).into_iter().chain([255])).collect())
+}
+
 fn bake_ped_tint(st: &ShaderTextures, part: Option<&str>, o: &ExportOptions, tdir: &Path, game: &Path) -> Option<(PathBuf, serde_json::Value)> {
     let e = st.entries.iter().find(|e| e["param_hash"] == crate::pedtint::SHADE_PARAM && e["status"].as_str().is_some_and(|x| x.starts_with("ok")))?;
     let m: [f64; 4] = serde_json::from_value(e["mean_rgba"].clone()).ok()?;
@@ -3321,6 +3361,16 @@ fn lod_exports(groups: &[Vec<crate::gltf::NodeGroup>]) -> Vec<(usize, String)> {
 #[cfg(test)]
 mod dictionary_tests {
     use super::*;
+
+    #[test]
+    fn lit_map_is_colour_times_alpha() {
+        // an LED (alpha 255) keeps its colour, the board (alpha 0) goes dark
+        let px = [224, 192, 0, 255, 230, 230, 230, 0, 200, 100, 50, 128];
+        assert_eq!(lit_map(&px).unwrap(), vec![224, 192, 0, 255, 0, 0, 0, 255, 100, 50, 25, 255]);
+        // one alpha all over: no mask to read
+        assert!(lit_map(&[10, 20, 30, 255, 40, 50, 60, 255]).is_none());
+        assert!(lit_map(&[]).is_none());
+    }
 
     #[test]
     fn material_file_names_what_is_known() {
