@@ -313,7 +313,7 @@ pub const TUNING_NAMES: &[(usize, &str, bool)] = &[
     (3, "disappears_when_dead_chance", true),
     (4, "min_damage_force", true),
     (5, "damage_health", true),
-    (6, "weapon_health", false),
+    (6, "weapon_health", true),
     (7, "joint_stiffness", true),
     (8, "motor_frequency", true),
     (9, "motor_damping", true),
@@ -341,31 +341,47 @@ pub const TUNING_NAMES: &[(usize, &str, bool)] = &[
 
 /// Group flag bits, as (word, bit, preset name, confirmed). Word 0 is the
 /// u32 at group +0x00, word 1 the u32 at +0x04. Matched against the
-/// booleans of the fragment tuning presets in common: across the 6,931
-/// level groups whose tuning values match exactly one preset, a confirmed
-/// bit is set on at least 97% of the groups whose preset says true and on
-/// none whose preset says false. The others have small samples or no
-/// preset that says false (see each line). `made_of_glass` has no preset:
-/// it is set on the `Glass_*` groups of windows and doors and on almost
-/// nothing that is not a box.
+/// booleans of the fragment tuning presets in common (the full table, 157
+/// presets, each listing every boolean): across the 11,865 level groups
+/// whose tuning values match exactly one preset, a confirmed bit is set on
+/// at least 95% of the groups whose preset says true (at least 100 of them)
+/// and on at most 0.2% of at least 100 whose preset says false. The others
+/// have small samples or no preset that says false (see each line).
+///
+/// Never true in any preset, so not placed: DisableMoverUntilBreak,
+/// BreakUsingTwistLimits, DoesntPushVehiclesDown, DisconnectFromParent,
+/// UseConstraintForJoint, NoConnections, ConnectivityRoot,
+/// LatchAfterAnimation, IsPortal, ScaleStrengthByMass (and MadeOfGlass,
+/// placed from group names instead). InitialArticulationDisabled and
+/// UseSoftConstraintForMuscle have no bit of their own. Unnamed bits with
+/// a clear pattern in the group names: word 0 bit 13 (litter, 64% of its
+/// groups are rub_litter roots), 17 (reeds, cattails, corn stalks), 21
+/// (safe keypads only), 25 (bending poles and leaves); word 1 bits 1, 2
+/// and 5 (wooden fences, pickets, crates, cardboard).
 pub const GROUP_FLAGS: &[(usize, u32, &str, bool)] = &[
     (0, 0, "break_when_damaged", true),
+    // no preset says true; 91% of the 1,186 groups with it are named
+    // Glass_* or *pane*, nearly all box bounds
     (0, 1, "made_of_glass", false),
     (0, 2, "damage_when_broken", true),
     (0, 3, "doesnt_affect_vehicles", true),
+    // 81%: one road-sign preset's 236 groups lack it; none of 767 false
     (0, 8, "break_when_parent_damaged", true),
     (0, 11, "enable_motor", true),
-    // 93% of 73 groups, none of 18 false
-    (0, 12, "damage_around_break", false),
+    (0, 12, "damage_around_break", true),
     (0, 14, "disappear_when_broken", true),
     (0, 16, "disable_map_collision_until_break", true),
-    // 7 groups
+    // 326 of 327 groups, none of 11 false; set on aircraft and other
+    // vehicle groups
+    (0, 18, "override_vehicle_defaults", false),
+    // all 7 groups that say true, none of 336 false
     (0, 20, "break_when_walked_over", false),
-    // set together with word 1 bit 3: one of the pair each, order unknown
+    // set together with word 1 bit 3, as the presets set the two collide
+    // booleans together: one of the pair each, order unknown
     (0, 23, "collide_convex_against_ground_or_larger_bounds", false),
-    // 93% of 76 groups, 1% of 1,471 false
+    // 71 of 76 groups, 19 of 1,925 false
     (0, 28, "obliterate_at_high_speed", false),
-    // 90% of 1,547 groups, none says false
+    // 92% of 2,001 groups, none of 4 false
     (0, 29, "obliterate_at_very_high_speed", false),
     // all 315 groups, none says false; set on none of the other matched groups
     (0, 30, "break_when_tilted", false),
