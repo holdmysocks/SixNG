@@ -975,14 +975,17 @@ baked map (`entities.bin`; bake first with `--bake-map`):
     integrated from the sky table each frame, scaled by
     `ambient_sky_intensity`. The timecycle's two height fog layers
     (`local_atmosphere_fog_*`, e.g. Misty and Fog) are drawn too.
-  - The frame is HDR. An exposure meter (histogram between the
-    timecycle's low and high percentiles, its key value and adaptation
-    rate, `postfx_exposure` as an offset) sets the exposure; then bloom
+  - The frame is HDR. An exposure meter sets the exposure: mostly the
+    light falling at the camera (sun, moon and sky), partly a histogram of
+    the frame between the timecycle's low and high percentiles, with its
+    key value and adaptation rate and `postfx_exposure` as an offset; then bloom
     (`postfx_intensity_bloom`), contrast and saturation, and a filmic curve.
   - Our own choices (not decoded): the scale from the timecycle's colour
     values to scattering per km (so its defaults give the usual Earth
     atmosphere), the moon's illuminance (0.25 lux), star and air-glow
-    brightness, night scenes metered up to 3 stops darker than mid grey,
+    brightness, the incident meter's 3:1 share against the histogram,
+    night scenes metered up to 3 stops darker than mid grey, baked map
+    tiles lit at 60 % of their colour,
     sun dimming by cloud cover (no clouds are drawn yet), the brightness
     of emissive surfaces (6 cd/m² at strength 1) and the filmic curve.
     Without the timecycle (no index) the built-in Sunny values are used.
