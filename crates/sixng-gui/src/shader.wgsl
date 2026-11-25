@@ -55,13 +55,13 @@ struct Sticker {
 @group(0) @binding(5) var samp_clamp: sampler;
 // the game's hair lighting tables (hairlight): lobes along the strand,
 // lobes around it, reflectance and path length, and the colour factor
-@group(0) @binding(12) var t_hair_m: texture_3d<f32>;
-@group(0) @binding(13) var t_hair_n: texture_3d<f32>;
-@group(0) @binding(14) var t_hair_a: texture_2d<f32>;
-@group(0) @binding(15) var t_hair_p: texture_3d<f32>;
-@group(0) @binding(16) var t_shadow: texture_depth_2d;
-@group(0) @binding(17) var samp_shadow: sampler_comparison;
-@group(0) @binding(18) var t_cam_depth: texture_depth_2d;
+@group(0) @binding(15) var t_hair_m: texture_3d<f32>;
+@group(0) @binding(16) var t_hair_n: texture_3d<f32>;
+@group(0) @binding(17) var t_hair_a: texture_2d<f32>;
+@group(0) @binding(18) var t_hair_p: texture_3d<f32>;
+@group(0) @binding(19) var t_sun_map: texture_depth_2d;
+@group(0) @binding(20) var samp_sun_map: sampler_comparison;
+@group(0) @binding(21) var t_cam_depth: texture_depth_2d;
 
 // The 3D map's scene (atmo.rs, atmo_common.wgsl): the game's atmosphere
 // as look-up tables, the exposure and the sky's ambient light. The model
@@ -73,7 +73,69 @@ struct Sticker {
 @group(0) @binding(10) var<storage, read> SCN: State;
 @group(0) @binding(11) var lin_clamp: sampler;
 
+// Sun and moon shadows (shadow.rs): four cascades from the light.
+struct Shadow {
+    mats: array<mat4x4<f32>, 4>,
+    splits: vec4<f32>,
+    texel: vec4<f32>,
+    bias: vec4<f32>,
+    // x on, y filter radius (texels), z softness
+    params: vec4<f32>,
+};
+@group(0) @binding(12) var<uniform> SH: Shadow;
+@group(0) @binding(13) var t_shadow: texture_depth_2d_array;
+@group(0) @binding(14) var samp_shadow: sampler_comparison;
+
 fn hdr() -> bool { return S.flags.x == 1u; }
+
+// How lit p is in cascade c (1 lit, 0 shadowed; -1 outside the cascade).
+fn shadow_in(p: vec3<f32>, c: u32) -> f32 {
+    let q = SH.mats[c] * vec4(p, 1.0);
+    let uv = vec2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);
+    if (any(uv < vec2(0.0)) || any(uv > vec2(1.0)) || q.z > 1.0) { return -1.0; }
+    let refd = q.z + SH.bias[c];
+    let px = 1.0 / f32(textureDimensions(t_shadow).x);
+    let rad = SH.params.y;
+    // 4x4 filter of bilinear compares, weights fall off from the centre
+    var lit = 0.0;
+    var wsum = 0.0;
+    for (var y = -1.5; y <= 1.5; y += 1.0) {
+        for (var x = -1.5; x <= 1.5; x += 1.0) {
+            let w = 1.0 - 0.15 * (abs(x) + abs(y));
+            let o = vec2(x, y) * px * rad * 0.67;
+            lit += w * textureSampleCompareLevel(t_shadow, samp_shadow, uv + o, i32(c), refd);
+            wsum += w;
+        }
+    }
+    return lit / wsum;
+}
+
+// How much of the sun (or moon) reaches world point p past the casters
+// in the shadow cascades; 1 beyond their range or with shadows off.
+fn sun_shadow(p: vec3<f32>) -> f32 {
+    if (!hdr() || SH.params.x < 0.5) { return 1.0; }
+    // view depth: the cascades split the distance along the view axis
+    let depth = (F.view_proj * vec4(p, 1.0)).w;
+    for (var c = 0u; c < 4u; c++) {
+        let far = SH.splits[c];
+        if (depth < far) {
+            var s = shadow_in(p, c);
+            if (s < 0.0) { continue; }
+            // last tenth of a cascade: blend into the next (or into lit)
+            let fade = clamp((depth - far * 0.9) / (far * 0.1), 0.0, 1.0);
+            if (fade > 0.0) {
+                var nxt = 1.0;
+                if (c < 3u) {
+                    let s2 = shadow_in(p, c + 1u);
+                    if (s2 >= 0.0) { nxt = s2; }
+                }
+                s = mix(s, nxt, fade);
+            }
+            return s;
+        }
+    }
+    return 1.0;
+}
 
 // share of a baked map tile's colour taken as the ground's reflectance
 const TILE_ALBEDO: f32 = 0.6;
@@ -90,10 +152,11 @@ fn sun_e(p: vec3<f32>) -> vec3<f32> {
     if (!hdr()) { return F.sun_col.rgb * F.sun_dir.w * 3.0; }
     let r = point_r(p);
     let l = normalize(F.sun_dir.xyz);
+    let sh = sun_shadow(p);
     if (dot(l, S.moon.xyz) > 0.99) {
-        return S.moon_dir_e.rgb * transmittance(r, S.moon.y);
+        return S.moon_dir_e.rgb * transmittance(r, S.moon.y) * sh;
     }
-    return S.sun_dir_e.rgb * transmittance(r, S.sun.y);
+    return S.sun_dir_e.rgb * transmittance(r, S.sun.y) * sh;
 }
 
 // Sky irradiance / pi on a surface facing n (ambient cube from the sky-view LUT).
@@ -751,11 +814,11 @@ fn sun_shadow_tap(wp: vec3<f32>, r: i32) -> f32 {
     let c = F.light_vp * vec4(wp, 1.0);
     let uv = c.xy * vec2(0.5, -0.5) + 0.5;
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || c.z > 1.0) { return 1.0; }
-    let px = 1.0 / f32(textureDimensions(t_shadow).x);
+    let px = 1.0 / f32(textureDimensions(t_sun_map).x);
     var s = 0.0;
     for (var y = -r; y <= r; y++) {
         for (var x = -r; x <= r; x++) {
-            s += textureSampleCompareLevel(t_shadow, samp_shadow, uv + vec2(f32(x), f32(y)) * px, c.z - 0.0012);
+            s += textureSampleCompareLevel(t_sun_map, samp_sun_map, uv + vec2(f32(x), f32(y)) * px, c.z - 0.0012);
         }
     }
     let n = f32(2 * r + 1);
@@ -772,7 +835,7 @@ fn sun_shadow_tap(wp: vec3<f32>, r: i32) -> f32 {
 // `dx`, `dy`), which is where a neighbour of nearly the same depth lies, and
 // read from the shadow map. The 3 x 3 map filter of the centre stands in for
 // whatever filters the game's buffer before this step (not read).
-fn sun_shadow(wp: vec3<f32>, dx: vec3<f32>, dy: vec3<f32>) -> f32 {
+fn model_sun_shadow(wp: vec3<f32>, dx: vec3<f32>, dy: vec3<f32>) -> f32 {
     if (F.light_vp[3][3] == 0.0) { return 1.0; }
     var s = sun_shadow_tap(wp, 1);
     for (var k = 0; k < 4; k++) {
@@ -1164,7 +1227,7 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     // 13 taps reach three times as far on strands (12 pixels), which with the many-frame accumulation of the
     // turned shadow ribbons stands in for that denoise
     let sh_k = select(1.0, 3.0, cls == 12u && i.uv1.y > 0.5);
-    let sh = sun_shadow(i.world, dpdx(i.world) * sh_k, dpdy(i.world) * sh_k);
+    let sh = model_sun_shadow(i.world, dpdx(i.world) * sh_k, dpdy(i.world) * sh_k);
     var ao_s = ao;
     // strength = max(0, I - 2 x roughness), I = 1 (the game's value in every weather and hour): no effect from
     // roughness 0.5 upward, so next to none on skin
@@ -1331,6 +1394,15 @@ fn vs_mesh(v: VIn) -> VOut {
 }
 
 // wireframe: same vertex path, flat colour, pulled towards the camera
+// Shadow casters: depth only, alpha-tested cut-outs (leaves, fences).
+@fragment
+fn fs_shadow(i: VOut) {
+    let a = M.base.a * select(1.0, textureSample(t_base, samp, i.uv0).a, (M.flags.x & 1u) != 0u);
+    if (M.flags.z == 1u && a < 0.5) {
+        discard;
+    }
+}
+
 @vertex
 fn vs_wire(v: VIn) -> VOut {
     var o = mesh_vertex(v);
@@ -1558,4 +1630,12 @@ fn fs_cell(i: COut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     }
     if (amode != 2u && cls != 5u && cls != 6u && cls != 8u) { alpha = 1.0; }
     return vec4(col, alpha);
+}
+
+@fragment
+fn fs_shadow_cell(i: COut) {
+    let a = i.base.a * textureSample(t_cell, samp, i.uv, i.lf.x).a;
+    if ((i.lf.y & 3u) == 1u && a < 0.5) {
+        discard;
+    }
 }
