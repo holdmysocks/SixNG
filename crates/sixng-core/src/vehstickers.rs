@@ -257,7 +257,7 @@ pub fn export_stickers(ws: &crate::export::Workspace, out: &std::path::Path, tex
         "failed": failed,
         "stickers": list,
     });
-    std::fs::write(dir.join("stickers.json"), serde_json::to_vec(&doc)?)?;
+    crate::atomic::write(dir.join("stickers.json"), serde_json::to_vec(&doc)?)?;
     Ok(stats)
 }
 
@@ -346,7 +346,7 @@ pub fn build(ws: &crate::export::Workspace, models: &HashMap<u32, String>, out: 
     });
     let dir = out.join("vehicles");
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("liveries.json"), serde_json::to_vec(&doc)?)?;
+    crate::atomic::write(dir.join("liveries.json"), serde_json::to_vec(&doc)?)?;
     Ok(stats)
 }
 

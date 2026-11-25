@@ -290,7 +290,7 @@ pub fn export_cloth(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], on
                 let extras = serde_json::json!({"source": e.id, "kind": "box volumes", "groups": v.groups,
                     "coordinate_system": "model space (Z-up metres) converted to glTF Y-up (x, z, -y)", "note": "oriented boxes drawn as their 12 edges"});
                 let p = dir.join(format!("{:x}.glb", e.off));
-                std::fs::write(&p, v.glb(&format!("volumes_{:x}", e.off), extras)).ok()?;
+                crate::atomic::write(&p, v.glb(&format!("volumes_{:x}", e.off), extras)).ok()?;
                 return Some((e.off, info.to_string(), true));
             }
             if !is_cloth(&r.sys) {
@@ -319,7 +319,7 @@ pub fn export_cloth(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], on
                 "coordinate_system": "model space (Z-up metres) converted to glTF Y-up (x, z, -y)",
                 "note": "edges of the verlet constraint graph drawn as lines; each set's particles follow the previous set's"});
             let p = dir.join(format!("{:x}.glb", e.off));
-            if let Err(x) = std::fs::write(&p, c.glb(&format!("cloth_{:x}", e.off), extras)) {
+            if let Err(x) = crate::atomic::write(&p, c.glb(&format!("cloth_{:x}", e.off), extras)) {
                 errors.fetch_add(1, Ordering::Relaxed);
                 return Some((e.off, serde_json::json!({"id": e.id, "error": x.to_string()}).to_string(), false));
             }
@@ -333,6 +333,6 @@ pub fn export_cloth(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], on
         s.push_str(line);
         s.push('\n');
     }
-    std::fs::write(dir.join("index.jsonl"), s)?;
+    crate::atomic::write(dir.join("index.jsonl"), s)?;
     Ok((ok, errors.load(Ordering::Relaxed)))
 }

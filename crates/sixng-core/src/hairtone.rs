@@ -118,7 +118,7 @@ impl Table {
             if let Some(d) = p.parent() {
                 let _ = std::fs::create_dir_all(d);
             }
-            let _ = std::fs::write(p, b);
+            let _ = crate::atomic::write(p, b);
         }
         Ok(t)
     }

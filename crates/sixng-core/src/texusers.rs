@@ -106,9 +106,8 @@ pub fn build(ws: &Workspace, archives: &[(ArchiveInfo, Vec<Entry>)], progress: P
     }
     let p = path(ws);
     std::fs::create_dir_all(p.parent().unwrap())?;
-    let tmp = p.with_extension("tmp");
     {
-        let f = std::fs::File::create(&tmp)?;
+        let f = crate::atomic::AtomicFile::create(&p)?;
         let mut w = std::io::BufWriter::new(flate2::write::GzEncoder::new(f, flate2::Compression::default()));
         writeln!(w, "{}", json!({"texture_users": 1, "materials": mats.len(), "models": models.len()}))?;
         for m in &mats {
@@ -118,9 +117,8 @@ pub fn build(ws: &Workspace, archives: &[(ArchiveInfo, Vec<Entry>)], progress: P
         for ((id, name, _), r) in models.iter().zip(&rows) {
             writeln!(w, "{}", json!({"id": id, "name": name, "mats": r}))?;
         }
-        w.into_inner().map_err(|e| e.into_error())?.finish()?;
+        w.into_inner().map_err(|e| e.into_error())?.finish()?.commit()?;
     }
-    std::fs::rename(&tmp, &p)?;
     let textures: std::collections::HashSet<u64> = mats.iter().flat_map(|m| m.slots.iter().map(|s| s.1)).collect();
     Ok(json!({"file": p, "models": models.len(), "materials": mats.len(), "textures": textures.len()}))
 }

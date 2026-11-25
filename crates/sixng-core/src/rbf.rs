@@ -359,7 +359,7 @@ pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], out
             match r {
                 Ok((xml, st)) => {
                     let file = format!("{:x}.xml", e.off);
-                    match std::fs::write(dir.join(&file), xml) {
+                    match crate::atomic::write(dir.join(&file), xml) {
                         Ok(()) => (serde_json::json!({"id": e.id, "name": e.name, "file": file, "stats": st}), Ok(())),
                         Err(x) => (serde_json::json!({"id": e.id, "error": x.to_string()}), Err("write failed".into())),
                     }
@@ -381,7 +381,7 @@ pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], out
         lines += &row.to_string();
         lines.push('\n');
     }
-    std::fs::write(dir.join("index.jsonl"), lines)?;
+    crate::atomic::write(dir.join("index.jsonl"), lines)?;
     Ok(s)
 }
 

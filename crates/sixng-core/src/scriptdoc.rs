@@ -187,11 +187,11 @@ pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], out
         };
         ok += 1;
         let file = format!("{:x}.xml", e.off);
-        std::fs::write(dir.join(&file), xml)?;
+        crate::atomic::write(dir.join(&file), xml)?;
         lines += &serde_json::json!({"id": e.id, "file": file, "stats": st}).to_string();
         lines.push('\n');
     }
-    std::fs::write(dir.join("index.jsonl"), lines)?;
+    crate::atomic::write(dir.join("index.jsonl"), lines)?;
     Ok((ok, bad))
 }
 
