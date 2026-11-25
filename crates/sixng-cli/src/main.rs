@@ -986,7 +986,7 @@ enum Cmd {
     /// of the viewer.
     PedLook {
         /// Model name (`cs_ali`, `player_story000_00`), or a regex starting
-        /// with `^` for one summary row per matching character (outfit
+        /// with `^` for one summary row per matching character or outfit-list model (outfit
         /// count, and whether the default outfit has a head, a body, clothes,
         /// shoes and hair).
         model: String,
@@ -1733,15 +1733,20 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             if model.starts_with('^') {
                 let re = regex::RegexBuilder::new(model).case_insensitive(true).build()?;
                 let mut rows = Vec::new();
-                for c in sixng_core::outfit::characters(&ix).into_iter().filter(|c| c.kind == "character" && re.is_match(&c.name)) {
-                    rows.push(match sixng_core::pedlook::look(&ws.game, &a, &ix, &c.name) {
+                // the characters with parts of their own, then the outfit list's other models
+                let mut names: Vec<String> = sixng_core::outfit::characters(&ix).into_iter().filter(|c| c.kind == "character").map(|c| c.name).collect();
+                let own: std::collections::HashSet<String> = names.iter().cloned().collect();
+                names.extend(sixng_core::pedlook::listed_models(&ws.game).unwrap_or_default().into_iter().map(|m| m.name).filter(|n| !own.contains(n) && !sixng_core::outfit::is_animal(n)));
+                for name in names.into_iter().filter(|n| re.is_match(n)) {
+                    let own_parts = own.contains(&name);
+                    rows.push(match sixng_core::pedlook::look(&ws.game, &a, &ix, &name) {
                         Ok(l) => {
                             let o = &l.outfits[0];
                             let has = |s: &str| o.parts.iter().any(|p| p.slot == s);
-                            json!({"model": c.name, "outfits": l.outfits.len(), "fit": l.fit, "default": o.label, "parts": o.parts.len(), "head": has("head"), "eyes": has("eyes"), "body": has("body upper") && has("body lower"),
+                            json!({"model": name, "own_parts": own_parts, "outfits": l.outfits.len(), "fit": l.fit, "default": o.label, "parts": o.parts.len(), "head": has("head"), "eyes": has("eyes"), "body": has("body upper") && has("body lower"),
                                 "clothed": has("full") || (has("top") || has("outer")) && has("bottom"), "shoes": has("feet"), "hair": o.parts.iter().filter(|p| p.slot == "hair").map(|p| p.guid.clone().unwrap_or_default()).next(), "unresolved": o.unresolved.len()})
                         }
-                        Err(e) => json!({"model": c.name, "error": e}),
+                        Err(e) => json!({"model": name, "own_parts": own_parts, "error": e}),
                     });
                 }
                 out.print(&json!({"ok": true, "count": rows.len(), "characters": rows}));
@@ -1818,21 +1823,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             use sixng_core::cutscene;
             let t = Instant::now();
             let c = cutscene::catalog(&ws, archive, *rescan, pr.clone())?;
-            // model names: every indexed archive's recovered names, and the
-            // characters `outfit` assembles (from packs)
-            let mut models = cutscene::Models::default();
-            for a in ws.archives() {
-                if !ws.is_indexed(&a) {
-                    continue;
-                }
-                let Ok(ix) = ws.load_index(&a) else { continue };
-                if a.id == "packs.rpf" {
-                    let ch = sixng_core::outfit::characters(&ix);
-                    models.add_characters(ch.iter().filter(|c| c.kind == "character").map(|c| c.name.as_str()));
-                }
-                models.add_index(&ix);
-            }
-            models.add_name_dict(&ws.work);
+            let models = cutscene::Models::of_workspace(&ws);
             let all = cutscene::scenes(&c, &models);
             let re = name.as_deref().map(|n| regex::RegexBuilder::new(n).case_insensitive(true).build()).transpose()?;
             let cre = cast.as_deref().map(|n| regex::RegexBuilder::new(n).case_insensitive(true).build()).transpose()?;

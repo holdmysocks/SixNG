@@ -240,7 +240,45 @@ pub struct ModelNames {
     pub display: BTreeMap<u32, String>,
 }
 
-const NAMES_VERSION: u32 = 3;
+const NAMES_VERSION: u32 = 4;
+
+/// The cached story cutscene catalog (`sixng cutscenes` or the Scenes tab
+/// builds it), when there is one.
+fn cutscene_catalog(work: &Path) -> Option<crate::cutscene::Catalog> {
+    let b = std::fs::read(catalog_path(work)).ok()?;
+    serde_json::from_slice::<crate::cutscene::Catalog>(&b).ok().filter(|c| c.version == crate::cutscene::CATALOG_VERSION)
+}
+
+fn catalog_path(work: &Path) -> std::path::PathBuf {
+    crate::cutscene::cache_path(&work.join("index"), crate::cutscene::STORY_ARCHIVE)
+}
+
+/// Model names from the handles of cutscene clips (`arnold_rubio`,
+/// `chart_bachelor2`): the handle, or the handle without its number, with or
+/// without `cs_`, names a listed model (`listed(joaat)`) that has no name yet.
+/// A name whose 64-bit id is also a scene file's ped model is certain; the
+/// others go to `uncertain`.
+fn names_from_scenes(c: &crate::cutscene::Catalog, listed: impl Fn(u32) -> bool, names: &mut BTreeMap<u32, String>, uncertain: &mut std::collections::BTreeSet<u32>) {
+    let peds: HashSet<u64> = c.files.iter().flat_map(|f| &f.objects).filter(|o| o.kind == "ped").filter_map(|o| o.model).collect();
+    let mut handles: Vec<String> = c.dicts.iter().flat_map(|d| &d.clips).map(|cl| crate::cutscene::split_clip_name(cl).0.to_ascii_lowercase()).collect();
+    handles.sort();
+    handles.dedup();
+    for h in &handles {
+        let base = h.trim_end_matches(|c: char| c.is_ascii_digit()).trim_end_matches('_');
+        for stem in [h.as_str(), base] {
+            for cand in [stem.to_string(), format!("cs_{stem}")] {
+                let j = joaat(&cand);
+                if !cand.contains('_') || !listed(j) || names.contains_key(&j) {
+                    continue;
+                }
+                if !peds.contains(&crate::meta7a::asset_id(&cand)) {
+                    uncertain.insert(j);
+                }
+                names.insert(j, cand);
+            }
+        }
+    }
+}
 const CHARACTER: u32 = 0x691f_01d2;
 const DISPLAY_LABEL: u32 = 0xf249_cb70;
 
@@ -313,6 +351,10 @@ fn build_names(game_root: &Path, work: &Path, t: &Models, ix: &ArchiveIndex) -> 
             }
         }
     }
+    let mut uncertain = std::collections::BTreeSet::new();
+    if let Some(c) = cutscene_catalog(work) {
+        names_from_scenes(&c, |h| keys.contains_key(&h), &mut names, &mut uncertain);
+    }
     // the name dictionary
     for &h in keys.keys() {
         if !names.contains_key(&h) {
@@ -338,7 +380,6 @@ fn build_names(game_root: &Path, work: &Path, t: &Models, ix: &ArchiveIndex) -> 
     }
     let numbered: Vec<String> = (0..10).map(|n| format!("_{n:02}")).collect();
     let mut display: BTreeMap<u32, String> = BTreeMap::new();
-    let mut uncertain = std::collections::BTreeSet::new();
     let mut grouped = |stems: &HashSet<String>, names: &mut BTreeMap<u32, String>, with_cs: bool, keep_single: bool| {
         let found: Vec<(String, u32, String, bool)> = stems
             .par_iter()
@@ -490,7 +531,7 @@ pub fn model_names(game_root: &Path) -> Result<&'static ModelNames, String> {
         let stamp = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
         if let Ok(b) = std::fs::read(&cache) {
             if let Ok(n) = serde_json::from_slice::<ModelNames>(&b) {
-                if n.version == NAMES_VERSION && stamp(&cache) >= stamp(&ixp) && stamp(&cache) >= stamp(&dxp) {
+                if n.version == NAMES_VERSION && stamp(&cache) >= stamp(&ixp) && stamp(&cache) >= stamp(&dxp) && stamp(&cache) >= stamp(&catalog_path(&work)) {
                     return Ok(n);
                 }
             }
@@ -1399,6 +1440,26 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_names_from_scene_handles() {
+        use crate::cutscene::{Catalog, FileObject, SceneDict, SceneFile, CATALOG_VERSION};
+        use crate::meta7a::asset_id;
+        let d = SceneDict { name: "cin@x_p1_t01".into(), id: "a.rpf@10".into(), clips: ["boss_face", "guard2", "lucia"].map(String::from).to_vec(), sections: 0, section_ids: vec![], adopted_sections: 0, streamed: vec![], unjoined: vec![], windows_streamed: 0, windows_missing: 0 };
+        // the scene file records the boss's model; the guard's is not recorded
+        let f = SceneFile { id: "a.rpf@20".into(), states: vec![], objects: vec![FileObject { key: joaat("boss"), kind: "ped".into(), model: Some(asset_id("cs_boss")) }] };
+        let c = Catalog { version: CATALOG_VERSION, archive: "a.rpf".into(), dicts: vec![d], files: vec![f] };
+        let listed: HashSet<u32> = ["cs_boss", "cs_guard", "player_story000_00"].iter().map(|n| joaat(n)).collect();
+        let (mut names, mut uncertain) = (BTreeMap::new(), std::collections::BTreeSet::new());
+        names.insert(joaat("player_story000_00"), "player_story000_00".to_string());
+        names_from_scenes(&c, |h| listed.contains(&h), &mut names, &mut uncertain);
+        assert_eq!(names.get(&joaat("cs_boss")).map(String::as_str), Some("cs_boss"));
+        // `guard2` without its number
+        assert_eq!(names.get(&joaat("cs_guard")).map(String::as_str), Some("cs_guard"));
+        assert_eq!(uncertain.iter().copied().collect::<Vec<_>>(), vec![joaat("cs_guard")]);
+        // `lucia` names no listed model
+        assert_eq!(names.len(), 3);
+    }
 
     #[test]
     fn model_names_from_text_and_hashes() {
