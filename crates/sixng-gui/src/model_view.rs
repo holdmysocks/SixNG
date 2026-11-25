@@ -1260,7 +1260,8 @@ impl ModelView {
             let r = (|| -> anyhow::Result<Vec<glb::Model>> {
                 let (a, ix) = index_for(&ws, "packs", &idx)?;
                 std::fs::create_dir_all(&dir)?;
-                let grooms: Vec<(u64, sixng_core::groom::Groom)> = sel.iter().map(|&off| sixng_core::groom::load(&a, &ix.entries, off).map(|g| (off, g))).collect::<anyhow::Result<_>>()?;
+                // research: SIXNG_NO_STRANDS=1 draws no strand pieces (to see the skin under them)
+                let grooms: Vec<(u64, sixng_core::groom::Groom)> = sel.iter().filter(|_| std::env::var("SIXNG_NO_STRANDS").is_err()).map(|&off| sixng_core::groom::load(&a, &ix.entries, off).map(|g| (off, g))).collect::<anyhow::Result<_>>()?;
                 let stored: usize = grooms.iter().map(|g| g.1.stored_strands()).sum();
                 let share = density * (COAT_STRANDS as f32 / stored.max(1) as f32).min(1.0);
                 let mut drawn = 0;
