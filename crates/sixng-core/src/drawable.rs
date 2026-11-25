@@ -1562,7 +1562,7 @@ mod dictionary_tests {
         original.geometries = geoms;
         original.buffers = (0..2).map(|i| GfxBuffer { struct_off: i, gfx_off: i, bytes: 0, flags: 0, kind_hint: 8, mesh_blob: None }).collect();
         original.embedded_textures = ["alpha_texture", "beta_texture", "", ""].iter().enumerate().map(|(i, name)| crate::texture::TexInfo {
-            name: name.to_string(), width: 1, height: 1, depth: 1, mips: 1, dxgi_format: 28,
+            name: name.to_string(), width: 1, height: 1, depth: 1, dimension: 1, mips: 1, dxgi_format: 28,
             format: String::new(), struct_off: if i < 2 { 0 } else { 0x1100 + (i as u64 - 2) * 0x200 },
             data_off: 0, size_field: 0, swizzle: String::new(),
         }).collect();
@@ -1607,7 +1607,7 @@ mod dictionary_tests {
         info.shaders = (0..3).map(|i| Shader { index: i, record_off: i as u64, name_hash: format!("shader{i}"), param_hashes: vec![], textures: vec![], flags: vec![], constants: vec![] }).collect();
         info.shaders[2].textures.push(TexRef { param: 0, param_hash: String::new(), hash64: String::new(), hash32: format!("{:08x}", crate::meta7a::joaat("own")) });
         info.embedded_textures = ["other", "own"].iter().map(|name| crate::texture::TexInfo {
-            name: name.to_string(), width: 1, height: 1, depth: 1, mips: 1, dxgi_format: 28,
+            name: name.to_string(), width: 1, height: 1, depth: 1, dimension: 1, mips: 1, dxgi_format: 28,
             format: String::new(), struct_off: 0, data_off: 0, size_field: 0, swizzle: String::new(),
         }).collect();
         info.shaders[2].record_off = 0xc00;
