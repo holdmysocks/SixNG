@@ -26,6 +26,11 @@ struct Mat {
     emis: vec4<f32>,      // x emissive scale of the material (from the GLB's emissive strength)
 };
 
+// rows of the part ramp image: 256 each of the first layer's palette rows,
+// the second layer's, the parts' surfaces and the parts' coats, and one row
+// with the body paint's coat
+const RAMP_ROWS: f32 = 1025.0;
+
 @group(0) @binding(0) var<uniform> F: Frame;
 @group(0) @binding(1) var<storage, read> J: array<mat4x4<f32>>;
 @group(0) @binding(2) var samp: sampler;
@@ -295,7 +300,7 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     if (M.tile.w > 1.5) {
         let g = textureSample(t_tile, samp, i.uv0).g;
         let id = floor(i.col.a * 255.0 + 0.5);
-        albedo = base.rgb * textureSampleLevel(t_em, samp, vec2(clamp(g, 0.004, 0.996), (id + 0.5) / 768.0), 0.0).rgb;
+        albedo = base.rgb * textureSampleLevel(t_em, samp, vec2(clamp(g, 0.004, 0.996), (id + 0.5) / RAMP_ROWS), 0.0).rgb;
     }
     if (M.tile.w > 0.5 && M.tile.w < 1.5) {
         let c = cos(M.tile.y);
@@ -348,6 +353,33 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
         else if (F.mode.z == 4u) { metal = F.misc3.w; rough = clamp(F.paint1.w, 0.04, 1.0); coat = F.jitter.xyz; }
         else { metal = 0.0; rough = 0.12; }
         pearl = F.paint2.rgb * F.paint2.w;
+    }
+    // The coat record of a part (rows 768.. of the part ramp image, by part
+    // id) or of the body paint (row 1024, with the vehicle's own finish):
+    // its values are in the alpha of the row's first columns. fin: x
+    // anisotropy, y sheen intensity, z film thickness; fin2: x sheen fade,
+    // y sheen reflectance, z film IOR.
+    var flake_size = F.sky_top.w;
+    var fin = vec3(0.0);
+    var fin2 = vec3(0.0);
+    var coat_row = -1;
+    if ((M.flags.w & 16384u) != 0u) {
+        if (painted) {
+            if (F.mode.z == 4u) { coat_row = 1024; }
+        } else if ((M.flags.w & 1024u) != 0u) {
+            coat_row = 768 + i32(floor(i.col.a * 255.0 + 0.5));
+        }
+    }
+    if (coat_row >= 0) {
+        coat = vec3(textureLoad(t_em, vec2(0, coat_row), 0).a, textureLoad(t_em, vec2(1, coat_row), 0).a, textureLoad(t_em, vec2(2, coat_row), 0).a * 0.25);
+        flake_size = textureLoad(t_em, vec2(3, coat_row), 0).a * 0.25;
+        // the record's base coat roughness: on the body paint only; other
+        // parts keep the roughness of their own surface (whether the game
+        // lets the coat override it there is not known)
+        let own = textureLoad(t_em, vec2(4, coat_row), 0).a;
+        if (own > 0.0 && painted) { rough = clamp(own, 0.04, 1.0); }
+        fin = vec3(textureLoad(t_em, vec2(5, coat_row), 0).a, textureLoad(t_em, vec2(6, coat_row), 0).a, textureLoad(t_em, vec2(10, coat_row), 0).a);
+        fin2 = vec3(textureLoad(t_em, vec2(7, coat_row), 0).a, textureLoad(t_em, vec2(8, coat_row), 0).a * 0.25, textureLoad(t_em, vec2(9, coat_row), 0).a * 4.0);
     }
     // Stickers placed on the vehicle (custom liveries). Like the game's
     // two-layer vehicle shader: a sticker lies on the sticker zones it
@@ -413,8 +445,8 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
         let d = textureSample(t_tile, samp, i.uv0);
         let id = floor(i.col.a * 255.0 + 0.5);
         let u = clamp(d.g, 0.004, 0.996);
-        let w1 = textureSampleLevel(t_em, samp, vec2(u, (id + 256.5) / 768.0), 0.0);
-        let m1 = textureSampleLevel(t_em, samp, vec2(u, (id + 0.5) / 768.0), 0.0).a;
+        let w1 = textureSampleLevel(t_em, samp, vec2(u, (id + 256.5) / RAMP_ROWS), 0.0);
+        let m1 = textureSampleLevel(t_em, samp, vec2(u, (id + 0.5) / RAMP_ROWS), 0.0).a;
         let k = clamp(d.b * F.jitter.w * 2.0, 0.0, 1.0);
         albedo = mix(albedo, w1.rgb, k);
         rough = clamp(mix(rough, w1.a, k), 0.04, 1.0);
@@ -474,7 +506,7 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     // highlight instead of sparkling.
     var nb = n;
     if (coat.z > 0.0 && cls != 11u) {
-        let p = i.world / (0.0006 + 0.02 * F.sky_top.w);
+        let p = i.world / (0.0006 + 0.02 * flake_size);
         let seen = clamp(1.5 - max(length(dpdx(p)), length(dpdy(p))), 0.0, 1.0);
         let c = floor(p);
         let q = fract(sin(vec3(dot(c, vec3(127.1, 311.7, 74.7)), dot(c, vec3(269.5, 183.3, 246.1)), dot(c, vec3(113.5, 271.9, 124.6)))) * 43758.5453) - 0.5;
@@ -485,10 +517,41 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let ndh = max(dot(nb, h), 0.0);
     let a2 = rough * rough * rough * rough;
     let dd = ndh * ndh * (a2 - 1.0) + 1.0;
-    let D = a2 / (3.14159 * dd * dd);
+    var D = a2 / (3.14159 * dd * dd);
+    // Anisotropy (brushed metal, carbon weave): the highlight is stretched
+    // across the surface's tangent and narrowed along it, and the mirror
+    // image of the surroundings is bent the same way.
+    var n_env = n;
+    let tan_len = length(i.tan.xyz);
+    if (fin.x > 0.0 && tan_len > 0.001) {
+        let t = normalize(i.tan.xyz - nb * dot(nb, i.tan.xyz));
+        let b = cross(nb, t);
+        let a = rough * rough;
+        let at = max(a * (1.0 + fin.x), 0.002);
+        let ab = max(a * (1.0 - fin.x), 0.002);
+        let th = dot(t, h) / at;
+        let bh = dot(b, h) / ab;
+        let ad = th * th + bh * bh + ndh * ndh;
+        D = 1.0 / (3.14159 * at * ab * ad * ad);
+        n_env = normalize(mix(n, cross(cross(b, v), b), fin.x));
+    }
     let k = (rough + 1.0) * (rough + 1.0) / 8.0;
     let G = (ndl / (ndl * (1.0 - k) + k)) * (ndv / (ndv * (1.0 - k) + k));
-    let f0 = mix(vec3(0.04), albedo, metal);
+    var f0 = mix(vec3(0.04), albedo, metal);
+    // Thin film (pearlescent paint): light mirrored at the top and at the
+    // bottom of a film interferes, so the colour of the mirror image turns
+    // with the viewing angle. The thickness is taken as micrometres. Only
+    // the colour of the reflection changes, not how much is reflected, so
+    // the paint under it keeps its colour.
+    if (fin.z > 0.0) {
+        let ior = max(fin2.z, 1.0);
+        let ct = sqrt(1.0 - (1.0 - ndv * ndv) / (ior * ior));
+        let path = 2.0 * ior * fin.z * 1000.0 * ct;
+        let wave = 0.5 + 0.5 * cos(6.28318 * path / vec3(650.0, 532.0, 450.0));
+        let tint = wave / max(dot(wave, vec3(1.0 / 3.0)), 0.05);
+        let r0 = (ior - 1.0) / (ior + 1.0);
+        f0 = f0 * mix(vec3(1.0), tint, clamp(2.0 * r0, 0.0, 1.0));
+    }
     let Fr = f0 + (1.0 - f0) * pow(1.0 - max(dot(h, v), 0.0), 5.0);
     let spec = D * G * Fr / max(4.0 * ndl * ndv, 0.001);
     let kd = (1.0 - Fr) * (1.0 - metal);
@@ -496,8 +559,16 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let amb_d = ambient(n);
     let fr_v = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
     let r = reflect(-v, n);
-    let env = environment(r, rough) * F.misc.w;
+    let env = environment(reflect(-v, n_env), rough) * F.misc.w;
     var col = direct * ao_direct + kd * albedo * amb_d * ao + env * fr_v * ao + emissive;
+    // Sheen (velvet, suede): fibres standing on the surface catch light
+    // towards the silhouette. The reflectance is the share seen head-on;
+    // the fade sets how fast it grows towards the edge.
+    if (fin.y > 0.0) {
+        let edge = pow(1.0 - ndv, 1.0 + 4.0 * fin2.x);
+        let sheen = fin.y * (fin2.y + (1.0 - fin2.y) * edge);
+        col += sheen * (F.sun_col.rgb * F.sun_dir.w * ndl * 3.0 / 3.14159 * ao_direct + amb_d * ao);
+    }
     // Clear coat: a second, glossy layer over the base coat (a dielectric,
     // 4 % at normal incidence). It mirrors the sun and the surroundings at
     // its own roughness, and what it reflects does not reach the base coat.
