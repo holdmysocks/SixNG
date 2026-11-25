@@ -30,6 +30,10 @@ pub struct TriPrim {
     /// Second raw RGBA8 stream (mesh stream 12), written as `_COLOR1`. On
     /// vehicle bodies one of its bytes is the sticker zone of the vertex.
     pub colors1: Option<Vec<[u8; 4]>>,
+    /// Raw mesh stream 13, written as `_REGION`. On people its first byte is
+    /// the region of the vertex (1 to 255) that the hide masks of clothes
+    /// address (`wardrobe::Part::hides`); the other bytes are 0 there.
+    pub regions: Option<Vec<[u8; 4]>>,
     /// Per-vertex colour (linear RGBA8) written as COLOR_0, which glTF
     /// multiplies into the base colour: the model's tint palette entry.
     pub tint: Option<Vec<[u8; 4]>>,
@@ -406,6 +410,9 @@ pub fn mesh_glb_with(name: &str, groups: &[NodeGroup], materials: &[Material], s
             }
             if let Some(c) = &p.colors1 {
                 attrs["_COLOR1"] = json!(b.rgba8(c));
+            }
+            if let Some(c) = &p.regions {
+                attrs["_REGION"] = json!(b.rgba8(c));
             }
             if let Some(t) = &p.tint {
                 attrs["COLOR_0"] = json!(b.rgba8(t));

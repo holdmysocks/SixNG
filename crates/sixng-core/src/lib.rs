@@ -1,5 +1,6 @@
 //! sixng-core: GTA VI (RPF9, Xbox Series) asset extraction core.
 pub mod anim;
+pub mod fragphys;
 pub mod cutscene;
 pub mod audio;
 pub mod audiometa;
@@ -70,6 +71,7 @@ pub mod storyflow;
 pub mod shaderfx;
 pub mod surface;
 pub mod timecycle;
+pub mod water;
 pub mod world;
 
 pub const INDEX_VERSION: &str = "8";

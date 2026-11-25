@@ -731,6 +731,22 @@ impl Jobs {
                 crate::open_path(&p);
             }
         }
+        if let Some(rows) = j.result.as_ref().and_then(index_summary) {
+            ui.label("Index");
+            egui::Grid::new("jobindex").striped(true).show(ui, |ui| {
+                for (archive, status, text, secs) in rows {
+                    ui.label(egui::RichText::new(archive).monospace().small());
+                    let col = match status.as_str() {
+                        "rescanned" | "new" => egui::Color32::from_rgb(230, 170, 90),
+                        "upgraded" | "resumed" => egui::Color32::from_rgb(120, 170, 230),
+                        _ => ui.visuals().weak_text_color(),
+                    };
+                    ui.label(egui::RichText::new(text).small().color(col));
+                    ui.label(egui::RichText::new(format!("{secs:.0} s")).small());
+                    ui.end_row();
+                }
+            });
+        }
         if let Some(r) = &j.result {
             ui.collapsing("Result", |ui| {
                 egui::ScrollArea::vertical()
@@ -759,6 +775,21 @@ impl Jobs {
     }
 }
 
+/// Per archive (archive, status, text, seconds) from a `sixng index` result,
+/// or None for other jobs.
+fn index_summary(r: &serde_json::Value) -> Option<Vec<(String, String, String, f64)>> {
+    let list = r["indexed"].as_array()?;
+    Some(
+        list.iter()
+            .map(|a| {
+                let status = a["status"].as_str().unwrap_or("").to_string();
+                let text = a["summary"].as_str().map_or_else(|| status.clone(), str::to_string);
+                (a["archive"].as_str().unwrap_or("?").to_string(), status, text, a["seconds"].as_f64().unwrap_or(0.0))
+            })
+            .collect(),
+    )
+}
+
 impl Drop for Jobs {
     fn drop(&mut self) {
         for j in self.jobs.iter_mut() {
@@ -772,6 +803,16 @@ impl Drop for Jobs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn index_result_rows() {
+        let r = serde_json::json!({"ok": true, "indexed": [
+            {"archive": "levels.rpf", "status": "upgraded", "summary": "upgraded from 6 (3 of 284 segments scanned)", "seconds": 12.5},
+            {"archive": "data.rpf", "status": "reused", "seconds": 0.1}]});
+        let rows = index_summary(&r).unwrap();
+        assert_eq!(rows[0].2, "upgraded from 6 (3 of 284 segments scanned)");
+        assert_eq!((rows[1].1.as_str(), rows[1].2.as_str()), ("reused", "reused"));
+        assert!(index_summary(&serde_json::json!({"ok": true})).is_none());
+    }
     #[test]
     fn parses_help() {
         let top = "x\n\nUsage: sixng [OPTIONS] <COMMAND>\n\nCommands:\n  info     Show archives\n  index    Build indexes\n  help     Print this\n\nOptions:\n";

@@ -255,6 +255,13 @@ impl<'a> Meta<'a> {
 
     /// Decode the scalar fields of an object (arrays/pointers/structs skipped).
     pub fn scalars(&self, hash: u32, o: usize, skip: &[u32]) -> BTreeMap<String, serde_json::Value> {
+        self.scalars_by_hash(hash, o, skip).into_iter().map(|(h, v)| (field_name(h), v)).collect()
+    }
+
+    /// Like [`Meta::scalars`], keyed by the member's name hash. Readers that
+    /// pick fields by hash use this one, so a newly resolved field name does
+    /// not change what they find.
+    pub fn scalars_by_hash(&self, hash: u32, o: usize, skip: &[u32]) -> BTreeMap<u32, serde_json::Value> {
         let mut out = BTreeMap::new();
         let Some(sd) = self.structs.get(&hash) else { return out };
         let r = self.r;
@@ -276,7 +283,7 @@ impl<'a> Meta<'a> {
                 0x08 | 0x4f => serde_json::json!(format!("{:016x}", r.u64(p))),
                 _ => continue,
             };
-            out.insert(field_name(m.hash), v);
+            out.insert(m.hash, v);
         }
         out
     }
@@ -291,6 +298,8 @@ impl<'a> Meta<'a> {
             0x14 | 0x15 | 0x4a | 0x21 => 4,
             0x31 | 0x32 | 0x33 | 0x34 => 16,
             0x08 | 0x4f | 0x07 | 0x4d => 8,
+            // An array of arrays: each element is a 16-byte array header.
+            0x52 => 16,
             0x05 => self.structs.get(&el.extra).map(|x| x.size as usize).unwrap_or(0),
             _ => 0,
         }
@@ -355,8 +364,13 @@ impl<'a> Meta<'a> {
                 }
                 json!((0..n).filter_map(|i| self.object(h, base + i * esz, depth + 1)).collect::<Vec<_>>())
             }
-            // Bit set / flags (PSO, 16 bytes): the first 64 bits.
-            0x65 => json!(format!("{:016x}", r.u64(p))),
+            // Bit set / flags: `reference` bits, stored as 64-bit words, lowest
+            // first. Printed as one hex number (16 digits per word, highest
+            // word first), so a set of up to 64 bits is its single word.
+            0x65 => {
+                let words = (m.reference as usize).div_ceil(64).clamp(1, 16);
+                json!((0..words).rev().map(|w| format!("{:016x}", r.u64(p + 8 * w))).collect::<String>())
+            }
             // Tagged value (PSO, 16 bytes): u32 tag, then payload.
             0x62 => json!({"tag": r.u32(p), "u32": [r.u32(p + 4), r.u32(p + 8), r.u32(p + 12)], "f32": [r.f32(p + 4), r.f32(p + 8), r.f32(p + 12)]}),
             // 64-bit hash (PSO).
@@ -409,6 +423,14 @@ impl<'a> Meta<'a> {
             }
         }
         Some(serde_json::Value::Object(out))
+    }
+
+    /// One member of an object (by member name hash), decoded like
+    /// [`Meta::object`] does: arrays, pointers and embedded structs followed.
+    pub fn member_value(&self, hash: u32, o: usize, member: u32) -> Option<serde_json::Value> {
+        let sd = self.structs.get(&hash)?;
+        let m = sd.members.iter().find(|m| m.hash == member)?;
+        self.value(sd, m, o + m.off as usize, 0)
     }
 
     /// Schema: struct hash -> size, instance count, members as hash:type:extra.

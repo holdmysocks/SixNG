@@ -431,7 +431,7 @@ enum Cmd {
         #[command(flatten)]
         filter: FilterArgs,
     },
-    /// Light emitters from archetype/entity light extensions, placed in world space: <out>/lights/<archive>/.
+    /// Light emitters from archetype/entity light extensions, placed in world space, plus the map files' distant / LOD lights and timecycle modifier regions: <out>/lights/<archive>/.
     Lights {
         /// Archive (default levels).
         #[arg(default_value = "levels")]
@@ -688,6 +688,35 @@ enum Cmd {
         /// Map bake folder (<work>/map) to compare against.
         #[arg(long)]
         check: Option<PathBuf>,
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
+    /// Water system export: the water fog atlas (scattering and extinction,
+    /// textures.rpf), the water height map and the shoreline wave grid
+    /// (levels.rpf), each placed on its 32 x 66 grid of 512 m cells; the
+    /// grid definitions, ocean and shore-wave settings of common.rpf as
+    /// JSON; and every water_* timecycle key. Tiles are placed by aligning
+    /// their stored order with the decimal-string order of the cell numbers
+    /// against each grid's fallback texture, then checked by edge
+    /// continuity. Prints the counts and checks. With -o writes
+    /// <out>/water/: grids.json, timecycle_water.json, settings/*.json,
+    /// fog/ (scattering.f32, extinction.f32, cells.json with the terms per
+    /// cell, previews), height/ (height.png, cells.json) and shore/
+    /// (tiles/<cell>.png, mosaic.png, cells.json). Needs the common,
+    /// textures and levels indexes.
+    Water {
+        /// Fog mosaic texels per cell (tiles have 128).
+        #[arg(long, default_value_t = 32)]
+        fog_px: usize,
+        /// Height mosaic texels per cell (tiles have 512, 1 m each).
+        #[arg(long, default_value_t = 128)]
+        height_px: usize,
+        /// Shore mosaic texels per cell (tiles have 256).
+        #[arg(long, default_value_t = 32)]
+        shore_px: usize,
+        /// Also write each height tile at full resolution (height/tiles/).
+        #[arg(long)]
+        height_tiles: bool,
         #[arg(long, short)]
         out: Option<PathBuf>,
     },
@@ -1152,9 +1181,13 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 let p2 = pr.clone();
                 let id = a.id.clone();
                 let pa: Progress = Arc::new(move |s, d, tot| p2(&format!("{id}:{s}"), d, tot));
-                let ix = ws.ensure_index(&a, *force, !*no_names, pa)?;
+                let (ix, how) = ws.ensure_index_report(&a, *force, !*no_names, pa)?;
                 let named = ix.entries.iter().filter(|e| e.name.is_some()).count();
-                res.push(json!({"archive": a.id, "seconds": t.elapsed().as_secs_f64(), "stats": ix.stats, "named_entries": named}));
+                if !cli.quiet {
+                    eprintln!("{}: {}", a.id, how.summary());
+                }
+                res.push(json!({"archive": a.id, "status": how.status, "summary": how.summary(), "outcome": how,
+                    "seconds": t.elapsed().as_secs_f64(), "stats": ix.stats, "named_entries": named}));
             }
             out.print(&json!({"ok": true, "indexed": res}));
         }
@@ -1419,6 +1452,13 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                                             o.insert(key.into(), json!(v));
                                         }
                                     }
+                                    // what the pass binds, by name hash
+                                    if let Some(b) = &ps.bindings {
+                                        let l = |x: &[u32]| x.iter().map(|&h| named(h)).collect::<Vec<_>>();
+                                        o.insert("bindings".into(), json!({"read": l(&b.read), "written": l(&b.written), "third": l(&b.third), "constant_buffers": l(&b.cbuffers), "word": b.word.map(|w| format!("{w:08x}"))}));
+                                    }
+                                    o.insert("blocks".into(), json!(ps.blocks()));
+                                    o.insert("tail".into(), json!(ps.tail.iter().map(|b| format!("{b:02x}")).collect::<String>()));
                                     serde_json::Value::Object(o)
                                 })
                                 .collect();
@@ -1428,10 +1468,29 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     let hex = |items: &[Vec<u8>]| items.iter().map(|x| x.iter().map(|b| format!("{b:02x}")).collect::<String>()).collect::<Vec<_>>();
                     v["database"] = json!(e.database);
                     v["states"] = json!({"rasterizer": hex(&e.states.rasterizer), "depth_stencil": hex(&e.states.depth_stencil), "blend": hex(&e.states.blend), "samplers": hex(&e.states.samplers)});
-                    v["blocks"] = e.blocks.iter().map(|b| match b {
-                        shaderfx::Block::Inline(_, len) => json!({"bytes": len}),
-                        shaderfx::Block::Shared(key) => json!({"shared": format!("{key:08x}"), "bytes": sh.databases[e.database].shared_block(*key).map(|i| sh.databases[e.database].shared_blocks[i].1)}),
+                    // the state items read as Direct3D 11 state descriptions (one byte per field)
+                    v["states_read"] = json!({
+                        "rasterizer": e.states.rasterizer.iter().map(|x| shaderfx::rasterizer_state(x).map(|(fill, cull)| json!({"fill": fill, "cull": *["?", "none", "front", "back"].get(cull as usize).unwrap_or(&"?")}))).collect::<Vec<_>>(),
+                        "depth_stencil": e.states.depth_stencil.iter().map(|x| shaderfx::depth_stencil_state(x).map(|d| {
+                            let face = |f: [u8; 4]| json!({"fail": shaderfx::stencil_op(f[0]), "depth_fail": shaderfx::stencil_op(f[1]), "pass": shaderfx::stencil_op(f[2]), "func": shaderfx::comparison(f[3])});
+                            json!({"depth": d.depth, "depth_write": d.depth_write, "depth_func": shaderfx::comparison(d.depth_func), "stencil": d.stencil, "stencil_read_mask": d.stencil_read_mask, "stencil_write_mask": d.stencil_write_mask, "front": face(d.faces[0]), "back": face(d.faces[1])})
+                        })).collect::<Vec<_>>(),
+                        "blend": e.states.blend.iter().map(|x| shaderfx::blend_state(x).map(|(a2c, independent, t)| {
+                            // without independent blend only the first target applies
+                            let targets: Vec<_> = t.iter().take(if independent { 8 } else { 1 }).map(|t| json!({"enable": t.enable, "src": shaderfx::blend_factor(t.src), "dst": shaderfx::blend_factor(t.dst), "op": shaderfx::blend_op(t.op),
+                                "src_alpha": shaderfx::blend_factor(t.src_alpha), "dst_alpha": shaderfx::blend_factor(t.dst_alpha), "op_alpha": shaderfx::blend_op(t.op_alpha), "mask": t.mask})).collect();
+                            json!({"alpha_to_coverage": a2c, "independent": independent, "targets": targets})
+                        })).collect::<Vec<_>>(),
+                        "samplers": e.states.samplers.iter().map(|x| shaderfx::sampler_state(x).map(|s| json!({"address": s.address, "lod_bias": s.lod_bias, "anisotropy": s.anisotropy, "comparison": shaderfx::comparison(s.comparison), "filter": format!("{:02x}", s.filter), "border": s.border, "min_lod": s.min_lod, "max_lod": s.max_lod}))).collect::<Vec<_>>(),
+                    });
+                    let layout = |l: Option<&shaderfx::Layout>| l.map(|l| json!({"id": format!("{:016x}", l.id), "header": l.header.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        "entries": l.entries.iter().map(|x| json!({"hash": format!("{:08x}", x.name), "name": lookup(x.name, Ctx::Param), "kind": format!("{:02x}{:02x}", x.kind[0], x.kind[1]), "slot": x.slot})).collect::<Vec<_>>()}));
+                    let db = &sh.databases[e.database];
+                    v["blocks"] = e.blocks.iter().zip(&e.layouts).map(|(b, l)| match b {
+                        shaderfx::Block::Inline(_, len) => json!({"bytes": len, "read": layout(l.as_ref())}),
+                        shaderfx::Block::Shared(key) => json!({"shared": format!("{key:08x}"), "bytes": db.shared_block(*key).map(|i| db.shared_blocks[i].1), "read": layout(db.shared_block(*key).and_then(|i| db.shared_layouts[i].as_ref()))}),
                     }).collect();
+                    v["second_table"] = json!(e.second.as_ref().map(|t| t.resources.iter().map(|r| named(r.name)).collect::<Vec<_>>()));
                     if let Some(t) = &e.table {
                         let mut textures: Vec<_> = t.resources.iter().filter_map(|r| Some((r.material_texture()?, r))).collect();
                         textures.sort_by_key(|x| x.0 .0);
@@ -1451,6 +1510,13 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 "effects": {"stated": sh.effects_stated(), "read": sh.effects.len(), "loaded_size_matches": sh.effects.iter().filter(|e| e.loaded_size == e.loaded_size_computed).count(),
                     "state_items": {"rasterizer": sh.effects.iter().map(|e| e.states.rasterizer.len()).sum::<usize>(), "depth_stencil": sh.effects.iter().map(|e| e.states.depth_stencil.len()).sum::<usize>(), "blend": sh.effects.iter().map(|e| e.states.blend.len()).sum::<usize>(), "samplers": sh.effects.iter().map(|e| e.states.samplers.len()).sum::<usize>()},
                     "pass_state_index_out_of_range": sh.effects.iter().map(|e| e.techniques.iter().flat_map(|t| &t.passes).filter(|ps| ps.rasterizer().is_some_and(|i| i as usize >= e.states.rasterizer.len()) || ps.depth_stencil().is_some_and(|i| i as usize >= e.states.depth_stencil.len()) || ps.blend().is_some_and(|i| i as usize >= e.states.blend.len())).count()).sum::<usize>(),
+                    "passes_with_bindings": sh.effects.iter().flat_map(|e| &e.techniques).flat_map(|t| &t.passes).filter(|ps| ps.bindings.is_some()).count(),
+                    "passes_with_binding_word": sh.effects.iter().flat_map(|e| &e.techniques).flat_map(|t| &t.passes).filter(|ps| ps.bindings.as_ref().is_some_and(|b| b.word.is_some())).count(),
+                    "pass_block_index_out_of_range": sh.effects.iter().map(|e| e.techniques.iter().flat_map(|t| &t.passes).filter(|ps| ps.blocks().iter().flatten().any(|&i| i as usize >= e.blocks.len())).count()).sum::<usize>(),
+                    "second_table_one_buffer": sh.effects.iter().filter(|e| e.second.as_ref().is_some_and(|t| t.resources.len() == 1 && t.members.is_empty())).count(),
+                    "blocks_inline_read": sh.effects.iter().flat_map(|e| &e.layouts).flatten().count(),
+                    "members_with_default": sh.effects.iter().filter_map(|e| e.table.as_ref()).chain(sh.databases.iter().filter_map(|d| d.table.as_ref())).chain(sh.programs.iter().map(|p| &p.table)).map(|t| (0..t.members.len()).filter(|&i| t.member_default(i).is_some()).count()).sum::<usize>(),
+                    "resources_with_entry": sh.effects.iter().filter_map(|e| e.table.as_ref()).chain(sh.databases.iter().filter_map(|d| d.table.as_ref())).chain(sh.programs.iter().map(|p| &p.table)).map(|t| (0..t.resources.len()).filter(|&i| t.resource_entry(i).is_some()).count()).sum::<usize>(),
                     "blocks_inline": sh.effects.iter().flat_map(|e| &e.blocks).filter(|b| matches!(b, shaderfx::Block::Inline(..))).count(),
                     "blocks_shared": sh.effects.iter().flat_map(|e| &e.blocks).filter(|b| matches!(b, shaderfx::Block::Shared(_))).count(),
                     "blocks_shared_unresolved": sh.effects.iter().map(|e| e.blocks.iter().filter(|b| matches!(b, shaderfx::Block::Shared(k) if sh.databases[e.database].shared_block(*k).is_none())).count()).sum::<usize>(), "with_table": sh.effects.iter().filter(|e| e.table.is_some()).count(),
@@ -2100,8 +2166,9 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             let sel: Vec<_> = f.select(&ix)?.into_iter().filter(|e| e.sub == "7a").collect();
             let t = Instant::now();
-            let (sets, lights, placed) = export::export_lights(&ws, &a, &sel, po, pr)?;
+            let (sets, lights, placed, (tc, distant, lod)) = export::export_lights(&ws, &a, &sel, po, pr)?;
             out.print(&json!({"ok": true, "archive": a.id, "scanned": sel.len(), "light_sets": sets, "lights": lights, "placed_lights": placed,
+                "distant_lights": distant, "unpaired_lod_lights": lod, "timecycle_modifier_regions": tc,
                 "seconds": t.elapsed().as_secs_f64(), "dir": po.join("lights").join(a.id.trim_end_matches(".rpf"))}));
         }
         Cmd::FindU32 { archive, values, filter } => {
@@ -2593,6 +2660,16 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 res["out"] = json!(dir);
             }
             out.print(&json!({"ok": true, "result": res}));
+        }
+        Cmd::Water { fog_px, height_px, shore_px, height_tiles, out: po } => {
+            for (n, v, max) in [("--fog-px", *fog_px, 128), ("--height-px", *height_px, 512), ("--shore-px", *shore_px, 256)] {
+                if v == 0 || max % v != 0 {
+                    anyhow::bail!("{n} {v}: must divide {max}");
+                }
+            }
+            let o = sixng_core::water::Options { fog_px: *fog_px, height_px: *height_px, shore_px: *shore_px, height_tiles: *height_tiles };
+            let r = sixng_core::water::export(&ws, po.as_deref(), &o)?;
+            out.print(&json!({"ok": true, "result": r}));
         }
         Cmd::SectorGrid { archive, entry, cell_m, out: po } => {
             use sixng_core::sectorgrid as sg;

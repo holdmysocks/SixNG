@@ -56,8 +56,8 @@ pub fn run_step(ws: &Workspace, step: &str, out: &Path, pr: Progress) -> Result<
                     Ok(format!("lane graph: {n} nodes, {l} links ({bad} unresolved)"))
                 }
                 "lights" => {
-                    let (sets, lights, placed) = export::export_lights(ws, &levels, &sel_meta(&ix.entries), out, pr)?;
-                    Ok(format!("lights: {sets} sets, {lights} lights, {placed} placed"))
+                    let (sets, lights, placed, (tc, distant, lod)) = export::export_lights(ws, &levels, &sel_meta(&ix.entries), out, pr)?;
+                    Ok(format!("lights: {sets} sets, {lights} lights, {placed} placed, {distant} distant, {lod} unpaired LOD, {tc} timecycle modifier regions"))
                 }
                 "interiors" => {
                     let (n, ok, m) = export::export_interiors(&levels, &sel_meta(&ix.entries), &ix.entries, out, pr)?;
