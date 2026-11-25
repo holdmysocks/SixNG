@@ -58,24 +58,37 @@ impl Workspace {
     }
     /// Build (or load) the index and run the name pass.
     pub fn ensure_index(&self, a: &ArchiveInfo, force: bool, names: bool, progress: Progress) -> Result<ArchiveIndex> {
+        Ok(self.ensure_index_report(a, force, names, progress)?.0)
+    }
+    /// [`Self::ensure_index`], also saying whether the index was reused,
+    /// upgraded from an older version or scanned. After an upgrade only the
+    /// entries whose names could not be kept get the name pass.
+    pub fn ensure_index_report(&self, a: &ArchiveInfo, force: bool, names: bool, progress: Progress) -> Result<(ArchiveIndex, scan::IndexOutcome)> {
         let p2 = progress.clone();
-        let pf: Arc<scan::ProgressFn> = Arc::new(move |d, t| p2("scan", d, t));
-        let mut ix = scan::build_index(&a.path, &a.id, &self.index_dir(), force, Some(pf))?;
+        let pf: Arc<scan::StageProgressFn> = Arc::new(move |s, d, t| p2(s, d, t));
+        let (mut ix, outcome) = scan::build_index_report(&a.path, &a.id, &self.index_dir(), force, Some(pf))?;
         if names && !ix.names_done {
-            recover_names(&a.path, &mut ix, progress)?;
+            let only = (!outcome.names_todo.is_empty()).then_some(outcome.names_todo.as_slice());
+            recover_names_of(&a.path, &mut ix, only, progress)?;
             scan::save_index(&self.index_dir(), &ix)?;
         }
-        Ok(ix)
+        Ok((ix, outcome))
     }
 }
 
 /// Load each resource's system page and recover name / type.
 pub fn recover_names(archive: &Path, ix: &mut ArchiveIndex, progress: Progress) -> Result<()> {
+    recover_names_of(archive, ix, None, progress)
+}
+
+/// [`recover_names`] for the entries `only` (indices into `entries`; the
+/// others keep their names), or every resource when `None`.
+pub fn recover_names_of(archive: &Path, ix: &mut ArchiveIndex, only: Option<&[usize]>, progress: Progress) -> Result<()> {
     let idx: Vec<usize> = ix
         .entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| matches!(e.kind, Kind::RageObj | Kind::Resource))
+        .filter(|(i, e)| matches!(e.kind, Kind::RageObj | Kind::Resource) && only.map_or(true, |o| o.binary_search(i).is_ok()))
         .map(|(i, _)| i)
         .collect();
     let total = idx.len() as u64;
