@@ -202,6 +202,13 @@ pub fn paint_block() -> Value {
 /// its emissive map (or lit colour map) is.
 pub const EMISSIVE_MULTIPLIER_PARAM: &str = "5eebed48";
 
+/// The colour of the light (float3, linear), the constant right after
+/// `emissivemultiplier` in the emissive shaders' buffer. Its name is not
+/// recovered. Neon tubes carry their colour here (light blue, red, green,
+/// yellow) over a white emissive map; LEDs with the colour in the map have
+/// white.
+pub const EMISSIVE_TINT_PARAM: &str = "7ab0fd74";
+
 /// The game's `emissivemultiplier` per glTF unit of emissive strength. The
 /// values read like luminance in nits (5 on glass railings, about 600 on a
 /// bulb, about 3200 on an LED sign), so 1.0 in the glTF is 100 nits: about
@@ -230,6 +237,9 @@ pub struct EmissiveStrength {
     pub multiplier: Option<f32>,
     /// The glTF strength: emissiveFactor x KHR_materials_emissive_strength.
     pub strength: f32,
+    /// The light's colour (`EMISSIVE_TINT_PARAM`), when the material has
+    /// one that is finite, not negative and not black.
+    pub tint: Option<[f32; 3]>,
     /// `multiplier` (the multiplier divided by the unit), `default` (no
     /// multiplier: strength 1), `runtime` (multiplier 0: strength 1) or
     /// `capped` (over [`EMISSIVE_MAX_STRENGTH`]).
@@ -250,12 +260,29 @@ impl EmissiveStrength {
             Some(m) if m == 0.0 => (1.0, "runtime"),
             _ => (1.0, "default"),
         };
-        EmissiveStrength { multiplier: multiplier.filter(|m| m.is_finite()), strength, source }
+        EmissiveStrength { multiplier: multiplier.filter(|m| m.is_finite()), strength, source, tint: None }
     }
 
-    /// The glTF `emissiveFactor` (grey, at most 1).
+    /// The light's colour from the tint constant's components.
+    pub fn with_tint(mut self, tint: Option<&[f32]>) -> Self {
+        self.tint = tint
+            .filter(|t| t.len() >= 3)
+            .map(|t| [t[0], t[1], t[2]])
+            .filter(|t| t.iter().all(|x| x.is_finite() && *x >= 0.0) && t.iter().any(|x| *x > 0.001));
+        self
+    }
+
+    /// The grey part of the glTF `emissiveFactor` (at most 1).
     pub fn factor(&self) -> f32 {
         self.strength.min(1.0)
+    }
+
+    /// The glTF `emissiveFactor`: the tint (white without one) times
+    /// [`Self::factor`].
+    pub fn factor_rgb(&self) -> [f32; 3] {
+        let t = self.tint.unwrap_or([1.0; 3]);
+        let f = self.factor();
+        [t[0] * f, t[1] * f, t[2] * f]
     }
 
     /// `KHR_materials_emissive_strength.emissiveStrength`, when above 1.
@@ -265,8 +292,7 @@ impl EmissiveStrength {
 
     /// Set the emissive factor and extension of a glTF material that lights.
     pub fn apply(&self, m: &mut Value) {
-        let f = self.factor();
-        m["emissiveFactor"] = json!([f, f, f]);
+        m["emissiveFactor"] = json!(self.factor_rgb());
         match self.extension() {
             Some(s) => m["extensions"]["KHR_materials_emissive_strength"] = json!({"emissiveStrength": s}),
             None => {
@@ -279,7 +305,7 @@ impl EmissiveStrength {
 
     /// The record written to model.json, materials.json and the GLB extras.
     pub fn json(&self) -> Value {
-        json!({"multiplier": self.multiplier, "strength": self.strength, "source": self.source})
+        json!({"multiplier": self.multiplier, "strength": self.strength, "source": self.source, "tint": self.tint})
     }
 }
 
@@ -1176,6 +1202,14 @@ mod paint_tests {
         let e = EmissiveStrength::from_multiplier(Some(50_000.0));
         assert_eq!((e.source, e.strength, e.extension()), ("capped", EMISSIVE_MAX_STRENGTH, Some(EMISSIVE_MAX_STRENGTH)));
         assert_eq!(e.json()["multiplier"], json!(50_000.0));
+        // tint: a dim tinted light keeps its colour in the factor; black,
+        // negative or short tints are ignored
+        let e = EmissiveStrength::from_multiplier(Some(50.0)).with_tint(Some(&[0.2, 0.4, 1.0]));
+        assert_eq!(e.factor_rgb(), [0.1, 0.2, 0.5]);
+        assert_eq!(e.json()["tint"], json!([0.2f32, 0.4f32, 1.0f32]));
+        for t in [&[0.0f32, 0.0, 0.0][..], &[-1.0, 0.5, 0.5], &[0.5, 0.5], &[f32::NAN, 1.0, 1.0]] {
+            assert_eq!(EmissiveStrength::from_multiplier(Some(50.0)).with_tint(Some(t)).tint, None, "{t:?}");
+        }
     }
 
     #[test]
