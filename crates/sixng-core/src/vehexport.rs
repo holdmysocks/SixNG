@@ -606,7 +606,7 @@ pub fn list_parts(ix: &ArchiveIndex, vehicle: &Value) -> Value {
                     by_a.or_else(|| hex32(&e["model"]).and_then(|h| by_hash.get(&h))).map_or(Value::Null, |s| json!(s))
                 })
                 .collect();
-            json!({"part": m["name"], "slot": m["slot"], "shared": m["shared"] == true, "configurations": hex32(&m["name"]).and_then(|h| used.get(&h)).copied().unwrap_or(0), "models": models})
+            json!({"part": m["name"], "slot": m["slot"], "slot_name": hex32(&m["slot"]).and_then(crate::vehicles::mod_slot_name), "shared": m["shared"] == true, "configurations": hex32(&m["name"]).and_then(|h| used.get(&h)).copied().unwrap_or(0), "models": models})
         })
         .collect();
     out.sort_by(|a, b| a["slot"].as_str().cmp(&b["slot"].as_str()).then(a["part"].as_str().cmp(&b["part"].as_str())));
