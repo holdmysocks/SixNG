@@ -872,7 +872,10 @@ pub fn find_bank_names(d: &Dict, extra: &[String], banks: &BTreeMap<u64, u32>, s
 /// after the bank's audio pack without `core.`, alone or with one more
 /// `.`-part (`props`, `resident.combat`); every pack with every identifier
 /// of letters and `_` is tried, and the shortest match kept. On audio.rpf
-/// 48 of 64 groups get a name.
+/// 48 of 64 groups get a name. The parents of each pack (`speech` of
+/// `core.speech.ped`) and the identifiers alone are tried too: the story
+/// pack's two largest groups are `speech.scripted` and `cutscene`, whose
+/// packs are not in the sound files.
 pub fn find_group_names(packs: &[String], words: &[String], groups: &std::collections::HashSet<u32>) -> HashMap<u32, String> {
     let mut out: HashMap<u32, String> = HashMap::new();
     let mut put = |h: u32, n: String| {
@@ -881,7 +884,15 @@ pub fn find_group_names(packs: &[String], words: &[String], groups: &std::collec
         }
     };
     let words: Vec<&String> = words.iter().filter(|w| w.len() <= 24 && w.bytes().all(|c| c.is_ascii_lowercase() || c == b'_')).collect();
+    for w in &words {
+        put(joaat_fin(joaat_step(0, w.as_bytes())), w.to_string());
+    }
+    let mut prefixes: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for p in packs.iter().filter_map(|p| p.strip_prefix("core.")) {
+        prefixes.insert(p);
+        prefixes.extend(p.match_indices('.').map(|(i, _)| &p[..i]));
+    }
+    for p in prefixes {
         let h0 = joaat_step(0, p.as_bytes());
         put(joaat_fin(h0), p.to_string());
         let h1 = joaat_step(h0, b".");
@@ -1156,6 +1167,10 @@ mod tests {
         let groups: BTreeMap<u32, u32> = banks.values().map(|c| (*c, g)).collect();
         let (packs, words) = audio_words(&d, &[]);
         assert_eq!(find_group_names(&packs, &words, &[g].into_iter().collect())[&g], "pack.sub");
+        // a bare word, and a word after a pack's parent
+        let gs = [h("horn"), h("core.bell")];
+        let gn = find_group_names(&["core.core.pack".to_string()], &words, &gs.into_iter().collect());
+        assert_eq!((gn[&gs[0]].as_str(), gn[&gs[1]].as_str()), ("horn", "core.bell"));
         let found: Vec<(u64, String)> = find_bank_names(&d, &[], &banks, &BTreeMap::new(), &groups).into_iter().map(|(o, _, n)| (o, n)).collect();
         // `lone_07` has no second suffix and no plain bank: not kept
         assert_eq!(found, [(0x1000, "core.pack/bell".into()), (0x3000, "core.pack/horn_01".into()), (0x5000, "core.pack/horn_02".into()), (0x8000, "core.pack/bell_b".into())]);
