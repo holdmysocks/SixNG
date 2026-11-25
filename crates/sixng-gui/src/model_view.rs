@@ -1095,8 +1095,10 @@ impl ModelView {
                         let base = if g.width > 0.0 { g.width } else { 0.0003 };
                         let w = (base / share.max(1e-3)).clamp(base, 0.004) * width_scale;
                         let var = |s: usize| (coat.variants.get(s).copied().unwrap_or(0) & 3) as usize;
-                        // with the game's tables the strand keeps its own width; only a reduced strand count widens it
-                        let share_widen = (1.0 / share.max(1e-3)).min(4.0);
+                        // with the game's tables the strand keeps its own width (Thickness x curve): the game's divisor on it
+                        // reads as 1 in the normal state (its per-instance scale is not fully read), and drawing fewer
+                        // strands does not widen the rest
+                        let share_widen = 1.0f32;
                         if std::env::var("SIXNG_DEBUG_HAIR").is_ok() { let mut h = [0usize; 4]; for s in 0..coat.guides.len() { h[var(s)] += 1; } let mut st: std::collections::BTreeMap<[u8; 4], usize> = Default::default(); for p in &g.pick_steps { *st.entry(*p).or_default() += 1; } eprintln!("coat {off:x}: stored {} k {} share {share:.3} width {:.2} mm (base {:.2} mm) tint weight {:.3} variants {h:?} thresholds {:?}", g.stored_strands(), k, w * 1000.0, base * 1000.0, g.tint_weight, st.iter().take(6).collect::<Vec<_>>()); }
                         // the atlas colour is stored sRGB-encoded: the linear base colour is its sRGB decode
                         let lin8 = |c: [f32; 3], m: [u8; 3]| -> [u8; 4] { [0, 1, 2].map(|q| ({ let x = c[q].clamp(0.0, 1.0); if x < 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) } } * m[q] as f32 + 0.5) as u8).iter().copied().chain([255u8]).collect::<Vec<u8>>().try_into().unwrap() };
