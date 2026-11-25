@@ -678,6 +678,7 @@ mod tests {
             detail: None,
             ramp_u: None,
             wear_mask: None,
+            primer_mask: None,
             ramp: None,
             parts: false,
             occlusion_only: false,

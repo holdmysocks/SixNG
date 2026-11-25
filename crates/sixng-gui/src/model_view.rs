@@ -3083,6 +3083,7 @@ impl ModelView {
         let wear_key = self.part_look_want.clone().unwrap_or_default();
         let part_wears = part_wear(&pc["wear_records"], idx as usize, self.part_look_want.as_deref());
         self.look.wear_levels = part_wears.is_some();
+        let primer_surface = primer_surface(&pc["wear_records"]["global"]);
         // the coat of this look's body paint (clear coat, flakes)
         let coat = &pc["coat"];
         let record = coat["paint_by_look"][idx].as_u64().map(|k| &coat["records"][k as usize]).filter(|r| r.is_object());
@@ -3163,14 +3164,24 @@ impl ModelView {
                         px[(768 + id) * 512..(769 + id) * 512].copy_from_slice(&coat_row(own));
                         // column 11 of the coat row: the part id's wear amount
                         let pw = part_wears.as_ref().map_or(PartWear::default(), |w| w[id]);
-                        for x in (11..128).step_by(16) {
-                            px[(768 + id) * 512 + x * 4 + 3] = pw.amount;
-                        }
+                        px[(768 + id) * 512 + 11 * 4 + 3] = pw.amount;
                         // columns 16 to 24 (read by textureLoad, not
                         // repeated): per wear mask channel the scale, the
                         // window start and the window width
                         for (c, v) in pw.scale.iter().chain(&pw.start).chain(&pw.width).enumerate() {
                             px[(768 + id) * 512 + (16 + c) * 4 + 3] = *v;
+                        }
+                        // columns 25 to 33: the primer's scale per channel,
+                        // cross byte, window start and width, mask switch,
+                        // and the library's primer roughness and metalness
+                        let primer = [pw.primer[0], pw.primer[1], pw.primer[2], pw.primer_cross, pw.primer_start, pw.primer_width, if pw.primer_on_wear_mask { 255 } else { 0 }, primer_surface[0], primer_surface[1]];
+                        for (c, v) in primer.iter().enumerate() {
+                            px[(768 + id) * 512 + (25 + c) * 4 + 3] = *v;
+                        }
+                        // columns 34 to 45: the bias and gamma of the first
+                        // layer, then of the primer, per channel
+                        for (c, v) in pw.bias.iter().chain(&pw.gamma).chain(&pw.primer_bias).chain(&pw.primer_gamma).enumerate() {
+                            px[(768 + id) * 512 + (34 + c) * 4 + 3] = *v;
                         }
                         let stored = surfaces.and_then(|s| hex4(&s[id * 8..id * 8 + 8]));
                         let s = patched_surf.iter().rev().find(|p| p.0 == id).map(|p| p.1).or(stored).unwrap_or_else(|| surface_of_code(look[id][3]));
@@ -4569,6 +4580,10 @@ impl ModelView {
                 ui.checkbox(&mut self.look.wear_from_config, "wear from the configuration")
                     .on_hover_text("Each part shows wear as the game works it out: the vehicle's configuration gives the part a wear level (0 new to 5 worn out), which picks a wear preset. Its age record sets the wear amount, and the preset's control intensities and rust windows say how much of each channel of the game's tiling wear mask turns to the worn layer (the game's packing of these values is read from its code). Not read: a per-part random sample and the vertex colours the game also multiplies in, and the per-vehicle pick within the age record's range (the middle is taken).");
             }
+            if self.look.wear_levels && self.look.wear_from_config {
+                ui.checkbox(&mut self.look.primer, "primer layer")
+                    .on_hover_text("Also draws the game's second wear layer, the primer, by its rules: its mask texture scaled per channel by the wear preset's primer intensities, summed and windowed by primerStart / primerEnd, where the first layer is not. Off by default: the game also scales the mask by per-part random samples and a per-vehicle amount, which are not decoded and taken as 1, so some parts (a truck bed) show far more primer than in the game. The primer's colour is a stand-in grey.");
+            }
             if !(self.look.wear_levels && self.look.wear_from_config) {
                 ui.add(egui::Slider::new(&mut self.look.wear, 0.0..=1.0).text("wear"))
                     .on_hover_text("Shows the second layer of the vehicle's surfaces (rust under paint, grey under bare metal), which the game's files give for every surface. Where it shows is taken from the blue channel of the parts' detail texture; how much the game shows is not known, so the amount is yours to set.");
@@ -5387,16 +5402,66 @@ const WEAR_WINDOW: [[u32; 2]; 3] = [[0x8f02_219f, 0x7a2d_3f04], [0x9d7c_73e7, 0x
 /// The age record's wear amount range (`fe5d32e7` +0x0c, +0x10): the game
 /// takes a per-vehicle value between them.
 const AGE_WEAR: [u32; 2] = [0x4e71_efc8, 0xb5fc_dec9];
+/// The wear preset bytes the game packs for the second wear layer (the
+/// primer, layer B): per mask channel the primer intensity and its
+/// activation start and end (`primerIntensityA`, 90824e97, df7be5cf /
+/// `primerIntensityB`, 4eb87881, 26007b2d / `primerIntensityC`, 601bdcc6,
+/// ad2cb19a), and the window on the summed mask (`primerStart`,
+/// `primerEnd`).
+const PRIMER_CONTROL: [[u32; 3]; 3] = [[0x9ed9_875c, 0x9082_4e97, 0xdf7b_e5cf], [0xc74b_d840, 0x4eb8_7881, 0x2600_7b2d], [0x4a7f_5ea9, 0x601b_dcc6, 0xad2c_b19a]];
+const PRIMER_WINDOW: [u32; 2] = [0x70b0_608e, 0xf47f_68a1];
+/// The preset byte by which the game takes the second and third mask
+/// channels off the first before the primer's first channel (8ed71149).
+const PRIMER_CROSS: u32 = 0x8ed7_1149;
+/// The preset bool that makes the primer read the wear mask instead of its
+/// own mask texture (eff390bd).
+const PRIMER_ON_WEAR_MASK: u32 = 0xeff3_90bd;
+/// The wear preset's links to its two colour range records (`3539c333`):
+/// the first feeds the first wear layer, the second the primer (by link
+/// order; the game holds them at wear preset object +0x38 and +0x40).
+const RANGE_LINKS: [u32; 2] = [0x02a2_7216, 0x8797_74bd];
+/// A colour range record's low and high bytes per mask channel R, G, B of
+/// the scale (`minRed` .. `maxBlue`), the bias and the gamma: the game draws
+/// 50 samples per record at load (rva 0xc7b660), each value
+/// lo + rand x (hi - lo), and each vehicle part picks one of them.
+const RANGE_SCALE: [[u32; 3]; 2] = [[0x0904_e7f5, 0xa3f6_55bd, 0x17fe_6786], [0x30a6_2d96, 0x7cdc_2a90, 0x0d16_6a4e]];
+const RANGE_BIAS: [[u32; 3]; 2] = [[0x9d9e_c6c9, 0xfb2b_7f54, 0xf0fb_4e0e], [0x1900_6c48, 0xc580_1a83, 0x77d2_db40]];
+const RANGE_GAMMA: [[u32; 3]; 2] = [[0x9543_82a0, 0x7e3d_ffd5, 0xaa03_fd91], [0x87f8_9264, 0xc82d_2173, 0x483f_35b8]];
+
+/// The middle of a colour range record's samples (scale, bias, gamma per
+/// channel, 0 to 1): what a part shows on average, as the part's own pick
+/// depends on a per-vehicle seed. Without a record: scale 1, bias 0,
+/// gamma 1.
+fn range_mid(r: &serde_json::Value) -> [[f32; 3]; 3] {
+    if !r.is_object() {
+        return [[1.0; 3], [0.0; 3], [1.0; 3]];
+    }
+    let f = |h: u32| r[sixng_core::meta7a::field_name(h)].as_f64().unwrap_or(0.0) as f32 / 255.0;
+    let mid = |t: &[[u32; 3]; 2]| std::array::from_fn(|c| (f(t[0][c]) + f(t[1][c])) * 0.5);
+    [mid(&RANGE_SCALE), mid(&RANGE_BIAS), mid(&RANGE_GAMMA)]
+}
 
 /// What the viewer draws of a part id's wear: the amount (0 to 255) and,
 /// per channel of the game's wear mask, the scale, window start and window
-/// width (0 to 255 each).
+/// width (0 to 255 each); for the primer (layer B) the scale per channel of
+/// its mask, the cross byte, the window start and width on the summed mask,
+/// and whether its mask is the wear mask.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct PartWear {
     amount: u8,
     scale: [u8; 3],
+    /// the bias added to the scaled mask, and the gamma (0 to 255 each)
+    bias: [u8; 3],
+    gamma: [u8; 3],
     start: [u8; 3],
     width: [u8; 3],
+    primer: [u8; 3],
+    primer_bias: [u8; 3],
+    primer_gamma: [u8; 3],
+    primer_cross: u8,
+    primer_start: u8,
+    primer_width: u8,
+    primer_on_wear_mask: bool,
 }
 
 /// Each part id's wear under a configuration, from model.json
@@ -5409,8 +5474,14 @@ struct PartWear {
 ///   `LEVEL_WEAR` of the level.
 /// - Per mask channel, as the game packs it: scale = v0 x intensity x
 ///   sat((v0 - start) / (end - start)) of `WEAR_CONTROL`, and the window
-///   start and width of `WEAR_WINDOW`. The game multiplies the scale by a
-///   per-part random sample and the vertex colours, which are not read.
+///   start and width of `WEAR_WINDOW`; the scale and the bias times the
+///   middle of the first colour range's samples (`range_mid`), and its
+///   gamma. The game takes one random sample per part, and multiplies by
+///   the vertex colours, which are not read.
+/// - The primer the same way from `PRIMER_CONTROL`, its window from
+///   `PRIMER_WINDOW` (no width floor), `PRIMER_CROSS` and
+///   `PRIMER_ON_WEAR_MASK`, with the second colour range.
+/// - Both layers only when v0 is above 0.1 (the game's flag bit 0).
 /// None when the model has no wear levels; all zero for a part id without
 /// a level.
 fn part_wear(w: &serde_json::Value, look: usize, config: Option<&str>) -> Option<Vec<PartWear>> {
@@ -5439,17 +5510,51 @@ fn part_wear(w: &serde_json::Value, look: usize, config: Option<&str>) -> Option
         let v0 = from_age.or(from_range).unwrap_or(LEVEL_WEAR[level] / 255.0).clamp(0.0, 1.0);
         o.amount = (v0 * 255.0 + 0.5) as u8;
         let Some(p) = preset else { continue };
+        if v0 <= 0.1 {
+            continue;
+        }
         let b = |h: u32| field(p, h).unwrap_or(0.0) as f32 / 255.0;
+        let byte = |x: f32| (x.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        // the game's B(): truncated
+        let trunc = |x: f32| (x.clamp(0.0, 1.0) * 255.0) as u8;
+        let [ra, rb] = RANGE_LINKS.map(|l| range_mid(p[sixng_core::meta7a::field_name(l)].as_str().map_or(&serde_json::Value::Null, |k| &w["colour_ranges"][k])));
+        for c in 0..3 {
+            let [i, s, e] = PRIMER_CONTROL[c].map(b);
+            let act = ((v0 - s) / (e - s).max(1.0e-4)).clamp(0.0, 1.0);
+            let k = v0 * i * act;
+            o.primer[c] = trunc(rb[0][c] * k);
+            o.primer_bias[c] = trunc(rb[1][c] * k);
+            o.primer_gamma[c] = trunc(rb[2][c]);
+        }
+        let [ps, pe] = PRIMER_WINDOW.map(b);
+        (o.primer_start, o.primer_width) = (byte(ps), byte(pe - ps));
+        o.primer_cross = byte(b(PRIMER_CROSS));
+        o.primer_on_wear_mask = p[sixng_core::meta7a::field_name(PRIMER_ON_WEAR_MASK)].as_bool() == Some(true);
         for c in 0..3 {
             let [i, s, e] = WEAR_CONTROL[c].map(b);
             let act = ((v0 - s) / (e - s).max(1.0e-4)).clamp(0.0, 1.0);
-            o.scale[c] = ((v0 * i * act).clamp(0.0, 1.0) * 255.0) as u8;
+            let k = v0 * i * act;
+            o.scale[c] = trunc(ra[0][c] * k);
+            o.bias[c] = trunc(ra[1][c] * k);
+            o.gamma[c] = trunc(ra[2][c]);
             let [ws, we] = WEAR_WINDOW[c].map(b);
             o.start[c] = (ws * 255.0 + 0.5) as u8;
             o.width[c] = (((we - ws).max(0.0)) * 255.0 + 0.5) as u8;
         }
     }
     Some(out)
+}
+
+/// The roughness and metalness (0 to 255 each) of the library's primer
+/// (`primerPalette` of the global record: the middle of `roughnessLow` and
+/// `roughnessHigh`, of `metallicLow` and `metallicHigh`; the game blends
+/// each pair by the material map, which the viewer does not read for the
+/// primer). Without the record: roughness 0.6, metalness 0.
+fn primer_surface(global: &serde_json::Value) -> [u8; 2] {
+    let p = &global["primerPalette"];
+    let mid = |a: &str, b: &str| Some(((p[a].as_f64()? + p[b].as_f64()?) * 0.5).clamp(0.0, 1.0) as f32);
+    let byte = |x: f32| (x * 255.0 + 0.5) as u8;
+    [byte(mid("roughnessLow", "roughnessHigh").unwrap_or(0.6)), byte(mid("metallicLow", "metallicHigh").unwrap_or(0.0))]
 }
 
 /// Four bytes from 8 hex digits.
@@ -8632,7 +8737,10 @@ mod tests {
             "levels_default": levels,
             "ladder_by_look": [ladder],
             "ladders": [{"wearPresets": ["p0", "p1", "p1", "p1", "p4", "p4"]}],
-            "presets": {"p1": {"ageWearHash": "r1"}, "p4": {"ageWearHash": "a4", "controlIntensityA": 255, "b18a6db5": 127.5, "1b6a3e09": 255, "rustStart": 51, "rustEnd": 102}},
+            "presets": {"p1": {"ageWearHash": "r1"}, "p4": {"ageWearHash": "a4", "controlIntensityA": 255, "b18a6db5": 127.5, "1b6a3e09": 255, "rustStart": 51, "rustEnd": 102,
+                "primerIntensityB": 102, "4eb87881": 0, "26007b2d": 255, "primerStart": 10, "primerEnd": 127, "8ed71149": 51, "eff390bd": true,
+                "879774bd": "cr"}},
+            "colour_ranges": {"cr": {"minGreen": 102, "maxGreen": 153, "fb2b7f54": 0, "c5801a83": 102, "7e3dffd5": 255, "c82d2173": 255}},
             "age_ranges": {"r1": {"minWear": 100, "maxWear": 200}},
             "ages": {"a4": {"4e71efc8": 0.6, "b5fcdec9": 1.0}},
         });
@@ -8640,6 +8748,13 @@ mod tests {
         assert_eq!((a[0].amount, a[1].amount, a[2]), (150, 204, PartWear::default()));
         // v0 0.8: activation (0.8 - 0.5) / 0.5 = 0.6, scale 0.8 x 1 x 0.6 = 0.48
         assert_eq!((a[1].scale, a[1].start[0], a[1].width[0]), ([122, 0, 0], 51, 51));
+        // primer channel B: 0.8 x 0.4 x act 0.8 = 0.256 times the range's
+        // middle scale 0.5 = 0.128, bias 0.2 x 0.256, gamma 1; window 10,
+        // width 117; no first range: scale 1, bias 0, gamma 1
+        assert_eq!((a[1].primer, a[1].primer_bias, a[1].primer_gamma[1]), ([0, 32, 0], [0, 13, 0], 255));
+        assert_eq!((a[1].primer_start, a[1].primer_width, a[1].primer_cross, a[1].primer_on_wear_mask), (10, 117, 51, true));
+        assert_eq!((a[1].bias, a[1].gamma), ([0; 3], [255; 3]));
+        assert_eq!(super::primer_surface(&serde_json::json!({"primerPalette": {"roughnessLow": 0.45, "roughnessHigh": 0.78, "metallicLow": 0.0, "metallicHigh": 0.0}})), [157, 0]);
         assert_eq!(part_wear(&w, 0, None).unwrap()[0].amount, 150);
         // a configuration without levels: no wear; level 0 without a ladder: the level's value
         assert_eq!(part_wear(&w, 0, Some("nope")).unwrap()[0], PartWear::default());

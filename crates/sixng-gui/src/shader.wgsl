@@ -363,6 +363,13 @@ fn map_finish(col0: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
 @group(1) @binding(5) var t_tile: texture_2d<f32>;
 // vehicle parts: the game's tiling wear mask (flags.w bit 15)
 @group(1) @binding(6) var t_wear: texture_2d<f32>;
+// vehicle parts: the primer's mask (the wear mask when the model has none)
+@group(1) @binding(7) var t_primer: texture_2d<f32>;
+
+// The primer's colour: a stand-in grey (linear). The game takes a palette
+// gradient (column = the windowed mask) of a surface record the CPU builds
+// for the primer, which is not decoded.
+const PRIMER_COLOUR: vec3<f32> = vec3(0.2, 0.2, 0.2);
 
 // How often the wear mask repeats across a part's UV0 (the age records'
 // minTiling / maxTiling are about 4 to 6.5).
@@ -374,6 +381,12 @@ const WEAR_TILING: f32 = 5.0;
 // histogram (10 % of its texels are above 0.81, 20 % above 0.58, 30 % above
 // 0.43, 40 % above 0.32, 50 % above 0.27). A stand-in: the game's windows
 // on the three channels are not decoded to fields.
+// A wear mask level raised to the game's exponent 100 / max(0.001,
+// 100 g^2) for the gamma byte g (0 to 1).
+fn wear_gamma(l: f32, g: f32) -> f32 {
+    return pow(l, 100.0 / max(0.001, 100.0 * g * g));
+}
+
 fn wear_threshold(a: f32) -> f32 {
     let c = 0.45 * a * a;
     if (c < 0.05) { return mix(1.01, 0.98, c / 0.05); }
@@ -1193,8 +1206,13 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             k = clamp(d.b * wear_amt * 2.0, 0.0, 1.0);
         }
         let id = floor(i.col.a * 255.0 + 0.5);
+        // the primer's weight (layer B) and its roughness and metalness
+        var w3 = 0.0;
+        var p_rough = 0.6;
+        var p_metal = 0.0;
         if (wear_mask) {
             let m = textureSample(t_wear, samp, i.uv0 * WEAR_TILING).rgb;
+            let pm = textureSample(t_primer, samp, i.uv0 * WEAR_TILING).rgb;
             if (F.jitter.w < 0.0) {
                 // the game's first wear layer: each mask channel scaled by
                 // the part's control term, then windowed (start, width), the
@@ -1205,9 +1223,41 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
                     let sc = textureLoad(t_em, vec2(16 + c, row), 0).a;
                     let st = textureLoad(t_em, vec2(19 + c, row), 0).a;
                     let wd = max(textureLoad(t_em, vec2(22 + c, row), 0).a, 1.0 / 255.0);
-                    s += clamp((clamp(m[c] * sc, 0.0, 1.0) - st) / wd, 0.0, 1.0);
+                    // bias (column 34 + c) and gamma (37 + c): the level is
+                    // the vertex colour's channel (the game's per-vertex wear
+                    // multipliers, GLB _COLOR0 rgb) times (scale x mask +
+                    // bias), raised to (1 / gamma)^2, as the game does
+                    let bi = textureLoad(t_em, vec2(34 + c, row), 0).a;
+                    let lv = wear_gamma(clamp(i.col[c] * (m[c] * sc + bi), 0.0, 1.0), textureLoad(t_em, vec2(37 + c, row), 0).a);
+                    s += clamp((lv - st) / wd, 0.0, 1.0);
                 }
                 k = clamp(s, 0.0, 1.0);
+                // The game's second wear layer, the primer (columns 25 to
+                // 33): its mask (or the wear mask, column 31) per channel
+                // scaled, the first channel less the other two by the cross
+                // byte (the vertex colours, as for the first layer), summed,
+                // windowed, and
+                // only where the first layer is not.
+                // (only when the user turns it on: F.jitter.w = -2)
+                let t = select(pm, m, textureLoad(t_em, vec2(31, row), 0).a > 0.5);
+                let cross = textureLoad(t_em, vec2(28, row), 0).a;
+                // scale (25 + c), bias (40 + c), gamma (43 + c)
+                let pl = vec3(clamp(i.col.r - (i.col.g + i.col.b) * cross, 0.0, 1.0), i.col.g, i.col.b);
+                var lv = vec3(0.0);
+                for (var c = 0; c < 3; c++) {
+                    let sc = textureLoad(t_em, vec2(25 + c, row), 0).a;
+                    let bi = textureLoad(t_em, vec2(40 + c, row), 0).a;
+                    lv[c] = wear_gamma(clamp(pl[c] * (sc * t[c] + bi), 0.0, 1.0), textureLoad(t_em, vec2(43 + c, row), 0).a);
+                }
+                let lr = lv.x;
+                let lg = lv.y;
+                let lb = lv.z;
+                let pb = clamp(lr + lg + lb, 0.0, 1.0);
+                let ps = textureLoad(t_em, vec2(29, row), 0).a;
+                let pw = max(textureLoad(t_em, vec2(30, row), 0).a, 1.0 / 255.0);
+                w3 = select(0.0, (1.0 - k) * clamp((pb - ps) / pw, 0.0, 1.0), F.jitter.w < -1.5);
+                p_rough = textureLoad(t_em, vec2(32, row), 0).a;
+                p_metal = textureLoad(t_em, vec2(33, row), 0).a;
             } else {
                 let t = wear_threshold(wear_amt);
                 k = smoothstep(t, t + 0.08, m.g);
@@ -1215,10 +1265,11 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         }
         let w1 = textureSampleLevel(t_em, samp, vec2(u, (id + 256.5) / RAMP_ROWS), 0.0);
         let m1 = textureSampleLevel(t_em, samp, vec2(u, (id + 0.5) / RAMP_ROWS), 0.0).a;
-        albedo = mix(albedo, w1.rgb, k);
-        rough = clamp(mix(rough, w1.a, k), 0.04, 1.0);
-        metal = mix(metal, m1, k);
-        pearl = pearl * (1.0 - k);
+        let w0 = 1.0 - k - w3;
+        albedo = albedo * w0 + w1.rgb * k + PRIMER_COLOUR * w3;
+        rough = clamp(rough * w0 + w1.a * k + p_rough * w3, 0.04, 1.0);
+        metal = metal * w0 + m1 * k + p_metal * w3;
+        pearl = pearl * w0;
     }
     if (cls == 5u || cls == 6u) {
         rough = 0.04; metal = 0.0;
