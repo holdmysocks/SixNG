@@ -710,9 +710,7 @@ pub fn build_index_report(
         })
     });
     let save = |cp: &Path, v: &Vec<RawStream>| -> Result<()> {
-        let tmp = cp.with_extension("tmp");
-        fs::write(&tmp, serde_json::to_vec(v)?)?;
-        fs::rename(&tmp, cp)?;
+        crate::atomic::write(cp, serde_json::to_vec(v)?)?;
         Ok(())
     };
     let read_seg = |p: &Path| fs::read(p).ok().and_then(|t| serde_json::from_slice::<Vec<RawStream>>(&t).ok());
@@ -828,9 +826,7 @@ pub fn build_index_report(
         names_done,
     };
     fs::create_dir_all(index_dir)?;
-    let tmp = final_path.with_extension("tmp");
-    fs::write(&tmp, serde_json::to_vec(&ix)?)?;
-    fs::rename(&tmp, &final_path)?;
+    crate::atomic::write(&final_path, serde_json::to_vec(&ix)?)?;
     let outcome = IndexOutcome {
         status,
         from_version: found_version,
@@ -882,9 +878,7 @@ pub fn index_path(index_dir: &Path, archive_id: &str) -> PathBuf {
 
 pub fn save_index(index_dir: &Path, ix: &ArchiveIndex) -> Result<()> {
     let p = index_path(index_dir, &ix.archive);
-    let tmp = p.with_extension("tmp");
-    fs::write(&tmp, serde_json::to_vec(ix)?)?;
-    fs::rename(&tmp, &p)?;
+    crate::atomic::write(&p, serde_json::to_vec(ix)?)?;
     Ok(())
 }
 
@@ -960,7 +954,7 @@ mod group_tests {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/scan-raw-chunk-test");
         fs::create_dir_all(&dir).unwrap();
         let p = dir.join(name);
-        fs::write(&p, bytes).unwrap();
+        crate::atomic::write(&p, bytes).unwrap();
         let s = scan_segment(&p, 0, bytes.len() as u64, &AtomicU64::new(0)).unwrap();
         (p.clone(), group_streams("t", s))
     }
@@ -1108,7 +1102,7 @@ mod upgrade_tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let archive = root.join("t.rpf");
-        fs::write(&archive, archive_bytes(raw)).unwrap();
+        crate::atomic::write(&archive, archive_bytes(raw)).unwrap();
         let m = fs::metadata(&archive).unwrap();
         let mtime = m.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         Case { archive, dir: root.join("index"), size: m.len(), mtime }
@@ -1121,7 +1115,7 @@ mod upgrade_tests {
         fs::create_dir_all(&segs).unwrap();
         let streams = scan_segment_with(&c.archive, 0, c.size, &AtomicU64::new(0), !scan1).unwrap();
         let sv = if scan1 { 1 } else { SCAN_VERSION };
-        fs::write(seg_path(&segs, 0, c.size, c.mtime, sv), serde_json::to_vec(&streams).unwrap()).unwrap();
+        crate::atomic::write(seg_path(&segs, 0, c.size, c.mtime, sv), serde_json::to_vec(&streams).unwrap()).unwrap();
         let mut entries = group_streams("t.rpf", streams);
         for e in entries.iter_mut() {
             crate::classify::refine(e);

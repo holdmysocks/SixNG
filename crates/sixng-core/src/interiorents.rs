@@ -131,7 +131,7 @@ pub fn build(ws: &Workspace, a: &ArchiveInfo, metas: &[&Entry], progress: Progre
     rows.sort_by_key(|x| x.0);
     let dir = ws.index_dir();
     fs::create_dir_all(&dir)?;
-    let mut w = std::io::BufWriter::new(fs::File::create(dir.join("interior_entities.jsonl"))?);
+    let mut w = crate::atomic::AtomicFile::create(dir.join("interior_entities.jsonl"))?;
     let mut by_space: HashMap<&str, (usize, usize)> = HashMap::new();
     let (mut mem, mut rooms, mut sets) = (0, 0, 0);
     for (_, v, n, m, r, s, sp) in &rows {
@@ -145,7 +145,7 @@ pub fn build(ws: &Workspace, a: &ArchiveInfo, metas: &[&Entry], progress: Progre
             writeln!(w, "{v}")?;
         }
     }
-    w.flush()?;
+    w.commit()?;
     Ok(json!({
         "files_by_space": by_space.iter().map(|(k, v)| (k.to_string(), json!({"files": v.0, "entities": v.1}))).collect::<serde_json::Map<_, _>>(),
         "interior_members": mem, "in_room": rooms, "in_entity_set": sets,

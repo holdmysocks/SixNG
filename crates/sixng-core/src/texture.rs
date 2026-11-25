@@ -318,6 +318,39 @@ pub fn deswizzle(src: &[u8], ew: u32, eh: u32, bpe: u32) -> Vec<u8> {
     out
 }
 
+/// Gfx10 SW_4KB_S layout of an uncompressed texture whose tiling is known:
+/// single-mip textures with 2- or 4-byte elements, and every uncompressed
+/// texture with a mip chain. Other single-mip textures (1- and 8-byte
+/// elements) keep the 16 x 16-element tiles of [`deswizzle`].
+///
+/// Single-mip 2/4-byte textures (R16 height maps, RGBA8 palettes and
+/// profiles, BGRA8 tiles): by neighbour smoothness over every such texture
+/// of 32 x 32 or more in textures.rpf, levels.rpf, common.rpf and the packs,
+/// SW_4KB_S is smoothest on 1,051 of 1,064; the rest are noise textures,
+/// small volumes and flat tiles, where smoothness tells nothing. Water
+/// height and shore tiles placed with it continue across 1,396 of 1,400 and
+/// 268 of 271 tile edges.
+///
+/// Mip chains (RGBA8, R8, A8, R32 float): mip k+1 matches mip k averaged 2 x 2
+/// at 41 to 67 dB on mips 0 to 1 (11 to 25 dB with 16 x 16 tiles), and on
+/// down through the packed tail for the R8 puddle layout (40 to 59 dB).
+fn uncompressed_layout(fmt: Fmt, t: &TexInfo) -> Option<crate::gfx10::Layout> {
+    let bpe = fmt.bytes_per_elem();
+    if fmt.block_dim() != 1 || bpe == 0 || !(t.mips > 1 || matches!(bpe, 2 | 4)) {
+        return None;
+    }
+    crate::gfx10::Layout::new(crate::gfx10::Swizzle::S4K, t.width, t.height, t.mips, bpe)
+}
+
+fn untile_mip(r: &Resource, t: &TexInfo, l: &crate::gfx10::Layout, m: usize) -> Result<Vec<u8>> {
+    let start = t.data_off as usize;
+    if start >= r.gfx.len() {
+        return Err(anyhow!("texture data out of range"));
+    }
+    let end = (start + l.total.max(l.block_bytes) as usize).min(r.gfx.len());
+    Ok(l.untile(&r.gfx[start..end], m))
+}
+
 /// Linear (deswizzled) mip-0 bytes of slice 0, in the texture's own format.
 pub fn mip0_linear(r: &Resource, t: &TexInfo, linear_input: bool) -> Result<(Fmt, Vec<u8>)> {
     let fmt = Fmt::from_dxgi(t.dxgi_format);
@@ -349,6 +382,11 @@ pub fn mip0_linear(r: &Resource, t: &TexInfo, linear_input: bool) -> Result<(Fmt
             }
         }
     }
+    if !linear_input {
+        if let Some(l) = uncompressed_layout(fmt, t) {
+            return untile_mip(r, t, &l, 0).map(|d| (fmt, d));
+        }
+    }
     let padded = (ew.div_ceil(16) * 16 * eh.div_ceil(16) * 16 * bpe) as u64;
     let start = (t.data_off + mip0_off) as usize;
     let len = if linear_input { (ew * eh * bpe) as usize } else { padded as usize };
@@ -372,9 +410,13 @@ pub fn mip_offset(fmt: Fmt, t: &TexInfo, m: u32) -> u64 {
 
 /// Number of leading mips that are safe to export: levels whose element
 /// grid is at least 32x32 (128 px for BC formats). Smaller mips sit in a
-/// packed tail whose layout is not solved yet.
+/// packed tail whose layout is not solved yet for block-compressed formats;
+/// uncompressed mip chains are untiled whole (see `uncompressed_layout`).
 pub fn exportable_mips(t: &TexInfo) -> u32 {
     let fmt = Fmt::from_dxgi(t.dxgi_format);
+    if t.mips > 1 && uncompressed_layout(fmt, t).is_some() {
+        return t.mips;
+    }
     let bd = fmt.block_dim().max(1);
     let mut n = 1;
     while n < t.mips {
@@ -387,9 +429,9 @@ pub fn exportable_mips(t: &TexInfo) -> u32 {
     n
 }
 
-/// Linear (untiled) data of one mip of slice 0. Mips whose element size is a
-/// multiple of the 16x16 tile are untiled; smaller ones are taken as linear
-///.
+/// Linear (untiled) data of one mip of slice 0. Uncompressed mip chains use
+/// the Gfx10 SW_4KB_S layout, packed tail included; other mips are untiled
+/// as 16x16-element tiles.
 pub fn mip_linear(r: &Resource, t: &TexInfo, m: u32) -> Result<(Fmt, Vec<u8>, u32, u32)> {
     let fmt = Fmt::from_dxgi(t.dxgi_format);
     if fmt == Fmt::Unknown {
@@ -398,6 +440,11 @@ pub fn mip_linear(r: &Resource, t: &TexInfo, m: u32) -> Result<(Fmt, Vec<u8>, u3
     if m == 0 {
         let (f, d) = mip0_linear(r, t, false)?;
         return Ok((f, d, t.width, t.height));
+    }
+    if let Some(l) = uncompressed_layout(fmt, t) {
+        let p = l.mips.get(m as usize).ok_or_else(|| anyhow!("mip {m} out of range"))?;
+        let (w, h) = (p.w, p.h);
+        return Ok((fmt, untile_mip(r, t, &l, m as usize)?, w, h));
     }
     let (mw, mh) = ((t.width >> m).max(1), (t.height >> m).max(1));
     let bd = fmt.block_dim();
@@ -618,7 +665,9 @@ fn reconstruct_bc5_z(img: &mut [u32]) {
 
 pub fn save_png(path: &Path, rgba: &[u8], w: u32, h: u32) -> Result<()> {
     let img = image::RgbaImage::from_raw(w, h, rgba.to_vec()).ok_or_else(|| anyhow!("bad image size"))?;
-    img.save(path)?;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::from_path(path)?)?;
+    crate::atomic::write(path, buf.into_inner())?;
     Ok(())
 }
 
@@ -667,7 +716,7 @@ fn save_dds_n(path: &Path, t: &TexInfo, fmt: Fmt, data: &[u8], nmips: u32, mip0_
     w32(&mut h, 1);
     w32(&mut h, 0);
     h.extend_from_slice(data);
-    std::fs::write(path, h)?;
+    crate::atomic::write(path, h)?;
     Ok(())
 }
 

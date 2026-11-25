@@ -235,20 +235,12 @@ impl Image {
 /// 0..1, 8-bit formats as 0..255 in RGBA order (B8G8R8A8 is swapped to
 /// RGBA, as a shader sees it).
 pub fn decode(r: &Resource, t: &TexInfo) -> Result<Image> {
-    let (fmt, mut lin) = texture::mip0_linear(r, t, false)?;
+    // R16 heights and BGRA shore tiles are single-mip SW_4KB_S textures,
+    // untiled by `mip0_linear` (1,396 of 1,400 height and 268 of 271 shore
+    // tile edges continue)
+    let (fmt, lin) = texture::mip0_linear(r, t, false)?;
     let (w, h) = (t.width as usize, t.height as usize);
     let need = texture::mip_bytes(fmt, t.width, t.height, 0) as usize;
-    let bpe = fmt.bytes_per_elem();
-    // 2- and 4-byte single-mip textures (R16 heights, BGRA shore tiles) are
-    // in SW_4KB_S blocks, not the 16 x 16-element tiles of `mip0_linear`
-    // (checked by tile seams: 1,396 of 1,400 height and 268 of 271 shore
-    // edges continue; with SW_64KB_D almost none do)
-    if t.mips == 1 && matches!(bpe, 2 | 4) {
-        let l = crate::gfx10::Layout::new(crate::gfx10::Swizzle::S4K, t.width, t.height, 1, bpe).ok_or_else(|| anyhow!("no tile layout for {}", t.format))?;
-        let start = t.data_off as usize;
-        let end = (start + l.total as usize).min(r.gfx.len());
-        lin = l.untile(r.gfx.get(start..end).ok_or_else(|| anyhow!("texture data out of range"))?, 0);
-    }
     if lin.len() < need || r.gfx.len() < t.data_off as usize + need {
         bail!("texture data incomplete ({} of {} bytes)", r.gfx.len().saturating_sub(t.data_off as usize), need);
     }
@@ -882,7 +874,7 @@ impl Layer {
 }
 
 fn write_json(p: &std::path::Path, v: &Value) -> Result<()> {
-    std::fs::write(p, serde_json::to_vec_pretty(v)?)?;
+    crate::atomic::write(p, serde_json::to_vec_pretty(v)?)?;
     Ok(())
 }
 
@@ -892,7 +884,7 @@ pub fn write_f32(p: &std::path::Path, im: &Image) -> Result<()> {
     for v in &im.px {
         b.extend_from_slice(&v.to_le_bytes());
     }
-    std::fs::write(p, b)?;
+    crate::atomic::write(p, b)?;
     Ok(())
 }
 
@@ -900,7 +892,9 @@ pub fn write_f32(p: &std::path::Path, im: &Image) -> Result<()> {
 pub fn write_png16(p: &std::path::Path, im: &Image) -> Result<()> {
     let px: Vec<u16> = (0..im.w * im.h).map(|i| (im.px[i * im.ch].clamp(0.0, 1.0) * 65535.0).round() as u16).collect();
     let img = image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_raw(im.w as u32, im.h as u32, px).ok_or_else(|| anyhow!("image size"))?;
-    img.save(p)?;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::from_path(p)?)?;
+    crate::atomic::write(p, buf.into_inner())?;
     Ok(())
 }
 

@@ -12,7 +12,7 @@
 //!   +0x60 vec3 centre of gravity (the archetype bound's, model space)
 //!   +0x80 vec3 bounding-sphere centre, +0x8C f32 radius
 //!   +0xA8 ptr  name
-//!   +0xB8 u32  flags?, +0xBC f32 minimum move force? (-1 = fixed until
+//!   +0xB8 u32  flags (`ROOT_FLAGS`), +0xBC f32 minimum move force? (-1 = fixed until
 //!              broken), +0xC0..+0xD4 f32 not named (-1 -1 -1 1 0.7 mostly)
 //! archetype
 //!   +0x10 u32  kind (2)
@@ -23,7 +23,7 @@
 //!   +0x60 f32  gravity factor, max speed, max angular speed, buoyancy factor
 //!   +0x70 6 x vec4 damping: linear C, V, V2, angular C, V, V2
 //! group (0x70)
-//!   +0x00 u32  flags?, +0x04 u32 ?
+//!   +0x00 u32  flags, +0x04 u32 more flags (both in `GROUP_FLAGS`)
 //!   +0x08 u32  joaat of the group's bone name (= group name)
 //!   +0x10 u16  bone index, ?, first child group, parent group (ffff = none),
 //!              child group count, first child, child end, child end, child end
@@ -310,9 +310,10 @@ pub const TUNING_NAMES: &[(usize, &str, bool)] = &[
     (0, "strength", true),
     (1, "force_transmission_up", true),
     (2, "force_transmission_down", true),
+    (3, "disappears_when_dead_chance", true),
     (4, "min_damage_force", true),
     (5, "damage_health", true),
-    (6, "weapon_health", false),
+    (6, "weapon_health", true),
     (7, "joint_stiffness", true),
     (8, "motor_frequency", true),
     (9, "motor_damping", true),
@@ -337,6 +338,102 @@ pub const TUNING_NAMES: &[(usize, &str, bool)] = &[
     (34, "ped_melee_inv_mass_scale", true),
     (35, "bike_scale", true),
 ];
+
+/// Group flag bits, as (word, bit, preset name, confirmed). Word 0 is the
+/// u32 at group +0x00, word 1 the u32 at +0x04. Matched against the
+/// booleans of the fragment tuning presets in common (the full table, 157
+/// presets, each listing every boolean): across the 11,865 level groups
+/// whose tuning values match exactly one preset, a confirmed bit is set on
+/// at least 95% of the groups whose preset says true (at least 100 of them)
+/// and on at most 0.2% of at least 100 whose preset says false. The others
+/// have small samples or no preset that says false (see each line).
+///
+/// Never true in any preset, so not placed: DisableMoverUntilBreak,
+/// BreakUsingTwistLimits, DoesntPushVehiclesDown, DisconnectFromParent,
+/// UseConstraintForJoint, NoConnections, ConnectivityRoot,
+/// LatchAfterAnimation, IsPortal, ScaleStrengthByMass (and MadeOfGlass,
+/// placed from group names instead). InitialArticulationDisabled and
+/// UseSoftConstraintForMuscle have no bit of their own. Unnamed bits with
+/// a clear pattern in the group names: word 0 bit 13 (litter, 64% of its
+/// groups are rub_litter roots), 17 (reeds, cattails, corn stalks), 21
+/// (safe keypads only), 25 (bending poles and leaves); word 1 bits 1, 2
+/// and 5 (wooden fences, pickets, crates, cardboard).
+pub const GROUP_FLAGS: &[(usize, u32, &str, bool)] = &[
+    (0, 0, "break_when_damaged", true),
+    // no preset says true; 91% of the 1,186 groups with it are named
+    // Glass_* or *pane*, nearly all box bounds
+    (0, 1, "made_of_glass", false),
+    (0, 2, "damage_when_broken", true),
+    (0, 3, "doesnt_affect_vehicles", true),
+    // 81%: one road-sign preset's 236 groups lack it; none of 767 false
+    (0, 8, "break_when_parent_damaged", true),
+    (0, 11, "enable_motor", true),
+    (0, 12, "damage_around_break", true),
+    (0, 14, "disappear_when_broken", true),
+    (0, 16, "disable_map_collision_until_break", true),
+    // 326 of 327 groups, none of 11 false; set on aircraft and other
+    // vehicle groups
+    (0, 18, "override_vehicle_defaults", false),
+    // all 7 groups that say true, none of 336 false
+    (0, 20, "break_when_walked_over", false),
+    // set together with word 1 bit 3, as the presets set the two collide
+    // booleans together: one of the pair each, order unknown
+    (0, 23, "collide_convex_against_ground_or_larger_bounds", false),
+    // 71 of 76 groups, 19 of 1,925 false
+    (0, 28, "obliterate_at_high_speed", false),
+    // 92% of 2,001 groups, none of 4 false
+    (0, 29, "obliterate_at_very_high_speed", false),
+    // all 315 groups, none says false; set on none of the other matched groups
+    (0, 30, "break_when_tilted", false),
+    // 84% of 607 groups, none says false; set on none of the other matched groups
+    (1, 0, "fade_with_time", false),
+    (1, 3, "collide_convex_against_ground_or_larger_bounds", false),
+];
+
+/// Fragment root flag bits (u32 at root +0xB8), as (bit, name, confirmed).
+/// The `any_group_*` bits equal "some group has that bit" on all 40,705
+/// level fragments. Bits 0, 5 and 30 are always set; 1, 4, 7, 9 and 31
+/// never.
+pub const ROOT_FLAGS: &[(u32, &str, bool)] = &[
+    (2, "any_group_flag_13", true),
+    (3, "any_group_disable_map_collision_until_break", true),
+    // set on every veg_ fragment; 99% of the fragments with it are veg_
+    (8, "vegetation", false),
+    // only on vehicle fragments
+    (10, "vehicle", false),
+    // 99% of the fragments with it have a jointed group (stiffness > 0),
+    // 5% of the others do
+    (20, "has_joints", false),
+    (21, "any_group_obliterate_at_high_speed", true),
+    (22, "any_group_obliterate_at_very_high_speed", true),
+    (23, "any_group_break_when_tilted", true),
+    (28, "any_group_flag2_1", true),
+    (29, "any_group_flag2_2", true),
+];
+
+/// Names of the set bits of group flag words `w`, and the bits left
+/// unnamed (as [word, bit]).
+pub fn group_flag_names(w: [u32; 2]) -> (Vec<&'static str>, Vec<[u32; 2]>) {
+    let mut names = Vec::new();
+    let mut rest = Vec::new();
+    for (word, v) in w.iter().enumerate() {
+        for bit in (0..32).filter(|b| v >> b & 1 == 1) {
+            match GROUP_FLAGS.iter().find(|f| f.0 == word && f.1 == bit) {
+                Some(f) if !names.contains(&f.2) => names.push(f.2),
+                Some(_) => {}
+                None => rest.push([word as u32, bit]),
+            }
+        }
+    }
+    (names, rest)
+}
+
+/// Names of the set bits of the root flags, and the bits left unnamed.
+pub fn root_flag_names(v: u32) -> (Vec<&'static str>, Vec<u32>) {
+    let bits = (0..32).filter(|b| v >> b & 1 == 1);
+    let (named, rest): (Vec<u32>, Vec<u32>) = bits.partition(|b| ROOT_FLAGS.iter().any(|f| f.0 == *b));
+    (named.iter().filter_map(|b| ROOT_FLAGS.iter().find(|f| f.0 == *b).map(|f| f.1)).collect(), rest)
+}
 
 fn bound_kind_name(k: u8) -> Option<&'static str> {
     Some(match k {
@@ -392,6 +489,7 @@ pub fn fragment_json(p: &FragPhysics, bones: &[String]) -> serde_json::Value {
                     tuning.insert(n.into(), serde_json::json!(v));
                 }
             }
+            let (flag_names, flag_bits_unnamed) = group_flag_names(g.flags);
             serde_json::json!({
                 "index": g.index, "name": name, "name_hash": g.name_hash, "bone": g.bone, "parent": g.parent,
                 "child_groups": g.first_child_group.map(|f| (f..f + g.child_group_count).collect::<Vec<_>>()).unwrap_or_default(),
@@ -399,6 +497,7 @@ pub fn fragment_json(p: &FragPhysics, bones: &[String]) -> serde_json::Value {
                 "child_range": [g.first_child, g.child_end],
                 "mass": g.mass, "tuning": tuning, "tuning_raw": g.tuning_raw,
                 "flags": format!("{:08x}", g.flags[0]), "flags2": format!("{:08x}", g.flags[1]),
+                "flag_names": flag_names, "flag_bits_unnamed": flag_bits_unnamed,
             })
         })
         .collect();
@@ -423,6 +522,8 @@ pub fn fragment_json(p: &FragPhysics, bones: &[String]) -> serde_json::Value {
         "damping": {"linear_c": a.damping[0], "linear_v": a.damping[1], "linear_v2": a.damping[2], "angular_c": a.damping[3], "angular_v": a.damping[4], "angular_v2": a.damping[5]},
         "min_move_force": p.root_tail[1],
         "root_flags": format!("{:08x}", p.root_tail[0].to_bits()),
+        "root_flag_names": root_flag_names(p.root_tail[0].to_bits()).0,
+        "root_flag_bits_unnamed": root_flag_names(p.root_tail[0].to_bits()).1,
         "root_tail": &p.root_tail[2..7],
         "archetype_type_flags": format!("{:08x}", a.type_flags), "archetype_include_flags": format!("{:08x}", a.include_flags),
         "groups": groups, "children": children,
@@ -430,7 +531,7 @@ pub fn fragment_json(p: &FragPhysics, bones: &[String]) -> serde_json::Value {
     })
 }
 
-pub const NOTE: &str = "Units: kg, metres, kg m^2; model space is RAGE Z-up. Confirmed: mass (= sum of in-use child masses on every fragment), inertia (= child mass x bound volume distribution), centre_of_gravity, bounding_sphere, the group tree (parent, child_groups, children, bone; name = the bone whose joaat is name_hash), child mass, bound and position (= bone pivot + offset). tuning: names matched against the game's fragment tuning presets (see TUNING_NAMES in the source for which are pinned); tuning_raw keeps all 36 half floats. strength -1 = never breaks off its parent; on group 0 it plausibly frees the whole object from the world (guess). min_move_force (root +0xBC): -1 on trees, gates, signs and poles, small on loose props, 0 on vehicle parts (guess: force needed to start moving, -1 = fixed until broken). gravity_factor, max_speed, max_ang_speed, buoyancy_factor and damping are read in the GTA V archetype order (likely). flags, flags2, root_flags, root_tail and the type/include flags are raw. Damaged masses and joint limits are not in the fragment as far as decoded.";
+pub const NOTE: &str = "Units: kg, metres, kg m^2; model space is RAGE Z-up. Confirmed: mass (= sum of in-use child masses on every fragment), inertia (= child mass x bound volume distribution), centre_of_gravity, bounding_sphere, the group tree (parent, child_groups, children, bone; name = the bone whose joaat is name_hash), child mass, bound and position (= bone pivot + offset). tuning: names matched against the game's fragment tuning presets (see TUNING_NAMES in the source for which are pinned); tuning_raw keeps all 36 half floats. strength -1 = never breaks off its parent; on group 0 it plausibly frees the whole object from the world (guess). min_move_force (root +0xBC): -1 on trees, gates, signs and poles, small on loose props, 0 on vehicle parts (guess: force needed to start moving, -1 = fixed until broken). gravity_factor, max_speed, max_ang_speed, buoyancy_factor and damping are read in the GTA V archetype order (likely). Group flags (flags = word 0, flags2 = word 1) and root_flags are named in flag_names / root_flag_names from the presets' booleans (see GROUP_FLAGS and ROOT_FLAGS in the source for which are confirmed); bits not named are listed in flag_bits_unnamed. made_of_glass is set on the glass panes of windows and doors. Type/include flags are collision layer masks: the archetype's type flags are the OR of its children's plus bit 0 on every fragment, and type bit 19 is only on vegetation (foliage, likely); layers are not named. root_tail is raw. Damaged masses and joint limits are not in the fragment as far as decoded.";
 
 /// Facts about a model's map archetype definition, from
 /// `<work>/index/archetype_lod.jsonl` (`sixng lod-links`), joined with the
@@ -477,7 +578,7 @@ pub fn tunable_objects(ws: &crate::export::Workspace) -> &'static std::collectio
         }
         match build_tunable_objects(ws) {
             Ok(v) => {
-                let _ = std::fs::write(&path, serde_json::to_vec(&v).unwrap_or_default());
+                let _ = crate::atomic::write(&path, serde_json::to_vec(&v).unwrap_or_default());
                 parse(&v)
             }
             Err(_) => Default::default(),
@@ -615,6 +716,9 @@ mod tests {
         let g1 = g0 + GROUP_SIZE;
         put(&mut r, g1 + 8, &crate::meta7a::joaat("arm").to_le_bytes());
         h(&mut r, g1 + 0x10, &[1, 0, 0xFFFF, 0, 0, 2, 3, 3, 3]);
+        // glass, damage when broken, and an unnamed bit 5; word 1: fade with time
+        put(&mut r, g1, &(0x2u32 | 0x4 | 0x20).to_le_bytes());
+        put(&mut r, g1 + 4, &1u32.to_le_bytes());
         h(&mut r, g1 + 0x28, &[0x5DDC, 0x3400, 0x3400, 0, 0x5640, 0x63D0, 0, 0x3800]); // 375, .25, .25, 0, 100, 1000, 0, 0.5
         // children: 10 kg in the root, a spare 1 kg record, 2 kg on the arm
         // (numbered 1, as the spare takes no number; ranges count positions)
@@ -656,12 +760,27 @@ mod tests {
         assert_eq!(j["groups"][0]["name"], "root_bone");
         assert_eq!(j["groups"][0]["child_groups"], serde_json::json!([1]));
         assert_eq!(j["groups"][1]["tuning"]["strength"], 375.0);
+        assert_eq!(j["groups"][1]["flag_names"], serde_json::json!(["made_of_glass", "damage_when_broken", "fade_with_time"]));
+        assert_eq!(j["groups"][1]["flag_bits_unnamed"], serde_json::json!([[0, 5]]));
+        assert_eq!(j["groups"][0]["flag_names"], serde_json::json!([]));
         assert_eq!(j["children"][2]["bone_name"], "arm");
         assert_eq!(j["groups"][1]["children"], serde_json::json!([2]));
         assert_eq!(j["groups"][0]["children"], serde_json::json!([0]));
         assert_eq!(j["children"][0]["bound"]["type_name"], "box");
         // a group whose name hash does not match its bone gets no name
         assert!(fragment_json(&p, &["other".into(), "arm".into()])["groups"][0]["name"].is_null());
+    }
+
+    #[test]
+    fn names_flag_bits() {
+        // the two collide bits share a name and give it once
+        let (n, rest) = group_flag_names([1 << 23 | 1 << 16 | 1 << 13, 1 << 3]);
+        assert_eq!(n, ["disable_map_collision_until_break", "collide_convex_against_ground_or_larger_bounds"]);
+        assert_eq!(rest, [[0, 13]]);
+        // a fallen-log fragment's root flags
+        let (n, rest) = root_flag_names(0x4103_0169);
+        assert_eq!(n, ["any_group_disable_map_collision_until_break", "vegetation"]);
+        assert_eq!(rest, [0, 5, 6, 16, 17, 24, 30]);
     }
 
     #[test]

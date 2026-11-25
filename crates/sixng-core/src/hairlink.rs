@@ -188,7 +188,7 @@ pub fn get(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry]
         }
         let t = build(work, a, all).map_err(|e| e.to_string())?;
         if let Ok(b) = serde_json::to_vec(&t) {
-            let _ = std::fs::write(&cache, b);
+            let _ = crate::atomic::write(&cache, b);
         }
         Ok(t)
     })

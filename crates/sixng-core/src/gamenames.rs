@@ -216,9 +216,9 @@ pub fn annotate(ws: &Workspace, archive: &str, out: &Path, progress: crate::expo
         let named_tri: u64 = by.keys().map(|k| tri[k]).sum();
         s["names_by_surface_id"] = json!(by);
         s["names_note"] = json!("surface id = 18 + elf(material name) % 32749 (Unix ELF/PJW hash of the name as written in common.rpf's material XML). The TERRAIN_ names are recovered by hash (that block of the XML is not read). Ids without a name belong to other materials in that block.");
-        std::fs::write(&sp, serde_json::to_vec_pretty(&s)?)?;
+        crate::atomic::write(&sp, serde_json::to_vec_pretty(&s)?)?;
         let all: BTreeMap<String, &String> = names.iter().map(|(k, v)| (format!("{k:04x}"), v)).collect();
-        std::fs::write(cdir.join("surface_names.json"), serde_json::to_vec_pretty(&json!({"note": s["names_note"], "names": all}))?)?;
+        crate::atomic::write(cdir.join("surface_names.json"), serde_json::to_vec_pretty(&json!({"note": s["names_note"], "names": all}))?)?;
         sum.insert("surface_ids".into(), json!(tri.len()));
         sum.insert("surface_ids_named".into(), json!(by.len()));
         sum.insert("triangles_named".into(), json!(if total > 0 { named_tri as f64 / total as f64 } else { 0.0 }));
@@ -233,7 +233,7 @@ pub fn annotate(ws: &Workspace, archive: &str, out: &Path, progress: crate::expo
                 }
             }
         }
-        std::fs::write(&cp, serde_json::to_vec_pretty(&c)?)?;
+        crate::atomic::write(&cp, serde_json::to_vec_pretty(&c)?)?;
     }
 
     let gp = out.join("paths").join(stem).join("graph.json");
@@ -279,7 +279,7 @@ pub fn annotate(ws: &Workspace, archive: &str, out: &Path, progress: crate::expo
             }
         }
         g["street_note"] = json!("street = joaat(lower-case location key), the key of an <Item key=\"CustomEntity<n>_<m>\"> in common.rpf's location name table; street_label is that item's <Name> (a text label), street_text its text from the first data.rpf text table that has it.");
-        std::fs::write(&gp, serde_json::to_vec(&g)?)?;
+        crate::atomic::write(&gp, serde_json::to_vec(&g)?)?;
         sum.insert("street_hashes".into(), json!(distinct.len()));
         sum.insert("named_nodes".into(), json!(named));
         sum.insert("nodes_with_label".into(), json!(resolved));

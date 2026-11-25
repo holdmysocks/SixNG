@@ -136,7 +136,7 @@ fn load_settings() -> AppSettings {
 fn save_settings(s: &AppSettings) -> std::io::Result<()> {
     let p = settings_path().ok_or_else(|| std::io::Error::other("no settings location"))?;
     let data = serde_json::to_vec_pretty(s).unwrap();
-    match std::fs::write(&p, &data) {
+    match sixng_core::atomic::write(&p, &data) {
         Ok(()) => Ok(()),
         Err(_) => {
             // exe folder not writable: use the per-user settings folder
@@ -144,7 +144,7 @@ fn save_settings(s: &AppSettings) -> std::io::Result<()> {
                 .ok_or_else(|| std::io::Error::other("no per-user settings folder"))?
                 .join("settings.json");
             std::fs::create_dir_all(p.parent().unwrap())?;
-            std::fs::write(p, data)
+            sixng_core::atomic::write(p, data)
         }
     }
 }

@@ -161,7 +161,7 @@ pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], out
         let r = crate::scan::read_entry(&a.path, e).ok().and_then(|d| parse(&d)).map(|p| {
             let mut v = p.to_json();
             v["id"] = serde_json::json!(e.id);
-            std::fs::write(dir.join(format!("{:x}.json", e.off)), serde_json::to_vec(&v).unwrap_or_default()).is_ok()
+            crate::atomic::write(dir.join(format!("{:x}.json", e.off)), serde_json::to_vec(&v).unwrap_or_default()).is_ok()
         });
         if r == Some(true) { &ok } else { &bad }.fetch_add(1, Ordering::Relaxed);
     });
@@ -299,7 +299,7 @@ pub fn export_handling(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::En
     let dir = out.join("pso");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("handling.json");
-    std::fs::write(&path, serde_json::to_vec_pretty(&json!({
+    crate::atomic::write(&path, serde_json::to_vec_pretty(&json!({
         "note": "Vehicle handling records. Field names resolve where known (GTA V handling names, case-sensitive joaat); others are hashes. Components are typed sub-records (_struct).",
         "records": recs.iter().map(|r| &r.1).collect::<Vec<_>>(),
     }))?)?;
