@@ -423,6 +423,9 @@ const EMISSIVE_PARAM: &str = "8e0d63ee";
 /// light ring. It has no `emissivetex`; the alpha of its `diffusetex` is 255
 /// on the LED packages and 0 on the board between them.
 const LED_STRIP_SHADER: &str = "f3ad0561";
+/// `standard_vehicle_emissive_animated_bones`: spot, flood and marker
+/// lamps. Some bind the LED strip's colour map and light by it.
+const VEHICLE_LAMP_SHADER: &str = "29648098";
 /// `diffusetex`.
 const DIFFUSE_PARAM: &str = "c8e8c282";
 /// The texture the game draws vehicle screens into while it runs (dials,
@@ -874,8 +877,13 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
             }
             // An LED strip lights where its colour map's alpha says, not
             // the whole board.
-            if s.name_hash == LED_STRIP_SHADER && st.emissive.is_none() && o.png {
-                st.emissive = lit_by_alpha(&st, o, &tdir).map(|p| uri_of(&p));
+            // The same goes for a lamp that lights by its colour map (no
+            // `emissivetex`, or the colour map bound there again). A map
+            // with one alpha all over stays as it is.
+            if lights_by_alpha(&s.name_hash, &st) && o.png {
+                if let Some(p) = lit_by_alpha(&st, o, &tdir) {
+                    st.emissive = Some(uri_of(&p));
+                }
             }
             if st.normal.is_none() {
                 st.normal = normal_fallback;
@@ -989,6 +997,17 @@ fn lit_by_alpha(st: &ShaderTextures, o: &ExportOptions, tdir: &Path) -> Option<P
         fs::rename(&tmp, &p).ok()?;
     }
     Some(p)
+}
+
+/// Whether a shader lights where the alpha of its colour map says: the LED
+/// strip without an `emissivetex`, and a vehicle lamp without one or with
+/// its colour map bound there again.
+fn lights_by_alpha(shader: &str, st: &ShaderTextures) -> bool {
+    match shader {
+        LED_STRIP_SHADER => st.emissive.is_none(),
+        VEHICLE_LAMP_SHADER => st.emissive.is_none() || st.emissive == st.base,
+        _ => false,
+    }
 }
 
 /// RGBA pixels with the colour scaled by the alpha, opaque: what an
@@ -3381,6 +3400,18 @@ mod dictionary_tests {
         // one alpha all over: no mask to read
         assert!(lit_map(&[10, 20, 30, 255, 40, 50, 60, 255]).is_none());
         assert!(lit_map(&[]).is_none());
+    }
+
+    #[test]
+    fn lamps_that_light_by_their_colour_map() {
+        let st = |base: Option<&str>, emissive: Option<&str>| ShaderTextures { base: base.map(str::to_string), emissive: emissive.map(str::to_string), ..Default::default() };
+        // the LED strip, and a lamp with no emissive map or the colour map again
+        assert!(lights_by_alpha(LED_STRIP_SHADER, &st(Some("a.png"), None)));
+        assert!(lights_by_alpha(VEHICLE_LAMP_SHADER, &st(Some("a.png"), None)));
+        assert!(lights_by_alpha(VEHICLE_LAMP_SHADER, &st(Some("a.png"), Some("a.png"))));
+        // a lamp with its own emissive map keeps it; other shaders are left alone
+        assert!(!lights_by_alpha(VEHICLE_LAMP_SHADER, &st(Some("a.png"), Some("b.png"))));
+        assert!(!lights_by_alpha("0badf00d", &st(Some("a.png"), None)));
     }
 
     #[test]
