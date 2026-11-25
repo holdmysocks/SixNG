@@ -680,7 +680,8 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             let up_h = root.y * 0.5 + 0.5;
             let sky_h = mix(neutral(F.sky_hor.rgb, 0.8) * 0.6, neutral(F.sky_top.rgb, 0.8), up_h) * F.misc.w;
             let amb_g = sky_h * albedo * hair_ambient(tdir, v, g0h, 1.0) + sky_h * 0.012;
-            col = direct_h * ao_direct + amb_g * ao;
+            // the game multiplies its light sum by the light's shadow (1 here without the sun shadow map)
+            col = direct_h * sh * ao_direct + amb_g * ao;
             // a set with UseStandardBsdf (uv1.y = 2 + reflectance scale; nearly all hair and fur): the game
             // lights the strand by its standard lighting, with the atlas colour as base colour, the ramp's
             // roughness, the tube normal and F0 = 0.0465 x the scale
