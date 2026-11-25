@@ -241,7 +241,8 @@ impl Table {
         self.value(w, var, hour).unwrap_or(default)
     }
 
-    fn rgb(&self, w: &Weather, var: &str, hour: f32) -> [f32; 3] {
+    /// The `<var>_r`, `_g`, `_b` triple (1 where unset).
+    pub fn rgb(&self, w: &Weather, var: &str, hour: f32) -> [f32; 3] {
         ["r", "g", "b"].map(|c| self.get(w, &format!("{var}_{c}"), hour, 1.0))
     }
 }

@@ -976,6 +976,40 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   hand-offs do not open holes. A child already drawn stays out to 1.5×
   its distance while its parent's model is still loading. Eviction runs
   in 3 ms slices, not in one burst.
+- **Sky, light and frame** from the game's timecycle (`sixng daylight`;
+  pick the **weather** next to the time of day, or `--weather W`):
+  - The sky is the timecycle's physical atmosphere (`sky_new_*`: planet
+    radius, atmosphere top, Rayleigh and Mie scattering with their scale
+    heights, Mie absorption and phase, two-layer ozone), rendered with
+    look-up tables: transmittance, multiple scattering, the sky seen from
+    the camera and a 32³ froxel volume of aerial perspective (haze over
+    distance, 40 km deep near the ground, out to the horizon from higher
+    up). The sun's disc, a full moon opposite it, stars
+    and the night air glow (`sky_air_glow_*`) are drawn on top.
+  - Surfaces are lit in physical units: the sun's illuminance
+    (`sky_scattering_sun_illuminance`, ~100 000 lux) times the light
+    colours, through the air to each point (so a low sun turns orange and
+    fades); the moon likewise. The sky's own light is an ambient cube
+    integrated from the sky table each frame, scaled by
+    `ambient_sky_intensity`, plus the sun's light bounced off lit
+    surroundings from every side (`ambient_bounce_intensity` times a 15 %
+    ground albedo, our choice). The timecycle's two height fog layers
+    (`local_atmosphere_fog_*`, e.g. Misty and Fog) are drawn too.
+  - The frame is HDR. An exposure meter sets the exposure: mostly the
+    light falling at the camera (sun, moon and sky), partly a histogram of
+    the frame between the timecycle's low and high percentiles, with its
+    key value and adaptation rate and `postfx_exposure` as an offset; then bloom
+    (`postfx_intensity_bloom`), contrast and saturation, and a filmic curve.
+  - Our own choices (not decoded): the scale from the timecycle's colour
+    values to scattering per km (so its defaults give the usual Earth
+    atmosphere), the moon's illuminance (0.25 lux), star and air-glow
+    brightness, the incident meter's 3:1 share against the histogram (a
+    low sun or moon counted as if 20° up),
+    night scenes metered up to 3 stops darker than mid grey, baked map
+    tiles lit at 60 % of their colour,
+    sun dimming by cloud cover (no clouds are drawn yet), the brightness
+    of emissive surfaces (6 cd/m² at strength 1) and the filmic curve.
+    Without the timecycle (no index) the built-in Sunny values are used.
 - **Map cells** (far placements merged per area): a placement more than
   0.6× the HD distance from the camera can be drawn from its cell instead
   of one by one. A cell holds one LOD level's placements in one square of
@@ -1110,7 +1144,7 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   (they showed as floating black boxes); the model viewer still shows them.
 
 Map 3D screenshots: `--tab map3d --center X,Y --height H --yaw DEG --pitch
-DEG [--quality low|medium|high|ultra] [--detail 0-1] [--tod H] [--lights]
+DEG [--quality low|medium|high|ultra] [--detail 0-1] [--tod H] [--weather W] [--lights]
 [--roads] [--no-terrain] [--fog F] [--max-tex PX] [--no-textures]
 [--no-hd-fallback] [--kinds a,b] [--lods a,b] [--ram-cap GB]
 [--no-windows] [--no-decal-bias] [--show-proxies] [--fly X,Y,H,SECONDS]
@@ -1125,7 +1159,7 @@ loader times) go to stderr and `<work>/map3d_perf.log`.
 Screenshots from the command line (for checks and docs):
 
 ```powershell
-.\target\release\sixng-gui.exe --model levels.rpf@10f266d010 --mode 5 --yaw 2.4 --pitch 0.25 --screenshot car.png --exit
+.\target\release\sixng-gui.exe --model levels.rpf@10f266d010 --mode 0 --yaw 2.4 --pitch 0.25 --screenshot car.png --exit
 ```
 
 Options: `--lod N`, `--mode 0-7` (shaded, albedo, normals, UV, slot,

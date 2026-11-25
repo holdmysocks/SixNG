@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 mod assemble;
+mod atmo;
 mod bc;
 mod cells;
 mod fabric;
@@ -1597,6 +1598,9 @@ impl App {
             if let Some(h) = c.f("tod") {
                 m3.tod = h;
                 m3.look.set_time_of_day(h);
+            }
+            if let Some(w) = c.get("weather") {
+                m3.weather = w.trim().to_ascii_lowercase();
             }
             if let Some(v) = c.f("fog") {
                 m3.look.fog = v;

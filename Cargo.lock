@@ -3481,6 +3481,7 @@ dependencies = [
  "image",
  "libc",
  "metal-rust",
+ "naga",
  "rayon",
  "regex",
  "rfd",
