@@ -378,7 +378,8 @@ pub struct PartFx {
     pub head: bool,
     /// A skin mesh without a colour texture: takes the head's neck tone.
     pub body: bool,
-    /// Heads: the face textures the outfit item names (colour, normal).
+    /// Heads and body skin: the textures the outfit item names (colour,
+    /// normal); the first colour texture in a store is used.
     pub skins: Vec<(u64, u64)>,
     /// Skin, head, eyes and teeth: skinned to the shared skeleton only, so
     /// the body-shape rig moves them. Everything else follows the skin.
@@ -4918,17 +4919,18 @@ fn load_parts(
             Err(err) => errs.push(format!("{}: {err:#}", e.id)),
         }
     }
-    if let (Some(m), false) = (&mut model, body_mats.is_empty()) {
+    // body materials without a colour texture (a body item that names a
+    // stored skin texture has one: `PartFx::skins`)
+    let bare_body: Vec<usize> = model.as_ref().map(|m| body_mats.into_iter().flatten().filter(|&i| m.materials.get(i).is_some_and(|x| x.base.is_none())).collect()).unwrap_or_default();
+    if let (Some(m), false) = (&mut model, bare_body.is_empty()) {
         match tone {
             Some(t) => {
-                for i in body_mats.into_iter().flatten() {
-                    let Some(mat) = m.materials.get_mut(i) else { continue };
-                    if mat.base.is_none() {
-                        mat.base_factor = [t[0], t[1], t[2], mat.base_factor[3]];
-                        mat.gap = "skin tone taken from the face texture at the neck".into();
-                    }
+                for i in bare_body {
+                    let mat = &mut m.materials[i];
+                    mat.base_factor = [t[0], t[1], t[2], mat.base_factor[3]];
+                    mat.gap = "skin tone taken from the face texture at the neck".into();
                 }
-                notes.push("Body skin: the game builds it at run time and no painted body texture is stored, so the body takes the skin tone of the face texture at the neck.".to_string());
+                notes.push("Body skin: the outfit item names no body texture that is in the install, so the body takes the skin tone of the face texture at the neck.".to_string());
             }
             None => notes.push("Body skin: no face texture to take a skin tone from, so the body is shown white.".to_string()),
         }
@@ -5461,8 +5463,11 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
             // textures are missing and it stores no preset, tint row, flat
             // colour or colour tag (19 items in the 292 named characters'
             // default looks, mostly watches). A neutral dark grey instead of
-            // white; not the game's colour.
-            bare_tint(m, |_| BARE_FALLBACK);
+            // white; not the game's colour. Not skin: the body takes the
+            // face's skin tone later, and a grey tint would darken it.
+            if !f.body && !f.head {
+                bare_tint(m, |_| BARE_FALLBACK);
+            }
             return false;
         }
     };
@@ -6429,7 +6434,7 @@ fn load_query_sel(
                         }
                         if oi == k {
                             let body = p.slot == "body upper" || p.slot == "body lower";
-                            fx.insert(e.off, PartFx { tint: p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t.rows[0]))).filter(|t| t.1 != 255), colour: p.colour.map(|c| [c[1], c[2], c[3]]), tag: p.colour_tag, subs: p.preset_colours.clone(), preset: p.preset.as_deref().and_then(|h| u32::from_str_radix(h, 16).ok()), head: p.slot == "head", body, skeletal: body || matches!(p.slot.as_str(), "head" | "eyes" | "teeth" | "teeth accessory"), covers: matches!(p.slot.as_str(), "top" | "outer" | "bottom" | "full" | "feet" | "gloves"), layer: match p.slot.as_str() { "outer" => 2, "top" | "bottom" | "full" => 1, _ => 0 }, heel: p.slot == "feet" && p.drawable.split('_').any(|t| matches!(t, "sh" | "mh" | "hh")), region_layer: p.layer.as_deref().and_then(|l| u32::from_str_radix(l, 16).ok()).unwrap_or(match p.slot.as_str() { "body upper" => 0xb4d9_d470, "body lower" => 0xe062_2b84, _ => 0 }), hides: p.hides.iter().filter_map(|(l, m)| Some((u32::from_str_radix(l, 16).ok()?, m.clone()))).collect(), skins: if p.slot == "head" { p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect() } else { Vec::new() } });
+                            fx.insert(e.off, PartFx { tint: p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t.rows[0]))).filter(|t| t.1 != 255), colour: p.colour.map(|c| [c[1], c[2], c[3]]), tag: p.colour_tag, subs: p.preset_colours.clone(), preset: p.preset.as_deref().and_then(|h| u32::from_str_radix(h, 16).ok()), head: p.slot == "head", body, skeletal: body || matches!(p.slot.as_str(), "head" | "eyes" | "teeth" | "teeth accessory"), covers: matches!(p.slot.as_str(), "top" | "outer" | "bottom" | "full" | "feet" | "gloves"), layer: match p.slot.as_str() { "outer" => 2, "top" | "bottom" | "full" => 1, _ => 0 }, heel: p.slot == "feet" && p.drawable.split('_').any(|t| matches!(t, "sh" | "mh" | "hh")), region_layer: p.layer.as_deref().and_then(|l| u32::from_str_radix(l, 16).ok()).unwrap_or(match p.slot.as_str() { "body upper" => 0xb4d9_d470, "body lower" => 0xe062_2b84, _ => 0 }), hides: p.hides.iter().filter_map(|(l, m)| Some((u32::from_str_radix(l, 16).ok()?, m.clone()))).collect(), skins: if p.slot == "head" || body { p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect() } else { Vec::new() } });
                         }
                     }
                 }

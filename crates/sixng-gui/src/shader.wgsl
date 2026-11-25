@@ -52,6 +52,298 @@ struct Sticker {
 @group(0) @binding(4) var t_stick: texture_2d_array<f32>;
 @group(0) @binding(5) var samp_clamp: sampler;
 
+// The 3D map's scene (atmo.rs, atmo_common.wgsl): the game's atmosphere
+// as look-up tables, the exposure and the sky's ambient light. The model
+// viewer binds a scene with flags.x = 0 and keeps its own light.
+@group(0) @binding(6) var<uniform> S: Scene;
+@group(0) @binding(7) var t_trans: texture_2d<f32>;
+@group(0) @binding(8) var t_sky: texture_2d<f32>;
+@group(0) @binding(9) var t_ap: texture_3d<f32>;
+@group(0) @binding(10) var<storage, read> SCN: State;
+@group(0) @binding(11) var lin_clamp: sampler;
+
+// Sun and moon shadows (shadow.rs): four cascades from the light.
+struct Shadow {
+    mats: array<mat4x4<f32>, 4>,
+    splits: vec4<f32>,
+    texel: vec4<f32>,
+    bias: vec4<f32>,
+    // x on, y filter radius (texels), z softness
+    params: vec4<f32>,
+};
+@group(0) @binding(12) var<uniform> SH: Shadow;
+@group(0) @binding(13) var t_shadow: texture_depth_2d_array;
+@group(0) @binding(14) var samp_shadow: sampler_comparison;
+
+fn hdr() -> bool { return S.flags.x == 1u; }
+
+// How lit p is in cascade c (1 lit, 0 shadowed; -1 outside the cascade).
+fn shadow_in(p: vec3<f32>, c: u32) -> f32 {
+    let q = SH.mats[c] * vec4(p, 1.0);
+    let uv = vec2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);
+    if (any(uv < vec2(0.0)) || any(uv > vec2(1.0)) || q.z > 1.0) { return -1.0; }
+    let refd = q.z + SH.bias[c];
+    let px = 1.0 / f32(textureDimensions(t_shadow).x);
+    let rad = SH.params.y;
+    // 4x4 filter of bilinear compares, weights fall off from the centre
+    var lit = 0.0;
+    var wsum = 0.0;
+    for (var y = -1.5; y <= 1.5; y += 1.0) {
+        for (var x = -1.5; x <= 1.5; x += 1.0) {
+            let w = 1.0 - 0.15 * (abs(x) + abs(y));
+            let o = vec2(x, y) * px * rad * 0.67;
+            lit += w * textureSampleCompareLevel(t_shadow, samp_shadow, uv + o, i32(c), refd);
+            wsum += w;
+        }
+    }
+    return lit / wsum;
+}
+
+// How much of the sun (or moon) reaches world point p past the casters
+// in the shadow cascades; 1 beyond their range or with shadows off.
+fn sun_shadow(p: vec3<f32>) -> f32 {
+    if (!hdr() || SH.params.x < 0.5) { return 1.0; }
+    // view depth: the cascades split the distance along the view axis
+    let depth = (F.view_proj * vec4(p, 1.0)).w;
+    for (var c = 0u; c < 4u; c++) {
+        let far = SH.splits[c];
+        if (depth < far) {
+            var s = shadow_in(p, c);
+            if (s < 0.0) { continue; }
+            // last tenth of a cascade: blend into the next (or into lit)
+            let fade = clamp((depth - far * 0.9) / (far * 0.1), 0.0, 1.0);
+            if (fade > 0.0) {
+                var nxt = 1.0;
+                if (c < 3u) {
+                    let s2 = shadow_in(p, c + 1u);
+                    if (s2 >= 0.0) { nxt = s2; }
+                }
+                s = mix(s, nxt, fade);
+            }
+            return s;
+        }
+    }
+    return 1.0;
+}
+
+// share of a baked map tile's colour taken as the ground's reflectance
+const TILE_ALBEDO: f32 = 0.6;
+// how far the map's terrain is drawn under its real height (world3d SINK, m)
+const TILE_SINK: f32 = 1.5;
+
+// radius (km from the planet centre) of a world point (m, y up)
+fn point_r(p: vec3<f32>) -> f32 {
+    return S.radii.x + max(p.y * 0.001, 0.002);
+}
+
+// Light of the sun (or the moon, whichever is the frame's light) that
+// reaches world point p through the air, in lux times pi (the callers
+// divide the Lambert term by pi); the model viewer's own light otherwise.
+fn sun_e(p: vec3<f32>) -> vec3<f32> {
+    return sun_e_shadowed(p, sun_shadow(p));
+}
+
+// The light of `sun_e` with the shadow `sh` already looked up.
+fn sun_e_shadowed(p: vec3<f32>, sh: f32) -> vec3<f32> {
+    if (!hdr()) { return F.sun_col.rgb * F.sun_dir.w * 3.0; }
+    let r = point_r(p);
+    let l = normalize(F.sun_dir.xyz);
+    if (dot(l, S.moon.xyz) > 0.99) {
+        return S.moon_dir_e.rgb * transmittance(r, S.moon.y) * sh;
+    }
+    return S.sun_dir_e.rgb * transmittance(r, S.sun.y) * sh;
+}
+
+// Sky irradiance / pi on a surface facing n (ambient cube from the sky-view LUT).
+fn sky_ambient(n: vec3<f32>) -> vec3<f32> {
+    let n2 = n * n;
+    let x = select(SCN.v[2].rgb, SCN.v[1].rgb, n.x >= 0.0);
+    let y = select(SCN.v[4].rgb, SCN.v[3].rgb, n.y >= 0.0);
+    let z = select(SCN.v[6].rgb, SCN.v[5].rgb, n.z >= 0.0);
+    return n2.x * x + n2.y * y + n2.z * z;
+}
+
+// Radiance of the sky along d as seen from the camera (no sun or moon
+// disc); under the horizon a ground of the scene's albedo.
+fn sky_radiance(d: vec3<f32>) -> vec3<f32> {
+    let r = S.radii.x + max(S.radii.z, 0.002);
+    var l = textureSampleLevel(t_sky, lin_clamp, sky_uv(d, r), 0.0).rgb;
+    if (hits_ground(r, d.y)) {
+        let up = sky_ambient(vec3(0.0, 1.0, 0.0));
+        let sun = S.sun_dir_e.rgb * SCN.v[7].rgb * max(S.sun.y, 0.0) + S.moon_dir_e.rgb * SCN.v[8].rgb * max(S.moon.y, 0.0);
+        l += S.air_glow.w * (up + sun / PI) * 0.7;
+    }
+    return l;
+}
+
+fn hash3(p: vec3<f32>) -> f32 {
+    return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453);
+}
+
+// The sun's and the moon's discs and the stars along d (unit), as luminance.
+fn sky_discs(d: vec3<f32>) -> vec3<f32> {
+    var c = vec3(0.0);
+    let r = S.radii.x + max(S.radii.z, 0.002);
+    let cs = dot(d, S.sun.xyz);
+    let ws = S.sun.w;
+    if (cs > cos(ws)) {
+        let x = acos(clamp(cs, -1.0, 1.0)) / ws;
+        let limb = 1.0 - 0.6 * (1.0 - sqrt(max(1.0 - x * x, 0.0)));
+        c += S.sun_dir_e.rgb * SCN.v[7].rgb / (PI * ws * ws) * limb * S.post2.y;
+    }
+    let cm = dot(d, S.moon.xyz);
+    let wm = S.moon.w;
+    if (cm > cos(wm)) {
+        c += S.moon_dir_e.rgb * SCN.v[8].rgb / (PI * wm * wm) * S.moon_dir_e.w;
+    }
+    if (d.y > 0.0 && S.moon_sky.w > 0.0) {
+        // stars: one in some cells of a fine grid of directions
+        let g = d * 420.0;
+        let cell = floor(g);
+        let h = hash3(cell);
+        if (h > 0.985) {
+            let o = vec3(hash3(cell + 1.7), hash3(cell + 3.1), hash3(cell + 5.3));
+            let dd = length(fract(g) - o);
+            let b = pow((h - 0.985) / 0.015, 6.0);
+            c += vec3(0.85, 0.9, 1.0) * S.moon_sky.w * b * smoothstep(0.35, 0.0, dd) * transmittance(r, d.y);
+        }
+    }
+    return c;
+}
+
+// Transmittance of the timecycle's two exponential height fog layers
+// between the camera and p.
+fn height_fog(p: vec3<f32>) -> f32 {
+    let o = F.cam_pos.xyz;
+    let len = length(p - o);
+    var tau = 0.0;
+    let n = 8;
+    for (var i = 0; i < n; i++) {
+        let y = mix(o.y, p.y, (f32(i) + 0.5) / f32(n));
+        tau += S.fog0.x * exp(-max(y - S.fog0.z, 0.0) / max(S.fog0.y, 1.0));
+        tau += S.fog1.x * exp(-max(y - S.fog1.z, 0.0) / max(S.fog1.y, 1.0));
+    }
+    return exp(-tau * len / f32(n));
+}
+
+// ---- water ------------------------------------------------------------
+// The sea and the game's water meshes on the map: a sum of wind waves for
+// the normal (wavelengths from the timecycle's Beaufort number and fetch,
+// atmo.rs `sea_waves`), the sky mirrored by Fresnel, the sun's glint, and
+// the water body's colour from its scattering and extinction.
+const WAVES: u32 = 10u;
+// least roughness of the sea's glint (keeps single-pixel sparkles out)
+const SEA_MIN_ROUGH: f32 = 0.06;
+// the baked map tiles' water colour (mapbake, 40 80 140 sRGB), linear
+const TILE_SEA: vec3<f32> = vec3(0.021, 0.080, 0.262);
+// share of the sea's slope variance drawn as waves (the rest is roughness)
+const WAVE_SHARE: f32 = 0.6;
+
+fn wave_rand(i: u32, k: f32) -> f32 {
+    return fract(sin(f32(i) * 12.9898 + k * 78.233) * 43758.5453);
+}
+
+// Surface normal of the sea at p (world), and the slope variance of the
+// waves too small to draw at this pixel (added to the roughness); `fp` is
+// the pixel's size on the surface (m, from the screen derivatives).
+fn sea_normal(p: vec3<f32>, fp: f32) -> vec4<f32> {
+    let lp = max(S.water0.w, 2.0);
+    let var_all = max(S.water1.w, 0.003);
+    let s = sqrt(2.0 * WAVE_SHARE * var_all / f32(WAVES));
+    let t = S.water4.w * S.water2.w;
+    var g = vec2(0.0);
+    var lost = 0.0;
+    var lam = lp;
+    for (var i = 0u; i < WAVES; i++) {
+        let a = 0.6 + (wave_rand(i, 1.0) - 0.5) * 2.2;
+        let d = vec2(cos(a), sin(a));
+        // waves shorter than about eight pixels fade into roughness
+        let keep = smoothstep(4.0 * fp, 12.0 * fp, lam);
+        lost += (1.0 - keep * keep) * s * s * 0.5;
+        if (keep > 0.0) {
+            let k = 2.0 * PI / lam;
+            let w = sqrt(9.81 * k);
+            let ph = k * dot(d, p.xz) - w * t + wave_rand(i, 2.0) * 2.0 * PI;
+            g += keep * s * d * cos(ph);
+        }
+        lam *= 0.62;
+    }
+    return vec4(normalize(vec3(-g.x, 1.0, -g.y)), lost);
+}
+
+// Size of a pixel on the surface at p (m), from the screen derivatives
+// (grazing views give long footprints).
+fn footprint(p: vec3<f32>) -> f32 {
+    return max(length(dpdx(p)), length(dpdy(p)));
+}
+
+// Radiance leaving the water surface at p towards the camera; `fp` from
+// `footprint` (taken in uniform control flow by the caller).
+fn water_shade(p: vec3<f32>, fp: f32) -> vec3<f32> {
+    let o = F.cam_pos.xyz;
+    let dist = length(o - p);
+    let v = (o - p) / max(dist, 1e-3);
+    let sn = sea_normal(p, fp);
+    var n = sn.xyz;
+    if (dot(n, v) < 0.02) { n = normalize(n + v * (0.02 - dot(n, v))); }
+    let var_micro = (1.0 - WAVE_SHARE) * max(S.water1.w, 0.003) + sn.w;
+    let a = clamp(sqrt(2.0 * var_micro) + S.water3.w, SEA_MIN_ROUGH, 0.8);
+    let ndv = max(dot(n, v), 1e-3);
+    var fr = 0.02 + 0.98 * pow(1.0 - ndv, 5.0);
+    fr = clamp(fr + clamp(S.water4.x, S.water4.y, S.water4.z), 0.0, 1.0);
+    // the sky in the mirror direction (kept above the horizon)
+    var r = reflect(-v, n);
+    r.y = abs(r.y);
+    let refl = environment(r, sqrt(a));
+    // the sun's (or moon's) glint
+    let l = normalize(F.sun_dir.xyz);
+    let ndl = max(dot(n, l), 0.0);
+    let h = normalize(l + v);
+    let ndh = max(dot(n, h), 0.0);
+    let a2 = a * a;
+    let dd = ndh * ndh * (a2 - 1.0) + 1.0;
+    let D = a2 / (PI * dd * dd);
+    let kk = a2 * 0.5;
+    let G = (ndl / (ndl * (1.0 - kk) + kk)) * (ndv / (ndv * (1.0 - kk) + kk));
+    let fh = 0.02 + 0.98 * pow(1.0 - max(dot(h, v), 0.0), 5.0);
+    let sun = sun_e(p);
+    let glint = D * G * fh / max(4.0 * ndl * ndv, 1e-3) * sun * ndl;
+    // the water body: light going down, scattered back up (a third of
+    // the single-scattering albedo, the usual ocean-colour rule)
+    let ssa = S.water1.rgb / max(S.water0.rgb, vec3(1e-5));
+    let e_down = sun * max(l.y, 0.0) * 0.98 + PI * sky_ambient(vec3(0.0, 1.0, 0.0));
+    let body = 0.33 * ssa * e_down / PI * S.water3.rgb;
+    return fr * refl + glint + (1.0 - fr) * body;
+}
+
+// The map's frame: aerial perspective (froxel volume), height fog, then
+// the exposure; `col0` is the radiance leaving the surface at `p`.
+fn map_finish(col0: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
+    var col = col0;
+    let o = F.cam_pos.xyz;
+    let v = p - o;
+    let d_km = length(v) * 0.001;
+    let c = F.view_proj * vec4(p, 1.0);
+    let ndc = c.xy / max(c.w, 1e-6);
+    let uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    let z = sqrt(clamp(d_km / max(S.radii.w, 0.001), 0.0, 1.0));
+    var ap = textureSampleLevel(t_ap, lin_clamp, vec3(uv, max(z - 0.5 / AP_N, 0.5 / AP_N)), 0.0);
+    // nearer than the first slice: fade in from nothing
+    let k = clamp(d_km / ap_depth(0.0), 0.0, 1.0);
+    ap = mix(vec4(0.0, 0.0, 0.0, 1.0), ap, k);
+    col = col * ap.a + ap.rgb;
+    let tf = height_fog(p);
+    if (tf < 0.9999) {
+        let dir = normalize(v);
+        let g = S.fog0.w;
+        let ph = (1.0 - g * g) / (4.0 * PI * pow(max(1.0 + g * g - 2.0 * g * dot(dir, S.sun.xyz), 1e-4), 1.5));
+        let lit = S.sun_dir_e.rgb * SCN.v[7].rgb * ph + S.moon_dir_e.rgb * SCN.v[8].rgb / (4.0 * PI)
+            + 0.5 * (sky_ambient(vec3(0.0, 1.0, 0.0)) + sky_ambient(vec3(0.0, -1.0, 0.0)));
+        col = mix(lit, col, tf);
+    }
+    return min(col * SCN.v[0].x, vec3(30000.0));
+}
+
 @group(1) @binding(0) var<uniform> M: Mat;
 @group(1) @binding(1) var t_base: texture_2d<f32>;
 @group(1) @binding(2) var t_nrm: texture_2d<f32>;
@@ -206,6 +498,9 @@ fn sun_glow(s: f32, n: f32, amp: f32, a: f32) -> f32 {
 // is not part of it: the direct specular term is its reflection.
 fn environment(d: vec3<f32>, blur: f32) -> vec3<f32> {
     let a = blur * blur;
+    if (hdr()) {
+        return mix(sky_radiance(d), sky_ambient(d), smoothstep(0.15, 0.85, blur));
+    }
     let y = clamp(d.y, -1.0, 1.0);
     let t = mix(max(y, 0.0), 0.35, min(a * 1.5, 1.0));
     var c = mix(F.sky_hor.rgb, F.sky_top.rgb, pow(t, 0.6));
@@ -219,6 +514,7 @@ fn environment(d: vec3<f32>, blur: f32) -> vec3<f32> {
 
 // The surroundings as the camera sees them: with the sun's disc.
 fn sky(d: vec3<f32>) -> vec3<f32> {
+    if (hdr()) { return sky_radiance(d) + sky_discs(d); }
     let s = max(dot(d, normalize(F.sun_dir.xyz)), 0.0);
     let disc = smoothstep(0.99972, 0.99984, s) * smoothstep(-0.006, 0.006, d.y);
     return environment(d, 0.0) + F.sun_col.rgb * (disc * 40.0 * F.sun_dir.w);
@@ -229,6 +525,7 @@ fn sky(d: vec3<f32>) -> vec3<f32> {
 // blue-white), and on surfaces that face down the light the ground sends
 // back.
 fn ambient(n: vec3<f32>) -> vec3<f32> {
+    if (hdr()) { return sky_ambient(n); }
     let sky_d = mix(neutral(F.sky_hor.rgb, 0.8) * 0.6, neutral(F.sky_top.rgb, 0.8), n.y * 0.5 + 0.5);
     return mix(sky_d, ground_col(), 0.8 * smoothstep(0.0, 1.0, -n.y)) * F.misc.w;
 }
@@ -269,6 +566,7 @@ fn weave_gain(g: f32) -> f32 {
 
 @fragment
 fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
+    let fp = footprint(i.world);
     let has = M.flags.x;
     let cls = M.flags.y;
     var base = M.base;
@@ -670,7 +968,7 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let Fr = f0 + (1.0 - f0) * pow(1.0 - max(dot(h, v), 0.0), 5.0);
     let spec = D * G * Fr / max(4.0 * ndl * ndv, 0.001);
     let kd = (1.0 - Fr) * (1.0 - metal);
-    let direct = (kd * albedo / 3.14159 + spec) * F.sun_col.rgb * F.sun_dir.w * ndl * 3.0;
+    let direct = (kd * albedo / 3.14159 + spec) * sun_e(i.world) * ndl;
     let amb_d = ambient(n);
     let fr_v = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
     let r = reflect(-v, n);
@@ -682,7 +980,7 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     if (fin.y > 0.0) {
         let edge = pow(1.0 - ndv, 1.0 + 4.0 * fin2.x);
         let sheen = fin.y * (fin2.y + (1.0 - fin2.y) * edge);
-        col += sheen * (F.sun_col.rgb * F.sun_dir.w * ndl * 3.0 / 3.14159 * ao_direct + amb_d * ao);
+        col += sheen * (sun_e(i.world) * ndl / 3.14159 * ao_direct + amb_d * ao);
     }
     // Clear coat: a second, glossy layer over the base coat (a dielectric,
     // 4 % at normal incidence). It mirrors the sun and the surroundings at
@@ -698,14 +996,40 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
         let cspec = ca2 / (3.14159 * cdd * cdd) * cG * cF / max(4.0 * ndl * ndv, 0.001);
         let cfv = 0.04 + (max(1.0 - cr, 0.04) - 0.04) * pow(1.0 - ndv, 5.0);
         col = (col - emissive) * (1.0 - coat.x * cfv) + emissive
-            + coat.x * (cspec * F.sun_col.rgb * F.sun_dir.w * ndl * 3.0 * ao_direct + environment(r, cr) * F.misc.w * cfv * ao);
+            + coat.x * (cspec * sun_e(i.world) * ndl * ao_direct + environment(r, cr) * F.misc.w * cfv * ao);
     }
     col += pearl * pow(1.0 - ndv, 2.0) * 0.6;
     if (cls == 11u) {
         // baked map tiles (already hill-shaded): soft diffuse, no sky reflection
-        col = albedo * (0.55 * F.sun_col.rgb * F.sun_dir.w * (0.35 + 0.65 * ndl) + 0.7 * amb_d);
+        if (hdr()) {
+            // the tiles carry the map's own light and hill shading: taken
+            // down to a ground's reflectance, half of the slope shading kept
+            // the terrain is drawn sunk under the placed ground meshes and
+            // shows where it rises through them; its shadow is looked up at
+            // its own height (and a little towards the light), so the meshes
+            // just under it don't blotch it at a low sun
+            let lsh = normalize(F.sun_dir.xyz);
+            let tsh = sun_shadow(i.world + vec3(0.0, TILE_SINK, 0.0) + lsh * 0.5);
+            col = albedo * TILE_ALBEDO * (sun_e_shadowed(i.world, tsh) * (0.5 + 0.5 * ndl) / 3.14159 + amb_d);
+            // the tiles' painted water (the map's water and no-data colour)
+            // is shaded as the game's water on sea cells (no height, or deeper
+            // than the beaches: vertex alpha 0, blending over a shore cell); on cells with a
+            // height the same paint marks wet sand and land, which stay ground
+            let painted = 1.0 - smoothstep(0.02, 0.07, length(base.rgb - TILE_SEA));
+            let wet = painted * (1.0 - i.col.a);
+            if (wet > 0.0) {
+                col = mix(col, water_shade(i.world, fp), wet);
+            }
+        } else {
+            col = albedo * (0.55 * F.sun_col.rgb * F.sun_dir.w * (0.35 + 0.65 * ndl) + 0.7 * amb_d);
+        }
     }
 
+    if (hdr() && cls == 8u && F.mode.x == 0u) {
+        // the map's water (the sea plane is opaque)
+        col = water_shade(i.world, fp);
+        alpha = select(0.92, 1.0, M.flags.z == 0u);
+    }
     let mode = F.mode.x;
     if (mode == 1u) { col = albedo; }
     else if (mode == 2u) { return vec4(n * 0.5 + 0.5, 1.0); }
@@ -728,7 +1052,7 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     else if (mode == 6u) { col = i.col.rgb; }
     else if (mode == 7u) {
         let w = vec3(0.8);
-        col = w / 3.14159 * F.sun_col.rgb * F.sun_dir.w * ndl * 3.0 + w * amb_d;
+        col = w / 3.14159 * sun_e(i.world) * ndl + w * amb_d;
     }
     // map tint (instance extra.z): 1 = selected, 2.. = gap heat
     if (i.extra.y > 0.5) { col = mix(col, vec3(1.0, 0.55, 0.1), 0.45); }
@@ -736,12 +1060,16 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     // livery editor: the chosen sticker's zones and its border
     if (st_hl > 0.0) { col = mix(col, vec3(0.1, 0.55, 1.0), st_hl); }
     if (st_edge > 0.0) { col = mix(col, vec3(1.0, 0.85, 0.1), 0.9); }
-    // distance fog
-    let dist = length(F.cam_pos.xyz - i.world);
-    let fog = 1.0 - exp(-dist * F.misc2.x);
-    col = mix(col, neutral(sky(-v), 0.5) * 0.9, fog);
-    if (mode != 1u && mode != 3u && mode != 6u) {
-        col = aces(col * F.sky_hor.w);
+    if (hdr() && (mode == 0u || mode == 7u)) {
+        col = map_finish(col, i.world);
+    } else if (!hdr()) {
+        // distance fog
+        let dist = length(F.cam_pos.xyz - i.world);
+        let fog = 1.0 - exp(-dist * F.misc2.x);
+        col = mix(col, neutral(sky(-v), 0.5) * 0.9, fog);
+        if (mode != 1u && mode != 3u && mode != 6u) {
+            col = aces(col * F.sky_hor.w);
+        }
     }
     if (M.flags.z != 2u && cls != 5u && cls != 6u && cls != 8u) { alpha = 1.0; }
     return vec4(col, alpha);
@@ -753,6 +1081,15 @@ fn vs_mesh(v: VIn) -> VOut {
 }
 
 // wireframe: same vertex path, flat colour, pulled towards the camera
+// Shadow casters: depth only, alpha-tested cut-outs (leaves, fences).
+@fragment
+fn fs_shadow(i: VOut) {
+    let a = M.base.a * select(1.0, textureSample(t_base, samp, i.uv0).a, (M.flags.x & 1u) != 0u);
+    if (M.flags.z == 1u && a < 0.5) {
+        discard;
+    }
+}
+
 @vertex
 fn vs_wire(v: VIn) -> VOut {
     var o = mesh_vertex(v);
@@ -810,6 +1147,10 @@ fn fs_sky(i: SOut) -> @location(0) vec4<f32> {
     let a = F.inv_view_proj * vec4(i.ndc, 1.0, 1.0);
     let b = F.inv_view_proj * vec4(i.ndc, 0.0, 1.0);
     let d = normalize(b.xyz / b.w - a.xyz / a.w);
+    if (hdr()) {
+        // the sun disc can pass the HDR target's range
+        return vec4(min(sky(d) * SCN.v[0].x, vec3(30000.0)), 1.0);
+    }
     return vec4(aces(sky(d) * F.sky_hor.w), 1.0);
 }
 
@@ -914,6 +1255,7 @@ fn cell_vert(v: CIn, fb: bool) -> COut {
 
 @fragment
 fn fs_cell(i: COut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
+    let fp = footprint(i.world);
     let amode = i.lf.y & 3u;
     let cls = i.lf.y >> 2u;
     let base = i.base * textureSample(t_cell, samp, i.uv, i.lf.x);
@@ -956,20 +1298,36 @@ fn fs_cell(i: COut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let Fr = f0 + (1.0 - f0) * pow(1.0 - max(dot(h, v), 0.0), 5.0);
     let spec = D * G * Fr / max(4.0 * ndl * ndv, 0.001);
     let kd = 1.0 - Fr;
-    let direct = (kd * albedo / 3.14159 + spec) * F.sun_col.rgb * F.sun_dir.w * ndl * 3.0;
+    let direct = (kd * albedo / 3.14159 + spec) * sun_e(i.world) * ndl;
     let amb_d = ambient(n);
     let fr_v = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
     let env = environment(reflect(-v, n), rough) * F.misc.w;
     var col = direct + kd * albedo * amb_d + env * fr_v + emissive;
+    if (hdr() && cls == 8u && F.mode.x == 0u) {
+        col = water_shade(i.world, fp);
+        alpha = select(0.92, 1.0, amode != 2u);
+    }
     let mode = F.mode.x;
     if (mode == 1u) { col = albedo; }
     else if (mode == 2u) { return vec4(n * 0.5 + 0.5, 1.0); }
-    let dist = length(F.cam_pos.xyz - i.world);
-    let fog = 1.0 - exp(-dist * F.misc2.x);
-    col = mix(col, neutral(sky(-v), 0.5) * 0.9, fog);
-    if (mode != 1u) {
-        col = aces(col * F.sky_hor.w);
+    if (hdr() && mode == 0u) {
+        col = map_finish(col, i.world);
+    } else if (!hdr()) {
+        let dist = length(F.cam_pos.xyz - i.world);
+        let fog = 1.0 - exp(-dist * F.misc2.x);
+        col = mix(col, neutral(sky(-v), 0.5) * 0.9, fog);
+        if (mode != 1u) {
+            col = aces(col * F.sky_hor.w);
+        }
     }
     if (amode != 2u && cls != 5u && cls != 6u && cls != 8u) { alpha = 1.0; }
     return vec4(col, alpha);
+}
+
+@fragment
+fn fs_shadow_cell(i: COut) {
+    let a = i.base.a * textureSample(t_cell, samp, i.uv, i.lf.x).a;
+    if ((i.lf.y & 3u) == 1u && a < 0.5) {
+        discard;
+    }
 }
