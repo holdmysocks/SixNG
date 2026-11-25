@@ -344,8 +344,13 @@ impl<'a> Meta<'a> {
                 }
                 json!((0..n).filter_map(|i| self.object(h, base + i * esz, depth + 1)).collect::<Vec<_>>())
             }
-            // Bit set / flags (PSO, 16 bytes): the first 64 bits.
-            0x65 => json!(format!("{:016x}", r.u64(p))),
+            // Bit set / flags: `reference` bits, stored as 64-bit words, lowest
+            // first. Printed as one hex number (16 digits per word, highest
+            // word first), so a set of up to 64 bits is its single word.
+            0x65 => {
+                let words = (m.reference as usize).div_ceil(64).clamp(1, 16);
+                json!((0..words).rev().map(|w| format!("{:016x}", r.u64(p + 8 * w))).collect::<String>())
+            }
             // Tagged value (PSO, 16 bytes): u32 tag, then payload.
             0x62 => json!({"tag": r.u32(p), "u32": [r.u32(p + 4), r.u32(p + 8), r.u32(p + 12)], "f32": [r.f32(p + 4), r.f32(p + 8), r.f32(p + 12)]}),
             // 64-bit hash (PSO).
