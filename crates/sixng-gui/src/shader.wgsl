@@ -424,8 +424,12 @@ fn strand_openness(clip: vec4<f32>) -> f32 {
 // horizon per side is clamped to the normal's hemisphere and integrated the
 // usual way. The game's noise comes from a texture and temporal passes
 // follow; here the noise is a hash and the viewer's frame accumulation
-// averages it. How the game mixes the result into its indirect light is not
-// read: the viewer scales its ambient light by it.
+// averages it. The game's standard lighting programs (not its hair programs)
+// use the result on the specular ambient only, through a cone test against
+// the reflection vector whose four constants are not read; the viewer scales
+// its specular ambient by the plain visibility instead (an approximation).
+// The game's diffuse ambient is darkened by its traced probe lighting, which
+// the viewer does not have.
 fn screen_occlusion(clip: vec4<f32>, wp: vec3<f32>, n: vec3<f32>) -> f32 {
     if (F.light_vp[3][3] == 0.0) { return 1.0; }
     let size = F.jitter.yz;
@@ -785,7 +789,8 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     let sh = sun_shadow(i.world, dpdx(i.world), dpdy(i.world));
     var ao_s = ao;
     if (cls != 12u) { ao_s = ao * screen_occlusion(i.clip, i.world, n); }
-    var col = direct * sh * ao_direct + kd * albedo * amb_d * ao_s + env * fr_v * ao_s + emissive;
+    // the game applies its horizon occlusion to the specular ambient only (never to diffuse ambient, never to hair)
+    var col = direct * sh * ao_direct + kd * albedo * amb_d * ao + env * fr_v * ao_s + emissive;
     col += pearl * pow(1.0 - ndv, 2.0) * 0.6;
     if (cls == 12u) {
         // strands: the fibre model on the strand's direction (the tangent)
