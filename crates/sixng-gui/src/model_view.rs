@@ -1111,9 +1111,13 @@ impl ModelView {
                             (Some(t), Some(d)) if d.colour_set(force_colour.unwrap_or(t.name)).is_some() => {
                                 let cs = d.colour_set(force_colour.unwrap_or(t.name)).unwrap();
                                 let ps = slot_params.get(&t.slot).and_then(|n| d.param_set(*n));
+                                // the minimum drawn width in pixels, as an index into the shader's list: the game's hair LOD
+                                // presets store TargetThickness 1.5 (hair, fur), 0.5 (brows, lashes, beard), 0.25 (body hair);
+                                // that this field is the minimum width is inferred
+                                let thick = match t.slot.as_str() { "brows" | "lashes" | "beard" => 1.0, "bodyhair" => 2.0, _ => 0.0 };
                                 let lit = slot_params.get(&t.slot).and_then(|n| d.param_flags(*n)).filter(|_| !force_hair_sum).map_or(1.0, |(std, fs)| if std { 2.0 + fs } else { 1.0 });
-                                let pf = |s: usize, f: f32| { let r = &ps.unwrap()[var(s)]; let v = r.at(f); [v[0], v[1], v[2], r.width * v[3].max(0.05) * w / base, lit] };
-                                g.coat_glb_ramped(&name, &coat, w, &|s, f| lin8(cs[var(s)].at(f), [255; 3]), ps.map(|_| &pf as &dyn Fn(usize, f32) -> [f32; 5]), serde_json::json!({}))
+                                let pf = |s: usize, f: f32| { let r = &ps.unwrap()[var(s)]; let v = r.at(f); [v[0], v[1], v[2], r.width * v[3].max(0.05) * w / base, lit, thick] };
+                                g.coat_glb_ramped(&name, &coat, w, &|s, f| lin8(cs[var(s)].at(f), [255; 3]), ps.map(|_| &pf as &dyn Fn(usize, f32) -> [f32; 6]), serde_json::json!({}))
                             }
                             // a character's hair without them: the appearance preset of each strand's variant
                             (Some(t), _) => g.coat_glb_with(&name, &coat, w, &|s, f| t.rgb(coat.variants.get(s).copied().unwrap_or(0), f), serde_json::json!({})),
@@ -1127,9 +1131,10 @@ impl ModelView {
                             (None, Some(d)) if fur_sets.is_some_and(|f| d.colour_set(f.0).is_some() || d.param_set(f.1).is_some()) => {
                                 let (cn, pn) = fur_sets.unwrap();
                                 let (cs, ps) = (d.colour_set(cn), d.param_set(pn));
+                                let thick = 0.0;
                                 let lit = d.param_flags(pn).filter(|_| !force_hair_sum).map_or(1.0, |(std, fs)| if std { 2.0 + fs } else { 1.0 });
-                                let pf = |s: usize, f: f32| { let r = &ps.unwrap()[var(s)]; let v = r.at(f); [v[0], v[1], v[2], r.width * v[3].max(0.05) * w / base, lit] };
-                                g.coat_glb_ramped(&name, &coat, w, &|s, f| match cs { Some(cs) => lin8(cs[var(s)].at(f), blend(s).map(|m| (m as f32 * g.tint_weight + 255.0 * (1.0 - g.tint_weight) + 0.5) as u8)), None => { let c = blend(s); [c[0], c[1], c[2], 255] } }, ps.map(|_| &pf as &dyn Fn(usize, f32) -> [f32; 5]), serde_json::json!({}))
+                                let pf = |s: usize, f: f32| { let r = &ps.unwrap()[var(s)]; let v = r.at(f); [v[0], v[1], v[2], r.width * v[3].max(0.05) * w / base, lit, thick] };
+                                g.coat_glb_ramped(&name, &coat, w, &|s, f| match cs { Some(cs) => lin8(cs[var(s)].at(f), blend(s).map(|m| (m as f32 * g.tint_weight + 255.0 * (1.0 - g.tint_weight) + 0.5) as u8)), None => { let c = blend(s); [c[0], c[1], c[2], 255] } }, ps.map(|_| &pf as &dyn Fn(usize, f32) -> [f32; 6]), serde_json::json!({}))
                             }
                             (None, _) => g.coat_glb(&name, &coat, w, &cols, serde_json::json!({})),
                         }

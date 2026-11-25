@@ -132,10 +132,14 @@ fn mesh_vertex(v: VIn) -> VOut {
     var edge = v.tan.w;
     var uv1 = v.uv1;
     // a strand ribbon stored closed (|tan.w| = 2 + its half width in mm): opened towards the eye as the
-    // game does, to at least one pixel (its minimum drawn width, taken as one pixel), with the share of
+    // game does, to at least its minimum drawn width, with the share of
     // that width the strand really covers kept for the pixel shader (uv1.x) when it is lit as a standard surface
     if (abs(v.tan.w) >= 2.0) {
-        let r = (abs(v.tan.w) - 2.0) * 0.001;
+        let code = abs(v.tan.w) - 2.0;
+        let ti = floor(code / 16.0);
+        let r = (code - 16.0 * ti) * 0.001;
+        // minimum drawn width in pixels by piece type, capped at 10 mm as the game's strand vertex program does
+        let npx = select(select(0.25, 0.5, ti < 1.5), 1.5, ti < 0.5);
         edge = sign(v.tan.w);
         let td = normalize((m * vec4(v.tan.xyz, 0.0)).xyz);
         var side = cross(td, normalize(F.cam_pos.xyz - w.xyz));
@@ -143,7 +147,7 @@ fn mesh_vertex(v: VIn) -> VOut {
         let c0 = F.view_proj * w;
         let c1 = F.view_proj * vec4(w.xyz + side, 1.0);
         let ppm = length((c1.xy / c1.w - c0.xy / c0.w) * 0.5 * F.jitter.yz);
-        let rmin = 0.5 / max(ppm, 1e-3);
+        let rmin = min(0.5 * npx / max(ppm, 1e-3), 0.005);
         if (uv1.y > 1.5) { uv1.x = clamp(r / rmin, 0.0, 1.0); }
         wp = w.xyz + side * edge * max(r, rmin);
     }

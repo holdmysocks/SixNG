@@ -536,7 +536,7 @@ impl Groom {
     /// game's strand shader reads from its parameter ramp at that point of
     /// the strand: TEXCOORD_0 = (g0, fill of the unlit side), TEXCOORD_1 =
     /// (profile scale, 1). Without it both are left out.
-    pub fn coat_glb_ramped(&self, name: &str, coat: &Coat, width: f32, colour: &dyn Fn(usize, f32) -> [u8; 4], params: Option<&dyn Fn(usize, f32) -> [f32; 5]>, extras: serde_json::Value) -> Vec<u8> {
+    pub fn coat_glb_ramped(&self, name: &str, coat: &Coat, width: f32, colour: &dyn Fn(usize, f32) -> [u8; 4], params: Option<&dyn Fn(usize, f32) -> [f32; 6]>, extras: serde_json::Value) -> Vec<u8> {
         let k = coat.k;
         let n = coat.guides.len();
         let (mut uv0, mut uv1): (Vec<[f32; 2]>, Vec<[f32; 2]>) = (Vec::new(), Vec::new());
@@ -569,8 +569,9 @@ impl Groom {
                     pos.push([p[0] + side[0] * rr * sg, p[1] + side[1] * rr * sg, p[2] + side[2] * rr * sg]);
                     nrm.push(nr);
                     // w: which edge of the ribbon (-1 / +1), so the shader can round the normal across it
-                    // with parameters: the magnitude carries the half width, 2 + millimetres
-                    tan.push([dir[0], dir[1], dir[2], if pv.is_some() { sg * (2.0 + r * 1000.0) } else { sg }]);
+                    // with parameters: the magnitude carries the half width, 2 + millimetres (under 16), plus 16 x the
+                    // index of the piece's minimum drawn width (the viewer's list of the LOD presets' TargetThickness)
+                    tan.push([dir[0], dir[1], dir[2], match pv { Some(v) => sg * (2.0 + (r * 1000.0).min(15.9) + 16.0 * v[5]), None => sg }]);
                     if let Some(pv) = pv {
                         uv0.push([pv[0], pv[1]]);
                         // y: 1 = lit by the hair lighting; 2 + reflectance scale = by the standard lighting
