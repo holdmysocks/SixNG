@@ -128,6 +128,8 @@ fn sun_shadow(p: vec3<f32>) -> f32 {
 
 // share of a baked map tile's colour taken as the ground's reflectance
 const TILE_ALBEDO: f32 = 0.6;
+// how far the map's terrain is drawn under its real height (world3d SINK, m)
+const TILE_SINK: f32 = 1.5;
 
 // radius (km from the planet centre) of a world point (m, y up)
 fn point_r(p: vec3<f32>) -> f32 {
@@ -138,10 +140,14 @@ fn point_r(p: vec3<f32>) -> f32 {
 // reaches world point p through the air, in lux times pi (the callers
 // divide the Lambert term by pi); the model viewer's own light otherwise.
 fn sun_e(p: vec3<f32>) -> vec3<f32> {
+    return sun_e_shadowed(p, sun_shadow(p));
+}
+
+// The light of `sun_e` with the shadow `sh` already looked up.
+fn sun_e_shadowed(p: vec3<f32>, sh: f32) -> vec3<f32> {
     if (!hdr()) { return F.sun_col.rgb * F.sun_dir.w * 3.0; }
     let r = point_r(p);
     let l = normalize(F.sun_dir.xyz);
-    let sh = sun_shadow(p);
     if (dot(l, S.moon.xyz) > 0.99) {
         return S.moon_dir_e.rgb * transmittance(r, S.moon.y) * sh;
     }
@@ -931,7 +937,13 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
         if (hdr()) {
             // the tiles carry the map's own light and hill shading: taken
             // down to a ground's reflectance, half of the slope shading kept
-            col = albedo * TILE_ALBEDO * (sun_e(i.world) * (0.5 + 0.5 * ndl) / 3.14159 + amb_d);
+            // the terrain is drawn sunk under the placed ground meshes and
+            // shows where it rises through them; its shadow is looked up at
+            // its own height (and a little towards the light), so the meshes
+            // just under it don't blotch it at a low sun
+            let lsh = normalize(F.sun_dir.xyz);
+            let tsh = sun_shadow(i.world + vec3(0.0, TILE_SINK, 0.0) + lsh * 0.5);
+            col = albedo * TILE_ALBEDO * (sun_e_shadowed(i.world, tsh) * (0.5 + 0.5 * ndl) / 3.14159 + amb_d);
             // the tiles' painted water (the map's water and no-data colour)
             // is shaded as the game's water on sea cells (no height, or deeper
             // than the beaches: vertex alpha 0, blending over a shore cell); on cells with a
