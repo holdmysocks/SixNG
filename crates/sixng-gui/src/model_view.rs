@@ -5312,8 +5312,11 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
             // textures are missing and it stores no preset, tint row, flat
             // colour or colour tag (19 items in the 292 named characters'
             // default looks, mostly watches). A neutral dark grey instead of
-            // white; not the game's colour.
-            bare_tint(m, |_| BARE_FALLBACK);
+            // white; not the game's colour. Not skin: the body takes the
+            // face's skin tone later, and a grey tint would darken it.
+            if !f.body && !f.head {
+                bare_tint(m, |_| BARE_FALLBACK);
+            }
             return false;
         }
     };
