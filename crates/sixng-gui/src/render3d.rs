@@ -157,6 +157,11 @@ pub struct Look {
     pub wear_from_config: bool,
     /// The shown vehicle has wear levels (set by the model view).
     pub wear_levels: bool,
+    /// With `wear_from_config`: also draw the second wear layer (the
+    /// primer). Off by default: its per-part colour-range samples and the
+    /// per-vehicle amount are not decoded and taken as 1, which shows far
+    /// more primer than the game on some parts.
+    pub primer: bool,
     pub slot: u32,
     pub paint: [f32; 3],
     pub paint2nd: [f32; 3],
@@ -193,6 +198,7 @@ impl Default for Look {
             wear: 0.0,
             wear_from_config: true,
             wear_levels: false,
+            primer: false,
             slot: 0,
             paint: [0.55, 0.02, 0.02],
             paint2nd: [0.6, 0.6, 0.62],
@@ -841,6 +847,7 @@ impl Renderer3D {
                 tex_entry(4),
                 tex_entry(5),
                 tex_entry(6),
+                tex_entry(7),
             ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1535,6 +1542,7 @@ impl Uploader {
             detail: None,
             ramp_u: None,
             wear_mask: None,
+            primer_mask: None,
             ramp: None,
             parts: false,
             occlusion_only: false,
@@ -1651,6 +1659,10 @@ impl Uploader {
                     wgpu::BindGroupEntry {
                         binding: 6,
                         resource: wgpu::BindingResource::TextureView(view(mt.wear_mask)),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::TextureView(view(mt.primer_mask.or(mt.wear_mask))),
                     },
                 ],
             });
@@ -1989,7 +2001,8 @@ impl Renderer3D {
             prev_view_proj: vp.to_cols_array_2d(),
             // xyz: the body paint's coat; w: vehicle wear (0 to 1)
             // w < 0: each part's own wear amount from the part ramp image
-            jitter: [look.coat[0], look.coat[1], look.coat[2], if look.wear_from_config && look.wear_levels { -1.0 } else { look.wear }],
+            // -2: the same, and the primer layer too
+            jitter: [look.coat[0], look.coat[1], look.coat[2], if look.wear_from_config && look.wear_levels { if look.primer { -2.0 } else { -1.0 } } else { look.wear }],
         }
     }
 
