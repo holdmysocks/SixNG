@@ -349,6 +349,24 @@ pub fn mip0_linear(r: &Resource, t: &TexInfo, linear_input: bool) -> Result<(Fmt
             }
         }
     }
+    // Single-mip textures with 2- or 4-byte elements (R16 height maps, RGBA8
+    // palettes and profiles, BGRA8 tiles) are in Gfx10 SW_4KB_S blocks, not
+    // the 16 x 16-element tiles below. Checked by neighbour smoothness over
+    // every such texture of 32 x 32 or more in textures.rpf, levels.rpf,
+    // common.rpf and the packs: SW_4KB_S is smoothest on 1,051 of 1,064;
+    // the rest are noise textures, small volumes and flat tiles, where
+    // smoothness tells nothing. Water height and shore tiles placed with it continue
+    // across 1,396 of 1,400 and 268 of 271 tile edges.
+    if !linear_input && t.mips == 1 && bd == 1 && matches!(bpe, 2 | 4) {
+        if let Some(l) = crate::gfx10::Layout::new(crate::gfx10::Swizzle::S4K, ew, eh, 1, bpe) {
+            let start = t.data_off as usize;
+            if start >= r.gfx.len() {
+                return Err(anyhow!("texture data out of range"));
+            }
+            let end = (start + l.total as usize).min(r.gfx.len());
+            return Ok((fmt, l.untile(&r.gfx[start..end], 0)));
+        }
+    }
     let padded = (ew.div_ceil(16) * 16 * eh.div_ceil(16) * 16 * bpe) as u64;
     let start = (t.data_off + mip0_off) as usize;
     let len = if linear_input { (ew * eh * bpe) as usize } else { padded as usize };

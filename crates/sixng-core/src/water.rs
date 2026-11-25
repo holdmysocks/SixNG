@@ -235,20 +235,12 @@ impl Image {
 /// 0..1, 8-bit formats as 0..255 in RGBA order (B8G8R8A8 is swapped to
 /// RGBA, as a shader sees it).
 pub fn decode(r: &Resource, t: &TexInfo) -> Result<Image> {
-    let (fmt, mut lin) = texture::mip0_linear(r, t, false)?;
+    // R16 heights and BGRA shore tiles are single-mip SW_4KB_S textures,
+    // untiled by `mip0_linear` (1,396 of 1,400 height and 268 of 271 shore
+    // tile edges continue)
+    let (fmt, lin) = texture::mip0_linear(r, t, false)?;
     let (w, h) = (t.width as usize, t.height as usize);
     let need = texture::mip_bytes(fmt, t.width, t.height, 0) as usize;
-    let bpe = fmt.bytes_per_elem();
-    // 2- and 4-byte single-mip textures (R16 heights, BGRA shore tiles) are
-    // in SW_4KB_S blocks, not the 16 x 16-element tiles of `mip0_linear`
-    // (checked by tile seams: 1,396 of 1,400 height and 268 of 271 shore
-    // edges continue; with SW_64KB_D almost none do)
-    if t.mips == 1 && matches!(bpe, 2 | 4) {
-        let l = crate::gfx10::Layout::new(crate::gfx10::Swizzle::S4K, t.width, t.height, 1, bpe).ok_or_else(|| anyhow!("no tile layout for {}", t.format))?;
-        let start = t.data_off as usize;
-        let end = (start + l.total as usize).min(r.gfx.len());
-        lin = l.untile(r.gfx.get(start..end).ok_or_else(|| anyhow!("texture data out of range"))?, 0);
-    }
     if lin.len() < need || r.gfx.len() < t.data_off as usize + need {
         bail!("texture data incomplete ({} of {} bytes)", r.gfx.len().saturating_sub(t.data_off as usize), need);
     }
