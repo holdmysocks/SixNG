@@ -2001,7 +2001,10 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let ix = ws.load_index(&a)?;
             let t = Instant::now();
             if *list {
-                let cat = sixng_core::groom::catalog(&a, &ix.entries)?;
+                let mut cat = sixng_core::groom::catalog(&a, &ix.entries)?;
+                if let Ok(t) = sixng_core::hairlink::get(&ws.work, &a, &ix.entries) {
+                    t.relabel(&mut cat);
+                }
                 let dir = po.join("grooms").join(a.id.trim_end_matches(".rpf"));
                 std::fs::create_dir_all(&dir)?;
                 sixng_core::atomic::write(dir.join("catalog.json"), serde_json::to_vec_pretty(&cat)?)?;
