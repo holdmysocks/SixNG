@@ -338,6 +338,8 @@ pub struct HairPick {
 #[derive(Clone)]
 pub struct HairTone {
     pub name: u32,
+    /// The strand colour set: the one the outfit's colour item gives the piece's category, else `name`.
+    pub set: u32,
     /// hair, brows, lashes, beard ...
     pub slot: String,
     pub variants: [sixng_core::hairtone::Preset; 4],
@@ -1315,8 +1317,8 @@ impl ModelView {
                         match (tones.get(&off), strand_data.as_deref()) {
                             // a character's hair with the game's tables: the colour set its item names
                             // (or the forced one) and the parameter set named for its slot
-                            (Some(t), Some(d)) if d.colour_set(force_colour.unwrap_or(t.name)).is_some() => {
-                                let cs = d.colour_set(force_colour.unwrap_or(t.name)).unwrap();
+                            (Some(t), Some(d)) if d.colour_set(force_colour.unwrap_or(t.set)).is_some() => {
+                                let cs = d.colour_set(force_colour.unwrap_or(t.set)).unwrap();
                                 let ps = slot_params.get(&t.slot).and_then(|n| d.param_set(*n));
                                 // the piece type, by the game's hair LOD presets (TargetThickness 1.5 hair and fur, 0.5 brows,
                                 // lashes, beard, 0.25 body hair): it sets how many strands the game draws at a distance; not used yet
@@ -6161,7 +6163,7 @@ fn load_query_sel(
                             let Some(l) = u64::from_str_radix(guid, 16).ok().and_then(|g| t.resolve(g, look.fit.as_deref())).or_else(|| guid.is_empty().then(|| t.by_placeholder(placeholder)).flatten()) else { continue };
                             let colour = info.strand_tints.iter().find(|t| t.0 == *slot && t.1 == 0x1e64_f584).and_then(|t| Some(sixng_core::pedtint::palettes(&ws.game).ok()?.get(&t.1)?.sample(t.2, 128)));
                             // presets whose colours are white are not hair colours (their flag is set)
-                            let tone = info.strand_presets.iter().find(|p| p.0 == *slot).and_then(|p| Some((p.1, presets.as_ref()?.variants(p.1)?))).filter(|(_, v)| !v[0].flag).map(|(name, variants)| HairTone { name, slot: slot.clone(), variants });
+                            let tone = info.strand_presets.iter().find(|p| p.0 == *slot).and_then(|p| Some((p.1, presets.as_ref()?.variants(p.1)?))).filter(|(_, v)| !v[0].flag).map(|(name, variants)| HairTone { name, set: { let cat = match slot.as_str() { "hair" => "864b03ae", "brows" => "7c50ad43", "lashes" => "83a664e7", "beard" => "44d2709f", "body hair" => "a228cc57", _ => "" }; look.outfits[k].strand_colours.iter().find(|c| c.0 == cat).and_then(|c| u32::from_str_radix(&c.1, 16).ok()).unwrap_or(name) }, slot: slot.clone(), variants });
                             let colour = colour.or(tone.as_ref().map(|t| sixng_core::hairtone::display(t.variants[0].a)));
                             info.hair.push(HairPick { slot: slot.clone(), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: t.uncontested(l), off_head: 0, shown: l.confidence >= 0.5 && slot != "body hair", colour, tone });
                         }

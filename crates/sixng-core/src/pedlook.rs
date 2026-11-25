@@ -794,6 +794,9 @@ pub struct Outfit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_shape: Option<String>,
     pub parts: Vec<LookPart>,
+    /// Strand colour sets the outfit's colour items give per item category (category hash, set name hash; hex).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub strand_colours: Vec<(String, String)>,
     /// Items of the outfit that resolved to no drawable (item id, slot hash).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unresolved: Vec<String>,
@@ -1153,7 +1156,7 @@ fn own_look(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Option<Look> {
         }
     }
     let main: Vec<String> = parts.iter().filter(|p| ["full", "outer", "top", "bottom"].contains(&p.slot.as_str())).map(|p| pretty(item_word(&p.drawable))).collect();
-    Some(Look { model: model.to_string(), resource: format!("{} (own parts: the outfit data does not cover this model)", a.id), fit, outfits: vec![Outfit { id: String::new(), outfit_type: String::new(), scale: 0.0, label: format!("own parts: {}", main.join(", ")), body_shape: None, parts, unresolved: vec![] }], note: Some("The outfit data does not cover this model: it is shown in its own parts.".into()) })
+    Some(Look { model: model.to_string(), resource: format!("{} (own parts: the outfit data does not cover this model)", a.id), fit, outfits: vec![Outfit { id: String::new(), outfit_type: String::new(), scale: 0.0, label: format!("own parts: {}", main.join(", ")), body_shape: None, parts, strand_colours: vec![], unresolved: vec![] }], note: Some("The outfit data does not cover this model: it is shown in its own parts.".into()) })
 }
 
 /// The outfits of one model row. `own_head`: keep only the outfits whose
@@ -1215,7 +1218,13 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
         let mut parts: Vec<LookPart> = Vec::new();
         let mut unresolved = Vec::new();
         let mut body_shape = None;
+        let mut strand_colours: Vec<(String, String)> = Vec::new();
         for v in &vs {
+            for c in v.parts.iter().filter_map(|p| p.strand_colour.clone()) {
+                if !strand_colours.iter().any(|x| x.0 == c.0) {
+                    strand_colours.push(c);
+                }
+            }
             if v.tags.values().flatten().any(|w| w == "BodyShapePreset") {
                 body_shape = v.tags.iter().filter(|(_, w)| !w.iter().any(|x| x == "BodyShapePreset")).flat_map(|(_, w)| w.first()).next().cloned();
             }
@@ -1291,6 +1300,7 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
             label: if main.is_empty() { format!("outfit {}", outfits.len() + 1) } else { main.join(", ") },
             body_shape,
             parts,
+            strand_colours,
             unresolved,
         });
     }
@@ -1365,7 +1375,7 @@ mod tests {
 
     #[test]
     fn choose_prefers_name_then_fit() {
-        let mut p = Part { item: "1".into(), category: None, name: None, drawable: None, tex_remap: vec![], tags: Default::default(), tint: None, named: None, guid: None, colour: None, colour_tag: None, hair_preset: None, preset: None, state: String::new(), skins: vec![], candidates: Default::default() };
+        let mut p = Part { item: "1".into(), category: None, name: None, drawable: None, tex_remap: vec![], tags: Default::default(), tint: None, named: None, guid: None, colour: None, colour_tag: None, hair_preset: None, strand_colour: None, preset: None, state: String::new(), skins: vec![], candidates: Default::default() };
         p.candidates.insert("hand_fc1_000_full".into(), 3);
         p.candidates.insert("hand_fr1_000_full".into(), 3);
         p.candidates.insert("hand_fr1_000_nude_cull".into(), 3);

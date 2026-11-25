@@ -72,6 +72,12 @@ pub struct Part {
     /// key of `hairtone` for a hair, brow, lash or beard item.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hair_preset: Option<String>,
+    /// A colour item (tag `b28c2b3f`): the strand colour set it gives every strand piece of one item category
+    /// of the outfit (category hash, colour set name hash; hex). A story character's outfit carries one per
+    /// category (hair, brows, lashes); it stands before the colour the hair item itself names. Read from the
+    /// data and checked against game pictures of one character, not read from the game's code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strand_colour: Option<(String, String)>,
     /// Layered-material preset (`e13ebaf8`, GarmentPreset) as hex, first
     /// along the chain: the key of the item's colours in the clothing
     /// material library (`matlib`).
@@ -368,7 +374,11 @@ pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers,
             chain.iter().rev().for_each(|c| tag_words(c, pre, &mut tg));
             let tint = chain_tint(&chain);
             let preset = chain.iter().find_map(|c| c[f(0xe13e_baf8)].as_u64().filter(|&x| x != 0)).map(|x| format!("{x:08x}"));
-            parts.push(Part { item: format!("{:08x}", it[f(0x6512_1749)].as_u64().unwrap_or(0)), category, name: name.map(|p| p.0.clone()), drawable, tex_remap, tags: tg, tint, named, guid, colour, colour_tag, hair_preset, preset, state: format!("{want_state:08x}"), skins, candidates: counts });
+            let strand_colour = chain.iter().find_map(|c| {
+                let v = tags(c, 0xb28c_2b3f);
+                (v.len() >= 2).then(|| (format!("{:08x}", v[0]), format!("{:08x}", v[1])))
+            });
+            parts.push(Part { item: format!("{:08x}", it[f(0x6512_1749)].as_u64().unwrap_or(0)), category, name: name.map(|p| p.0.clone()), drawable, tex_remap, tags: tg, tint, named, guid, colour, colour_tag, hair_preset, strand_colour, preset, state: format!("{want_state:08x}"), skins, candidates: counts });
         }
         let mut tags = BTreeMap::new();
         tag_words(&v, pre, &mut tags);
