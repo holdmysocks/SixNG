@@ -113,19 +113,25 @@ pub type AxleBrakes = [(Option<String>, Option<String>); 2];
 
 /// The brakes of a configuration per axle. `named_*`: the disc (or drum)
 /// and caliper its part list names by model; `slot_models`: the models of
-/// its parts in the brake slots. The parts named by model and the slots
-/// `brakediscs` / `calipers_front` are the front axle's (a model name and
-/// a `brakediscs` part never come together; where a caliper comes both
-/// ways the name is taken, which is not confirmed). The rear axle takes
-/// the `_rear` slots, else what the front has; a rear drum without a rear
-/// caliper part gets no caliper.
+/// its parts in the brake slots. A disc named by model and the slot
+/// `brakediscs` are the front axle's (the two never come together); the
+/// rear axle takes `brakediscs_rear`, else what the front has.
+/// A caliper named by model is the vehicle's, a part in `calipers_front`
+/// or `calipers_rear` is that axle's and goes before it: 1,900
+/// configurations name a caliper and give the rear another one that way.
+/// The front part is rarer (266) and is how a vehicle with rear drums gets
+/// its front calipers without naming one; where it comes with a name (44,
+/// in 28 another model) it is taken for the front, by that symmetry and
+/// not confirmed in the game. A rear drum without a rear caliper part
+/// gets no caliper.
 pub fn brake_axles(named_disc: Option<&str>, named_caliper: Option<&str>, slot_models: &[(u32, String)]) -> AxleBrakes {
     let of = |slot: u32| slot_models.iter().find(|(s, _)| *s == slot).map(|(_, n)| n.clone());
     let front_disc = named_disc.map(str::to_string).or_else(|| of(BRAKE_SLOTS[0]));
-    let front_caliper = named_caliper.map(str::to_string).or_else(|| of(BRAKE_SLOTS[2]));
+    let named_caliper = named_caliper.map(str::to_string);
+    let front_caliper = of(BRAKE_SLOTS[2]).or_else(|| named_caliper.clone());
     let rear_disc = of(BRAKE_SLOTS[1]).or_else(|| front_disc.clone());
     let drum = rear_disc.as_deref().is_some_and(|d| d.starts_with("drumbrake_"));
-    let rear_caliper = of(BRAKE_SLOTS[3]).or_else(|| if drum { None } else { front_caliper.clone() });
+    let rear_caliper = of(BRAKE_SLOTS[3]).or_else(|| if drum { None } else { named_caliper.or_else(|| front_caliper.clone()) });
     [(front_disc, front_caliper), (rear_disc, rear_caliper)]
 }
 
@@ -643,6 +649,12 @@ mod tests {
         // front discs with a caliper part, rear drums: the rear gets no caliper
         let b = brake_axles(Some("brakedisc_std_001"), None, &[(BRAKE_SLOTS[2], "caliper_2pot_001".into()), (BRAKE_SLOTS[1], "drumbrake_002".into())]);
         assert_eq!(b, [(s("brakedisc_std_001"), s("caliper_2pot_001")), (s("drumbrake_002"), None)]);
+        // a named caliper and a front caliper part: the part is the front's
+        let b = brake_axles(Some("brakedisc_std_001"), Some("caliper_1pot_stock"), &[(BRAKE_SLOTS[2], "caliper_2pot_001".into()), (BRAKE_SLOTS[1], "drumbrake_002".into())]);
+        assert_eq!(b, [(s("brakedisc_std_001"), s("caliper_2pot_001")), (s("drumbrake_002"), None)]);
+        // ... and with rear discs and no rear part the rear keeps the named one
+        let b = brake_axles(Some("brakedisc_std_001"), Some("caliper_1pot_stock"), &[(BRAKE_SLOTS[2], "caliper_2pot_001".into())]);
+        assert_eq!(b, [(s("brakedisc_std_001"), s("caliper_2pot_001")), (s("brakedisc_std_001"), s("caliper_1pot_stock"))]);
         assert_eq!(brake_axles(None, None, &[]), AxleBrakes::default());
     }
 
