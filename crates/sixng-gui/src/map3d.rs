@@ -3142,6 +3142,13 @@ impl Map3D {
                 if *from_tc { "" } else { " (timecycle not loaded: built-in Sunny)" }
             ));
         }
+        if let Some(r) = self.renderer.as_mut() {
+            ui.checkbox(&mut r.shadows, "sun and moon shadows")
+                .on_hover_text("four shadow cascades over the nearest 900 m");
+            if r.shadows && r.shadow_draws > 0 {
+                ui.label(format!("shadow draws {}", r.shadow_draws));
+            }
+        }
         ui.add(
             egui::Slider::new(&mut self.look.fog, 0.0..=0.002)
                 .logarithmic(true)

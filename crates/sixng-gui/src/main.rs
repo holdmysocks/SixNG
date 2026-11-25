@@ -44,6 +44,7 @@ mod model_view;
 mod pages;
 mod render3d;
 mod scenes_view;
+mod shadow;
 mod siren_sound;
 #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
 mod render3d_metal4;

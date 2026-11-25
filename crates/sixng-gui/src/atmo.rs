@@ -250,9 +250,14 @@ pub struct SceneBinds {
     pub ap: wgpu::TextureView,
     pub state: wgpu::Buffer,
     pub sampler: wgpu::Sampler,
+    /// Sun and moon shadows (shadow.rs): the cascades' uniform, depth array
+    /// and comparison sampler.
+    pub shadow_ub: wgpu::Buffer,
+    pub shadow: wgpu::TextureView,
+    pub shadow_cmp: wgpu::Sampler,
 }
 
-/// Bind group layout entries 6 to 11 of the mesh shaders' group 0.
+/// Bind group layout entries 6 to 14 of the mesh shaders' group 0.
 pub fn frame_layout_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
     let vis = wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT;
     let tex = |b: u32, dim: wgpu::TextureViewDimension| wgpu::BindGroupLayoutEntry {
@@ -295,11 +300,37 @@ pub fn frame_layout_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
             count: None,
         },
+        wgpu::BindGroupLayoutEntry {
+            binding: 12,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 13,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Depth,
+                view_dimension: wgpu::TextureViewDimension::D2Array,
+                multisampled: false,
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 14,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+            count: None,
+        },
     ]
 }
 
 impl SceneBinds {
-    pub fn entries(&self) -> [wgpu::BindGroupEntry<'_>; 6] {
+    pub fn entries(&self) -> [wgpu::BindGroupEntry<'_>; 9] {
         [
             wgpu::BindGroupEntry { binding: 6, resource: self.scene_ub.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&self.trans) },
@@ -307,6 +338,9 @@ impl SceneBinds {
             wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&self.ap) },
             wgpu::BindGroupEntry { binding: 10, resource: self.state.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            wgpu::BindGroupEntry { binding: 12, resource: self.shadow_ub.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(&self.shadow) },
+            wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::Sampler(&self.shadow_cmp) },
         ]
     }
 }
@@ -396,7 +430,7 @@ fn tex(device: &wgpu::Device, label: &str, w: u32, h: u32, d: u32, dim: wgpu::Te
 }
 
 impl Atmosphere {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, shadows: &crate::shadow::ShadowGpu) -> Self {
         let src = format!("{}\n{}", include_str!("atmo_common.wgsl"), include_str!("atmo.wgsl"));
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("atmosphere"),
@@ -597,7 +631,17 @@ impl Atmosphere {
         let fs_up = rp("fs_up", HDR_FMT);
         let fs_tonemap = rp("fs_tonemap", DISPLAY_FMT);
         Atmosphere {
-            binds: SceneBinds { scene_ub, trans, sky, ap, state, sampler },
+            binds: SceneBinds {
+                scene_ub,
+                trans,
+                sky,
+                ap,
+                state,
+                sampler,
+                shadow_ub: shadows.ub.clone(),
+                shadow: shadows.array.clone(),
+                shadow_cmp: shadows.cmp.clone(),
+            },
             _ms: ms,
             hist,
             bgl_post,

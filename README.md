@@ -989,6 +989,16 @@ baked map (`entities.bin`; bake first with `--bake-map`):
     sun dimming by cloud cover (no clouds are drawn yet), the brightness
     of emissive surfaces (6 cd/m² at strength 1) and the filmic curve.
     Without the timecycle (no index) the built-in Sunny values are used.
+- **Sun and moon shadows** (HDR map, on by default; **sun and moon
+  shadows** turns them off): four cascaded shadow maps, 2048² each, over
+  the nearest 900 m (the timecycle's `dir_shadow_num_cascades`), split
+  between even and logarithmic spacing, snapped to whole texels so they
+  do not shimmer, and filtered over 4×4 compares with a blend between
+  cascades. The two near cascades are drawn every frame and the two far
+  ones in turn; the far ones skip models smaller than two of their
+  texels. Models and map cells cast (opaque and cut-out surfaces);
+  skinned, see-through and decal surfaces do not. Only what the camera
+  draws casts: a caster just outside the view leaves no shadow.
 - **Map cells** (far placements merged per area): a placement more than
   0.6× the HD distance from the camera can be drawn from its cell instead
   of one by one. A cell holds one LOD level's placements in one square of

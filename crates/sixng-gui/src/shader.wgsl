@@ -62,7 +62,69 @@ struct Sticker {
 @group(0) @binding(10) var<storage, read> SCN: State;
 @group(0) @binding(11) var lin_clamp: sampler;
 
+// Sun and moon shadows (shadow.rs): four cascades from the light.
+struct Shadow {
+    mats: array<mat4x4<f32>, 4>,
+    splits: vec4<f32>,
+    texel: vec4<f32>,
+    bias: vec4<f32>,
+    // x on, y filter radius (texels), z softness
+    params: vec4<f32>,
+};
+@group(0) @binding(12) var<uniform> SH: Shadow;
+@group(0) @binding(13) var t_shadow: texture_depth_2d_array;
+@group(0) @binding(14) var samp_shadow: sampler_comparison;
+
 fn hdr() -> bool { return S.flags.x == 1u; }
+
+// How lit p is in cascade c (1 lit, 0 shadowed; -1 outside the cascade).
+fn shadow_in(p: vec3<f32>, c: u32) -> f32 {
+    let q = SH.mats[c] * vec4(p, 1.0);
+    let uv = vec2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);
+    if (any(uv < vec2(0.0)) || any(uv > vec2(1.0)) || q.z > 1.0) { return -1.0; }
+    let refd = q.z + SH.bias[c];
+    let px = 1.0 / f32(textureDimensions(t_shadow).x);
+    let rad = SH.params.y;
+    // 4x4 filter of bilinear compares, weights fall off from the centre
+    var lit = 0.0;
+    var wsum = 0.0;
+    for (var y = -1.5; y <= 1.5; y += 1.0) {
+        for (var x = -1.5; x <= 1.5; x += 1.0) {
+            let w = 1.0 - 0.15 * (abs(x) + abs(y));
+            let o = vec2(x, y) * px * rad * 0.67;
+            lit += w * textureSampleCompareLevel(t_shadow, samp_shadow, uv + o, i32(c), refd);
+            wsum += w;
+        }
+    }
+    return lit / wsum;
+}
+
+// How much of the sun (or moon) reaches world point p past the casters
+// in the shadow cascades; 1 beyond their range or with shadows off.
+fn sun_shadow(p: vec3<f32>) -> f32 {
+    if (!hdr() || SH.params.x < 0.5) { return 1.0; }
+    // view depth: the cascades split the distance along the view axis
+    let depth = (F.view_proj * vec4(p, 1.0)).w;
+    for (var c = 0u; c < 4u; c++) {
+        let far = SH.splits[c];
+        if (depth < far) {
+            var s = shadow_in(p, c);
+            if (s < 0.0) { continue; }
+            // last tenth of a cascade: blend into the next (or into lit)
+            let fade = clamp((depth - far * 0.9) / (far * 0.1), 0.0, 1.0);
+            if (fade > 0.0) {
+                var nxt = 1.0;
+                if (c < 3u) {
+                    let s2 = shadow_in(p, c + 1u);
+                    if (s2 >= 0.0) { nxt = s2; }
+                }
+                s = mix(s, nxt, fade);
+            }
+            return s;
+        }
+    }
+    return 1.0;
+}
 
 // share of a baked map tile's colour taken as the ground's reflectance
 const TILE_ALBEDO: f32 = 0.6;
@@ -79,10 +141,11 @@ fn sun_e(p: vec3<f32>) -> vec3<f32> {
     if (!hdr()) { return F.sun_col.rgb * F.sun_dir.w * 3.0; }
     let r = point_r(p);
     let l = normalize(F.sun_dir.xyz);
+    let sh = sun_shadow(p);
     if (dot(l, S.moon.xyz) > 0.99) {
-        return S.moon_dir_e.rgb * transmittance(r, S.moon.y);
+        return S.moon_dir_e.rgb * transmittance(r, S.moon.y) * sh;
     }
-    return S.sun_dir_e.rgb * transmittance(r, S.sun.y);
+    return S.sun_dir_e.rgb * transmittance(r, S.sun.y) * sh;
 }
 
 // Sky irradiance / pi on a surface facing n (ambient cube from the sky-view LUT).
@@ -786,6 +849,15 @@ fn vs_mesh(v: VIn) -> VOut {
 }
 
 // wireframe: same vertex path, flat colour, pulled towards the camera
+// Shadow casters: depth only, alpha-tested cut-outs (leaves, fences).
+@fragment
+fn fs_shadow(i: VOut) {
+    let a = M.base.a * select(1.0, textureSample(t_base, samp, i.uv0).a, (M.flags.x & 1u) != 0u);
+    if (M.flags.z == 1u && a < 0.5) {
+        discard;
+    }
+}
+
 @vertex
 fn vs_wire(v: VIn) -> VOut {
     var o = mesh_vertex(v);
@@ -1013,4 +1085,12 @@ fn fs_cell(i: COut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     }
     if (amode != 2u && cls != 5u && cls != 6u && cls != 8u) { alpha = 1.0; }
     return vec4(col, alpha);
+}
+
+@fragment
+fn fs_shadow_cell(i: COut) {
+    let a = i.base.a * textureSample(t_cell, samp, i.uv, i.lf.x).a;
+    if ((i.lf.y & 3u) == 1u && a < 0.5) {
+        discard;
+    }
 }
