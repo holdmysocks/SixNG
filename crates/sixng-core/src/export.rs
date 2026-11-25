@@ -1811,7 +1811,10 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         o.insert("paint_coat".into(), t.coat_json(c));
     }
     if let Some(o) = part_looks.as_object_mut() {
-        let coat = serde_json::json!({"paint": o["paint_coat"], "paint_by_look": o["paint_coats"], "by_look": o["coats"], "records": o["coat_records"], "note": "the coat (paint layers) of each part id. records: the library's coat records the looks use (name = record name hash; clear coat, flakes, film, sheen and anisotropy values as stored, see vehcolour::Coat). by_look: per look 256 x 2 hex digits, the index into records of each part id (ff = none). paint_by_look: per look the index of the record of the primary-paint parts (null = none). paint: that record for the look in the GLB, weighted by vertices. A configuration's paint type part gives the body paint its coat. What the game's shader does with each value is not decoded."});
+        // by `get`: a map panics on a key it does not have, and a model without
+        // a body paint or with looks from an older table has none of these
+        let of = |k: &str| o.get(k).cloned().unwrap_or(serde_json::Value::Null);
+        let coat = serde_json::json!({"paint": of("paint_coat"), "paint_by_look": of("paint_coats"), "by_look": of("coats"), "records": of("coat_records"), "note": "the coat (paint layers) of each part id. records: the library's coat records the looks use (name = record name hash; clear coat, flakes, film, sheen and anisotropy values as stored, see vehcolour::Coat). by_look: per look 256 x 2 hex digits, the index into records of each part id (ff = none). paint_by_look: per look the index of the record of the primary-paint parts (null = none). paint: that record for the look in the GLB, weighted by vertices. A configuration's paint type part gives the body paint its coat. What the game's shader does with each value is not decoded."});
         o.insert("coat".into(), coat);
     }
     BuiltDrawable { lod_groups, part_groups, materials: mats, joints: skin.joints, mesh_meta, shader_tex, part_looks, head }
