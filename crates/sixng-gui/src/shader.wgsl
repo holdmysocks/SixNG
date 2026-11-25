@@ -23,7 +23,7 @@ struct Mat {
     base: vec4<f32>,
     flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask, bit 12 = an emissive shader of another class (lit by its emissive map), bit 13 = the packed map is a vehicle material map, bit 14 = the emissive slot holds the part ramp image with the parts' surfaces
     tile: vec4<f32>,      // fabric detail tile: x UV scale, y rotation, z mean grey value, w bound
-    emis: vec4<f32>,      // x emissive scale of the material (from the GLB's emissive strength)
+    emis: vec4<f32>,      // x emissive scale of the material (from the GLB's emissive strength), yzw the light's colour
 };
 
 // rows of the part ramp image: 256 each of the first layer's palette rows,
@@ -472,7 +472,15 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     if (cls == 7u || ((M.flags.w & 4096u) != 0u && (has & 8u) != 0u)) {
         var e = albedo;
         if ((has & 8u) != 0u) { e = textureSample(t_em, samp, i.uv0).rgb; }
-        emissive = e * F.misc.y * M.emis.x;
+        emissive = e * M.emis.yzw * F.misc.y * M.emis.x;
+        // A coloured light (neon) far above white washes out to white in
+        // the tone map; its brightest channel is capped at 1.2 after
+        // exposure, all channels in proportion, so it keeps its colour.
+        // White lights are not capped.
+        let sat = 1.0 - min(M.emis.y, min(M.emis.z, M.emis.w)) / max(max(M.emis.y, max(M.emis.z, M.emis.w)), 1.0e-4);
+        let peak = max(emissive.r, max(emissive.g, emissive.b)) * F.sky_hor.w;
+        let cap = mix(1.0e4, 1.2, smoothstep(0.05, 0.3, sat));
+        if (peak > cap) { emissive = emissive * (cap / peak); }
     }
     // vehicle lamps: a lamp's own emissive mesh (bit 11) is lit only while
     // its bone is; reflectors and lenses on a lit lamp bone glow in its colour
