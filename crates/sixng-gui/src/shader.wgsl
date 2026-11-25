@@ -225,7 +225,11 @@ fn height_fog(p: vec3<f32>) -> f32 {
 // the normal (wavelengths from the timecycle's Beaufort number and fetch,
 // atmo.rs `sea_waves`), the sky mirrored by Fresnel, the sun's glint, and
 // the water body's colour from its scattering and extinction.
-const WAVES: u32 = 12u;
+const WAVES: u32 = 10u;
+// least roughness of the sea's glint (keeps single-pixel sparkles out)
+const SEA_MIN_ROUGH: f32 = 0.06;
+// the baked map tiles' water colour (mapbake, 40 80 140 sRGB), linear
+const TILE_SEA: vec3<f32> = vec3(0.021, 0.080, 0.262);
 // share of the sea's slope variance drawn as waves (the rest is roughness)
 const WAVE_SHARE: f32 = 0.6;
 
@@ -234,13 +238,12 @@ fn wave_rand(i: u32, k: f32) -> f32 {
 }
 
 // Surface normal of the sea at p (world), and the slope variance of the
-// waves too small to draw at this distance (added to the roughness).
-fn sea_normal(p: vec3<f32>, dist: f32) -> vec4<f32> {
+// waves too small to draw at this pixel (added to the roughness); `fp` is
+// the pixel's size on the surface (m, from the screen derivatives).
+fn sea_normal(p: vec3<f32>, fp: f32) -> vec4<f32> {
     let lp = max(S.water0.w, 2.0);
     let var_all = max(S.water1.w, 0.003);
     let s = sqrt(2.0 * WAVE_SHARE * var_all / f32(WAVES));
-    // world size of a pixel here (m), for a typical view
-    let fp = dist * 0.0012 + 0.002;
     let t = S.water4.w * S.water2.w;
     var g = vec2(0.0);
     var lost = 0.0;
@@ -248,28 +251,37 @@ fn sea_normal(p: vec3<f32>, dist: f32) -> vec4<f32> {
     for (var i = 0u; i < WAVES; i++) {
         let a = 0.6 + (wave_rand(i, 1.0) - 0.5) * 2.2;
         let d = vec2(cos(a), sin(a));
-        let k = 2.0 * PI / lam;
-        let w = sqrt(9.81 * k);
-        let ph = k * dot(d, p.xz) - w * t + wave_rand(i, 2.0) * 2.0 * PI;
-        // fade out waves shorter than a few pixels
-        let keep = smoothstep(2.0 * fp, 8.0 * fp, lam);
-        g += keep * s * d * cos(ph);
+        // waves shorter than about eight pixels fade into roughness
+        let keep = smoothstep(4.0 * fp, 12.0 * fp, lam);
         lost += (1.0 - keep * keep) * s * s * 0.5;
+        if (keep > 0.0) {
+            let k = 2.0 * PI / lam;
+            let w = sqrt(9.81 * k);
+            let ph = k * dot(d, p.xz) - w * t + wave_rand(i, 2.0) * 2.0 * PI;
+            g += keep * s * d * cos(ph);
+        }
         lam *= 0.62;
     }
     return vec4(normalize(vec3(-g.x, 1.0, -g.y)), lost);
 }
 
-// Radiance leaving the water surface at p towards the camera.
-fn water_shade(p: vec3<f32>) -> vec3<f32> {
+// Size of a pixel on the surface at p (m), from the screen derivatives
+// (grazing views give long footprints).
+fn footprint(p: vec3<f32>) -> f32 {
+    return max(length(dpdx(p)), length(dpdy(p)));
+}
+
+// Radiance leaving the water surface at p towards the camera; `fp` from
+// `footprint` (taken in uniform control flow by the caller).
+fn water_shade(p: vec3<f32>, fp: f32) -> vec3<f32> {
     let o = F.cam_pos.xyz;
     let dist = length(o - p);
     let v = (o - p) / max(dist, 1e-3);
-    let sn = sea_normal(p, dist);
+    let sn = sea_normal(p, fp);
     var n = sn.xyz;
     if (dot(n, v) < 0.02) { n = normalize(n + v * (0.02 - dot(n, v))); }
     let var_micro = (1.0 - WAVE_SHARE) * max(S.water1.w, 0.003) + sn.w;
-    let a = clamp(sqrt(2.0 * var_micro) + S.water3.w, 0.02, 0.8);
+    let a = clamp(sqrt(2.0 * var_micro) + S.water3.w, SEA_MIN_ROUGH, 0.8);
     let ndv = max(dot(n, v), 1e-3);
     var fr = 0.02 + 0.98 * pow(1.0 - ndv, 5.0);
     fr = clamp(fr + clamp(S.water4.x, S.water4.y, S.water4.z), 0.0, 1.0);
@@ -535,6 +547,7 @@ fn weave_gain(g: f32) -> f32 {
 
 @fragment
 fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
+    let fp = footprint(i.world);
     let has = M.flags.x;
     let cls = M.flags.y;
     var base = M.base;
@@ -919,6 +932,12 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
             // the tiles carry the map's own light and hill shading: taken
             // down to a ground's reflectance, half of the slope shading kept
             col = albedo * TILE_ALBEDO * (sun_e(i.world) * (0.5 + 0.5 * ndl) / 3.14159 + amb_d);
+            // the tiles' painted water (the map's water and no-data colour)
+            // is shaded as the game's water, blending at the shore
+            let wet = 1.0 - smoothstep(0.02, 0.07, length(base.rgb - TILE_SEA));
+            if (wet > 0.0) {
+                col = mix(col, water_shade(i.world, fp), wet);
+            }
         } else {
             col = albedo * (0.55 * F.sun_col.rgb * F.sun_dir.w * (0.35 + 0.65 * ndl) + 0.7 * amb_d);
         }
@@ -926,7 +945,7 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
 
     if (hdr() && cls == 8u && F.mode.x == 0u) {
         // the map's water (the sea plane is opaque)
-        col = water_shade(i.world);
+        col = water_shade(i.world, fp);
         alpha = select(0.92, 1.0, M.flags.z == 0u);
     }
     let mode = F.mode.x;
@@ -1154,6 +1173,7 @@ fn cell_vert(v: CIn, fb: bool) -> COut {
 
 @fragment
 fn fs_cell(i: COut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
+    let fp = footprint(i.world);
     let amode = i.lf.y & 3u;
     let cls = i.lf.y >> 2u;
     let base = i.base * textureSample(t_cell, samp, i.uv, i.lf.x);
@@ -1202,7 +1222,7 @@ fn fs_cell(i: COut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let env = environment(reflect(-v, n), rough) * F.misc.w;
     var col = direct + kd * albedo * amb_d + env * fr_v + emissive;
     if (hdr() && cls == 8u && F.mode.x == 0u) {
-        col = water_shade(i.world);
+        col = water_shade(i.world, fp);
         alpha = select(0.92, 1.0, amode != 2u);
     }
     let mode = F.mode.x;

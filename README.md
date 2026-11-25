@@ -1023,13 +1023,15 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   peak wavelength comes from `water_ocean_beaufort_scale` and
   `water_ocean_fetch` (Beaufort wind speed, fetch-limited JONSWAP peak, no
   lower than a fully developed sea), and the slope variance from the
-  Cox-Munk fit. Twelve waves are drawn, and those shorter than a few
-  pixels become roughness. The sky is mirrored by Fresnel
+  Cox-Munk fit. Ten waves are drawn, and those shorter than about eight
+  pixels (from the screen derivatives, so grazing views too) become
+  roughness. The sky is mirrored by Fresnel
   (`water_fresnel_rescale*`), the sun or moon glints (with the shadows),
   and the body colour comes from `water_clip_scattering_*` and
   `water_clip_extinction_*` (a third of the single-scattering albedo).
-  The sea is a plane at 1 m under sea level, between the sunk terrain and
-  the placed models. Our choices: the scale from the timecycle's water
+  The map tiles' painted water (their water and no-data colour, which
+  also covers some land cells) is shaded as water where it shows, blending
+  at the shore, and a water plane under the terrain reaches the horizon. Our choices: the scale from the timecycle's water
   units to coefficients per metre (0.03), the wind direction, and the
   share of the slope drawn as waves (60 %). Not yet: shallow water over
   the seabed, foam, shore waves, refraction and underwater fog.

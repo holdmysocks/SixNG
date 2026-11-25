@@ -48,9 +48,7 @@ const SINK: f32 = 1.5;
 /// Ground nodes (coverage pass only) sit this far above the ground estimate.
 const GROUND_LIFT: f32 = 2.0;
 const WATER_Z: f32 = -2.0;
-/// Height of the sea's surface (m): between the sunk terrain's water cells
-/// and the placed models, so shores and quays meet it.
-const SEA_Z: f32 = -1.0;
+
 /// The map tiles' water colour (40, 80, 140 sRGB), linear.
 const SEA: [f32; 4] = [0.021, 0.080, 0.262, 1.0];
 /// Colour of cells filled from the height map (no map tile there), linear.
@@ -1225,7 +1223,9 @@ fn in_frustum(vp: &Mat4, r: [f32; 4], zmin: f32, zmax: f32) -> bool {
 fn ocean_model() -> glb::Model {
     let (cx, cy) = (X0 + W as f32 * CELL * 0.5, Y1 - H as f32 * CELL * 0.5);
     let e = 120_000.0;
-    let z = SEA_Z;
+    // under the terrain's water and no-data cells (which hold land too:
+    // dunes, beaches); their painted water is shaded as water as well
+    let z = WATER_Z - SINK - 0.5;
     let v = |x: f32, y: f32| glb::Vertex {
         pos: gl([x, y, z]),
         nrm: [0.0, 1.0, 0.0],
