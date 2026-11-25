@@ -209,7 +209,7 @@ pub struct AudioIndex {
 }
 
 /// A stream in a specific archive index, with its encoded byte range for validation.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamAddress {
     pub archive: String,
     pub bank_offset: u64,
@@ -228,23 +228,26 @@ impl StreamAddress {
             return None;
         }
         let bank_index = index.banks.iter().position(|bank| bank.off == self.bank_offset)?;
-        let bank = &index.banks[bank_index];
-        let stream = bank.streams.get(self.stream_index)?;
-        let data_end = self.data_offset.checked_add(u64::from(self.data_size))?;
-        let bank_end = bank.off.checked_add(bank.size)?;
-        (stream.id == self.stream_id
+        self.matches_bank(&index.banks[bank_index], index.archive_size).then_some(bank_index)
+    }
+
+    /// Validate the address against a bank found by its archive and offset.
+    pub fn matches_bank(&self, bank: &Bank, archive_size: u64) -> bool {
+        let Some(stream) = bank.streams.get(self.stream_index) else { return false };
+        let Some(data_end) = self.data_offset.checked_add(u64::from(self.data_size)) else { return false };
+        bank.off == self.bank_offset
+            && stream.id == self.stream_id
             && stream.layout != "none"
             && self.data_size > 0
             && stream.data.1 == self.data_size
             && self.bank_offset.checked_add(u64::from(stream.data.0)) == Some(self.data_offset)
-            && data_end <= bank_end
-            && data_end <= index.archive_size)
-        .then_some(bank_index)
+            && bank.off.checked_add(bank.size).is_some_and(|end| data_end <= end)
+            && data_end <= archive_size
     }
 }
 
 /// An excerpt from one channel of an interleaved audio stream, at 48 kHz.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct StemWindow {
     pub channel_id: u32,
     pub start_frame: u32,

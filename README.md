@@ -1115,10 +1115,48 @@ listed but only export raw. From the command line: `--tab audio [--bank
 ### Scenes dialogue
 
 The **Scenes** tab can show subtitle occurrences from a local
-`<work>/scene_dialogue.json` supplied by a dialogue analysis tool. Use
-the exact scene name displayed in Scenes and list its occurrences in
-order. The file is read when Scenes first opens. Minimal example with
-synthetic values:
+`<work>/scene_dialogue.json`. The file is read when Scenes first opens.
+To build it, run:
+
+```sh
+sixng text data --out text-export
+sixng audio 'local/fixture.rpf'
+sixng scene-dialogue --input turns.json --text-table 'text-export/text/data/1000.json'
+```
+
+Substitute your archive ID and text table path. Choose tables from one
+locale and repeat `--text-table` as needed. Use
+the exact scene names from `sixng cutscenes`. The input lists verified
+turns in scene order with the full native speaker hash, display label and
+localization key. Supply these facts from local scene analysis. The
+command joins the text by key and fills the encoded range from the current
+SixNG audio index. A missing or ambiguous subtitle is reported by turn
+number. A rejected audio address leaves the text and speaker visible.
+
+Example `turns.json` with synthetic values:
+
+```json
+{
+  "schema_version": 1,
+  "turns": [
+    {
+      "scene": "fixture_scene",
+      "speaker": "Guide",
+      "speaker_hash": 1,
+      "subtitle_key": 3,
+      "audio": {
+        "archive": "local/fixture.rpf",
+        "bank_offset": 4096,
+        "stream_index": 1,
+        "stream_id": 66
+      }
+    }
+  ]
+}
+```
+
+An external tool can also write the Scenes file directly. Its generated
+form adds the text and encoded byte range:
 
 ```json
 {
@@ -1155,7 +1193,8 @@ speaker remain visible for those rows.
 
 For an excerpt of a shared voice stem, include a
 `"stem": {"channel_id": 52, "start_frame": 48000, "end_frame": 96000}`
-object inside `audio`. The outer address points to the parent stream,
+object inside `audio` in the input or the output. The outer address
+points to the parent stream,
 and `channel_id` identifies its sub-stream. Frame offsets count from
 the start of the decoded channel at 48 kHz after SixNG applies Opus
 pre-skip, with an exclusive end.
