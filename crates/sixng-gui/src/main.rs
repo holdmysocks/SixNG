@@ -42,6 +42,7 @@ mod metal4_egui;
 mod model_picker;
 mod model_view;
 mod pages;
+mod ped_parts;
 mod render3d;
 mod scenes_view;
 mod shadow;
@@ -58,7 +59,7 @@ mod vehicle_db;
 /// `sixng-gui --model <id|regex|glb> [--lod N] [--mode N] [--slot N] [--rma N] [--wire] [--skeleton]
 ///  [--tod H] [--paint r,g,b] [--finish N] [--pearl A] [--spin R] [--door R] [--yaw R] [--pitch R] [--zoom F]
 ///  [--sector-grid [N]] (Map 2D / 3D: grid N of levels.rpf, default the world grid)
-///  [--no-tint] [--hair hex,hex] [--hair-width MM] [--size WxH] --screenshot out.png --exit`
+///  [--no-tint] [--hair hex,hex] [--hair-width MM] [--full-set] [--size WxH] --screenshot out.png --exit`
 #[derive(Default, Clone)]
 struct Cli {
     args: std::collections::HashMap<String, String>,
@@ -1891,6 +1892,9 @@ impl App {
         }
         if c.has("no-picker") {
             m.show_picker = false;
+        }
+        if c.has("full-set") {
+            ped_parts::OPEN.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         if let Some(s) = c.get("picker-search") {
             m.picker.search = s.to_string();

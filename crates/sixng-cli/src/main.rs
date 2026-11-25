@@ -1027,6 +1027,24 @@ enum Cmd {
         #[arg(long, default_value = "packs")]
         archive: String,
     },
+    /// Every part a character uses: each drawable of all its outfits and of
+    /// the other variations of its wardrobe, grouped as body, hair,
+    /// clothing and accessory, with each texture / colour variant (wardrobe
+    /// item) and the outfits that wear it. Writes `<out>/<model>/parts.json`
+    /// with --out; prints the set (or, for a regex, one summary row per
+    /// character) as JSON.
+    PedParts {
+        /// Model name (`cs_mandy`), or a regex starting with `^` for every
+        /// matching character: those with parts of their own and the named
+        /// models of the outfit list.
+        model: String,
+        /// Folder for `<model>/parts.json`.
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+        /// Archive holding the parts.
+        #[arg(long, default_value = "packs")]
+        archive: String,
+    },
     /// Characters and animals that `outfit` can assemble: named characters
     /// (outfit prefixes such as cs_ali, sc_slow_demon) and animal roots
     /// (crb_eagle_bald_m_00), with their part counts. JSON to stdout.
@@ -1816,6 +1834,50 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             let l = sixng_core::pedlook::look(&ws.game, &a, &ix, model).map_err(|e| anyhow!(e))?;
             out.print(&json!({"ok": true, "look": l}));
+        }
+        Cmd::PedParts { model, out: dir, archive } => {
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            let write = |set: &sixng_core::pedset::PartSet| -> Result<Option<String>> {
+                let Some(d) = dir else { return Ok(None) };
+                let p = d.join(&set.model).join("parts.json");
+                std::fs::create_dir_all(p.parent().unwrap())?;
+                std::fs::write(&p, serde_json::to_vec_pretty(set)?)?;
+                Ok(Some(p.display().to_string()))
+            };
+            if model.starts_with('^') {
+                let re = regex::RegexBuilder::new(model).case_insensitive(true).build()?;
+                let mut rows = Vec::new();
+                let (mut ok, mut complete) = (0, 0);
+                // the characters with parts of their own, then the named
+                // models of the outfit list (`cs_mandy` has no drawable of
+                // its own: all of its parts are shared items)
+                let mut names: Vec<String> = sixng_core::outfit::characters(&ix).into_iter().filter(|c| c.kind == "character").map(|c| c.name).collect();
+                let own = names.len();
+                let mut seen: std::collections::HashSet<String> = names.iter().cloned().collect();
+                for m in sixng_core::pedlook::listed_models(&ws.game).unwrap_or_default().into_iter().filter(|m| m.named && !m.uncertain) {
+                    if seen.insert(m.name.clone()) {
+                        names.push(m.name);
+                    }
+                }
+                for (i, name) in names.iter().enumerate().filter(|(_, n)| re.is_match(n)) {
+                    let own_parts = i < own;
+                    rows.push(match sixng_core::pedset::of(&ws.game, &a, &ix, name) {
+                        Ok(set) => {
+                            ok += 1;
+                            complete += set.complete as usize;
+                            let variants: usize = set.parts.iter().map(|p| p.variants.len()).sum();
+                            json!({"model": set.model, "display": set.display, "own_parts": own_parts, "outfits": set.outfits.iter().filter(|o| o.listed).count(), "other_variations": set.outfits.iter().filter(|o| !o.listed).count(), "parts": set.parts.len(), "variants": variants, "complete": set.complete, "unresolved": set.unresolved, "file": write(&set)?})
+                        }
+                        Err(e) => json!({"model": name, "own_parts": own_parts, "error": e}),
+                    });
+                }
+                out.print(&json!({"ok": true, "count": rows.len(), "with_set": ok, "complete": complete, "characters": rows}));
+                return Ok(());
+            }
+            let set = sixng_core::pedset::of(&ws.game, &a, &ix, model).map_err(|e| anyhow!(e))?;
+            let file = write(&set)?;
+            out.print(&json!({"ok": true, "file": file, "set": set}));
         }
         Cmd::Characters { name, kind, archive } => {
             let a = ws.resolve(archive)?;

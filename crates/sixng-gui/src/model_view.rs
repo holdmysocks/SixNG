@@ -310,6 +310,8 @@ pub struct LookInfo {
     /// The colours of the game's hair palette (`ped_tint_hair`, each row at
     /// mid shade, sRGB), to pick from.
     pub hair_swatches: Vec<[u8; 3]>,
+    /// Every part of the character's outfits and wardrobe (`pedset`).
+    pub parts: Option<Arc<sixng_core::pedset::PartSet>>,
 }
 
 /// The grooms of one hair asset of an outfit.
@@ -2009,6 +2011,10 @@ impl ModelView {
             ui.end_row();
         });
         ui.label(egui::RichText::new("The outfits the game lists for this character, in its order. The first one is shown by default.").weak().small());
+        if let Some(k) = look.parts.as_deref().and_then(|set| crate::ped_parts::ui(ui, set, look.current)) {
+            let base = l.base.split("#look=").next().unwrap_or(&l.base);
+            reload = Some(format!("{base}#look={k}"));
+        }
         let mut shape = *BODY_SHAPE.lock().unwrap();
         let before = shape;
         let mut released = false;
@@ -6752,6 +6758,8 @@ fn load_query_sel(
                 opts.iter_mut().for_each(|o| o.default = false);
                 let mut info = LookInfo { model: look.model.clone(), labels: look.outfits.iter().map(|o| o.label.clone()).collect(), current: k, ..Default::default() };
                 info.notes.extend(look.note.clone());
+                let display = sixng_core::pedlook::model_names(&ws.game).ok().and_then(|n| n.display.get(&sixng_core::pedlook::model_hash(&look.model)).cloned());
+                info.parts = Some(Arc::new(sixng_core::pedset::part_set(&look, display)));
                 info.hats = look.outfits[k].parts.iter().filter(|p| p.slot == "hat").map(|p| p.drawable.to_ascii_lowercase()).collect();
                 for (oi, o) in look.outfits.iter().enumerate() {
                     for p in &o.parts {

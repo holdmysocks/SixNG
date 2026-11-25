@@ -715,6 +715,28 @@ again**).
     with what its default outfit has. `sixng outfit <name> --look N`
     exports outfit N as one rigged GLB (parts, the face, stored tints;
     not the viewer's skin tone, colour words or hidden skin).
+  - **Full set.** The Character panel's *Full set* section lists every
+    part a character uses. That covers each drawable of all its listed outfits,
+    plus the variations of its wardrobe that no listed outfit reaches. Parts are grouped as
+    body, hair, clothing and accessory, with each texture and colour
+    variant (one wardrobe item on that drawable) and the outfits that wear
+    it. Clicking an outfit number shows that outfit. The game links a
+    character to these parts in three steps: the outfit list maps the
+    model to its outfit variations, the wardrobe resource holds those and
+    the head, body, brow and lash sets they include, and each item names
+    its drawable by asset GUID. The grouping into kinds is read from
+    the drawable names; the wardrobe stores none. Run
+    `sixng ped-parts cs_mandy --out <dir>` to write `<dir>/cs_mandy/parts.json`, and
+    `sixng ped-parts "^" --out <dir>` to write one for every character, with a
+    summary. That covers the 292 characters with parts of their own and the 457 other
+    named models of the outfit list (Mandy is one: all her parts are
+    shared items). Of these 749, 747 have every item resolved; Raina
+    (under both her model names) misses one. Items left out on purpose
+    (first-person arms, the anatomical body layer) are listed apart and
+    do not count as missing. Mandy (9 outfits, 40 parts, 47 variants),
+    Vicki (15, 48, 53) and Viper (3, 18, 18) are complete. 30
+    characters have a wardrobe variation that no outfit uses; in each case it
+    is a spare head set (head, eyes, teeth).
   - The first character opened builds `<work>/index/ped_models.json`
     (about a minute) and loads the texture-users index (about 10 s).
   - Watches and rings are modelled at their own root bone and moved onto
