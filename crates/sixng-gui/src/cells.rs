@@ -677,6 +677,7 @@ mod tests {
             ped_shade: false,
             detail: None,
             ramp_u: None,
+            wear_mask: None,
             ramp: None,
             parts: false,
             occlusion_only: false,

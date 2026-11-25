@@ -152,6 +152,11 @@ pub struct Look {
     pub coat_base: Option<f32>,
     /// How much of the second layer of vehicle part surfaces shows (0 to 1).
     pub wear: f32,
+    /// Show each part's wear as the vehicle's configuration sets it (its
+    /// wear level), instead of `wear`, when the model has wear levels.
+    pub wear_from_config: bool,
+    /// The shown vehicle has wear levels (set by the model view).
+    pub wear_levels: bool,
     pub slot: u32,
     pub paint: [f32; 3],
     pub paint2nd: [f32; 3],
@@ -186,6 +191,8 @@ impl Default for Look {
             coat: [0.0; 4],
             coat_base: None,
             wear: 0.0,
+            wear_from_config: true,
+            wear_levels: false,
             slot: 0,
             paint: [0.55, 0.02, 0.02],
             paint2nd: [0.6, 0.6, 0.62],
@@ -900,6 +907,7 @@ impl Renderer3D {
                 tex_entry(3),
                 tex_entry(4),
                 tex_entry(5),
+                tex_entry(6),
             ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1648,6 +1656,7 @@ impl Uploader {
             ped_shade: false,
             detail: None,
             ramp_u: None,
+            wear_mask: None,
             ramp: None,
             parts: false,
             occlusion_only: false,
@@ -1711,7 +1720,9 @@ impl Uploader {
                 // bit 14: the emissive slot holds the part ramp image, whose
                 // rows 512.. are the parts' surfaces (low and high metalness
                 // and roughness)
-                | if mt.ramp.is_some() && mt.emissive.is_none() { 0x4000 } else { 0 };
+                | if mt.ramp.is_some() && mt.emissive.is_none() { 0x4000 } else { 0 }
+                // bit 15: the game's wear mask is bound (binding 6)
+                | if mt.wear_mask.is_some() && mt.ramp.is_some() && mt.emissive.is_none() { 0x8000 } else { 0 };
             let u = MatU {
                 base,
                 flags: [has, class_id(&mt.class), alpha, gap | mr],
@@ -1758,6 +1769,10 @@ impl Uploader {
                     wgpu::BindGroupEntry {
                         binding: 5,
                         resource: wgpu::BindingResource::TextureView(view(mt.detail.map(|d| d.image).or(mt.ramp_u.filter(|_| mt.ramp.is_some() && mt.emissive.is_none())))),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(view(mt.wear_mask)),
                     },
                 ],
             });
@@ -2111,7 +2126,8 @@ impl Renderer3D {
             ],
             prev_view_proj: vp.to_cols_array_2d(),
             // xyz: the body paint's coat; w: vehicle wear (0 to 1)
-            jitter: [look.coat[0], look.coat[1], look.coat[2], look.wear],
+            // w < 0: each part's own wear amount from the part ramp image
+            jitter: [look.coat[0], look.coat[1], look.coat[2], if look.wear_from_config && look.wear_levels { -1.0 } else { look.wear }],
         }
     }
 

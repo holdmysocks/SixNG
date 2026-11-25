@@ -84,7 +84,9 @@ pub struct Material {
     /// (shading) is shown as grey.
     pub tint_mask: bool,
     /// Ped clothing whose base texture is the grey shade map (`ped_tint` in
-    /// the extras): the viewer colours it with the outfit's tint.
+    /// the extras): the viewer colours it with the outfit's tint. Also set,
+    /// with no base texture, on ped clothing whose textures are not in the
+    /// install: it is coloured per vertex.
     pub ped_shade: bool,
     /// Clothing: the tiling fabric texture of the garment's main
     /// sub-material, drawn by the shader as close-up weave over the baked
@@ -97,6 +99,9 @@ pub struct Material {
     /// Vehicle parts: the palette row of each part id as an image (128
     /// columns, row = part id), set by the viewer for the look shown.
     pub ramp: Option<usize>,
+    /// Vehicle parts: the game's tiling wear mask (material parameter
+    /// `b9f4bdac`, three grunge channels), where the second layer shows.
+    pub wear_mask: Option<usize>,
     /// Vehicle parts coloured per vertex (COLOR_0; alpha 254 = the primary
     /// body paint, other values = metalness in four steps x 50 + roughness in 50 steps).
     pub parts: bool,
@@ -838,7 +843,9 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             emissive,
             mr,
             tint_mask: ex["classification"]["tint_mask"] == true,
-            ped_shade: ex["ped_tint"].is_object(),
+            // the clothing shaders bind `speculartex2` (739e3d0d), which marks
+            // ped clothing, whether or not the texture is in the install
+            ped_shade: ex["ped_tint"].is_object() || (base.is_none() && ex["shader_name"].as_str().is_some_and(|s| s.starts_with("ped_")) && tex_list.iter().any(|t| t["param_hash"] == "739e3d0d")),
             detail: None,
             ramp_u: (ex["classification"]["stand_in"] == "parts" && !opts.base_only)
                 .then(|| tex_list.iter().find(|t| t["param_hash"] == "346394ea" && t["status"].as_str().is_some_and(|s| s.starts_with("ok")) && t["width"].as_u64().is_some_and(|w| w >= 32)))
@@ -846,6 +853,11 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                 .and_then(|t| t["png"].as_str())
                 .and_then(|p| add_img(out_root.join(p), false, &mut images)),
             ramp: None,
+            wear_mask: (ex["classification"]["stand_in"] == "parts" && !opts.base_only)
+                .then(|| tex_list.iter().find(|t| t["param_hash"] == "b9f4bdac" && t["status"].as_str().is_some_and(|s| s.starts_with("ok")) && t["width"].as_u64().is_some_and(|w| w >= 32)))
+                .flatten()
+                .and_then(|t| t["png"].as_str())
+                .and_then(|p| add_img(out_root.join(p), false, &mut images)),
             parts: ex["classification"]["stand_in"] == "parts",
             occlusion_only,
             emissive_scale,

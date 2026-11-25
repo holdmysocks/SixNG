@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 /// Most pieces a placeholder without a preset is given.
 const MAX_UNKNOWN: usize = 14;
 /// Roots this close to the skin (median, metres) mark an animal's run.
@@ -266,6 +266,12 @@ pub struct Variant {
     pub slot: String,
     /// Densest groom of each piece (archive offsets).
     pub grooms: Vec<u64>,
+    /// The LOD chain of each piece, densest first (same order as `grooms`).
+    /// Read: by the files' names (`<piece>_lod1` …) where the piece word is
+    /// known, else `hairlink`'s chain by bones and strand counts. Inferred:
+    /// `pieces`.
+    #[serde(default)]
+    pub chains: Vec<Vec<u64>>,
     /// The piece count came from the piece table (false: a placeholder
     /// the table does not list; inferred: sized by what the walk left).
     pub known: bool,
@@ -482,6 +488,14 @@ pub fn link_exact(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::scan:
     if names.is_empty() {
         return Err(anyhow!("{root} has no fur variants"));
     }
+    // LOD chains: by name where the piece is named, else the exact hair
+    // table's chain (bones and strand counts), else the groom alone
+    let starts: std::collections::HashSet<u64> = table.values().flatten().filter_map(file).collect();
+    let listed: std::collections::HashSet<u64> = names.iter().filter_map(|(n, p)| table.get(&crate::meta7a::asset_id(n)).or_else(|| table.get(p))).flatten().copied().collect();
+    let named = crate::hairlink::piece_names(names.keys().map(|n| n.as_str()), &listed);
+    let by_name: HashMap<u64, Vec<u64>> = named.iter().filter_map(|(id, n)| file(id).map(|o| (o, crate::hairlink::lod_files(n, o, file, &starts)))).collect();
+    let guessed: HashMap<u64, Vec<u64>> = crate::hairlink::get(work, a, all).map(|t| t.lods.iter().map(|c| (c[0], c.clone())).collect()).unwrap_or_default();
+    let chain = |o: &u64| by_name.get(o).or_else(|| guessed.get(o)).cloned().unwrap_or_else(|| vec![*o]);
     let mut variants = Vec::new();
     for (name, preset) in &names {
         let list = table.get(&crate::meta7a::asset_id(name)).or_else(|| table.get(preset));
@@ -492,7 +506,7 @@ pub fn link_exact(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::scan:
             }
         }
         let head = name.split("_fur_").nth(1).is_some_and(|s| s.starts_with("head"));
-        variants.push(Variant { name: name.clone(), slot: if head { "head" } else { "body" }.into(), exact: list.is_some_and(|l| l.len() == own.len()), known: list.is_some(), grooms: own });
+        variants.push(Variant { name: name.clone(), slot: if head { "head" } else { "body" }.into(), exact: list.is_some_and(|l| l.len() == own.len()), known: list.is_some(), chains: own.iter().map(chain).collect(), grooms: own });
     }
     if variants.iter().all(|v| v.grooms.is_empty()) {
         return Err(anyhow!("the piece table lists no groom of {root}"));
@@ -648,7 +662,8 @@ fn link(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], r
             }
         }
         if asset.root == l {
-            variants.push(Variant { name: asset.name.clone(), slot: if asset.head { "head" } else { "body" }.into(), grooms, known: asset.ids.is_some(), exact });
+            let chains = grooms.iter().map(|g| pcs.iter().find(|p| p.lods[0] == *g).map(|p| p.lods.clone()).unwrap_or_else(|| vec![*g])).collect();
+            variants.push(Variant { name: asset.name.clone(), slot: if asset.head { "head" } else { "body" }.into(), grooms, chains, known: asset.ids.is_some(), exact });
         }
     }
     if variants.iter().all(|v| v.grooms.is_empty()) {
