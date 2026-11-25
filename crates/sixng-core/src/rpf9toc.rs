@@ -32,6 +32,10 @@
 //!   Most inner archives use this instead of the file entry.
 //! * `286030a358a789fb` crypto record, 64 bytes: u32 key id, u16 type (0x11 =
 //!   stream cipher), IV at +6, five u64 at +0x18: first, on, off, tail, ?.
+//! * `73bcb72dce74f11f` file id, 8 bytes: the name id of the file, the first
+//!   half of MurmurHash3 x64 128 (seed 0) of its lower-case name
+//!   (`meta7a::asset_id`). Checked on groom files, whose names have no
+//!   extension (`<placeholder>_base`, `<placeholder>_base_lod1`).
 //!
 //! An encrypted file is one cipher stream over its stored bytes (the keystream
 //! position is the offset in the data), but only some spans are encrypted:
@@ -51,6 +55,7 @@ use std::io::{Read, Seek, SeekFrom};
 pub const COL_ENTRY: u64 = 0x33f7_0dfa_f2c5_0989;
 pub const COL_CRYPTO: u64 = 0x2860_30a3_58a7_89fb;
 pub const COL_RESOURCE: u64 = 0xba18_0afb_232d_1b4b;
+pub const COL_FILE_ID: u64 = 0x73bc_b72d_ce74_f11f;
 /// A resource's data starts after this many zero bytes.
 pub const RESOURCE_PREFIX: usize = 16;
 /// Entry flag: the stored bytes are one raw deflate stream.
@@ -321,6 +326,35 @@ impl Toc {
         }
         Ok(out)
     }
+}
+
+/// File id (`COL_FILE_ID`) -> where the data of the files with that id
+/// starts (offset in `f`; an index entry's `off`), over the archive and the
+/// archives stored in it. An inner archive whose table cannot be read is
+/// left out.
+pub fn file_ids<R: Read + Seek>(cipher: &mut dyn ArchiveCipher, f: &mut R) -> Result<std::collections::HashMap<u64, Vec<u64>>> {
+    let mut out: std::collections::HashMap<u64, Vec<u64>> = std::collections::HashMap::new();
+    let mut todo = vec![0u64];
+    while let Some(base) = todo.pop() {
+        let toc = match open_toc(cipher, f, base) {
+            Ok(t) => t,
+            Err(e) if base == 0 => return Err(e),
+            Err(_) => continue,
+        };
+        if !toc.has_entries() {
+            continue;
+        }
+        let files = toc.files()?;
+        if let Some(c) = toc.column(COL_FILE_ID).filter(|&c| toc.columns[c].elem_size == 8) {
+            for e in &files {
+                if let Some(id) = toc.index(c, e.row).and_then(|i| toc.cell(c, i)) {
+                    out.entry(u64le(id, 0)).or_default().push(base + e.offset + e.data_start() as u64);
+                }
+            }
+        }
+        todo.extend(nested_archives(f, base, &files).into_iter().map(|o| base + o));
+    }
+    Ok(out)
 }
 
 /// The encrypted byte ranges (offset, length) of `size` bytes of data, in
