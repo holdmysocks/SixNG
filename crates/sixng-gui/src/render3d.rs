@@ -1549,7 +1549,11 @@ impl Uploader {
                 // (a bulb's emissive layer, a neon tube): lit like class 7
                 | if mt.lit && mt.class != "emissive" { 0x1000 } else { 0 }
                 // bit 13: the packed map is a vehicle material map, blue = occlusion
-                | if mt.occlusion_only { 0x2000 } else { 0 };
+                | if mt.occlusion_only { 0x2000 } else { 0 }
+                // bit 14: the emissive slot holds the part ramp image, whose
+                // rows 512.. are the parts' surfaces (low and high metalness
+                // and roughness)
+                | if mt.ramp.is_some() && mt.emissive.is_none() { 0x4000 } else { 0 };
             let u = MatU {
                 base,
                 flags: [has, class_id(&mt.class), alpha, gap | mr],
@@ -1591,7 +1595,7 @@ impl Uploader {
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
-                        resource: wgpu::BindingResource::TextureView(view(mt.emissive.or(mt.ramp.filter(|_| mt.ramp_u.is_some() && mt.detail.is_none())))),
+                        resource: wgpu::BindingResource::TextureView(view(mt.emissive.or(mt.ramp))),
                     },
                     wgpu::BindGroupEntry {
                         binding: 5,

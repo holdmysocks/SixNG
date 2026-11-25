@@ -42,7 +42,8 @@
 //! roughness are low / high pairs of the part's surface blended by the red
 //! and green channels of `lyr0materialatex`. An export has one value of
 //! each of those three texture channels per model (the textures' means),
-//! not one per pixel.
+//! not one per pixel. For a viewer that reads the material map itself,
+//! model.json also lists each part id's low and high (`surface_table`).
 //!
 //! A third record gives a part its **coat**: the layers of a paint (clear
 //! coat, flakes, thin film, sheen, anisotropy). Coat records (`2b84f07e`,
@@ -75,7 +76,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// 23: `sliding_doors` in model.json.
 /// 24: the tyre colour slot is left unapplied (tyres stay black).
 /// 25: coat records (`coats`, `coat_records`, `paint_coats`, `paint_coat`).
-pub const EXPORT_VERSION: u32 = 25;
+/// 26: `surfaces` (each part id's low and high metalness and roughness, for
+/// a viewer that reads the material map per pixel).
+pub const EXPORT_VERSION: u32 = 26;
 /// Layout version of `<work>/index/vehicle_parts.json`.
 /// 21: a part's coat and the library's coat records.
 pub const FORMAT: u32 = 21;
@@ -962,6 +965,7 @@ impl Tables {
         let looks: Vec<Value> = names.iter().map(|n| hex(n).map_or(Value::Null, Value::String)).collect();
         let rows: Vec<Value> = names.iter().map(|n| self.sets.get(*n).map_or(Value::Null, |p| Value::String(row_table(p)))).collect();
         let wear: Vec<Value> = names.iter().map(|n| self.sets.get(*n).map_or(Value::Null, |p| Value::String(wear_table(p, mat)))).collect();
+        let surfaces: Vec<Value> = names.iter().map(|n| self.sets.get(*n).map_or(Value::Null, |p| Value::String(surface_table(p)))).collect();
         // the coat records the looks use, and per look the index of each part id's
         let mut used: Vec<u32> = names.iter().filter_map(|n| self.sets.get(*n)).flatten().map(|p| p.coat).filter(|c| self.coats.contains_key(&format!("{c:08x}"))).collect();
         used.sort();
@@ -983,7 +987,9 @@ impl Tables {
                 }
                 let look = look_table(&set, palette, u, mat);
                 let rgba: String = d.iter().flat_map(|x| look[x.0 as usize]).map(|b| format!("{b:02x}")).collect();
-                Some((part.clone(), serde_json::json!({"ids": d.iter().map(|x| x.0).collect::<Vec<_>>(), "rgba": rgba})))
+                let all = surface_table(&set);
+                let surfaces: String = d.iter().map(|x| &all[x.0 as usize * 8..x.0 as usize * 8 + 8]).collect();
+                Some((part.clone(), serde_json::json!({"ids": d.iter().map(|x| x.0).collect::<Vec<_>>(), "rgba": rgba, "surfaces": surfaces})))
             })
             .collect();
         serde_json::json!({
@@ -991,6 +997,7 @@ impl Tables {
             "part_patches": patches,
             "rows": rows,
             "wear": wear,
+            "surfaces": surfaces,
             "coats": coats,
             "paint_coats": paint_coats,
             "coat_records": coat_records,
@@ -1030,6 +1037,21 @@ pub fn paint_coat(parts: &[Part], counts: &[u64; 256]) -> Option<u32> {
 /// `used` (coat record names), `ff` for a part whose coat is not among them.
 pub fn coat_table(parts: &[Part], used: &[u32]) -> String {
     (0..256).map(|i| format!("{:02x}", parts.get(i).and_then(|p| used.iter().position(|u| *u == p.coat)).filter(|k| *k < 255).unwrap_or(255))).collect()
+}
+
+/// The first layer's surface of each of the 256 part ids, 8 hex digits each:
+/// metalness low, metalness high, roughness low, roughness high (0 to 255).
+/// The paint shader blends low to high by the red (metalness) and green
+/// (roughness) of `lyr0materialatex` at each pixel; `surface_code` holds the
+/// same pair blended once, by that texture's mean.
+pub fn surface_table(parts: &[Part]) -> String {
+    let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    (0..256)
+        .map(|i| match parts.get(i) {
+            Some(p) => format!("{:02x}{:02x}{:02x}{:02x}", q(p.metal[0]), q(p.metal[1]), q(p.rough[0]), q(p.rough[1])),
+            None => "0000c0c0".to_string(),
+        })
+        .collect()
 }
 
 /// The palette row of each of the 256 part ids, 4 hex digits each: slice x
@@ -1118,6 +1140,13 @@ mod tests {
         parts[0].metal = [0.0, 1.0];
         assert_eq!(vertex_colours(&parts, &pal, 0.5, [1.0, 0.0], [0u8].into_iter())[0][3], 150 + 10);
         assert_eq!(vertex_colours(&parts, &pal, 0.5, [0.0, 1.0], [0u8].into_iter())[0][3], 20);
+        // the low and high themselves, for a viewer that blends per pixel
+        parts[0].rough = [0.2, 0.4];
+        let t = surface_table(&parts);
+        assert_eq!(t.len(), 2048);
+        assert_eq!(&t[..8], "00ff3366");
+        assert_eq!(&t[16..24], "0000ffff");
+        assert_eq!(&surface_table(&parts[..1])[8..16], "0000c0c0");
         // the position along the row picks the column
         for x in 0..128 {
             pal[at(3, 5, x)] = [x as u8 * 2, 0, 0, 255];
