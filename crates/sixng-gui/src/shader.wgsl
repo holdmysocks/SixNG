@@ -16,7 +16,8 @@ struct Frame {
     misc2: vec4<f32>,     // x fog density, yzw secondary paint colour
     misc3: vec4<f32>,     // x tint palette on (1) / off (0), w the vehicle's own paint metalness
     prev_view_proj: mat4x4<f32>,
-    jitter: vec4<f32>,    // y, z the target's width and height in pixels, w vehicle wear (0 to 1)
+    jitter: vec4<f32>,    // x strand dither index, y, z the target's width and height in pixels, w vehicle wear (0 to 1)
+    light_vp: mat4x4<f32>, // the sun shadow map's view-projection (all zero: none)
 };
 
 struct Mat {
@@ -51,6 +52,8 @@ struct Sticker {
 @group(0) @binding(7) var t_hair_n: texture_3d<f32>;
 @group(0) @binding(8) var t_hair_a: texture_2d<f32>;
 @group(0) @binding(9) var t_hair_p: texture_3d<f32>;
+@group(0) @binding(10) var t_shadow: texture_depth_2d;
+@group(0) @binding(11) var samp_shadow: sampler_comparison;
 
 @group(1) @binding(0) var<uniform> M: Mat;
 @group(1) @binding(1) var t_base: texture_2d<f32>;
@@ -369,6 +372,23 @@ fn ign(p: vec2<f32>) -> f32 {
     return fract(52.9829 * fract(0.0671106 * p.x + 0.00583715 * p.y));
 }
 
+// Share of the sun's light that reaches a point, from the sun shadow map (1 where there is none): 3 x 3 taps
+// of a linear comparison. A stand-in for the game's shadow filtering, which is not read.
+fn sun_shadow(wp: vec3<f32>) -> f32 {
+    if (F.light_vp[3][3] == 0.0) { return 1.0; }
+    let c = F.light_vp * vec4(wp, 1.0);
+    let uv = c.xy * vec2(0.5, -0.5) + 0.5;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || c.z > 1.0) { return 1.0; }
+    let px = 1.0 / f32(textureDimensions(t_shadow).x);
+    var s = 0.0;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            s += textureSampleCompareLevel(t_shadow, samp_shadow, uv + vec2(f32(x), f32(y)) * px, c.z - 0.0012);
+        }
+    }
+    return s / 9.0;
+}
+
 @fragment
 fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {
     var o: MeshOut;
@@ -619,14 +639,15 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     let fr_v = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
     let r = reflect(-v, n);
     let env = mix(sky(r), (F.sky_top.rgb + F.sky_hor.rgb) * 0.5, rough) * F.misc.w;
-    var col = direct * ao_direct + kd * albedo * amb_d * ao + env * fr_v * ao + emissive;
+    let sh = sun_shadow(i.world);
+    var col = direct * sh * ao_direct + kd * albedo * amb_d * ao + env * fr_v * ao + emissive;
     col += pearl * pow(1.0 - ndv, 2.0) * 0.6;
     if (cls == 12u) {
         // strands: the fibre model on the strand's direction (the tangent)
         let tdir = normalize(i.tan.xyz);
         let sun = F.sun_col.rgb * F.sun_dir.w * 3.0;
         let amb_h = sqrt(albedo) * 0.5 * (neutral(F.sky_top.rgb, 0.8) + neutral(F.sky_hor.rgb, 0.8) * 0.6) * 0.5 * F.misc.w;
-        col = hair_light(albedo, tdir, v, l, 0.33, 0.5) * sun * ao_direct + amb_h * ao;
+        col = hair_light(albedo, tdir, v, l, 0.33, 0.5) * sun * sh * ao_direct + amb_h * ao;
         // with the game's tables: its own light sum
         let dims = textureDimensions(t_hair_m);
         if (dims.x > 1u) {
@@ -668,7 +689,8 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
                 let frs = f0s + (1.0 - f0s) * pow(1.0 - max(dot(hs, v), 0.0), 5.0);
                 let specs = a2s / (3.14159 * dds * dds) * gs * frs / max(4.0 * nls * nvs, 0.001);
                 // stand-in for the shadow the rest of the hair casts: the side of the head turned from the light
-                let shade = smoothstep(-0.35, 0.35, dot(root, l));
+                // (with the sun shadow map: its shadow instead)
+                let shade = select(smoothstep(-0.35, 0.35, dot(root, l)), sh, F.light_vp[3][3] != 0.0);
                 col = ((1.0 - frs) * albedo / 3.14159 + specs) * sun * nls * shade * ao_direct + sky_h * (albedo + f0s) * ao;
             }
         }

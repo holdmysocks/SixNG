@@ -903,6 +903,7 @@ fn frame_uniform(
         misc3: [look.tint as u32 as f32, 0.0, 0.0, 0.0],
         prev_view_proj: prev_view_projection.to_cols_array_2d(),
         jitter: [jitter[0], jitter[1], 0.0, 0.0],
+        light_view_proj: [[0.0; 4]; 4],
     }
 }
 
