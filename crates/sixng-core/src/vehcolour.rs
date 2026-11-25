@@ -44,6 +44,16 @@
 //! each of those three texture channels per model (the textures' means),
 //! not one per pixel.
 //!
+//! A third record gives a part its **coat**: the layers of a paint (clear
+//! coat, flakes, thin film, sheen, anisotropy). Coat records (`2b84f07e`,
+//! 92 in the library) are named by `paintHash` next to a part id's colour
+//! record in the part set, and per configuration by the paint type parts:
+//! a modifier `1f6c6730` gives a channel a coat (`paintType`), an
+//! assignment a default one (`defaultPaintType`), and a binding with its
+//! `paintType` flag set passes the channel's coat to its group of part ids.
+//! That the paint type modifier wins over the assignment's default, and
+//! what the shader does with each value, is not checked in code.
+//!
 //! Not decoded: the other modifier kinds (dirt, liveries, decal layers),
 //! which configuration a spawned vehicle uses, the wear layers (a colour
 //! record's second and third picks, mostly on page 5).
@@ -64,9 +74,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// 22: `part_patches` (what a fitted part changes).
 /// 23: `sliding_doors` in model.json.
 /// 24: the tyre colour slot is left unapplied (tyres stay black).
-pub const EXPORT_VERSION: u32 = 24;
+/// 25: coat records (`coats`, `coat_records`, `paint_coats`, `paint_coat`).
+pub const EXPORT_VERSION: u32 = 25;
 /// Layout version of `<work>/index/vehicle_parts.json`.
-pub const FORMAT: u32 = 20;
+/// 21: a part's coat and the library's coat records.
+pub const FORMAT: u32 = 21;
 
 const PART_SET: u32 = 0xf142_44fd;
 const SET_COLOURS: u32 = 0x7847_6477;
@@ -94,6 +106,17 @@ const ROUGH_HIGH: u32 = 0x26e5_d460;
 const METAL_LOW: u32 = 0xf763_652d;
 const METAL_HIGH: u32 = 0x09dd_33c1;
 const NAME: u32 = 0xe6e1_7f14;
+/// A coat record of the library and the fields that name one: `paintHash`
+/// of a part set's colour entry, `defaultPaintType` of an assignment,
+/// `paintType` of a paint type modifier (`1f6c6730`: `group` = channel) and,
+/// as a flag, of a binding.
+const COAT: u32 = 0x2b84_f07e;
+const ENTRY_COAT: u32 = 0x9647_9496;
+const ASSIGN_COAT: u32 = 0xa816_7b82;
+const PAINT_TYPE: u32 = 0x1f6c_6730;
+const PAINT_TYPE_COAT: u32 = 0xdb4b_dec4;
+/// The coat record most parts name (`default`: no clear coat, no flakes).
+pub const DEFAULT_COAT: u32 = 0xe4df_46d5;
 /// A configuration's part list (`51019114.e89b8540`).
 const CONFIG_PARTS: u32 = 0xe89b_8540;
 /// A library record a configuration's part list names (`0caef606`): slot
@@ -135,6 +158,8 @@ const OPTION_PARTS: u32 = 0xbf34_0aab;
 /// library part whose modifiers come along. The other types (0 to 4) are
 /// not read.
 const PART_REF: u32 = 0x51aa_b7c1;
+const REF_TYPE: u32 = 0x3165_b05d;
+const REF_DATA: u32 = 0x5eb5_e655;
 /// The channel body panels are bound to (bonnet, boot, bumpers, doors, at
 /// priority 1 over a default); no record assigns it a colour, so it is taken
 /// as the body paint.
@@ -160,6 +185,92 @@ const OWNER: u32 = 0xfb1f_80ff;
 /// The colour record of the primary body paint (its stored colour is a
 /// dark grey default; a configuration's body colour replaces it).
 pub const PRIMARY_PAINT: u32 = 0x2640_0a11;
+
+/// A coat record (`2b84f07e`, 56 bytes): the layers of a paint. Field names
+/// are the game's (case-sensitive joaat of the member hashes), except the
+/// two that are not named. Booleans are bytes, `base_coat_roughness` and
+/// `value_9851c9f1` are f32, the other numbers half floats.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Coat {
+    pub use_anisotropy: bool,
+    /// 0 to 0.55.
+    pub anisotropy_intensity: f32,
+    /// `f6d2a18e` = `useClearCoat`.
+    pub use_clear_coat: bool,
+    /// 0 to 1.
+    pub clear_coat_intensity: f32,
+    /// 0 (gloss) to 0.7 (matte).
+    pub clear_coat_roughness: f32,
+    pub use_specular_color: bool,
+    /// Not named; set on one record.
+    pub flag_b97f4910: bool,
+    pub use_flakes: bool,
+    /// 0 or 1.
+    pub flake_coverage: f32,
+    /// 0 to 0.104.
+    pub flake_size: f32,
+    /// 0 to 0.1.
+    pub flake_orientation: f32,
+    /// `4bd9d63e` = `overrideBaseCoatRoughness`.
+    pub override_base_coat_roughness: bool,
+    /// 0.09 to 0.7.
+    pub base_coat_roughness: f32,
+    /// Not named; 1 on one record, else 0.
+    pub value_9851c9f1: f32,
+    /// False on every record.
+    pub use_emissive: bool,
+    /// `5f4aa231` = `filmIOR`: 1, or 2.3 / 2.6 on the records with a film.
+    pub film_ior: f32,
+    /// 0 (no film) to 2.75; the unit is not known.
+    pub film_thickness: f32,
+    /// 0 to 0.8.
+    pub sheen_intensity: f32,
+    pub sheen_fade: f32,
+    pub sheen_reflectance: f32,
+}
+
+/// The coat records of a library, by name hash. Each member is found by its
+/// name hash and read by its declared type, so a record with members moved
+/// or missing still reads (a missing one stays 0 / false).
+pub fn coats(m: &Meta) -> HashMap<u32, Coat> {
+    let Some(sd) = m.structs.get(&COAT) else { return HashMap::new() };
+    let r = m.r;
+    let member = |h: u32| sd.members.iter().find(|x| x.hash == h);
+    m.objects(COAT)
+        .into_iter()
+        .map(|o| {
+            let num = |h: u32| match member(h) {
+                Some(x) if x.ty == 0x20 => meta7a::half(r.u16(o + x.off as usize)),
+                Some(x) if x.ty == 0x21 => r.f32(o + x.off as usize),
+                _ => 0.0,
+            };
+            let flag = |h: u32| member(h).filter(|x| x.ty == 0x01).and_then(|x| r.sys.get(o + x.off as usize)).is_some_and(|b| *b != 0);
+            let c = Coat {
+                use_anisotropy: flag(0x4953_63e4),
+                anisotropy_intensity: num(0xd926_02db),
+                use_clear_coat: flag(0xf6d2_a18e),
+                clear_coat_intensity: num(0xf031_0a8b),
+                clear_coat_roughness: num(0xc5cb_49ba),
+                use_specular_color: flag(0x61e8_2f14),
+                flag_b97f4910: flag(0xb97f_4910),
+                use_flakes: flag(0xe57c_6a65),
+                flake_coverage: num(0xdf5b_7432),
+                flake_size: num(0xef79_abb2),
+                flake_orientation: num(0xa17a_dbe1),
+                override_base_coat_roughness: flag(0x4bd9_d63e),
+                base_coat_roughness: num(0xc920_19cc),
+                value_9851c9f1: num(0x9851_c9f1),
+                use_emissive: flag(0xc8d4_8032),
+                film_ior: num(0x5f4a_a231),
+                film_thickness: num(0x85d1_88cc),
+                sheen_intensity: num(0x210d_19b3),
+                sheen_fade: num(0x469c_3c58),
+                sheen_reflectance: num(0x850e_331c),
+            };
+            (member(NAME).map_or(0, |x| r.u32(o + x.off as usize)), c)
+        })
+        .collect()
+}
 
 /// One part id of a part set.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -192,6 +303,10 @@ pub struct Part {
     pub wear_rough: [f32; 2],
     #[serde(default)]
     pub wear_metal: [f32; 2],
+    /// Name hash of the coat record (`2b84f07e`, see `Tables::coats`); 0
+    /// when the part set names none.
+    #[serde(default)]
+    pub coat: u32,
 }
 
 impl Part {
@@ -240,6 +355,10 @@ pub struct Tables {
     /// ids of its panels to the body paint this way.
     #[serde(default)]
     pub part_patches: HashMap<String, HashMap<String, Vec<(u8, Part)>>>,
+    /// The library's coat records by name (8 hex digits): what `Part::coat`
+    /// names.
+    #[serde(default)]
+    pub coats: HashMap<String, Coat>,
 }
 
 /// A key for a configuration: FNV-1a of its part list (the name hashes in
@@ -286,10 +405,13 @@ struct Library {
     groups: HashMap<u32, Vec<u8>>,
     /// modifier name -> (group, part ids)
     group_defs: HashMap<u32, (u32, Vec<u8>)>,
-    /// modifier name -> (group, channel, priority, colour, surface)
-    binds: HashMap<u32, (u32, u32, i64, bool, bool)>,
-    /// modifier name -> (channel, colour record, surface record)
-    assigns: HashMap<u32, (u32, u32, u32)>,
+    /// modifier name -> (group, channel, priority, colour, surface, coat)
+    binds: HashMap<u32, (u32, u32, i64, bool, bool, bool)>,
+    /// modifier name -> (channel, colour record, surface record, coat record)
+    assigns: HashMap<u32, (u32, u32, u32, u32)>,
+    /// paint type modifier name -> (channel, coat record)
+    paint_types: HashMap<u32, (u32, u32)>,
+    coats: HashMap<u32, Coat>,
     /// modifier name -> the parts of an option list (`f5e9d7df.bf340aab`)
     options: HashMap<u32, Vec<u32>>,
     /// modifier name -> the library part it brings along (`51aab7c1` with
@@ -322,7 +444,7 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
             }
             let m = &m;
             let dump = |h: u32| m.objects(h).into_iter().filter_map(|o| m.object(h, o, 0)).collect::<Vec<_>>();
-            let mut l = Library { colours: HashMap::new(), surfaces: HashMap::new(), wear: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), options: HashMap::new(), refs: HashMap::new(), part_models: HashMap::new(), id: Some(e.id.clone()) };
+            let mut l = Library { colours: HashMap::new(), surfaces: HashMap::new(), wear: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), paint_types: HashMap::new(), coats: coats(m), options: HashMap::new(), refs: HashMap::new(), part_models: HashMap::new(), id: Some(e.id.clone()) };
             for o in dump(OPTION_LIST) {
                 if let Some(n) = num(&o, NAME) {
                     l.options.insert(n as u32, get(&o, OPTION_PARTS).and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()).unwrap_or_default());
@@ -343,7 +465,9 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
                 }
             }
             for o in dump(PART_REF) {
-                if let (Some(n), Some(5), Some(p)) = (num(&o, NAME), o["type"]["tag"].as_u64(), o["data"].as_u64()) {
+                // by member hash: `data` is not among the built-in field names, so
+                // by name these read only with the name dictionary loaded
+                if let (Some(n), Some(5), Some(p)) = (num(&o, NAME), get(&o, REF_TYPE).and_then(|t| t["tag"].as_u64()), num(&o, REF_DATA)) {
                     l.refs.insert(n as u32, p as u32);
                 }
             }
@@ -354,12 +478,17 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
             }
             for b in dump(BIND) {
                 if let (Some(n), Some(gr), Some(ch)) = (num(&b, NAME), num(&b, DEF_GROUP), num(&b, BIND_CHANNEL)) {
-                    l.binds.insert(n as u32, (gr as u32, ch as u32, num(&b, PRIORITY).unwrap_or(0), flag(&b, FLAG_COLOUR), flag(&b, FLAG_SURFACE)));
+                    l.binds.insert(n as u32, (gr as u32, ch as u32, num(&b, PRIORITY).unwrap_or(0), flag(&b, FLAG_COLOUR), flag(&b, FLAG_SURFACE), flag(&b, PAINT_TYPE_COAT)));
                 }
             }
             for a in dump(ASSIGN) {
                 if let (Some(n), Some(ch)) = (num(&a, NAME), num(&a, ASSIGN_CHANNEL)) {
-                    l.assigns.insert(n as u32, (ch as u32, num(&a, ASSIGN_COLOUR).unwrap_or(0) as u32, num(&a, FLAG_SURFACE).unwrap_or(0) as u32));
+                    l.assigns.insert(n as u32, (ch as u32, num(&a, ASSIGN_COLOUR).unwrap_or(0) as u32, num(&a, FLAG_SURFACE).unwrap_or(0) as u32, num(&a, ASSIGN_COAT).unwrap_or(0) as u32));
+                }
+            }
+            for t in dump(PAINT_TYPE) {
+                if let (Some(n), Some(ch), Some(c)) = (num(&t, NAME), num(&t, ASSIGN_CHANNEL), num(&t, PAINT_TYPE_COAT)) {
+                    l.paint_types.insert(n as u32, (ch as u32, c as u32));
                 }
             }
             let fits: HashMap<u32, f32> = dump(WHEEL_FIT)
@@ -456,7 +585,8 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
                         let rough = rec.and_then(|r| lib.rough.get(r)).copied().unwrap_or([0.5, 0.5]);
                         let metal = rec.and_then(|r| lib.metal.get(r)).copied().unwrap_or([0.0, 0.0]);
                         let (wear_row, wear_rough, wear_metal) = lib.wear_of(surface);
-                        Part { colour, surface, row, mode, rgb, rough, metal, wear_row, wear_rough, wear_metal }
+                        let coat = num(c, ENTRY_COAT).unwrap_or(0) as u32;
+                        Part { colour, surface, row, mode, rgb, rough, metal, wear_row, wear_rough, wear_metal, coat }
                     })
                     .collect();
                 sets.push((name.to_string(), parts));
@@ -512,7 +642,7 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
             }
         }
     }
-    let mut t = Tables { format: FORMAT, library: lib.id.clone(), rim_ratio: lib.rim_ratio.clone(), ..Default::default() };
+    let mut t = Tables { format: FORMAT, library: lib.id.clone(), rim_ratio: lib.rim_ratio.clone(), coats: lib.coats.iter().map(|(n, c)| (format!("{n:08x}"), *c)).collect(), ..Default::default() };
     for (sets, _, _, _, _) in &found {
         for (n, p) in sets {
             t.sets.insert(n.clone(), p.clone());
@@ -576,8 +706,17 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
                     }
                 }
             }
-            let most = results.iter().map(|r| r.1.len()).max().unwrap_or(0);
-            let best = results.iter().position(|r| r.1.len() == most);
+            // The most common result counts configurations by their colours
+            // and surfaces alone (paint types split them further); of the
+            // results with those, the one most configurations give.
+            let plain = |r: &[Part]| r.iter().map(|p| Part { coat: 0, ..*p }).collect::<Vec<_>>();
+            let plains: Vec<Vec<Part>> = results.iter().map(|r| plain(&r.0)).collect();
+            let shared = |i: usize| results.iter().zip(&plains).filter(|(_, p)| **p == plains[i]).map(|(r, _)| r.1.len()).sum::<usize>();
+            let most = (0..results.len()).map(shared).max().unwrap_or(0);
+            let group = (0..results.len()).find(|i| shared(*i) == most);
+            let in_group = |i: usize| group.is_some_and(|g| plains[i] == plains[g]);
+            let most = (0..results.len()).filter(|i| in_group(*i)).map(|i| results[i].1.len()).max().unwrap_or(0);
+            let best = (0..results.len()).find(|i| in_group(*i) && results[*i].1.len() == most);
             // What one more of the vehicle's own parts changes when it is
             // fitted on top of the usual configuration: a part's modifier
             // list can define a group of part ids (a kit's panels) that the
@@ -659,11 +798,14 @@ fn apply_config(lib: &Library, own: &HashMap<u32, Vec<u32>>, parts: &[u32], set:
         collect(lib, own, p, 0, &mut mods);
     }
     let local: HashMap<u32, &Vec<u8>> = mods.iter().filter_map(|m| lib.group_defs.get(m)).map(|(g, ids)| (*g, ids)).collect();
-    let channel: HashMap<u32, (u32, u32)> = mods.iter().filter_map(|m| lib.assigns.get(m)).map(|&(ch, c, s)| (ch, (c, s))).collect();
-    let mut binds: Vec<&(u32, u32, i64, bool, bool)> = mods.iter().filter_map(|m| lib.binds.get(m)).collect();
+    let channel: HashMap<u32, (u32, u32)> = mods.iter().filter_map(|m| lib.assigns.get(m)).map(|&(ch, c, s, _)| (ch, (c, s))).collect();
+    // a channel's coat: its paint type modifier, else its assignment's default
+    let mut coats: HashMap<u32, u32> = mods.iter().filter_map(|m| lib.assigns.get(m)).filter(|a| a.3 != 0).map(|a| (a.0, a.3)).collect();
+    coats.extend(mods.iter().filter_map(|m| lib.paint_types.get(m)).filter(|t| t.1 != 0).copied());
+    let mut binds: Vec<&(u32, u32, i64, bool, bool, bool)> = mods.iter().filter_map(|m| lib.binds.get(m)).collect();
     binds.sort_by_key(|b| b.2);
     let mut changed = vec![false; set.len()];
-    for &&(group, ch, _, colour, surface) in &binds {
+    for &&(group, ch, _, colour, surface, coat) in &binds {
         if ch == TYRE_COLOUR_CHANNEL {
             continue;
         }
@@ -682,6 +824,9 @@ fn apply_config(lib: &Library, own: &HashMap<u32, Vec<u32>>, parts: &[u32], set:
                     (p.surface, p.rough, p.metal) = (s, *r, lib.metal.get(rec).copied().unwrap_or([0.0, 0.0]));
                     (p.wear_row, p.wear_rough, p.wear_metal) = lib.wear_of(s);
                 }
+            }
+            if let Some(k) = coats.get(&ch).filter(|k| coat && lib.coats.contains_key(k)) {
+                p.coat = *k;
             }
             changed[i as usize] |= *p != before;
         }
@@ -817,6 +962,13 @@ impl Tables {
         let looks: Vec<Value> = names.iter().map(|n| hex(n).map_or(Value::Null, Value::String)).collect();
         let rows: Vec<Value> = names.iter().map(|n| self.sets.get(*n).map_or(Value::Null, |p| Value::String(row_table(p)))).collect();
         let wear: Vec<Value> = names.iter().map(|n| self.sets.get(*n).map_or(Value::Null, |p| Value::String(wear_table(p, mat)))).collect();
+        // the coat records the looks use, and per look the index of each part id's
+        let mut used: Vec<u32> = names.iter().filter_map(|n| self.sets.get(*n)).flatten().map(|p| p.coat).filter(|c| self.coats.contains_key(&format!("{c:08x}"))).collect();
+        used.sort();
+        used.dedup();
+        let coats: Vec<Value> = names.iter().map(|n| self.sets.get(*n).map_or(Value::Null, |p| Value::String(coat_table(p, &used)))).collect();
+        let paint_coats: Vec<Value> = names.iter().map(|n| self.sets.get(*n).and_then(|p| paint_coat(p, &[1; 256])).and_then(|c| used.iter().position(|u| *u == c)).map_or(Value::Null, Value::from)).collect();
+        let coat_records: Vec<Value> = used.iter().map(|c| self.coat_json(*c)).collect();
         let index = |n: &String| names.iter().position(|x| *x == n);
         // what fitting one more part changes, as look entries
         let patches: serde_json::Map<String, Value> = self
@@ -839,10 +991,45 @@ impl Tables {
             "part_patches": patches,
             "rows": rows,
             "wear": wear,
+            "coats": coats,
+            "paint_coats": paint_coats,
+            "coat_records": coat_records,
             "configs": by_config.iter().filter_map(|(k, n)| Some((k.clone(), Value::from(index(n)?)))).collect::<serde_json::Map<String, Value>>(),
             "default": index(default),
         })
     }
+}
+
+impl Tables {
+    /// A coat record as JSON: its name (8 hex digits) and fields; Null when
+    /// the library has none of that name.
+    pub fn coat_json(&self, name: u32) -> Value {
+        let key = format!("{name:08x}");
+        let Some(mut v) = self.coats.get(&key).and_then(|c| serde_json::to_value(c).ok()) else { return Value::Null };
+        v["name"] = Value::String(key);
+        v
+    }
+}
+
+/// The coat of a vehicle's body paint: the coat record most of its
+/// primary-paint parts name, weighted by `counts` (vertices per part id).
+/// None when no counted part is primary paint or none names a coat.
+pub fn paint_coat(parts: &[Part], counts: &[u64; 256]) -> Option<u32> {
+    let mut n: Vec<(u32, u64)> = Vec::new();
+    for (p, c) in parts.iter().zip(counts).filter(|(p, c)| p.is_primary() && p.coat != 0 && **c > 0) {
+        match n.iter_mut().find(|x| x.0 == p.coat) {
+            Some(x) => x.1 += *c,
+            None => n.push((p.coat, *c)),
+        }
+    }
+    // the first seen wins a tie
+    n.iter().rev().max_by_key(|x| x.1).map(|x| x.0)
+}
+
+/// The coat of each of the 256 part ids, 2 hex digits each: the index into
+/// `used` (coat record names), `ff` for a part whose coat is not among them.
+pub fn coat_table(parts: &[Part], used: &[u32]) -> String {
+    (0..256).map(|i| format!("{:02x}", parts.get(i).and_then(|p| used.iter().position(|u| *u == p.coat)).filter(|k| *k < 255).unwrap_or(255))).collect()
 }
 
 /// The palette row of each of the 256 part ids, 4 hex digits each: slice x
@@ -936,6 +1123,180 @@ mod tests {
             pal[at(3, 5, x)] = [x as u8 * 2, 0, 0, 255];
         }
         assert!(ramp(&pal, 3, 5, 0.1)[0] < ramp(&pal, 3, 5, 0.9)[0]);
+    }
+
+    /// A meta resource with one struct (`members`: hash, offset, type) of
+    /// `size` bytes and one block holding `objects`.
+    fn meta_resource(hash: u32, size: usize, members: &[(u32, u32, u8)], objects: &[Vec<u8>]) -> Resource {
+        let mut sys = vec![0u8; 0x200];
+        sys[0x10..0x15].copy_from_slice(b"0DRPz");
+        let (st, mem, it, data) = (0x60usize, 0x80usize, 0x1e0usize, 0x200usize);
+        let ptr = |o: usize| 0x5000_0000u64 + o as u64;
+        sys[0x28..0x30].copy_from_slice(&ptr(st).to_le_bytes());
+        sys[0x38..0x40].copy_from_slice(&ptr(it).to_le_bytes());
+        sys[0x48..0x4a].copy_from_slice(&1u16.to_le_bytes());
+        sys[0x4c..0x4e].copy_from_slice(&1u16.to_le_bytes());
+        sys[st..st + 4].copy_from_slice(&hash.to_le_bytes());
+        sys[st + 0x10..st + 0x18].copy_from_slice(&ptr(mem).to_le_bytes());
+        sys[st + 0x18..st + 0x1c].copy_from_slice(&(size as u32).to_le_bytes());
+        sys[st + 0x1e..st + 0x20].copy_from_slice(&(members.len() as u16).to_le_bytes());
+        assert!(mem + 16 * members.len() <= it);
+        for (k, (h, off, ty)) in members.iter().enumerate() {
+            let m = mem + 16 * k;
+            sys[m..m + 4].copy_from_slice(&h.to_le_bytes());
+            sys[m + 4..m + 8].copy_from_slice(&off.to_le_bytes());
+            sys[m + 8] = *ty;
+        }
+        sys[it..it + 4].copy_from_slice(&hash.to_le_bytes());
+        sys[it + 4..it + 8].copy_from_slice(&((size * objects.len()) as u32).to_le_bytes());
+        sys[it + 8..it + 16].copy_from_slice(&ptr(data).to_le_bytes());
+        for o in objects {
+            assert_eq!(o.len(), size);
+            sys.extend_from_slice(o);
+        }
+        Resource { sys, gfx: Vec::new(), gfx_base: 0 }
+    }
+
+    /// The members of the library's coat struct, as stored (data.rpf).
+    const COAT_MEMBERS: &[(u32, u32, u8)] = &[
+        (0xe6e1_7f14, 8, 0x4a),
+        (0x4953_63e4, 12, 0x01),
+        (0xd926_02db, 14, 0x20),
+        (0xf6d2_a18e, 16, 0x01),
+        (0xf031_0a8b, 18, 0x20),
+        (0xc5cb_49ba, 20, 0x20),
+        (0x61e8_2f14, 22, 0x01),
+        (0xb97f_4910, 23, 0x01),
+        (0xe57c_6a65, 24, 0x01),
+        (0xdf5b_7432, 26, 0x20),
+        (0xef79_abb2, 28, 0x20),
+        (0xa17a_dbe1, 30, 0x20),
+        (0x4bd9_d63e, 32, 0x01),
+        (0xc920_19cc, 36, 0x21),
+        (0x9851_c9f1, 40, 0x21),
+        (0xc8d4_8032, 44, 0x01),
+        (0x5f4a_a231, 46, 0x20),
+        (0x85d1_88cc, 48, 0x20),
+        (0x210d_19b3, 50, 0x20),
+        (0x469c_3c58, 52, 0x20),
+        (0x850e_331c, 54, 0x20),
+    ];
+    const COAT_NAME_OFF: usize = 8;
+
+    #[test]
+    fn coat_records_read_by_member() {
+        // two records with the bytes of the library's `metallic` and of one
+        // of its film paints
+        let rec = |name: u32, f: &dyn Fn(&mut Vec<u8>)| {
+            let mut b = vec![0u8; 56];
+            b[COAT_NAME_OFF..COAT_NAME_OFF + 4].copy_from_slice(&name.to_le_bytes());
+            f(&mut b);
+            b
+        };
+        let off = |h: u32| COAT_MEMBERS.iter().find(|m| m.0 == h).unwrap().1 as usize;
+        let half = |b: &mut Vec<u8>, h: u32, bits: u16| b[off(h)..off(h) + 2].copy_from_slice(&bits.to_le_bytes());
+        let metallic = rec(0x8369_7767, &|b| {
+            b[off(0xf6d2_a18e)] = 1; // useClearCoat
+            half(b, 0xf031_0a8b, 0x3c00); // clearCoatIntensity 1.0
+            b[off(0x61e8_2f14)] = 1; // useSpecularColor
+            b[off(0xe57c_6a65)] = 1; // useFlakes
+            half(b, 0xdf5b_7432, 0x3c00); // flakeCoverage 1.0
+            half(b, 0xa17a_dbe1, 0x26e9); // flakeOrientation 0.027
+            b[off(0x4bd9_d63e)] = 1;
+            b[off(0xc920_19cc)..off(0xc920_19cc) + 4].copy_from_slice(&0.4f32.to_le_bytes());
+            half(b, 0x5f4a_a231, 0x3c00); // filmIOR 1.0
+            half(b, 0x469c_3c58, 0x3c00); // sheenFade 1.0
+        });
+        let film = rec(0x6b0a_629f, &|b| {
+            half(b, 0x5f4a_a231, 0x4098); // filmIOR 2.297
+            half(b, 0x85d1_88cc, 0x3800); // filmThickness 0.5
+            b[off(0x4953_63e4)] = 1; // useAnisotropy
+            half(b, 0xd926_02db, 0x3866); // anisotropyIntensity 0.5498
+        });
+        // the library's own bytes of `metallic` build the same record
+        let stored: Vec<u8> = (0..56).map(|i| u8::from_str_radix(&"000000000000000067776983000000000100003c000001000100003c0000e92601000000cdcccc3e000000000000003c00000000003c0000"[2 * i..2 * i + 2], 16).unwrap()).collect();
+        assert_eq!(stored, metallic);
+        let r = meta_resource(COAT, 56, COAT_MEMBERS, &[metallic, film]);
+        let m = Meta::parse(&r).unwrap();
+        let c = coats(&m);
+        assert_eq!(c.len(), 2);
+        let a = c[&0x8369_7767];
+        assert!(a.use_clear_coat && a.use_flakes && a.use_specular_color && a.override_base_coat_roughness);
+        assert!(!a.use_anisotropy && !a.use_emissive && !a.flag_b97f4910);
+        assert_eq!((a.clear_coat_intensity, a.clear_coat_roughness, a.flake_coverage, a.film_ior, a.sheen_fade), (1.0, 0.0, 1.0, 1.0, 1.0));
+        assert!((a.flake_orientation - 0.027).abs() < 1e-4 && a.base_coat_roughness == 0.4);
+        let b = c[&0x6b0a_629f];
+        assert!(b.use_anisotropy && !b.use_clear_coat);
+        assert!((b.film_ior - 2.2969).abs() < 1e-3 && b.film_thickness == 0.5 && (b.anisotropy_intensity - 0.5498).abs() < 1e-3);
+        // a library without the struct, and a struct without the members
+        assert!(coats(&Meta::parse(&meta_resource(0x1234_5678, 8, &[(NAME, 0, 0x4a)], &[vec![0; 8]])).unwrap()).is_empty());
+        let bare = meta_resource(COAT, 8, &[(NAME, 4, 0x4a)], &[vec![0, 0, 0, 0, 7, 0, 0, 0]]);
+        assert_eq!(coats(&Meta::parse(&bare).unwrap())[&7], Coat::default());
+    }
+
+    #[test]
+    fn half_floats() {
+        assert_eq!(meta7a::half(0x3c00), 1.0);
+        assert_eq!(meta7a::half(0xbc00), -1.0);
+        assert_eq!(meta7a::half(0x3800), 0.5);
+        assert_eq!(meta7a::half(0), 0.0);
+        assert!((meta7a::half(0x2e66) - 0.1).abs() < 1e-4);
+    }
+
+    #[test]
+    fn coats_follow_the_paint_type_of_a_channel() {
+        let mut lib = Library { colours: HashMap::new(), surfaces: HashMap::new(), wear: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), paint_types: HashMap::new(), coats: HashMap::new(), options: HashMap::new(), refs: HashMap::new(), part_models: HashMap::new(), id: None };
+        for k in [0xa1, 0xa2, 0xa3] {
+            lib.coats.insert(k, Coat::default());
+        }
+        lib.groups.insert(0x10, vec![1, 2]);
+        lib.groups.insert(0x11, vec![3]);
+        lib.groups.insert(0x12, vec![4]);
+        // modifiers: bindings (group, channel, priority, colour, surface, coat)
+        lib.binds.insert(1, (0x10, PAINT_CHANNEL, 1, true, false, true));
+        lib.binds.insert(2, (0x11, 0x77, 1, false, false, true));
+        lib.binds.insert(3, (0x12, PAINT_CHANNEL, 1, true, false, false));
+        // channel 0x77: a default from its assignment; the paint channel: a paint type
+        lib.assigns.insert(4, (0x77, 0, 0, 0xa2));
+        lib.assigns.insert(5, (PAINT_CHANNEL, 0, 0, 0xa3));
+        lib.paint_types.insert(6, (PAINT_CHANNEL, 0xa1));
+        lib.mods.insert(100, vec![1, 2, 3, 4, 5]);
+        lib.mods.insert(101, vec![6]);
+        let mut set = vec![Part { coat: DEFAULT_COAT, ..Default::default() }; 256];
+        apply_config(&lib, &HashMap::new(), &[100], &mut set);
+        // without a paint type part the assignment's default applies
+        assert_eq!((set[1].coat, set[3].coat, set[4].coat, set[0].coat), (0xa3, 0xa2, DEFAULT_COAT, DEFAULT_COAT));
+        let mut set = vec![Part { coat: DEFAULT_COAT, ..Default::default() }; 256];
+        apply_config(&lib, &HashMap::new(), &[100, 101], &mut set);
+        // the paint type wins; a binding without the flag leaves the coat
+        assert_eq!((set[1].coat, set[2].coat, set[3].coat, set[4].coat), (0xa1, 0xa1, 0xa2, DEFAULT_COAT));
+        // a coat name the library does not have is not applied
+        lib.paint_types.insert(6, (PAINT_CHANNEL, 0xdead));
+        let mut set = vec![Part { coat: DEFAULT_COAT, ..Default::default() }; 256];
+        apply_config(&lib, &HashMap::new(), &[100, 101], &mut set);
+        assert_eq!(set[1].coat, DEFAULT_COAT);
+    }
+
+    #[test]
+    fn paint_coat_and_tables() {
+        let mut parts = vec![Part { coat: 0xa1, ..Default::default() }; 256];
+        parts[1] = Part { colour: PRIMARY_PAINT, coat: 0xa2, ..Default::default() };
+        parts[2] = Part { colour: PRIMARY_PAINT, coat: 0xa3, ..Default::default() };
+        parts[3] = Part { colour: PRIMARY_PAINT, coat: 0xa3, ..Default::default() };
+        let mut counts = [0u64; 256];
+        assert_eq!(paint_coat(&parts, &counts), None);
+        (counts[1], counts[2], counts[3]) = (10, 4, 5);
+        assert_eq!(paint_coat(&parts, &counts), Some(0xa2));
+        counts[3] = 7;
+        assert_eq!(paint_coat(&parts, &counts), Some(0xa3));
+        let t = coat_table(&parts, &[0xa2, 0xa3]);
+        assert_eq!(t.len(), 512);
+        assert_eq!(&t[..8], "ff000101");
+        let mut tables = Tables::default();
+        tables.coats.insert("000000a2".into(), Coat { use_flakes: true, flake_size: 0.5, ..Default::default() });
+        let j = tables.coat_json(0xa2);
+        assert_eq!((j["name"].as_str(), j["use_flakes"].as_bool(), j["flake_size"].as_f64()), (Some("000000a2"), Some(true), Some(0.5)));
+        assert!(tables.coat_json(0xa3).is_null());
     }
 
     #[test]
