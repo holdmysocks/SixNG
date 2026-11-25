@@ -822,7 +822,24 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             let sky_h = mix(neutral(F.sky_hor.rgb, 0.8) * 0.6, neutral(F.sky_top.rgb, 0.8), up_h) * F.misc.w;
             // o = profile4 / 15 x openness (profile4: the ramp's profile value in 15 steps)
             let o_h = select(1.0, round(15.0 * clamp(i.uv1.x, 0.0, 1.0)) / 15.0, ramped) * strand_openness(i.clip);
-            let amb_g = sky_h * albedo * hair_ambient(tdir, v, g0h, o_h) + sky_h * 0.012;
+            // the reflection part of the game's hair ambient (read from its hair program, medium confidence):
+            // its reflection buffer x Fenv x an energy term, Fenv = (0.3 + 1.4 o) x a roughness factor x the
+            // environment table's Fresnel; the diffuse part keeps 1 - Fenv. Stand-ins here: the viewer's sky along
+            // the reflection about the tube normal for the game's traced reflection buffer, a published fit for
+            // its environment table, and a reflectance scale of 1.
+            let m_h = max(0.001, (1.0 - g0h) * (1.0 - g0h));
+            let nv_h = max(abs(dot(v, tube)), 0.0001);
+            let rg_h = 1.0 - g0h;
+            let c4 = vec4(-1.0, -0.0275, -0.572, 0.022) * rg_h + vec4(1.0, 0.0425, 1.04, -0.04);
+            let a004 = min(c4.x * c4.x, exp2(-9.28 * nv_h)) * c4.x + c4.y;
+            let e_ab = vec2(-1.04, 1.04) * a004 + c4.zw;
+            let e_r = max(e_ab.y, 0.0);
+            let e_g = max(e_ab.x + e_ab.y, 0.001);
+            let f0_h = 0.046461;
+            let fenv = clamp((0.3 + 1.4 * o_h) * mix(0.55 + 0.65 * m_h, 1.4 + 0.16 * m_h, m_h) * (e_r * (1.0 - f0_h) + e_g * f0_h), 0.0, 1.0);
+            let refl_h = mix(sky(reflect(-v, tube)), (F.sky_top.rgb + F.sky_hor.rgb) * 0.5, clamp(rg_h, 0.0, 1.0)) * F.misc.w;
+            let spec_g = refl_h * fenv * (1.0 + (1.0 / e_g - 1.0) * f0_h);
+            let amb_g = sky_h * albedo * hair_ambient(tdir, v, g0h, o_h) * (1.0 - fenv) + spec_g;
             // the game multiplies its light sum by the light's shadow (1 here without the sun shadow map)
             col = direct_h * sh * ao_direct + amb_g * ao;
             // a set with UseStandardBsdf (uv1.y = 2 + reflectance scale; nearly all hair and fur): the game
