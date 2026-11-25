@@ -4226,7 +4226,7 @@ impl ModelView {
         if self.part_ramp_done.is_some() && self.loaded.as_ref().is_some_and(|l| l.model.materials.iter().any(|m| m.ramp.is_some() && m.ramp_u.is_some())) {
             if self.look.wear_levels {
                 ui.checkbox(&mut self.look.wear_from_config, "wear from the configuration")
-                    .on_hover_text("Each part shows as much wear as the vehicle's configuration gives it: its wear level (0 new to 5 worn out) picks a wear preset, whose age range (minWear to maxWear) sets the amount (the middle of the range; a preset without a range takes the average of its level). Where on the part it shows is still taken from the blue channel of the parts' detail texture, which is a guess; the game's own wear mask is not read.");
+                    .on_hover_text("Each part shows as much wear as the vehicle's configuration gives it: its wear level (0 new to 5 worn out) picks a wear preset, whose age range (minWear to maxWear) sets the amount (the middle of the range; a preset without a range takes the average of its level). Where it shows: in patches of the game's tiling wear mask (the green channel above a threshold that falls as the amount rises) on parts whose material names one, else the blue channel of the parts' detail texture. How the game windows the mask's three channels is not decoded, so the patches are a stand-in.");
             }
             if !(self.look.wear_levels && self.look.wear_from_config) {
                 ui.add(egui::Slider::new(&mut self.look.wear, 0.0..=1.0).text("wear"))

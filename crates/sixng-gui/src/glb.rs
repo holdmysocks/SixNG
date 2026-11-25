@@ -97,6 +97,9 @@ pub struct Material {
     /// Vehicle parts: the palette row of each part id as an image (128
     /// columns, row = part id), set by the viewer for the look shown.
     pub ramp: Option<usize>,
+    /// Vehicle parts: the game's tiling wear mask (material parameter
+    /// `b9f4bdac`, three grunge channels), where the second layer shows.
+    pub wear_mask: Option<usize>,
     /// Vehicle parts coloured per vertex (COLOR_0; alpha 254 = the primary
     /// body paint, other values = metalness in four steps x 50 + roughness in 50 steps).
     pub parts: bool,
@@ -846,6 +849,11 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                 .and_then(|t| t["png"].as_str())
                 .and_then(|p| add_img(out_root.join(p), false, &mut images)),
             ramp: None,
+            wear_mask: (ex["classification"]["stand_in"] == "parts" && !opts.base_only)
+                .then(|| tex_list.iter().find(|t| t["param_hash"] == "b9f4bdac" && t["status"].as_str().is_some_and(|s| s.starts_with("ok")) && t["width"].as_u64().is_some_and(|w| w >= 32)))
+                .flatten()
+                .and_then(|t| t["png"].as_str())
+                .and_then(|p| add_img(out_root.join(p), false, &mut images)),
             parts: ex["classification"]["stand_in"] == "parts",
             occlusion_only,
             emissive_scale,
