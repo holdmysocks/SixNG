@@ -405,7 +405,9 @@ fn node_model(
                 tan: [1.0, 0.0, 0.0, 1.0],
                 uv0: [u, v],
                 uv1: [0.0, 0.0],
-                col: [255, 255, 255, 255],
+                // alpha 0: a cell with no height (the map's water and
+                // no-data cells), whose painted water the shader draws as water
+                col: [255, 255, 255, if raw.is_nan() { 0 } else { 255 }],
                 joints: [0; 4],
                 weights: [0; 4],
                 tint: [255; 4],

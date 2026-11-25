@@ -230,9 +230,6 @@ const WAVES: u32 = 10u;
 const SEA_MIN_ROUGH: f32 = 0.06;
 // the baked map tiles' water colour (mapbake, 40 80 140 sRGB), linear
 const TILE_SEA: vec3<f32> = vec3(0.021, 0.080, 0.262);
-// highest terrain (map y, m) whose painted water is drawn as water: the
-// terrain is sunk 1.5 m, so this is about 0.5 m above sea level
-const TILE_WET_TOP: f32 = -1.0;
 // share of the sea's slope variance drawn as waves (the rest is roughness)
 const WAVE_SHARE: f32 = 0.6;
 
@@ -936,12 +933,11 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
             // down to a ground's reflectance, half of the slope shading kept
             col = albedo * TILE_ALBEDO * (sun_e(i.world) * (0.5 + 0.5 * ndl) / 3.14159 + amb_d);
             // the tiles' painted water (the map's water and no-data colour)
-            // is shaded as the game's water where the terrain lies at sea
-            // level (its no-data cells and low shores); higher up the same
-            // paint marks wet sand and land, which stay ground
+            // is shaded as the game's water on cells with no height (vertex
+            // alpha 0, blending over a cell at the shore); on cells with a
+            // height the same paint marks wet sand and land, which stay ground
             let painted = 1.0 - smoothstep(0.02, 0.07, length(base.rgb - TILE_SEA));
-            let low = 1.0 - smoothstep(TILE_WET_TOP - 1.0, TILE_WET_TOP, i.world.y);
-            let wet = painted * low;
+            let wet = painted * (1.0 - i.col.a);
             if (wet > 0.0) {
                 col = mix(col, water_shade(i.world, fp), wet);
             }
