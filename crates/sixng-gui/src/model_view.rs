@@ -316,11 +316,15 @@ pub struct HairPick {
     pub slot: String,
     /// The placeholder the grooms were placed under.
     pub placeholder: String,
-    /// Model probability of the placement (0..1); under 0.5 it is a guess
-    /// and starts hidden.
+    /// 1 for a link read from the game. For an inferred one the model
+    /// probability of the placement (0..1); under 0.5 it is a guess and
+    /// starts hidden.
     pub confidence: f32,
+    /// The link was read from the game (`HairLinks::exact`), not inferred.
+    pub exact: bool,
     pub grooms: Vec<u64>,
-    /// Pieces left out because their strand roots do not lie on this head.
+    /// Pieces of an inferred link left out because their strand roots do
+    /// not lie on this head.
     pub off_head: usize,
     /// Shown when the character loads: confidence of 50 % or more, or 20 %
     /// or more with every piece rooted on this head.
@@ -452,6 +456,11 @@ pub struct ModelView {
     pub cam: Camera,
     pub look: Look,
     pub tod: f32,
+    /// Weather type id for the game's lighting (`sixng_core::daylight`);
+    /// empty = the viewer's own light set-up.
+    pub weather: String,
+    /// The game's lighting for `weather` has been applied to `look`.
+    daylight_applied: bool,
     pub show_skeleton: bool,
     pub show_normals: bool,
     /// Depth-bias decal-bucket materials (off = raw z-fighting, for comparison).
@@ -840,6 +849,8 @@ impl ModelView {
             cam: Camera::default(),
             look: Look::default(),
             tod: 13.0,
+            weather: String::new(),
+            daylight_applied: false,
             show_skeleton: false,
             show_normals: false,
             decal_bias: true,
@@ -1807,14 +1818,14 @@ impl ModelView {
             for h in &look.hair {
                 let mut on = !h.grooms.is_empty() && h.grooms.iter().all(|g| self.hair.selected.contains(g));
                 let name = h.placeholder.trim_end_matches("_full");
-                let mut text = format!("{}: {name} ({:.0} %)", h.slot, h.confidence * 100.0);
+                let mut text = if h.exact { format!("{}: {name}", h.slot) } else { format!("{}: {name} ({:.0} %)", h.slot, h.confidence * 100.0) };
                 if h.off_head > 0 {
                     text += &format!(", {} piece(s) not on this head left out", h.off_head);
                 }
                 if h.colour.is_some() {
                     text += ", stored colour";
                 }
-                if ui.checkbox(&mut on, text).on_hover_text("The strand grooms placed for this hair asset. Nothing in the game files links a hair asset to its strand files; they are placed by name words, archive order, piece counts and where the strand roots lie. The percentage is that model's probability of this placement. Shown at the start: 50 % or more, or 20 % or more when every piece is rooted on this head (a probable style, not a certain one). Pieces whose strand roots do not lie on this head are left out.").changed() {
+                if ui.checkbox(&mut on, text).on_hover_text(if h.exact { "The strand grooms of this hair asset, read from the game: the asset lists its pieces by the ids of their files." } else { "The strand grooms placed for this hair asset. The game's own link could not be read here (it needs the archive's table of contents), so they are placed by name words, archive order, piece counts and where the strand roots lie. The percentage is that model's probability of this placement. Shown at the start: 50 % or more, or 20 % or more when every piece is rooted on this head (a probable style, not a certain one). Pieces whose strand roots do not lie on this head are left out." }).changed() {
                     self.hair.selected.retain(|g| !h.grooms.contains(g));
                     if on {
                         self.hair.selected.extend(h.grooms.iter().copied());
@@ -3565,6 +3576,14 @@ impl ModelView {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, render_state: Option<&egui_wgpu::RenderState>) {
+        if !self.weather.is_empty() && !self.daylight_applied {
+            // the weather's table arrives in the background
+            match daylight_table(&self.game, &self.work, true) {
+                DaylightState::Ready(_) => self.apply_light(),
+                DaylightState::Loading => ui.ctx().request_repaint_after(std::time::Duration::from_millis(200)),
+                DaylightState::Failed(_) => {}
+            }
+        }
         let ctx = ui.ctx().clone();
         let Some(rs) = render_state else {
             ui.label("The model viewer needs the wgpu renderer.");
@@ -4006,6 +4025,74 @@ impl ModelView {
         self.caps.as_ref().unwrap().2
     }
 
+    /// Weather choice for the game's time-of-day lighting. Returns true when
+    /// the light should be set again (weather picked, or the table arrived).
+    fn weather_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        let state = daylight_table(&self.game, &self.work, !self.weather.is_empty());
+        let label = |id: &str| {
+            sixng_core::daylight::WEATHERS.iter().find(|w| w.0 == id).map(|w| w.2).unwrap_or("viewer default")
+        };
+        let mut changed = false;
+        egui::ComboBox::from_label("weather")
+            .selected_text(label(&self.weather))
+            .show_ui(ui, |ui| {
+                changed |= ui.selectable_value(&mut self.weather, String::new(), "viewer default").on_hover_text("The viewer's own fixed light set-up").changed();
+                for (id, _, l) in sixng_core::daylight::WEATHERS {
+                    changed |= ui.selectable_value(&mut self.weather, id.to_string(), l).changed();
+                }
+            })
+            .response
+            .on_hover_text("Light the model as the game does for this weather at the chosen hour: sun or moon direction, sun colour and strength, sky tint and ambient from the game's timecycle (needs common.rpf indexed)");
+        if self.weather.is_empty() {
+            return changed;
+        }
+        match state {
+            DaylightState::Loading => {
+                ui.label("reading the game's timecycle…");
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                self.daylight_applied = false;
+            }
+            DaylightState::Failed(e) => {
+                ui.colored_label(egui::Color32::from_rgb(220, 140, 60), format!("no timecycle data, viewer light kept: {e}"));
+            }
+            DaylightState::Ready(t) => {
+                if let Some(w) = t.weather(&self.weather) {
+                    let l = sixng_core::daylight::light(&t, w, self.tod);
+                    ui.label(format!(
+                        "{} {:.0}°, light ×{:.2} (cycle ×{:.2}), ambient ×{:.2} (cycle ×{:.2}), clouds {:.0}%",
+                        if l.moon { "moon" } else { "sun" },
+                        if l.moon { l.dir[1].asin().to_degrees() } else { l.sun_elev },
+                        l.dir_strength,
+                        l.light_dir_mult,
+                        l.ambient,
+                        l.ambient_sky_intensity,
+                        l.cloud_cover * 100.0
+                    ));
+                }
+                if !self.daylight_applied {
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Set the light from the hour and weather (the game's lighting when a
+    /// weather is picked and its table is loaded, else the viewer's own).
+    pub fn apply_light(&mut self) {
+        if !self.weather.is_empty() {
+            if let DaylightState::Ready(t) = daylight_table(&self.game, &self.work, true) {
+                if let Some(w) = t.weather(&self.weather) {
+                    self.look.set_game_light(&sixng_core::daylight::light(&t, w, self.tod));
+                    self.daylight_applied = true;
+                    return;
+                }
+            }
+            self.daylight_applied = false;
+        }
+        self.look.set_time_of_day(self.tod);
+    }
+
     fn side_ui(&mut self, ui: &mut egui::Ui, rs: &egui_wgpu::RenderState) {
         let caps = self.caps();
         let seen = HEAD_SKIN_SEEN.lock().unwrap().clone();
@@ -4082,11 +4169,12 @@ impl ModelView {
         });
         ui.separator();
         ui.heading("Light");
-        if ui
+        let mut relight = ui
             .add(egui::Slider::new(&mut self.tod, 0.0..=24.0).text("time of day (h)"))
-            .changed()
-        {
-            self.look.set_time_of_day(self.tod);
+            .changed();
+        relight |= self.weather_ui(ui);
+        if relight {
+            self.apply_light();
         }
         ui.add(
             egui::Slider::new(&mut self.look.exposure, 0.2..=4.0)
@@ -4908,6 +4996,35 @@ fn sub_material_map(mat: &glb::Material, roots: &[&Path], w: u32, h: u32) -> Opt
         }
     }
     Some(out)
+}
+
+pub(crate) enum DaylightState {
+    Loading,
+    Failed(String),
+    Ready(Arc<sixng_core::daylight::Table>),
+}
+
+/// The game's time-of-day table (`sixng_core::daylight`), loaded or
+/// decoded once in the background when first wanted (`start`).
+pub(crate) fn daylight_table(game: &str, work: &str, start: bool) -> DaylightState {
+    type Slot = Mutex<Option<Result<Arc<sixng_core::daylight::Table>, String>>>;
+    static TABLE: std::sync::OnceLock<Arc<Slot>> = std::sync::OnceLock::new();
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let slot = TABLE.get_or_init(|| Arc::new(Mutex::new(None))).clone();
+    if let Some(r) = slot.lock().unwrap().as_ref() {
+        return match r {
+            Ok(t) => DaylightState::Ready(t.clone()),
+            Err(e) => DaylightState::Failed(e.clone()),
+        };
+    }
+    if start && !STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        let ws = Workspace::new(game, work);
+        std::thread::spawn(move || {
+            let r = sixng_core::daylight::load_or_build(&ws).map(Arc::new).map_err(|e| format!("{e:#}"));
+            *slot.lock().unwrap() = Some(r);
+        });
+    }
+    DaylightState::Loading
 }
 
 /// The layered-material index (`sixng materials`), loaded or built once.
@@ -6030,7 +6147,7 @@ fn load_query_sel(
                                 HairTone { name, preset, noise }
                             });
                             let colour = colour.or(tone.as_ref().map(|t| sixng_core::hairtone::display(t.preset.a)));
-                            info.hair.push(HairPick { slot: slot.clone(), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: t.uncontested(l), off_head: 0, shown: l.confidence >= 0.5 && slot != "body hair", colour, tone });
+                            info.hair.push(HairPick { slot: slot.clone(), placeholder: l.placeholder.clone(), confidence: l.confidence, exact: t.exact, grooms: t.uncontested(l), off_head: 0, shown: l.confidence >= 0.5 && slot != "body hair" && l.part != "body", colour, tone });
                         }
                     }
                     Err(e) => info.notes.push(format!("Strand hair: {e}")),
@@ -6046,7 +6163,7 @@ fn load_query_sel(
                     for l in extra {
                         let slot = sixng_core::pedlook::slot_of(&l.placeholder);
                         if slot == "hair" || slot == "beard" {
-                            info.hair.push(HairPick { slot: format!("other {slot}"), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: t.uncontested(l), off_head: 0, shown: false, colour: None, tone: None });
+                            info.hair.push(HairPick { slot: format!("other {slot}"), placeholder: l.placeholder.clone(), confidence: l.confidence, exact: t.exact, grooms: t.uncontested(l), off_head: 0, shown: false, colour: None, tone: None });
                         }
                     }
                 }
@@ -6088,9 +6205,10 @@ fn load_query_sel(
                 l.hat = Some(Arc::new(sixng_core::groom::Shell::new([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, top - 0.10], &hat, &head)));
                 l.notes.push("Hat: the scalp hair is pressed under the hat's lining (strand points beyond it are pulled in to 3 mm under it), so the hair does not come through the hat; an opening the hat encloses (over a cap's strap) counts as closed. A stand-in, not the game's method: the outfit asks for the plain hair, and no stored rule says how the game keeps it under the hat.".to_string());
             }
-            // Strand roots must lie on this character: pieces that do not
-            // (another head shape, a neighbour's piece) are left out. Only in
-            // the neutral body shape, where the skin is where the grooms expect it.
+            // Strand roots of an inferred link must lie on this character:
+            // pieces that do not (another head shape, a neighbour's piece)
+            // are left out. Only in the neutral body shape, where the skin is
+            // where the grooms expect it. A link read from the game is kept whole.
             if *BODY_SHAPE.lock().unwrap() == (0.0, 0.0) && !l.hair.is_empty() {
                 const CELL: f32 = 0.012;
                 let key = |p: &[f32; 3]| ((p[0] / CELL).floor() as i32, (p[1] / CELL).floor() as i32, (p[2] / CELL).floor() as i32);
@@ -6100,7 +6218,7 @@ fn load_query_sel(
                 let head_cells: std::collections::HashSet<(i32, i32, i32)> = skin.iter().filter(|(n, _)| is_head(n)).flat_map(|(_, pts)| pts.iter().map(key)).collect();
                 let all_cells: std::collections::HashSet<(i32, i32, i32)> = skin.iter().filter(|(n, _)| is_head(n) || n.starts_with("hand_") || n.starts_with("feet_")).flat_map(|(_, pts)| pts.iter().map(key)).collect();
                 if !head_cells.is_empty() {
-                    for h in &mut l.hair {
+                    for h in l.hair.iter_mut().filter(|h| !h.exact) {
                         let cells = if h.slot == "body hair" { &all_cells } else { &head_cells };
                         let all = h.grooms.len();
                         h.grooms.retain(|&off| {

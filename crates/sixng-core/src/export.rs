@@ -3125,7 +3125,7 @@ pub fn export_lights(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: &
                 "falloff_exponent": l.falloff_exponent, "cone": [l.cone_inner, l.cone_outer], "corona_size": l.corona_size,
                 "corona_intensity": l.corona_intensity, "vol_intensity": l.vol_intensity, "flashiness": l.flashiness,
                 "light_fade_distance": l.light_fade_distance, "shadow_fade_distance": l.shadow_fade_distance, "time_flags": l.time_flags,
-                "night_only": l.night_only, "ext_name": format!("{:08x}", s.ext_name), "local": l.position, "v0": l.v0, "fields": l.fields,
+                "night_only": l.night_only, "ext_name": format!("{:08x}", s.ext_name), "local": l.position, "v0": l.v0, "extents": l.extents, "fields": l.fields,
                 "map": map, "entity": ei, "owner": s.owner});
             if let Some((im, ii, _)) = inst {
                 v["interior_map"] = serde_json::json!(im);
@@ -3135,10 +3135,7 @@ pub fn export_lights(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: &
             if let Some(g) = l.fields.get(&crate::meta7a::field_name(0x5812_2c00)).and_then(|x| x.as_u64()).filter(|&g| g != 0) {
                 v["light_group"] = serde_json::json!(format!("{g:08x}"));
             }
-            if l.light_type == 2 {
-                let p = l.fields.get(&crate::meta7a::field_name(0x47d5_d47a)).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
-                v["distant_intensity"] = serde_json::json!(l.intensity * crate::lights::distant_spot_factor(l.cone_inner, l.cone_outer, p));
-            }
+            v["distant_intensity"] = serde_json::json!(crate::lights::distant_intensity(l));
             writeln!(w, "{v}")?;
             placed += 1;
         }
