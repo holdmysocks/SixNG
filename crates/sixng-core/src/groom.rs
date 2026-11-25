@@ -68,6 +68,12 @@ pub struct Groom {
     /// Graphics header +0x60 (two half floats): how much a generated
     /// strand's length varies, and the lowest factor it can get.
     pub length_var: [f32; 2],
+    /// System +0xF8 and +0x104: two style groups of six half floats each
+    /// (bend, fade-in length, noise amplitude, curl radius, noise and curl
+    /// frequency; `hairgen::Style`). The first is applied to the strands
+    /// grown from c0, the second to those grown from c1 (which group feeds
+    /// which population is inferred).
+    pub style: [crate::hairgen::Style; 2],
 }
 
 /// A hat seen from a point inside the head: per direction, the distance to
@@ -316,7 +322,12 @@ pub fn parse(r: &Resource) -> Result<Groom> {
         Some(p) if a3 > 0 => p.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect(),
         _ => Vec::new(),
     };
-    Ok(Groom { strands: s, points_per_strand: k, points, w, roots, lengths, root_uv, bones, root_box, group_box, tri_counts, width, taper, pick_steps, seed: gu32(0x7C), length_var: [f16(gu16(0x60)), f16(gu16(0x62))] })
+    let style_at = |o: usize| {
+        let v = |i: usize| Some(f16(r.u16(o + 2 * i))).filter(|x| x.is_finite() && x.abs() < 1e4).unwrap_or(0.0);
+        crate::hairgen::Style { bend: v(0), fade: v(1), noise: v(2), curl: v(3), noise_freq: v(4), curl_freq: v(5) }
+    };
+    let style = if r.sys.len() >= 0x110 { [style_at(0xF8), style_at(0x104)] } else { Default::default() };
+    Ok(Groom { strands: s, points_per_strand: k, points, w, roots, lengths, root_uv, bones, root_box, group_box, tri_counts, width, taper, pick_steps, seed: gu32(0x7C), length_var: [f16(gu16(0x60)), f16(gu16(0x62))], style })
 }
 
 impl Groom {
@@ -413,10 +424,12 @@ impl Groom {
     /// cut at its own length. `share` of the stored strand count is grown:
     /// the game's own count is a run-time number, and so is the scale of
     /// the density byte (here the densest triangle always takes a strand).
-    /// Clumping and curl belong to other variants of the program and are
-    /// not decoded; a piece that stores only clump strands (c0 = 0
-    /// everywhere) is grown from c1 the same way. Same strands for the
-    /// same groom and share. Empty without B6.
+    /// Noise and curl (`hairgen::apply_style`) follow from the groom's
+    /// style groups, with the root triangle's normal standing in for the
+    /// game's twist vector. Clumping is not decoded; a piece that stores
+    /// only clump strands (c0 = 0 everywhere) is grown from c1 the same
+    /// way, unclumped. Same strands for the same groom and share. Empty
+    /// without B6.
     pub fn coat(&self, share: f32) -> Coat {
         use crate::hairgen;
         let k = self.points_per_strand;
@@ -426,8 +439,10 @@ impl Groom {
         // A piece whose strands are all clump strands (first byte 0 in every
         // triangle, e.g. the top of a short men's cut) would grow nothing:
         // its second count stands in, and the strands grow unclumped.
+        let mut style = self.style[0];
         if density.iter().all(|&d| d == 0) {
             density = self.tri_counts.iter().map(|q| q[1]).collect();
+            style = self.style[1];
         }
         let top = density.iter().copied().max().unwrap_or(0);
         if n == 0 || top == 0 || density.len() != self.roots.len() {
@@ -445,14 +460,17 @@ impl Groom {
             // without stored lengths the strand is not cut
             let len = if self.lengths.len() == self.strands { hairgen::length(mix(&|s| self.lengths[s]), d_len, self.length_var) } else { f32::MAX };
             let steps = [0usize, 1, 2].map(|q| mix(&|s| self.pick_steps.get(s).map_or([64u8, 128, 191][q], |b| b[q]) as f32) / 255.0);
-            c.points.extend(hairgen::grow(k, len, |j| {
+            let mut pts = hairgen::grow(k, len, |j| {
                 let (a, b, d) = (self.points[g[0] + j], self.points[g[1] + j], self.points[g[2] + j]);
                 [a[0] * w[0] + b[0] * w[1] + d[0] * w[2], a[1] * w[0] + b[1] * w[1] + d[1] * w[2], a[2] * w[0] + b[2] * w[1] + d[2] * w[2]]
-            }));
+            });
             let (e1, e2) = (sub(self.points[g[1]], self.points[g[0]]), sub(self.points[g[2]], self.points[g[0]]));
             let nr = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
             let l = (nr[0] * nr[0] + nr[1] * nr[1] + nr[2] * nr[2]).sqrt();
-            c.normals.push(if l > 1e-12 { [nr[0] / l, nr[1] / l, nr[2] / l] } else { [0.0, 0.0, 1.0] });
+            let normal = if l > 1e-12 { [nr[0] / l, nr[1] / l, nr[2] / l] } else { [0.0, 0.0, 1.0] };
+            hairgen::apply_style(&mut pts, &style, seed, d_len, normal);
+            c.points.extend(pts);
+            c.normals.push(normal);
             c.guides.push((t, w));
             c.variants.push(hairgen::variant(d_var, steps));
         }
@@ -505,8 +523,10 @@ impl Groom {
             "stored_strands": self.stored_strands(),
             "strand_width_m": self.width,
             "taper": self.taper,
+            "style": self.style,
+            "style_note": "system +0xF8 and +0x104: bend, fade-in length, noise amplitude, curl radius, noise and curl frequency; the first group for c0 strands, the second for c1 (inferred)",
             "taper_note": "16 width steps from root to tip, each / 255 of the strand width (inferred)",
-            "method": "per root triangle, c0 + c1 strands at random barycentric points; every point of a strand is the same barycentric blend of the three guide strands' points. The game's own placement, clumping, curl and noise are not decoded",
+            "method": "per root triangle, c0 + c1 strands at random barycentric points; every point of a strand is the same barycentric blend of the three guide strands' points. Noise and curl from the groom's style groups (the root triangle normal stands in for the game's twist vector); clumping is not decoded",
         })
     }
 
@@ -558,7 +578,7 @@ impl Groom {
             base_color_uri: None,
             normal_uri: None,
             gltf: serde_json::json!({"doubleSided": true, "pbrMetallicRoughness": {"baseColorFactor": [1.0, 1.0, 1.0, 1.0], "metallicFactor": 0.0, "roughnessFactor": 0.85}}),
-            extras: serde_json::json!({"note": "interpolated coat: the stored per-triangle strand counts, strands blended from the three guides; placement, clumping and curl are not the game's. COLOR_0 = skin colour under the root (a display choice)"}),
+            extras: serde_json::json!({"note": "interpolated coat: the stored per-triangle strand counts, strands blended from the three guides; noise and curl from the style groups; clumping is not the game's. COLOR_0 = skin colour under the root (a display choice)"}),
         };
         crate::gltf::mesh_glb(name, &[crate::gltf::NodeGroup { name: name.to_string(), prims: vec![prim] }], &[mat], &[], extras)
     }
@@ -795,7 +815,7 @@ pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], o
             let mut extras = extras;
             if let Some(c) = &coat {
                 extras["full_strands"] = serde_json::json!({"written": c.guides.len(), "stored": c.stored,
-                    "note": "strands grown between the guides from the stored per-triangle counts (barycentric blend of three guides); the game's placement, clumping, curl and noise are not decoded"});
+                    "note": "strands grown between the guides from the stored per-triangle counts (barycentric blend of three guides); noise and curl follow the style groups; clumping is not decoded"});
             }
             if full.is_some() && crate::atomic::write(dir.join(format!("{:x}.growth.json", e.off)), g.growth_json().to_string()).is_err() {
                 errors.fetch_add(1, Ordering::Relaxed);
@@ -858,6 +878,7 @@ mod tests {
             pick_steps: vec![],
             seed: 0,
             length_var: [0.0, 1.0],
+            style: Default::default(),
         };
         let c = g.coat(1.0);
         assert_eq!(c.guides.len(), 7);
@@ -908,7 +929,7 @@ mod tests {
     }
     #[test]
     fn segments() {
-        let g = Groom { strands: 2, points_per_strand: 3, points: vec![[0.0; 3]; 6], w: vec![0.0; 6], roots: vec![[0, 1, 1]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0] };
+        let g = Groom { strands: 2, points_per_strand: 3, points: vec![[0.0; 3]; 6], w: vec![0.0; 6], roots: vec![[0, 1, 1]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], style: Default::default() };
         assert_eq!(g.segments(), vec![0, 1, 1, 2, 3, 4, 4, 5]);
         assert_eq!(g.root_indices(), vec![0, 3, 3]);
     }
@@ -916,7 +937,7 @@ mod tests {
     fn coat_from_strand_counts() {
         // one root triangle of three 2-point guides, 40 + 10 stored strands
         let pts = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.1], [1.0, 0.0, 0.0], [1.0, 0.0, 0.1], [0.0, 1.0, 0.0], [0.0, 1.0, 0.1]];
-        let g = Groom { strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![[40, 10, 1, 0]], width: 0.0003, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0] };
+        let g = Groom { strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![[40, 10, 1, 0]], width: 0.0003, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], style: Default::default() };
         assert_eq!(g.stored_strands(), 50);
         let c = g.coat(1.0);
         assert_eq!((c.guides.len(), c.points.len(), c.stored), (50, 100, 50));
