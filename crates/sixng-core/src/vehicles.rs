@@ -33,10 +33,8 @@ const GAME_NAME: u32 = 0x120e_5836;
 const OWNER: u32 = 0xfb1f_80ff;
 /// `handlingId` (case-sensitive joaat).
 const HANDLING_ID: u32 = 0xec41_bd9c;
-/// The number plate bones: `plate_f`, `plate_r`, `mod_plate_f`, `mod_plate_r`.
-const PLATE_BONES: [&str; 4] = ["03e3e512", "567b0a43", "a0976fcb", "8e174ab3"];
 /// Layout version of vehicles.json; the model viewer rebuilds older files.
-pub const FORMAT: u32 = 17;
+pub const FORMAT: u32 = 18;
 /// A mod part or kit of one vehicle (in that vehicle's own pack resource):
 /// `name` joaat of the part model's name, or of a kit's name (the names of
 /// its left and right models without the side word:
@@ -544,15 +542,19 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
         // boot) sets c623bf2c, and nothing with 68bd62ca; the front one
         // shows nothing unless a part sets 2aef799d (then `plate_f`, or
         // `mod_plate_f` where a front bumper sets 7be534e0), and nothing
-        // with 503c4352. Other library switches with a default or an empty
-        // option are left out, and their parts keep fitting every element.
+        // with 503c4352.
+        // Every other library switch with a default or an empty option is
+        // taken the same way: it shows its default (or nothing) until a
+        // fitted part sets the key of one of its options. A radar's place on
+        // a boat, the hanging accessory under a pickup's rear bumper, a
+        // police scanner, the gear lever's head, a truck's fridge unit.
         let settable: std::collections::HashSet<&str> = keys.values().flatten().map(|k| k.as_str()).collect();
         let answerable = |s: &Value| {
             let o = s["options"].as_array().map(|o| o.as_slice()).unwrap_or(&[]);
             // a plain choice of one element: no default, no empty option
             let plain = s["default"].is_null() && o.iter().all(|o| !o["element"].is_null()) && o.iter().any(|o| o["key"].as_str().is_some_and(|k| settable.contains(k)) && o["also"].as_str().is_none_or(|k| settable.contains(k)));
-            let mut bones = o.iter().map(|o| &o["element"]).chain(std::iter::once(&s["default"])).filter(|e| !e.is_null()).map(|e| e["bone"].as_str().unwrap_or("")).peekable();
-            plain || (bones.peek().is_some() && bones.all(|b| PLATE_BONES.contains(&b)))
+            let with_default = !s["default"].is_null() || (o.iter().any(|o| o["element"].is_null()) && o.iter().any(|o| !o["element"].is_null()));
+            plain || with_default
         };
         let mut library_taken: Vec<Value> = Vec::new();
         for p in parts_of.get(&h).into_iter().flatten() {

@@ -980,8 +980,14 @@ impl App {
         if self.tab == Tab::Scenes {
             let mut act = None;
             egui::CentralPanel::default().show(ui, |ui| act = self.scenes.ui(ui));
-            if let Some(scenes_view::Action::Play { model, clip }) = act {
-                self.play_scene_clip(&model, &clip, &ctx);
+            match act {
+                Some(scenes_view::Action::Play { model, clip }) => self.play_scene_clip(&model, &clip, &ctx),
+                Some(scenes_view::Action::OpenAudio(address)) => {
+                    self.audio.select_stream(address);
+                    self.tab = Tab::Audio;
+                    ctx.request_repaint();
+                }
+                None => {}
             }
             return;
         }
@@ -1500,6 +1506,10 @@ impl App {
             }
             if let Some(q) = c.get("cast") {
                 self.scenes.cast_q = q.to_string();
+            }
+            // --order mission: the Scenes list in mission order
+            if c.get("order") == Some("mission") {
+                self.scenes.mission_order = true;
             }
             if c.has("palette") {
                 self.palette.open = true;

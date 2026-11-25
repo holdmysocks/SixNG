@@ -520,14 +520,21 @@ pub fn bank_list(file: &[u8], m: &AudioMeta) -> Option<Vec<BankListEntry>> {
     })
 }
 
+/// How far past the last placed bank [`align_bank_list`] looks for an
+/// entry's bank.
+pub const LOOKAHEAD: usize = 128;
+
 /// Give banks their bank-list entry. `banks` is (offset, size) of every
 /// bank; `anchors` the containers already known (from the sound files).
 /// Entries whose container is a known bank's and whose size is that bank's
 /// are anchors; the longest run of them that rises in archive order is
 /// kept, and the entries between two anchors go, in order, to the banks
-/// between them with the same size. Checked on `audio.rpf` by holding a
-/// quarter of the anchors back: 901 of 908 placed right. Returns bank
-/// offset -> entry.
+/// between them with the same size, at most [`LOOKAHEAD`] banks after the
+/// last one placed. Checked on `audio.rpf` by holding a quarter of the
+/// anchors back: 901 of 928 placed right, 13 wrong. In `story000.rpf`
+/// (68,784 entries, 63,861 banks, every anchor near the start) 58,512 of the
+/// 59,303 entries placed go to the very next bank; about 9,500 entries match
+/// no bank there. Returns bank offset -> entry.
 pub fn align_bank_list(list: &[BankListEntry], banks: &[(u64, u64)], anchors: &std::collections::BTreeMap<u64, u32>) -> std::collections::BTreeMap<u64, BankListEntry> {
     let mut banks = banks.to_vec();
     banks.sort();
@@ -572,11 +579,15 @@ pub fn align_bank_list(list: &[BankListEntry], banks: &[(u64, u64)], anchors: &s
         }
         let mut i = (i0 + 1) as usize;
         for k in (k0 + 1) as usize..k1 as usize {
+            // look a short way ahead only: an entry whose bank lies in another
+            // archive would otherwise match a far bank of the same size and
+            // skip every bank before it
+            let lim = (i1 as usize).min(i + LOOKAHEAD);
             let mut j = i;
-            while j < i1 as usize && banks[j].1 != list[k].size as u64 {
+            while j < lim && banks[j].1 != list[k].size as u64 {
                 j += 1;
             }
-            if j < i1 as usize {
+            if j < lim {
                 out.insert(banks[j].0, list[k]);
                 i = j + 1;
             }
@@ -789,6 +800,21 @@ mod tests {
         let al = align_bank_list(&list, &banks, &anchors);
         let got: Vec<(u64, u32)> = al.iter().map(|(b, e)| (*b, e.container)).collect();
         assert_eq!(got, [(0x100, 0xa), (0x200, 0xb), (0x300, 0xc), (0x400, 0xd), (0x500, 0xe)]);
+        // after the last anchor: an entry whose bank is elsewhere (size 999)
+        // has a same-size bank far ahead; it must not swallow the banks
+        // before that one
+        let n = LOOKAHEAD + 10;
+        let mut list = vec![BankListEntry { container: 1, size: 5, group: 0 }, BankListEntry { container: 2, size: 999, group: 0 }];
+        let mut banks = vec![(0u64, 5u64)];
+        for k in 0..n as u32 {
+            list.push(BankListEntry { container: 100 + k, size: 10 + k, group: 0 });
+            banks.push((1 + k as u64, 10 + k as u64));
+        }
+        banks.push((1 + n as u64, 999));
+        let al = align_bank_list(&list, &banks, &[(0, 1)].into_iter().collect());
+        assert_eq!(al.len(), 1 + n);
+        assert_eq!(al[&1].container, 100);
+        assert!(!al.contains_key(&(1 + n as u64)));
     }
     #[test]
     fn bank_container_pick() {
