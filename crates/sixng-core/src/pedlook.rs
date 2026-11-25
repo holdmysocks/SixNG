@@ -140,7 +140,7 @@ fn build(packs: &Path, ix: &ArchiveIndex) -> Models {
             if !vars.is_empty() {
                 for o in m.objects(0xf795_e8ba) {
                     let Some(p) = m.object(0xf795_e8ba, o, 1) else { continue };
-                    for t in p[f(0x12f8_5293)].as_array().into_iter().flatten().filter(|t| matches!(t["Key"].as_u64(), Some(0x4bfd_27dd) | Some(0x023e_5a2f))) {
+                    for t in p[f(0x12f8_5293)].as_array().into_iter().flatten().filter(|t| matches!(t["Key"].as_u64(), Some(0x4bfd_27dd) | Some(0x023e_5a2f) | Some(0x2cd3_1b46))) {
                         v.extend(t["Item"].as_array().into_iter().flatten().filter_map(|x| x.as_u64()).map(|h| (true, h as u32, e.off)));
                     }
                 }

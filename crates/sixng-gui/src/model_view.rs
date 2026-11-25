@@ -6169,10 +6169,20 @@ fn load_query_sel(
                         let presets = if info.strand_presets.is_empty() { None } else { sixng_core::hairtone::Table::load_or_build(&ws).map_err(|e| info.notes.push(format!("Hair colours: {e}"))).ok() };
                         for (slot, placeholder, guid) in &info.strands {
                             // by the item's hair asset, else by the character's own placeholder
-                            let Some(l) = u64::from_str_radix(guid, 16).ok().and_then(|g| t.resolve(g, look.fit.as_deref())).or_else(|| guid.is_empty().then(|| t.by_placeholder(placeholder)).flatten()) else { continue };
+                            // research: SIXNG_STRANDS_BY_NAME=1 takes the placement under the item's own placeholder name before the asset's best one
+                            let by_name = std::env::var("SIXNG_STRANDS_BY_NAME").is_ok().then(|| t.by_placeholder(placeholder)).flatten();
+                            let Some(l) = by_name.or_else(|| u64::from_str_radix(guid, 16).ok().and_then(|g| t.resolve(g, look.fit.as_deref()))).or_else(|| guid.is_empty().then(|| t.by_placeholder(placeholder)).flatten()) else { continue };
                             let colour = info.strand_tints.iter().find(|t| t.0 == *slot && t.1 == 0x1e64_f584).and_then(|t| Some(sixng_core::pedtint::palettes(&ws.game).ok()?.get(&t.1)?.sample(t.2, 128)));
                             // presets whose colours are white are not hair colours (their flag is set)
                             let tone = info.strand_presets.iter().find(|p| p.0 == *slot).and_then(|p| Some((p.1, presets.as_ref()?.variants(p.1)?))).filter(|(_, v)| !v[0].flag).map(|(name, variants)| HairTone { name, set: { let cat = match slot.as_str() { "hair" => "864b03ae", "brows" => "7c50ad43", "lashes" => "83a664e7", "beard" => "44d2709f", "body hair" => "a228cc57", _ => "" }; look.outfits[k].strand_colours.iter().find(|c| c.0 == cat).and_then(|c| u32::from_str_radix(&c.1, 16).ok()).unwrap_or(name) }, slot: slot.clone(), variants });
+                            // a piece whose item names no colour preset (lashes): the colour set the outfit's colour item gives its
+                            // category, when there is one; the stand-in colours here are only used without the strand tables
+                            let tone = tone.or_else(|| {
+                                let cat = match slot.as_str() { "hair" => "864b03ae", "brows" => "7c50ad43", "lashes" => "83a664e7", "beard" => "44d2709f", "body hair" => "a228cc57", _ => return None };
+                                let set = look.outfits[k].strand_colours.iter().find(|c| c.0 == cat).and_then(|c| u32::from_str_radix(&c.1, 16).ok())?;
+                                let dark = sixng_core::hairtone::Preset { a: [20, 14, 10], b: [20, 14, 10], texture: 0, flag: false, values: Default::default() };
+                                Some(HairTone { name: set, set, slot: slot.clone(), variants: [dark.clone(), dark.clone(), dark.clone(), dark] })
+                            });
                             let colour = colour.or(tone.as_ref().map(|t| sixng_core::hairtone::display(t.variants[0].a)));
                             info.hair.push(HairPick { slot: slot.clone(), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: t.uncontested(l), off_head: 0, shown: l.confidence >= 0.5 && slot != "body hair", colour, tone });
                         }
@@ -6261,6 +6271,10 @@ fn load_query_sel(
                         // body hair is fine fuzz in the game; drawn at hair
                         // width it reads as fur, so it is offered but starts off
                         h.shown = h.slot != "body hair" && !h.slot.starts_with("other ") && !h.grooms.is_empty() && (h.confidence >= 0.5 || (h.confidence >= 0.2 && h.off_head == 0));
+                        // research: SIXNG_SHOW_STRANDS=lashes,... shows those slots' picks whatever their confidence
+                        if std::env::var("SIXNG_SHOW_STRANDS").is_ok_and(|v| v.split(',').any(|x| x == h.slot)) && !h.grooms.is_empty() {
+                            h.shown = true;
+                        }
                     }
                 }
             }
