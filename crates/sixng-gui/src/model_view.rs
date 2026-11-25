@@ -1272,7 +1272,7 @@ impl ModelView {
 
     fn hair_ui(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new("Hair and fur (grooms)").default_open(!self.hair.selected.is_empty() || self.auto.find_hair || self.auto.export_hair).show(ui, |ui| {
-            ui.label(egui::RichText::new("Strand grooms from packs.rpf. Animals get their fur automatically (worked out from the order of the files and a fit to the skin, not from a stored link); for characters pick grooms here. Shown as ribbons; width and colour are display choices.").weak());
+            ui.label(egui::RichText::new("Strand grooms from packs.rpf. Characters get their hair and animals their fur automatically, read from the game's own link (where the archive's table of contents cannot be read, worked out from the order of the files and a fit to the skin instead); other grooms can be picked here. Shown as ribbons; width and colour are display choices.").weak());
             self.hair_fit_ui(ui);
             if let Some(l) = self.hair.fur.clone() {
                 let mut changed = false;
@@ -1287,7 +1287,7 @@ impl ModelView {
                         egui::ComboBox::from_id_salt(("fur_variant", k)).selected_text(if self.hair.fur_pick[k].is_empty() { "none".to_string() } else { short(&self.hair.fur_pick[k]) }).show_ui(ui, |ui| {
                             changed |= ui.selectable_value(&mut self.hair.fur_pick[k], String::new(), "none").changed();
                             for v in &opts {
-                                let label = format!("{} · {} piece(s){}", short(&v.name), v.grooms.len(), if v.known { "" } else { " · count inferred" });
+                                let label = format!("{} · {} piece(s){}", short(&v.name), v.grooms.len(), if v.known || l.read { "" } else { " · count inferred" });
                                 changed |= ui.selectable_value(&mut self.hair.fur_pick[k], v.name.clone(), label).changed();
                             }
                         });
@@ -1296,8 +1296,15 @@ impl ModelView {
                 if changed {
                     self.hair.apply_fur();
                 }
-                let with = if l.roots.len() > 1 { format!("; walked together with {}", l.roots.iter().filter(|r| **r != l.root).cloned().collect::<Vec<_>>().join(", ")) } else { String::new() };
-                ui.label(egui::RichText::new(format!("{} of {} groom pieces in this run fit the skin; {:.0} % of the pieces with a known count sit on their own slot{with}.", l.fitting, l.block, l.agreement * 100.0)).weak().small());
+                let with = if l.read {
+                    String::new()
+                } else if l.roots.len() > 1 { format!("; walked together with {}", l.roots.iter().filter(|r| **r != l.root).cloned().collect::<Vec<_>>().join(", ")) } else { String::new() };
+                let text = if l.read {
+                    format!("{} groom pieces, read from the game (each variant lists its pieces).", l.block)
+                } else {
+                    format!("{} of {} groom pieces in this run fit the skin; {:.0} % of the pieces with a known count sit on their own slot{with}. Inferred: the game's own link could not be read here.", l.fitting, l.block, l.agreement * 100.0)
+                };
+                ui.label(egui::RichText::new(text).weak().small());
             } else if !self.hair.fur_note.is_empty() {
                 ui.label(egui::RichText::new(format!("No automatic fur: {}", self.hair.fur_note)).weak().small());
             }
