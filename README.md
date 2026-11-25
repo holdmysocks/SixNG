@@ -631,8 +631,8 @@ again**).
   and the archive's table of contents gives every file its id. That
   links 878 hair, beard, brow, lash and body-hair assets to their
   grooms; the Character panel lists them. A piece's LOD files are read
-  by name too (`<piece>_lod1` …) when its piece word is known (2,766 of
-  4,095 pieces), else attached by bones and strand counts. It needs the table of contents
+  by name too (`<piece>_lod1` …) when its piece word is known (2,859 of
+  3,419 groom pieces), else attached by bones and strand counts. It needs the table of contents
   (Windows, the supported game build); without it the link is inferred
   from name words, archive order, piece counts and geometry with a model
   probability, which is often wrong. The panel then shows that
