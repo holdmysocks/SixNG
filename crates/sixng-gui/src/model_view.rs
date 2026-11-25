@@ -6185,6 +6185,18 @@ fn load_query_sel(
                             });
                             let colour = colour.or(tone.as_ref().map(|t| sixng_core::hairtone::display(t.variants[0].a)));
                             info.hair.push(HairPick { slot: slot.clone(), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: t.uncontested(l), off_head: 0, shown: l.confidence >= 0.5 && slot != "body hair", colour, tone });
+                            // research: SIXNG_HAIR_GROOMS=hair:10c5cc010+10c605010+... draws those pieces (first LOD offsets) for the slot
+                            if let Ok(v) = std::env::var("SIXNG_HAIR_GROOMS") {
+                                for part in v.split(',') {
+                                    if let Some((sl, list)) = part.split_once(':') {
+                                        if sl == slot.as_str() {
+                                            if let Some(h) = info.hair.last_mut() {
+                                                h.grooms = list.split('+').filter_map(|x| u64::from_str_radix(x, 16).ok()).collect();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     Err(e) => info.notes.push(format!("Strand hair: {e}")),
