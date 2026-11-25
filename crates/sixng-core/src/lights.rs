@@ -186,7 +186,10 @@ pub const TC_MODIFIERS: u32 = 0xaf9c_3bd9; // timeCycleModifiers (empty in every
 /// The modifier volumes GTA VI uses instead: an array of `3bc4ac19`
 /// (112 B): `name` (joaat of the modifier name), `center`, `orientation`
 /// (always 0), `scale`, `fe27ffde` (the shape, [`tc_shape`]), `percentage`,
-/// `range`, `startHour`, `endHour`, `854db4c2` (u32, 0 on 96 %) and
+/// `range`, `startHour`, `endHour`, `854db4c2` (the light group, 0 on 96 %:
+/// placed lights carry the same hash in their `58122c00`, as the 662 lights
+/// of a road tunnel do for its modifier; the other volumes are interior
+/// states such as dim / bright or clean / dirty) and
 /// `rotation` (quaternion x, y, z, w, applied as stored: unlike entities it
 /// is not the inverse).
 pub const TC_BOXES: u32 = 0x8471_928b;
@@ -343,11 +346,23 @@ fn half(h: u16) -> f32 {
 /// `a13c79ef` (`random`: spread evenly over 0..100 and independent of every
 /// other field, of the placed light it comes from, its hash and its
 /// position: a per-light random value). None of the three is a copy of a
-/// placed-light field. LOD record: `direction`, `falloff` (the range),
+/// placed-light field; `time_multiplier` is the same for a given light of
+/// an archetype (98.5 %), so it comes from the light's definition, not the
+/// entity. `intensity` is the placed intensity converted for a light seen
+/// from far away: points keep it (88 %); a spot's is multiplied by
+/// `F + (1 - F) * p`, with `F = 2 / ((1 - cos inner) + (cos inner - cos
+/// outer) / 3)` (4 pi over the solid angle of a cone with a squared falloff
+/// from inner to outer) and `p` the placed field `47d5d47a` (0 on most
+/// spots: full conversion; 1: none); a capsule's is divided by
+/// `(1 + L)^2`, with `L` growing with the capsule extent (its source field
+/// is not found). LOD record: `direction`, `falloff` (the range),
 /// `falloffExponent`, cone angles as u8 = degrees x 255 / 180 (for
-/// capsules, the outer one is the capsule extent), `8e6f0ba9` (two half
-/// floats), `0e852fda` (two u16, the second equal to the first or one
-/// more), and the u8 fields not identified yet.
+/// capsules, the outer one is the capsule extent), `8e6f0ba9` (the tangent,
+/// octahedral-encoded as two half floats in 0..1; matches the placed
+/// tangent on 99.8 %), `0e852fda` (two u16: a first / last index, the
+/// second equal to the first or one more, rising with the light index, 0 /
+/// 0 on 47 %; what it indexes is not known), and the u8 fields not
+/// identified yet.
 pub fn distant_row(d: &serde_json::Map<String, serde_json::Value>, l: Option<&serde_json::Map<String, serde_json::Value>>) -> serde_json::Value {
     use crate::meta7a::field_name;
     let g = |m: &serde_json::Map<String, serde_json::Value>, h: u32| m.get(&field_name(h)).cloned().unwrap_or(serde_json::Value::Null);
@@ -374,11 +389,38 @@ pub fn distant_row(d: &serde_json::Map<String, serde_json::Value>, l: Option<&se
         v["falloff_exponent"] = g(l, 0x2bb3_42ba);
         v["cone"] = serde_json::json!([deg(0x455c_3938), deg(0xbc76_acc0)]);
         let (a, b) = (n(l, 0x8e6f_0ba9) as u32, n(l, 0x0e85_2fda) as u32);
-        v["halves_8e6f0ba9"] = serde_json::json!([half(a as u16), half((a >> 16) as u16)]);
+        let (u, w) = (half(a as u16), half((a >> 16) as u16));
+        v["halves_8e6f0ba9"] = serde_json::json!([u, w]);
+        v["tangent"] = serde_json::json!(octa_decode(u, w));
         v["u16_0e852fda"] = serde_json::json!([b & 0xffff, b >> 16]);
         v["lod_raw"] = serde_json::Value::Object(l.clone());
     }
     v
+}
+
+/// Unit vector from an octahedral encoding with both coordinates in 0..1.
+pub fn octa_decode(u: f32, v: f32) -> [f32; 3] {
+    let (mut x, mut y) = (u * 2.0 - 1.0, v * 2.0 - 1.0);
+    let z = 1.0 - x.abs() - y.abs();
+    if z < 0.0 {
+        let (ox, oy) = (x, y);
+        x = (1.0 - oy.abs()) * ox.signum();
+        y = (1.0 - ox.abs()) * oy.signum();
+    }
+    let n = (x * x + y * y + z * z).sqrt();
+    if n == 0.0 {
+        return [0.0, 0.0, 1.0];
+    }
+    [x / n, y / n, z / n]
+}
+
+/// Spot intensity factor of a distant light: 4 pi over the solid angle of
+/// a cone (degrees) whose falloff is squared from `inner` to `outer`,
+/// blended to 1 by `p` (the placed field `47d5d47a`).
+pub fn distant_spot_factor(inner: f32, outer: f32, p: f32) -> f32 {
+    let (ci, co) = (inner.to_radians().cos(), outer.to_radians().cos());
+    let f = 2.0 / ((1.0 - ci) + (ci - co) / 3.0);
+    f + (1.0 - f) * p
 }
 
 /// Rotate `v` by quaternion `q` (x, y, z, w).
@@ -487,5 +529,17 @@ mod tests {
         assert_eq!(b[0].map(r), [8.0, 17.0, 29.0]);
         assert_eq!(b[1].map(r), [12.0, 23.0, 31.0]);
         assert_eq!(tc_shape(0x27ac_c35b, [3.0, 3.0, 1.0]), ("cylinder", [3.0, 3.0, 1.0]));
+    }
+    #[test]
+    fn octa_and_spot_factor() {
+        let r = |v: [f32; 3]| v.map(|x| (x * 1000.0).round() / 1000.0);
+        assert_eq!(r(octa_decode(0.5, 0.5)), [0.0, 0.0, 1.0]);
+        assert_eq!(r(octa_decode(1.0, 0.5)), [1.0, 0.0, 0.0]);
+        assert_eq!(r(octa_decode(0.5, 0.0)), [0.0, -1.0, 0.0]);
+        // Measured on the map files: 40 / 65 degrees gives 5.74, 10 / 40 gives 22.70.
+        assert!((distant_spot_factor(40.0, 65.0, 0.0) - 5.739).abs() < 0.01);
+        assert!((distant_spot_factor(10.0, 40.0, 0.0) - 22.698).abs() < 0.01);
+        assert!((distant_spot_factor(20.0, 68.0, 0.25) - 6.282).abs() < 0.01);
+        assert_eq!(distant_spot_factor(20.0, 68.0, 1.0), 1.0);
     }
 }

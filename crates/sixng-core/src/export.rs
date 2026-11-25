@@ -3027,6 +3027,13 @@ pub fn export_lights(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: &
                 v["interior_instance"] = serde_json::json!(ii);
             }
             v["space"] = serde_json::json!(if group { "group_local" } else { "world" });
+            if let Some(g) = l.fields.get(&crate::meta7a::field_name(0x5812_2c00)).and_then(|x| x.as_u64()).filter(|&g| g != 0) {
+                v["light_group"] = serde_json::json!(format!("{g:08x}"));
+            }
+            if l.light_type == 2 {
+                let p = l.fields.get(&crate::meta7a::field_name(0x47d5_d47a)).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+                v["distant_intensity"] = serde_json::json!(l.intensity * crate::lights::distant_spot_factor(l.cone_inner, l.cone_outer, p));
+            }
             writeln!(w, "{v}")?;
             placed += 1;
         }
@@ -3122,6 +3129,9 @@ pub fn export_map_lights(ws: &Workspace, scans: &[MetaScan], dir: &Path) -> Resu
                 if !in_region(b[0], b[1]) {
                     continue;
                 }
+            }
+            if let Some(g) = v.get(field_name(0x854d_b4c2)).and_then(|x| x.as_u64()).filter(|&g| g != 0) {
+                v["light_group"] = serde_json::json!(format!("{g:08x}"));
             }
             v["map"] = serde_json::json!(sc.id);
             v["index"] = serde_json::json!(i);
