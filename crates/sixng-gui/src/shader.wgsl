@@ -384,19 +384,44 @@ fn ign(p: vec2<f32>) -> f32 {
 
 // Share of the sun's light that reaches a point, from the sun shadow map (1 where there is none): 3 x 3 taps
 // of a linear comparison. A stand-in for the game's shadow filtering, which is not read.
-fn sun_shadow(wp: vec3<f32>) -> f32 {
-    if (F.light_vp[3][3] == 0.0) { return 1.0; }
+// One tap of the sun shadow map at a world position (1 outside the map).
+fn sun_shadow_tap(wp: vec3<f32>, r: i32) -> f32 {
     let c = F.light_vp * vec4(wp, 1.0);
     let uv = c.xy * vec2(0.5, -0.5) + 0.5;
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || c.z > 1.0) { return 1.0; }
     let px = 1.0 / f32(textureDimensions(t_shadow).x);
     var s = 0.0;
-    for (var y = -1; y <= 1; y++) {
-        for (var x = -1; x <= 1; x++) {
+    for (var y = -r; y <= r; y++) {
+        for (var x = -r; x <= r; x++) {
             s += textureSampleCompareLevel(t_shadow, samp_shadow, uv + vec2(f32(x), f32(y)) * px, c.z - 0.0012);
         }
     }
-    return s / 9.0;
+    let n = f32(2 * r + 1);
+    return s / (n * n);
+}
+
+// The sun's visibility at a pixel. The game's lighting programs average its
+// screen-space shadow buffer over 13 pixels (read from its hair and standard
+// lighting programs by the shader archive work): the pixel, its four
+// diagonal neighbours, and the pixels 2 and 4 to each side and above and
+// below, a neighbour counting only when its depth is within 0.275 % of the
+// pixel's. The viewer has no such buffer: each neighbour is taken on the
+// pixel's own surface (the world position moved by its screen derivatives
+// `dx`, `dy`), which is where a neighbour of nearly the same depth lies, and
+// read from the shadow map. The 3 x 3 map filter of the centre stands in for
+// whatever filters the game's buffer before this step (not read).
+fn sun_shadow(wp: vec3<f32>, dx: vec3<f32>, dy: vec3<f32>) -> f32 {
+    if (F.light_vp[3][3] == 0.0) { return 1.0; }
+    var s = sun_shadow_tap(wp, 1);
+    for (var k = 0; k < 4; k++) {
+        let a = f32(k & 1) * 2.0 - 1.0;
+        let b = f32(k >> 1u) * 2.0 - 1.0;
+        s += sun_shadow_tap(wp + dx * a + dy * b, 0);
+        // the cross: 2 and 4 pixels along x (k = 0, 1) and along y (k = 2, 3)
+        let d = select(dy, dx, k < 2) * a;
+        s += sun_shadow_tap(wp + d * 2.0, 0) + sun_shadow_tap(wp + d * 4.0, 0);
+    }
+    return s / 13.0;
 }
 
 @fragment
@@ -650,7 +675,7 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     let fr_v = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
     let r = reflect(-v, n);
     let env = mix(sky(r), (F.sky_top.rgb + F.sky_hor.rgb) * 0.5, rough) * F.misc.w;
-    let sh = sun_shadow(i.world);
+    let sh = sun_shadow(i.world, dpdx(i.world), dpdy(i.world));
     var col = direct * sh * ao_direct + kd * albedo * amb_d * ao + env * fr_v * ao + emissive;
     col += pearl * pow(1.0 - ndv, 2.0) * 0.6;
     if (cls == 12u) {
