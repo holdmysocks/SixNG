@@ -885,6 +885,8 @@ again**).
   name, in the hair picker's colour.
   Animal sets that span several parts (`08 collarharness`: body + harness,
   `09 corpse roadkill`) have a button each, and **Defaults** goes back.
+  Only the parts shown hide skin under them: a garment switched off no
+  longer leaves its hole in the body (before 2026-11-25 it did).
   The camera stays put while parts change, and the item page's Export and
   Files follow the parts shown in the viewer.
 - **Head skins** (since 2026-11-21): ped heads bind no textures in the
