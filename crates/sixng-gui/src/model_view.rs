@@ -3700,7 +3700,7 @@ impl ModelView {
         self.update_ped_clip(&ctx);
         let (globals, mut skin) = self.joint_mats();
         // Lit lamps: the light of each lamp bone rides in the bottom row of
-        // its joint matrix (see the shader). Not on the Metal renderer.
+        // its joint matrix (see the shader). Not in a Metal 4 build.
         if self.siren_dirty {
             self.siren_dirty = false;
             self.sirens = match (&self.loaded, &self.veh_lights) {
@@ -3719,7 +3719,7 @@ impl ModelView {
                 self.siren = self.siren.min(self.sirens.len());
             }
         }
-        if (self.has_lamps || !self.sirens.is_empty()) && cfg!(not(target_os = "macos")) {
+        if (self.has_lamps || !self.sirens.is_empty()) && !crate::METAL4_BUILD {
             let t = ctx.input(|i| i.time);
             if let Some(l) = &self.loaded {
                 for (i, (j, m)) in l.model.joints.iter().zip(skin.iter_mut()).enumerate() {
@@ -4863,8 +4863,8 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
                 let mat = m.materials[mi].clone();
                 // The wgpu shader draws the main sub-material's weave per
                 // pixel on opaque garments (alpha carries its texels); the
-                // Metal renderer has no such path and keeps the baked weave.
-                let detail = cfg!(not(target_os = "macos")) && std::env::var_os("SIXNG_NO_FABRIC_DETAIL").is_none() && mats.iter().all(|&k| m.materials[k].alpha_mode == "OPAQUE");
+                // Metal 4 renderer has no such path and keeps the baked weave.
+                let detail = !crate::METAL4_BUILD && std::env::var_os("SIXNG_NO_FABRIC_DETAIL").is_none() && mats.iter().all(|&k| m.materials[k].alpha_mode == "OPAQUE");
                 if let Some(main) = crate::fabric::bake(m, &mats, i, &fab, &|w, h| sub_material_map(&mat, &[cache, shaped.as_path()], w, h), detail) {
                     m.images[i].key = format!("{}#fabric{:08x}{}", m.images[i].key, f.preset.unwrap_or(0), if main.is_some() { "d" } else { "" });
                     if let Some((tile, scale, rot)) = main.and_then(|s| fab.detail(s)) {

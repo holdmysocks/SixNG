@@ -174,6 +174,13 @@ fn default_game() -> String {
         .unwrap_or_default()
 }
 
+/// True in a build that can draw with the Metal 4 renderer: macOS with the
+/// opt-in `metal4-poc` feature. That renderer has no path for lit vehicle
+/// lamps, the occlusion of a vehicle material map or the per-pixel fabric
+/// weave, so those stay off in such a build. Every other build, the normal
+/// macOS one included, draws with the wgpu shader and has them.
+pub(crate) const METAL4_BUILD: bool = cfg!(all(target_os = "macos", feature = "metal4-poc"));
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
