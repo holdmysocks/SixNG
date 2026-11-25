@@ -1134,8 +1134,10 @@ colour and multiplier (`light_dir_col_*`, `light_dir_mult`, with the sun's
 `indirect_light_sky_multiplier`, tint `ambient_sky_color_mult_*` x
 `sky_scattering_sky_col_*`), `postfx_exposure` and the high-level cloud
 cover. The game feeds these into a physical sky and eye adaptation that are
-not decoded, so the rest is our own simple model: sun path at the equinox
-at 25.8° N, a full moon opposite the sun, Rayleigh/aerosol air-mass tint of
+not decoded, so the rest is our own simple model: sun path at 25.8° N at
+the summer solstice with the clock one hour ahead of solar time (sunrise
+~06:10, sunset ~19:50, where the cycle's colours turn from moonlight to
+sunlight and back), a full moon opposite the sun, Rayleigh/aerosol air-mass tint of
 the sun near the horizon, sky brightness over the day, the sun dimmed by
 85 % of the cloud cover, and an exposure that brightens dark scenes.
 Directional and ambient strength are scaled so that Sunny at 12:00 matches

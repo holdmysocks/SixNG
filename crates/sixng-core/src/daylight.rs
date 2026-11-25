@@ -289,6 +289,12 @@ pub struct Light {
 
 /// Latitude of the sun path, degrees north (the game's sun path is not decoded).
 pub const LATITUDE: f32 = 25.8;
+/// Sun declination, degrees (summer solstice) and clock hours ahead of
+/// solar time. Chosen so sunrise (~06:10) and sunset (~19:50) fall where
+/// the cycle's own directional colours turn from moonlight to sunlight
+/// (05-06 h) and back (20-21 h); the game's sun path is not decoded.
+pub const DECLINATION: f32 = 23.44;
+pub const CLOCK_AHEAD: f32 = 1.0;
 /// Ambient at night relative to the day sky before the timecycle's own
 /// ambient multiplier (the physical night sky is not decoded).
 pub const NIGHT_SKY: f32 = 0.02;
@@ -309,11 +315,14 @@ fn norm3(c: [f32; 3]) -> [f32; 3] {
     c.map(|x| (x / m).max(0.0))
 }
 
-/// Direction to the sun at an hour (equinox, [`LATITUDE`]): x east, y up, z south.
+/// Direction to the sun at a clock hour ([`LATITUDE`], [`DECLINATION`],
+/// [`CLOCK_AHEAD`]): x east, y up, z south.
 pub fn sun_dir(hour: f32) -> [f32; 3] {
-    let h = (hour - 12.0) * 15f32.to_radians();
-    let lat = LATITUDE.to_radians();
-    let (e, n, u) = (-h.sin(), -lat.sin() * h.cos(), lat.cos() * h.cos());
+    let h = (hour - CLOCK_AHEAD - 12.0) * 15f32.to_radians();
+    let (lat, d) = (LATITUDE.to_radians(), DECLINATION.to_radians());
+    let e = -d.cos() * h.sin();
+    let n = lat.cos() * d.sin() - lat.sin() * d.cos() * h.cos();
+    let u = lat.sin() * d.sin() + lat.cos() * d.cos() * h.cos();
     [e, u, -n]
 }
 
@@ -334,7 +343,8 @@ fn raw(t: &Table, w: &Weather, hour: f32) -> Light {
     let g = |k: &str, d: f32| t.get(w, k, hour, d);
     let s = sun_dir(hour);
     let elev = s[1].clamp(-1.0, 1.0).asin().to_degrees();
-    let day = smooth(-4.0, 20.0, elev);
+    // the sky stays lit through civil and part of nautical twilight
+    let day = smooth(-10.0, 15.0, elev);
     let dusk = (1.0 - (elev.abs() / 12.0).min(1.0)).max(0.0);
     let mult = g("light_dir_mult", 1.0);
     let base = t.rgb(w, "light_dir_col", hour);
@@ -484,11 +494,13 @@ mod tests {
 
     #[test]
     fn sun_path() {
-        let n = sun_dir(12.0);
-        assert!(n[1] > 0.89 && n[2] > 0.4, "{n:?}");
-        let m = sun_dir(6.0);
-        assert!(m[1].abs() < 1e-5 && m[0] > 0.99);
-        assert!(sun_dir(0.0)[1] < -0.89);
+        // solar noon at 13 h: 87.6 degrees high, a little to the south
+        let n = sun_dir(13.0);
+        assert!(n[0].abs() < 1e-5 && (n[1].asin().to_degrees() - 87.64).abs() < 0.01, "{n:?}");
+        // sunrise ~06:12 in the east-north-east, sunset ~19:48
+        assert!(sun_dir(6.1)[1] < 0.0 && sun_dir(6.3)[1] > 0.0 && sun_dir(6.2)[0] > 0.85);
+        assert!(sun_dir(19.7)[1] > 0.0 && sun_dir(19.9)[1] < 0.0);
+        assert!(sun_dir(1.0)[1] < -0.6);
     }
 
     #[test]
