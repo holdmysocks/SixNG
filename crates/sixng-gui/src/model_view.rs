@@ -5305,7 +5305,15 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
         (Some(c), _, _) => flat(c),
         (None, Some((p, row)), _) => std::array::from_fn(|v| p.sample(row, v as u8)),
         (None, None, Some(c)) => flat(c),
-        (None, None, None) => return false,
+        (None, None, None) => {
+            // Nothing in the install gives this item a colour: its own
+            // textures are missing and it stores no preset, tint row, flat
+            // colour or colour tag (19 items in the 292 named characters'
+            // default looks, mostly watches). A neutral dark grey instead of
+            // white; not the game's colour.
+            bare_tint(m, |_| BARE_FALLBACK);
+            return false;
+        }
     };
     let mut done = std::collections::HashSet::new();
     // clothing whose textures are not in the install: the colour of plain
@@ -5331,6 +5339,10 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
     }
     !done.is_empty()
 }
+
+/// sRGB colour of clothing that has no texture in the install and no colour
+/// in its item either (see `colour_part`).
+const BARE_FALLBACK: [u8; 3] = [88, 88, 88];
 
 /// Colour the ped clothing materials that have no base texture (their
 /// textures are not in the install; `glb` marks them `ped_shade`) with a
