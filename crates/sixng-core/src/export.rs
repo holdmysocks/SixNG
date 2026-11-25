@@ -2124,7 +2124,7 @@ fn ped_skin(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &crate::drawable::Dr
     let ped = if animal.is_some() {
         animal
     } else if names_own || ped_name {
-        crate::pedskel::get(&game_root(a), female)
+        crate::pedskel::get_for(&game_root(a), e.name.as_deref().unwrap_or(""))
     } else {
         None
     };
@@ -2149,7 +2149,12 @@ fn ped_skin(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &crate::drawable::Dr
         .collect();
     if let Some(p) = ped {
         let mut j: Vec<Joint> = p.bones.iter().map(|b| joint(b, 0)).collect();
-        if !o.body_shape.is_empty() && animal.is_none() {
+        // kid and infant bodies have no body-shape rig
+        let child = crate::pedskel::is_child_name(e.name.as_deref().unwrap_or(""));
+        if child && !o.body_shape.is_empty() && animal.is_none() {
+            item.warnings.push("body shape: kid and infant bodies have no body-shape rig; neutral body exported".into());
+        }
+        if !o.body_shape.is_empty() && animal.is_none() && !child {
             match crate::bodyshape::get(&game_root(a), female) {
                 Ok(rig) => match crate::bodyshape::pose(&p.bones, rig, &crate::bodyshape::input_values(&o.body_shape)) {
                     Some((posed, _)) => j.iter_mut().zip(posed).for_each(|(j, m)| j.pose = Some(m)),
@@ -2193,7 +2198,7 @@ fn ped_skin(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &crate::drawable::Dr
         }
         out.joints = j;
     } else {
-        item.warnings.push(format!("ped clothing skin: shared ped skeleton ({}) not found in the packs index; only the drawable's own bones are bound", crate::pedskel::source_name(female)));
+        item.warnings.push(format!("ped clothing skin: shared ped skeleton ({}) not found in the packs index; only the drawable's own bones are bound", crate::pedskel::source_for(e.name.as_deref().unwrap_or(""))));
     }
     let resolve = |h: &u32| -> u16 {
         if let Some(&i) = ped.and_then(|p| p.by_hash.get(h)) {

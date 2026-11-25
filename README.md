@@ -782,7 +782,15 @@ again**).
   This is inferred from the results, not read from the game. The game's
   rig and its body-shape presets have no face controls, so the face does
   not change with the sliders. Each rig also reads 14 inputs that no
-  known control drives; they stay at 0.
+  known control drives; they stay at 0. The game has two body-shape
+  rigs, female and male. The body type comes from the part's fit tag:
+  every tag that starts with `m` (`mr1`, `mb1`, `mo1`, `mc1`, `msk1`) gets
+  the male rig and skeleton. Before 2026-11-25, only `mr1` did, and the
+  other male bodies were shaped as female ones. Kid (`mk1`) and infant
+  (`mi1`) parts get their own reference skeletons, `ambient_kidbody` and
+  `ambient_infantbody`. Before, they were bound to the adult female
+  skeleton, which put their bones up to 0.65 m away from the mesh. They
+  have no body-shape rig, so the sliders leave them as they are.
 - The viewer's **Parts** panel lists every part an animal or character
   has, grouped by slot (body, eye, crown, shirt, harness …; head, top,
   outer, bottom, feet, hat, glasses …). Pick one per group or "none";

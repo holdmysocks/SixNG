@@ -90,13 +90,72 @@ pub fn animal(game_root: &Path, part_name: &str) -> Option<&'static PedSkeleton>
     s
 }
 
-/// Ped part name: has a fit tag (`mr1`, `fr1`, `mk1` …: sex + body type +
-/// number) as one of its `_` tokens.
-pub fn is_ped_name(name: &str) -> bool {
-    name.split('_').any(crate::outfit::is_fit)
+/// Fit tag of a ped part name: the first `_` token that is `mr1`, `fr1`,
+/// `mk1` … (sex + body type + number), or the bare body `msk1` / `fsk1`.
+pub fn fit_tag(name: &str) -> Option<&str> {
+    name.split('_').find(|t| crate::outfit::is_fit(t) || (t.len() == 4 && (t.starts_with("msk") || t.starts_with("fsk")) && t.as_bytes()[3].is_ascii_digit()))
 }
 
-/// Female rig unless the name has the male rig token (`_mr1`).
+/// Ped part name: has a fit tag (see [`fit_tag`]).
+pub fn is_ped_name(name: &str) -> bool {
+    fit_tag(name).is_some()
+}
+
+/// Female body unless the fit tag starts with `m` (`mr1`, `mb1`, `mo1`,
+/// `mc1`, `msk1` …). Names without a fit tag count as female.
 pub fn is_female_name(name: &str) -> bool {
-    !name.contains("_mr1")
+    fit_tag(name).is_none_or(|t| !t.starts_with('m'))
+}
+
+/// Child body (fit tag `mk1` / `mi1` …: kid or infant). These have their own
+/// reference skeletons and no body-shape rig.
+pub fn is_child_name(name: &str) -> bool {
+    fit_tag(name).is_some_and(|t| matches!(t.as_bytes()[1], b'k' | b'i'))
+}
+
+/// Fragment holding the reference skeleton for a ped part: the kid and
+/// infant bodies have their own; every other body type uses the female or
+/// male one (the `bb` and `xxl` skeletons in packs.rpf have the same joint
+/// positions).
+pub fn source_for(name: &str) -> &'static str {
+    match fit_tag(name).map(|t| t.as_bytes()[1]) {
+        Some(b'k') => "ambient_kidbody",
+        Some(b'i') => "ambient_infantbody",
+        _ => source_name(is_female_name(name)),
+    }
+}
+
+/// The reference skeleton for a ped part (see [`source_for`]), cached.
+pub fn get_for(game_root: &Path, name: &str) -> Option<&'static PedSkeleton> {
+    static K: OnceLock<Option<PedSkeleton>> = OnceLock::new();
+    static I: OnceLock<Option<PedSkeleton>> = OnceLock::new();
+    match source_for(name) {
+        "ambient_kidbody" => K.get_or_init(|| load_fragment(game_root, "ambient_kidbody")).as_ref(),
+        "ambient_infantbody" => I.get_or_init(|| load_fragment(game_root, "ambient_infantbody")).as_ref(),
+        _ => get(game_root, is_female_name(name)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_from_fit_tag() {
+        assert!(is_female_name("hand_fr1_000_nude_cull"));
+        assert!(is_female_name("feet_fo1_000_nude_cull"));
+        assert!(!is_female_name("hand_mr1_000_nude_cull"));
+        // male body types other than mr1 are male too
+        assert!(!is_female_name("hand_mb1_000_nude_cull"));
+        assert!(!is_female_name("feet_mo1_000_nude_cull"));
+        assert!(!is_female_name("hand_msk1_000_nude_cull"));
+        assert!(is_ped_name("hand_fsk1_000_nude_cull"));
+        assert!(is_child_name("hand_mk1_000_nude_cull"));
+        assert!(is_child_name("hand_mi1_000_nude_cull"));
+        assert!(!is_child_name("hand_mb1_000_nude_cull"));
+        assert_eq!(source_for("hand_mk1_000_nude_cull"), "ambient_kidbody");
+        assert_eq!(source_for("hand_mi1_000_nude_cull"), "ambient_infantbody");
+        assert_eq!(source_for("hand_mc1_000_nude_full"), "ambient_malebody");
+        assert_eq!(source_for("hand_fb1_000_nude_cull"), "ambient_femalebody");
+    }
 }
