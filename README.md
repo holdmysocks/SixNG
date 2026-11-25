@@ -1133,7 +1133,7 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   (they showed as floating black boxes); the model viewer still shows them.
 
 Map 3D screenshots: `--tab map3d --center X,Y --height H --yaw DEG --pitch
-DEG [--quality low|medium|high|ultra] [--detail 0-1] [--tod H] [--weather W] [--lights]
+DEG [--quality low|medium|high|ultra] [--detail 0-1] [--tod H] [--weather W] [--no-shadows] [--lights]
 [--roads] [--no-terrain] [--fog F] [--max-tex PX] [--no-textures]
 [--no-hd-fallback] [--kinds a,b] [--lods a,b] [--ram-cap GB]
 [--no-windows] [--no-decal-bias] [--show-proxies] [--fly X,Y,H,SECONDS]

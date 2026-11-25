@@ -1603,6 +1603,9 @@ impl App {
             if let Some(w) = c.get("weather") {
                 m3.weather = w.trim().to_ascii_lowercase();
             }
+            if c.has("no-shadows") {
+                m3.no_shadows = true;
+            }
             if let Some(v) = c.f("fog") {
                 m3.look.fog = v;
             }

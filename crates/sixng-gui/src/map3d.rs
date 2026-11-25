@@ -235,6 +235,8 @@ pub struct Map3D {
     pub tod: f32,
     /// Weather type of the game's timecycle (`sixng_core::daylight::WEATHERS`).
     pub weather: String,
+    /// Start with the sun and moon shadows off (`--no-shadows`).
+    pub no_shadows: bool,
     /// The sky of the last (weather, hour), from the timecycle.
     sky_cache: Option<(String, f32, bool, crate::atmo::Sky)>,
     pub detail_level: f32,
@@ -490,6 +492,7 @@ impl Map3D {
             look,
             tod: 14.0,
             weather: "sunny".into(),
+            no_shadows: false,
             sky_cache: None,
             detail_level,
             detail: Detail::from_level(detail_level),
@@ -2236,7 +2239,9 @@ impl Map3D {
                     "[map3d] adapter {} ({:?}, {:?}) present {:?}",
                     ai.name, ai.backend, ai.device_type, rs.target_format
                 );
-                self.renderer = Some(Renderer3D::new_map(rs));
+                let mut ren = Renderer3D::new_map(rs);
+                ren.shadows = !self.no_shadows;
+                self.renderer = Some(ren);
                 let bc = rs
                     .device
                     .features()
@@ -3365,7 +3370,7 @@ impl Map3D {
                     format!("{} {} {}", r[0].swap(0, Ordering::Relaxed) / n, r[1].swap(0, Ordering::Relaxed) / n, r[2].swap(0, Ordering::Relaxed) / n).replace(' ', "|")
                 }
             );
-            let line = format!("{line} | draws {} | {} ({} placements) | {} fallbacks ({:?} draws, by level unlinked/linked {:?}) | wait: terrain idle {}, keep missing {}, inflight {}", self.stats.draws, self.cells.summary(), self.stats.in_cells, self.stats.n_fb, self.renderer.as_ref().map_or([0, 0], |r| r.fb_draws), self.stats.fb_lvl, self.world.idle(), self.keep.iter().filter(|m| !self.cache.contains_key(m)).count(), self.stats.inflight);
+            let line = format!("{line} | draws {} (shadow {}) | {} ({} placements) | {} fallbacks ({:?} draws, by level unlinked/linked {:?}) | wait: terrain idle {}, keep missing {}, inflight {}", self.stats.draws, self.renderer.as_ref().map_or(0, |r| r.shadow_draws), self.cells.summary(), self.stats.in_cells, self.stats.n_fb, self.renderer.as_ref().map_or([0, 0], |r| r.fb_draws), self.stats.fb_lvl, self.world.idle(), self.keep.iter().filter(|m| !self.cache.contains_key(m)).count(), self.stats.inflight);
             eprintln!("{line}");
         }
         if self.perf.near_s.is_none()
@@ -3491,12 +3496,14 @@ impl Map3D {
                 let v: Vec<f32> = self.perf.frame_ms.iter().copied().collect();
                 let (mean, p99, worst) = frame_summary(&v);
                 self.perf_log(&format!(
-                    "shot: last {} frames mean {:.1} ms ({:.0} fps), p99 {:.1}, worst {:.1}",
+                    "shot: last {} frames mean {:.1} ms ({:.0} fps), p99 {:.1}, worst {:.1} | shadows {} ({} draws)",
                     v.len(),
                     mean,
                     1000.0 / mean.max(0.01),
                     p99,
-                    worst
+                    worst,
+                    if self.renderer.as_ref().is_some_and(|r| r.shadows) { "on" } else { "off" },
+                    self.renderer.as_ref().map_or(0, |r| r.shadow_draws)
                 ));
                 if let Some(data) = self.data.clone() {
                     for f in std::mem::take(&mut self.auto.picks) {
