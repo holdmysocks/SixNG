@@ -209,6 +209,13 @@ impl Resource {
 }
 
 /// Find "<name>.#<tag>" in a system page; returns (name, tag).
+///
+/// The string is found by its ".#" and walked back over name characters.
+/// A byte in front of it that happens to be a name character (the tail of
+/// whatever is stored before the string) would be taken along
+/// ("dbison1800_bumr_01_dangle_mount_01"), so where a pointer of the page
+/// (0x5000_0000 | offset, 8-byte aligned) points into the walked-back run,
+/// the name starts there.
 pub fn find_resource_name(sys: &[u8]) -> Option<(String, String)> {
     let mut i = 0;
     while let Some(p) = memfind(&sys[i..], b".#") {
@@ -218,6 +225,10 @@ pub fn find_resource_name(sys: &[u8]) -> Option<(String, String)> {
             let mut s = at;
             while s > 0 && is_name_char(sys[s - 1]) {
                 s -= 1;
+            }
+            if s < at {
+                let pointed = sys.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).filter(|p| p >> 28 == 5).map(|p| (p & 0x0FFF_FFFF) as usize).filter(|p| (s..at).contains(p)).min();
+                s = pointed.unwrap_or(s);
             }
             if at - s >= 2 {
                 return Some((
@@ -326,5 +337,33 @@ mod page_stream_tests {
         // Too small or too large: no match.
         assert!(find_page_stream(&buf, 50000).is_none());
         assert!(find_page_stream(&buf2, 0x10001).is_none());
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::find_resource_name;
+
+    fn page(before: &[u8], name: &str, pointer: bool) -> Vec<u8> {
+        // a pointer slot at 0x10, the string at 0x40 after `before`
+        let mut p = vec![0u8; 0x40 - before.len()];
+        p.extend_from_slice(before);
+        if pointer {
+            p[0x10..0x18].copy_from_slice(&(0x5000_0040u64).to_le_bytes());
+        }
+        p.extend_from_slice(name.as_bytes());
+        p.extend_from_slice(&[b'.', b'#', b'f', b't', 0]);
+        p
+    }
+
+    #[test]
+    fn name_starts_where_the_pointer_points() {
+        let n = "bison1800_bumr_01_dangle_mount_01_hi";
+        // bytes in front that look like name characters are not the name's
+        assert_eq!(find_resource_name(&page(&[0xe8, b'm', 0xd4, b'd'], n, true)).unwrap().0, n);
+        assert_eq!(find_resource_name(&page(&[0, b'w', b'7'], n, true)).unwrap().0, n);
+        assert_eq!(find_resource_name(&page(&[0, 0], n, true)).unwrap(), (n.to_string(), "ft".to_string()));
+        // without a pointer the walked-back run is kept, as before
+        assert_eq!(find_resource_name(&page(&[0, b'd'], n, false)).unwrap().0, format!("d{n}"));
     }
 }
