@@ -103,6 +103,10 @@ pub struct Material {
     /// The packed slot holds a vehicle layer's material map
     /// (`lyr0materialatex`): only its blue channel is used, as occlusion.
     pub occlusion_only: bool,
+    /// How much brighter (or dimmer) than the viewer's emissive level an
+    /// emissive material lights, from the GLB's emissive strength
+    /// (`emissive_scale`); 1 when the export does not say.
+    pub emissive_scale: f32,
     pub slots: Vec<Slot>,
     /// worst slot status: ok / lowmip / flat
     pub gap: String,
@@ -812,6 +816,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             } else {
                 (alpha_mode, base_factor)
             };
+        let emissive_scale = emissive_scale(&m);
         materials.push(Material {
             name: m["name"].as_str().unwrap_or("").into(),
             class,
@@ -833,6 +838,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             ramp: None,
             parts: ex["classification"]["stand_in"] == "parts",
             occlusion_only,
+            emissive_scale,
             slots,
             gap: gap.into(),
             shader_hash: ex["shader_name_hash"].as_str().unwrap_or("").into(),
@@ -1218,6 +1224,26 @@ pub fn load_anims(path: &Path) -> Result<Vec<Anim>> {
     Ok(out)
 }
 
+/// The glTF emissive strength of a material: `emissiveFactor` (its
+/// brightest channel) x `KHR_materials_emissive_strength`. 1 when the
+/// material does not say.
+pub fn gltf_emissive_strength(m: &Value) -> f32 {
+    let f = m["emissiveFactor"].as_array().map(|a| a.iter().filter_map(|v| v.as_f64()).fold(0.0f64, f64::max)).unwrap_or(1.0);
+    let x = m["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"].as_f64().unwrap_or(1.0);
+    (f * x) as f32
+}
+
+/// The viewer's scale for an emissive material, from its glTF strength
+/// (1.0 = 100 nits, from the game's `emissivemultiplier`). The game's
+/// range (a glass railing at 0.05, a bulb at 6, an LED sign at 32) is far
+/// wider than the viewer's fixed exposure shows: a linear scale makes the
+/// dim ones black and the bright ones a flat white. The square root, kept
+/// between 0.25 and 3, keeps them in order while dim lights stay visible
+/// and bright signs keep their colours.
+pub fn emissive_scale(m: &Value) -> f32 {
+    gltf_emissive_strength(m).max(0.0).sqrt().clamp(0.25, 3.0)
+}
+
 #[cfg(test)]
 mod bench {
     use super::*;
@@ -1290,5 +1316,31 @@ mod tangent_tests {
         assert!(m[0].tan[0] < -0.99);
         assert!(bitangent(&m[0])[1] < -0.99);
         assert!(v[0].tan[3] != m[0].tan[3], "mirroring flips the sign");
+    }
+}
+
+#[cfg(test)]
+mod emissive_tests {
+    use super::*;
+
+    #[test]
+    fn emissive_scale_follows_the_gltf_strength() {
+        let m = |f: f64, x: Option<f64>| {
+            let mut m = serde_json::json!({"emissiveFactor": [f, f, f]});
+            if let Some(x) = x {
+                m["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"] = serde_json::json!(x);
+            }
+            m
+        };
+        // no strength said: as before
+        assert_eq!(emissive_scale(&serde_json::json!({})), 1.0);
+        assert_eq!(emissive_scale(&m(1.0, None)), 1.0);
+        // glass railings (0.05): kept visible
+        assert_eq!(emissive_scale(&m(0.05, None)), 0.25);
+        // a bulb (6.28) is brighter than the default, an LED sign (32) brighter still, up to 3
+        let bulb = emissive_scale(&m(1.0, Some(6.28)));
+        assert!((bulb - 6.28f32.sqrt()).abs() < 1e-5);
+        assert_eq!(emissive_scale(&m(1.0, Some(32.3))), 3.0);
+        assert!((gltf_emissive_strength(&m(1.0, Some(32.3))) - 32.3).abs() < 1e-4);
     }
 }
