@@ -905,6 +905,8 @@ fn frame_uniform(
         misc3: [look.tint as u32 as f32, 0.0, 0.0, 0.0],
         prev_view_proj: prev_view_projection.to_cols_array_2d(),
         jitter: [jitter[0], jitter[1], 0.0, 0.0],
+        frame: [0.0; 4],
+        light_view_proj: [[0.0; 4]; 4],
     }
 }
 
@@ -1515,6 +1517,7 @@ impl Renderer3D4 {
             detail: None,
             ramp_u: None,
             wear_mask: None,
+            primer_mask: None,
             ramp: None,
             parts: false,
             occlusion_only: false,
@@ -2707,7 +2710,7 @@ mod tests {
         };
         glb::Model {
             path: PathBuf::new(),
-            meshes: vec![glb::Mesh {
+            meshes: vec![glb::Mesh { strand_lod: None,
                 name: "test triangle".into(),
                 verts: vec![
                     vertex([-1.0, -1.0, 0.0]),
@@ -2736,6 +2739,7 @@ mod tests {
                 detail: None,
             ramp_u: None,
             wear_mask: None,
+            primer_mask: None,
             ramp: None,
                 parts: false,
                 occlusion_only: false,

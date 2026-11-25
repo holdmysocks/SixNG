@@ -72,6 +72,12 @@ pub struct Part {
     /// key of `hairtone` for a hair, brow, lash or beard item.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hair_preset: Option<String>,
+    /// A colour item (tag `b28c2b3f`): the strand colour set it gives every strand piece of one item category
+    /// of the outfit (category hash, colour set name hash; hex). A story character's outfit carries one per
+    /// category (hair, brows, lashes); it stands before the colour the hair item itself names. Read from the
+    /// data and checked against game pictures of one character, not read from the game's code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strand_colour: Option<(String, String)>,
     /// Layered-material preset (`e13ebaf8`, GarmentPreset) as hex, first
     /// along the chain: the key of the item's colours in the clothing
     /// material library (`matlib`).
@@ -283,6 +289,10 @@ fn hashes64(v: &Value, out: &mut Vec<u64>) {
 
 /// Decode the variations of one wardrobe resource. `archive` restricts the
 /// texture-linked models to that archive's entries (`packs.rpf`).
+/// Tag keys whose words name an item's drawable: the head, a hair, brow or body hair piece, a style word, and
+/// a lash piece (`2cd31b46`, e.g. `lashesnatural_fr1_000`).
+const NAME_TAGS: [u32; 4] = [0x4bfd_27dd, 0x023e_5a2f, 0x2a8c_db1d, 0x2cd3_1b46];
+
 pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers, archive: &str) -> Vec<Variation> {
     let f = crate::meta7a::field_name;
     let get = |h: u32| -> Vec<Value> { m.objects(h).into_iter().filter_map(|o| m.object(h, o, 0)).collect() };
@@ -305,7 +315,7 @@ pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers,
     // stay on the right body class.
     let mut class_counts: BTreeMap<&str, usize> = BTreeMap::new();
     for it in items.values() {
-        for &k in &[0x4bfd_27ddu32, 0x023e_5a2f, 0x2a8c_db1d] {
+        for &k in &NAME_TAGS {
             for x in tags(it, k) {
                 if let Some(p) = pre.get(&x).filter(|p| p.0.contains('_')) {
                     if let Some(bc) = body_class(&p.0) {
@@ -363,7 +373,7 @@ pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers,
                     }
                 }
             }
-            let name = chain.iter().find_map(|c| [0x4bfd_27ddu32, 0x023e_5a2f, 0x2a8c_db1d].iter().flat_map(|&k| tags(c, k)).find_map(|x| pre.get(&x).filter(|p| p.0.contains('_'))));
+            let name = chain.iter().find_map(|c| NAME_TAGS.iter().flat_map(|&k| tags(c, k)).find_map(|x| pre.get(&x).filter(|p| p.0.contains('_'))));
             let category = chain.iter().find_map(|c| c["Category"].as_u64().filter(|&x| x != 0)).map(|h| crate::names::lookup(h as u32, crate::names::Ctx::Field).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("{h:08x}")));
             let drawable = pick_with_name(&counts, name, ped_class.as_deref(), head_prefix.as_deref());
             let named = name.filter(|p| p.0.split('_').any(crate::outfit::is_fit)).map(|p| p.1.clone());
@@ -402,6 +412,10 @@ pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers,
             chain.iter().rev().for_each(|c| tag_words(c, pre, &mut tg));
             let tint = chain_tint(&chain);
             let preset = chain.iter().find_map(|c| c[f(0xe13e_baf8)].as_u64().filter(|&x| x != 0)).map(|x| format!("{x:08x}"));
+            let strand_colour = chain.iter().find_map(|c| {
+                let v = tags(c, 0xb28c_2b3f);
+                (v.len() >= 2).then(|| (format!("{:08x}", v[0]), format!("{:08x}", v[1])))
+            });
             let masked = chain.iter().filter_map(|c| state(c)).find(|s| [0x35ff_19d7u32, 0x3b76_01de].iter().any(|&k| s[f(k)].as_array().is_some_and(|a| !a.is_empty())));
             let hides: Vec<(String, String)> = masked.iter().flat_map(|s| s[f(0x35ff_19d7)].as_array().cloned().unwrap_or_default()).map(|e| (format!("{:08x}", e["Key"].as_u64().unwrap_or(0)), mask_of(&e["Item"]))).collect();
             let hides_sub: Vec<(String, u32, String)> = masked
@@ -422,7 +436,7 @@ pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers,
                     }
                 }
             }
-            parts.push(Part { layer, hides, hides_sub, state_guids, item: format!("{:08x}", it[f(0x6512_1749)].as_u64().unwrap_or(0)), category, name: name.map(|p| p.0.clone()), drawable, tex_remap, tags: tg, tint, named, guid, colour, colour_tag, hair_preset, preset, state: format!("{want_state:08x}"), skins, candidates: counts });
+            parts.push(Part { layer, hides, hides_sub, state_guids, item: format!("{:08x}", it[f(0x6512_1749)].as_u64().unwrap_or(0)), category, name: name.map(|p| p.0.clone()), drawable, tex_remap, tags: tg, tint, named, guid, colour, colour_tag, hair_preset, strand_colour, preset, state: format!("{want_state:08x}"), skins, candidates: counts });
         }
         let mut tags = BTreeMap::new();
         tag_words(&v, pre, &mut tags);

@@ -48,6 +48,10 @@ const SINK: f32 = 1.5;
 /// Ground nodes (coverage pass only) sit this far above the ground estimate.
 const GROUND_LIFT: f32 = 2.0;
 const WATER_Z: f32 = -2.0;
+/// Height (m) below which a terrain cell counts as sea: the beaches and
+/// dunes reach down to about -4 m, the open sea lies deeper.
+const SEA_FLOOR: f32 = -4.5;
+
 /// The map tiles' water colour (40, 80, 140 sRGB), linear.
 const SEA: [f32; 4] = [0.021, 0.080, 0.262, 1.0];
 /// Colour of cells filled from the height map (no map tile there), linear.
@@ -404,7 +408,9 @@ fn node_model(
                 tan: [1.0, 0.0, 0.0, 1.0],
                 uv0: [u, v],
                 uv1: [0.0, 0.0],
-                col: [255, 255, 255, 255],
+                // alpha 0: a sea cell (no height, or below SEA_FLOOR), whose
+                // painted water the shader draws as water
+                col: [255, 255, 255, if raw.is_nan() || raw < SEA_FLOOR { 0 } else { 255 }],
                 joints: [0; 4],
                 weights: [0; 4],
                 tint: [255; 4],
@@ -511,7 +517,7 @@ fn node_model(
     let nv = verts.len();
     let mut meshes = Vec::new();
     if !idx_hm.is_empty() {
-        meshes.push(glb::Mesh {
+        meshes.push(glb::Mesh { strand_lod: None,
             name: format!("world {}/{}/{} heightmap", k.l, k.x, k.y),
             verts: verts.clone(),
             indices: idx_hm,
@@ -527,7 +533,7 @@ fn node_model(
     if !idx.is_empty() || meshes.is_empty() {
         meshes.insert(
             0,
-            glb::Mesh {
+            glb::Mesh { strand_lod: None,
                 name: format!("world {}/{}/{}", k.l, k.x, k.y),
                 verts,
                 indices: idx,
@@ -554,6 +560,7 @@ fn node_model(
         detail: None,
             ramp_u: None,
             wear_mask: None,
+            primer_mask: None,
             ramp: None,
         parts: false,
         occlusion_only: false,
@@ -1164,7 +1171,8 @@ impl World {
         Ok(())
     }
 
-    /// The selected nodes plus a sea plane to the horizon.
+    /// The selected nodes plus a sea plane to the horizon (shaded as the
+    /// game's water on the HDR map).
     pub fn models(&mut self, rs: &egui_wgpu::RenderState, ren: &Renderer3D) -> Vec<&GpuModel> {
         if self.ocean.is_none() {
             let mut o = ren.upload(rs, &ocean_model(), &[]);
@@ -1221,7 +1229,9 @@ fn in_frustum(vp: &Mat4, r: [f32; 4], zmin: f32, zmax: f32) -> bool {
 fn ocean_model() -> glb::Model {
     let (cx, cy) = (X0 + W as f32 * CELL * 0.5, Y1 - H as f32 * CELL * 0.5);
     let e = 120_000.0;
-    let z = WATER_Z - SINK - 0.5;
+    // under every land cell (down to SEA_FLOOR, sunk), so it never covers
+    // a beach; sea cells above it are shaded as water themselves
+    let z = SEA_FLOOR - SINK - 0.5;
     let v = |x: f32, y: f32| glb::Vertex {
         pos: gl([x, y, z]),
         nrm: [0.0, 1.0, 0.0],
@@ -1240,7 +1250,7 @@ fn ocean_model() -> glb::Model {
         v(cx - e, cy + e),
         v(cx + e, cy + e),
     ];
-    let mesh = glb::Mesh {
+    let mesh = glb::Mesh { strand_lod: None,
         name: "sea".into(),
         verts,
         indices: vec![0, 2, 1, 1, 2, 3],
@@ -1252,7 +1262,7 @@ fn ocean_model() -> glb::Model {
     };
     let mat = glb::Material {
         name: "sea".into(),
-        class: "map_tile".into(),
+        class: "water".into(),
         alpha_mode: "OPAQUE".into(),
         base_factor: SEA,
         base: None,
@@ -1265,6 +1275,7 @@ fn ocean_model() -> glb::Model {
         detail: None,
             ramp_u: None,
             wear_mask: None,
+            primer_mask: None,
             ramp: None,
         parts: false,
         occlusion_only: false,

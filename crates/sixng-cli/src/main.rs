@@ -1707,7 +1707,8 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 eo.tex_remap.insert(hex(k)?, hex(v)?);
             }
             for (_, p) in &look_parts {
-                if p.slot == "head" && !p.skins.is_empty() {
+                // a head's face and a body item's painted skin, where stored
+                if matches!(p.slot.as_str(), "head" | "body upper" | "body lower") && !p.skins.is_empty() {
                     eo.part_skins.insert(p.drawable.clone(), p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect());
                 }
                 if p.colour.is_none() && p.preset_colours.iter().any(|c| c.is_some()) {

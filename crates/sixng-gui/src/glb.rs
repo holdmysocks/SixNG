@@ -30,6 +30,140 @@ pub struct Vertex {
     pub zone: [u8; 4],
 }
 
+/// How many of a strand piece's strands the game draws at a distance (its
+/// strand count rule, read from the game's code by the shader archive
+/// work). With d the distance in metres, T = tan(vertical field of view /
+/// 2), H the view's height in pixels, t the mean strand width and
+/// fd = min(1, 1 / (2 d DistanceScale)):
+///
+/// presets with ThicknessCurveVersion 2 (people's hair):
+///   p = min(1, t H / (max(d T, MinDistance) x TargetThickness))
+///   share = m + (p - m) x UseThicknessCurve, m = min(fd, p);
+///   nothing is drawn when 2 d T > DistanceCutoff
+///
+/// presets with version 1 (fur), R the piece's extent:
+///   q = t / max((d - R) T, 0.1), a = min(1, 2/3 H q), b = min(1, 2 H q)
+///   share = f + (b - f) x max(UseThicknessCurve, 0.1), f = min(fd, a)
+///
+/// The first round(count x share) strands in stored order are drawn, at
+/// their own width. Two global factors of the rule that start at 0 are
+/// taken as 0; that H is the render height is not confirmed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StrandLod {
+    /// Strands in the mesh (in stored order, the same number of indices each).
+    pub strands: u32,
+    /// Strands the piece stores.
+    pub stored: u32,
+    /// ThicknessCurveVersion of the piece's preset (1 or 2).
+    pub version: u8,
+    /// Mean strand width in metres (of the parameter set's first ramp).
+    pub t: f32,
+    pub target: f32,
+    pub dist_scale: f32,
+    pub min_dist: f32,
+    pub use_curve: f32,
+    pub cutoff: f32,
+    /// Version 1: the piece's extent in metres (the largest half-size of its box).
+    pub radius: f32,
+    /// ShadowLodScale: the sun shadow pass draws this share of the main pass's share.
+    pub shadow_scale: f32,
+    /// GILodScale and GIDistanceCutoff: the share of the drawn strands the game's ray-traced passes keep.
+    pub gi_scale: f32,
+    pub gi_cutoff: f32,
+}
+
+impl StrandLod {
+    /// Share of the stored strands drawn at distance `d` in a view `h` pixels high with tan(fov / 2) = `tan`.
+    pub fn share(&self, d: f32, h: f32, tan: f32) -> f32 {
+        let d = d.max(1e-3);
+        let fd = (1.0 / (2.0 * d * self.dist_scale.max(1e-6))).min(1.0);
+        if self.version == 1 {
+            let q = self.t / ((d - self.radius) * tan).max(0.1);
+            let (a, b) = ((h * 2.0 / 3.0 * q).min(1.0), (2.0 * h * q).min(1.0));
+            let f = fd.min(a);
+            return f + (b - f) * self.use_curve.max(0.1);
+        }
+        if 2.0 * d * tan > self.cutoff {
+            return 0.0;
+        }
+        let p = (self.t * h / ((d * tan).max(self.min_dist).max(1e-6) * self.target.max(1e-6))).min(1.0);
+        let m = fd.min(p);
+        m + (p - m) * self.use_curve
+    }
+
+    /// Share drawn into the sun shadow map: ShadowLodScale of the main share, which version 1 then caps and
+    /// lifts by the same two terms as the main share.
+    pub fn shadow_share(&self, d: f32, h: f32, tan: f32) -> f32 {
+        let s = self.share(d, h, tan) * self.shadow_scale;
+        if self.version != 1 {
+            return s;
+        }
+        let q = self.t / ((d.max(1e-3) - self.radius) * tan).max(0.1);
+        let (a, b) = ((h * 2.0 / 3.0 * q).min(1.0), (2.0 * h * q).min(1.0));
+        let s = s.min(a);
+        s + (b - s) * self.use_curve.max(0.1)
+    }
+
+    /// The game's ray-traced passes (its ray-traced sun shadows among them): of the `m` strands the main pass
+    /// draws, the first n = m x min(1, GILodScale) rounded down to a power of two are kept, each as a ribbon
+    /// m / n times its own width, so the summed width stays. None past the GI cutoff distance. Returns n.
+    pub fn traced_strands(&self, m: f32, d: f32, tan: f32) -> f32 {
+        let x = m * self.gi_scale.clamp(0.0, 1.0);
+        if x < 1.0 || 2.0 * d * tan > self.gi_cutoff {
+            return 0.0;
+        }
+        2f32.powf(x.log2().floor())
+    }
+
+    /// Indices to draw of the mesh's `n_idx` for a share of the stored strands.
+    pub fn indices(&self, n_idx: u32, share: f32) -> u32 {
+        if self.strands == 0 {
+            return n_idx;
+        }
+        let want = (self.stored as f32 * share).round() as u32;
+        (n_idx / self.strands) * want.min(self.strands)
+    }
+}
+
+#[cfg(test)]
+mod strand_lod_tests {
+    use super::StrandLod;
+
+    #[test]
+    fn the_strand_count_falls_with_distance() {
+        // long head hair: mean width 0.23 mm, TargetThickness 1.5, DistanceScale 1, MinDistance 0.1, UseThicknessCurve 0.5
+        let l = StrandLod { strands: 800, stored: 1000, version: 2, t: 2.3e-4, target: 1.5, dist_scale: 1.0, min_dist: 0.1, use_curve: 0.5, cutoff: 100.0, radius: 0.0, shadow_scale: 0.15, gi_scale: 0.1, gi_cutoff: 100.0 };
+        // a 1440-pixel view with tan(fov / 2) = 0.5
+        for (d, want) in [(0.5, 0.883), (1.0, 0.442), (2.0, 0.221), (5.0, 0.088)] {
+            assert!((l.share(d, 1440.0, 0.5) - want).abs() < 2e-3, "{d}: {}", l.share(d, 1440.0, 0.5));
+        }
+        // very close: every strand; a narrower view or more pixels: more strands; beyond the cutoff: none
+        assert_eq!(l.share(0.1, 1440.0, 0.5), 1.0);
+        assert!(l.share(2.0, 1440.0, 0.25) > l.share(2.0, 1440.0, 0.5) && l.share(2.0, 2160.0, 0.5) > l.share(2.0, 1440.0, 0.5));
+        assert_eq!(l.share(120.0, 1440.0, 0.5), 0.0);
+        // the mesh holds the first 800 of 1000 strands, 6 indices each
+        assert_eq!(l.indices(4800, 1.0), 4800);
+        assert_eq!(l.indices(4800, 0.442), 6 * 442);
+        // ray-traced passes: of 442 drawn strands 44.2 would be kept, rounded down to 32; none past the cutoff
+        assert_eq!(l.traced_strands(442.0, 1.0, 0.5), 32.0);
+        assert_eq!(l.traced_strands(442.0, 120.0, 0.5), 0.0);
+        assert_eq!(l.traced_strands(5.0, 1.0, 0.5), 0.0);
+    }
+
+    #[test]
+    fn fur_follows_the_first_version_of_the_rule() {
+        // fur 0.21 mm wide, DistanceScale 1, UseThicknessCurve 0, extent 0.3 m
+        let l = StrandLod { strands: 1000, stored: 1000, version: 1, t: 2.1e-4, target: 1.5, dist_scale: 1.0, min_dist: 0.1, use_curve: 0.0, cutoff: 100.0, radius: 0.3, shadow_scale: 0.25, gi_scale: 0.0, gi_cutoff: 100.0 };
+        // at 2.3 m: q = t / (2 x 0.5) = 2.1e-4, a = min(1, 960 q) = 0.2016, b = min(1, 2880 q) = 0.6048, fd = 0.217
+        let f = l.share(2.3, 1440.0, 0.5);
+        assert!((f - (0.2016 + (0.6048 - 0.2016) * 0.1)).abs() < 1e-3, "{f}");
+        // near: the distance term alone holds it at 1
+        assert_eq!(l.share(0.4, 1440.0, 0.5), 1.0);
+        // the shadow share at 2.3 m: 0.25 x 0.2419 = 0.0605, lifted a tenth of the way to b
+        assert!((l.shadow_share(2.3, 1440.0, 0.5) - (0.0605 + (0.6048 - 0.0605) * 0.1)).abs() < 1e-3);
+    }
+}
+
 pub struct Mesh {
     pub name: String,
     pub verts: Vec<Vertex>,
@@ -39,6 +173,8 @@ pub struct Mesh {
     pub has_tangents: bool,
     pub uv_sets: usize,
     pub centre: [f32; 3],
+    /// A strand hair piece that follows the game's strand count rule.
+    pub strand_lod: Option<StrandLod>,
 }
 
 /// Close-up fabric weave of a clothing material (see `Material::detail`).
@@ -102,6 +238,9 @@ pub struct Material {
     /// Vehicle parts: the game's tiling wear mask (material parameter
     /// `b9f4bdac`, three grunge channels), where the second layer shows.
     pub wear_mask: Option<usize>,
+    /// Vehicle parts: the primer's mask (material parameter `640111c6`,
+    /// three splat masks), where the second wear layer shows.
+    pub primer_mask: Option<usize>,
     /// Vehicle parts coloured per vertex (COLOR_0; alpha 254 = the primary
     /// body paint, other values = metalness in four steps x 50 + roughness in 50 steps).
     pub parts: bool,
@@ -858,6 +997,11 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                 .flatten()
                 .and_then(|t| t["png"].as_str())
                 .and_then(|p| add_img(out_root.join(p), false, &mut images)),
+            primer_mask: (ex["classification"]["stand_in"] == "parts" && !opts.base_only)
+                .then(|| tex_list.iter().find(|t| t["param_hash"] == "640111c6" && t["status"].as_str().is_some_and(|s| s.starts_with("ok")) && t["width"].as_u64().is_some_and(|w| w >= 32)))
+                .flatten()
+                .and_then(|t| t["png"].as_str())
+                .and_then(|p| add_img(out_root.join(p), false, &mut images)),
             parts: ex["classification"]["stand_in"] == "parts",
             occlusion_only,
             emissive_scale,
@@ -1091,7 +1235,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                     c[k] += x.pos[k] / n.max(1) as f32;
                 }
             }
-            meshes.push(Mesh {
+            meshes.push(Mesh { strand_lod: None,
                 name: mesh["name"].as_str().unwrap_or("").into(),
                 verts: v,
                 indices,
@@ -1131,6 +1275,24 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
 /// Append another model's meshes, materials and images (for animals and
 /// characters assembled from parts). The appended meshes are drawn in their
 /// bind pose (not skinned to this model's joints).
+/// Texture coordinate sets 0, 2 and 3 and the triangle indices of every
+/// mesh primitive of a GLB, in file order (a set the primitive does not
+/// have is empty). The viewer's vertices keep sets 0 and 1 only.
+pub fn uv_sets(path: &Path) -> Result<Vec<([Vec<[f32; 2]>; 3], Vec<u32>)>> {
+    let b = std::fs::read(path)?;
+    let (j, bin) = split_glb(&b)?;
+    let d = Doc { j, bin };
+    let mut out = Vec::new();
+    for m in d.j["meshes"].as_array().into_iter().flatten() {
+        for p in m["primitives"].as_array().into_iter().flatten() {
+            let set = |k: &str| -> Vec<[f32; 2]> { p["attributes"][k].as_u64().and_then(|a| d.floats(a as usize).ok()).filter(|x| x.1 == 2).map(|x| x.0.chunks_exact(2).map(|c| [c[0], c[1]]).collect()).unwrap_or_default() };
+            let idx = p["indices"].as_u64().and_then(|a| d.u32s(a as usize).ok()).unwrap_or_default();
+            out.push(([set("TEXCOORD_0"), set("TEXCOORD_2"), set("TEXCOORD_3")], idx));
+        }
+    }
+    Ok(out)
+}
+
 pub fn merge(into: &mut Model, other: Model) {
     let empty = into.meshes.is_empty();
     let img0 = into.images.len();
