@@ -617,7 +617,7 @@ impl App {
                     dirs.push((rel, b, f));
                 }
                 let snap = Snapshot { when: now(), dirs };
-                let _ = std::fs::write(
+                let _ = sixng_core::atomic::write(
                     w.join("status_snapshot.json"),
                     serde_json::to_vec(&snap).unwrap_or_default(),
                 );
