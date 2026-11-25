@@ -189,7 +189,12 @@ impl Sky {
             g("postfx_contrast_pivot", 0.18),
             g("postfx_desaturation", 1.0).clamp(0.0, 2.0),
         ];
-        u.post2 = [0.0, (g("sky_scattering_sun_disk_intensity_multiplier", 256.0) / 256.0).clamp(0.01, 1.0), 0.0, 0.0];
+        u.post2 = [
+            0.0,
+            (g("sky_scattering_sun_disk_intensity_multiplier", 256.0) / 256.0).clamp(0.01, 1.0),
+            g("ambient_bounce_intensity", 0.5).clamp(0.0, 4.0),
+            0.0,
+        ];
         u.flags = [1, 0, 0, 0];
         // the light that shades surfaces: the sun until it is a little under
         // the horizon (the twilight sky still lights), then the moon
@@ -225,7 +230,7 @@ impl Sky {
         u.expo = [0.0, -6.0, 17.0, 1.3];
         u.expo2 = [0.3, 0.3, 0.1797, 0.016];
         u.post = [0.25 * 0.1498, 1.0, 0.1797, 1.0];
-        u.post2 = [0.0, 1.0, 0.0, 0.0];
+        u.post2 = [0.0, 1.0, 0.5, 0.0];
         u.flags = [1, 0, 0, 0];
         let key_is_moon = sun.y < -0.02;
         Sky {

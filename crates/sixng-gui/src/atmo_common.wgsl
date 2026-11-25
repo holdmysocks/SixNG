@@ -34,7 +34,7 @@ struct Scene {
     expo: vec4<f32>,      // exposure offset EV, lowest EV100, highest EV100, adaptation rate per s
     expo2: vec4<f32>,     // low percentile, high percentile, key value, frame time s
     post: vec4<f32>,      // bloom amount, contrast, contrast pivot, saturation
-    post2: vec4<f32>,     // 1 = exposure reset this frame, sun disc boost, unused, unused
+    post2: vec4<f32>,     // 1 = exposure reset this frame, sun disc boost, bounce intensity, unused
     flags: vec4<u32>,     // x 1 = map HDR frame, y frame index, z width, w height
     inv_vp: mat4x4<f32>,  // camera clip to world
     cam: vec4<f32>,       // camera position (world m), w unused

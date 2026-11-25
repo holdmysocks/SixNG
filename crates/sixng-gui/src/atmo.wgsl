@@ -238,11 +238,15 @@ fn cs_ambient(@builtin(local_invocation_index) li: u32) {
         // each direction stands for 4 pi / 512 sr
         let w = 4.0 * PI / 512.0;
         let sky_on_ground = t[6] * w * S.air_glow.w / PI;
+        // sun and moon light bounced off lit surroundings (ground, walls)
+        // reaches a surface from every side: the timecycle's
+        // ambient_bounce_intensity times the ground's albedo, as irradiance
+        let bounce = e_dir * S.air_glow.w * S.post2.z;
         for (var j = 0u; j < 6u; j++) {
             // the ground's share from the sky: the lower hemisphere seen by the axis
             let below = select(0.5, select(0.0, 1.0, j == 3u), j == 2u || j == 3u);
             let g = sky_on_ground * PI * below;
-            ST.v[1u + j] = vec4((t[j] * w + g) / PI * S.intens.w, 1.0);
+            ST.v[1u + j] = vec4((t[j] * w + g) / PI * S.intens.w + bounce / PI, 1.0);
         }
         ST.v[7] = vec4(ts, 1.0);
         ST.v[8] = vec4(tm, 1.0);
