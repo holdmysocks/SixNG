@@ -121,9 +121,11 @@ impl Style {
     /// Re-shape one strand (its points in order, root first): point j goes
     /// to the strand's point at arc length z(u) L, u = j / (K - 1), plus the
     /// style offset x along the strand's normal (`up` made square to the
-    /// strand) and y along normal x tangent. Which offset goes on which axis
-    /// is not settled; `swap` exchanges them.
-    pub fn apply(&self, pts: &mut [[f32; 3]], up: [f32; 3], swap: bool) {
+    /// strand) and y along normal x tangent (`swap` exchanges them). The
+    /// offset's length is 0.8 mm + k (|d| - 0.8 mm), capped at |d|: the
+    /// game's k is a per-point weight from its strand generator (not read)
+    /// times the per-instance style strength.
+    pub fn apply(&self, pts: &mut [[f32; 3]], up: [f32; 3], swap: bool, k_strength: f32) {
         let k = pts.len();
         if k < 2 || self.samples.is_empty() {
             return;
@@ -142,6 +144,9 @@ impl Style {
         let src = pts.to_vec();
         for j in 0..k {
             let [x, y, z] = self.at(j as f32 / (k - 1) as f32);
+            let len = (x * x + y * y).sqrt();
+            let f = if len > 1e-9 { ((0.0008 + k_strength * (len - 0.0008)) / len).clamp(0.0, 1.0) } else { 0.0 };
+            let (x, y) = (x * f, y * f);
             let s = z.clamp(0.0, 1.0) * total;
             let i = arc.partition_point(|&a| a <= s).clamp(1, k - 1);
             let seg = (arc[i] - arc[i - 1]).max(1e-9);
@@ -599,11 +604,13 @@ impl Groom {
         // The strand's style is picked by the generator (not read); here by
         // its variant draw among the stored records.
         let swap = std::env::var_os("SIXNG_STYLE_SWAP").is_some();
-        let off = std::env::var_os("SIXNG_STYLE").is_none();
+        // SIXNG_STYLE=<k>: the strength (1 when not a number)
+        let k_style = std::env::var("SIXNG_STYLE").ok().map(|v| v.parse::<f32>().unwrap_or(1.0).clamp(0.0, 1.0));
+        let off = k_style.is_none();
         let style = |pts: &mut [[f32; 3]], up: [f32; 3], d: f32| {
             if !off && !self.styles.is_empty() {
                 let i = ((d * self.styles.len() as f32) as usize).min(self.styles.len() - 1);
-                self.styles[i].apply(pts, up, swap);
+                self.styles[i].apply(pts, up, swap, k_style.unwrap_or(1.0));
             }
         };
         // scattered strands
@@ -1186,7 +1193,7 @@ mod tests {
         assert!((a[0] - 0.0).abs() < 1e-4 && a[1].abs() < 1e-4 && (a[2] - 0.5).abs() < 1e-3, "{a:?}");
         // a straight strand along -z with up = +x: the tip moves 1 cm along +x
         let mut pts = [[0.0, 0.0, 0.0], [0.0, 0.0, -0.5], [0.0, 0.0, -1.0]];
-        st.apply(&mut pts, [1.0, 0.0, 0.0], false);
+        st.apply(&mut pts, [1.0, 0.0, 0.0], false, 1.0);
         assert!((pts[2][0] - 0.01).abs() < 1e-4 && (pts[2][2] + 1.0).abs() < 1e-4 && (pts[0][0] + 0.01).abs() < 1e-4, "{pts:?}");
     }
 
