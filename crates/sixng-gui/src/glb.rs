@@ -28,55 +28,70 @@ pub struct Vertex {
     pub zone: [u8; 4],
 }
 
-/// How many of a hair piece's strands the game draws at a distance (its
-/// strand count rule, read from the game's code by the shader archive work
-/// for the LOD presets with ThicknessCurveVersion 2): with d the distance
-/// in metres,
+/// How many of a strand piece's strands the game draws at a distance (its
+/// strand count rule, read from the game's code by the shader archive
+/// work). With d the distance in metres, T = tan(vertical field of view /
+/// 2), H the view's height in pixels, t the mean strand width and
+/// fd = min(1, 1 / (2 d DistanceScale)):
 ///
-///   fd = min(1, 1 / (2 d DistanceScale))
-///   p  = min(1, a / max(0.5 d, MinDistance)),  a = mean strand width x 1440 / TargetThickness
-///   m  = min(fd, p),  share = m + (p - m) x UseThicknessCurve
+/// presets with ThicknessCurveVersion 2 (people's hair):
+///   p = min(1, t H / (max(d T, MinDistance) x TargetThickness))
+///   share = m + (p - m) x UseThicknessCurve, m = min(fd, p);
+///   nothing is drawn when 2 d T > DistanceCutoff
 ///
-/// and the first round(count x share) strands in stored order are drawn,
-/// at their own width.
+/// presets with version 1 (fur), R the piece's extent:
+///   q = t / max((d - R) T, 0.1), a = min(1, 2/3 H q), b = min(1, 2 H q)
+///   share = f + (b - f) x max(UseThicknessCurve, 0.1), f = min(fd, a)
+///
+/// The first round(count x share) strands in stored order are drawn, at
+/// their own width. Two global factors of the rule that start at 0 are
+/// taken as 0; that H is the render height is not confirmed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StrandLod {
     /// Strands in the mesh (in stored order, the same number of indices each).
     pub strands: u32,
     /// Strands the piece stores.
     pub stored: u32,
-    pub a: f32,
+    /// ThicknessCurveVersion of the piece's preset (1 or 2).
+    pub version: u8,
+    /// Mean strand width in metres (of the parameter set's first ramp).
+    pub t: f32,
+    pub target: f32,
     pub dist_scale: f32,
     pub min_dist: f32,
     pub use_curve: f32,
+    pub cutoff: f32,
+    /// Version 1: the piece's extent in metres.
+    pub radius: f32,
     /// ShadowLodScale: the sun shadow pass draws this share of the main pass's share.
     pub shadow_scale: f32,
 }
 
 impl StrandLod {
-    pub fn share(&self, d: f32) -> f32 {
+    /// Share of the stored strands drawn at distance `d` in a view `h` pixels high with tan(fov / 2) = `tan`.
+    pub fn share(&self, d: f32, h: f32, tan: f32) -> f32 {
         let d = d.max(1e-3);
         let fd = (1.0 / (2.0 * d * self.dist_scale.max(1e-6))).min(1.0);
-        let p = (self.a / (0.5 * d).max(self.min_dist).max(1e-6)).min(1.0);
+        if self.version == 1 {
+            let q = self.t / ((d - self.radius) * tan).max(0.1);
+            let (a, b) = ((h * 2.0 / 3.0 * q).min(1.0), (2.0 * h * q).min(1.0));
+            let f = fd.min(a);
+            return f + (b - f) * self.use_curve.max(0.1);
+        }
+        if 2.0 * d * tan > self.cutoff {
+            return 0.0;
+        }
+        let p = (self.t * h / ((d * tan).max(self.min_dist).max(1e-6) * self.target.max(1e-6))).min(1.0);
         let m = fd.min(p);
         m + (p - m) * self.use_curve
     }
 
-    /// Indices to draw of the mesh's `n_idx` at distance `d`.
-    pub fn indices(&self, n_idx: u32, d: f32) -> u32 {
+    /// Indices to draw of the mesh's `n_idx` for a share of the stored strands.
+    pub fn indices(&self, n_idx: u32, share: f32) -> u32 {
         if self.strands == 0 {
             return n_idx;
         }
-        let want = (self.stored as f32 * self.share(d)).round() as u32;
-        (n_idx / self.strands) * want.min(self.strands)
-    }
-
-    /// Indices to draw into the sun shadow map at distance `d`.
-    pub fn shadow_indices(&self, n_idx: u32, d: f32) -> u32 {
-        if self.strands == 0 {
-            return n_idx;
-        }
-        let want = (self.stored as f32 * self.share(d) * self.shadow_scale).round() as u32;
+        let want = (self.stored as f32 * share).round() as u32;
         (n_idx / self.strands) * want.min(self.strands)
     }
 }
@@ -88,17 +103,29 @@ mod strand_lod_tests {
     #[test]
     fn the_strand_count_falls_with_distance() {
         // long head hair: mean width 0.23 mm, TargetThickness 1.5, DistanceScale 1, MinDistance 0.1, UseThicknessCurve 0.5
-        let l = StrandLod { strands: 800, stored: 1000, a: 2.3e-4 * 1440.0 / 1.5, dist_scale: 1.0, min_dist: 0.1, use_curve: 0.5, shadow_scale: 0.15 };
+        let l = StrandLod { strands: 800, stored: 1000, version: 2, t: 2.3e-4, target: 1.5, dist_scale: 1.0, min_dist: 0.1, use_curve: 0.5, cutoff: 100.0, radius: 0.0, shadow_scale: 0.15 };
+        // a 1440-pixel view with tan(fov / 2) = 0.5
         for (d, want) in [(0.5, 0.883), (1.0, 0.442), (2.0, 0.221), (5.0, 0.088)] {
-            assert!((l.share(d) - want).abs() < 2e-3, "{d}: {}", l.share(d));
+            assert!((l.share(d, 1440.0, 0.5) - want).abs() < 2e-3, "{d}: {}", l.share(d, 1440.0, 0.5));
         }
-        // very close: every strand
-        assert_eq!(l.share(0.1), 1.0);
+        // very close: every strand; a narrower view or more pixels: more strands; beyond the cutoff: none
+        assert_eq!(l.share(0.1, 1440.0, 0.5), 1.0);
+        assert!(l.share(2.0, 1440.0, 0.25) > l.share(2.0, 1440.0, 0.5) && l.share(2.0, 2160.0, 0.5) > l.share(2.0, 1440.0, 0.5));
+        assert_eq!(l.share(120.0, 1440.0, 0.5), 0.0);
         // the mesh holds the first 800 of 1000 strands, 6 indices each
-        assert_eq!(l.indices(4800, 0.1), 4800);
-        assert_eq!(l.indices(4800, 1.0), 6 * 442);
-        // the shadow pass: 0.15 of that share
-        assert_eq!(l.shadow_indices(4800, 1.0), 6 * 66);
+        assert_eq!(l.indices(4800, 1.0), 4800);
+        assert_eq!(l.indices(4800, 0.442), 6 * 442);
+    }
+
+    #[test]
+    fn fur_follows_the_first_version_of_the_rule() {
+        // fur 0.21 mm wide, DistanceScale 1, UseThicknessCurve 0, extent 0.3 m
+        let l = StrandLod { strands: 1000, stored: 1000, version: 1, t: 2.1e-4, target: 1.5, dist_scale: 1.0, min_dist: 0.1, use_curve: 0.0, cutoff: 100.0, radius: 0.3, shadow_scale: 0.25 };
+        // at 2.3 m: q = t / (2 x 0.5) = 2.1e-4, a = min(1, 960 q) = 0.2016, b = min(1, 2880 q) = 0.6048, fd = 0.217
+        let f = l.share(2.3, 1440.0, 0.5);
+        assert!((f - (0.2016 + (0.6048 - 0.2016) * 0.1)).abs() < 1e-3, "{f}");
+        // near: the distance term alone holds it at 1
+        assert_eq!(l.share(0.4, 1440.0, 0.5), 1.0);
     }
 }
 

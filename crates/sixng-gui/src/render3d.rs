@@ -2235,9 +2235,16 @@ impl Renderer3D {
         let eye = cam.eye();
         for me in models.iter().flat_map(|gm| gm.meshes.iter()) {
             if let Some(l) = me.strand_lod {
-                me.n_draw.store(l.indices(me.n_idx, (eye - me.centre).length()), std::sync::atomic::Ordering::Relaxed);
-                me.n_shadow.store(l.shadow_indices(me.n_idx, (eye - me.centre).length()), std::sync::atomic::Ordering::Relaxed);
-                if std::env::var("SIXNG_DEBUG_HAIR").is_ok() { static ONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0); if ONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 { eprintln!("strand piece at {:.2} m: share {:.3}", (eye - me.centre).length(), l.share((eye - me.centre).length())); } }
+                let d = (eye - me.centre).length();
+                let f = l.share(d, size[1] as f32, (cam.fov * 0.5).tan());
+                me.n_draw.store(l.indices(me.n_idx, f), std::sync::atomic::Ordering::Relaxed);
+                me.n_shadow.store(l.indices(me.n_idx, f * l.shadow_scale), std::sync::atomic::Ordering::Relaxed);
+                if std::env::var("SIXNG_DEBUG_HAIR").is_ok() {
+                    static ONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if ONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+                        eprintln!("strand piece (rule version {}) at {d:.2} m: share {f:.3}", l.version);
+                    }
+                }
             }
         }
         let lb = (!lines.is_empty()).then(|| {

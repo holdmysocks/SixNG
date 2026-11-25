@@ -394,6 +394,18 @@ pub struct PartFx {
     pub under: Vec<UnderPaint>,
 }
 
+/// The strand count rule of a piece from its hair LOD preset (a record of the parsed presets) and the first
+/// ramp of its parameter set, whose mean width the game takes: Thickness x its curve at 16 samples.
+fn strand_lod(lp: &serde_json::Value, ramp: &sixng_core::hairtone::ParamRamp, coat: &sixng_core::groom::Coat) -> Option<glb::StrandLod> {
+    let num = |k: &str| lp[k].as_f64().map(|x| x as f32);
+    let t = ((0..16).map(|i| (ramp.width * ramp.at(i as f32 / 15.0)[3]).max(1e-6)).sum::<f32>() / 16.0).min(0.0255);
+    let version = num("ThicknessCurveVersion")? as u8;
+    if version != 1 && version != 2 {
+        return None;
+    }
+    Some(glb::StrandLod { strands: coat.guides.len() as u32, stored: coat.stored as u32, version, t, target: num("TargetThickness")?, dist_scale: num("DistanceScale")?, min_dist: num("MinDistance")?, use_curve: num("UseThicknessCurve")?, cutoff: num("DistanceCutoff").unwrap_or(f32::MAX), radius: 0.0, shadow_scale: num("ShadowLodScale").unwrap_or(1.0) })
+}
+
 /// A painted hair layer of the head skin with its two colours: the hair
 /// colour the game draws on the scalp under the strands, and the brows
 /// under the brow strands.
@@ -1240,7 +1252,7 @@ impl ModelView {
         let slot_params: HashMap<String, u32> = std::env::var("SIXNG_HAIR_PARAMSETS").ok().map(|s| s.split(',').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_string(), joaat(&v.to_ascii_lowercase()))).collect()).unwrap_or_default();
         // SIXNG_HAIR_LOD=<json of the parsed hair LOD presets> applies the game's strand count rule to a character's pieces
         // (head hair by the preset Default: whether its items name another one is not traced; brows, lashes, beard and
-        // body hair by the presets of those names; only presets with ThicknessCurveVersion 2, whose rule is read)
+        // body hair by the presets of those names) and to an animal's fur given with SIXNG_FUR_SETS (the preset Animal)
         let lod_presets: Option<serde_json::Value> = std::env::var("SIXNG_HAIR_LOD").ok().and_then(|f| serde_json::from_slice(&std::fs::read(f).ok()?).ok());
         let fur_sets: Option<(u32, u32)> = std::env::var("SIXNG_FUR_SETS").ok().and_then(|s| s.split_once(',').map(|(c, p)| (joaat(&c.to_ascii_lowercase()), joaat(&p.to_ascii_lowercase()))));
         let ctx = ctx.clone();
@@ -1310,17 +1322,8 @@ impl ModelView {
                                 let thick = match t.slot.as_str() { "brows" | "lashes" | "beard" => 1.0, "bodyhair" => 2.0, _ => 0.0 };
                                 let lit = slot_params.get(&t.slot).and_then(|n| d.param_flags(*n)).filter(|_| !force_hair_sum).map_or(1.0, |(std, fs)| if std { 2.0 + fs } else { 1.0 });
                                 if let (Some(ps), Some(lp)) = (ps, lod_presets.as_ref()) {
-                                    let lp = &lp[match t.slot.as_str() { "brows" => "Brows", "lashes" => "Lashes", "beard" => "Beard", "body hair" => "BodyHair", _ => "Default" }];
-                                    let num = |k: &str| lp[k].as_f64().map(|x| x as f32);
-                                    // mean strand width: that of the set's first ramp (Thickness x its curve, 16 samples), as the game takes it
-                                    let mean = ((0..16).map(|i| (ps[0].width * ps[0].at(i as f32 / 15.0)[3]).max(1e-6)).sum::<f32>() / 16.0).min(0.0255);
-                                    if let (Some(2.0), Some(tt), Some(ds), Some(md), Some(uc)) = (num("ThicknessCurveVersion"), num("TargetThickness"), num("DistanceScale"), num("MinDistance"), num("UseThicknessCurve")) {
-                                        lod = Some(glb::StrandLod { strands: coat.guides.len() as u32, stored: coat.stored as u32, a: mean * 1440.0 / tt.max(1e-6), dist_scale: ds, min_dist: md, use_curve: uc, shadow_scale: num("ShadowLodScale").unwrap_or(1.0) });
-                                    }
+                                    lod = strand_lod(&lp[match t.slot.as_str() { "brows" => "Brows", "lashes" => "Lashes", "beard" => "Beard", "body hair" => "BodyHair", _ => "Default" }], &ps[0], &coat);
                                 }
-                                // research: SIXNG_HAIR_LOD_WIDEN=<metres> widens the strands by 1 / the count rule's share at that distance
-                                // (a test of whether the game's reduced count comes with wider strands; not read from its code)
-                                let share_widen = lod.zip(std::env::var("SIXNG_HAIR_LOD_WIDEN").ok().and_then(|d| d.parse::<f32>().ok())).map_or(share_widen, |(l, d)| 1.0 / l.share(d).max(0.05));
                                 let pf = |s: usize, f: f32| { let r = &ps.unwrap()[var(s)]; let v = r.at(f); [v[0], v[1], v[2], r.width * v[3].max(0.05) * share_widen, lit, thick] };
                                 g.coat_glb_ramped(&name, &coat, w, &|s, f| lin8(cs[var(s)].at(f), [255; 3]), ps.map(|_| &pf as &dyn Fn(usize, f32) -> [f32; 6]), serde_json::json!({}))
                             }
@@ -1337,6 +1340,10 @@ impl ModelView {
                                 let (cn, pn) = fur_sets.unwrap();
                                 let (cs, ps) = (d.colour_set(cn), d.param_set(pn));
                                 let thick = 0.0;
+                                // an animal's fur: the preset Animal
+                                if let (Some(ps), Some(lp)) = (ps, lod_presets.as_ref()) {
+                                    lod = strand_lod(&lp["Animal"], &ps[0], &coat);
+                                }
                                 let lit = d.param_flags(pn).filter(|_| !force_hair_sum).map_or(1.0, |(std, fs)| if std { 2.0 + fs } else { 1.0 });
                                 let pf = |s: usize, f: f32| { let r = &ps.unwrap()[var(s)]; let v = r.at(f); [v[0], v[1], v[2], r.width * v[3].max(0.05) * share_widen, lit, thick] };
                                 g.coat_glb_ramped(&name, &coat, w, &|s, f| match cs { Some(cs) => lin8(cs[var(s)].at(f), blend(s).map(|m| (m as f32 * g.tint_weight + 255.0 * (1.0 - g.tint_weight) + 0.5) as u8)), None => { let c = blend(s); [c[0], c[1], c[2], 255] } }, ps.map(|_| &pf as &dyn Fn(usize, f32) -> [f32; 6]), serde_json::json!({}))
@@ -1361,11 +1368,21 @@ impl ModelView {
                     };
                     std::fs::write(&p, glb_bytes)?;
                     let mut gm = glb::load(&p, &dir)?;
-                    if let Some(l) = lod.filter(|l| gm.meshes.len() == 1 && l.strands > 0 && gm.meshes[0].indices.len() as u32 % l.strands == 0) {
-                        if std::env::var("SIXNG_DEBUG_HAIR").is_ok() { eprintln!("coat {off:x}: count rule a {:.4} share at 0.5 / 1 / 2 m: {:.3} {:.3} {:.3}", l.a, l.share(0.5), l.share(1.0), l.share(2.0)); }
+                    if let Some(mut l) = lod.filter(|l| gm.meshes.len() == 1 && l.strands > 0 && gm.meshes[0].indices.len() as u32 % l.strands == 0) {
+                        // the piece's extent: half the diagonal of its box (what the game's extent is exactly is not read)
+                        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+                        for v in &gm.meshes[0].verts {
+                            for q in 0..3 {
+                                lo[q] = lo[q].min(v.pos[q]);
+                                hi[q] = hi[q].max(v.pos[q]);
+                            }
+                        }
+                        l.radius = 0.5 * (0..3).map(|q| (hi[q] - lo[q]).max(0.0).powi(2)).sum::<f32>().sqrt();
+                        if std::env::var("SIXNG_DEBUG_HAIR").is_ok() {
+                            eprintln!("coat {off:x}: count rule version {} t {:.2e} m extent {:.2} m", l.version, l.t, l.radius);
+                        }
                         gm.meshes[0].strand_lod = Some(l);
                     }
-                    gm.materials.iter_mut().for_each(|x| x.mr = Some([0.0, 0.85]));
                     if let Some(r) = &rig {
                         r.bind(&mut gm);
                     }
