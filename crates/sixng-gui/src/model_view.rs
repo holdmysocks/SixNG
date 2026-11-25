@@ -1324,6 +1324,7 @@ impl ModelView {
                                 // lashes, beard, 0.25 body hair): it sets how many strands the game draws at a distance; not used yet
                                 let thick = match t.slot.as_str() { "brows" | "lashes" | "beard" => 1.0, "bodyhair" => 2.0, _ => 0.0 };
                                 let lit = slot_params.get(&t.slot).and_then(|n| d.param_flags(*n)).filter(|_| !force_hair_sum).map_or(1.0, |(std, fs)| if std { 2.0 + fs } else { 1.0 });
+                                if std::env::var("SIXNG_DEBUG_HAIR").is_ok() { eprintln!("coat {off:x}: slot {:?} lighting flag {lit} (sets flags {:?}, forced hair sum {force_hair_sum})", t.slot, slot_params.get(&t.slot).map(|n| d.param_flags(*n))); }
                                 if let (Some(ps), Some(lp)) = (ps, lod_presets.as_ref()) {
                                     lod = strand_lod(&lp[match t.slot.as_str() { "brows" => "Brows", "lashes" => "Lashes", "beard" => "Beard", "body hair" => "BodyHair", _ => "Default" }], &ps[0], &coat);
                                 }
