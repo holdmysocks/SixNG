@@ -413,49 +413,82 @@ fn strand_openness(clip: vec4<f32>) -> f32 {
 }
 
 // Screen-space occlusion of the ambient light on an opaque surface, from the
-// camera depth pre-pass. The game's indirect light carries a screen-space
-// horizon occlusion (found by the shader archive work; its radius, falloff
-// and the way it enters the light are not read). This is the viewer's own
-// stand-in of that kind: two slices through the pixel, four steps each way
-// at growing distances, the highest horizon over the surface on each side,
-// faded with distance; radius 0.15 m (the viewer's choice).
+// camera depth pre-pass: the game's horizon occlusion pass (read in full from
+// its shader archive by the shader archive work). Two perpendicular slices
+// through the pixel at a random turn; on each side of a slice two depth taps
+// at j^2 R + 1.3 and (1 + j)^2 R + 1.3 pixels (j random, 0..1); R in pixels,
+// 0.625 x the target height, held to 64 near the eye. A tap's horizon is
+// blended towards the surface's own tangent plane by its depth difference in
+// pixel units ((0.15 dz)^2, so a tap 6.7 pixels or more away in depth counts
+// for nothing): the pass only sees fine contact occlusion. The larger
+// horizon per side is clamped to the normal's hemisphere and integrated the
+// usual way. The game's noise comes from a texture and temporal passes
+// follow; here the noise is a hash and the viewer's frame accumulation
+// averages it. How the game mixes the result into its indirect light is not
+// read: the viewer scales its ambient light by it.
 fn screen_occlusion(clip: vec4<f32>, wp: vec3<f32>, n: vec3<f32>) -> f32 {
     if (F.light_vp[3][3] == 0.0) { return 1.0; }
     let size = F.jitter.yz;
-    let radius = 0.15;
-    // pixels a metre covers at the pixel's distance
     let toeye = F.cam_pos.xyz - wp;
-    var right = cross(toeye, vec3(0.0, 1.0, 0.0));
-    right = right / max(length(right), 1.0e-5);
+    let v = toeye / max(length(toeye), 1.0e-6);
     let c0 = F.view_proj * vec4(wp, 1.0);
-    let c1 = F.view_proj * vec4(wp + right * radius, 1.0);
-    let rpx = min(length((c1.xy / c1.w - c0.xy / c0.w) * 0.5 * size), 0.25 * size.y);
-    let turn = ign(clip.xy + vec2(F.jitter.x * 7.31, F.jitter.x * 3.17)) * 3.14159;
+    let z = max(c0.w, 1.0e-4);
+    // pixels a metre covers at the pixel's depth: 0.5 H / tan(fov_y / 2) / z
+    var up = cross(v, cross(vec3(0.0, 1.0, 0.0), v));
+    up = up / max(length(up), 1.0e-5);
+    let c1 = F.view_proj * vec4(wp + up * 0.01, 1.0);
+    let ppm = length((c1.xy / c1.w - c0.xy / c0.w) * 0.5 * size) * 100.0;
+    let r0 = 0.625 * size.y;
+    let th = tanh(min(0.02 * z, 10.0));
+    let rad = mix(clamp(r0, 1.0, 64.0), r0, th * th);
+    let phi = ign(clip.xy + vec2(F.jitter.x * 7.31, F.jitter.x * 3.17)) * 1.5708;
     let jit = ign(clip.xy * 1.37 + vec2(F.jitter.x * 2.11, 17.0));
-    var occ = 0.0;
+    let ndc0 = c0.xy / c0.w;
+    var sum = 0.0;
     for (var sl = 0; sl < 2; sl++) {
-        let ang = turn + f32(sl) * 1.5708;
+        let ang = phi + f32(sl) * 1.5708;
         let dir = vec2(cos(ang), sin(ang));
-        for (var side = -1; side <= 1; side += 2) {
-            var hmax = 0.0;
-            for (var k = 1; k <= 4; k++) {
-                let t = (f32(k) - jit) * 0.25;
-                let q = clip.xy + dir * f32(side) * (t * t * rpx + 1.3);
-                if (q.x < 0.0 || q.y < 0.0 || q.x >= size.x || q.y >= size.y) { continue; }
-                let d = eye_depth(vec2<i32>(q));
-                if (d <= 0.0) { continue; }
-                let ndc = vec2(q.x / size.x * 2.0 - 1.0, 1.0 - q.y / size.y * 2.0);
-                let w4 = F.inv_view_proj * vec4(ndc, d, 1.0);
-                let dv = w4.xyz / w4.w - wp;
-                let len = length(dv);
-                let rise = dot(dv, n) / max(len, 1.0e-5);
-                let fall = clamp(1.0 - len * len / (radius * radius), 0.0, 1.0);
-                hmax = max(hmax, (rise - 0.08) * fall);
+        // the slice's direction in the world, at right angles to the view
+        let w1 = F.inv_view_proj * vec4(ndc0 + vec2(dir.x, -dir.y) * 0.01, c0.z / c0.w, 1.0);
+        var t = w1.xyz / w1.w - wp;
+        t = t - v * dot(t, v);
+        t = t / max(length(t), 1.0e-9);
+        let axis = cross(t, v);
+        let pn = n - axis * dot(n, axis);
+        let pl = length(pn);
+        let na = select(-1.0, 1.0, dot(pn, t) >= 0.0) * acos(clamp(dot(pn, v) / max(pl, 1.0e-5), -1.0, 1.0));
+        var hc = vec2(-1.0, -1.0);
+        for (var sd = 0; sd < 2; sd++) {
+            let sg = f32(sd) * 2.0 - 1.0;
+            // the tangent plane's own horizon on this side
+            let flat = -sg * sin(na);
+            var best = -1.0;
+            for (var k = 0; k < 2; k++) {
+                let d = (f32(k) + jit) * (f32(k) + jit) * rad + 1.3;
+                let q = floor(clip.xy) + round(dir * sg * d) + 0.5;
+                var h = flat;
+                if (q.x >= 0.0 && q.y >= 0.0 && q.x < size.x && q.y < size.y) {
+                    let dep = eye_depth(vec2<i32>(q));
+                    if (dep > 0.0) {
+                        let w4 = F.inv_view_proj * vec4(q.x / size.x * 2.0 - 1.0, 1.0 - q.y / size.y * 2.0, dep, 1.0);
+                        let pt = w4.xyz / w4.w;
+                        let dv = pt - wp;
+                        let zt = (F.view_proj * vec4(pt, 1.0)).w;
+                        let dz = abs(zt - z) * ppm;
+                        let w = clamp(0.0225 * dz * dz, 0.0, 1.0);
+                        h = mix(dot(dv, v) / max(length(dv), 1.0e-6), flat, w);
+                    }
+                }
+                best = max(best, h);
             }
-            occ += hmax;
+            if (sd == 0) { hc.x = best; } else { hc.y = best; }
         }
+        let h0 = na + max(-acos(clamp(hc.x, -1.0, 1.0)) - na, -1.5708);
+        let h1 = na + min(acos(clamp(hc.y, -1.0, 1.0)) - na, 1.5708);
+        let lw = pl + 0.15 * (1.0 - pl);
+        sum += lw * ((cos(na) + 2.0 * h0 * sin(na) - cos(2.0 * h0 - na)) + (cos(na) + 2.0 * h1 * sin(na) - cos(2.0 * h1 - na)));
     }
-    return clamp(1.0 - occ * 0.25, 0.0, 1.0);
+    return clamp(max(0.01, 0.125 * sum), 0.0, 1.0);
 }
 
 // One tap of the sun shadow map at a world position (1 outside the map).
