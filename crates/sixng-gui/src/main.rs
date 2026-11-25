@@ -1507,6 +1507,10 @@ impl App {
             if let Some(q) = c.get("cast") {
                 self.scenes.cast_q = q.to_string();
             }
+            // --order mission: the Scenes list in mission order
+            if c.get("order") == Some("mission") {
+                self.scenes.mission_order = true;
+            }
             if c.has("palette") {
                 self.palette.open = true;
                 self.palette_query(c.get("palette").unwrap_or(""));
