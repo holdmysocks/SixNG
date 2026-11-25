@@ -1046,7 +1046,7 @@ fn is_lit(s: &crate::drawable::Shader, c: &serde_json::Value) -> bool {
 
 /// `emissive_source` of a model.json material and of the GLB extras.
 fn emissive_source_json(s: &crate::drawable::Shader, st: &ShaderTextures, c: &serde_json::Value) -> serde_json::Value {
-    match emissive_source(st, is_lit(s, c)) {
+    match lit_source(s, st, c) {
         Some(EmissiveSource::Map) => "emissive_map".into(),
         Some(EmissiveSource::ColourMap) => "colour_map".into(),
         Some(EmissiveSource::Missing) => "none".into(),
@@ -1065,9 +1065,27 @@ fn emissive_strength(s: &crate::drawable::Shader) -> crate::material::EmissiveSt
 /// null for materials that do not light (or whose emissive map did not
 /// decode).
 fn emissive_strength_json(s: &crate::drawable::Shader, st: &ShaderTextures, c: &serde_json::Value) -> serde_json::Value {
-    match emissive_source(st, is_lit(s, c)) {
+    match lit_source(s, st, c) {
         Some(EmissiveSource::Map | EmissiveSource::ColourMap) => emissive_strength(s).json(),
         _ => serde_json::Value::Null,
+    }
+}
+
+/// Whether a shader is a character's glow layer (`ped_standard_emissive_layer_alpha`
+/// and kin, on the one ghost character): the game lights it through a
+/// layer blended in at run time (`diffusetexanimatedblend`, not in the
+/// install), not through its colour map, so it is drawn unlit.
+fn is_ped_glow_layer(s: &crate::drawable::Shader) -> bool {
+    // ped_standard_emissive_layer_alpha, ped_standard_emissive_layer
+    ["b8916043", "2e920e9f"].contains(&s.name_hash.as_str()) || crate::names::shader(&s.name_hash).is_some_and(|n| n.starts_with("ped_") && n.contains("emissive_layer"))
+}
+
+/// `emissive_source` of a material: a character's glow layer does not light
+/// (`is_ped_glow_layer`).
+fn lit_source(s: &crate::drawable::Shader, st: &ShaderTextures, c: &serde_json::Value) -> Option<EmissiveSource> {
+    match emissive_source(st, is_lit(s, c)) {
+        Some(_) if is_ped_glow_layer(s) => Some(EmissiveSource::Missing),
+        x => x,
     }
 }
 
@@ -1862,7 +1880,7 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             // shows (lamp bulbs, not the whole lamp unit). One whose
             // `emissivetex` did not decode does not light at all: its colour
             // map is not the light.
-            match emissive_source(st, is_lit(s, &classify_shader(s, st))) {
+            match lit_source(s, st, &classify_shader(s, st)) {
                 Some(EmissiveSource::Map) => g["emissiveTexture"] = serde_json::json!({"uri": st.emissive.clone()}),
                 Some(EmissiveSource::Missing) => {
                     if let Some(o) = g.as_object_mut() {
@@ -3759,6 +3777,13 @@ mod dictionary_tests {
             assert!(!is_lit(&s, &c), "{h}");
             assert!(crate::material::gltf_fields(&c, true)["emissiveFactor"].is_null(), "{h}");
         }
+        // a character's glow layer has no light in its colour map
+        let sh = |h: &str| crate::drawable::Shader { index: 0, record_off: 0, name_hash: h.into(), param_hashes: vec![], textures: vec![], flags: vec![], constants: vec![] };
+        assert!(is_ped_glow_layer(&sh("b8916043")));
+        let lit = serde_json::json!({"class": "emissive"});
+        assert_eq!(lit_source(&sh("b8916043"), &st(None, &[DIFFUSE_PARAM]), &lit), Some(EmissiveSource::Missing));
+        assert!(!is_ped_glow_layer(&sh("db8b21bd")));
+        assert_eq!(lit_source(&sh("db8b21bd"), &st(None, &[DIFFUSE_PARAM]), &lit), Some(EmissiveSource::ColourMap));
     }
 
     #[test]
