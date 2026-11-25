@@ -463,7 +463,7 @@ pub const ROOT_FLAGS: &[(u32, &str, bool)] = &[
     (8, "vegetation", false),
     // only on vehicle fragments
     (10, "vehicle", false),
-    // set on all 12,030 fragments with more than one group and a group that
+    // set on all 11,950 fragments with more than one group and a group that
     // can break (strength >= 0), and on 80 of the 1,921 multi-group ones
     // with none; never on single-group fragments. Bits 16 and 24 are set
     // together on all but one fragment and share the name.
