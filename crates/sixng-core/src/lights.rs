@@ -183,11 +183,42 @@ pub fn light_sets(r: &Resource) -> Vec<LightSet> {
 /// the map file's timecycle modifier boxes and its LOD / distant light
 /// arrays.
 pub const TC_MODIFIERS: u32 = 0xaf9c_3bd9; // timeCycleModifiers (empty in every file)
-/// The modifier boxes GTA VI uses instead: an array of `3bc4ac19` (112 B):
-/// `name` (joaat of the modifier name), `center`, `orientation`, `scale`,
-/// `fe27ffde` (u32), `percentage`, `range`, `startHour`, `endHour`,
-/// `854db4c2` (u32), `rotation` (quaternion).
+/// The modifier volumes GTA VI uses instead: an array of `3bc4ac19`
+/// (112 B): `name` (joaat of the modifier name), `center`, `orientation`
+/// (always 0), `scale`, `fe27ffde` (the shape, [`tc_shape`]), `percentage`,
+/// `range`, `startHour`, `endHour`, `854db4c2` (u32, 0 on 96 %) and
+/// `rotation` (quaternion x, y, z, w, applied as stored: unlike entities it
+/// is not the inverse).
 pub const TC_BOXES: u32 = 0x8471_928b;
+
+/// Shape of a modifier volume (`fe27ffde`) and its half extents from
+/// `scale`. Boxes (469 of 586) store the full size; cylinders (103, axis
+/// local z) and ellipsoids (14) store the radii. Checked on the map files
+/// that hold one volume: their extents enclose a sphere of radius
+/// |scale| / 2 around a box and |scale| around the other two shapes.
+pub fn tc_shape(shape: u32, scale: [f32; 3]) -> (&'static str, [f32; 3]) {
+    match shape {
+        0x9fde_1ac6 => ("box", [scale[0] / 2.0, scale[1] / 2.0, scale[2] / 2.0]),
+        0x27ac_c35b => ("cylinder", scale),
+        0xe63a_0d71 => ("ellipsoid", scale),
+        _ => ("unknown", scale),
+    }
+}
+
+/// World-space bounds of a modifier volume: its local box of `half`
+/// extents rotated by `rotation` (as stored) around `center`.
+pub fn tc_bounds(center: [f32; 3], rotation: [f32; 4], half: [f32; 3]) -> [[f32; 3]; 2] {
+    let mut b = [center, center];
+    for k in 0..8 {
+        let s = |i: usize| if k >> i & 1 == 1 { 1.0 } else { -1.0 };
+        let v = rotate(rotation, [s(0) * half[0], s(1) * half[1], s(2) * half[2]]);
+        for i in 0..3 {
+            b[0][i] = b[0][i].min(center[i] + v[i]);
+            b[1][i] = b[1][i].max(center[i] + v[i]);
+        }
+    }
+    b
+}
 /// Interior room (`CMloRoomDef`) and its timecycle members.
 pub const ROOM: u32 = 0x0b18_11f1;
 pub const LOD_LIGHTS: u32 = 0x69c2_c0fa; // LODLightsSOA
@@ -307,11 +338,16 @@ fn half(h: u16) -> f32 {
 /// Distant record: `position` (world), `94720dec` colour as u8 R, G, B and
 /// a fourth byte (`i`, 254 or 255 on 70 % of lights), `intensity`,
 /// `lightType` (as the placed lights), `flags` (u8), `hash`, and u16 fields
-/// that read as half floats (`699dd4d9`, 93 % = 1.0; `fdafb23b`;
-/// `a13c79ef`, 0..100). LOD record: `direction`, `falloff` (the range),
+/// that read as half floats: `699dd4d9` (`time_multiplier`, 1.0 on 93 %,
+/// 0 on 4.6 %; distant `flags` 2 and 7 occur only with 0), `fdafb23b`, and
+/// `a13c79ef` (`random`: spread evenly over 0..100 and independent of every
+/// other field, of the placed light it comes from, its hash and its
+/// position: a per-light random value). None of the three is a copy of a
+/// placed-light field. LOD record: `direction`, `falloff` (the range),
 /// `falloffExponent`, cone angles as u8 = degrees x 255 / 180 (for
-/// capsules, the outer one is the capsule extent), and the u8 / u32 fields
-/// not identified yet.
+/// capsules, the outer one is the capsule extent), `8e6f0ba9` (two half
+/// floats), `0e852fda` (two u16, the second equal to the first or one
+/// more), and the u8 fields not identified yet.
 pub fn distant_row(d: &serde_json::Map<String, serde_json::Value>, l: Option<&serde_json::Map<String, serde_json::Value>>) -> serde_json::Value {
     use crate::meta7a::field_name;
     let g = |m: &serde_json::Map<String, serde_json::Value>, h: u32| m.get(&field_name(h)).cloned().unwrap_or(serde_json::Value::Null);
@@ -328,6 +364,7 @@ pub fn distant_row(d: &serde_json::Map<String, serde_json::Value>, l: Option<&se
         "time_multiplier": half(n(d, 0x699d_d4d9) as u16),
         "half_fdafb23b": half(n(d, 0xfdaf_b23b) as u16),
         "half_a13c79ef": half(n(d, 0xa13c_79ef) as u16),
+        "random": half(n(d, 0xa13c_79ef) as u16),
         "distant_raw": d,
     });
     if let Some(l) = l {
@@ -336,6 +373,9 @@ pub fn distant_row(d: &serde_json::Map<String, serde_json::Value>, l: Option<&se
         v["range"] = g(l, 0xcc68_06e8);
         v["falloff_exponent"] = g(l, 0x2bb3_42ba);
         v["cone"] = serde_json::json!([deg(0x455c_3938), deg(0xbc76_acc0)]);
+        let (a, b) = (n(l, 0x8e6f_0ba9) as u32, n(l, 0x0e85_2fda) as u32);
+        v["halves_8e6f0ba9"] = serde_json::json!([half(a as u16), half((a >> 16) as u16)]);
+        v["u16_0e852fda"] = serde_json::json!([b & 0xffff, b >> 16]);
         v["lod_raw"] = serde_json::Value::Object(l.clone());
     }
     v
@@ -435,5 +475,17 @@ mod tests {
         assert_eq!(v["cone"], serde_json::json!([60.0, 180.0]));
         assert_eq!(v["p"], serde_json::json!([1.0, 2.0, 3.0]));
         assert_eq!(half(0x4200), 3.0);
+    }
+    #[test]
+    fn tc_volume_bounds() {
+        // A box of full size 4 x 2 x 6 turned 90 degrees about X (y up).
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        let (shape, half) = tc_shape(0x9fde_1ac6, [4.0, 2.0, 6.0]);
+        assert_eq!((shape, half), ("box", [2.0, 1.0, 3.0]));
+        let b = tc_bounds([10.0, 20.0, 30.0], [s, 0.0, 0.0, s], half);
+        let r = |x: f32| (x * 1000.0).round() / 1000.0;
+        assert_eq!(b[0].map(r), [8.0, 17.0, 29.0]);
+        assert_eq!(b[1].map(r), [12.0, 23.0, 31.0]);
+        assert_eq!(tc_shape(0x27ac_c35b, [3.0, 3.0, 1.0]), ("cylinder", [3.0, 3.0, 1.0]));
     }
 }

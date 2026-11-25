@@ -3110,6 +3110,19 @@ pub fn export_map_lights(ws: &Workspace, scans: &[MetaScan], dir: &Path) -> Resu
                     v["modifier"] = serde_json::json!(n);
                 }
             }
+            let f3 = |h: u32| v.get(field_name(h)).and_then(vec3);
+            let q = v.get(field_name(0x77dd_4010)).and_then(|x| serde_json::from_value::<[f32; 4]>(x.clone()).ok());
+            if let (Some(c), Some(sc3), Some(q)) = (f3(0x9a64_11e7), f3(0x5003_2cdc), q) {
+                let shape = v.get(field_name(0xfe27_ffde)).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                let (name, half) = crate::lights::tc_shape(shape, sc3);
+                v["shape"] = serde_json::json!(name);
+                v["half_extents"] = serde_json::json!(half);
+                let b = crate::lights::tc_bounds(c, q, half);
+                v["bounds"] = serde_json::json!(b);
+                if !in_region(b[0], b[1]) {
+                    continue;
+                }
+            }
             v["map"] = serde_json::json!(sc.id);
             v["index"] = serde_json::json!(i);
             v["kind"] = serde_json::json!("box");
