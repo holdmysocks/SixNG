@@ -997,8 +997,9 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   logarithmically (to about 12, 52, 216 and 900 m), snapped to whole texels so they
   do not shimmer, and filtered over 4×4 compares with a blend between
   cascades. The two near cascades are drawn every frame and the two far
-  ones in turn; the far ones skip models smaller than two of their
-  texels. Models and map cells cast (opaque and cut-out surfaces);
+  ones in turn. Each cascade draws only the models that can shadow it
+  (the bounding sphere of their instances), and all but the nearest skip
+  models smaller than three of their texels. Models and map cells cast (opaque and cut-out surfaces);
   skinned, see-through and decal surfaces do not. Only what the camera
   draws casts: a caster just outside the view leaves no shadow.
 - **Map cells** (far placements merged per area): a placement more than

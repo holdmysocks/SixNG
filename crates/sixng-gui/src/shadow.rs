@@ -7,7 +7,9 @@
 //! the light over the bounding sphere of its slice of the view, snapped to
 //! whole texels so shadows do not shimmer while the camera moves. The two
 //! near cascades are drawn every frame, the two far ones on alternate
-//! frames; a far cascade skips meshes smaller than about two of its texels.
+//! frames. Each cascade draws only the models whose instances' bounding
+//! sphere can shadow it, and all but the nearest skip models smaller than
+//! three of their texels.
 use eframe::egui_wgpu::wgpu;
 use glam::{Mat4, Vec3};
 
@@ -46,6 +48,9 @@ pub struct Cascade {
     pub bias: f32,
     /// Meshes smaller than this (bounding radius, m) are not drawn into it.
     pub min_radius: f32,
+    /// Half width of its square (m) and depth of its box along the light (m).
+    pub half: f32,
+    pub depth: f32,
 }
 
 /// Split distances: logarithmic from `near` (at least `SPLIT_NEAR`) to `range`.
@@ -70,7 +75,7 @@ pub fn cascades(eye: Vec3, fwd: Vec3, fov_y: f32, aspect: f32, light: Vec3, near
     let tx = ty * aspect;
     // distance from the axis to a corner of the view, per unit of depth
     let corner = (1.0 + tx * tx + ty * ty).sqrt();
-    let mut out = [Cascade { view_proj: Mat4::IDENTITY, far: 0.0, texel: 1.0, bias: 0.0, min_radius: 0.0 }; CASCADES];
+    let mut out = [Cascade { view_proj: Mat4::IDENTITY, far: 0.0, texel: 1.0, bias: 0.0, min_radius: 0.0, half: 1.0, depth: 1.0 }; CASCADES];
     let mut prev = near;
     for (i, &far) in sp.iter().enumerate() {
         // bounding sphere of the slice between prev and far: the centre on
@@ -96,7 +101,9 @@ pub fn cascades(eye: Vec3, fwd: Vec3, fov_y: f32, aspect: f32, light: Vec3, near
             far,
             texel,
             bias: 1.5 * texel / depth,
-            min_radius: if i >= 2 { 2.0 * texel } else { 0.0 },
+            min_radius: if i >= 1 { 3.0 * texel } else { 0.0 },
+            half: r,
+            depth,
         };
         prev = far;
     }
@@ -115,6 +122,17 @@ impl ShadowU {
         u.params = [on as u32 as f32, 1.5, softness, 0.0];
         u
     }
+}
+
+/// Can a caster in this sphere (world centre, radius) shadow anything in
+/// the cascade? It must overlap the cascade's square seen from the light
+/// and not lie wholly beyond its far side.
+pub fn in_cascade(c: &Cascade, centre: Vec3, radius: f32) -> bool {
+    let p = c.view_proj * centre.extend(1.0);
+    let rr = radius / c.half;
+    let rz = radius / c.depth;
+    // reversed depth: 1 at the light end of the box, 0 at the far end
+    p.x.abs() <= 1.0 + rr && p.y.abs() <= 1.0 + rr && p.z >= -rz
 }
 
 #[cfg(test)]
@@ -141,6 +159,10 @@ mod tests {
             assert!(p.x.abs() <= 1.0 && p.y.abs() <= 1.0, "{p:?}");
             assert!(p.z > 0.0 && p.z < 1.0, "{p:?}");
         }
+        // casters: one on the view axis is in, one far off to the side is not
+        let c0 = &cs[0];
+        assert!(in_cascade(c0, eye + fwd * 2.0, 0.5));
+        assert!(!in_cascade(c0, eye + Vec3::new(5000.0, 0.0, 0.0), 10.0));
         // a point between the eye and the light is nearer the light (larger depth)
         let c = &cs[0];
         let a = c.view_proj * (eye + fwd * 2.0).extend(1.0);

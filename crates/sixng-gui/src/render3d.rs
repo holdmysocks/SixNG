@@ -448,6 +448,9 @@ pub struct GpuModel {
     pub n_fb: u32,
     pub instance_cap: u32,
     pub bbox: [Vec3; 2],
+    /// World bounding sphere of the normally drawn instances (centre,
+    /// radius), set with the instances; None: unknown (always drawn).
+    pub world: Option<(Vec3, f32)>,
     /// Stencil value its opaque surfaces write: 1 = real surface, 0 = far
     /// field (terrain, ocean), which coverage fallbacks may draw over.
     pub stencil: u32,
@@ -478,6 +481,29 @@ impl GpuModel {
     pub fn n_normal(&self) -> u32 {
         self.n_instances - self.n_fb.min(self.n_instances)
     }
+}
+
+/// World bounding sphere of a model's instances from its local box.
+fn world_sphere<'a>(bbox: [Vec3; 2], inst: impl Iterator<Item = &'a Instance>) -> Option<(Vec3, f32)> {
+    let c = (bbox[0] + bbox[1]) * 0.5;
+    let r = (bbox[1] - bbox[0]).length() * 0.5;
+    if !c.is_finite() || !r.is_finite() {
+        return None;
+    }
+    let mut lo = Vec3::splat(f32::MAX);
+    let mut hi = Vec3::splat(f32::MIN);
+    for i in inst {
+        let m = Mat4::from_cols_array_2d(&i.m);
+        let wc = m.transform_point3(c);
+        let s = m.x_axis.truncate().length().max(m.y_axis.truncate().length()).max(m.z_axis.truncate().length());
+        let wr = r * s;
+        lo = lo.min(wc - Vec3::splat(wr));
+        hi = hi.max(wc + Vec3::splat(wr));
+    }
+    if lo.x > hi.x {
+        return None;
+    }
+    Some(((lo + hi) * 0.5, (hi - lo).length() * 0.5))
 }
 
 /// Spacing of the material uniforms in a model's buffer (the uniform offset alignment).
@@ -1834,6 +1860,7 @@ impl Uploader {
             n_fb: 0,
             instance_cap: 1,
             bbox: [Vec3::from(m.bbox[0]), Vec3::from(m.bbox[1])],
+            world: None,
             stencil: 1,
             mat_names: mats
                 .iter()
@@ -1894,6 +1921,7 @@ impl Renderer3D {
         }
         gm.n_instances = inst.len() as u32;
         gm.n_fb = n_fb as u32;
+        gm.world = world_sphere(gm.bbox, inst.iter().filter(|i| !i.is_fallback()));
     }
 
     /// Give a model its stickers: the shader records (header first, see
@@ -2167,7 +2195,7 @@ impl Renderer3D {
         bg: &wgpu::BindGroup,
         be: &mut wgpu::RenderPass<'_>,
         models: &[&GpuModel],
-        min_radius: f32,
+        c: &crate::shadow::Cascade,
     ) -> u32 {
         let mut n = 0u32;
         be.set_pipeline(pipe);
@@ -2177,8 +2205,13 @@ impl Renderer3D {
             if range.is_empty() || gm.meshes.iter().any(|m| m.skinned) {
                 continue;
             }
-            if min_radius > 0.0 && (gm.bbox[1] - gm.bbox[0]).length() * 0.5 < min_radius {
+            if c.min_radius > 0.0 && (gm.bbox[1] - gm.bbox[0]).length() * 0.5 < c.min_radius {
                 continue;
+            }
+            if let Some((wc, wr)) = gm.world {
+                if !crate::shadow::in_cascade(c, wc, wr) {
+                    continue;
+                }
             }
             be.set_vertex_buffer(1, Some(gm.instances.slice(..)));
             let mut bound: Option<&wgpu::Buffer> = None;
@@ -2256,15 +2289,19 @@ impl Renderer3D {
                 multiview_mask: None,
             });
             let bg = &self.shadow_bgs[i];
-            self.shadow_draws += Self::record_shadow(&self.pipe_shadow, bg, &mut pass, models, c.min_radius);
-            self.shadow_draws += Self::draw_cells(
-                &mut pass,
-                &self.pipe_shadow_cell,
-                bg,
-                &self.cells,
-                crate::cells::PASS_OPAQUE,
-                false,
-            );
+            self.shadow_draws += Self::record_shadow(&self.pipe_shadow, bg, &mut pass, models, &c);
+            // map cells stand in for placements far from the camera: none
+            // in the nearest cascade
+            if i > 0 {
+                self.shadow_draws += Self::draw_cells(
+                    &mut pass,
+                    &self.pipe_shadow_cell,
+                    bg,
+                    &self.cells,
+                    crate::cells::PASS_OPAQUE,
+                    false,
+                );
+            }
             drop(pass);
             self.shadow.drawn[i] = Some(c);
         }
