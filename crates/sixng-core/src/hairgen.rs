@@ -31,14 +31,15 @@
 //!    fade length to the fade length. The offset goes on the output point
 //!    only, so it does not accumulate. Checked against the program with an
 //!    interpreter on 400 random inputs (to 2.5e-7). The six values are the
-//!    groom's style groups (system page +0xF8 and +0x104).
+//!    groom's first style group (system page +0xF8), which the game
+//!    copies into the per-instance record the program reads.
 //!
 //! Not covered: the cull groups (hat and clothing masks), the length
 //! texture, skinning, the twist value written per vertex (the style
-//! offset's frame uses it: here the root triangle's normal stands in), the
-//! bend term of bit 128 and clumping (bits 2 / 4 / 8 / 16, only partly
-//! read). The run-time weight that scales the style amplitudes (`1 - w`,
-//! from the pose pass) is taken as 1 (w = 0).
+//! offset's frame uses it: here the root triangle's normal stands in)
+//! and clumping (bits 2 / 4 / 8 / 16, only partly
+//! read). Both amplitudes are scaled by `1 - m`, `m` a per-guide value not yet
+//! found: taken as 0.
 //! The acceptance scale of step 1 is a run-time number; here the densest
 //! triangle is always taken.
 
@@ -172,7 +173,8 @@ pub fn pcg_bits(st: u32) -> u32 {
 }
 
 /// Noise and curl settings of one style group, in the order the groom
-/// stores them (six f16): bend amount, fade-in length (m), noise amplitude
+/// stores them (six f16): a word the generator does not read, fade-in
+/// length (m), noise amplitude
 /// (m), curl radius (m), noise frequency and curl frequency (per metre of
 /// strand).
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
