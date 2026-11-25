@@ -520,7 +520,10 @@ again**).
     is missing. A garment whose textures are not in the install (some hats:
     no store holds them) has no shade texture to bake into; the viewer
     gives it the same colours per vertex, without fabric shading (before
-    2026-11-25 it was shown white).
+    2026-11-25 it was shown white). An item that stores no colour either
+    (no preset, tint row, flat colour or colour tag; 19 items in the named
+    characters' default looks, mostly watches) is shown neutral dark grey,
+    which is not the game's colour.
   - **Fabric in the viewer.** Where the preset's library is read, the
     viewer bakes the fabric into the garment's base texture (at 2048
     texels): each sub-material's tiling fabric texture (`tilematerialmap`
