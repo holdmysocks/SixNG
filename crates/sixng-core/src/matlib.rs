@@ -327,7 +327,7 @@ fn to_linear(c: u8) -> f32 {
 /// (sRGB in, linear RGB out): dark = the colour at 0.1 x value, middle =
 /// the colour, light = saturation x 0.55 at value x 0.55 + 0.45. The
 /// shader maps the fabric texture's grey value g over them (g < 0.5: dark
-/// to middle by 2g, else middle towards light by g - 0.5) and mixes the
+/// to middle by 2g, else middle to light by 2(g - 0.5)) and mixes the
 /// result with plain g by the colour's alpha.
 pub fn stops(srgb: [u8; 3]) -> [[f32; 3]; 3] {
     let lin = srgb.map(to_linear);
