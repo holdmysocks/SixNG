@@ -1729,6 +1729,8 @@ impl App {
         }
         if let Some(v) = c.f("wear") {
             m.look.wear = (v as f32).clamp(0.0, 1.0);
+            // a set amount instead of the configuration's wear levels
+            m.look.wear_from_config = false;
         }
         if let Some(v) = c.get("fit-parts") {
             m.fit_parts_once = Some(v.to_string());

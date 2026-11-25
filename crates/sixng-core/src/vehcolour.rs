@@ -90,11 +90,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// a viewer that reads the material map per pixel).
 /// 27: `wear_records` (each part id's wear ladder and detail set, and the
 /// records they reach).
-pub const EXPORT_VERSION: u32 = 27;
+/// 28: `wear_records.levels_by_config` and `levels_default` (each part id's
+/// wear level per configuration: the entry of its ladder).
+pub const EXPORT_VERSION: u32 = 28;
 /// Layout version of `<work>/index/vehicle_parts.json`.
 /// 21: a part's coat and the library's coat records.
 /// 22: the surfaces' wear ladders and detail sets, and the wear records.
-pub const FORMAT: u32 = 22;
+/// 23: each configuration's wear levels.
+pub const FORMAT: u32 = 23;
 
 const PART_SET: u32 = 0xf142_44fd;
 const SET_COLOURS: u32 = 0x7847_6477;
@@ -156,6 +159,20 @@ const DEF_IDS: u32 = 0xe9bf_9f2d;
 /// channel, `1470edc0` priority, flags `c8d27281` (colour) and `7a84e7bf`
 /// (surface).
 const BIND: u32 = 0x501f_f112;
+/// A binding's `wear` flag (joaat "wear"): the binding sets the wear channel
+/// of the group's part ids (bindings with only this flag exist for the
+/// interior, engine bay, wheels ...).
+const FLAG_WEAR: u32 = 0x7593_9b79;
+/// A modifier that gives a wear channel its level (`ca2065a9` channel):
+/// `5f89e0d0` 0 to 5, the entry of a ladder's `materialPresets` and
+/// `wearPresets` the channel's part ids take, and `primerSets` (a bit mask:
+/// 1 at levels 0 to 2 of the body, 7 at 3 to 5, 2 on some). The
+/// configuration parts that carry these sit in slots named `wear`,
+/// `wear_interior`, `wear_engine`, `wear_wheels` and six more; each slot's
+/// parts step one channel set through the six levels.
+const WEAR_LEVEL: u32 = 0x08b2_439a;
+const LEVEL: u32 = 0x5f89_e0d0;
+const PRIMER_SETS: u32 = 0x4790_9786;
 const BIND_CHANNEL: u32 = 0x178c_c382;
 const PRIORITY: u32 = 0x1470_edc0;
 const FLAG_COLOUR: u32 = 0xc8d2_7281;
@@ -436,6 +453,12 @@ pub struct Tables {
     /// digits) -> record as stored (`wear_record`).
     #[serde(default)]
     pub wear_records: HashMap<String, HashMap<String, Value>>,
+    /// Model (8 hex digits) -> configuration key -> each part id's wear
+    /// level and primer sets (256 x 4 hex digits: level, then the mask;
+    /// `ffff` = no level). Configurations whose parts set no level are left
+    /// out.
+    #[serde(default)]
+    pub wear_levels: HashMap<String, HashMap<String, String>>,
 }
 
 /// A key for a configuration: FNV-1a of its part list (the name hashes in
@@ -501,6 +524,10 @@ struct Library {
     surface_wear: HashMap<u32, (u32, u32)>,
     /// kind -> name -> wear record
     wear_records: HashMap<String, HashMap<u32, Value>>,
+    /// modifier name -> (wear channel, level, primer sets)
+    levels: HashMap<u32, (u32, u8, u8)>,
+    /// binding modifiers with the wear flag
+    wear_binds: std::collections::HashSet<u32>,
     id: Option<String>,
 }
 
@@ -525,7 +552,7 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
             }
             let m = &m;
             let dump = |h: u32| m.objects(h).into_iter().filter_map(|o| m.object(h, o, 0)).collect::<Vec<_>>();
-            let mut l = Library { colours: HashMap::new(), surfaces: HashMap::new(), wear: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), paint_types: HashMap::new(), coats: coats(m), options: HashMap::new(), refs: HashMap::new(), part_models: HashMap::new(), surface_wear: HashMap::new(), wear_records: HashMap::new(), id: Some(e.id.clone()) };
+            let mut l = Library { colours: HashMap::new(), surfaces: HashMap::new(), wear: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), paint_types: HashMap::new(), coats: coats(m), options: HashMap::new(), refs: HashMap::new(), part_models: HashMap::new(), surface_wear: HashMap::new(), wear_records: HashMap::new(), levels: HashMap::new(), wear_binds: Default::default(), id: Some(e.id.clone()) };
             for (kind, h) in WEAR_KINDS {
                 let recs = dump(*h).into_iter().filter_map(|v| Some((num(&v, NAME)? as u32, wear_record(v)))).collect();
                 l.wear_records.insert(kind.to_string(), recs);
@@ -564,6 +591,16 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
             for b in dump(BIND) {
                 if let (Some(n), Some(gr), Some(ch)) = (num(&b, NAME), num(&b, DEF_GROUP), num(&b, BIND_CHANNEL)) {
                     l.binds.insert(n as u32, (gr as u32, ch as u32, num(&b, PRIORITY).unwrap_or(0), flag(&b, FLAG_COLOUR), flag(&b, FLAG_SURFACE), flag(&b, PAINT_TYPE_COAT)));
+                    if flag(&b, FLAG_WEAR) {
+                        l.wear_binds.insert(n as u32);
+                    }
+                }
+            }
+            for w in dump(WEAR_LEVEL) {
+                if let (Some(n), Some(ch), Some(lv)) = (num(&w, NAME), num(&w, ASSIGN_CHANNEL), num(&w, LEVEL)) {
+                    // a 64-bit mask, 16 hex digits (or a number)
+                    let primer = get(&w, PRIMER_SETS).and_then(|x| x.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()).or_else(|| x.as_u64())).unwrap_or(0);
+                    l.levels.insert(n as u32, (ch as u32, lv.clamp(0, 254) as u8, primer.min(255) as u8));
                 }
             }
             for a in dump(ASSIGN) {
@@ -796,6 +833,9 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
                 let mut out = base.clone();
                 apply_config(&lib, own, parts, &mut out);
                 let ck = config_key(parts);
+                if let Some(lv) = wear_levels(&lib, own, parts) {
+                    t.wear_levels.entry(key.clone()).or_default().insert(ck.clone(), lv);
+                }
                 match results.iter_mut().find(|r| r.0 == out) {
                     Some(r) => r.1.push(ck),
                     None => {
@@ -877,8 +917,9 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
 /// part set; returns the number of part ids changed. Bindings are applied in
 /// priority order (as listed within a priority). Of an option list the
 /// first part is followed (which one the game picks is not decoded).
-fn apply_config(lib: &Library, own: &HashMap<u32, Vec<u32>>, parts: &[u32], set: &mut [Part]) -> usize {
-    // a part's modifiers, with the first part of each option list followed
+/// The modifiers of a configuration's parts, in order, with the first part
+/// of each option list and each referenced library part followed.
+fn config_mods(lib: &Library, own: &HashMap<u32, Vec<u32>>, parts: &[u32]) -> Vec<u32> {
     fn collect(lib: &Library, own: &HashMap<u32, Vec<u32>>, part: u32, depth: u32, out: &mut Vec<u32>) {
         let Some(list) = own.get(&part).or_else(|| lib.mods.get(&part)) else { return };
         for &m in list {
@@ -895,6 +936,46 @@ fn apply_config(lib: &Library, own: &HashMap<u32, Vec<u32>>, parts: &[u32], set:
     for &p in parts {
         collect(lib, own, p, 0, &mut mods);
     }
+    mods
+}
+
+/// Each part id's wear level and primer sets under a configuration (256 x
+/// 4 hex digits, `ffff` = none): the bindings with the wear flag give a part
+/// id its wear channel (in priority order, the last one wins), the level
+/// modifiers give a channel its level (the last one listed wins). None when
+/// no part id gets a level.
+fn wear_levels(lib: &Library, own: &HashMap<u32, Vec<u32>>, parts: &[u32]) -> Option<String> {
+    let mods = config_mods(lib, own, parts);
+    let levels: HashMap<u32, (u8, u8)> = mods.iter().filter_map(|m| lib.levels.get(m)).map(|&(ch, lv, pr)| (ch, (lv, pr))).collect();
+    if levels.is_empty() {
+        return None;
+    }
+    let local: HashMap<u32, &Vec<u8>> = mods.iter().filter_map(|m| lib.group_defs.get(m)).map(|(g, ids)| (*g, ids)).collect();
+    let mut binds: Vec<&(u32, u32, i64, bool, bool, bool)> = mods.iter().filter(|m| lib.wear_binds.contains(m)).filter_map(|m| lib.binds.get(m)).collect();
+    binds.sort_by_key(|b| b.2);
+    let mut channel = [0u32; 256];
+    for b in binds {
+        let Some(ids) = local.get(&b.0).copied().or_else(|| lib.groups.get(&b.0)) else { continue };
+        for &i in ids {
+            channel[i as usize] = b.1;
+        }
+    }
+    let mut any = false;
+    let s: String = channel
+        .iter()
+        .map(|ch| match levels.get(ch) {
+            Some(&(lv, pr)) => {
+                any = true;
+                format!("{lv:02x}{pr:02x}")
+            }
+            None => "ffff".to_string(),
+        })
+        .collect();
+    any.then_some(s)
+}
+
+fn apply_config(lib: &Library, own: &HashMap<u32, Vec<u32>>, parts: &[u32], set: &mut [Part]) -> usize {
+    let mods = config_mods(lib, own, parts);
     let local: HashMap<u32, &Vec<u8>> = mods.iter().filter_map(|m| lib.group_defs.get(m)).map(|(g, ids)| (*g, ids)).collect();
     let channel: HashMap<u32, (u32, u32)> = mods.iter().filter_map(|m| lib.assigns.get(m)).map(|&(ch, c, s, _)| (ch, (c, s))).collect();
     // a channel's coat: its paint type modifier, else its assignment's default
@@ -1068,7 +1149,17 @@ impl Tables {
         let coats: Vec<Value> = names.iter().map(|n| self.sets.get(*n).map_or(Value::Null, |p| Value::String(coat_table(p, &used)))).collect();
         let paint_coats: Vec<Value> = names.iter().map(|n| self.sets.get(*n).and_then(|p| paint_coat(p, &[1; 256])).and_then(|c| used.iter().position(|u| *u == c)).map_or(Value::Null, Value::from)).collect();
         let coat_records: Vec<Value> = used.iter().map(|c| self.coat_json(*c)).collect();
-        let wear_records = self.wear_json(&names);
+        let mut wear_records = self.wear_json(&names);
+        if let (Some(w), Some(levels)) = (wear_records.as_object_mut(), self.wear_levels.get(&key)) {
+            // the levels most configurations give (the smallest on a tie)
+            let mut count: HashMap<&String, usize> = HashMap::new();
+            for l in levels.values() {
+                *count.entry(l).or_default() += 1;
+            }
+            let usual = count.iter().max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0))).map(|(l, _)| (*l).clone());
+            w.insert("levels_by_config".into(), Value::Object(levels.iter().map(|(k, l)| (k.clone(), Value::String(l.clone()))).collect()));
+            w.insert("levels_default".into(), usual.map_or(Value::Null, Value::String));
+        }
         let index = |n: &String| names.iter().position(|x| *x == n);
         // what fitting one more part changes, as look entries
         let patches: serde_json::Map<String, Value> = self
@@ -1486,8 +1577,36 @@ mod tests {
     }
 
     #[test]
+    fn wear_levels_follow_the_wear_bindings() {
+        let mut lib = Library { colours: HashMap::new(), surfaces: HashMap::new(), wear: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), paint_types: HashMap::new(), coats: HashMap::new(), options: HashMap::new(), refs: HashMap::new(), part_models: HashMap::new(), surface_wear: HashMap::new(), wear_records: HashMap::new(), levels: HashMap::new(), wear_binds: Default::default(), id: None };
+        lib.groups.insert(0x10, vec![1, 2]);
+        lib.groups.insert(0x11, vec![2, 3]);
+        lib.groups.insert(0x12, vec![4]);
+        // wear bindings: ids 1, 2 to channel 0x70, then (higher priority) 2, 3 to 0x71
+        lib.binds.insert(1, (0x10, 0x70, 0, true, true, false));
+        lib.binds.insert(2, (0x11, 0x71, 1, false, false, false));
+        // a binding without the wear flag does not set a wear channel
+        lib.binds.insert(3, (0x12, 0x70, 2, true, true, false));
+        lib.wear_binds.extend([1, 2]);
+        lib.levels.insert(10, (0x70, 1, 1));
+        lib.levels.insert(11, (0x71, 4, 7));
+        lib.levels.insert(12, (0x70, 3, 7));
+        lib.mods.insert(100, vec![1, 2, 3]);
+        lib.mods.insert(101, vec![10, 11]);
+        lib.mods.insert(102, vec![12]);
+        let own = HashMap::new();
+        assert_eq!(wear_levels(&lib, &own, &[100]), None);
+        let l = wear_levels(&lib, &own, &[100, 101]).unwrap();
+        assert_eq!(l.len(), 1024);
+        assert_eq!((&l[0..4], &l[4..8], &l[8..12], &l[12..16], &l[16..20]), ("ffff", "0101", "0407", "0407", "ffff"));
+        // a later level part for the same channel wins
+        let l = wear_levels(&lib, &own, &[100, 101, 102]).unwrap();
+        assert_eq!(&l[4..8], "0307");
+    }
+
+    #[test]
     fn coats_follow_the_paint_type_of_a_channel() {
-        let mut lib = Library { colours: HashMap::new(), surfaces: HashMap::new(), wear: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), paint_types: HashMap::new(), coats: HashMap::new(), options: HashMap::new(), refs: HashMap::new(), part_models: HashMap::new(), surface_wear: HashMap::new(), wear_records: HashMap::new(), id: None };
+        let mut lib = Library { colours: HashMap::new(), surfaces: HashMap::new(), wear: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), paint_types: HashMap::new(), coats: HashMap::new(), options: HashMap::new(), refs: HashMap::new(), part_models: HashMap::new(), surface_wear: HashMap::new(), wear_records: HashMap::new(), levels: HashMap::new(), wear_binds: Default::default(), id: None };
         for k in [0xa1, 0xa2, 0xa3] {
             lib.coats.insert(k, Coat::default());
         }

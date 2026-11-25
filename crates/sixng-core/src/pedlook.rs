@@ -16,10 +16,12 @@
 //! is used as the default look (nothing marks a default; it is the first one
 //! the game lists).
 //!
-//! Which drawable an item uses: the name the item's tags give (heads, hair,
-//! brows), else the drawable that shares most of the item's textures, where
-//! ties go to the model's own fit (`fr1`) and to `_full` meshes. Items whose
-//! textures are in no drawable get no part.
+//! Which drawable an item uses: the one its asset GUID names (the GUID is
+//! the name id, `meta7a::asset_id`, of the item's drawable with `_full`;
+//! not for heads, whose GUID names the base head template); else the name
+//! the item's tags give (heads, hair, brows), else the drawable that shares
+//! most of the item's textures, where ties go to the model's own fit
+//! (`fr1`) and to `_full` meshes. Items found by none of these get no part.
 //!
 //! The model table is built once from the packs.rpf index and cached as
 //! `<work>/index/ped_models.json`.
@@ -1222,6 +1224,10 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
     let by_id: HashMap<&str, &Variation> = vars.iter().map(|v| (v.id.as_str(), v)).collect();
     let names: HashSet<String> = ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| e.name.as_ref().map(|n| n.to_ascii_lowercase())).collect();
     let exists = |n: &str| names.contains(n);
+    // An item's asset GUID is the name id (`meta7a::asset_id`) of its own
+    // drawable, `_full` included (`shortswork_mr1_001_regular_mw_long_full`),
+    // as for hair assets (`hairlink`).
+    let by_guid: HashMap<u64, &String> = names.iter().map(|n| (crate::meta7a::asset_id(n), n)).collect();
     // an outfit with everything it includes (head set, body set, brows …)
     fn collect<'a>(v: &'a Variation, by_id: &HashMap<&str, &'a Variation>, seen: &mut HashSet<String>, out: &mut Vec<&'a Variation>) {
         if !seen.insert(v.id.clone()) {
@@ -1273,7 +1279,17 @@ fn look_row(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &ModelRow, own
             }
             for p in &v.parts {
                 let by_asset = || Some((assets?.pick(p.guid.as_deref()?, fit.as_deref(), &exists)?, "asset id"));
-                let Some((drawable, found_by)) = choose(p, fit.as_deref(), &exists).or_else(by_asset) else {
+                // The drawable the GUID names, first: the texture and name
+                // matches below pick a sibling variant (open / closed
+                // jacket, hood up / down, another piercing) for about one
+                // item in eight. Not for a head: its GUID names the base
+                // head template (`head_mr1_base_000_m_full`); the face is
+                // the head the item names.
+                let own = || {
+                    let n = by_guid.get(&u64::from_str_radix(p.guid.as_deref()?, 16).ok()?)?;
+                    (slot_of(n) != "head" && !n.ends_with("_fp") && !n.contains("_fp_")).then(|| ((*n).clone(), "asset id (name)"))
+                };
+                let Some((drawable, found_by)) = own().or_else(|| choose(p, fit.as_deref(), &exists)).or_else(by_asset) else {
                     // items without textures or names are settings, not parts;
                     // a garment that names a model by GUID is a part whose
                     // model was not found
