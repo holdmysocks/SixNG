@@ -1120,8 +1120,10 @@ impl ModelView {
                             // an animal's strands with the game's tables: the ramp of the variant times
                             // the colour of the skin under the root. The game's strand resolve does this: colour = mix(C, C x T, w), T read
                             // at the strand's root UV from the first texture of one of the ped's own components (with that
-                            // component's palette rows when it has them): wiring read from the game's code. That the texture is
-                            // the body's colour map is by fit (medium); w is the groom's stored tint weight (the texture's alpha taken as 1); the palette case is not done here.
+                            // component's palette rows when it has them): wiring read from the game's code, and the animal's fur items name
+                            // that body component (item tag 2f9afe84 = the component's category). Here the body's displayed
+                            // (already tinted) colour stands in for texture and palette; the coat variant's own rows are not
+                            // selected for the fur. w is the groom's stored tint weight (the texture's alpha taken as 1).
                             (None, Some(d)) if fur_sets.is_some_and(|f| d.colour_set(f.0).is_some() || d.param_set(f.1).is_some()) => {
                                 let (cn, pn) = fur_sets.unwrap();
                                 let (cs, ps) = (d.colour_set(cn), d.param_set(pn));
