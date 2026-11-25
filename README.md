@@ -625,15 +625,18 @@ again**).
     (about a minute) and loads the texture-users index (about 10 s).
   - Watches and rings are modelled at their own root bone and moved onto
     their attach bone (the left wrist when there are two).
-- **Hair on characters.** Nothing in the files links a hair asset to its
-  strand grooms; `hairlink` places them by the name words in the asset
-  registry, archive order, piece counts and geometry, with a model
-  probability. The Character panel lists each hair asset (hair, brows,
-  beard, lashes) with that percentage. Shown at the start: 50 % or more,
-  or 20 % or more when every piece is rooted on this head (a probable
-  style, not a certain one). Pieces whose strand roots do not lie on the
-  head are left out, and a piece two neighbouring assets claim goes to
-  the stronger claim. The hair is grown to its stored strand count (capped
+- **Hair on characters.** A hair asset's strand grooms are read from the
+  game (`hairlink`): the asset's id is the name id of its placeholder
+  model, a table lists the asset's pieces by the name ids of their files,
+  and the archive's table of contents gives every file its id. That
+  links 878 hair, beard, brow, lash and body-hair assets to their
+  grooms; the Character panel lists them. It needs the table of contents
+  (Windows, the supported game build); without it the link is inferred
+  from name words, archive order, piece counts and geometry with a model
+  probability, which is often wrong. The panel then shows that
+  percentage, a style starts shown at 50 % or more (20 % or more when
+  every piece is rooted on this head), and pieces whose strand roots do
+  not lie on the head are left out. The hair is grown to its stored strand count (capped
   per piece) and drawn 6 mm wide so it reads as hair (`--hair-width MM`).
   Colour: row tint 0 of `ped_tint_hair` for the items that name that
   palette (a few hundred, mostly named characters); the others leave the

@@ -316,11 +316,15 @@ pub struct HairPick {
     pub slot: String,
     /// The placeholder the grooms were placed under.
     pub placeholder: String,
-    /// Model probability of the placement (0..1); under 0.5 it is a guess
-    /// and starts hidden.
+    /// 1 for a link read from the game. For an inferred one the model
+    /// probability of the placement (0..1); under 0.5 it is a guess and
+    /// starts hidden.
     pub confidence: f32,
+    /// The link was read from the game (`HairLinks::exact`), not inferred.
+    pub exact: bool,
     pub grooms: Vec<u64>,
-    /// Pieces left out because their strand roots do not lie on this head.
+    /// Pieces of an inferred link left out because their strand roots do
+    /// not lie on this head.
     pub off_head: usize,
     /// Shown when the character loads: confidence of 50 % or more, or 20 %
     /// or more with every piece rooted on this head.
@@ -1807,14 +1811,14 @@ impl ModelView {
             for h in &look.hair {
                 let mut on = !h.grooms.is_empty() && h.grooms.iter().all(|g| self.hair.selected.contains(g));
                 let name = h.placeholder.trim_end_matches("_full");
-                let mut text = format!("{}: {name} ({:.0} %)", h.slot, h.confidence * 100.0);
+                let mut text = if h.exact { format!("{}: {name}", h.slot) } else { format!("{}: {name} ({:.0} %)", h.slot, h.confidence * 100.0) };
                 if h.off_head > 0 {
                     text += &format!(", {} piece(s) not on this head left out", h.off_head);
                 }
                 if h.colour.is_some() {
                     text += ", stored colour";
                 }
-                if ui.checkbox(&mut on, text).on_hover_text("The strand grooms placed for this hair asset. Nothing in the game files links a hair asset to its strand files; they are placed by name words, archive order, piece counts and where the strand roots lie. The percentage is that model's probability of this placement. Shown at the start: 50 % or more, or 20 % or more when every piece is rooted on this head (a probable style, not a certain one). Pieces whose strand roots do not lie on this head are left out.").changed() {
+                if ui.checkbox(&mut on, text).on_hover_text(if h.exact { "The strand grooms of this hair asset, read from the game: the asset lists its pieces by the ids of their files." } else { "The strand grooms placed for this hair asset. The game's own link could not be read here (it needs the archive's table of contents), so they are placed by name words, archive order, piece counts and where the strand roots lie. The percentage is that model's probability of this placement. Shown at the start: 50 % or more, or 20 % or more when every piece is rooted on this head (a probable style, not a certain one). Pieces whose strand roots do not lie on this head are left out." }).changed() {
                     self.hair.selected.retain(|g| !h.grooms.contains(g));
                     if on {
                         self.hair.selected.extend(h.grooms.iter().copied());
@@ -5975,7 +5979,7 @@ fn load_query_sel(
                                 HairTone { name, preset, noise }
                             });
                             let colour = colour.or(tone.as_ref().map(|t| sixng_core::hairtone::display(t.preset.a)));
-                            info.hair.push(HairPick { slot: slot.clone(), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: t.uncontested(l), off_head: 0, shown: l.confidence >= 0.5 && slot != "body hair", colour, tone });
+                            info.hair.push(HairPick { slot: slot.clone(), placeholder: l.placeholder.clone(), confidence: l.confidence, exact: t.exact, grooms: t.uncontested(l), off_head: 0, shown: l.confidence >= 0.5 && slot != "body hair" && l.part != "body", colour, tone });
                         }
                     }
                     Err(e) => info.notes.push(format!("Strand hair: {e}")),
@@ -5991,7 +5995,7 @@ fn load_query_sel(
                     for l in extra {
                         let slot = sixng_core::pedlook::slot_of(&l.placeholder);
                         if slot == "hair" || slot == "beard" {
-                            info.hair.push(HairPick { slot: format!("other {slot}"), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: t.uncontested(l), off_head: 0, shown: false, colour: None, tone: None });
+                            info.hair.push(HairPick { slot: format!("other {slot}"), placeholder: l.placeholder.clone(), confidence: l.confidence, exact: t.exact, grooms: t.uncontested(l), off_head: 0, shown: false, colour: None, tone: None });
                         }
                     }
                 }
@@ -6033,9 +6037,10 @@ fn load_query_sel(
                 l.hat = Some(Arc::new(sixng_core::groom::Shell::new([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, top - 0.10], &hat, &head)));
                 l.notes.push("Hat: the scalp hair is pressed under the hat's lining (strand points beyond it are pulled in to 3 mm under it), so the hair does not come through the hat; an opening the hat encloses (over a cap's strap) counts as closed. A stand-in, not the game's method: the outfit asks for the plain hair, and no stored rule says how the game keeps it under the hat.".to_string());
             }
-            // Strand roots must lie on this character: pieces that do not
-            // (another head shape, a neighbour's piece) are left out. Only in
-            // the neutral body shape, where the skin is where the grooms expect it.
+            // Strand roots of an inferred link must lie on this character:
+            // pieces that do not (another head shape, a neighbour's piece)
+            // are left out. Only in the neutral body shape, where the skin is
+            // where the grooms expect it. A link read from the game is kept whole.
             if *BODY_SHAPE.lock().unwrap() == (0.0, 0.0) && !l.hair.is_empty() {
                 const CELL: f32 = 0.012;
                 let key = |p: &[f32; 3]| ((p[0] / CELL).floor() as i32, (p[1] / CELL).floor() as i32, (p[2] / CELL).floor() as i32);
@@ -6045,7 +6050,7 @@ fn load_query_sel(
                 let head_cells: std::collections::HashSet<(i32, i32, i32)> = skin.iter().filter(|(n, _)| is_head(n)).flat_map(|(_, pts)| pts.iter().map(key)).collect();
                 let all_cells: std::collections::HashSet<(i32, i32, i32)> = skin.iter().filter(|(n, _)| is_head(n) || n.starts_with("hand_") || n.starts_with("feet_")).flat_map(|(_, pts)| pts.iter().map(key)).collect();
                 if !head_cells.is_empty() {
-                    for h in &mut l.hair {
+                    for h in l.hair.iter_mut().filter(|h| !h.exact) {
                         let cells = if h.slot == "body hair" { &all_cells } else { &head_cells };
                         let all = h.grooms.len();
                         h.grooms.retain(|&off| {

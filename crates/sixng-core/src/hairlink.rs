@@ -1,10 +1,32 @@
 //! Hair on people: which strand grooms are a human hair asset (GUID).
 //!
-//! No resource links a hair asset to its grooms. Five facts together place
-//! many of them; all of it is inferred from names, order and geometry:
+//! The link is stored, in three steps, and read exactly when the archive's
+//! table of contents can be read (`gamecipher`):
 //!
-//! 1. The piece table (`furlink::piece_table`) lists, per asset GUID, the
-//!    ids of its groom pieces. Over all hair / fur assets there are as many
+//! 1. A hair asset's GUID is the name id (`meta7a::asset_id`, the first
+//!    half of MurmurHash3 x64 128) of its 3-vertex placeholder drawable,
+//!    `_full` included (`hairlob_fr1_018_straight_l08_non_sm_n_full`).
+//!    1,854 of the 1,879 assets of the piece table are named this way.
+//! 2. The piece table (`furlink::piece_table`) lists, per asset GUID, the
+//!    ids of its groom pieces. A piece id is the name id of the piece's
+//!    file: the placeholder's name without `_full`, then a piece word
+//!    (`…_sb_n_base`, `_hairline`, `_babyhair`, `_tail`, `_fringe` …).
+//! 3. The table of contents gives every file its name id (column
+//!    `rpf9toc::COL_FILE_ID`), so a piece id leads to one groom file.
+//!    6,232 of the 6,238 ids of the table are files of the archive; 5,711
+//!    of them are grooms (the rest are other files of the same resource
+//!    type, listed for hats, shoes and animals).
+//!
+//! Only a piece's densest groom has an id in the table. Its LODs
+//! (`<piece>_lod1` …) follow it in the archive; they are attached by
+//! bones and falling strand counts (`chains`), which is the one inferred
+//! part of an exact table.
+//!
+//! Without the table of contents (another platform, another game build)
+//! the table is inferred instead, as before; all of that is a guess from
+//! names, order and geometry:
+//!
+//! 1. Over all hair / fur assets the piece table has about as many
 //!    distinct ids as the archive has groom pieces (5,591 against 5,599).
 //! 2. The asset registries (PSO files, record struct `20e0f6ed`, type
 //!    `2d4958cf` = 30 for hair / fur) carry a tag list (`e3da9c8b`) per
@@ -12,15 +34,14 @@
 //!    `hair`, `lob`, `wavy`, `l08`, `non`, `sf`, `n`, or the whole stem for
 //!    a character's own asset (`cs_andrea_hairlob`). The body fit (`fr1`,
 //!    `mr1`) and the number are not among them.
-//! 3. The 3-vertex placeholder drawables (`hairlob_fr1_018_straight_l08_
-//!    non_sm_n_full`) are named like the assets, so an asset is matched to
-//!    the placeholders made of the same words. A wardrobe item (tag
-//!    `023e5a2f`, the placeholder prefix) settles some of the ties; many
-//!    items name a stand-in placeholder of another style, which is ignored.
+//! 3. An asset is matched to the placeholders made of the same words. A
+//!    wardrobe item (tag `023e5a2f`, the placeholder prefix) settles some
+//!    of the ties; many items name a stand-in placeholder of another
+//!    style, which is ignored.
 //! 4. packs.rpf stores resources in name order and a groom file is named
-//!    after its asset (as for animals, `furlink`): the pieces of the
-//!    placeholders follow each other in placeholder order, each asset
-//!    taking as many pieces as it has ids not listed by an earlier asset.
+//!    after its asset: the pieces of the placeholders follow each other in
+//!    placeholder order, each asset taking as many pieces as it has ids
+//!    not listed by an earlier asset.
 //! 5. Geometry pins the walk: strand roots of women's hair end at z 0.72,
 //!    men's at 0.82; beards, brows and body hair sit elsewhere; the length
 //!    word (`l01`..`l09`) follows the longest strand (20 mm .. 490 mm); the
@@ -28,17 +49,15 @@
 //!
 //! The walk is a hidden Markov chain over the placeholders (name order)
 //! and the pieces (archive order). An asset takes its count of pieces, one
-//! more or fewer, or none (its files are not in the archive); pieces of
-//! unknown assets may lie between. The confidence of a link is the
-//! posterior probability of exactly that asset on exactly that run of
-//! pieces. It is a model probability, not a measured error rate: between
-//! two changes of body fit or part nothing but counts, lengths and lean
-//! holds the walk, and one missing file shifts every asset after it.
-//! Assets made of the same words (`beardgoatee_mr1_001` / `_006` / `_008`)
-//! cannot be told apart at all and share their confidence.
+//! more or fewer, or none; pieces of unknown assets may lie between. The
+//! confidence of a link is the posterior probability of exactly that asset
+//! on exactly that run of pieces. It is a model probability, not a
+//! measured error rate, and against the exact table it is often wrong:
+//! files are missing and unlisted pieces lie between, and one of either
+//! shifts every asset after it.
 //!
-//! The table is built once (about a minute) and cached as
-//! `<work>/index/hair_links.json`.
+//! The table is built once (seconds when exact, about a minute when
+//! inferred) and cached as `<work>/index/hair_links.json`.
 
 use crate::classify::Kind;
 use crate::groom::GroomInfo;
@@ -47,11 +66,11 @@ use crate::resource::Resource;
 use anyhow::{anyhow, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::OnceLock;
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 const ITEM: u32 = 0xf795_e8ba;
 const TAG_PLACEHOLDER: u32 = 0x023e_5a2f;
 const STATE_BASE: u32 = 0x44e2_1c90;
@@ -80,17 +99,18 @@ const LEAN_X: [(&str, f64, f64); 5] = [("sl", 0.016, 0.010), ("sr", -0.017, 0.01
 /// Lean backwards for swept back / forward.
 const LEAN_Y: [(&str, f64, f64); 2] = [("sb", 0.043, 0.032), ("sf", 0.005, 0.026)];
 
-/// One placement of an asset: the placeholder it was matched to and the
-/// grooms the walk gave it.
+/// One placement of an asset: its placeholder and its grooms. In an exact
+/// table every asset has one placement of confidence 1.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Link {
     /// Placeholder drawable (`cs_ali_hairdreadlocks_fr1_000_curly_l05_f02_sb_n_full`).
     pub placeholder: String,
     /// Body fit of the placeholder (`fr1`, `mr1`, …).
     pub fit: String,
-    /// hair / beard / brows / lashes / body.
+    /// hair / beard / brows / lashes / body; other for strands on clothing.
     pub part: String,
-    /// Posterior probability of this asset on exactly these pieces (0..1).
+    /// 1 in an exact table. In an inferred one, the posterior probability
+    /// of this asset on exactly these pieces (0..1).
     pub confidence: f32,
     /// Densest groom of each piece (archive offsets). Empty when the walk
     /// found the asset's files missing.
@@ -113,6 +133,9 @@ pub struct Link {
 pub struct HairLinks {
     version: u32,
     pub note: String,
+    /// The links were read (table of contents), not inferred.
+    #[serde(default)]
+    pub exact: bool,
     /// Asset GUID (16 hex digits) -> placements, most probable first.
     pub links: BTreeMap<String, Vec<Link>>,
 }
@@ -232,7 +255,7 @@ fn part_of(words: &BTreeSet<String>, stem: &str) -> &'static str {
         "lashes"
     } else if has("brows") {
         "brows"
-    } else if has("beard") || stem.contains("chin") || stem.contains("chops") {
+    } else if has("beard") || stem.contains("chin") || stem.contains("chops") || stem.contains("mustache") {
         "beard"
     } else {
         "hair"
@@ -625,9 +648,129 @@ fn candidates<'a>(own: &str, words: &BTreeSet<String>, phs: &'a [Placeholder]) -
     }
 }
 
-/// Build the table: registries, wardrobe items, piece table, groom shapes,
-/// then the walk.
+/// The game folder of an archive: its path without its id.
+fn game_root(a: &crate::game::ArchiveInfo) -> std::path::PathBuf {
+    let mut p = a.path.clone();
+    for _ in Path::new(&a.id).components() {
+        p.pop();
+    }
+    p
+}
+
+/// Group the catalog's grooms (archive order) into pieces when the densest
+/// groom of every listed piece is known (`starts`): densest groom -> its
+/// LOD chain. A groom that is no start joins one of the last three pieces
+/// by `furlink::pieces`' rule (same bones, fewer strands than the piece's
+/// last LOD, and for a piece further back the same root box) or stands
+/// alone.
+pub fn chains(cat: &[GroomInfo], starts: &HashSet<u64>) -> HashMap<u64, Vec<u64>> {
+    let close = |a: &[[f32; 3]; 2], b: &[[f32; 3]; 2]| (0..3).all(|k| (a[0][k] - b[0][k]).abs() < 0.002 && (a[1][k] - b[1][k]).abs() < 0.002);
+    // (LODs, index of the densest in `cat`, strands of the last LOD)
+    let mut out: Vec<(Vec<u64>, usize, u32)> = Vec::new();
+    for (i, g) in cat.iter().enumerate() {
+        let n = out.len();
+        let hit = if starts.contains(&g.off) {
+            None
+        } else {
+            (1..=3.min(n)).find(|&back| {
+                let (_, first, last) = &out[n - back];
+                cat[*first].bones == g.bones && g.strands < *last && (back == 1 || close(&cat[*first].root_box, &g.root_box))
+            })
+        };
+        match hit {
+            Some(back) => {
+                let e = &mut out[n - back];
+                e.0.push(g.off);
+                e.2 = g.strands;
+            }
+            None => out.push((vec![g.off], i, g.strands)),
+        }
+    }
+    out.into_iter().map(|e| (e.0[0], e.0)).collect()
+}
+
+/// Build the table: exactly when the table of contents can be read,
+/// inferred otherwise.
 pub fn build(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry]) -> Result<HairLinks> {
+    match build_exact(work, a, all) {
+        Ok(t) => Ok(t),
+        Err(e) => {
+            let mut t = build_inferred(work, a, all)?;
+            t.note = format!("{} The stored link could not be read: {e:#}.", t.note);
+            Ok(t)
+        }
+    }
+}
+
+/// The stored link: placeholder name -> GUID, piece table, file ids of the
+/// table of contents.
+pub fn build_exact(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry]) -> Result<HairLinks> {
+    let cat: Vec<GroomInfo> = crate::groom::catalog_cached(work, a, all)?;
+    if cat.is_empty() {
+        return Err(anyhow!("no grooms in {}", a.id));
+    }
+    let table = crate::furlink::piece_table(&a.path, all);
+    if table.is_empty() {
+        return Err(anyhow!("groom piece table not found in {}", a.id));
+    }
+    let mut cipher = crate::gamecipher::open(&game_root(a))?;
+    let mut f = std::fs::File::open(&a.path)?;
+    let ids = crate::rpf9toc::file_ids(cipher.as_mut(), &mut f)?;
+    let grooms: HashSet<u64> = cat.iter().map(|g| g.off).collect();
+    let file = |id: &u64| ids.get(id).into_iter().flatten().copied().find(|o| grooms.contains(o));
+    let starts: HashSet<u64> = table.values().flatten().filter_map(file).collect();
+    if starts.is_empty() {
+        return Err(anyhow!("no groom of {} has an id of the piece table", a.id));
+    }
+    let lods = chains(&cat, &starts);
+    let names: HashMap<u64, String> = all.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| e.name.as_deref()).map(|n| n.to_ascii_lowercase()).map(|n| (crate::meta7a::asset_id(&n), n)).collect();
+    let mut links: BTreeMap<String, Vec<Link>> = BTreeMap::new();
+    for (guid, list) in &table {
+        let name = names.get(guid).map(|s| s.as_str()).unwrap_or("");
+        // animals: their fur is `furlink`'s
+        if name.starts_with("cr") {
+            continue;
+        }
+        let mut own: Vec<u64> = list.iter().filter_map(file).collect();
+        own.sort_unstable();
+        own.dedup();
+        if own.is_empty() {
+            continue;
+        }
+        let ph = placeholder(name);
+        links.insert(
+            format!("{guid:016x}"),
+            vec![Link {
+                placeholder: name.to_string(),
+                fit: ph.as_ref().map(|p| p.fit.clone()).or_else(|| name.split('_').find(|t| is_fit(t)).map(|t| t.to_string())).unwrap_or_default(),
+                part: match &ph {
+                    Some(p) => p.part,
+                    // a name that is no hair placeholder: strands on a hat, a mask, a costume
+                    None if !name.is_empty() && !["hair", "beard", "mustache", "brows", "lashes"].iter().any(|k| name.contains(k)) => "other",
+                    None => part_of(&BTreeSet::new(), name),
+                }
+                .to_string(),
+                confidence: 1.0,
+                chains: own.iter().map(|o| lods.get(o).cloned().unwrap_or_else(|| vec![*o])).collect(),
+                shared: Vec::new(),
+                listed: list.len(),
+                missing: list.len() - list.iter().filter(|id| file(id).is_some()).count(),
+                rivals: 0,
+                grooms: own,
+            }],
+        );
+    }
+    Ok(HairLinks {
+        version: CACHE_VERSION,
+        note: "Read from the game: an asset's GUID is the name id of its placeholder, the piece table lists its pieces by the name ids of their files, and the table of contents gives each file its id. missing = listed pieces that are no groom file of the archive. The LODs after a piece's densest groom are attached by bones and strand counts.".into(),
+        exact: true,
+        links,
+    })
+}
+
+/// The inferred table: registries, wardrobe items, piece table, groom
+/// shapes, then the walk.
+pub fn build_inferred(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry]) -> Result<HairLinks> {
     let cat: Vec<GroomInfo> = crate::groom::catalog_cached(work, a, all)?;
     let pcs = crate::furlink::pieces(&cat);
     if pcs.is_empty() {
@@ -723,6 +866,41 @@ pub fn build(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::scan::Entr
         })
         .collect();
     let placed = walk(&slots, &shapes);
+    if let Ok(pat) = std::env::var("SIXNG_DEBUG_HAIR") {
+        for g in pat.split(',').filter_map(|x| u64::from_str_radix(x, 16).ok()) {
+            let hit = reg.iter().find(|(k, _)| **k == g || **k >> 32 == g);
+            eprintln!("[hair] asset {g:x}: reg {:?} words {:?} at {:?} table {:?}", hit.map(|(k, t)| (format!("{k:016x}"), t.iter().map(|x| format!("{x:08x}")).collect::<Vec<_>>())), hit.and_then(|(_, t)| asset_words(t, &stems, &words)), hit.and_then(|(k, _)| at.get(k)).map(|(c, _)| c.iter().map(|&i| phs[i].name.clone()).collect::<Vec<_>>()), hit.and_then(|(k, _)| table.get(k)).map(|v| v.len()));
+        }
+        let distinct: BTreeSet<u64> = table.values().flatten().copied().collect();
+        let hairids: BTreeSet<u64> = reg.iter().filter_map(|(k, _)| table.get(k)).flatten().copied().collect();
+        let atids: BTreeSet<u64> = at.keys().filter_map(|k| table.get(k)).flatten().copied().collect();
+        eprintln!("[hair] ids: {} distinct in table, {} of hair assets, {} of matched assets; pieces {}", distinct.len(), hairids.len(), atids.len(), pcs.len());
+        for g in pat.split(',').filter_map(|x| u64::from_str_radix(x, 16).ok()) {
+            if let Some((k, _)) = reg.iter().find(|(k, _)| **k >> 32 == g) {
+                eprintln!("[hair] ids {k:016x}: {:x?}", table.get(k));
+            }
+        }
+        let _ = std::fs::write("hair_reg.json", serde_json::to_vec(&reg.iter().map(|(k, t)| (format!("{k:016x}"), t.clone())).collect::<BTreeMap<_, _>>()).unwrap());
+        let key = pat.split(',').next().unwrap_or("");
+        for (i, (s, pl)) in slots.iter().zip(&placed).enumerate() {
+            if key.is_empty() || !s.name.contains(key) {
+                continue;
+            }
+            eprintln!("[hair] slot {i} {}", s.name);
+            for (c, p) in s.cands.iter().zip(pl) {
+                let ids = table.get(&c.guid).map(|v| v.as_slice()).unwrap_or(&[]);
+                let other: Vec<String> = ids.iter().filter(|id| !c.new.contains(id)).map(|id| phs[owner[id]].name.clone()).collect::<BTreeSet<_>>().into_iter().collect();
+                eprintln!("[hair]   {:016x} ids {} new {} post {:.3} start {} count {} off {:x?} others {:?}", c.guid, ids.len(), c.new.len(), p.post, p.start, p.count, pcs.get(p.start).map(|q| q.lods[0]), other);
+            }
+        }
+        if let Ok(r) = std::env::var("SIXNG_DEBUG_HAIR_RANGE") {
+            let v: Vec<usize> = r.split(',').filter_map(|x| x.parse().ok()).collect();
+            for q in v[0]..v[1].min(pcs.len()) {
+                let sh = &shapes[q];
+                eprintln!("[hair] piece {q} off {:x} strands {} len {:.3}/{:.3} top {:.3} y {:.3} lean {:.2?}", pcs[q].lods[0], sh.strands, sh.len_med, sh.len_max, sh.root_box[1][2], sh.root_y, sh.lean);
+            }
+        }
+    }
     // ids placed with their owner
     let mut id_piece: HashMap<u64, usize> = HashMap::new();
     for (s, pl) in slots.iter().zip(&placed) {
@@ -759,7 +937,8 @@ pub fn build(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::scan::Entr
     }
     Ok(HairLinks {
         version: CACHE_VERSION,
-        note: "Inferred from name words, archive order, piece counts and geometry; not a stored link. confidence = model posterior of this asset on exactly these pieces. Under 0.5 treat the grooms as a guess; rivals > 0 = assets of the same words that could not be told apart.".into(),
+        exact: false,
+        note: "Inferred from name words, archive order, piece counts and geometry; not the stored link. confidence = model posterior of this asset on exactly these pieces. Under 0.5 treat the grooms as a guess; rivals > 0 = assets of the same words that could not be told apart.".into(),
         links,
     })
 }
@@ -783,6 +962,19 @@ mod tests {
 
     fn shape(top: f32, y: f32, len: f32) -> Shape {
         Shape { root_box: [[-0.08, -0.1, top - 0.15], [0.08, 0.08, top]], root_y: y, len_max: len, len_med: len / 2.0, strands: 100, lean: [0.0, 0.0] }
+    }
+
+    #[test]
+    fn chains_by_starts() {
+        let g = |off: u64, strands: u32, bones: &[&str]| GroomInfo { off, id: String::new(), strands, root_triangles: 0, bones: bones.iter().map(|b| b.to_string()).collect(), root_box: [[0.0; 3], [0.1; 3]], category: String::new(), chain: 0, lod: 0 };
+        // x, x_fluff (fewer strands, same bones: a piece of its own), x_fluff_lod1, x_lod1, y
+        let cat = [g(1, 100, &["a"]), g(2, 60, &["a"]), g(3, 30, &["a"]), g(4, 50, &["a"]), g(5, 40, &["b"])];
+        let c = chains(&cat, &HashSet::from([1, 2, 5]));
+        assert_eq!(c[&1], [1, 4]);
+        assert_eq!(c[&2], [2, 3]);
+        assert_eq!(c[&5], [5]);
+        // without the ids x_fluff reads as a LOD of x
+        assert_eq!(chains(&cat, &HashSet::new())[&1], [1, 2, 3]);
     }
 
     #[test]
