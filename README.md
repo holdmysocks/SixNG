@@ -517,7 +517,10 @@ again**).
     their own. `sixng outfit --look` exports carry the same colours: baked
     into the base texture, or as GLB `COLOR_0` over a shade-only texture
     for the per-vertex garments. The viewer builds `<work>/index/material_presets.json` itself when it
-    is missing.
+    is missing. A garment whose textures are not in the install (some hats:
+    no store holds them) has no shade texture to bake into; the viewer
+    gives it the same colours per vertex, without fabric shading (before
+    2026-11-25 it was shown white).
   - **Fabric in the viewer.** Where the preset's library is read, the
     viewer bakes the fabric into the garment's base texture (at 2048
     texels): each sub-material's tiling fabric texture (`tilematerialmap`
