@@ -966,7 +966,8 @@ baked map (`entities.bin`; bake first with `--bake-map`):
     heights, Mie absorption and phase, two-layer ozone), rendered with
     look-up tables: transmittance, multiple scattering, the sky seen from
     the camera and a 32³ froxel volume of aerial perspective (haze over
-    distance, 40 km deep). The sun's disc, a full moon opposite it, stars
+    distance, 40 km deep near the ground, out to the horizon from higher
+    up). The sun's disc, a full moon opposite it, stars
     and the night air glow (`sky_air_glow_*`) are drawn on top.
   - Surfaces are lit in physical units: the sun's illuminance
     (`sky_scattering_sun_illuminance`, ~100 000 lux) times the light
@@ -983,7 +984,8 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   - Our own choices (not decoded): the scale from the timecycle's colour
     values to scattering per km (so its defaults give the usual Earth
     atmosphere), the moon's illuminance (0.25 lux), star and air-glow
-    brightness, the incident meter's 3:1 share against the histogram,
+    brightness, the incident meter's 3:1 share against the histogram (a
+    low sun or moon counted as if 20° up),
     night scenes metered up to 3 stops darker than mid grey, baked map
     tiles lit at 60 % of their colour,
     sun dimming by cloud cover (no clouds are drawn yet), the brightness
