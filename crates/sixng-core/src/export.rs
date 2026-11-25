@@ -215,24 +215,44 @@ pub fn in_region(min: [f32; 3], max: [f32; 3]) -> bool {
     }
 }
 
+/// One key per slot or parameter: its name, else its hash; a second use of
+/// a name gets its hash appended, and any key still taken gets a number, so
+/// no entry replaces another.
+fn unique_key(map: &serde_json::Map<String, serde_json::Value>, name: Option<String>, hash: &str) -> String {
+    let k = match name {
+        Some(n) if !map.contains_key(&n) => n,
+        Some(n) => format!("{n} ({hash})"),
+        None => hash.to_string(),
+    };
+    match (2..).map(|i| format!("{k} #{i}")).find(|c| !map.contains_key(c)) {
+        Some(c) if map.contains_key(&k) => c,
+        _ => k,
+    }
+}
+
+/// A material's constant values by parameter name (hash where the name is
+/// not known), with their real types: a scalar as a number, a vector as its
+/// own 2 to 4 components, integers and booleans as such. Second: the
+/// parameters whose values lie outside the material's constant block.
+fn parameter_values(s: &crate::drawable::Shader) -> (serde_json::Map<String, serde_json::Value>, Vec<String>) {
+    let (mut values, mut unread) = (serde_json::Map::new(), Vec::new());
+    for c in &s.constants {
+        match c.json() {
+            Some(v) => {
+                let k = unique_key(&values, crate::names::param(&c.hash), &c.hash);
+                values.insert(k, v);
+            }
+            None => unread.push(crate::names::param(&c.hash).unwrap_or_else(|| c.hash.clone())),
+        }
+    }
+    (values, unread)
+}
+
 /// `materials.json`, written beside a model: per material its shader, its
 /// textures by slot and its parameter values, keyed by name where the name
 /// is known and by hash where it is not. The same facts as model.json's
 /// `materials` and `drawable.shaders`, laid out to be read.
 fn readable_materials(model: &str, shaders: &[crate::drawable::Shader], mats: &serde_json::Value) -> serde_json::Value {
-    // one key per slot or parameter: its name, else its hash; a second use of a name gets its hash
-    // appended, and any key still taken gets a number, so no entry replaces another
-    fn key(map: &serde_json::Map<String, serde_json::Value>, name: Option<String>, hash: &str) -> String {
-        let k = match name {
-            Some(n) if !map.contains_key(&n) => n,
-            Some(n) => format!("{n} ({hash})"),
-            None => hash.to_string(),
-        };
-        match (2..).map(|i| format!("{k} #{i}")).find(|c| !map.contains_key(c)) {
-            Some(c) if map.contains_key(&k) => c,
-            _ => k,
-        }
-    }
     let list: Vec<serde_json::Value> = shaders
         .iter()
         .enumerate()
@@ -248,20 +268,10 @@ fn readable_materials(model: &str, shaders: &[crate::drawable::Shader], mats: &s
                     }
                 }
                 rec.insert("slot_hash".to_string(), hash.into());
-                let k = key(&textures, t["param_name"].as_str().map(str::to_string), hash);
+                let k = unique_key(&textures, t["param_name"].as_str().map(str::to_string), hash);
                 textures.insert(k, rec.into());
             }
-            let (mut values, mut unread) = (serde_json::Map::new(), Vec::new());
-            for c in &s.constants {
-                match c.json() {
-                    // a scalar as a number, a vector as its own 2 to 4 components; integers and booleans as such
-                    Some(v) => {
-                        let k = key(&values, crate::names::param(&c.hash), &c.hash);
-                        values.insert(k, v);
-                    }
-                    None => unread.push(crate::names::param(&c.hash).unwrap_or_else(|| c.hash.clone())),
-                }
-            }
+            let (values, unread) = parameter_values(s);
             let mut out = serde_json::json!({
                 "index": i,
                 "shader": crate::names::shader(&s.name_hash).unwrap_or_else(|| s.name_hash.clone()),
@@ -273,7 +283,7 @@ fn readable_materials(model: &str, shaders: &[crate::drawable::Shader], mats: &s
                 "parameters": values,
                 "parameters_not_read": unread,
             });
-            for k in ["paint", "multilayer", "stitches", "texture_fallback"] {
+            for k in ["emissive_source", "paint", "multilayer", "stitches", "texture_fallback"] {
                 if !m[k].is_null() {
                     out[k] = m[k].clone();
                 }
@@ -1012,6 +1022,49 @@ fn lit_by_alpha(st: &ShaderTextures, o: &ExportOptions, tdir: &Path) -> Option<P
     Some(p)
 }
 
+/// What lights an emissive material in the glTF.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum EmissiveSource {
+    /// Its own emissive map (`emissivetex`, or a lit map made from the
+    /// colour map's alpha).
+    Map,
+    /// The colour map: shaders with no `emissivetex` input
+    /// (`signs_emissive`, `standard_emissive`, the LED strip).
+    ColourMap,
+    /// It has an `emissivetex` that did not decode: not lit.
+    Missing,
+}
+
+/// Whether a material lights: its class is `emissive`, or its shader is one
+/// of the emissive shaders by name (`standard_emissive`,
+/// `standard_emissive_layer` …), which sit in any render bucket. Hidden
+/// materials never light.
+fn is_lit(s: &crate::drawable::Shader, c: &serde_json::Value) -> bool {
+    c["stand_in"] != "hidden" && (c["class"] == "emissive" || crate::names::shader(&s.name_hash).is_some_and(|n| n.contains("emissive")))
+}
+
+/// `emissive_source` of a model.json material and of the GLB extras.
+fn emissive_source_json(s: &crate::drawable::Shader, st: &ShaderTextures, c: &serde_json::Value) -> serde_json::Value {
+    match emissive_source(st, is_lit(s, c)) {
+        Some(EmissiveSource::Map) => "emissive_map".into(),
+        Some(EmissiveSource::ColourMap) => "colour_map".into(),
+        Some(EmissiveSource::Missing) => "none".into(),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// `lit`: the material lights (`is_lit`). None for materials that do not.
+fn emissive_source(st: &ShaderTextures, lit: bool) -> Option<EmissiveSource> {
+    if !lit {
+        return None;
+    }
+    Some(match (&st.emissive, st.entries.iter().any(|e| e["param_hash"] == EMISSIVE_PARAM)) {
+        (Some(_), _) => EmissiveSource::Map,
+        (None, true) => EmissiveSource::Missing,
+        (None, false) => EmissiveSource::ColourMap,
+    })
+}
+
 /// Whether a shader lights where the alpha of its colour map says: the LED
 /// strip without an `emissivetex`, and a vehicle lamp without one or with
 /// its colour map bound there again.
@@ -1408,6 +1461,10 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                         "base_color": if is_paint(s, st) { None } else { st.base.clone() }, "normal": st.normal, "normal_green": "directx (+Y down); invert G for glTF/OpenGL",
                         "textures": st.entries,
                     });
+                    let (values, unread) = parameter_values(s);
+                    m["parameters"] = values.into();
+                    m["parameters_not_read"] = unread.into();
+                    m["emissive_source"] = emissive_source_json(s, st, &c);
                     if let Some(fb) = &st.fallback {
                         m["texture_fallback"] = fb.clone();
                     }
@@ -1427,7 +1484,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     }
                     m
                 }).collect::<Vec<_>>(),
-                "materials_note": "Textures come from the data/ttdb/*.ttpf stores by 64-bit hash and are written once to <out>/textures/ttpf/<hash>.png. Roles are guessed from the shader parameter hash and the format (sRGB = colour, BC5 / known normal slots = normal map). classification.class is one of opaque/alpha/cutout/decal/glass/window/emissive/water/terrain_multilayer/car_paint, from the shader record flags and known shader families. shader_name and param_name are joaat names from <work>/names/names.json (`sixng names`), null when unknown. slot_role names the PBR map a known parameter slot holds.",
+                "materials_note": "parameters: every constant value of the material, keyed by the parameter's name (its 8-digit hash where the name is not known; a repeated name gets the hash appended), with the type from the shader archive (a scalar as a number, a vector as its 2 to 4 components, int and bool as such); drawable.shaders[].constants has the same values with buffer and byte offset. parameters_not_read: parameters whose values lie outside the material's constant block. emissive_source: what lights an emissive material in the GLB (emissive_map, colour_map, or none when the shader's emissivetex did not decode), null for materials that do not light. Textures come from the data/ttdb/*.ttpf stores by 64-bit hash and are written once to <out>/textures/ttpf/<hash>.png. Roles are guessed from the shader parameter hash and the format (sRGB = colour, BC5 / known normal slots = normal map). classification.class is one of opaque/alpha/cutout/decal/glass/window/emissive/water/terrain_multilayer/car_paint, from the shader record flags and known shader families. shader_name and param_name are joaat names from <work>/names/names.json (`sixng names`), null when unknown. slot_role names the PBR map a known parameter slot holds.",
             });
             let mut j = j;
             if physics.is_some() || archetype.is_some() {
@@ -1769,9 +1826,18 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
                 g["emissiveTexture"] = serde_json::json!("base");
             }
             // A shader with its own emissive map lights only what that map
-            // shows (lamp bulbs, not the whole lamp unit).
-            if let (false, Some(u)) = (g["emissiveFactor"].is_null(), &st.emissive) {
-                g["emissiveTexture"] = serde_json::json!({"uri": u});
+            // shows (lamp bulbs, not the whole lamp unit). One whose
+            // `emissivetex` did not decode does not light at all: its colour
+            // map is not the light.
+            match emissive_source(st, is_lit(s, &classify_shader(s, st))) {
+                Some(EmissiveSource::Map) => g["emissiveTexture"] = serde_json::json!({"uri": st.emissive.clone()}),
+                Some(EmissiveSource::Missing) => {
+                    if let Some(o) = g.as_object_mut() {
+                        o.remove("emissiveFactor");
+                        o.remove("emissiveTexture");
+                    }
+                }
+                _ => {}
             }
             if let (Some(p), true) = (o.paint, is_paint(s, st)) {
                 g["pbrMetallicRoughness"]["baseColorFactor"] = serde_json::json!([p[0], p[1], p[2], 1.0]);
@@ -1787,7 +1853,8 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             g
         },
         extras: {
-            let mut x = serde_json::json!({"shader_name_hash": s.name_hash, "shader_name": crate::names::shader(&s.name_hash), "classification": classify_shader(s, st), "textures": st.entries, "texture_fallback": st.fallback});
+            let c = classify_shader(s, st);
+            let mut x = serde_json::json!({"shader_name_hash": s.name_hash, "shader_name": crate::names::shader(&s.name_hash), "emissive_source": emissive_source_json(s, st, &c), "classification": c, "textures": st.entries, "texture_fallback": st.fallback});
             if let Some(t) = &st.ped_tint {
                 x["ped_tint"] = t.clone();
             }
@@ -3589,6 +3656,48 @@ mod dictionary_tests {
         // a lamp with its own emissive map keeps it; other shaders are left alone
         assert!(!lights_by_alpha(VEHICLE_LAMP_SHADER, &st(Some("a.png"), Some("b.png"))));
         assert!(!lights_by_alpha("0badf00d", &st(Some("a.png"), None)));
+    }
+
+    #[test]
+    fn emissive_materials_light_by_their_own_map() {
+        let slot = |h: &str| serde_json::json!({"param_hash": h});
+        let st = |emissive: Option<&str>, slots: &[&str]| ShaderTextures { base: Some("a.png".into()), emissive: emissive.map(str::to_string), entries: slots.iter().map(|h| slot(h)).collect(), ..Default::default() };
+        // an emissive layer lights by its emissivetex, never by the colour map
+        assert_eq!(emissive_source(&st(Some("e.png"), &[DIFFUSE_PARAM, EMISSIVE_PARAM]), true), Some(EmissiveSource::Map));
+        assert_eq!(emissive_source(&st(None, &[DIFFUSE_PARAM, EMISSIVE_PARAM]), true), Some(EmissiveSource::Missing));
+        // signs_emissive has only its colour map, which is the light
+        assert_eq!(emissive_source(&st(None, &[DIFFUSE_PARAM]), true), Some(EmissiveSource::ColourMap));
+        assert_eq!(emissive_source(&st(Some("e.png"), &[EMISSIVE_PARAM]), false), None);
+        // plain alpha shaders do not light (they were labelled emissive before)
+        for h in ["d9ec330c", "5b775918", "e3ba3129"] {
+            let c = crate::material::classify(h, &[0, 0, 0, 0, 2, 0, 0, 0]);
+            let s = crate::drawable::Shader { index: 0, record_off: 0, name_hash: h.into(), param_hashes: vec![], textures: vec![], flags: vec![], constants: vec![] };
+            assert_eq!(c["class"], "alpha", "{h}");
+            assert!(!is_lit(&s, &c), "{h}");
+            assert!(crate::material::gltf_fields(&c, true)["emissiveFactor"].is_null(), "{h}");
+        }
+    }
+
+    #[test]
+    fn every_constant_value_is_kept_with_its_type() {
+        let s: crate::drawable::Shader = serde_json::from_value(serde_json::json!({
+            "index": 0, "record_off": 0, "name_hash": "e3ba3129", "param_hashes": [], "textures": [], "flags": [],
+            "constants": [
+                {"hash": "0badf00d", "desc": "", "offset": 0, "values": [0.5, 0.0, 0.0, 0.0], "buffer": 3, "count": 1, "type": "float"},
+                {"hash": "0badf00e", "desc": "", "offset": 16, "values": [1.0, 2.0, 3.0, 4.0], "buffer": 3, "count": 4, "type": "float4"},
+                {"hash": "0badf00f", "desc": "", "offset": 32, "values": [f32::from_bits(7), 0.0, 0.0, 0.0], "buffer": 3, "count": 1, "type": "int"},
+                {"hash": "0badf00d", "desc": "", "offset": 36, "values": [0.25, 0.0, 0.0, 0.0], "buffer": 7, "count": 1, "type": "float"},
+                {"hash": "0badf010", "desc": "", "offset": 9999, "values": null, "buffer": 3, "count": 1}
+            ]
+        }))
+        .unwrap();
+        let (v, unread) = parameter_values(&s);
+        // the names dictionary is not loaded in tests: keyed by hash, a repeat gets a number
+        assert_eq!(v["0badf00d"], 0.5);
+        assert_eq!(v["0badf00d #2"], 0.25);
+        assert_eq!(v["0badf00e"], serde_json::json!([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(v["0badf00f"], 7);
+        assert_eq!(unread, vec!["0badf010".to_string()]);
     }
 
     #[test]
