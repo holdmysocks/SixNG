@@ -2238,7 +2238,7 @@ impl Renderer3D {
                 let d = (eye - me.centre).length();
                 let f = l.share(d, size[1] as f32, (cam.fov * 0.5).tan());
                 me.n_draw.store(l.indices(me.n_idx, f), std::sync::atomic::Ordering::Relaxed);
-                me.n_shadow.store(l.indices(me.n_idx, f * l.shadow_scale), std::sync::atomic::Ordering::Relaxed);
+                me.n_shadow.store(l.indices(me.n_idx, l.shadow_share(d, size[1] as f32, (cam.fov * 0.5).tan())), std::sync::atomic::Ordering::Relaxed);
                 if std::env::var("SIXNG_DEBUG_HAIR").is_ok() {
                     static ONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if ONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {

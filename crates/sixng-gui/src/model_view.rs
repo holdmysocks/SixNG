@@ -1369,7 +1369,7 @@ impl ModelView {
                     std::fs::write(&p, glb_bytes)?;
                     let mut gm = glb::load(&p, &dir)?;
                     if let Some(mut l) = lod.filter(|l| gm.meshes.len() == 1 && l.strands > 0 && gm.meshes[0].indices.len() as u32 % l.strands == 0) {
-                        // the piece's extent: half the diagonal of its box (what the game's extent is exactly is not read)
+                        // the piece's extent: the largest half-size of its box
                         let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
                         for v in &gm.meshes[0].verts {
                             for q in 0..3 {
@@ -1377,7 +1377,7 @@ impl ModelView {
                                 hi[q] = hi[q].max(v.pos[q]);
                             }
                         }
-                        l.radius = 0.5 * (0..3).map(|q| (hi[q] - lo[q]).max(0.0).powi(2)).sum::<f32>().sqrt();
+                        l.radius = 0.5 * (0..3).map(|q| (hi[q] - lo[q]).max(0.0)).fold(0.0, f32::max);
                         if std::env::var("SIXNG_DEBUG_HAIR").is_ok() {
                             eprintln!("coat {off:x}: count rule version {} t {:.2e} m extent {:.2} m", l.version, l.t, l.radius);
                         }

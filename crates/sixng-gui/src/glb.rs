@@ -61,7 +61,7 @@ pub struct StrandLod {
     pub min_dist: f32,
     pub use_curve: f32,
     pub cutoff: f32,
-    /// Version 1: the piece's extent in metres.
+    /// Version 1: the piece's extent in metres (the largest half-size of its box).
     pub radius: f32,
     /// ShadowLodScale: the sun shadow pass draws this share of the main pass's share.
     pub shadow_scale: f32,
@@ -84,6 +84,19 @@ impl StrandLod {
         let p = (self.t * h / ((d * tan).max(self.min_dist).max(1e-6) * self.target.max(1e-6))).min(1.0);
         let m = fd.min(p);
         m + (p - m) * self.use_curve
+    }
+
+    /// Share drawn into the sun shadow map: ShadowLodScale of the main share, which version 1 then caps and
+    /// lifts by the same two terms as the main share.
+    pub fn shadow_share(&self, d: f32, h: f32, tan: f32) -> f32 {
+        let s = self.share(d, h, tan) * self.shadow_scale;
+        if self.version != 1 {
+            return s;
+        }
+        let q = self.t / ((d.max(1e-3) - self.radius) * tan).max(0.1);
+        let (a, b) = ((h * 2.0 / 3.0 * q).min(1.0), (2.0 * h * q).min(1.0));
+        let s = s.min(a);
+        s + (b - s) * self.use_curve.max(0.1)
     }
 
     /// Indices to draw of the mesh's `n_idx` for a share of the stored strands.
@@ -126,6 +139,8 @@ mod strand_lod_tests {
         assert!((f - (0.2016 + (0.6048 - 0.2016) * 0.1)).abs() < 1e-3, "{f}");
         // near: the distance term alone holds it at 1
         assert_eq!(l.share(0.4, 1440.0, 0.5), 1.0);
+        // the shadow share at 2.3 m: 0.25 x 0.2419 = 0.0605, lifted a tenth of the way to b
+        assert!((l.shadow_share(2.3, 1440.0, 0.5) - (0.0605 + (0.6048 - 0.0605) * 0.1)).abs() < 1e-3);
     }
 }
 
