@@ -384,10 +384,13 @@ pub fn is_paint(name_hash: &str) -> bool {
 ///   `lyr0normaltex`, `lyr0materialbtex`, `lyr0materialatex`, `lyr1…`,
 ///   `dirtdiffusetex` for the overlay).
 ///   Confidence: high for the grouping.
-/// * COLOR0.a is the only vertex channel painted over the full 0..255 range
-///   (R is mostly a constant 255, G stays within 0..45, B has a few
-///   distinct values); A = 0 on most vertices, so A weights layer 2 over
-///   the base. Confidence: medium.
+/// * Layer weight (shader code, 2026-11-25; replaces a guess from vertex
+///   statistics that pointed at COLOR0.a): the deferred pixel programs
+///   blend `colour = lerp(layer 1, layer 2, w)` with `w` from the second
+///   vertex colour set's red (`_COLOR1.r`), the blend mask (slot 11),
+///   `blendsoftness`, `blendintensity` and `blendoffset`; see
+///   [`TWO_LAYER_BLEND`] and [`two_layer_blend`]. `_COLOR0.a` scales the
+///   dirt overlay instead.
 /// * UV sets: layer 2 follows TEXCOORD_1 (texel anisotropy matches its
 ///   textures in 108 of 117 primitives for 1251cae5, 54 of 72 for
 ///   cd8ceb5e); the base uses TEXCOORD_0 by elimination (TEXCOORD_2 is
@@ -416,33 +419,27 @@ pub fn layers(name_hash: &str, entries: &[Value]) -> Option<Value> {
     };
     let mut out = json!({
         "layers": [
-            layer("base", base, "TEXCOORD_0", "1 - COLOR0.a"),
-            layer("layer2", l2, "TEXCOORD_1", "COLOR0.a"),
+            layer("base", base, "TEXCOORD_0", "1 - w"),
+            layer("layer2", l2, "TEXCOORD_1", "w"),
         ],
+        "blend": two_layer_blend_text(),
         "overlay": {"colour_alpha": tex(overlay), "uv_set": "TEXCOORD_2", "weight": "texture alpha (grime/dirt)", "uv_note": "TEXCOORD_2 by analogy with prop_2lyr_batch, where a seam test shows it (the tiling wall dirt maps cannot be checked that way). On walls it is constant (0, 1) on most primitives (uniform dirt), exactly the horizontal position at 1 m per unit (rotated, no residual) on ground and track pieces, and an irregular second mapping on others"},
         "extra_data": tex(extra),
-        "vertex_color_channels": {"r": "unverified: a baked shading term, mostly 255 (dark blobs on ground tiles where trees stand, 23 on average on trees, 252 on interior shaders; does not follow sky visibility from its own or neighbouring placed geometry in ray tests, nor nearby batch trees, grass AO or road distance)", "g": "unverified: equal to r on 63 % of ordinary vertices; low on ground shaders and varies widely within one collision surface, so not a surface-type mask (looks painted per vertex)", "b": "tint palette index (entry within the palette row)", "a": "layer 2 weight"},
-        "confidence": {"grouping": "high", "weight_channel": "medium", "uv_layer2": "medium", "uv_base": "low", "uv_overlay": "low", "data_channels": "unknown"},
-        "note": "Derived from texture-size grouping and vertex/UV statistics, not from shader code. Blend: lerp(base, layer2, COLOR0.a), then the overlay by its alpha (TEXCOORD_2). Normal maps: DirectX green.",
+        "vertex_color_channels": {"r": "unverified: a baked shading term, mostly 255 (dark blobs on ground tiles where trees stand, 23 on average on trees, 252 on interior shaders; does not follow sky visibility from its own or neighbouring placed geometry in ray tests, nor nearby batch trees, grass AO or road distance)", "g": "unverified: equal to r on 63 % of ordinary vertices; low on ground shaders and varies widely within one collision surface, so not a surface-type mask (looks painted per vertex)", "b": "tint palette index (entry within the palette row)", "a": "multiplies the dirt overlay's alpha (shader code); not the layer weight"},
+        "vertex_color1_channels": {"r": "layer 2 weight input c (shader code; see blend)", "g": "subtracted from w for the normal blend (max(0, w - g)); not traced further", "b": "not read by the blend", "a": "not read by the blend"},
+        "confidence": {"grouping": "high", "weight_channel": "high (shader code: mesh and pixel programs)", "weight_formula": "medium-high (read in full for standard_2lyr and prop_2lyr_batch; the pxm and decal ground variants have the same code shape; not compared with a rendered image)", "uv_layer2": "medium", "uv_base": "low", "uv_overlay": "low", "data_channels": "unknown"},
+        "note": "Slots from texture-size grouping and recovered slot names; the blend from shader code: lerp(base, layer2, w) with w in blend, then the overlay by its alpha (TEXCOORD_2) times _COLOR0.a. Normal maps: DirectX green.",
     });
     if name_hash == "89c8fe07" {
-        // Unpainted vertices are A = 255 here (every granite rock, plain
-        // barriers), and A is painted down on container corner posts, edges
-        // and corrugations (more on the weathered `_b` variant): the overlay
-        // layer weight is 1 - A, the reverse of the wall shaders.
-        out["layers"][0]["weight"] = json!("COLOR0.a");
-        out["layers"][1]["weight"] = json!("1 - COLOR0.a");
-        out["vertex_color_channels"]["a"] = json!("layer-1 weight as 1 - a: 255 (unpainted) = base layer only");
         out["vertex_color_channels"]["r"] = json!("unverified on props: 0/1 part masks on containers, varies on concrete barriers (lower on upward faces)");
-        out["confidence"]["weight_channel"] = json!("medium (direction from where the painting sits, not from shader code)");
-        out["note"] = json!("Derived from recovered slot names, UV tests and where the vertex alpha is painted, not from shader code. Blend: lerp(base, layer2, 1 - COLOR0.a), sharpened by the layers' materialb alpha (height-like), then the dirt overlay by its alpha on TEXCOORD_2. Normal maps: DirectX green.");
+        out["note"] = json!("Slots from recovered slot names and UV tests; the blend from shader code (same code shape as standard_2lyr): lerp(base, layer2, w) with w in blend, then the dirt overlay by its alpha on TEXCOORD_2 times _COLOR0.a. Normal maps: DirectX green.");
         out["overlay"].as_object_mut().unwrap().remove("uv_note");
         out["confidence"]["uv_overlay"] = json!("medium");
         out["prop_2lyr"] = json!({
             "slot_names": {"p0": "lyr0diffusetex", "p6": "lyr0normaltex", "p7": "lyr0materialbtex", "p9": "lyr0materialatex", "p4": "lyr1diffusetex", "p10": "lyr1normaltex", "p5": "lyr1materialbtex", "p2": "lyr1materialatex", "p8": "dirtdiffusetex", "p1": "tintpalettetex (embedded)", "p11": "unnamed (greyscale mask, containers only)"},
             "tint": "the tintpalettetex colour is applied per vertex as COLOR_0 (tint_applied in meshes[]; props with a palette such as containers and barriers, not the rocks); multiply it into the base layer (white paint), not the rust or moss overlay, whose textures are already coloured",
             "dirt_uv": "TEXCOORD_2. On barriers and most containers it is a mapping of its own with almost no seams (27 against about 560 for TEXCOORD_0 and _1 on one barrier), and the dirt map is continuous across those seams while it reads as random across the other sets' seams. On every rock and on some containers it is parked at one point, (1, 0) or (0, 1), so the dirt there is one uniform sample (with wrap and bilinear filtering, the average of the four corner texels: alpha about 64 of 255 on the rock dirt map); sampling it as-is matches the vertex data. Not checked against shader code",
-            "note": "prop_2lyr_batch (rocks, containers, concrete barriers): same slot layout as the multilayer walls. Layer 0 is the unwrapped base (rock chunk atlas, painted metal) on TEXCOORD_0 (checked: rock UV0 triangles fall inside the atlas chunks, UV1 ones do not); layer 1 is a tiling overlay (moss, rust). materialb alpha looks like a height map in both layers (a height blend would sharpen the COLOR0.a weight). Raw COLOR0 on a container is all 1 and on a large rock R is 0/1, G 1, B about 0 and A varies, so A = 255 means base only and the overlay weight is 1 - A (see layers[].weight).",
+            "note": "prop_2lyr_batch (rocks, containers, concrete barriers): same slot layout as the multilayer walls. Layer 0 is the unwrapped base (rock chunk atlas, painted metal) on TEXCOORD_0 (checked: rock UV0 triangles fall inside the atlas chunks, UV1 ones do not); layer 1 is a tiling overlay (moss, rust). The layer weight comes from _COLOR1.r and the blend mask (slot 11), not from COLOR0.a as was guessed before (see blend); COLOR0.a scales the dirt overlay.",
         });
     }
     Some(out)
@@ -460,11 +457,103 @@ pub fn multilayer(s: &crate::drawable::Shader, entries: &[Value], fit: impl FnOn
         l["detail_uv"]["recommended"] = four_layer_detail_uv(&fit);
         four_layer_uv(&mut l, &s.constants);
         four_layer_tint(&mut l, &s.constants);
+    } else if l["blend"].is_object() {
+        two_layer_blend(&mut l, &s.constants);
     }
     if !fit.is_null() {
         l["uv_fit"] = fit;
     }
     Some(l)
+}
+
+/// Material constants of the two-layer blend: `blendsoftness`,
+/// `blendintensity`, `blendoffset`, the blend mask's channel weights
+/// (59eb15c5), the mask invert switch (f208e5ee), the mask UV pick
+/// (f50070cc), the instance-value switch (d969fac9) and the layer-2
+/// colour-alpha switch (d6de9e14).
+pub const TWO_LAYER_BLEND: [(&str, &str); 8] = [
+    ("cbc6c5b3", "blendsoftness"),
+    ("ba3b95db", "blendintensity"),
+    ("29265d05", "blendoffset"),
+    ("59eb15c5", "mask_weights"),
+    ("f208e5ee", "mask_invert"),
+    ("f50070cc", "mask_uv_pair"),
+    ("d969fac9", "instance_switch"),
+    ("d6de9e14", "layer2_alpha"),
+];
+
+/// How the two-layer shaders weight layer 2, as their deferred pixel
+/// programs compute it. Read in full in `standard_2lyr`
+/// (`PS_DeferredTextured_4dbafe93`) and `prop_2lyr_batch` (`…_aa5a1a1b`);
+/// `standard_2lyr_pxm` (`…_1d195d65`, also used by `_pxm_ground`) and
+/// `_pxm_decal_ground` (`…_0c91b99b`) have the same code, the pxm ones
+/// after a first pass that moves the mask's UV by a preliminary weight.
+/// The weight input is the pixel input COLOR1.x, which the mesh programs
+/// (`MS_VS_Transform_4dbafe93`, `…_0c91b99b`) load from mesh stream 12 (the
+/// exported `_COLOR1`), red byte; COLOR0.a reaches the pixel program as the
+/// first colour set's alpha and scales the dirt overlay.
+fn two_layer_blend_text() -> Value {
+    json!({
+        "inputs": {
+            "c": "_COLOR1.r / 255 (the second vertex colour set)",
+            "M": "the blend mask: slot 11 (extra_data), rgba, on TEXCOORD_0 when mask_uv_pair is 1, else TEXCOORD_1 (2 on 6 to 26 % of sampled materials; the mesh program packs mesh UV sets 0 and 1 into the pixel input TEXCOORD0)",
+            "b": "a per-instance value (byte 3 of the instance's record; batch props: an instance input). Not exported; 1 (byte 255) is assumed, which makes m = blendintensity",
+        },
+        "steps": [
+            "h = dot(M, mask_weights)                (mask_weights.z is replaced by b where instance_switch is 1 and b < 1)",
+            "h = 1 - h                               where mask_invert is not 0",
+            "t = saturate(c x (1 + h))",
+            "k = 1 / max(0.001, blendsoftness^2)",
+            "s = saturate(t / max(0.01, t + k x (1 - t)))",
+            "m = b if b + instance_switch < 1, else min(blendintensity, 3 b)      (b = 1: m = blendintensity)",
+            "w = saturate(s x m + blendoffset)",
+            "w = w x lyr1diffusetex.a                where layer2_alpha is not 0",
+            "colour = lerp(base, layer2, w)",
+        ],
+        "simple": "with b = 1 and the mask ignored (h = 0): w = saturate(sharpen(c) x blendintensity + blendoffset), sharpen(c) = c / (c + k (1 - c)); blendsoftness 1 gives sharpen(c) = c",
+        "source": "shader code: the deferred pixel programs of standard_2lyr and prop_2lyr_batch read in full, the pxm and decal ground ones compared; the mesh programs' export of _COLOR1.r to the pixel input checked. Not compared with a rendered image",
+        "not_read": "where the per-instance value comes from in the placements; the normal and material-map blend (they use max(0, w - _COLOR1.g))",
+    })
+}
+
+/// Resolve [`two_layer_blend_text`] for one material: its own constants
+/// (`blend.params`) and the formula with them filled in
+/// (`blend.resolved`). Leaves the general text alone when the material
+/// lacks the constants.
+fn two_layer_blend(l: &mut Value, consts: &[crate::drawable::ShaderConst]) {
+    let get = |h: &str| consts.iter().find(|c| c.hash == h).and_then(|c| c.components()).filter(|v| !v.is_empty() && v.iter().all(|x| x.is_finite())).map(<[f32]>::to_vec);
+    let one = |h: &str| get(h).map(|v| v[0]);
+    let mut params = serde_json::Map::new();
+    for (h, name) in TWO_LAYER_BLEND {
+        if let Some(v) = get(h) {
+            params.insert(name.into(), if v.len() == 1 { json!(v[0]) } else { json!(v) });
+        }
+    }
+    l["blend"]["params"] = Value::Object(params);
+    let (Some(soft), Some(int), Some(off)) = (one("cbc6c5b3"), one("ba3b95db"), one("29265d05")) else { return };
+    let g = |x: f32| format!("{}", (x as f64 * 1e4).round() / 1e4);
+    let k = 1.0 / (soft * soft).max(0.001);
+    let mask = match get("59eb15c5").filter(|v| v.len() == 4) {
+        Some(w) => {
+            let terms: Vec<String> = w.iter().zip(["M.r", "M.g", "M.b", "M.a"]).filter(|(x, _)| **x != 0.0).map(|(x, n)| if *x == 1.0 { n.to_string() } else { format!("{} {n}", g(*x)) }).collect();
+            let h = if terms.is_empty() { "0".to_string() } else { terms.join(" + ") };
+            if one("f208e5ee").is_some_and(|x| x != 0.0) { format!("1 - ({h})") } else { h }
+        }
+        None => "dot(M, mask_weights)".into(),
+    };
+    let mut w = format!("saturate(s x {} + {})", g(int.min(3.0)), g(off));
+    if one("d6de9e14").is_some_and(|x| x != 0.0) {
+        w += " x lyr1diffusetex.a";
+    }
+    l["blend"]["resolved"] = json!({
+        "h": mask,
+        "t": "saturate(c x (1 + h))",
+        "k": g(k),
+        "s": if (k - 1.0).abs() < 1e-6 { "t".to_string() } else { format!("saturate(t / max(0.01, t + {} x (1 - t)))", g(k)) },
+        "w": w,
+        "mask_uv": if one("f50070cc") == Some(1.0) { "TEXCOORD_0" } else { "TEXCOORD_1" },
+        "assumes": "instance value b = 1",
+    });
 }
 
 /// Fit each UV set as a plane over the horizontal model position
@@ -1092,9 +1181,32 @@ mod paint_tests {
         assert_eq!(l["overlay"]["colour_alpha"]["png"], "t8.png");
         assert_eq!(l["overlay"]["uv_set"], "TEXCOORD_2");
         assert!(l["prop_2lyr"].is_object());
-        assert_eq!(l["layers"][1]["weight"], "1 - COLOR0.a");
-        assert_eq!(layers("b217b263", &entries).unwrap()["layers"][1]["weight"], "COLOR0.a");
+        assert_eq!((l["layers"][0]["weight"].as_str(), l["layers"][1]["weight"].as_str()), (Some("1 - w"), Some("w")));
+        assert_eq!(layers("b217b263", &entries).unwrap()["layers"][1]["weight"], "w");
         assert_eq!(layers("b217b263", &entries).unwrap()["overlay"]["uv_set"], "TEXCOORD_2");
+        assert!(l["blend"]["inputs"]["c"].as_str().unwrap().starts_with("_COLOR1.r"));
+    }
+
+    #[test]
+    fn two_layer_blend_from_constants() {
+        // a pipe stack's prop_2lyr_batch material: intensity 0.4, offset 0.3, softness 0.3, mask = blue
+        let k = |hash: &str, v: [f32; 4], count: u8| crate::drawable::ShaderConst { hash: hash.into(), desc: String::new(), offset: 0, values: Some(v), buffer: 7, count, ty: None };
+        let s1 = |hash: &str, x: f32| k(hash, [x, 0.0, 0.0, 0.0], 1);
+        let sh = crate::drawable::Shader { index: 0, record_off: 0, name_hash: "89c8fe07".into(), param_hashes: vec![], textures: vec![], flags: vec![],
+            constants: vec![s1("cbc6c5b3", 0.3), s1("ba3b95db", 0.4), s1("29265d05", 0.3), k("59eb15c5", [0.0, 0.0, 1.0, 0.0], 4), s1("f208e5ee", 1.0), s1("f50070cc", 2.0), s1("d969fac9", 0.0), s1("d6de9e14", 0.0)] };
+        let m = multilayer(&sh, &[], || Value::Null).unwrap();
+        let b = &m["blend"];
+        assert_eq!((b["params"]["blendintensity"].as_f64().map(|x| (x * 10.0).round()), b["params"]["mask_weights"][2].as_f64()), (Some(4.0), Some(1.0)));
+        let r = &b["resolved"];
+        assert_eq!((r["h"].as_str(), r["k"].as_str(), r["w"].as_str()), (Some("1 - (M.b)"), Some("11.1111"), Some("saturate(s x 0.4 + 0.3)")));
+        assert_eq!(r["mask_uv"], "TEXCOORD_1");
+        // softness 1: no sharpening; the layer-2 alpha switch multiplies in lyr1diffusetex.a
+        let sh = crate::drawable::Shader { constants: vec![s1("cbc6c5b3", 1.0), s1("ba3b95db", 1.0), s1("29265d05", 0.0), s1("d6de9e14", 1.0)], ..sh };
+        let r = &multilayer(&sh, &[], || Value::Null).unwrap()["blend"]["resolved"];
+        assert_eq!((r["s"].as_str(), r["w"].as_str()), (Some("t"), Some("saturate(s x 1 + 0) x lyr1diffusetex.a")));
+        // no constants: the general text only
+        let sh = crate::drawable::Shader { constants: vec![], ..sh };
+        assert!(multilayer(&sh, &[], || Value::Null).unwrap()["blend"]["resolved"].is_null());
     }
 
     #[test]
