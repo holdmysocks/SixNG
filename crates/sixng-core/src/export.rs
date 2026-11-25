@@ -2684,6 +2684,8 @@ pub struct MetaScan {
     /// entities are in group-local space and nothing in the map data
     /// places the group.
     pub group: bool,
+    /// Timecycle modifier boxes and LOD / distant lights (lights scan only).
+    pub map_lights: Option<crate::lights::MapLightData>,
 }
 
 pub fn scan_meta(a: &ArchiveInfo, entries: &[&Entry], lights: bool, progress: Progress) -> Vec<MetaScan> {
@@ -2707,12 +2709,13 @@ pub fn scan_meta(a: &ArchiveInfo, entries: &[&Entry], lights: bool, progress: Pr
                 .collect();
             let mlos = crate::meta7a::mlos(&m);
             let instances = crate::meta7a::mlo_instances(&m);
-            if sets.is_empty() && ents.is_empty() && mlos.is_empty() && instances.is_empty() {
+            let map_lights = if lights { crate::lights::map_light_data(&m) } else { None };
+            if sets.is_empty() && ents.is_empty() && mlos.is_empty() && instances.is_empty() && map_lights.is_none() {
                 return None;
             }
             let interior = mlos.iter().flat_map(|x| x.entities.iter().chain(&x.set_entities).copied()).collect();
             let group = !m.objects(0x35ab_c248).is_empty();
-            Some(MetaScan { id: e.id.clone(), sets, ents, mlos, instances, interior, group })
+            Some(MetaScan { id: e.id.clone(), sets, ents, mlos, instances, interior, group, map_lights })
         })
         .collect();
     v.sort_by(|x, y| x.id.cmp(&y.id));
@@ -2933,9 +2936,12 @@ fn link_interior_collision(
 /// entities in the meta resources, then every placed light in world space.
 /// Writes `<out>/lights/<archive>/sets.jsonl` (one line per light set, with
 /// local positions and all fields) and `world.jsonl` (one line per placed
-/// light: world position, archetype, map file, entity index, light index).
-/// Returns (light sets, lights in sets, placed lights).
-pub fn export_lights(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: &Path, progress: Progress) -> Result<(usize, usize, usize)> {
+/// light: world position and direction, archetype, map file, entity index,
+/// light index, and every field of the light record).
+/// Also writes the modifier boxes and distant / LOD lights
+/// ([`export_map_lights`]). Returns (light sets, lights in sets, placed
+/// lights, (modifier boxes and rooms, distant lights, unpaired LOD lights)).
+pub fn export_lights(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: &Path, progress: Progress) -> Result<(usize, usize, usize, (usize, usize, usize))> {
     use crate::lights::{rotate, LightSet};
     use std::io::Write;
     let names = model_names(ws);
@@ -3007,9 +3013,15 @@ pub fn export_lights(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: &
             if !in_region(wp, wp) {
                 continue;
             }
-            let dir = rotate(q_of(en, inst.map(|x| x.2)), l.direction);
-            let mut v = serde_json::json!({"p": wp, "dir": dir, "archetype": format!("{:08x}", en.0), "light": li, "colour": l.colour, "type": l.light_type,
-                "intensity": l.intensity, "range": l.range, "cone": [l.cone_inner, l.cone_outer], "night_only": l.night_only, "map": map, "entity": ei, "owner": s.owner});
+            let q = q_of(en, inst.map(|x| x.2));
+            let (dir, tangent) = (rotate(q, l.direction), rotate(q, l.tangent));
+            let mut v = serde_json::json!({"p": wp, "dir": dir, "tangent": tangent, "archetype": format!("{:08x}", en.0), "light": li, "colour": l.colour,
+                "colour2": l.colour2, "colour3": l.colour3, "type": l.light_type, "intensity": l.intensity, "range": l.range,
+                "falloff_exponent": l.falloff_exponent, "cone": [l.cone_inner, l.cone_outer], "corona_size": l.corona_size,
+                "corona_intensity": l.corona_intensity, "vol_intensity": l.vol_intensity, "flashiness": l.flashiness,
+                "light_fade_distance": l.light_fade_distance, "shadow_fade_distance": l.shadow_fade_distance, "time_flags": l.time_flags,
+                "night_only": l.night_only, "ext_name": format!("{:08x}", s.ext_name), "local": l.position, "v0": l.v0, "fields": l.fields,
+                "map": map, "entity": ei, "owner": s.owner});
             if let Some((im, ii, _)) = inst {
                 v["interior_map"] = serde_json::json!(im);
                 v["interior_instance"] = serde_json::json!(ii);
@@ -3047,7 +3059,144 @@ pub fn export_lights(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: &
         }
     }
     w.flush()?;
-    Ok((n_sets, n_lights, placed))
+    let extra = export_map_lights(ws, &scans, &dir)?;
+    Ok((n_sets, n_lights, placed, extra))
+}
+
+/// Joaat of each timecycle modifier name in `common.rpf` (empty when that
+/// archive or its index is missing).
+fn tc_modifier_names(ws: &Workspace) -> std::collections::HashMap<u32, String> {
+    let Ok(a) = ws.resolve("common") else { return Default::default() };
+    let Ok(ix) = ws.load_index(&a) else { return Default::default() };
+    let entries: Vec<&Entry> = ix.entries.iter().collect();
+    let Ok(d) = crate::timecycle::decode(&a.path, &entries) else { return Default::default() };
+    d.modifiers.iter().filter_map(|m| m["name"].as_str()).map(|n| (crate::meta7a::joaat(n), n.to_string())).collect()
+}
+
+/// The map files' timecycle modifier boxes and LOD / distant lights:
+/// `tc_modifiers.jsonl` (one line per modifier box and per interior room
+/// with a modifier), `distant.jsonl` (one line per
+/// distant light, joined with the LOD light of the same index in the LOD
+/// light file whose parent is the distant file), `distant_groups.jsonl`
+/// (per distant file: name, flags and the members that are not one value
+/// per light, such as the light groups' boxes and index lists) and
+/// `lod.jsonl` (LOD lights whose file pairs with no distant file).
+/// Returns (modifier boxes, distant lights, unpaired LOD lights).
+pub fn export_map_lights(ws: &Workspace, scans: &[MetaScan], dir: &Path) -> Result<(usize, usize, usize)> {
+    use crate::lights::{soa_len, soa_rows};
+    use crate::meta7a::field_name;
+    use std::io::Write;
+    let tc_names = tc_modifier_names(ws);
+    let file = |n: &str| -> Result<std::io::BufWriter<fs::File>> { Ok(std::io::BufWriter::new(fs::File::create(dir.join(n))?)) };
+    let (mut tcw, mut dw, mut lw, mut gw) = (file("tc_modifiers.jsonl")?, file("distant.jsonl")?, file("lod.jsonl")?, file("distant_groups.jsonl")?);
+    let (mut n_tc, mut n_d, mut n_l) = (0, 0, 0);
+    let lod_of: std::collections::HashMap<u32, (&str, &serde_json::Value)> =
+        scans.iter().filter_map(|sc| sc.map_lights.as_ref().and_then(|m| Some((m.parent, (sc.id.as_str(), m.lod.as_ref()?))))).filter(|x| x.0 != 0).collect();
+    let distant_names: std::collections::HashSet<u32> = scans.iter().filter_map(|sc| sc.map_lights.as_ref().filter(|m| m.distant.is_some()).map(|m| m.name)).collect();
+    let vec3 = |v: &serde_json::Value| -> Option<[f32; 3]> { serde_json::from_value::<Vec<f32>>(v.clone()).ok().filter(|a| a.len() >= 3).map(|a| [a[0], a[1], a[2]]) };
+    for sc in scans {
+        let Some(ml) = &sc.map_lights else { continue };
+        for (i, t) in ml.tc_modifiers.iter().enumerate() {
+            let mut v = t.clone();
+            let (lo, hi) = (v.get(field_name(0x672d_4771)).and_then(vec3), v.get(field_name(0x9847_4238)).and_then(vec3));
+            if let (Some(lo), Some(hi)) = (lo, hi) {
+                if !in_region(lo, hi) {
+                    continue;
+                }
+            }
+            if let Some(h) = v.get(field_name(0xe6e1_7f14)).and_then(|x| x.as_u64()) {
+                v["name_hash"] = serde_json::json!(format!("{h:08x}"));
+                if let Some(n) = tc_names.get(&(h as u32)) {
+                    v["modifier"] = serde_json::json!(n);
+                }
+            }
+            v["map"] = serde_json::json!(sc.id);
+            v["index"] = serde_json::json!(i);
+            v["kind"] = serde_json::json!("box");
+            writeln!(tcw, "{v}")?;
+            n_tc += 1;
+        }
+        // Interior rooms: the room's modifier and secondary modifier.
+        for (i, room) in ml.rooms.iter().enumerate() {
+            let mut v = room.clone();
+            let mut any = false;
+            for (f, k) in [(0xa261_e0a9u32, "modifier"), (0xc208_509c, "secondary_modifier")] {
+                if let Some(h) = v.get(field_name(f)).and_then(|x| x.as_u64()).filter(|&h| h != 0) {
+                    any = true;
+                    v[format!("{k}_hash")] = serde_json::json!(format!("{h:08x}"));
+                    if let Some(n) = tc_names.get(&(h as u32)) {
+                        v[k] = serde_json::json!(n);
+                    }
+                }
+            }
+            if !any {
+                continue;
+            }
+            if let Some(rn) = v.get(field_name(0xe6e1_7f14)).and_then(|x| x.as_u64()) {
+                if let Some(mlo) = sc.mlos.iter().find(|m| m.rooms.iter().any(|r| u64::from(r.0) == rn)) {
+                    v["interior"] = serde_json::json!(format!("{:08x}", mlo.name));
+                }
+            }
+            v["map"] = serde_json::json!(sc.id);
+            v["index"] = serde_json::json!(i);
+            v["kind"] = serde_json::json!("room");
+            writeln!(tcw, "{v}")?;
+            n_tc += 1;
+        }
+        let Some(d) = &ml.distant else { continue };
+        // The LOD light file whose parent is this file: same light count,
+        // joined by index.
+        let lod = lod_of.get(&ml.name).copied().filter(|_| ml.name != 0);
+        let n = soa_len(d, 0x0116_6164);
+        let (rows, rest) = soa_rows(d, n);
+        let lod_rows = lod.and_then(|(_, l)| {
+            let ln = soa_len(l, 0x34df_9828);
+            (ln == n).then(|| soa_rows(l, ln))
+        });
+        for (i, r) in rows.iter().enumerate() {
+            let p = r.get(&field_name(0x0116_6164)).and_then(vec3).unwrap_or_default();
+            if !in_region(p, p) {
+                continue;
+            }
+            let mut v = crate::lights::distant_row(r, lod_rows.as_ref().map(|x| &x.0[i]));
+            v["map"] = serde_json::json!(sc.id);
+            v["index"] = serde_json::json!(i);
+            if let Some((id, _)) = lod {
+                v["lod_map"] = serde_json::json!(id);
+            }
+            writeln!(dw, "{v}")?;
+            n_d += 1;
+        }
+        let mut group = serde_json::json!({"map": sc.id, "name": format!("{:08x}", ml.name), "flags": ml.flags, "lights": n, "rest": rest});
+        if let Some((id, _)) = lod {
+            group["lod_map"] = serde_json::json!(id);
+            group["lod_paired"] = serde_json::json!(lod_rows.is_some());
+            if let Some((_, lr)) = &lod_rows {
+                group["lod_rest"] = serde_json::Value::Object(lr.clone());
+            }
+        }
+        writeln!(gw, "{group}")?;
+    }
+    // LOD light files with no distant light file to pair with.
+    for sc in scans {
+        let Some(ml) = &sc.map_lights else { continue };
+        let Some(l) = &ml.lod else { continue };
+        if distant_names.contains(&ml.parent) {
+            continue;
+        }
+        let (rows, _) = soa_rows(l, soa_len(l, 0x34df_9828));
+        for (i, mut r) in rows.into_iter().enumerate() {
+            r.insert("map".into(), serde_json::json!(sc.id));
+            r.insert("parent".into(), serde_json::json!(format!("{:08x}", ml.parent)));
+            r.insert("index".into(), serde_json::json!(i));
+            writeln!(lw, "{}", serde_json::Value::Object(r))?;
+            n_l += 1;
+        }
+    }
+    for w in [&mut tcw, &mut dw, &mut lw, &mut gw] {
+        w.flush()?;
+    }
+    Ok((n_tc, n_d, n_l))
 }
 
 /// Road / path-node graph (`sixng paths`): finds the node (`0c69a100`) and
