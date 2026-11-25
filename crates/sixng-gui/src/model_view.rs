@@ -7319,10 +7319,6 @@ fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db:
     const BODY_SLOT: u32 = 0x1c9d_d6fe;
     // asset id -> model
     let by_asset: HashMap<u64, (&String, &sixng_core::scan::Entry)> = stems.iter().map(|(stem, e)| (sixng_core::meta7a::asset_id(stem), (stem, *e))).collect();
-    const SLOTS: [&str; 24] = [
-        "bonnet", "boot", "bumper_f", "bumper_r", "exhaust", "spoiler", "splitter", "diffuser", "towing", "roof", "chassis", "skirt", "skirts", "grille", "wing", "cage", "seats", "intake", "plate", "canards", "interior", "engine", "suspension", "lights",
-    ];
-    let slot_name: HashMap<u32, &str> = SLOTS.iter().map(|s| (joaat(s), *s)).collect();
     let mut opts = Vec::new();
     let mut kits = HashMap::new();
     // the parts of the first configuration are on to begin with
@@ -7393,7 +7389,7 @@ fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db:
             id: first.id.clone(),
             name: ms[0].0.to_string(),
             // the part that fits a pickup's bed (and its rear bumper)
-            group: if m.slot == BODY_SLOT || ms.iter().any(|x| is_body(x.0)) { "body".to_string() } else { slot_name.get(&m.slot).map(|s| s.to_string()).unwrap_or_else(|| format!("slot {:08x}", m.slot)) },
+            group: if m.slot == BODY_SLOT || ms.iter().any(|x| is_body(x.0)) { "body".to_string() } else { sixng_core::vehicles::mod_slot_name(m.slot).map(|s| s.to_string()).unwrap_or_else(|| format!("slot {:08x}", m.slot)) },
             label,
             default: first_config.contains(&m.name),
         });
