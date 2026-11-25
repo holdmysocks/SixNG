@@ -1285,9 +1285,10 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             // profile4 = 15 x (ramp profile x the strand's own profile, taken as 1); y = 0.5 + 0.0266667 profile4
             let yh = select(0.6067, 0.5 + 0.4 * clamp(i.uv1.x, 0.0, 1.0), ramped);
             let direct_h = hair_game(albedo, tdir, tube, root, v, l, g0h, yh, eh) * sun;
-            // ambient: the viewer's sky light at the root normal, with the game's factor
-            let up_h = root.y * 0.5 + 0.5;
-            let sky_h = mix(neutral(F.sky_hor.rgb, 0.8) * 0.6, neutral(F.sky_top.rgb, 0.8), up_h) * F.misc.w;
+            // ambient: the game's diffuse probe light for hair is a plain cosine (Lambert) lobe with the strand
+            // tangent in place of the normal (its final-gather pass; medium-high confidence). Here: the viewer's
+            // diffuse ambient around the tangent, with the game's factor
+            let sky_h = ambient(tdir);
             // o = sqrt(profile4 / 15 x openness) (profile4: the ramp's profile value in 15 steps)
             let o_h = sqrt(select(1.0, round(15.0 * clamp(i.uv1.x, 0.0, 1.0)) / 15.0, ramped) * strand_openness(i.clip));
             // the reflection part of the game's hair ambient (read from its hair program, medium confidence):
