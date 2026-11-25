@@ -158,6 +158,8 @@ const OPTION_PARTS: u32 = 0xbf34_0aab;
 /// library part whose modifiers come along. The other types (0 to 4) are
 /// not read.
 const PART_REF: u32 = 0x51aa_b7c1;
+const REF_TYPE: u32 = 0x3165_b05d;
+const REF_DATA: u32 = 0x5eb5_e655;
 /// The channel body panels are bound to (bonnet, boot, bumpers, doors, at
 /// priority 1 over a default); no record assigns it a colour, so it is taken
 /// as the body paint.
@@ -463,7 +465,9 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
                 }
             }
             for o in dump(PART_REF) {
-                if let (Some(n), Some(5), Some(p)) = (num(&o, NAME), o["type"]["tag"].as_u64(), o["data"].as_u64()) {
+                // by member hash: `data` is not among the built-in field names, so
+                // by name these read only with the name dictionary loaded
+                if let (Some(n), Some(5), Some(p)) = (num(&o, NAME), get(&o, REF_TYPE).and_then(|t| t["tag"].as_u64()), num(&o, REF_DATA)) {
                     l.refs.insert(n as u32, p as u32);
                 }
             }
