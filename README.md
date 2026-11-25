@@ -783,7 +783,12 @@ again**).
 - The viewer's **Parts** panel lists every part an animal or character
   has, grouped by slot (body, eye, crown, shirt, harness …; head, top,
   outer, bottom, feet, hat, glasses …). Pick one per group or "none";
-  accessories (hats, harnesses, holsters …) and alternate sets start off.
+  accessories (hats, harnesses, holsters …), lash cards stored as head
+  parts and alternate sets start off. A character with no part in an
+  outfit slot (one full-body model) shows the first part of each group.
+  Characters outside the game's outfit list (cutscene heads and the like)
+  still get their strand hair: the grooms linked to their hair parts by
+  name, in the hair picker's colour.
   Animal sets that span several parts (`08 collarharness`: body + harness,
   `09 corpse roadkill`) have a button each, and **Defaults** goes back.
   The camera stays put while parts change, and the item page's Export and
