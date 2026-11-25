@@ -110,6 +110,9 @@ pub struct Material {
     /// The material lights: its class is `emissive`, or the GLB gives it
     /// an emissive texture (emissive shaders of other classes).
     pub lit: bool,
+    /// The colour of the light (the GLB emissiveFactor divided by its
+    /// brightest channel); white when the export does not say.
+    pub emissive_tint: [f32; 3],
     pub slots: Vec<Slot>,
     /// worst slot status: ok / lowmip / flat
     pub gap: String,
@@ -847,6 +850,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             occlusion_only,
             emissive_scale,
             lit,
+            emissive_tint: emissive_tint(&m),
             slots,
             gap: gap.into(),
             shader_hash: ex["shader_name_hash"].as_str().unwrap_or("").into(),
@@ -1241,6 +1245,20 @@ pub fn gltf_emissive_strength(m: &Value) -> f32 {
     (f * x) as f32
 }
 
+/// The colour of a material's light: its `emissiveFactor` divided by the
+/// brightest channel (the brightness is in `emissive_scale`); white when
+/// there is no factor or it is black.
+pub fn emissive_tint(m: &Value) -> [f32; 3] {
+    let f: Vec<f32> = m["emissiveFactor"].as_array().map(|a| a.iter().filter_map(|v| v.as_f64()).map(|v| v as f32).collect()).unwrap_or_default();
+    match f.as_slice() {
+        [r, g, b, ..] if r.max(*g).max(*b) > 1e-4 => {
+            let k = r.max(*g).max(*b);
+            [r / k, g / k, b / k]
+        }
+        _ => [1.0; 3],
+    }
+}
+
 /// Whether a material lights: class `emissive`, or any class with an
 /// emissive texture in the GLB (the export sets one only on materials whose
 /// shader lights).
@@ -1357,6 +1375,16 @@ mod emissive_tests {
         assert!((bulb - 6.28f32.sqrt()).abs() < 1e-5);
         assert_eq!(emissive_scale(&m(1.0, Some(32.3))), 3.0);
         assert!((gltf_emissive_strength(&m(1.0, Some(32.3))) - 32.3).abs() < 1e-4);
+    }
+
+    #[test]
+    fn emissive_tint_is_the_factor_colour() {
+        assert_eq!(emissive_tint(&serde_json::json!({})), [1.0; 3]);
+        assert_eq!(emissive_tint(&serde_json::json!({"emissiveFactor": [0.0, 0.0, 0.0]})), [1.0; 3]);
+        // a dim blue railing glow and a light blue neon tube
+        let t = emissive_tint(&serde_json::json!({"emissiveFactor": [0.008, 0.0105, 0.05]}));
+        assert!(t.iter().zip([0.16, 0.21, 1.0]).all(|(a, b)| (a - b).abs() < 1e-5), "{t:?}");
+        assert_eq!(emissive_tint(&serde_json::json!({"emissiveFactor": [0.42, 0.85, 1.0]})), [0.42, 0.85, 1.0]);
     }
 
     #[test]

@@ -99,6 +99,17 @@ fn rgb(r: &Resource, o: usize) -> String {
 fn light_at(m: &Meta, o: usize) -> Light {
     let r = m.r;
     let mut f = m.scalars_by_hash(LIGHT, o, &[0, 0x120]);
+    // The members the scalar reader leaves out (half floats, bools, 64-bit
+    // hashes, inline arrays, embedded structs), decoded in full.
+    if let Some(sd) = m.structs.get(&LIGHT) {
+        for mb in &sd.members {
+            if mb.hash != 0x100 && mb.off != 0 && mb.off != 0x120 && !f.contains_key(&mb.hash) {
+                if let Some(v) = m.member_value(LIGHT, o, mb.hash) {
+                    f.insert(mb.hash, v);
+                }
+            }
+        }
+    }
     let extents = m.member_value(LIGHT, o, 0x2d3f_79c0).and_then(|v| serde_json::from_value::<[f32; 3]>(v).ok());
     if let Some(e) = extents {
         f.insert(0x2d3f_79c0, serde_json::json!(e));
@@ -355,9 +366,8 @@ fn half(h: u16) -> f32 {
 /// `a13c79ef` (`random`: spread evenly over 0..100 and independent of every
 /// other field, of the placed light it comes from, its hash and its
 /// position: a per-light random value). None of the three is a copy of a
-/// placed-light field; `time_multiplier` is the same for a given light of
-/// an archetype (98.5 %), so it comes from the light's definition, not the
-/// entity. `intensity` is the placed intensity converted for a light seen
+/// plain placed-light field: `time_multiplier` is copied from the placed
+/// light's embedded distant settings (`092999c9.timeMultiplier`, 99.6 %). `intensity` is the placed intensity converted for a light seen
 /// from far away: points keep it; a spot's is multiplied by
 /// `F + (1 - F) * p`, with `F = 2 / ((1 - cos inner) + (cos inner - cos
 /// outer) / 3)` (4 pi over the solid angle of a cone with a squared falloff
