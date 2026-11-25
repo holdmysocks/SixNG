@@ -334,6 +334,9 @@ pub struct Coat {
     /// Per strand: its 2-bit variant (which of four colour ramps the game's
     /// strand shader takes for it).
     pub variants: Vec<u8>,
+    /// Per strand: its clump (1-based, numbered in the order grown; 0 for a
+    /// scattered strand). In mode 16 the clump is the guide strand + 1.
+    pub clumps: Vec<u32>,
     /// Strands the groom stores for the whole piece (sum of c0 + c1).
     pub stored: usize,
 }
@@ -584,7 +587,7 @@ impl Groom {
     pub fn coat(&self, share: f32) -> Coat {
         use crate::hairgen;
         let k = self.points_per_strand;
-        let mut c = Coat { k, points: Vec::new(), guides: Vec::new(), normals: Vec::new(), variants: Vec::new(), stored: self.stored_strands() };
+        let mut c = Coat { k, points: Vec::new(), guides: Vec::new(), normals: Vec::new(), variants: Vec::new(), clumps: Vec::new(), stored: self.stored_strands() };
         let share = share.clamp(0.0, 1.0);
         if share <= 0.0 || k == 0 || self.tri_counts.len() != self.roots.len() || self.roots.is_empty() {
             return c;
@@ -644,6 +647,7 @@ impl Groom {
                 c.normals.push(normal(t));
                 c.guides.push((t, w));
                 c.variants.push(hairgen::variant(d_var, steps(t, w)));
+                c.clumps.push(0);
             }
         }
 
@@ -731,10 +735,12 @@ impl Groom {
                 c.normals.push(nr);
                 c.guides.push((t, w));
                 c.variants.push(hairgen::variant(d_var, steps(t, w)));
+                c.clumps.push(idx as u32 + 1);
             }
             return c;
         }
         let mut acc = 0.0f32;
+        let mut clump_id = 0u32;
         for (ti, (&t, q)) in self.roots.iter().zip(&self.tri_counts).enumerate() {
             let (members, clumps) = (q[1] as u32, q[2].max(1) as u32);
             if members == 0 {
@@ -742,6 +748,7 @@ impl Groom {
             }
             let nr = normal(t);
             for ck in 0..clumps {
+                clump_id += 1;
                 let (cseed, b) = hairgen::seed_bary(ti as u32, clump_seed, ck.wrapping_mul(0x9e37_79b9) ^ 0x5bd1_e995);
                 let radius = 0.001 * mix(t, b, &|s| self.corners.get(s).map_or(0.0, |c| c[1] as f32));
                 let centre: Vec<[f32; 3]> = (0..k).map(|j| blend(t, b, j)).collect();
@@ -767,6 +774,7 @@ impl Groom {
                     c.normals.push(nr);
                     c.guides.push((t, b));
                     c.variants.push(hairgen::variant(d_var, steps(t, b)));
+                    c.clumps.push(clump_id);
                 }
             }
         }
@@ -1152,9 +1160,11 @@ pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], o
             }
             let bytes = match (ribbons, &coat) {
                 (Some(hw), Some(c)) => g.coat_glb(&name, c, hw * 2.0, &[], extras),
-                (None, Some(c)) => {
-                    let (w, uv, seg) = g.coat_lines(c);
-                    crate::gltf::lines_glb(&name, &c.points, &w, &uv, &seg, &[], extras)
+                // the grown strands with their root UV, width, clump and variant (`hairexport`)
+                (None, Some(_)) => {
+                    let o = crate::hairexport::Options { density: full.unwrap_or(1.0), guides: false, ..Default::default() };
+                    let (prims, _) = crate::hairexport::piece(&g, &name, &o, serde_json::json!({"source": e.id}));
+                    crate::gltf::strands_glb(&name, &prims, extras)
                 }
                 (Some(hw), None) => g.ribbon_glb(&name, hw, [0.08, 0.05, 0.03], extras),
                 (None, None) => {
