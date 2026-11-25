@@ -933,8 +933,8 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
             // down to a ground's reflectance, half of the slope shading kept
             col = albedo * TILE_ALBEDO * (sun_e(i.world) * (0.5 + 0.5 * ndl) / 3.14159 + amb_d);
             // the tiles' painted water (the map's water and no-data colour)
-            // is shaded as the game's water on cells with no height (vertex
-            // alpha 0, blending over a cell at the shore); on cells with a
+            // is shaded as the game's water on sea cells (no height, or deeper
+            // than the beaches: vertex alpha 0, blending over a shore cell); on cells with a
             // height the same paint marks wet sand and land, which stay ground
             let painted = 1.0 - smoothstep(0.02, 0.07, length(base.rgb - TILE_SEA));
             let wet = painted * (1.0 - i.col.a);
