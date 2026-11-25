@@ -148,7 +148,6 @@ fn sun_e_shadowed(p: vec3<f32>, sh: f32) -> vec3<f32> {
     if (!hdr()) { return F.sun_col.rgb * F.sun_dir.w * 3.0; }
     let r = point_r(p);
     let l = normalize(F.sun_dir.xyz);
-    let sh = sun_shadow(p);
     if (dot(l, S.moon.xyz) > 0.99) {
         return S.moon_dir_e.rgb * transmittance(r, S.moon.y) * sh;
     }
