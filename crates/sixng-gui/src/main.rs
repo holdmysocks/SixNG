@@ -44,6 +44,7 @@ mod model_view;
 mod pages;
 mod render3d;
 mod scenes_view;
+mod shadow;
 mod siren_sound;
 #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
 mod render3d_metal4;
@@ -1601,6 +1602,9 @@ impl App {
             }
             if let Some(w) = c.get("weather") {
                 m3.weather = w.trim().to_ascii_lowercase();
+            }
+            if c.has("no-shadows") {
+                m3.no_shadows = true;
             }
             if let Some(v) = c.f("fog") {
                 m3.look.fog = v;

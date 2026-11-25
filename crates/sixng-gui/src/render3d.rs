@@ -456,6 +456,9 @@ pub struct GpuModel {
     pub n_fb: u32,
     pub instance_cap: u32,
     pub bbox: [Vec3; 2],
+    /// World bounding sphere of the normally drawn instances (centre,
+    /// radius), set with the instances; None: unknown (always drawn).
+    pub world: Option<(Vec3, f32)>,
     /// Stencil value its opaque surfaces write: 1 = real surface, 0 = far
     /// field (terrain, ocean), which coverage fallbacks may draw over.
     pub stencil: u32,
@@ -486,6 +489,29 @@ impl GpuModel {
     pub fn n_normal(&self) -> u32 {
         self.n_instances - self.n_fb.min(self.n_instances)
     }
+}
+
+/// World bounding sphere of a model's instances from its local box.
+fn world_sphere<'a>(bbox: [Vec3; 2], inst: impl Iterator<Item = &'a Instance>) -> Option<(Vec3, f32)> {
+    let c = (bbox[0] + bbox[1]) * 0.5;
+    let r = (bbox[1] - bbox[0]).length() * 0.5;
+    if !c.is_finite() || !r.is_finite() {
+        return None;
+    }
+    let mut lo = Vec3::splat(f32::MAX);
+    let mut hi = Vec3::splat(f32::MIN);
+    for i in inst {
+        let m = Mat4::from_cols_array_2d(&i.m);
+        let wc = m.transform_point3(c);
+        let s = m.x_axis.truncate().length().max(m.y_axis.truncate().length()).max(m.z_axis.truncate().length());
+        let wr = r * s;
+        lo = lo.min(wc - Vec3::splat(wr));
+        hi = hi.max(wc + Vec3::splat(wr));
+    }
+    if lo.x > hi.x {
+        return None;
+    }
+    Some(((lo + hi) * 0.5, (hi - lo).length() * 0.5))
 }
 
 /// Spacing of the material uniforms in a model's buffer (the uniform offset alignment).
@@ -571,6 +597,17 @@ pub struct Renderer3D {
     /// The sky of this frame (HDR frame only).
     pub sky: Option<crate::atmo::Sky>,
     last_frame: Option<std::time::Instant>,
+    /// Sun and moon shadow cascades (HDR frame only; shadow.rs).
+    shadow: crate::shadow::ShadowGpu,
+    /// One frame bind group per cascade: its view, and a stand-in in place
+    /// of the cascades it draws into.
+    shadow_bgs: Vec<wgpu::BindGroup>,
+    pipe_shadow: wgpu::RenderPipeline,
+    pipe_shadow_cell: wgpu::RenderPipeline,
+    /// Draw sun and moon shadows (3D map).
+    pub shadows: bool,
+    /// Draw calls into the shadow cascades in the last frame.
+    pub shadow_draws: u32,
 }
 
 /// A map cell on the GPU (see cells.rs).
@@ -771,7 +808,8 @@ impl Renderer3D {
     fn new_with(rs: &egui_wgpu::RenderState, hdr: bool) -> Self {
         let device = &rs.device;
         let color_fmt = if hdr { crate::atmo::HDR_FMT } else { COLOR_FMT };
-        let atmo = crate::atmo::Atmosphere::new(device, &rs.queue);
+        let shadow = crate::shadow::ShadowGpu::new(device, hdr, std::mem::size_of::<FrameU>() as u64);
+        let atmo = crate::atmo::Atmosphere::new(device, &rs.queue, &shadow);
         let shader_src = format!("{}\n{}", include_str!("atmo_common.wgsl"), include_str!("shader.wgsl"));
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sixng shader"),
@@ -1188,6 +1226,12 @@ impl Renderer3D {
             }),
         };
         let default_frame_bg = frame_bind_group(device, &bgl_frame, &frame_ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &atmo.binds);
+        let stand_in = crate::atmo::SceneBinds { shadow: shadow.stand_in.clone(), ..atmo.binds.clone() };
+        let shadow_bgs = shadow
+            .frame_ubs
+            .iter()
+            .map(|ub| frame_bind_group(device, &bgl_frame, ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &stand_in))
+            .collect();
         std::mem::forget(wt); // the 1x1 white texture lives for the process
                               // map cells
         let bgl_cell = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1287,7 +1331,50 @@ impl Renderer3D {
             depth_st(&st_fb),
             Some(wgpu::Face::Back),
         );
+        // shadow casters: depth only, both faces, pushed away from the light
+        // by the slope (reversed depth: towards 0)
+        let shadow_pipe = |label: &str, layout: &wgpu::PipelineLayout, vs: &str, fs: &str, bufs: &[Option<wgpu::VertexBufferLayout>]| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some(vs),
+                    compilation_options: Default::default(),
+                    buffers: bufs,
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: crate::shadow::FMT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Greater),
+                    stencil: Default::default(),
+                    bias: wgpu::DepthBiasState { constant: 0, slope_scale: -2.0, clamp: 0.0 },
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &[],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipe_shadow = shadow_pipe("shadow", &layout, "vs_mesh", "fs_shadow", &vbufs);
+        let pipe_shadow_cell = shadow_pipe("shadow cell", &layout_cell, "vs_cell", "fs_shadow_cell", &cbufs);
         Renderer3D {
+            shadow,
+            shadow_bgs,
+            pipe_shadow,
+            pipe_shadow_cell,
+            shadows: true,
+            shadow_draws: 0,
             pipe_fb,
             pipe_cell_fb,
             depth_fmt,
@@ -1790,6 +1877,7 @@ impl Uploader {
             n_fb: 0,
             instance_cap: 1,
             bbox: [Vec3::from(m.bbox[0]), Vec3::from(m.bbox[1])],
+            world: None,
             stencil: 1,
             mat_names: mats
                 .iter()
@@ -1850,6 +1938,7 @@ impl Renderer3D {
         }
         gm.n_instances = inst.len() as u32;
         gm.n_fb = n_fb as u32;
+        gm.world = world_sphere(gm.bbox, inst.iter().filter(|i| !i.is_fallback()));
     }
 
     /// Give a model its stickers: the shader records (header first, see
@@ -2116,6 +2205,129 @@ impl Renderer3D {
         n
     }
 
+    /// Draw the models' opaque and cut-out meshes into a shadow cascade:
+    /// no skinned models, see-through or decal surfaces or coverage
+    /// fallbacks, and no model smaller than `min_radius` (m).
+    fn record_shadow(
+        pipe: &wgpu::RenderPipeline,
+        bg: &wgpu::BindGroup,
+        be: &mut wgpu::RenderPass<'_>,
+        models: &[&GpuModel],
+        c: &crate::shadow::Cascade,
+    ) -> u32 {
+        let mut n = 0u32;
+        be.set_pipeline(pipe);
+        be.set_bind_group(0, Some(bg), &[]);
+        for gm in models {
+            let range = 0..gm.n_normal();
+            if range.is_empty() || gm.meshes.iter().any(|m| m.skinned) {
+                continue;
+            }
+            if c.min_radius > 0.0 && (gm.bbox[1] - gm.bbox[0]).length() * 0.5 < c.min_radius {
+                continue;
+            }
+            if let Some((wc, wr)) = gm.world {
+                if !crate::shadow::in_cascade(c, wc, wr) {
+                    continue;
+                }
+            }
+            be.set_vertex_buffer(1, Some(gm.instances.slice(..)));
+            let mut bound: Option<&wgpu::Buffer> = None;
+            let mut mat = usize::MAX;
+            for me in gm.meshes.iter().filter(|m| m.visible && m.n_idx > 0) {
+                let see_through = gm.mat_alpha[me.material] == 2
+                    || matches!(gm.mat_class[me.material], 5 | 6 | 8);
+                if see_through || gm.mat_decal[me.material].is_some() {
+                    continue;
+                }
+                if mat != me.material {
+                    be.set_bind_group(1, Some(&gm.mat_bg[me.material]), &[]);
+                    mat = me.material;
+                }
+                if bound != Some(&me.vb) {
+                    be.set_vertex_buffer(0, Some(me.vb.slice(..)));
+                    be.set_index_buffer(me.ib.slice(..), wgpu::IndexFormat::Uint32);
+                    bound = Some(&me.vb);
+                }
+                let first = (me.ib_range.start / 4) as u32;
+                let base = (me.vb_range.start / std::mem::size_of::<glb::Vertex>() as u64) as i32;
+                be.draw_indexed(first..first + me.n_idx, base, range.clone());
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Draw the shadow cascades of the frame's light (sun or moon) and set
+    /// the uniform the mesh shaders read them with.
+    #[allow(clippy::too_many_arguments)]
+    fn render_shadows(
+        &mut self,
+        queue: &wgpu::Queue,
+        enc: &mut wgpu::CommandEncoder,
+        cam: &Camera,
+        look: &Look,
+        fu: &FrameU,
+        aspect: f32,
+        models: &[&GpuModel],
+    ) {
+        use crate::shadow::{cascades, ShadowU, CASCADES};
+        let light = look.sun_dir.normalize_or_zero();
+        let on = self.hdr && self.shadows && self.sky.is_some() && look.mode == 0 && light.y > 0.02;
+        self.shadow_draws = 0;
+        if !on {
+            self.shadow.drawn = [None; CASCADES];
+            queue.write_buffer(&self.shadow.ub, 0, bytemuck::bytes_of(&ShadowU::default()));
+            return;
+        }
+        let fwd = -cam.view().row(2).truncate();
+        let cs = cascades(cam.eye(), fwd, cam.fov, aspect, light, cam.near);
+        let due = self.shadow.due();
+        for i in 0..CASCADES {
+            if !due[i] {
+                continue;
+            }
+            let c = cs[i];
+            let mut sfu = *fu;
+            sfu.view_proj = c.view_proj.to_cols_array_2d();
+            queue.write_buffer(&self.shadow.frame_ubs[i], 0, bytemuck::bytes_of(&sfu));
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow cascade"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.shadow.layers[i],
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            let bg = &self.shadow_bgs[i];
+            self.shadow_draws += Self::record_shadow(&self.pipe_shadow, bg, &mut pass, models, &c);
+            // map cells stand in for placements far from the camera: none
+            // in the nearest cascade
+            if i > 0 {
+                self.shadow_draws += Self::draw_cells(
+                    &mut pass,
+                    &self.pipe_shadow_cell,
+                    bg,
+                    &self.cells,
+                    crate::cells::PASS_OPAQUE,
+                    false,
+                );
+            }
+            drop(pass);
+            self.shadow.drawn[i] = Some(c);
+        }
+        let used: [crate::shadow::Cascade; CASCADES] = std::array::from_fn(|i| self.shadow.drawn[i].unwrap_or(cs[i]));
+        queue.write_buffer(&self.shadow.ub, 0, bytemuck::bytes_of(&ShadowU::new(&used, true, 1.0)));
+        self.shadow.frame += 1;
+    }
+
     /// Draw the cell batches of one pass (see `cells::PASS_*`).
     fn draw_cells(
         pass: &mut wgpu::RenderPass<'_>,
@@ -2220,6 +2432,7 @@ impl Renderer3D {
         if let Some(sky) = &sky {
             self.atmo.compute(&mut enc, sky);
         }
+        self.render_shadows(queue, &mut enc, cam, look, &fu, aspect, models);
         let t = self.target.as_ref().unwrap();
         let mut draws = 0u32;
         {

@@ -1010,6 +1010,17 @@ baked map (`entities.bin`; bake first with `--bake-map`):
     sun dimming by cloud cover (no clouds are drawn yet), the brightness
     of emissive surfaces (6 cd/m² at strength 1) and the filmic curve.
     Without the timecycle (no index) the built-in Sunny values are used.
+- **Sun and moon shadows** (HDR map, on by default; **sun and moon
+  shadows** turns them off): four cascaded shadow maps, 2048² each, over
+  the nearest 900 m (the timecycle's `dir_shadow_num_cascades`), split
+  logarithmically (to about 12, 52, 216 and 900 m), snapped to whole texels so they
+  do not shimmer, and filtered over 4×4 compares with a blend between
+  cascades. The two near cascades are drawn every frame and the two far
+  ones in turn. Each cascade draws only the models that can shadow it
+  (the bounding sphere of their instances), and all but the nearest skip
+  models smaller than three of their texels. Models and map cells cast (opaque and cut-out surfaces);
+  skinned, see-through and decal surfaces do not. Only what the camera
+  draws casts: a caster just outside the view leaves no shadow.
 - **Map cells** (far placements merged per area): a placement more than
   0.6× the HD distance from the camera can be drawn from its cell instead
   of one by one. A cell holds one LOD level's placements in one square of
@@ -1144,7 +1155,7 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   (they showed as floating black boxes); the model viewer still shows them.
 
 Map 3D screenshots: `--tab map3d --center X,Y --height H --yaw DEG --pitch
-DEG [--quality low|medium|high|ultra] [--detail 0-1] [--tod H] [--weather W] [--lights]
+DEG [--quality low|medium|high|ultra] [--detail 0-1] [--tod H] [--weather W] [--no-shadows] [--lights]
 [--roads] [--no-terrain] [--fog F] [--max-tex PX] [--no-textures]
 [--no-hd-fallback] [--kinds a,b] [--lods a,b] [--ram-cap GB]
 [--no-windows] [--no-decal-bias] [--show-proxies] [--fly X,Y,H,SECONDS]
