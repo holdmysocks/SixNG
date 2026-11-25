@@ -431,12 +431,16 @@ impl Groom {
     ///   hashed centre point in the triangle whose guide blend G(t) is the
     ///   clump's centre line. A member starts at a random offset T (uniform
     ///   in the square [-1, 1]^2) of the clump radius R (per-guide byte 1,
-    ///   mm) in the root's tangent plane, and is walked toward
-    ///   G(t) + (1 - p(t)) R T with the centre line's segment lengths, where
+    ///   mm) in the root triangle's plane (axes: the centre line's heading
+    ///   and its cross with the normal, fixed for the whole strand), and is
+    ///   walked toward G(t) + (1 - p(t)) R T with the centre line's segment
+    ///   lengths, where
     ///   p is the 16-step pull profile at graphics header +0x90 (255 = on
     ///   the centre line). Read from the program's clump variant by the
     ///   shader archive work (medium confidence); the hashes and the offset
-    ///   table are the viewer's own, with the same spread.
+    ///   table are the viewer's own, with the same spread. Not read: the
+    ///   per-axis scales of the offset, and the program's other branch
+    ///   taken when graphics header +0xA8 is 3.
     ///
     /// A piece without the clump bytes grows its clumped strands on their
     /// centre lines. `share` of each population is grown: the game's own
@@ -448,7 +452,7 @@ impl Groom {
         let k = self.points_per_strand;
         let mut c = Coat { k, points: Vec::new(), guides: Vec::new(), normals: Vec::new(), variants: Vec::new(), stored: self.stored_strands() };
         let share = share.clamp(0.0, 1.0);
-        if share <= 0.0 || self.tri_counts.len() != self.roots.len() || self.roots.is_empty() {
+        if share <= 0.0 || k == 0 || self.tri_counts.len() != self.roots.len() || self.roots.is_empty() {
             return c;
         }
         let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
@@ -510,13 +514,15 @@ impl Groom {
                 continue;
             }
             let nr = normal(t);
-            let g0 = t.map(|x| x as usize * k);
-            let e1 = unit(sub(self.points[g0[1]], self.points[g0[0]]), [1.0, 0.0, 0.0]);
-            let a0 = unit(sub(e1, scale(nr, dot(e1, nr))), [1.0, 0.0, 0.0]);
             for ck in 0..clumps {
                 let (cseed, b) = hairgen::seed_bary(ti as u32, clump_seed, ck.wrapping_mul(0x9e37_79b9) ^ 0x5bd1_e995);
                 let radius = 0.001 * mix(t, b, &|s| self.corners.get(s).map_or(0.0, |c| c[1] as f32));
                 let centre: Vec<[f32; 3]> = (0..k).map(|j| blend(t, b, j)).collect();
+                // the member frame, fixed for the whole strand: A = the centre line's
+                // first segment carried into the root triangle's plane, B = A x N
+                let head = sub(centre[1.min(k - 1)], centre[0]);
+                let fa = unit(sub(head, scale(nr, dot(head, nr))), { let g0 = self.points[t[0] as usize * k]; unit(sub(self.points[t[1] as usize * k], g0), [1.0, 0.0, 0.0]) });
+                let fb = unit(cross(fa, nr), [0.0, 1.0, 0.0]);
                 let total: f32 = centre.windows(2).map(|p| { let e = sub(p[1], p[0]); dot(e, e).sqrt() }).sum::<f32>().max(1e-9);
                 let m = members / clumps + u32::from(ck < members % clumps);
                 for mi in 0..m {
@@ -529,13 +535,12 @@ impl Groom {
                     let (tx, ty) = (draws.next() * 2.0 - 1.0, draws.next() * 2.0 - 1.0);
                     let (d_len, d_var) = (draws.next(), draws.next());
                     let len = length(t, b, d_len);
-                    // the offset frame, carried along the centre line
-                    let (mut fa, mut fb) = (a0, cross(nr, a0));
-                    let off = |f: f32, fa: [f32; 3], fb: [f32; 3]| {
+                    // one world offset per member, scaled down the strand by the pull profile
+                    let off = |f: f32| {
                         let r = (1.0 - pull(f)) * radius;
                         [r * (tx * fa[0] + ty * fb[0]), r * (tx * fa[1] + ty * fb[1]), r * (tx * fa[2] + ty * fb[2])]
                     };
-                    let o = off(0.0, fa, fb);
+                    let o = off(0.0);
                     let mut p = [centre[0][0] + o[0], centre[0][1] + o[1], centre[0][2] + o[2]];
                     c.points.push(p);
                     let (mut arc, mut used) = (0.0f32, 0.0f32);
@@ -543,15 +548,12 @@ impl Groom {
                         let e = sub(centre[j], centre[j - 1]);
                         let seg = dot(e, e).sqrt();
                         arc += seg;
-                        let tg = unit(e, nr);
-                        fa = unit(sub(fa, scale(tg, dot(fa, tg))), fa);
-                        fb = cross(tg, fa);
-                        let o = off(arc / total, fa, fb);
+                        let o = off(arc / total);
                         let target = [centre[j][0] + o[0], centre[j][1] + o[1], centre[j][2] + o[2]];
                         let step = seg.min((len - used).max(0.0));
                         let step = if step > 0.000_976_562_5 { step } else { 0.0 };
                         used += step;
-                        let dir = unit(sub(target, p), tg);
+                        let dir = unit(sub(target, p), unit(e, nr));
                         p = [p[0] + dir[0] * step, p[1] + dir[1] * step, p[2] + dir[2] * step];
                         c.points.push(p);
                     }
