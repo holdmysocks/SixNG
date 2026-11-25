@@ -78,6 +78,11 @@ pub struct Groom {
     /// A0, one dword per guide strand: byte 0 density, byte 1 clump radius
     /// in mm (shader archive reading). Empty when not stored.
     pub corners: Vec<[u8; 4]>,
+    /// System +0x12A / +0x12B (byte / 255): how far a clump member's offset
+    /// reaches along the clump's two axes (heading, sideways). The game
+    /// copies them into its per-draw record; hair modifiers can change
+    /// them at run time.
+    pub clump_scale: [f32; 2],
 }
 
 /// A hat seen from a point inside the head: per direction, the distance to
@@ -331,7 +336,7 @@ pub fn parse(r: &Resource) -> Result<Groom> {
         Some(p) if a3 > 0 => p.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect(),
         _ => Vec::new(),
     };
-    Ok(Groom { tint_weight: r.sys.get(0x12C).map_or(1.0, |b| *b as f32 / 255.0), strands: s, points_per_strand: k, points, w, roots, lengths, root_uv, bones, root_box, group_box, tri_counts, width, taper, pick_steps, seed: gu32(0x7C), length_var: [f16(gu16(0x60)), f16(gu16(0x62))], head: g.get(..0xC0).map_or(Vec::new(), |h| h.to_vec()), corners })
+    Ok(Groom { tint_weight: r.sys.get(0x12C).map_or(1.0, |b| *b as f32 / 255.0), strands: s, points_per_strand: k, points, w, roots, lengths, root_uv, bones, root_box, group_box, tri_counts, width, taper, pick_steps, seed: gu32(0x7C), length_var: [f16(gu16(0x60)), f16(gu16(0x62))], head: g.get(..0xC0).map_or(Vec::new(), |h| h.to_vec()), corners, clump_scale: [0x12A, 0x12B].map(|o| r.sys.get(o).map_or(1.0, |b| *b as f32 / 255.0)) })
 }
 
 impl Groom {
@@ -438,9 +443,9 @@ impl Groom {
     ///   p is the 16-step pull profile at graphics header +0x90 (255 = on
     ///   the centre line). Read from the program's clump variant by the
     ///   shader archive work (medium confidence); the hashes and the offset
-    ///   table are the viewer's own, with the same spread. Clumps are
-    ///   round: the game scales the two axes by bytes of its per-draw
-    ///   record, which is built at run time. With graphics header +0xA8 = 3
+    ///   table are the viewer's own, with the same spread. The two axes
+    ///   are scaled by `clump_scale` (hair modifiers that change it at run
+    ///   time are not applied). With graphics header +0xA8 = 3
     ///   the game takes the root normal from a per-vertex table at +0xBC
     ///   when that offset is set; it does not change the clump shape, and
     ///   the viewer keeps the triangle's normal.
@@ -535,7 +540,7 @@ impl Groom {
                     }
                     acc -= 1.0;
                     let mut draws = hairgen::Draws(cseed.wrapping_add(mi.wrapping_mul(0x2545_f491)));
-                    let (tx, ty) = (draws.next() * 2.0 - 1.0, draws.next() * 2.0 - 1.0);
+                    let (tx, ty) = ((draws.next() * 2.0 - 1.0) * self.clump_scale[0], (draws.next() * 2.0 - 1.0) * self.clump_scale[1]);
                     let (d_len, d_var) = (draws.next(), draws.next());
                     let len = length(t, b, d_len);
                     // one world offset per member, scaled down the strand by the pull profile
@@ -1005,6 +1010,7 @@ mod tests {
             length_var: [0.0, 1.0],
             head: vec![],
             corners: vec![],
+            clump_scale: [1.0; 2],
         };
         let c = g.coat(1.0);
         assert_eq!(c.guides.len(), 7);
@@ -1055,7 +1061,7 @@ mod tests {
     }
     #[test]
     fn segments() {
-        let g = Groom { tint_weight: 1.0, strands: 2, points_per_strand: 3, points: vec![[0.0; 3]; 6], w: vec![0.0; 6], roots: vec![[0, 1, 1]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![] };
+        let g = Groom { tint_weight: 1.0, strands: 2, points_per_strand: 3, points: vec![[0.0; 3]; 6], w: vec![0.0; 6], roots: vec![[0, 1, 1]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2] };
         assert_eq!(g.segments(), vec![0, 1, 1, 2, 3, 4, 4, 5]);
         assert_eq!(g.root_indices(), vec![0, 3, 3]);
     }
@@ -1063,7 +1069,7 @@ mod tests {
     fn coat_from_strand_counts() {
         // one root triangle of three 2-point guides, 40 + 10 stored strands
         let pts = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.1], [1.0, 0.0, 0.0], [1.0, 0.0, 0.1], [0.0, 1.0, 0.0], [0.0, 1.0, 0.1]];
-        let g = Groom { tint_weight: 1.0, strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![[40, 10, 1, 0]], width: 0.0003, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![] };
+        let g = Groom { tint_weight: 1.0, strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![[40, 10, 1, 0]], width: 0.0003, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2] };
         assert_eq!(g.stored_strands(), 50);
         let c = g.coat(1.0);
         assert_eq!((c.guides.len(), c.points.len(), c.stored), (50, 100, 50));
