@@ -492,7 +492,11 @@ locally with your own install.
 **Emissive and paint**: materials of the emissive shaders (`standard_emissive`,
 `standard_emissive_layer` …, by recovered shader name or known family) get
 their colour texture as `emissiveTexture` in the GLB, so lamps, neon and
-screens light up in viewers and engines. `--paint RRGGBB` (or `AARRGGBB`)
+screens light up in viewers and engines. The character glow layers
+(`ped_standard_emissive_layer_alpha`) are the exception: the game lights
+them through a layer blended in at run time, which is not in the install,
+so they are drawn unlit (`emissive_source` "none"); lit by the colour map,
+a face came out white. `--paint RRGGBB` (or `AARRGGBB`)
 sets the colour of car-paint materials (linear `baseColorFactor`, and
 `paint.colour` in `model.json`). Map wreck props (`prop_am_wreck_*`) have no
 car-paint material: their colour is in their textures.

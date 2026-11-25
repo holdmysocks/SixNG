@@ -8598,6 +8598,8 @@ fn export_load_shaped(
     // placeholder palette (entry 0 pure red) was left unapplied.
     let stale_tyre = std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| j.contains("b994d670") && j.contains("GLB COLOR_0 = palette entry"));
     let stale_cloth = std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| j.contains("739e3d0d") && !j.contains("shade_source"));
+    // Cached character glow layers from before they stopped lighting by their colour map.
+    let stale_glow = std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| (j.contains("b8916043") || j.contains("2e920e9f")) && j.contains("\"colour_map\""));
     // Cached animal parts from before part skins (eyes, tint-mask coats).
     let stale_animal = e.name.as_deref().is_some_and(|n| sixng_core::partskin::animal_root(n).is_some())
         && std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| !j.contains("\"part_skin\""));
@@ -8606,7 +8608,7 @@ fn export_load_shaped(
         png: true,
         dds: false,
         raw: false,
-        force: head || shaped || !skins.is_empty() || stale_tint || stale_vehicle || stale_animal || stale_cloth || stale_tyre,
+        force: head || shaped || !skins.is_empty() || stale_tint || stale_vehicle || stale_animal || stale_cloth || stale_tyre || stale_glow,
         skip_embedded_textures: false,
         body_shape,
         head_skin: HEAD_SKIN.load(std::sync::atomic::Ordering::Relaxed),
