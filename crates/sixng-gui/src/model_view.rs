@@ -6881,7 +6881,26 @@ fn load_query_sel(
                 }
                 look_info = Some(info);
             }
-            Err(e) => look_err = Some(e),
+            Err(e) => {
+                // Not in the game's outfit list (cutscene heads and the like):
+                // its own parts are drawn. Its hair parts are strand-hair
+                // placeholders, and their grooms are linked by the
+                // placeholder's name, so they are drawn the same way.
+                if let Ok(t) = sixng_core::hairlink::get(&ws.work, &a, &ix.entries) {
+                    let mut info = LookInfo { model: prefix.to_string(), labels: vec!["own parts (not in the game's outfit list)".into()], ..Default::default() };
+                    for o in opts.iter().filter(|o| o.default) {
+                        let Some(l) = t.by_placeholder(&o.name.to_ascii_lowercase()) else { continue };
+                        let slot = sixng_core::pedlook::slot_of(&l.placeholder);
+                        let shown = l.confidence >= 0.5 && slot != "body hair" && l.part != "body";
+                        info.hair.push(HairPick { slot, placeholder: l.placeholder.clone(), confidence: l.confidence, exact: t.exact, grooms: t.uncontested(l), off_head: 0, shown, colour: None, tone: None });
+                    }
+                    if !info.hair.is_empty() {
+                        info.notes.push("Not in the game's outfit list: its own parts, with the strand hair linked to its hair parts by name. No hair colour is stored for it here: the hair takes the picker's colour.".into());
+                        look_info = Some(info);
+                    }
+                }
+                look_err = Some(e);
+            }
         }
         if opts.is_empty() {
             return Err(anyhow::anyhow!("no parts found for {prefix}"));

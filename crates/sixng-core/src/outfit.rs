@@ -157,26 +157,37 @@ fn accessory_group(item: &str) -> Option<&'static str> {
 /// Every part of a character prefix, grouped by outfit slot (or by item word
 /// for hats, bags, watches …). The default look is one part per slot (the
 /// first in name order) plus the eyes that go with the head; a one-piece
-/// outfit replaces top and bottom. Accessories, `_alt_` pieces and holsters
-/// are offered but off by default; clipping-cut (`_cull`) and first-person
-/// copies are left out.
+/// outfit replaces top and bottom (a character with no slot parts shows the
+/// first part of each group). Accessories, `_alt_` pieces, holsters and lash
+/// cards are offered but off by default; clipping-cut (`_cull`) and
+/// first-person copies are left out.
 pub fn outfit_options(ix: &ArchiveIndex, prefix: &str) -> Vec<PartOpt> {
     let p = format!("{}_", prefix.to_ascii_lowercase());
     let by_name = dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
         let n = e.name.as_ref()?.to_ascii_lowercase();
         (n.starts_with(&p) && outfit_prefix(&n).as_deref() == Some(prefix)).then_some((n, e))
     }));
+    options_from(&p, by_name.iter().map(|(n, e)| (n.as_str(), e.off, e.id.as_str())))
+}
+
+/// `outfit_options` over (lower-case name, offset, id) in name order;
+/// `p` is the prefix with its trailing underscore.
+fn options_from<'a>(p: &str, parts: impl Iterator<Item = (&'a str, u64, &'a str)>) -> Vec<PartOpt> {
     let mut opts = Vec::new();
     let mut chosen: BTreeMap<String, u64> = BTreeMap::new();
-    for (n, e) in &by_name {
+    for (n, off, id) in parts {
         if ["_cull", "_fp", "eyecap", "tattooprojection"].iter().any(|x| n.contains(x)) {
             continue;
         }
         let rest = &n[p.len()..];
         let item = rest.split('_').next().unwrap_or("");
-        let optional = n.contains("_alt_") || n.contains("holster");
+        let optional = n.contains("_alt_") || n.contains("holster") || n.contains("_eyelashes");
         let group = match slot(item) {
             Some("head") if n.contains("_eyes") => "head eyes".to_string(),
+            // lashes stored as a head part (`…_head_…_eyelashes_full`): their
+            // own group, or they would stand in for the head itself; off by
+            // default (alpha cards, drawn as solid white slabs here)
+            Some("head") if n.contains("_eyelashes") => "head lashes".to_string(),
             // heads with an accessory baked in (`cs_raul_head_…_earring_full`)
             // are their own group, so the plain head stays the default head
             Some("head") if n.contains("_earring") => "head earring".to_string(),
@@ -184,13 +195,21 @@ pub fn outfit_options(ix: &ArchiveIndex, prefix: &str) -> Vec<PartOpt> {
             None => accessory_group(item).unwrap_or(item).to_string(),
         };
         if !optional && slot(item).is_some() {
-            chosen.entry(group.clone()).or_insert(e.off);
+            chosen.entry(group.clone()).or_insert(off);
         }
-        opts.push(PartOpt { off: e.off, id: e.id.clone(), name: n.clone(), group, label: rest.to_string(), default: false });
+        opts.push(PartOpt { off, id: id.to_string(), name: n.to_string(), group, label: rest.to_string(), default: false });
     }
     if chosen.contains_key("full") {
         chosen.remove("top");
         chosen.remove("bottom");
+    }
+    // A character whose parts are all outside the outfit slots (one
+    // `legacypedcs_…_fullbody` model) would show nothing: the first part of
+    // each of its groups stands in.
+    if chosen.is_empty() {
+        for o in opts.iter().filter(|o| !["_alt_", "holster", "_eyelashes"].iter().any(|x| o.name.contains(x))) {
+            chosen.entry(o.group.clone()).or_insert(o.off);
+        }
     }
     for o in &mut opts {
         o.default = chosen.get(&o.group) == Some(&o.off);
@@ -661,6 +680,20 @@ mod tests {
         };
         remap_joints(&mut p, &maps[1]);
         assert_eq!(p.joints.unwrap(), [[4, 3, 1, u16::MAX], [0, 0, 0, 0]]);
+    }
+
+    #[test]
+    fn default_parts() {
+        let opts = |names: &[&str]| {
+            let v: Vec<(String, u64)> = names.iter().enumerate().map(|(i, n)| (n.to_string(), i as u64)).collect();
+            options_from("x_", v.iter().map(|(n, o)| (n.as_str(), *o, ""))).into_iter().filter(|o| o.default).map(|o| o.name).collect::<Vec<_>>()
+        };
+        // lashes stored as a head part do not replace the head (and start off)
+        assert_eq!(opts(&["x_head_mr1_000_eyelashes_full", "x_head_mr1_000_eyes_full", "x_head_mr1_000_full"]), ["x_head_mr1_000_eyes_full", "x_head_mr1_000_full"]);
+        // only parts outside the slots: the first of each group still shows
+        assert_eq!(opts(&["x_legacypedcs_mr1_000_fullbody_full"]), ["x_legacypedcs_mr1_000_fullbody_full"]);
+        // with a slot part, accessories stay off
+        assert_eq!(opts(&["x_hatflatcap_mr1_000_full", "x_head_mr1_000_full"]), ["x_head_mr1_000_full"]);
     }
 
     /// Real data: a whole outfit with a walk clip, from a local install.
