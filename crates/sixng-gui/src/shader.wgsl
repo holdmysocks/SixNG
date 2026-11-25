@@ -21,7 +21,7 @@ struct Frame {
 
 struct Mat {
     base: vec4<f32>,
-    flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask, bit 12 = an emissive shader of another class (lit by its emissive map)
+    flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask, bit 12 = an emissive shader of another class (lit by its emissive map), bit 13 = the packed map is a vehicle material map, bit 14 = the emissive slot holds the part ramp image with the parts' surfaces
     tile: vec4<f32>,      // fabric detail tile: x UV scale, y rotation, z mean grey value, w bound
     emis: vec4<f32>,      // x emissive scale of the material (from the GLB's emissive strength)
 };
@@ -266,8 +266,13 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     // a vehicle layer's material map: blue is occlusion, on the direct
     // light as well (the game multiplies its diffuse and specular sides)
     var ao_direct = 1.0;
+    // its red and green: where a part's metalness and roughness lie between
+    // the low and the high of its surface
+    var mat_blend = vec2(0.5);
     if ((has & 4u) != 0u && (M.flags.w & 8192u) != 0u) {
-        ao = textureSample(t_pk, samp, i.uv0).b;
+        let mm = textureSample(t_pk, samp, i.uv0);
+        mat_blend = mm.rg;
+        ao = mm.b;
         ao_direct = ao;
     } else if ((has & 4u) != 0u && F.mode.y < 3u) {
         let p = textureSample(t_pk, samp, i.uv0);
@@ -290,7 +295,7 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     if (M.tile.w > 1.5) {
         let g = textureSample(t_tile, samp, i.uv0).g;
         let id = floor(i.col.a * 255.0 + 0.5);
-        albedo = base.rgb * textureSampleLevel(t_em, samp, vec2(clamp(g, 0.004, 0.996), (id + 0.5) / 512.0), 0.0).rgb;
+        albedo = base.rgb * textureSampleLevel(t_em, samp, vec2(clamp(g, 0.004, 0.996), (id + 0.5) / 768.0), 0.0).rgb;
     }
     if (M.tile.w > 0.5 && M.tile.w < 1.5) {
         let c = cos(M.tile.y);
@@ -314,6 +319,21 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
             let code = floor(ta + 0.5);
             metal = floor(code / 50.0) / 3.0;
             rough = clamp((code - floor(code / 50.0) * 50.0) / 49.0, 0.04, 1.0);
+            // With the material map and the parts' surfaces at hand
+            // (rows 512.. of the part ramp image: metalness low and high,
+            // roughness low and high in the alpha of columns 0 to 3 of the
+            // part id's row), the blend is done here per pixel, as the
+            // game's paint shader does; the code above is the same blend
+            // at the map's mean. The body paint keeps its own finish.
+            if ((M.flags.w & 24576u) == 24576u && (has & 4u) != 0u) {
+                let row = 512 + i32(floor(i.col.a * 255.0 + 0.5));
+                let m_lo = textureLoad(t_em, vec2(0, row), 0).a;
+                let m_hi = textureLoad(t_em, vec2(1, row), 0).a;
+                let r_lo = textureLoad(t_em, vec2(2, row), 0).a;
+                let r_hi = textureLoad(t_em, vec2(3, row), 0).a;
+                metal = clamp(mix(m_lo, m_hi, mat_blend.x), 0.0, 1.0);
+                rough = clamp(mix(r_lo, r_hi, mat_blend.y), 0.04, 1.0);
+            }
         }
     }
     // the body paint's coat record (the vehicle's own finish only): clear
@@ -385,7 +405,7 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
         }
     }
     // vehicle parts, second layer of the surface (rust under paint, grey
-    // under bare metal): rows 256.. of the part ramp image hold its colour
+    // under bare metal): rows 256..512 of the part ramp image hold its colour
     // and roughness (alpha); its metalness is the alpha of the first rows.
     // Shown where the layer detail texture's blue is high (taken as the
     // wear mask), by the amount the user sets.
@@ -393,8 +413,8 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
         let d = textureSample(t_tile, samp, i.uv0);
         let id = floor(i.col.a * 255.0 + 0.5);
         let u = clamp(d.g, 0.004, 0.996);
-        let w1 = textureSampleLevel(t_em, samp, vec2(u, (id + 256.5) / 512.0), 0.0);
-        let m1 = textureSampleLevel(t_em, samp, vec2(u, (id + 0.5) / 512.0), 0.0).a;
+        let w1 = textureSampleLevel(t_em, samp, vec2(u, (id + 256.5) / 768.0), 0.0);
+        let m1 = textureSampleLevel(t_em, samp, vec2(u, (id + 0.5) / 768.0), 0.0).a;
         let k = clamp(d.b * F.jitter.w * 2.0, 0.0, 1.0);
         albedo = mix(albedo, w1.rgb, k);
         rough = clamp(mix(rough, w1.a, k), 0.04, 1.0);
