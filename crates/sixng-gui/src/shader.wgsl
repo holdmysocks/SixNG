@@ -54,6 +54,7 @@ struct Sticker {
 @group(0) @binding(9) var t_hair_p: texture_3d<f32>;
 @group(0) @binding(10) var t_shadow: texture_depth_2d;
 @group(0) @binding(11) var samp_shadow: sampler_comparison;
+@group(0) @binding(12) var t_cam_depth: texture_depth_2d;
 
 @group(1) @binding(0) var<uniform> M: Mat;
 @group(1) @binding(1) var t_base: texture_2d<f32>;
@@ -384,6 +385,79 @@ fn ign(p: vec2<f32>) -> f32 {
 
 // Share of the sun's light that reaches a point, from the sun shadow map (1 where there is none): 3 x 3 taps
 // of a linear comparison. A stand-in for the game's shadow filtering, which is not read.
+// The camera depth pre-pass at a pixel (reversed: nearer is larger; 0: nothing drawn).
+fn eye_depth(p: vec2<i32>) -> f32 {
+    let lim = vec2<i32>(F.jitter.yz) - 1;
+    return textureLoad(t_cam_depth, clamp(p, vec2(0), lim), 0);
+}
+
+// The game's openness of a strand pixel (read from its hair lighting program
+// by the shader archive work): over 16 neighbours at (dx, dy), dx and dy in
+// -2, -1, 1, 2, the weighted share that is not in front of the pixel, by
+// depth. 1: the nearest thing in its block of pixels; towards 0: seen
+// through a gap.
+fn strand_openness(clip: vec4<f32>) -> f32 {
+    if (F.light_vp[3][3] == 0.0) { return 1.0; }
+    let p = vec2<i32>(clip.xy);
+    let z = clip.z * 1.0001 + 1.0e-7;
+    var s = 0.0;
+    for (var y = -2; y <= 2; y++) {
+        for (var x = -2; x <= 2; x++) {
+            if (x == 0 || y == 0) { continue; }
+            let far = abs(x) + abs(y);
+            let w = select(select(0.376603, 0.209611, far == 4), 0.676634, far == 2);
+            if (eye_depth(p + vec2(x, y)) <= z) { s += w; }
+        }
+    }
+    return clamp(0.15249 * s, 0.0, 1.0);
+}
+
+// Screen-space occlusion of the ambient light on an opaque surface, from the
+// camera depth pre-pass. The game's indirect light carries a screen-space
+// horizon occlusion (found by the shader archive work; its radius, falloff
+// and the way it enters the light are not read). This is the viewer's own
+// stand-in of that kind: two slices through the pixel, four steps each way
+// at growing distances, the highest horizon over the surface on each side,
+// faded with distance; radius 0.15 m (the viewer's choice).
+fn screen_occlusion(clip: vec4<f32>, wp: vec3<f32>, n: vec3<f32>) -> f32 {
+    if (F.light_vp[3][3] == 0.0) { return 1.0; }
+    let size = F.jitter.yz;
+    let radius = 0.15;
+    // pixels a metre covers at the pixel's distance
+    let toeye = F.cam_pos.xyz - wp;
+    var right = cross(toeye, vec3(0.0, 1.0, 0.0));
+    right = right / max(length(right), 1.0e-5);
+    let c0 = F.view_proj * vec4(wp, 1.0);
+    let c1 = F.view_proj * vec4(wp + right * radius, 1.0);
+    let rpx = min(length((c1.xy / c1.w - c0.xy / c0.w) * 0.5 * size), 0.25 * size.y);
+    let turn = ign(clip.xy + vec2(F.jitter.x * 7.31, F.jitter.x * 3.17)) * 3.14159;
+    let jit = ign(clip.xy * 1.37 + vec2(F.jitter.x * 2.11, 17.0));
+    var occ = 0.0;
+    for (var sl = 0; sl < 2; sl++) {
+        let ang = turn + f32(sl) * 1.5708;
+        let dir = vec2(cos(ang), sin(ang));
+        for (var side = -1; side <= 1; side += 2) {
+            var hmax = 0.0;
+            for (var k = 1; k <= 4; k++) {
+                let t = (f32(k) - jit) * 0.25;
+                let q = clip.xy + dir * f32(side) * (t * t * rpx + 1.3);
+                if (q.x < 0.0 || q.y < 0.0 || q.x >= size.x || q.y >= size.y) { continue; }
+                let d = eye_depth(vec2<i32>(q));
+                if (d <= 0.0) { continue; }
+                let ndc = vec2(q.x / size.x * 2.0 - 1.0, 1.0 - q.y / size.y * 2.0);
+                let w4 = F.inv_view_proj * vec4(ndc, d, 1.0);
+                let dv = w4.xyz / w4.w - wp;
+                let len = length(dv);
+                let rise = dot(dv, n) / max(len, 1.0e-5);
+                let fall = clamp(1.0 - len * len / (radius * radius), 0.0, 1.0);
+                hmax = max(hmax, (rise - 0.08) * fall);
+            }
+            occ += hmax;
+        }
+    }
+    return clamp(1.0 - occ * 0.25, 0.0, 1.0);
+}
+
 // One tap of the sun shadow map at a world position (1 outside the map).
 fn sun_shadow_tap(wp: vec3<f32>, r: i32) -> f32 {
     let c = F.light_vp * vec4(wp, 1.0);
@@ -676,7 +750,9 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     let r = reflect(-v, n);
     let env = mix(sky(r), (F.sky_top.rgb + F.sky_hor.rgb) * 0.5, rough) * F.misc.w;
     let sh = sun_shadow(i.world, dpdx(i.world), dpdy(i.world));
-    var col = direct * sh * ao_direct + kd * albedo * amb_d * ao + env * fr_v * ao + emissive;
+    var ao_s = ao;
+    if (cls != 12u) { ao_s = ao * screen_occlusion(i.clip, i.world, n); }
+    var col = direct * sh * ao_direct + kd * albedo * amb_d * ao_s + env * fr_v * ao_s + emissive;
     col += pearl * pow(1.0 - ndv, 2.0) * 0.6;
     if (cls == 12u) {
         // strands: the fibre model on the strand's direction (the tangent)
@@ -706,7 +782,9 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             // ambient: the viewer's sky light at the root normal, with the game's factor
             let up_h = root.y * 0.5 + 0.5;
             let sky_h = mix(neutral(F.sky_hor.rgb, 0.8) * 0.6, neutral(F.sky_top.rgb, 0.8), up_h) * F.misc.w;
-            let amb_g = sky_h * albedo * hair_ambient(tdir, v, g0h, 1.0) + sky_h * 0.012;
+            // o = profile4 / 15 x openness (profile4: the ramp's profile value in 15 steps)
+            let o_h = select(1.0, round(15.0 * clamp(i.uv1.x, 0.0, 1.0)) / 15.0, ramped) * strand_openness(i.clip);
+            let amb_g = sky_h * albedo * hair_ambient(tdir, v, g0h, o_h) + sky_h * 0.012;
             // the game multiplies its light sum by the light's shadow (1 here without the sun shadow map)
             col = direct_h * sh * ao_direct + amb_g * ao;
             // a set with UseStandardBsdf (uv1.y = 2 + reflectance scale; nearly all hair and fur): the game

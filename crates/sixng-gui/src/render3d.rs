@@ -13,6 +13,8 @@ pub const COLOR_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 pub const DEPTH_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Side of the sun shadow map in texels.
 const SHADOW_SIZE: u32 = 4096;
+/// Side of the camera depth pre-pass texture (the view is drawn into its top-left corner).
+const CAM_DEPTH_SIZE: u32 = 4096;
 /// Depth with stencil (needs the DEPTH32FLOAT_STENCIL8 feature): the stencil
 /// marks pixels covered by a real surface, so coarse fallback LODs fill only
 /// the pixels nothing else covers.
@@ -467,7 +469,7 @@ pub struct Renderer3D {
     /// Draw calls in the last frame.
     pub draws: u32,
     /// The sun shadow map and its sampler (a 1-texel map when shadows are off).
-    shadow: (wgpu::TextureView, wgpu::Sampler),
+    shadow: (wgpu::TextureView, wgpu::Sampler, wgpu::TextureView),
     pub shadows: bool,
     shadow_ub: wgpu::Buffer,
     shadow_frame_bg: wgpu::BindGroup,
@@ -477,6 +479,9 @@ pub struct Renderer3D {
     /// off: by the rule of its cascade shadow pass (SIXNG_SHADOWS=map).
     pub shadow_traced: bool,
     pipe_shadow: wgpu::RenderPipeline,
+    depth_ub: wgpu::Buffer,
+    depth_frame_bg: wgpu::BindGroup,
+    pipe_cam_depth: wgpu::RenderPipeline,
     light_vp: [[f32; 4]; 4],
     /// Map cells: opaque, decal, decal blend, blend pipelines.
     pipe_cell: [wgpu::RenderPipeline; 4],
@@ -571,7 +576,7 @@ fn frame_bind_group(
     sticker_view: &wgpu::TextureView,
     sticker_sampler: &wgpu::Sampler,
     hair: &[wgpu::TextureView],
-    shadow: &(wgpu::TextureView, wgpu::Sampler),
+    shadow: &(wgpu::TextureView, wgpu::Sampler, wgpu::TextureView),
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("frame bg"),
@@ -589,6 +594,7 @@ fn frame_bind_group(
             wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&hair[3]) },
             wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&shadow.0) },
             wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::Sampler(&shadow.1) },
+            wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(&shadow.2) },
         ],
     })
 }
@@ -808,6 +814,13 @@ impl Renderer3D {
                     binding: 11,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+                // the camera depth pre-pass (opaque surfaces and strands as the eye sees them)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
                     count: None,
                 },
             ],
@@ -1167,7 +1180,7 @@ impl Renderer3D {
             ..Default::default()
         });
         let shadows = std::env::var("SIXNG_SHADOWS").is_ok();
-        let shadow = (shadow_tex(if shadows { SHADOW_SIZE } else { 1 }), shadow_sampler.clone());
+        let shadow = (shadow_tex(if shadows { SHADOW_SIZE } else { 1 }), shadow_sampler.clone(), shadow_tex(if shadows { CAM_DEPTH_SIZE } else { 1 }));
         let shadow_ub = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("shadow frame ub"),
             size: std::mem::size_of::<FrameU>() as u64,
@@ -1175,11 +1188,11 @@ impl Renderer3D {
             mapped_at_creation: false,
         });
         // the shadow pass's own frame group: the light's matrices, and a 1-texel map in place of the one it draws
-        let shadow_frame_bg = frame_bind_group(device, &bgl_frame, &shadow_ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &hair_luts, &(shadow_tex(1), shadow_sampler.clone()));
+        let shadow_frame_bg = frame_bind_group(device, &bgl_frame, &shadow_ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &hair_luts, &(shadow_tex(1), shadow_sampler.clone(), shadow_tex(1)));
         let shadow_extra: Vec<(wgpu::Buffer, wgpu::BindGroup)> = (0..if shadows { 15 } else { 0 })
             .map(|_| {
                 let ub = device.create_buffer(&wgpu::BufferDescriptor { label: Some("shadow frame ub"), size: std::mem::size_of::<FrameU>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-                let bg = frame_bind_group(device, &bgl_frame, &ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &hair_luts, &(shadow_tex(1), shadow_sampler.clone()));
+                let bg = frame_bind_group(device, &bgl_frame, &ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &hair_luts, &(shadow_tex(1), shadow_sampler.clone(), shadow_tex(1)));
                 (ub, bg)
             })
             .collect();
@@ -1194,6 +1207,28 @@ impl Renderer3D {
                 depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: Default::default(),
                 bias: wgpu::DepthBiasState { constant: 2, slope_scale: 2.0, clamp: 0.0 },
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: None,
+            multiview_mask: None,
+            cache: None,
+        });
+        // The camera depth pre-pass (with the sun shadow map): the same depth-only draw from the eye, read by the
+        // lighting for the game's strand openness test and a screen-space occlusion of the ambient light.
+        let depth_ub = device.create_buffer(&wgpu::BufferDescriptor { label: Some("depth pre-pass frame ub"), size: std::mem::size_of::<FrameU>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let depth_frame_bg = frame_bind_group(device, &bgl_frame, &depth_ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &hair_luts, &(shadow_tex(1), shadow_sampler.clone(), shadow_tex(1)));
+        let pipe_cam_depth = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("camera depth pre-pass"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_mesh"), compilation_options: Default::default(), buffers: &vbufs },
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                // the viewer's depth is reversed: nearer is larger
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
             fragment: None,
@@ -1328,6 +1363,9 @@ impl Renderer3D {
             shadow_extra,
             shadow_traced: std::env::var("SIXNG_SHADOWS").map_or(true, |v| v != "map"),
             pipe_shadow,
+            depth_ub,
+            depth_frame_bg,
+            pipe_cam_depth,
             light_vp: [[0.0; 4]; 4],
             hair_tried: false,
             default_frame_bg,
@@ -1450,7 +1488,7 @@ pub struct Uploader {
     bgl_cell: wgpu::BindGroupLayout,
     stickers: StickerDefaults,
     hair_luts: Vec<wgpu::TextureView>,
-    shadow: (wgpu::TextureView, wgpu::Sampler),
+    shadow: (wgpu::TextureView, wgpu::Sampler, wgpu::TextureView),
 }
 
 impl Uploader {
@@ -2068,7 +2106,8 @@ impl Renderer3D {
     /// main share, as the game's sun shadow pass does. Models skinned on the GPU are left out (their joints are bound
     /// with the main pass's frame group); the character viewer poses its
     /// parts on the CPU.
-    fn record_shadow(pipe: &wgpu::RenderPipeline, frame_bg: &wgpu::BindGroup, extra: &[(wgpu::Buffer, wgpu::BindGroup)], be: &mut wgpu::RenderPass<'_>, models: &[&GpuModel]) {
+    /// `eye`: the camera depth pre-pass instead (the strands of the main pass, one frame group).
+    fn record_shadow(pipe: &wgpu::RenderPipeline, frame_bg: &wgpu::BindGroup, extra: &[(wgpu::Buffer, wgpu::BindGroup)], be: &mut wgpu::RenderPass<'_>, models: &[&GpuModel], eye: bool) {
         be.set_pipeline(pipe);
         be.set_bind_group(0, Some(frame_bg), &[]);
         let mut slot = 0usize;
@@ -2082,7 +2121,7 @@ impl Renderer3D {
                 if gm.mat_alpha[me.material] == 2 || matches!(gm.mat_class[me.material], 5 | 6 | 8) || gm.mat_decal[me.material].is_some() {
                     continue;
                 }
-                let want = (me.shadow_slot.load(std::sync::atomic::Ordering::Relaxed) as usize).min(extra.len());
+                let want = if eye { 0 } else { (me.shadow_slot.load(std::sync::atomic::Ordering::Relaxed) as usize).min(extra.len()) };
                 if want != slot {
                     be.set_bind_group(0, Some(if want == 0 { frame_bg } else { &extra[want - 1].1 }), &[]);
                     slot = want;
@@ -2095,7 +2134,7 @@ impl Renderer3D {
                 }
                 let first = (me.ib_range.start / 4) as u32;
                 let base = (me.vb_range.start / std::mem::size_of::<glb::Vertex>() as u64) as i32;
-                let cnt = if me.strand_lod.is_some() { me.n_shadow.load(std::sync::atomic::Ordering::Relaxed).min(me.n_idx) } else { me.n_idx };
+                let cnt = if me.strand_lod.is_some() { if eye { &me.n_draw } else { &me.n_shadow }.load(std::sync::atomic::Ordering::Relaxed).min(me.n_idx) } else { me.n_idx };
                 if cnt > 0 {
                     be.draw_indexed(first..first + cnt, base, 0..gm.n_normal());
                 }
@@ -2332,7 +2371,28 @@ impl Renderer3D {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            Self::record_shadow(&self.pipe_shadow, &self.shadow_frame_bg, &self.shadow_extra, &mut sp, models);
+            Self::record_shadow(&self.pipe_shadow, &self.shadow_frame_bg, &self.shadow_extra, &mut sp, models, false);
+        }
+        if shadow_fu.is_some() {
+            // the camera depth pre-pass, into the corner of its texture (cleared to far; a view larger than the texture
+            // leaves it so, which reads as nothing in front anywhere)
+            queue.write_buffer(&self.depth_ub, 0, bytemuck::bytes_of(&fu));
+            let mut dp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("camera depth pre-pass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.shadow.2,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if size[0] <= CAM_DEPTH_SIZE && size[1] <= CAM_DEPTH_SIZE {
+                dp.set_viewport(0.0, 0.0, size[0] as f32, size[1] as f32, 0.0, 1.0);
+                Self::record_shadow(&self.pipe_cam_depth, &self.depth_frame_bg, &[], &mut dp, models, true);
+            }
         }
         {
             let c = look.clear;
