@@ -254,6 +254,9 @@ impl Look {
         // part of their darkness, plus the timecycle's exposure offset
         let key = (l.dir_strength * l.dir[1].max(0.0) + 0.5 * l.ambient) / (0.9 + 0.5);
         self.exposure = ((1.0 / key.max(1e-3)).powf(0.5).clamp(1.0, 4.0) * 2f32.powf(l.exposure_ev)).clamp(0.2, 4.0);
+        // keep the viewer's sun turn (the sun direction slider) across weather and hour changes
+        let t = std::mem::take(&mut self.sun_turn);
+        self.turn_sun(t);
     }
 
     /// Time of day 0..24 h: sun direction, colours and sky.
