@@ -1095,7 +1095,7 @@ impl ModelView {
                         let base = if g.width > 0.0 { g.width } else { 0.0003 };
                         let w = (base / share.max(1e-3)).clamp(base, 0.004) * width_scale;
                         let var = |s: usize| (coat.variants.get(s).copied().unwrap_or(0) & 3) as usize;
-                        if std::env::var("SIXNG_DEBUG_HAIR").is_ok() { let mut h = [0usize; 4]; for s in 0..coat.guides.len() { h[var(s)] += 1; } let mut st: std::collections::BTreeMap<[u8; 4], usize> = Default::default(); for p in &g.pick_steps { *st.entry(*p).or_default() += 1; } eprintln!("coat {off:x}: variants {h:?} thresholds {:?}", st.iter().take(6).collect::<Vec<_>>()); }
+                        if std::env::var("SIXNG_DEBUG_HAIR").is_ok() { let mut h = [0usize; 4]; for s in 0..coat.guides.len() { h[var(s)] += 1; } let mut st: std::collections::BTreeMap<[u8; 4], usize> = Default::default(); for p in &g.pick_steps { *st.entry(*p).or_default() += 1; } eprintln!("coat {off:x}: tint weight {:.3} variants {h:?} thresholds {:?}", g.tint_weight, st.iter().take(6).collect::<Vec<_>>()); }
                         // the atlas colour is stored sRGB-encoded: the linear base colour is its sRGB decode
                         let lin8 = |c: [f32; 3], m: [u8; 3]| -> [u8; 4] { [0, 1, 2].map(|q| ({ let x = c[q].clamp(0.0, 1.0); if x < 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) } } * m[q] as f32 + 0.5) as u8).iter().copied().chain([255u8]).collect::<Vec<u8>>().try_into().unwrap() };
                         let blend = |s: usize| -> [u8; 3] {
@@ -1121,13 +1121,13 @@ impl ModelView {
                             // the colour of the skin under the root. The game's strand resolve does this: colour = mix(C, C x T, w), T read
                             // at the strand's root UV from the first texture of one of the ped's own components (with that
                             // component's palette rows when it has them): wiring read from the game's code. That the texture is
-                            // the body's colour map is by fit (medium); w is not found and taken as 1; the palette case is not done here.
+                            // the body's colour map is by fit (medium); w is the groom's stored tint weight (the texture's alpha taken as 1); the palette case is not done here.
                             (None, Some(d)) if fur_sets.is_some_and(|f| d.colour_set(f.0).is_some() || d.param_set(f.1).is_some()) => {
                                 let (cn, pn) = fur_sets.unwrap();
                                 let (cs, ps) = (d.colour_set(cn), d.param_set(pn));
                                 let lit = d.param_flags(pn).filter(|_| !force_hair_sum).map_or(1.0, |(std, fs)| if std { 2.0 + fs } else { 1.0 });
                                 let pf = |s: usize, f: f32| { let r = &ps.unwrap()[var(s)]; let v = r.at(f); [v[0], v[1], v[2], r.width * v[3].max(0.05) * w / base, lit] };
-                                g.coat_glb_ramped(&name, &coat, w, &|s, f| match cs { Some(cs) => lin8(cs[var(s)].at(f), blend(s)), None => { let c = blend(s); [c[0], c[1], c[2], 255] } }, ps.map(|_| &pf as &dyn Fn(usize, f32) -> [f32; 5]), serde_json::json!({}))
+                                g.coat_glb_ramped(&name, &coat, w, &|s, f| match cs { Some(cs) => lin8(cs[var(s)].at(f), blend(s).map(|m| (m as f32 * g.tint_weight + 255.0 * (1.0 - g.tint_weight) + 0.5) as u8)), None => { let c = blend(s); [c[0], c[1], c[2], 255] } }, ps.map(|_| &pf as &dyn Fn(usize, f32) -> [f32; 5]), serde_json::json!({}))
                             }
                             (None, _) => g.coat_glb(&name, &coat, w, &cols, serde_json::json!({})),
                         }

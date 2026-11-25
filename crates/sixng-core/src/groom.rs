@@ -61,6 +61,11 @@ pub struct Groom {
     /// strand's 2-bit variant, which its strand shader uses to choose among
     /// four colour ramps (`hairgen`). Most grooms store 64, 128, 191, so
     /// the four variants are equally likely. Empty when not stored.
+    /// System +0x12C (byte / 255): how far the strand colour is multiplied
+    /// by the tint read at the strand's root (the body's colour under it):
+    /// colour = mix(C, C x T, weight x the tint's alpha). Read from the
+    /// game's code by the shader archive work; 1 on most grooms.
+    pub tint_weight: f32,
     pub pick_steps: Vec<[u8; 4]>,
     /// Graphics header +0x7C: the groom's seed for strand generation.
     pub seed: u32,
@@ -315,7 +320,7 @@ pub fn parse(r: &Resource) -> Result<Groom> {
         Some(p) if a3 > 0 => p.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect(),
         _ => Vec::new(),
     };
-    Ok(Groom { strands: s, points_per_strand: k, points, w, roots, lengths, root_uv, bones, root_box, group_box, tri_counts, width, taper, pick_steps, seed: gu32(0x7C), length_var: [f16(gu16(0x60)), f16(gu16(0x62))] })
+    Ok(Groom { tint_weight: r.sys.get(0x12C).map_or(1.0, |b| *b as f32 / 255.0), strands: s, points_per_strand: k, points, w, roots, lengths, root_uv, bones, root_box, group_box, tri_counts, width, taper, pick_steps, seed: gu32(0x7C), length_var: [f16(gu16(0x60)), f16(gu16(0x62))] })
 }
 
 impl Groom {
@@ -864,7 +869,7 @@ mod tests {
     #[test]
     fn full_strand_set_follows_the_stored_counts() {
         // three guides of two points each, one root triangle that stores 5 + 2 strands
-        let g = Groom {
+        let g = Groom { tint_weight: 1.0,
             strands: 3,
             points_per_strand: 2,
             points: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [1.0, 0.0, 1.0], [0.0, 1.0, 0.0], [0.0, 1.0, 1.0]],
@@ -931,7 +936,7 @@ mod tests {
     }
     #[test]
     fn segments() {
-        let g = Groom { strands: 2, points_per_strand: 3, points: vec![[0.0; 3]; 6], w: vec![0.0; 6], roots: vec![[0, 1, 1]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0] };
+        let g = Groom { tint_weight: 1.0, strands: 2, points_per_strand: 3, points: vec![[0.0; 3]; 6], w: vec![0.0; 6], roots: vec![[0, 1, 1]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0] };
         assert_eq!(g.segments(), vec![0, 1, 1, 2, 3, 4, 4, 5]);
         assert_eq!(g.root_indices(), vec![0, 3, 3]);
     }
@@ -939,7 +944,7 @@ mod tests {
     fn coat_from_strand_counts() {
         // one root triangle of three 2-point guides, 40 + 10 stored strands
         let pts = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.1], [1.0, 0.0, 0.0], [1.0, 0.0, 0.1], [0.0, 1.0, 0.0], [0.0, 1.0, 0.1]];
-        let g = Groom { strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![[40, 10, 1, 0]], width: 0.0003, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0] };
+        let g = Groom { tint_weight: 1.0, strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![[40, 10, 1, 0]], width: 0.0003, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0] };
         assert_eq!(g.stored_strands(), 50);
         let c = g.coat(1.0);
         assert_eq!((c.guides.len(), c.points.len(), c.stored), (50, 100, 50));
