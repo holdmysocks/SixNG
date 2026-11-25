@@ -78,6 +78,12 @@ const WEAR_TILING: f32 = 5.0;
 // histogram (10 % of its texels are above 0.81, 20 % above 0.58, 30 % above
 // 0.43, 40 % above 0.32, 50 % above 0.27). A stand-in: the game's windows
 // on the three channels are not decoded to fields.
+// A wear mask level raised to the game's exponent 100 / max(0.001,
+// 100 g^2) for the gamma byte g (0 to 1).
+fn wear_gamma(l: f32, g: f32) -> f32 {
+    return pow(l, 100.0 / max(0.001, 100.0 * g * g));
+}
+
 fn wear_threshold(a: f32) -> f32 {
     let c = 0.45 * a * a;
     if (c < 0.05) { return mix(1.01, 0.98, c / 0.05); }
@@ -506,20 +512,35 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
                     let sc = textureLoad(t_em, vec2(16 + c, row), 0).a;
                     let st = textureLoad(t_em, vec2(19 + c, row), 0).a;
                     let wd = max(textureLoad(t_em, vec2(22 + c, row), 0).a, 1.0 / 255.0);
-                    s += clamp((clamp(m[c] * sc, 0.0, 1.0) - st) / wd, 0.0, 1.0);
+                    // bias (column 34 + c) and gamma (37 + c): the level is
+                    // the vertex colour's channel (the game's per-vertex wear
+                    // multipliers, GLB _COLOR0 rgb) times (scale x mask +
+                    // bias), raised to (1 / gamma)^2, as the game does
+                    let bi = textureLoad(t_em, vec2(34 + c, row), 0).a;
+                    let lv = wear_gamma(clamp(i.col[c] * (m[c] * sc + bi), 0.0, 1.0), textureLoad(t_em, vec2(37 + c, row), 0).a);
+                    s += clamp((lv - st) / wd, 0.0, 1.0);
                 }
                 k = clamp(s, 0.0, 1.0);
                 // The game's second wear layer, the primer (columns 25 to
                 // 33): its mask (or the wear mask, column 31) per channel
                 // scaled, the first channel less the other two by the cross
-                // byte (vertex colours taken as 1), summed, windowed, and
+                // byte (the vertex colours, as for the first layer), summed,
+                // windowed, and
                 // only where the first layer is not.
                 // (only when the user turns it on: F.jitter.w = -2)
                 let t = select(pm, m, textureLoad(t_em, vec2(31, row), 0).a > 0.5);
                 let cross = textureLoad(t_em, vec2(28, row), 0).a;
-                let lr = clamp(clamp(1.0 - 2.0 * cross, 0.0, 1.0) * textureLoad(t_em, vec2(25, row), 0).a * t.r, 0.0, 1.0);
-                let lg = clamp(textureLoad(t_em, vec2(26, row), 0).a * t.g, 0.0, 1.0);
-                let lb = clamp(textureLoad(t_em, vec2(27, row), 0).a * t.b, 0.0, 1.0);
+                // scale (25 + c), bias (40 + c), gamma (43 + c)
+                let pl = vec3(clamp(i.col.r - (i.col.g + i.col.b) * cross, 0.0, 1.0), i.col.g, i.col.b);
+                var lv = vec3(0.0);
+                for (var c = 0; c < 3; c++) {
+                    let sc = textureLoad(t_em, vec2(25 + c, row), 0).a;
+                    let bi = textureLoad(t_em, vec2(40 + c, row), 0).a;
+                    lv[c] = wear_gamma(clamp(pl[c] * (sc * t[c] + bi), 0.0, 1.0), textureLoad(t_em, vec2(43 + c, row), 0).a);
+                }
+                let lr = lv.x;
+                let lg = lv.y;
+                let lb = lv.z;
                 let pb = clamp(lr + lg + lb, 0.0, 1.0);
                 let ps = textureLoad(t_em, vec2(29, row), 0).a;
                 let pw = max(textureLoad(t_em, vec2(30, row), 0).a, 1.0 / 255.0);
