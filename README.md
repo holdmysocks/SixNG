@@ -406,8 +406,7 @@ restyle the hair:
    from root to tip. Variant: a random value against three per-guide
    thresholds gives each strand one of four colour ramps.
 
-Not in the export yet: curl and noise (being read from the groom's style
-groups), how the hair is pressed under a hat (export the model without the
+Not in the export yet: how the hair is pressed under a hat (export the model without the
 hat and add the hat afterwards), and the game's run-time strand count (it
 draws fewer strands at a distance; the export writes all it stores). To
 restyle in Blender, edit the hidden `_guides` objects and grow new strands
