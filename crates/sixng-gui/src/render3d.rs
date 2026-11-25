@@ -324,6 +324,10 @@ pub struct GpuMesh {
     pub skinned: bool,
     pub centre: Vec3,
     pub visible: bool,
+    /// Strand hair that follows the game's strand count rule, and the
+    /// indices of it to draw this frame.
+    pub strand_lod: Option<glb::StrandLod>,
+    pub n_draw: std::sync::atomic::AtomicU32,
 }
 
 pub struct GpuModel {
@@ -1655,6 +1659,8 @@ impl Uploader {
                     skinned: me.skinned,
                     centre: Vec3::from(me.centre),
                     visible: true,
+                    strand_lod: me.strand_lod,
+                    n_draw: std::sync::atomic::AtomicU32::new(me.indices.len() as u32),
                 });
             }
         }
@@ -1997,7 +2003,12 @@ impl Renderer3D {
                 }
                 let first = (me.ib_range.start / 4) as u32;
                 let base = (me.vb_range.start / std::mem::size_of::<glb::Vertex>() as u64) as i32;
-                be.draw_indexed(first..first + me.n_idx, base, range.clone());
+                // strand hair: the first strands the game's count rule keeps at this distance
+                let cnt = if me.strand_lod.is_some() { me.n_draw.load(std::sync::atomic::Ordering::Relaxed).min(me.n_idx) } else { me.n_idx };
+                if cnt == 0 {
+                    continue;
+                }
+                be.draw_indexed(first..first + cnt, base, range.clone());
                 n += 1;
             }
         }
@@ -2064,6 +2075,14 @@ impl Renderer3D {
         let aspect = size[0] as f32 / size[1] as f32;
         let fu = self.frame_uniform(cam, look, aspect, 0.0);
         queue.write_buffer(&self.frame_ub, 0, bytemuck::bytes_of(&fu));
+        // strand count by distance (from the eye to the piece's centre; the model's own placement is taken as none)
+        let eye = cam.eye();
+        for me in models.iter().flat_map(|gm| gm.meshes.iter()) {
+            if let Some(l) = me.strand_lod {
+                me.n_draw.store(l.indices(me.n_idx, (eye - me.centre).length()), std::sync::atomic::Ordering::Relaxed);
+                if std::env::var("SIXNG_DEBUG_HAIR").is_ok() { static ONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0); if ONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 { eprintln!("strand piece at {:.2} m: share {:.3}", (eye - me.centre).length(), l.share((eye - me.centre).length())); } }
+            }
+        }
         let lb = (!lines.is_empty()).then(|| {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("lines"),

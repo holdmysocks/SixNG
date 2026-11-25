@@ -28,6 +28,67 @@ pub struct Vertex {
     pub zone: [u8; 4],
 }
 
+/// How many of a hair piece's strands the game draws at a distance (its
+/// strand count rule, read from the game's code by the shader archive work
+/// for the LOD presets with ThicknessCurveVersion 2): with d the distance
+/// in metres,
+///
+///   fd = min(1, 1 / (2 d DistanceScale))
+///   p  = min(1, a / max(0.5 d, MinDistance)),  a = mean strand width x 1440 / TargetThickness
+///   m  = min(fd, p),  share = m + (p - m) x UseThicknessCurve
+///
+/// and the first round(count x share) strands in stored order are drawn,
+/// at their own width.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StrandLod {
+    /// Strands in the mesh (in stored order, the same number of indices each).
+    pub strands: u32,
+    /// Strands the piece stores.
+    pub stored: u32,
+    pub a: f32,
+    pub dist_scale: f32,
+    pub min_dist: f32,
+    pub use_curve: f32,
+}
+
+impl StrandLod {
+    pub fn share(&self, d: f32) -> f32 {
+        let d = d.max(1e-3);
+        let fd = (1.0 / (2.0 * d * self.dist_scale.max(1e-6))).min(1.0);
+        let p = (self.a / (0.5 * d).max(self.min_dist).max(1e-6)).min(1.0);
+        let m = fd.min(p);
+        m + (p - m) * self.use_curve
+    }
+
+    /// Indices to draw of the mesh's `n_idx` at distance `d`.
+    pub fn indices(&self, n_idx: u32, d: f32) -> u32 {
+        if self.strands == 0 {
+            return n_idx;
+        }
+        let want = (self.stored as f32 * self.share(d)).round() as u32;
+        (n_idx / self.strands) * want.min(self.strands)
+    }
+}
+
+#[cfg(test)]
+mod strand_lod_tests {
+    use super::StrandLod;
+
+    #[test]
+    fn the_strand_count_falls_with_distance() {
+        // long head hair: mean width 0.23 mm, TargetThickness 1.5, DistanceScale 1, MinDistance 0.1, UseThicknessCurve 0.5
+        let l = StrandLod { strands: 800, stored: 1000, a: 2.3e-4 * 1440.0 / 1.5, dist_scale: 1.0, min_dist: 0.1, use_curve: 0.5 };
+        for (d, want) in [(0.5, 0.883), (1.0, 0.442), (2.0, 0.221), (5.0, 0.088)] {
+            assert!((l.share(d) - want).abs() < 2e-3, "{d}: {}", l.share(d));
+        }
+        // very close: every strand
+        assert_eq!(l.share(0.1), 1.0);
+        // the mesh holds the first 800 of 1000 strands, 6 indices each
+        assert_eq!(l.indices(4800, 0.1), 4800);
+        assert_eq!(l.indices(4800, 1.0), 6 * 442);
+    }
+}
+
 pub struct Mesh {
     pub name: String,
     pub verts: Vec<Vertex>,
@@ -37,6 +98,8 @@ pub struct Mesh {
     pub has_tangents: bool,
     pub uv_sets: usize,
     pub centre: [f32; 3],
+    /// A strand hair piece that follows the game's strand count rule.
+    pub strand_lod: Option<StrandLod>,
 }
 
 /// Close-up fabric weave of a clothing material (see `Material::detail`).
@@ -1060,7 +1123,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                     c[k] += x.pos[k] / n.max(1) as f32;
                 }
             }
-            meshes.push(Mesh {
+            meshes.push(Mesh { strand_lod: None,
                 name: mesh["name"].as_str().unwrap_or("").into(),
                 verts: v,
                 indices,

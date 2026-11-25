@@ -2653,7 +2653,7 @@ mod tests {
         };
         glb::Model {
             path: PathBuf::new(),
-            meshes: vec![glb::Mesh {
+            meshes: vec![glb::Mesh { strand_lod: None,
                 name: "test triangle".into(),
                 verts: vec![
                     vertex([-1.0, -1.0, 0.0]),
