@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 mod assemble;
+mod atmo;
 mod bc;
 mod cells;
 mod fabric;
@@ -1598,6 +1599,9 @@ impl App {
                 m3.tod = h;
                 m3.look.set_time_of_day(h);
             }
+            if let Some(w) = c.get("weather") {
+                m3.weather = w.trim().to_ascii_lowercase();
+            }
             if let Some(v) = c.f("fog") {
                 m3.look.fog = v;
             }
@@ -1725,6 +1729,8 @@ impl App {
         }
         if let Some(v) = c.f("wear") {
             m.look.wear = (v as f32).clamp(0.0, 1.0);
+            // a set amount instead of the configuration's wear levels
+            m.look.wear_from_config = false;
         }
         if let Some(v) = c.get("fit-parts") {
             m.fit_parts_once = Some(v.to_string());

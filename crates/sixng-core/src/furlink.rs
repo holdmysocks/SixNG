@@ -1,6 +1,15 @@
 //! Fur: which strand grooms belong to an animal's fur variants.
 //!
-//! Nothing readable names a groom, but four facts together place them:
+//! The link is stored and read exactly when the archive's table of
+//! contents can be read (`link_exact`), as for people's hair (`hairlink`):
+//! a fur variant's asset GUID is the name id (`meta7a::asset_id`) of its
+//! placeholder drawable `<root>_fur_<slot>_<variant>`, the piece table
+//! lists its pieces by the name ids of their files, and the table of
+//! contents gives every file its name id. 570 fur variants list 3,149
+//! pieces; 3,148 of them are groom files of the archive.
+//!
+//! Without the table of contents the link is inferred instead. Four facts
+//! together place the grooms:
 //!
 //! 1. A fur preset (`partskin`, slot fur body / fur head, named after the
 //!    3-vertex placeholder drawable `<root>_fur_<slot>_<variant>`) carries
@@ -31,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 3;
 /// Most pieces a placeholder without a preset is given.
 const MAX_UNKNOWN: usize = 14;
 /// Roots this close to the skin (median, metres) mark an animal's run.
@@ -257,11 +266,18 @@ pub struct Variant {
     pub slot: String,
     /// Densest groom of each piece (archive offsets).
     pub grooms: Vec<u64>,
+    /// The LOD chain of each piece, densest first (same order as `grooms`).
+    /// Read: by the files' names (`<piece>_lod1` …) where the piece word is
+    /// known, else `hairlink`'s chain by bones and strand counts. Inferred:
+    /// `pieces`.
+    #[serde(default)]
+    pub chains: Vec<Vec<u64>>,
     /// The piece count came from the piece table (false: a placeholder
-    /// without a preset, sized by what the walk left).
+    /// the table does not list; inferred: sized by what the walk left).
     pub known: bool,
-    /// The walk gave it exactly the table's count (false: one more or
-    /// fewer, or none because its files are not in the archive).
+    /// Every listed piece is here (false, inferred: the walk used one more
+    /// or fewer, or none because its files are not in the archive; read:
+    /// a listed piece is no groom file of the archive).
     pub exact: bool,
 }
 
@@ -278,6 +294,11 @@ pub struct FurLink {
     /// `fitting` over `block` for the variants with a known count (0..1).
     pub agreement: f32,
     pub note: String,
+    /// Read from the game (piece table and the archive's file ids), not
+    /// inferred; `roots`, `block`, `fitting` and `agreement` then describe
+    /// only this animal's own pieces, all counted as fitting.
+    #[serde(default)]
+    pub read: bool,
 }
 
 impl FurLink {
@@ -365,12 +386,10 @@ pub struct OnSkin {
 }
 
 /// The groom pieces whose roots lie on `pts` (skin points in RAGE model
-/// space, see `skin_points`): median root distance under `FIT`. For
-/// people no link from a hair model to its grooms is decoded (their hair
-/// assets are in the piece table, but nothing readable names the
-/// placeholder), so this is how hair is found for a head: every style
-/// made for that head shape fits it, and the pieces of one style are
-/// neighbours in the list.
+/// space, see `skin_points`): median root distance under `FIT`. Every
+/// style made for a head shape fits it, and the pieces of one style are
+/// neighbours in the list. A character's own hair is linked by `hairlink`;
+/// this is for browsing what else fits.
 pub fn on_skin(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], pts: &[[f32; 3]]) -> Result<Vec<OnSkin>> {
     if pts.is_empty() {
         return Err(anyhow!("no mesh to fit grooms to"));
@@ -421,13 +440,88 @@ pub fn for_animal(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::scan:
     if let Some(l) = cache.links.get(&root) {
         return Ok(l.clone());
     }
-    let link = link(work, a, all, &root, skin)?;
+    let link = match link_exact(work, a, all, &root) {
+        Ok(l) => l,
+        Err(e) => {
+            let mut l = link(work, a, all, &root, skin)?;
+            l.note = format!("{} The stored link could not be read: {e:#}.", l.note);
+            l
+        }
+    };
     cache.version = CACHE_VERSION;
     cache.links.insert(root, link.clone());
     if let Ok(b) = serde_json::to_vec(&cache) {
         let _ = crate::atomic::write(&cache_path, b);
     }
     Ok(link)
+}
+
+/// The stored link of animal `root`: every `<root>_fur_…` placeholder (a
+/// drawable, or a preset's own name), its GUID by name id, its pieces from
+/// the piece table, each piece's file by the table of contents.
+pub fn link_exact(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], root: &str) -> Result<FurLink> {
+    let cat = crate::groom::catalog_cached(work, a, all)?;
+    if cat.is_empty() {
+        return Err(anyhow!("no grooms in {}", a.id));
+    }
+    let table = piece_table(&a.path, all);
+    if table.is_empty() {
+        return Err(anyhow!("fur piece table not found in {}", a.id));
+    }
+    let mut cipher = crate::gamecipher::open(&crate::export::game_root(a))?;
+    let mut f = std::fs::File::open(&a.path)?;
+    let ids = crate::rpf9toc::file_ids(cipher.as_mut(), &mut f)?;
+    let grooms: std::collections::HashSet<u64> = cat.iter().map(|g| g.off).collect();
+    let file = |id: &u64| ids.get(id).into_iter().flatten().copied().find(|o| grooms.contains(o));
+    let pre = format!("{root}_fur_");
+    let mut names: BTreeMap<String, u64> = all.iter().filter_map(|e| e.name.as_deref()).map(|n| n.to_ascii_lowercase()).filter(|n| n.starts_with(&pre)).map(|n| (n, 0)).collect();
+    if let Ok(skins) = crate::partskin::get(&crate::export::game_root(a)) {
+        for p in skins.sets.iter().flat_map(|s| &s.presets) {
+            if let Some(own) = p.own.as_deref().map(|o| o.to_ascii_lowercase()).filter(|o| o.starts_with(&pre)) {
+                let g = names.entry(own).or_insert(0);
+                if *g == 0 {
+                    *g = p.guid;
+                }
+            }
+        }
+    }
+    if names.is_empty() {
+        return Err(anyhow!("{root} has no fur variants"));
+    }
+    // LOD chains: by name where the piece is named, else the exact hair
+    // table's chain (bones and strand counts), else the groom alone
+    let starts: std::collections::HashSet<u64> = table.values().flatten().filter_map(file).collect();
+    let listed: std::collections::HashSet<u64> = names.iter().filter_map(|(n, p)| table.get(&crate::meta7a::asset_id(n)).or_else(|| table.get(p))).flatten().copied().collect();
+    let named = crate::hairlink::piece_names(names.keys().map(|n| n.as_str()), &listed);
+    let by_name: HashMap<u64, Vec<u64>> = named.iter().filter_map(|(id, n)| file(id).map(|o| (o, crate::hairlink::lod_files(n, o, file, &starts)))).collect();
+    let guessed: HashMap<u64, Vec<u64>> = crate::hairlink::get(work, a, all).map(|t| t.lods.iter().map(|c| (c[0], c.clone())).collect()).unwrap_or_default();
+    let chain = |o: &u64| by_name.get(o).or_else(|| guessed.get(o)).cloned().unwrap_or_else(|| vec![*o]);
+    let mut variants = Vec::new();
+    for (name, preset) in &names {
+        let list = table.get(&crate::meta7a::asset_id(name)).or_else(|| table.get(preset));
+        let mut own: Vec<u64> = Vec::new();
+        for o in list.into_iter().flatten().filter_map(file) {
+            if !own.contains(&o) {
+                own.push(o);
+            }
+        }
+        let head = name.split("_fur_").nth(1).is_some_and(|s| s.starts_with("head"));
+        variants.push(Variant { name: name.clone(), slot: if head { "head" } else { "body" }.into(), exact: list.is_some_and(|l| l.len() == own.len()), known: list.is_some(), chains: own.iter().map(chain).collect(), grooms: own });
+    }
+    if variants.iter().all(|v| v.grooms.is_empty()) {
+        return Err(anyhow!("the piece table lists no groom of {root}"));
+    }
+    let block: BTreeSet<u64> = variants.iter().flat_map(|v| v.grooms.iter().copied()).collect();
+    Ok(FurLink {
+        root: root.to_string(),
+        variants,
+        roots: vec![root.to_string()],
+        block: block.len(),
+        fitting: block.len(),
+        agreement: 1.0,
+        note: "Read from the game: a fur variant's GUID is the name id of its placeholder, the piece table lists its pieces by the name ids of their files, and the table of contents gives each file its id. known: false = a placeholder the table does not list (no fur files).".into(),
+        read: true,
+    })
 }
 
 fn link(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], root: &str, skin: &[(String, Vec<[f32; 3]>)]) -> Result<FurLink> {
@@ -568,7 +662,8 @@ fn link(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], r
             }
         }
         if asset.root == l {
-            variants.push(Variant { name: asset.name.clone(), slot: if asset.head { "head" } else { "body" }.into(), grooms, known: asset.ids.is_some(), exact });
+            let chains = grooms.iter().map(|g| pcs.iter().find(|p| p.lods[0] == *g).map(|p| p.lods.clone()).unwrap_or_else(|| vec![*g])).collect();
+            variants.push(Variant { name: asset.name.clone(), slot: if asset.head { "head" } else { "body" }.into(), grooms, chains, known: asset.ids.is_some(), exact });
         }
     }
     if variants.iter().all(|v| v.grooms.is_empty()) {
@@ -581,7 +676,8 @@ fn link(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], r
         block,
         fitting,
         agreement: if known == 0 { 0.0 } else { known_fit as f32 / known as f32 },
-        note: "Inferred from archive order, the fur piece table and a fit of strand roots to the skin; not a stored link. known: false = a placeholder without a preset, given the pieces the others leave; exact: false = the walk used one piece more or fewer than the table lists, or none.".into(),
+        read: false,
+        note: "Inferred from archive order, the fur piece table and a fit of strand roots to the skin; not the stored link. known: false = a placeholder without a preset, given the pieces the others leave; exact: false = the walk used one piece more or fewer than the table lists, or none.".into(),
     })
 }
 
@@ -654,6 +750,13 @@ mod tests {
         assert!(gain(false, &Seen { dist: Some(0.012), head: false }) > 0.0);
         assert!(gain(false, &Seen { dist: Some(0.04), head: false }) < 0.0);
         assert!(gain(true, &b) < 0.0);
+    }
+
+    #[test]
+    fn old_cache_reads_as_inferred() {
+        // a link cached before `read` existed
+        let j = r#"{"root":"r","variants":[],"roots":["r"],"block":0,"fitting":0,"agreement":0.0,"note":""}"#;
+        assert!(!serde_json::from_str::<FurLink>(j).unwrap().read);
     }
 
     #[test]

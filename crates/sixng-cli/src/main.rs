@@ -277,7 +277,7 @@ enum Cmd {
         #[arg(long, short)]
         out: PathBuf,
     },
-    /// Strand hair grooms (hair, beards, brows, fur: unnamed packs.rpf resources) as GLB line strips or ribbons in model space: <out>/grooms/<archive>/<offset>.glb and index.jsonl (strands, points, bones, region, LOD chain). No link to peds is stored; pick them by region and bones.
+    /// Strand hair grooms (hair, beards, brows, fur: unnamed packs.rpf resources) as GLB line strips or ribbons in model space: <out>/grooms/<archive>/<offset>.glb and index.jsonl (strands, points, bones, region, LOD chain). Pick them by region and bones, or an animal's fur with --animal.
     Grooms {
         /// Archive (default packs).
         #[arg(default_value = "packs")]
@@ -303,9 +303,11 @@ enum Cmd {
         /// Export the fur of this animal (its root name, e.g.
         /// crm_cat_feral_m_00): the grooms of its default body and head
         /// fur, in the animal's model space, so they sit on the model that
-        /// `outfit <root>` exports. The link is inferred (archive order,
-        /// piece counts, distance to the skin), not stored; it is written
-        /// with its agreement score to <root>.fur.json.
+        /// `outfit <root>` exports. The link is read from the game (the
+        /// variants' placeholder name ids, the piece table, the file ids of
+        /// the table of contents), or inferred from archive order, piece
+        /// counts and distance to the skin where the table of contents
+        /// cannot be read; it is written to <root>.fur.json.
         #[arg(long)]
         animal: Option<String>,
         /// Only these groom offsets (hex, comma-separated).
@@ -1999,7 +2001,10 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let ix = ws.load_index(&a)?;
             let t = Instant::now();
             if *list {
-                let cat = sixng_core::groom::catalog(&a, &ix.entries)?;
+                let mut cat = sixng_core::groom::catalog(&a, &ix.entries)?;
+                if let Ok(t) = sixng_core::hairlink::get(&ws.work, &a, &ix.entries) {
+                    t.relabel(&mut cat);
+                }
                 let dir = po.join("grooms").join(a.id.trim_end_matches(".rpf"));
                 std::fs::create_dir_all(&dir)?;
                 sixng_core::atomic::write(dir.join("catalog.json"), serde_json::to_vec_pretty(&cat)?)?;
@@ -2037,7 +2042,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     fur = json!({"animal": root, "variants": picked.iter().map(|v| json!({"name": v.name, "slot": v.slot, "grooms": v.grooms.iter().map(|g| format!("{g:x}")).collect::<Vec<_>>(), "count_known": v.known, "count_exact": v.exact})).collect::<Vec<_>>(),
                         "other_variants": link.variants.iter().filter(|v| !picked.iter().any(|p| p.name == v.name)).map(|v| v.name.clone()).collect::<Vec<_>>(),
                         "agreement": link.agreement, "note": link.note,
-                        "link": "inferred from archive order, piece counts and distance to the skin; no resource stores it"});
+                        "link": if link.read { "read from the game: placeholder name id, piece table, file ids of the table of contents" } else { "inferred from archive order, piece counts and distance to the skin (the table of contents could not be read)" }});
                     let dir = po.join("grooms").join(a.id.trim_end_matches(".rpf"));
                     std::fs::create_dir_all(&dir)?;
                     sixng_core::atomic::write(dir.join(format!("{root}.fur.json")), serde_json::to_vec_pretty(&fur)?)?;

@@ -935,7 +935,8 @@ pub struct GroomInfo {
     /// scalp / face / brows / lashes / body / animal / other, from the bones (a guess).
     pub category: String,
     /// LOD chain: consecutive grooms with the same bones and fewer strands
-    /// each time (inferred); `lod` 0 is the densest.
+    /// each time (inferred); `lod` 0 is the densest. `hairlink::HairLinks::
+    /// relabel` sets both from the files' names where they can be read.
     pub chain: u32,
     pub lod: u32,
 }

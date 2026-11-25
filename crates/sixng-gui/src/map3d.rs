@@ -233,6 +233,10 @@ pub struct Map3D {
     pub cam: Camera,
     pub look: Look,
     pub tod: f32,
+    /// Weather type of the game's timecycle (`sixng_core::daylight::WEATHERS`).
+    pub weather: String,
+    /// The sky of the last (weather, hour), from the timecycle.
+    sky_cache: Option<(String, f32, bool, crate::atmo::Sky)>,
     pub detail_level: f32,
     pub detail: Detail,
     pub show_terrain: bool,
@@ -344,6 +348,9 @@ pub struct Map3D {
 }
 
 /// Seconds of camera motion to load ahead, and the cap on that distance (m).
+/// Luminance (cd/m2) of an emissive surface at emissive strength 1 in the
+/// map's HDR frame: lit signs and windows read at night and vanish by day.
+const EMISSIVE_NITS: f32 = 6.0;
 const LOOKAHEAD_S: f32 = 2.0;
 const LOOKAHEAD_MAX: f32 = 800.0;
 /// Eviction time slice per frame (ms).
@@ -482,6 +489,8 @@ impl Map3D {
             cam,
             look,
             tod: 14.0,
+            weather: "sunny".into(),
+            sky_cache: None,
             detail_level,
             detail: Detail::from_level(detail_level),
             show_terrain: true,
@@ -2227,7 +2236,7 @@ impl Map3D {
                     "[map3d] adapter {} ({:?}, {:?}) present {:?}",
                     ai.name, ai.backend, ai.device_type, rs.target_format
                 );
-                self.renderer = Some(Renderer3D::new(rs));
+                self.renderer = Some(Renderer3D::new_map(rs));
                 let bc = rs
                     .device
                     .features()
@@ -2608,7 +2617,15 @@ impl Map3D {
         } else {
             Vec::new()
         };
+        // the game's sky and light for the weather and hour (timecycle)
+        let sky = self.game_sky();
+        look.sun_dir = sky.key_dir;
+        look.sun_intensity = 1.0;
+        look.sun_col = [1.0; 3];
+        look.ambient = 1.0;
+        look.emissive = EMISSIVE_NITS;
         if let Some(ren) = self.renderer.as_mut() {
+            ren.sky = Some(sky);
             ren.decal_bias = self.decal_bias;
             ren.cells = cell_list;
             ren.lod_k = lod_k;
@@ -2798,6 +2815,31 @@ impl Map3D {
         self.world_tau = tau;
         self.size_boost = 1.0;
         self.dirty = true;
+    }
+
+    /// The game's sky for the current weather and hour: from the timecycle
+    /// once its table is loaded (`sixng daylight` cache or common.rpf),
+    /// the built-in Sunny values until then.
+    fn game_sky(&mut self) -> crate::atmo::Sky {
+        let table = match crate::model_view::daylight_table(&self.game, &self.work, true) {
+            crate::model_view::DaylightState::Ready(t) => Some(t),
+            _ => None,
+        };
+        let from_tc = table.is_some();
+        if let Some((w, h, f, sky)) = &self.sky_cache {
+            if *w == self.weather && *h == self.tod && *f == from_tc {
+                return *sky;
+            }
+        }
+        let sky = table
+            .as_ref()
+            .and_then(|t| {
+                let w = t.weather(&self.weather).or_else(|| t.weather("sunny"))?;
+                Some(crate::atmo::Sky::from_timecycle(t, w, self.tod))
+            })
+            .unwrap_or_else(|| crate::atmo::Sky::fallback(self.tod));
+        self.sky_cache = Some((self.weather.clone(), self.tod, from_tc, sky));
+        sky
     }
 
     fn ground_radius(&self) -> f32 {
@@ -3071,6 +3113,34 @@ impl Map3D {
             .changed()
         {
             self.look.set_time_of_day(self.tod);
+        }
+        let label = |id: &str| {
+            sixng_core::daylight::WEATHERS
+                .iter()
+                .find(|w| w.0 == id)
+                .map(|w| w.2)
+                .unwrap_or("Sunny")
+        };
+        let before = self.weather.clone();
+        egui::ComboBox::from_label("weather")
+            .selected_text(label(&self.weather))
+            .show_ui(ui, |ui| {
+                for (id, _, l) in sixng_core::daylight::WEATHERS {
+                    ui.selectable_value(&mut self.weather, id.to_string(), l);
+                }
+            });
+        if before != self.weather {
+            if let Some(r) = self.renderer.as_mut() {
+                r.reset_exposure();
+            }
+        }
+        if let Some((_, _, from_tc, sky)) = &self.sky_cache {
+            let el = sky.u.sun[1].clamp(-1.0, 1.0).asin().to_degrees();
+            ui.label(format!(
+                "sun {el:.1}°, {}{}",
+                if sky.key_is_moon { "moonlit" } else { "sunlit" },
+                if *from_tc { "" } else { " (timecycle not loaded: built-in Sunny)" }
+            ));
         }
         ui.add(
             egui::Slider::new(&mut self.look.fog, 0.0..=0.002)

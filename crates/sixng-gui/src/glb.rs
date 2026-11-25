@@ -220,7 +220,9 @@ pub struct Material {
     /// (shading) is shown as grey.
     pub tint_mask: bool,
     /// Ped clothing whose base texture is the grey shade map (`ped_tint` in
-    /// the extras): the viewer colours it with the outfit's tint.
+    /// the extras): the viewer colours it with the outfit's tint. Also set,
+    /// with no base texture, on ped clothing whose textures are not in the
+    /// install: it is coloured per vertex.
     pub ped_shade: bool,
     /// Clothing: the tiling fabric texture of the garment's main
     /// sub-material, drawn by the shader as close-up weave over the baked
@@ -233,6 +235,9 @@ pub struct Material {
     /// Vehicle parts: the palette row of each part id as an image (128
     /// columns, row = part id), set by the viewer for the look shown.
     pub ramp: Option<usize>,
+    /// Vehicle parts: the game's tiling wear mask (material parameter
+    /// `b9f4bdac`, three grunge channels), where the second layer shows.
+    pub wear_mask: Option<usize>,
     /// Vehicle parts coloured per vertex (COLOR_0; alpha 254 = the primary
     /// body paint, other values = metalness in four steps x 50 + roughness in 50 steps).
     pub parts: bool,
@@ -246,6 +251,9 @@ pub struct Material {
     /// The material lights: its class is `emissive`, or the GLB gives it
     /// an emissive texture (emissive shaders of other classes).
     pub lit: bool,
+    /// The colour of the light (the GLB emissiveFactor divided by its
+    /// brightest channel); white when the export does not say.
+    pub emissive_tint: [f32; 3],
     pub slots: Vec<Slot>,
     /// worst slot status: ok / lowmip / flat
     pub gap: String,
@@ -971,7 +979,9 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             emissive,
             mr,
             tint_mask: ex["classification"]["tint_mask"] == true,
-            ped_shade: ex["ped_tint"].is_object(),
+            // the clothing shaders bind `speculartex2` (739e3d0d), which marks
+            // ped clothing, whether or not the texture is in the install
+            ped_shade: ex["ped_tint"].is_object() || (base.is_none() && ex["shader_name"].as_str().is_some_and(|s| s.starts_with("ped_")) && tex_list.iter().any(|t| t["param_hash"] == "739e3d0d")),
             detail: None,
             ramp_u: (ex["classification"]["stand_in"] == "parts" && !opts.base_only)
                 .then(|| tex_list.iter().find(|t| t["param_hash"] == "346394ea" && t["status"].as_str().is_some_and(|s| s.starts_with("ok")) && t["width"].as_u64().is_some_and(|w| w >= 32)))
@@ -979,10 +989,16 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                 .and_then(|t| t["png"].as_str())
                 .and_then(|p| add_img(out_root.join(p), false, &mut images)),
             ramp: None,
+            wear_mask: (ex["classification"]["stand_in"] == "parts" && !opts.base_only)
+                .then(|| tex_list.iter().find(|t| t["param_hash"] == "b9f4bdac" && t["status"].as_str().is_some_and(|s| s.starts_with("ok")) && t["width"].as_u64().is_some_and(|w| w >= 32)))
+                .flatten()
+                .and_then(|t| t["png"].as_str())
+                .and_then(|p| add_img(out_root.join(p), false, &mut images)),
             parts: ex["classification"]["stand_in"] == "parts",
             occlusion_only,
             emissive_scale,
             lit,
+            emissive_tint: emissive_tint(&m),
             slots,
             gap: gap.into(),
             shader_hash: ex["shader_name_hash"].as_str().unwrap_or("").into(),
@@ -1395,6 +1411,20 @@ pub fn gltf_emissive_strength(m: &Value) -> f32 {
     (f * x) as f32
 }
 
+/// The colour of a material's light: its `emissiveFactor` divided by the
+/// brightest channel (the brightness is in `emissive_scale`); white when
+/// there is no factor or it is black.
+pub fn emissive_tint(m: &Value) -> [f32; 3] {
+    let f: Vec<f32> = m["emissiveFactor"].as_array().map(|a| a.iter().filter_map(|v| v.as_f64()).map(|v| v as f32).collect()).unwrap_or_default();
+    match f.as_slice() {
+        [r, g, b, ..] if r.max(*g).max(*b) > 1e-4 => {
+            let k = r.max(*g).max(*b);
+            [r / k, g / k, b / k]
+        }
+        _ => [1.0; 3],
+    }
+}
+
 /// Whether a material lights: class `emissive`, or any class with an
 /// emissive texture in the GLB (the export sets one only on materials whose
 /// shader lights).
@@ -1511,6 +1541,16 @@ mod emissive_tests {
         assert!((bulb - 6.28f32.sqrt()).abs() < 1e-5);
         assert_eq!(emissive_scale(&m(1.0, Some(32.3))), 3.0);
         assert!((gltf_emissive_strength(&m(1.0, Some(32.3))) - 32.3).abs() < 1e-4);
+    }
+
+    #[test]
+    fn emissive_tint_is_the_factor_colour() {
+        assert_eq!(emissive_tint(&serde_json::json!({})), [1.0; 3]);
+        assert_eq!(emissive_tint(&serde_json::json!({"emissiveFactor": [0.0, 0.0, 0.0]})), [1.0; 3]);
+        // a dim blue railing glow and a light blue neon tube
+        let t = emissive_tint(&serde_json::json!({"emissiveFactor": [0.008, 0.0105, 0.05]}));
+        assert!(t.iter().zip([0.16, 0.21, 1.0]).all(|(a, b)| (a - b).abs() < 1e-5), "{t:?}");
+        assert_eq!(emissive_tint(&serde_json::json!({"emissiveFactor": [0.42, 0.85, 1.0]})), [0.42, 0.85, 1.0]);
     }
 
     #[test]

@@ -55,6 +55,16 @@
 //! That the paint type modifier wins over the assignment's default, and
 //! what the shader does with each value, is not checked in code.
 //!
+//! **Wear records**: a surface record names a wear ladder (`1b1a2e6c`,
+//! by `e9aaa040`) and a detail set (`cf980e6f`, by `detailMapsHash`). A
+//! ladder lists six wear presets (`cc518af0`: dust, rust, primer and
+//! control intensities), and a preset names an age record (`fe5d32e7`, sun
+//! and base bleach, scratches; or `d8511ada`, min and max wear), an edge
+//! record (`487f0f4c`) and two colour range records (`3539c333`). model.json
+//! lists the ones a vehicle's parts reach, as stored. Which of the six
+//! entries a vehicle uses, how dirty it is and what the shader does with
+//! each value is not decoded.
+//!
 //! Not decoded: the other modifier kinds (dirt, liveries, decal layers),
 //! which configuration a spawned vehicle uses, the wear layers (a colour
 //! record's second and third picks, mostly on page 5).
@@ -78,10 +88,16 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// 25: coat records (`coats`, `coat_records`, `paint_coats`, `paint_coat`).
 /// 26: `surfaces` (each part id's low and high metalness and roughness, for
 /// a viewer that reads the material map per pixel).
-pub const EXPORT_VERSION: u32 = 26;
+/// 27: `wear_records` (each part id's wear ladder and detail set, and the
+/// records they reach).
+/// 28: `wear_records.levels_by_config` and `levels_default` (each part id's
+/// wear level per configuration: the entry of its ladder).
+pub const EXPORT_VERSION: u32 = 28;
 /// Layout version of `<work>/index/vehicle_parts.json`.
 /// 21: a part's coat and the library's coat records.
-pub const FORMAT: u32 = 21;
+/// 22: the surfaces' wear ladders and detail sets, and the wear records.
+/// 23: each configuration's wear levels.
+pub const FORMAT: u32 = 23;
 
 const PART_SET: u32 = 0xf142_44fd;
 const SET_COLOURS: u32 = 0x7847_6477;
@@ -143,6 +159,20 @@ const DEF_IDS: u32 = 0xe9bf_9f2d;
 /// channel, `1470edc0` priority, flags `c8d27281` (colour) and `7a84e7bf`
 /// (surface).
 const BIND: u32 = 0x501f_f112;
+/// A binding's `wear` flag (joaat "wear"): the binding sets the wear channel
+/// of the group's part ids (bindings with only this flag exist for the
+/// interior, engine bay, wheels ...).
+const FLAG_WEAR: u32 = 0x7593_9b79;
+/// A modifier that gives a wear channel its level (`ca2065a9` channel):
+/// `5f89e0d0` 0 to 5, the entry of a ladder's `materialPresets` and
+/// `wearPresets` the channel's part ids take, and `primerSets` (a bit mask:
+/// 1 at levels 0 to 2 of the body, 7 at 3 to 5, 2 on some). The
+/// configuration parts that carry these sit in slots named `wear`,
+/// `wear_interior`, `wear_engine`, `wear_wheels` and six more; each slot's
+/// parts step one channel set through the six levels.
+const WEAR_LEVEL: u32 = 0x08b2_439a;
+const LEVEL: u32 = 0x5f89_e0d0;
+const PRIMER_SETS: u32 = 0x4790_9786;
 const BIND_CHANNEL: u32 = 0x178c_c382;
 const PRIORITY: u32 = 0x1470_edc0;
 const FLAG_COLOUR: u32 = 0xc8d2_7281;
@@ -188,6 +218,59 @@ const OWNER: u32 = 0xfb1f_80ff;
 /// The colour record of the primary body paint (its stored colour is a
 /// dark grey default; a configuration's body colour replaces it).
 pub const PRIMARY_PAINT: u32 = 0x2640_0a11;
+
+/// A surface record's wear ladder (`e9aaa040`, not named) and detail set
+/// (`detailMapsHash`).
+const SURFACE_LADDER: u32 = 0xe9aa_a040;
+const SURFACE_DETAIL: u32 = 0x6c3d_dabc;
+/// Wear ladder: `materialPresets` (6 surfaces) and `wearPresets` (6 wear
+/// presets).
+const LADDER: u32 = 0x1b1a_2e6c;
+const LADDER_MATERIALS: u32 = 0x0723_c6c9;
+const LADDER_WEAR: u32 = 0xedad_007e;
+/// Wear preset and its links: `ageWearHash` (an age or an age range
+/// record), `7f1fe0a2` (an edge record), `879774bd` and `02a27216` (colour
+/// range records).
+const WEAR_PRESET: u32 = 0xcc51_8af0;
+const PRESET_AGE: u32 = 0x993a_1850;
+const PRESET_EDGE: u32 = 0x7f1f_e0a2;
+const PRESET_RANGE_A: u32 = 0x8797_74bd;
+const PRESET_RANGE_B: u32 = 0x02a2_7216;
+const DETAIL_SET: u32 = 0xcf98_0e6f;
+/// The kinds of wear record read from the library: key in the tables and
+/// in model.json, struct.
+const WEAR_KINDS: &[(&str, u32)] = &[
+    ("ladders", LADDER),
+    ("presets", WEAR_PRESET),
+    ("ages", 0xfe5d_32e7),
+    ("age_ranges", 0xd851_1ada),
+    ("edges", 0x487f_0f4c),
+    ("colour_ranges", 0x3539_c333),
+    ("details", DETAIL_SET),
+    ("global", 0x7008_2353),
+];
+/// Fields of the wear records that name another record: written as 8 hex
+/// digits, like the other record names in model.json.
+const WEAR_LINKS: &[u32] = &[NAME, LADDER_MATERIALS, LADDER_WEAR, PRESET_AGE, PRESET_EDGE, PRESET_RANGE_A, PRESET_RANGE_B];
+
+/// A wear record as stored, with its links as 8 hex digits and without the
+/// struct tag.
+fn wear_record(mut v: Value) -> Value {
+    let hex = |x: &Value| x.as_u64().map_or_else(|| x.clone(), |n| Value::String(format!("{:08x}", n as u32)));
+    if let Some(o) = v.as_object_mut() {
+        o.remove("_struct");
+        for h in WEAR_LINKS {
+            if let Some(x) = o.get_mut(&meta7a::field_name(*h)) {
+                let new = match &*x {
+                    Value::Array(a) => Value::Array(a.iter().map(hex).collect()),
+                    other => hex(other),
+                };
+                *x = new;
+            }
+        }
+    }
+    v
+}
 
 /// A coat record (`2b84f07e`, 56 bytes): the layers of a paint. Field names
 /// are the game's (case-sensitive joaat of the member hashes), except the
@@ -362,6 +445,20 @@ pub struct Tables {
     /// names.
     #[serde(default)]
     pub coats: HashMap<String, Coat>,
+    /// Surface name (8 hex digits) -> its wear ladder and detail set (0 =
+    /// none, or not a record of the library).
+    #[serde(default)]
+    pub surface_wear: HashMap<String, [u32; 2]>,
+    /// The library's wear records: kind (`WEAR_KINDS`) -> name (8 hex
+    /// digits) -> record as stored (`wear_record`).
+    #[serde(default)]
+    pub wear_records: HashMap<String, HashMap<String, Value>>,
+    /// Model (8 hex digits) -> configuration key -> each part id's wear
+    /// level and primer sets (256 x 4 hex digits: level, then the mask;
+    /// `ffff` = no level). Configurations whose parts set no level are left
+    /// out.
+    #[serde(default)]
+    pub wear_levels: HashMap<String, HashMap<String, String>>,
 }
 
 /// A key for a configuration: FNV-1a of its part list (the name hashes in
@@ -423,6 +520,14 @@ struct Library {
     refs: HashMap<u32, u32>,
     /// configuration part name -> the models of its elements (joaat)
     part_models: HashMap<u32, Vec<u32>>,
+    /// surface name -> its wear ladder and detail set names
+    surface_wear: HashMap<u32, (u32, u32)>,
+    /// kind -> name -> wear record
+    wear_records: HashMap<String, HashMap<u32, Value>>,
+    /// modifier name -> (wear channel, level, primer sets)
+    levels: HashMap<u32, (u32, u8, u8)>,
+    /// binding modifiers with the wear flag
+    wear_binds: std::collections::HashSet<u32>,
     id: Option<String>,
 }
 
@@ -447,7 +552,11 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
             }
             let m = &m;
             let dump = |h: u32| m.objects(h).into_iter().filter_map(|o| m.object(h, o, 0)).collect::<Vec<_>>();
-            let mut l = Library { colours: HashMap::new(), surfaces: HashMap::new(), wear: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), paint_types: HashMap::new(), coats: coats(m), options: HashMap::new(), refs: HashMap::new(), part_models: HashMap::new(), id: Some(e.id.clone()) };
+            let mut l = Library { colours: HashMap::new(), surfaces: HashMap::new(), wear: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), paint_types: HashMap::new(), coats: coats(m), options: HashMap::new(), refs: HashMap::new(), part_models: HashMap::new(), surface_wear: HashMap::new(), wear_records: HashMap::new(), levels: HashMap::new(), wear_binds: Default::default(), id: Some(e.id.clone()) };
+            for (kind, h) in WEAR_KINDS {
+                let recs = dump(*h).into_iter().filter_map(|v| Some((num(&v, NAME)? as u32, wear_record(v)))).collect();
+                l.wear_records.insert(kind.to_string(), recs);
+            }
             for o in dump(OPTION_LIST) {
                 if let Some(n) = num(&o, NAME) {
                     l.options.insert(n as u32, get(&o, OPTION_PARTS).and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()).unwrap_or_default());
@@ -482,6 +591,16 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
             for b in dump(BIND) {
                 if let (Some(n), Some(gr), Some(ch)) = (num(&b, NAME), num(&b, DEF_GROUP), num(&b, BIND_CHANNEL)) {
                     l.binds.insert(n as u32, (gr as u32, ch as u32, num(&b, PRIORITY).unwrap_or(0), flag(&b, FLAG_COLOUR), flag(&b, FLAG_SURFACE), flag(&b, PAINT_TYPE_COAT)));
+                    if flag(&b, FLAG_WEAR) {
+                        l.wear_binds.insert(n as u32);
+                    }
+                }
+            }
+            for w in dump(WEAR_LEVEL) {
+                if let (Some(n), Some(ch), Some(lv)) = (num(&w, NAME), num(&w, ASSIGN_CHANNEL), num(&w, LEVEL)) {
+                    // a 64-bit mask, 16 hex digits (or a number)
+                    let primer = get(&w, PRIMER_SETS).and_then(|x| x.as_str().and_then(|s| u64::from_str_radix(s, 16).ok()).or_else(|| x.as_u64())).unwrap_or(0);
+                    l.levels.insert(n as u32, (ch as u32, lv.clamp(0, 254) as u8, primer.min(255) as u8));
                 }
             }
             for a in dump(ASSIGN) {
@@ -537,6 +656,9 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
                 }
                 if let (Some(n), Some(c), Some(r)) = (num(&s, NAME), num(&s, SURFACE_WEAR_COLOUR), num(&s, SURFACE_WEAR_ROUGH)) {
                     l.wear.insert(n as u32, (c as u32, r as u32));
+                }
+                if let Some(n) = num(&s, NAME) {
+                    l.surface_wear.insert(n as u32, (num(&s, SURFACE_LADDER).unwrap_or(0) as u32, num(&s, SURFACE_DETAIL).unwrap_or(0) as u32));
                 }
             }
             for s in dump(ROUGH) {
@@ -646,6 +768,16 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
         }
     }
     let mut t = Tables { format: FORMAT, library: lib.id.clone(), rim_ratio: lib.rim_ratio.clone(), coats: lib.coats.iter().map(|(n, c)| (format!("{n:08x}"), *c)).collect(), ..Default::default() };
+    t.wear_records = lib.wear_records.iter().map(|(k, m)| (k.clone(), m.iter().map(|(n, v)| (format!("{n:08x}"), v.clone())).collect())).collect();
+    // a surface's links, kept only where they name a record of that kind
+    // (`e9aaa040` names a surface instead on some records)
+    let known = |kind: &str, n: u32| lib.wear_records.get(kind).is_some_and(|m| m.contains_key(&n));
+    t.surface_wear = lib
+        .surface_wear
+        .iter()
+        .map(|(s, &(l, d))| (format!("{s:08x}"), [if known("ladders", l) { l } else { 0 }, if known("details", d) { d } else { 0 }]))
+        .filter(|(_, x)| *x != [0, 0])
+        .collect();
     for (sets, _, _, _, _) in &found {
         for (n, p) in sets {
             t.sets.insert(n.clone(), p.clone());
@@ -701,6 +833,9 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
                 let mut out = base.clone();
                 apply_config(&lib, own, parts, &mut out);
                 let ck = config_key(parts);
+                if let Some(lv) = wear_levels(&lib, own, parts) {
+                    t.wear_levels.entry(key.clone()).or_default().insert(ck.clone(), lv);
+                }
                 match results.iter_mut().find(|r| r.0 == out) {
                     Some(r) => r.1.push(ck),
                     None => {
@@ -782,8 +917,9 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
 /// part set; returns the number of part ids changed. Bindings are applied in
 /// priority order (as listed within a priority). Of an option list the
 /// first part is followed (which one the game picks is not decoded).
-fn apply_config(lib: &Library, own: &HashMap<u32, Vec<u32>>, parts: &[u32], set: &mut [Part]) -> usize {
-    // a part's modifiers, with the first part of each option list followed
+/// The modifiers of a configuration's parts, in order, with the first part
+/// of each option list and each referenced library part followed.
+fn config_mods(lib: &Library, own: &HashMap<u32, Vec<u32>>, parts: &[u32]) -> Vec<u32> {
     fn collect(lib: &Library, own: &HashMap<u32, Vec<u32>>, part: u32, depth: u32, out: &mut Vec<u32>) {
         let Some(list) = own.get(&part).or_else(|| lib.mods.get(&part)) else { return };
         for &m in list {
@@ -800,6 +936,46 @@ fn apply_config(lib: &Library, own: &HashMap<u32, Vec<u32>>, parts: &[u32], set:
     for &p in parts {
         collect(lib, own, p, 0, &mut mods);
     }
+    mods
+}
+
+/// Each part id's wear level and primer sets under a configuration (256 x
+/// 4 hex digits, `ffff` = none): the bindings with the wear flag give a part
+/// id its wear channel (in priority order, the last one wins), the level
+/// modifiers give a channel its level (the last one listed wins). None when
+/// no part id gets a level.
+fn wear_levels(lib: &Library, own: &HashMap<u32, Vec<u32>>, parts: &[u32]) -> Option<String> {
+    let mods = config_mods(lib, own, parts);
+    let levels: HashMap<u32, (u8, u8)> = mods.iter().filter_map(|m| lib.levels.get(m)).map(|&(ch, lv, pr)| (ch, (lv, pr))).collect();
+    if levels.is_empty() {
+        return None;
+    }
+    let local: HashMap<u32, &Vec<u8>> = mods.iter().filter_map(|m| lib.group_defs.get(m)).map(|(g, ids)| (*g, ids)).collect();
+    let mut binds: Vec<&(u32, u32, i64, bool, bool, bool)> = mods.iter().filter(|m| lib.wear_binds.contains(m)).filter_map(|m| lib.binds.get(m)).collect();
+    binds.sort_by_key(|b| b.2);
+    let mut channel = [0u32; 256];
+    for b in binds {
+        let Some(ids) = local.get(&b.0).copied().or_else(|| lib.groups.get(&b.0)) else { continue };
+        for &i in ids {
+            channel[i as usize] = b.1;
+        }
+    }
+    let mut any = false;
+    let s: String = channel
+        .iter()
+        .map(|ch| match levels.get(ch) {
+            Some(&(lv, pr)) => {
+                any = true;
+                format!("{lv:02x}{pr:02x}")
+            }
+            None => "ffff".to_string(),
+        })
+        .collect();
+    any.then_some(s)
+}
+
+fn apply_config(lib: &Library, own: &HashMap<u32, Vec<u32>>, parts: &[u32], set: &mut [Part]) -> usize {
+    let mods = config_mods(lib, own, parts);
     let local: HashMap<u32, &Vec<u8>> = mods.iter().filter_map(|m| lib.group_defs.get(m)).map(|(g, ids)| (*g, ids)).collect();
     let channel: HashMap<u32, (u32, u32)> = mods.iter().filter_map(|m| lib.assigns.get(m)).map(|&(ch, c, s, _)| (ch, (c, s))).collect();
     // a channel's coat: its paint type modifier, else its assignment's default
@@ -973,6 +1149,17 @@ impl Tables {
         let coats: Vec<Value> = names.iter().map(|n| self.sets.get(*n).map_or(Value::Null, |p| Value::String(coat_table(p, &used)))).collect();
         let paint_coats: Vec<Value> = names.iter().map(|n| self.sets.get(*n).and_then(|p| paint_coat(p, &[1; 256])).and_then(|c| used.iter().position(|u| *u == c)).map_or(Value::Null, Value::from)).collect();
         let coat_records: Vec<Value> = used.iter().map(|c| self.coat_json(*c)).collect();
+        let mut wear_records = self.wear_json(&names);
+        if let (Some(w), Some(levels)) = (wear_records.as_object_mut(), self.wear_levels.get(&key)) {
+            // the levels most configurations give (the smallest on a tie)
+            let mut count: HashMap<&String, usize> = HashMap::new();
+            for l in levels.values() {
+                *count.entry(l).or_default() += 1;
+            }
+            let usual = count.iter().max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0))).map(|(l, _)| (*l).clone());
+            w.insert("levels_by_config".into(), Value::Object(levels.iter().map(|(k, l)| (k.clone(), Value::String(l.clone()))).collect()));
+            w.insert("levels_default".into(), usual.map_or(Value::Null, Value::String));
+        }
         let index = |n: &String| names.iter().position(|x| *x == n);
         // what fitting one more part changes, as look entries
         let patches: serde_json::Map<String, Value> = self
@@ -1001,6 +1188,7 @@ impl Tables {
             "coats": coats,
             "paint_coats": paint_coats,
             "coat_records": coat_records,
+            "wear_records": wear_records,
             "configs": by_config.iter().filter_map(|(k, n)| Some((k.clone(), Value::from(index(n)?)))).collect::<serde_json::Map<String, Value>>(),
             "default": index(default),
         })
@@ -1008,6 +1196,73 @@ impl Tables {
 }
 
 impl Tables {
+    /// The wear records the parts of these part sets (one per look) reach:
+    /// per look the index of each part id's wear ladder and detail set (256
+    /// x 2 hex digits, `ff` = none), the ladders and detail sets in that
+    /// order, and the presets, age, edge and colour range records the
+    /// ladders lead to, by name.
+    pub fn wear_json(&self, names: &[&String]) -> Value {
+        let link = |p: &Part| self.surface_wear.get(&format!("{:08x}", p.surface)).copied().unwrap_or([0, 0]);
+        let sets: Vec<Option<&Vec<Part>>> = names.iter().map(|n| self.sets.get(*n)).collect();
+        let used = |k: usize| {
+            let mut u: Vec<u32> = sets.iter().flatten().copied().flatten().map(|p| link(p)[k]).filter(|x| *x != 0).collect();
+            u.sort();
+            u.dedup();
+            u
+        };
+        let (ladders, details) = (used(0), used(1));
+        let table = |k: usize, of: &[u32]| -> Vec<Value> {
+            sets.iter()
+                .map(|s| s.map_or(Value::Null, |p| Value::String((0..256).map(|i| format!("{:02x}", p.get(i).and_then(|p| of.iter().position(|u| *u == link(p)[k])).filter(|x| *x < 255).unwrap_or(255))).collect())))
+                .collect()
+        };
+        let rec = |kind: &str, name: &str| self.wear_records.get(kind).and_then(|m| m.get(name));
+        let list = |kind: &str, of: &[u32]| -> Vec<Value> { of.iter().map(|n| rec(kind, &format!("{n:08x}")).cloned().unwrap_or(Value::Null)).collect() };
+        let ladder_recs = list("ladders", &ladders);
+        let names_in = |v: &Value, h: u32| -> Vec<String> {
+            match &v[meta7a::field_name(h)] {
+                Value::String(s) => vec![s.clone()],
+                Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+                _ => vec![],
+            }
+        };
+        let mut out: HashMap<&str, serde_json::Map<String, Value>> = HashMap::new();
+        let mut add = |kind: &'static str, name: &str| {
+            if let Some(r) = rec(kind, name) {
+                out.entry(kind).or_default().insert(name.to_string(), r.clone());
+            }
+        };
+        let presets: Vec<String> = ladder_recs.iter().flat_map(|l| names_in(l, LADDER_WEAR)).collect();
+        for p in &presets {
+            add("presets", p);
+            let Some(r) = rec("presets", p) else { continue };
+            for a in names_in(r, PRESET_AGE) {
+                add("ages", &a);
+                add("age_ranges", &a);
+            }
+            for e in names_in(r, PRESET_EDGE) {
+                add("edges", &e);
+            }
+            for c in names_in(r, PRESET_RANGE_A).into_iter().chain(names_in(r, PRESET_RANGE_B)) {
+                add("colour_ranges", &c);
+            }
+        }
+        if ladders.is_empty() && details.is_empty() {
+            return Value::Null;
+        }
+        let mut v = serde_json::json!({
+            "ladder_by_look": table(0, &ladders),
+            "detail_by_look": table(1, &details),
+            "ladders": ladder_recs,
+            "details": list("details", &details),
+            "global": self.wear_records.get("global").and_then(|m| m.values().next()).cloned().unwrap_or(Value::Null),
+        });
+        for kind in ["presets", "ages", "age_ranges", "edges", "colour_ranges"] {
+            v[kind] = Value::Object(out.remove(kind).unwrap_or_default());
+        }
+        v
+    }
+
     /// A coat record as JSON: its name (8 hex digits) and fields; Null when
     /// the library has none of that name.
     pub fn coat_json(&self, name: u32) -> Value {
@@ -1273,8 +1528,85 @@ mod tests {
     }
 
     #[test]
+    fn wear_records_a_vehicle_reaches() {
+        // links become 8 hex digits, the struct tag goes
+        let r = wear_record(serde_json::json!({"_struct": "cc518af0", "name": 0x10, "ageWearHash": 0x20, "7f1fe0a2": 0x30, "879774bd": 0x40, "02a27216": 0x41, "dustIntensity": 51}));
+        assert_eq!(r, serde_json::json!({"name": "00000010", "ageWearHash": "00000020", "7f1fe0a2": "00000030", "879774bd": "00000040", "02a27216": "00000041", "dustIntensity": 51}));
+        let l = wear_record(serde_json::json!({"name": 0x1, "wearPresets": [0x10, 0x10, 0x11, 0x99, 0x10, 0x10], "materialPresets": [5, 5, 5, 5, 5, 5]}));
+        assert_eq!(l["wearPresets"][2], "00000011");
+        let mut t = Tables::default();
+        let recs = |kind: &str, v: Vec<Value>| (kind.to_string(), v.into_iter().map(|r| (r["name"].as_str().unwrap().to_string(), r)).collect::<HashMap<_, _>>());
+        t.wear_records = [
+            recs("ladders", vec![l.clone(), serde_json::json!({"name": "00000002", "wearPresets": ["00000011"]})]),
+            recs("presets", vec![r, serde_json::json!({"name": "00000011", "ageWearHash": "00000021", "dustIntensity": 0})]),
+            recs("ages", vec![serde_json::json!({"name": "00000020"})]),
+            recs("age_ranges", vec![serde_json::json!({"name": "00000021", "minWear": 0})]),
+            recs("edges", vec![serde_json::json!({"name": "00000030"})]),
+            recs("colour_ranges", vec![serde_json::json!({"name": "00000040"}), serde_json::json!({"name": "000000ff"})]),
+            recs("details", vec![serde_json::json!({"name": "00000050", "detailIndex0": 3})]),
+            recs("global", vec![serde_json::json!({"name": "00000060", "dirtLumMax": 0.1})]),
+        ]
+        .into_iter()
+        .collect();
+        t.surface_wear = [("0000000a".to_string(), [1, 0x50]), ("0000000b".to_string(), [2, 0])].into_iter().collect();
+        let mut a = vec![Part::default(); 256];
+        a[3].surface = 0xa;
+        a[4].surface = 0xb;
+        let mut b = vec![Part::default(); 256];
+        b[7].surface = 0xb;
+        t.sets = [("a".to_string(), a), ("b".to_string(), b)].into_iter().collect();
+        let (na, nb) = ("a".to_string(), "b".to_string());
+        let v = t.wear_json(&[&na, &nb]);
+        // ladders in name order; part 3 -> ladder 0, part 4 -> ladder 1, others none
+        assert_eq!(v["ladders"].as_array().unwrap().len(), 2);
+        let look_a = v["ladder_by_look"][0].as_str().unwrap();
+        assert_eq!((&look_a[6..8], &look_a[8..10], &look_a[0..2]), ("00", "01", "ff"));
+        assert_eq!(&v["ladder_by_look"][1].as_str().unwrap()[14..16], "01");
+        assert_eq!(&v["detail_by_look"][0].as_str().unwrap()[6..8], "00");
+        assert_eq!(v["details"][0]["detailIndex0"], 3);
+        // what the ladders reach, and only that: preset 99 is not a record,
+        // colour range ff is not reached
+        assert_eq!(v["presets"].as_object().unwrap().len(), 2);
+        assert!(v["ages"].get("00000020").is_some() && v["age_ranges"].get("00000021").is_some());
+        assert!(v["edges"].get("00000030").is_some());
+        assert_eq!(v["colour_ranges"].as_object().unwrap().len(), 1);
+        assert_eq!(v["global"]["dirtLumMax"], 0.1);
+        // a vehicle whose surfaces name no ladder or detail set: nothing
+        let nothing = Tables { sets: [("c".to_string(), vec![Part::default(); 256])].into_iter().collect(), ..Default::default() };
+        assert_eq!(nothing.wear_json(&[&"c".to_string()]), Value::Null);
+    }
+
+    #[test]
+    fn wear_levels_follow_the_wear_bindings() {
+        let mut lib = Library { colours: HashMap::new(), surfaces: HashMap::new(), wear: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), paint_types: HashMap::new(), coats: HashMap::new(), options: HashMap::new(), refs: HashMap::new(), part_models: HashMap::new(), surface_wear: HashMap::new(), wear_records: HashMap::new(), levels: HashMap::new(), wear_binds: Default::default(), id: None };
+        lib.groups.insert(0x10, vec![1, 2]);
+        lib.groups.insert(0x11, vec![2, 3]);
+        lib.groups.insert(0x12, vec![4]);
+        // wear bindings: ids 1, 2 to channel 0x70, then (higher priority) 2, 3 to 0x71
+        lib.binds.insert(1, (0x10, 0x70, 0, true, true, false));
+        lib.binds.insert(2, (0x11, 0x71, 1, false, false, false));
+        // a binding without the wear flag does not set a wear channel
+        lib.binds.insert(3, (0x12, 0x70, 2, true, true, false));
+        lib.wear_binds.extend([1, 2]);
+        lib.levels.insert(10, (0x70, 1, 1));
+        lib.levels.insert(11, (0x71, 4, 7));
+        lib.levels.insert(12, (0x70, 3, 7));
+        lib.mods.insert(100, vec![1, 2, 3]);
+        lib.mods.insert(101, vec![10, 11]);
+        lib.mods.insert(102, vec![12]);
+        let own = HashMap::new();
+        assert_eq!(wear_levels(&lib, &own, &[100]), None);
+        let l = wear_levels(&lib, &own, &[100, 101]).unwrap();
+        assert_eq!(l.len(), 1024);
+        assert_eq!((&l[0..4], &l[4..8], &l[8..12], &l[12..16], &l[16..20]), ("ffff", "0101", "0407", "0407", "ffff"));
+        // a later level part for the same channel wins
+        let l = wear_levels(&lib, &own, &[100, 101, 102]).unwrap();
+        assert_eq!(&l[4..8], "0307");
+    }
+
+    #[test]
     fn coats_follow_the_paint_type_of_a_channel() {
-        let mut lib = Library { colours: HashMap::new(), surfaces: HashMap::new(), wear: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), paint_types: HashMap::new(), coats: HashMap::new(), options: HashMap::new(), refs: HashMap::new(), part_models: HashMap::new(), id: None };
+        let mut lib = Library { colours: HashMap::new(), surfaces: HashMap::new(), wear: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), paint_types: HashMap::new(), coats: HashMap::new(), options: HashMap::new(), refs: HashMap::new(), part_models: HashMap::new(), surface_wear: HashMap::new(), wear_records: HashMap::new(), levels: HashMap::new(), wear_binds: Default::default(), id: None };
         for k in [0xa1, 0xa2, 0xa3] {
             lib.coats.insert(k, Coat::default());
         }

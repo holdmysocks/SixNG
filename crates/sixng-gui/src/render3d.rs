@@ -56,7 +56,8 @@ struct MatU {
     /// 1 = bound.
     tile: [f32; 4],
     /// x: how bright an emissive material lights, times the frame's
-    /// emissive level (`glb::emissive_scale`); y, z, w unused.
+    /// emissive level (`glb::emissive_scale`); y, z, w: the light's colour
+    /// (`glb::emissive_tint`).
     emis: [f32; 4],
 }
 
@@ -160,6 +161,11 @@ pub struct Look {
     pub coat_base: Option<f32>,
     /// How much of the second layer of vehicle part surfaces shows (0 to 1).
     pub wear: f32,
+    /// Show each part's wear as the vehicle's configuration sets it (its
+    /// wear level), instead of `wear`, when the model has wear levels.
+    pub wear_from_config: bool,
+    /// The shown vehicle has wear levels (set by the model view).
+    pub wear_levels: bool,
     pub slot: u32,
     pub paint: [f32; 3],
     pub paint2nd: [f32; 3],
@@ -196,6 +202,8 @@ impl Default for Look {
             coat: [0.0; 4],
             coat_base: None,
             wear: 0.0,
+            wear_from_config: true,
+            wear_levels: false,
             slot: 0,
             paint: [0.55, 0.02, 0.02],
             paint2nd: [0.6, 0.6, 0.62],
@@ -433,6 +441,8 @@ struct Target {
     depth: wgpu::TextureView,
     resolve: wgpu::Texture,
     resolve_view: wgpu::TextureView,
+    /// HDR frame (the 3D map): the tone-mapped image that is shown and read back.
+    display: Option<(wgpu::Texture, wgpu::TextureView)>,
     egui_id: egui::TextureId,
 }
 
@@ -611,6 +621,14 @@ pub struct Renderer3D {
     pub map_glass: bool,
     /// Draw calls of the coverage fallbacks in the last frame: models, cells.
     pub fb_draws: [u32; 2],
+    /// The scene's atmosphere, exposure and post chain (atmo.rs); the model
+    /// viewer only binds its resources.
+    atmo: crate::atmo::Atmosphere,
+    /// HDR frame with the game's sky and light (the 3D map).
+    hdr: bool,
+    /// The sky of this frame (HDR frame only).
+    pub sky: Option<crate::atmo::Sky>,
+    last_frame: Option<std::time::Instant>,
 }
 
 /// A map cell on the GPU (see cells.rs).
@@ -683,27 +701,29 @@ fn frame_bind_group(
     stickers: &wgpu::Buffer,
     sticker_view: &wgpu::TextureView,
     sticker_sampler: &wgpu::Sampler,
+    scene: &crate::atmo::SceneBinds,
     hair: &[wgpu::TextureView],
     shadow: &(wgpu::TextureView, wgpu::Sampler, wgpu::TextureView),
 ) -> wgpu::BindGroup {
+    let mut entries = vec![
+        wgpu::BindGroupEntry { binding: 0, resource: frame_ub.as_entire_binding() },
+        wgpu::BindGroupEntry { binding: 1, resource: joints.as_entire_binding() },
+        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+        wgpu::BindGroupEntry { binding: 3, resource: stickers.as_entire_binding() },
+        wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(sticker_view) },
+        wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(sticker_sampler) },
+    ];
+    entries.extend(scene.entries());
+    for (k, v) in hair.iter().enumerate() {
+        entries.push(wgpu::BindGroupEntry { binding: 12 + k as u32, resource: wgpu::BindingResource::TextureView(v) });
+    }
+    entries.push(wgpu::BindGroupEntry { binding: 16, resource: wgpu::BindingResource::TextureView(&shadow.0) });
+    entries.push(wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::Sampler(&shadow.1) });
+    entries.push(wgpu::BindGroupEntry { binding: 18, resource: wgpu::BindingResource::TextureView(&shadow.2) });
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("frame bg"),
         layout,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: frame_ub.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: joints.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
-            wgpu::BindGroupEntry { binding: 3, resource: stickers.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(sticker_view) },
-            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(sticker_sampler) },
-            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&hair[0]) },
-            wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&hair[1]) },
-            wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&hair[2]) },
-            wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&hair[3]) },
-            wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&shadow.0) },
-            wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::Sampler(&shadow.1) },
-            wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(&shadow.2) },
-        ],
+        entries: &entries,
     })
 }
 
@@ -842,10 +862,23 @@ fn tex_bc(
 
 impl Renderer3D {
     pub fn new(rs: &egui_wgpu::RenderState) -> Self {
+        Self::new_with(rs, false)
+    }
+
+    /// The 3D map's renderer: HDR frame with the game's sky, light and
+    /// exposure (atmo.rs), tone mapped for display.
+    pub fn new_map(rs: &egui_wgpu::RenderState) -> Self {
+        Self::new_with(rs, true)
+    }
+
+    fn new_with(rs: &egui_wgpu::RenderState, hdr: bool) -> Self {
         let device = &rs.device;
+        let color_fmt = if hdr { crate::atmo::HDR_FMT } else { COLOR_FMT };
+        let atmo = crate::atmo::Atmosphere::new(device, &rs.queue);
+        let shader_src = format!("{}\n{}", include_str!("atmo_common.wgsl"), include_str!("shader.wgsl"));
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sixng shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
         });
         let vis = wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT;
         let bgl_frame = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -907,31 +940,34 @@ impl Renderer3D {
                     count: None,
                 },
                 // the four lookup tables of the game's hair lighting (M, N, A, P)
-                hair_entry(6, wgpu::TextureViewDimension::D3),
-                hair_entry(7, wgpu::TextureViewDimension::D3),
-                hair_entry(8, wgpu::TextureViewDimension::D2),
-                hair_entry(9, wgpu::TextureViewDimension::D3),
+                hair_entry(12, wgpu::TextureViewDimension::D3),
+                hair_entry(13, wgpu::TextureViewDimension::D3),
+                hair_entry(14, wgpu::TextureViewDimension::D2),
+                hair_entry(15, wgpu::TextureViewDimension::D3),
                 // the sun shadow map and its comparison sampler
                 wgpu::BindGroupLayoutEntry {
-                    binding: 10,
+                    binding: 16,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 11,
+                    binding: 17,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
                 // the camera depth pre-pass (opaque surfaces and strands as the eye sees them)
                 wgpu::BindGroupLayoutEntry {
-                    binding: 12,
+                    binding: 18,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
                     count: None,
                 },
-            ],
+            ]
+            .into_iter()
+            .chain(crate::atmo::frame_layout_entries())
+            .collect::<Vec<_>>(),
         });
         let tex_entry = |b: u32| wgpu::BindGroupLayoutEntry {
             binding: b,
@@ -961,6 +997,7 @@ impl Renderer3D {
                 tex_entry(3),
                 tex_entry(4),
                 tex_entry(5),
+                tex_entry(6),
             ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1087,7 +1124,7 @@ impl Renderer3D {
                     entry_point: Some(fs),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
-                        format: COLOR_FMT,
+                        format: color_fmt,
                         blend,
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
@@ -1311,11 +1348,11 @@ impl Renderer3D {
             mapped_at_creation: false,
         });
         // the shadow pass's own frame group: the light's matrices, and a 1-texel map in place of the one it draws
-        let shadow_frame_bg = frame_bind_group(device, &bgl_frame, &shadow_ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &hair_luts, &(shadow_tex(1), shadow_sampler.clone(), shadow_tex(1)));
+        let shadow_frame_bg = frame_bind_group(device, &bgl_frame, &shadow_ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &atmo.binds, &hair_luts, &(shadow_tex(1), shadow_sampler.clone(), shadow_tex(1)));
         let shadow_extra: Vec<(wgpu::Buffer, wgpu::BindGroup)> = (0..if shadows { 15 } else { 0 })
             .map(|_| {
                 let ub = device.create_buffer(&wgpu::BufferDescriptor { label: Some("shadow frame ub"), size: std::mem::size_of::<FrameU>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-                let bg = frame_bind_group(device, &bgl_frame, &ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &hair_luts, &(shadow_tex(1), shadow_sampler.clone(), shadow_tex(1)));
+                let bg = frame_bind_group(device, &bgl_frame, &ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &atmo.binds, &hair_luts, &(shadow_tex(1), shadow_sampler.clone(), shadow_tex(1)));
                 (ub, bg)
             })
             .collect();
@@ -1339,7 +1376,7 @@ impl Renderer3D {
         // The camera depth pre-pass (with the sun shadow map): the same depth-only draw from the eye, read by the
         // lighting for the game's strand openness test and a screen-space occlusion of the ambient light.
         let depth_ub = device.create_buffer(&wgpu::BufferDescriptor { label: Some("depth pre-pass frame ub"), size: std::mem::size_of::<FrameU>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let depth_frame_bg = frame_bind_group(device, &bgl_frame, &depth_ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &hair_luts, &(shadow_tex(1), shadow_sampler.clone(), shadow_tex(1)));
+        let depth_frame_bg = frame_bind_group(device, &bgl_frame, &depth_ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &atmo.binds, &hair_luts, &(shadow_tex(1), shadow_sampler.clone(), shadow_tex(1)));
         let pipe_cam_depth = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("camera depth pre-pass"),
             layout: Some(&layout),
@@ -1358,7 +1395,7 @@ impl Renderer3D {
             multiview_mask: None,
             cache: None,
         });
-        let default_frame_bg = frame_bind_group(device, &bgl_frame, &frame_ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &hair_luts, &shadow);
+        let default_frame_bg = frame_bind_group(device, &bgl_frame, &frame_ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &atmo.binds, &hair_luts, &shadow);
         std::mem::forget(wt); // the 1x1 white texture lives for the process
                               // map cells
         let bgl_cell = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1503,6 +1540,10 @@ impl Renderer3D {
             dither_frame: 0.0,
             map_glass: false,
             fb_draws: [0, 0],
+            atmo,
+            hdr,
+            sky: None,
+            last_frame: None,
         }
     }
 
@@ -1520,7 +1561,7 @@ impl Renderer3D {
             Ok(l) if l.len() == 4 => {
                 self.hair_luts = l.iter().enumerate().map(|(i, t)| hair_texture(&rs.device, &rs.queue, t.w, t.h, t.d, i != 2, &t.rgba16())).collect();
                 // models without joints of their own are drawn with the shared frame group
-                self.default_frame_bg = frame_bind_group(&rs.device, &self.bgl_frame, &self.frame_ub, &self.dummy_joints, &self.sampler, &self.stickers.none, &self.stickers.view, &self.stickers.sampler, &self.hair_luts, &self.shadow);
+                self.default_frame_bg = frame_bind_group(&rs.device, &self.bgl_frame, &self.frame_ub, &self.dummy_joints, &self.sampler, &self.stickers.none, &self.stickers.view, &self.stickers.sampler, &self.atmo.binds, &self.hair_luts, &self.shadow);
                 if std::env::var_os("SIXNG_DEBUG_HAIR").is_some() {
                     eprintln!("[hair] lighting tables: {:?}", l.iter().map(|t| (t.w, t.h, t.d, t.ch, t.v.iter().cloned().fold(0.0f32, f32::max))).collect::<Vec<_>>());
                 }
@@ -1589,6 +1630,7 @@ impl Renderer3D {
             stickers: self.stickers.clone(),
             hair_luts: self.hair_luts.clone(),
             shadow: self.shadow.clone(),
+            scene: self.atmo.binds.clone(),
         }
     }
 }
@@ -1614,6 +1656,7 @@ pub struct Uploader {
     stickers: StickerDefaults,
     hair_luts: Vec<wgpu::TextureView>,
     shadow: (wgpu::TextureView, wgpu::Sampler, wgpu::TextureView),
+    scene: crate::atmo::SceneBinds,
 }
 
 impl Uploader {
@@ -1781,11 +1824,13 @@ impl Uploader {
             ped_shade: false,
             detail: None,
             ramp_u: None,
+            wear_mask: None,
             ramp: None,
             parts: false,
             occlusion_only: false,
             emissive_scale: 1.0,
             lit: false,
+            emissive_tint: [1.0; 3],
             slots: vec![],
             gap: "ok".into(),
             shader_hash: String::new(),
@@ -1843,7 +1888,9 @@ impl Uploader {
                 // bit 14: the emissive slot holds the part ramp image, whose
                 // rows 512.. are the parts' surfaces (low and high metalness
                 // and roughness)
-                | if mt.ramp.is_some() && mt.emissive.is_none() { 0x4000 } else { 0 };
+                | if mt.ramp.is_some() && mt.emissive.is_none() { 0x4000 } else { 0 }
+                // bit 15: the game's wear mask is bound (binding 6)
+                | if mt.wear_mask.is_some() && mt.ramp.is_some() && mt.emissive.is_none() { 0x8000 } else { 0 };
             let u = MatU {
                 base,
                 flags: [has, class_id(&mt.class), alpha, gap | mr],
@@ -1855,7 +1902,7 @@ impl Uploader {
                     (None, Some(_)) => [0.0, 0.0, 0.0, 2.0],
                     _ => [0.0; 4],
                 },
-                emis: [mt.emissive_scale, 0.0, 0.0, 0.0],
+                emis: [mt.emissive_scale, mt.emissive_tint[0], mt.emissive_tint[1], mt.emissive_tint[2]],
             };
             let o = k * MAT_STRIDE as usize;
             mat_bytes[o..o + std::mem::size_of::<MatU>()].copy_from_slice(bytemuck::bytes_of(&u));
@@ -1890,6 +1937,10 @@ impl Uploader {
                     wgpu::BindGroupEntry {
                         binding: 5,
                         resource: wgpu::BindingResource::TextureView(view(mt.detail.map(|d| d.image).or(mt.ramp_u.filter(|_| mt.ramp.is_some() && mt.emissive.is_none())))),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(view(mt.wear_mask)),
                     },
                 ],
             });
@@ -1974,7 +2025,7 @@ impl Uploader {
             .flat_map(|_| Mat4::IDENTITY.to_cols_array())
             .collect();
         queue.write_buffer(&joints_buf, 0, bytemuck::cast_slice(&ident));
-        let frame_bg = frame_bind_group(device, &self.bgl_frame, &self.frame_ub, &joints_buf, &self.sampler, &self.stickers.none, &self.stickers.view, &self.stickers.sampler, &self.hair_luts, &self.shadow);
+        let frame_bg = frame_bind_group(device, &self.bgl_frame, &self.frame_ub, &joints_buf, &self.sampler, &self.stickers.none, &self.stickers.view, &self.stickers.sampler, &self.scene, &self.hair_luts, &self.shadow);
         let inst = [Instance::new(Mat4::IDENTITY, !m.joints.is_empty())];
         let instances = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("inst"),
@@ -2077,7 +2128,7 @@ impl Renderer3D {
         if n > 0 {
             rs.queue.write_buffer(buf, 0, bytemuck::cast_slice(&recs[..n]));
         }
-        gm.frame_bg = frame_bind_group(&rs.device, &self.bgl_frame, &self.frame_ub, &gm.joints_buf, &self.sampler, buf, pictures.unwrap_or(&self.stickers.view), &self.stickers.sampler, &self.hair_luts, &self.shadow);
+        gm.frame_bg = frame_bind_group(&rs.device, &self.bgl_frame, &self.frame_ub, &gm.joints_buf, &self.sampler, buf, pictures.unwrap_or(&self.stickers.view), &self.stickers.sampler, &self.atmo.binds, &self.hair_luts, &self.shadow);
     }
 
     pub fn set_joints(&self, rs: &egui_wgpu::RenderState, gm: &GpuModel, mats: &[Mat4]) {
@@ -2153,30 +2204,43 @@ impl Renderer3D {
                 view_formats: &[],
             })
         };
-        let msaa = mk(MSAA, COLOR_FMT, wgpu::TextureUsages::RENDER_ATTACHMENT)
+        let color_fmt = if self.hdr { crate::atmo::HDR_FMT } else { COLOR_FMT };
+        let msaa = mk(MSAA, color_fmt, wgpu::TextureUsages::RENDER_ATTACHMENT)
             .create_view(&Default::default());
         let depth = mk(MSAA, self.depth_fmt, wgpu::TextureUsages::RENDER_ATTACHMENT)
             .create_view(&Default::default());
         let resolve = mk(
             1,
-            COLOR_FMT,
+            color_fmt,
             wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
         );
         let resolve_view = resolve.create_view(&Default::default());
+        let display = self.hdr.then(|| {
+            let t = mk(
+                1,
+                crate::atmo::DISPLAY_FMT,
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+            );
+            let v = t.create_view(&Default::default());
+            (t, v)
+        });
+        let shown = display.as_ref().map(|d| &d.1).unwrap_or(&resolve_view);
         let mut r = rs.renderer.write();
         let egui_id = match &self.target {
             Some(t) => {
                 r.update_egui_texture_from_wgpu_texture(
                     device,
-                    &resolve_view,
+                    shown,
                     wgpu::FilterMode::Linear,
                     t.egui_id,
                 );
                 t.egui_id
             }
-            None => r.register_native_texture(device, &resolve_view, wgpu::FilterMode::Linear),
+            None => r.register_native_texture(device, shown, wgpu::FilterMode::Linear),
         };
         self.target = Some(Target {
             size,
@@ -2184,6 +2248,7 @@ impl Renderer3D {
             depth,
             resolve,
             resolve_view,
+            display,
             egui_id,
         });
     }
@@ -2231,7 +2296,8 @@ impl Renderer3D {
             ],
             prev_view_proj: vp.to_cols_array_2d(),
             // xyz: the body paint's coat; w: vehicle wear (0 to 1)
-            jitter: [look.coat[0], look.coat[1], look.coat[2], look.wear],
+            // w < 0: each part's own wear amount from the part ramp image
+            jitter: [look.coat[0], look.coat[1], look.coat[2], if look.wear_from_config && look.wear_levels { -1.0 } else { look.wear }],
             frame: [self.dither_frame, self.target.as_ref().map_or(aspect * 1080.0, |t| t.size[0] as f32), self.target.as_ref().map_or(1080.0, |t| t.size[1] as f32), 0.0],
             light_view_proj: self.light_vp,
         }
@@ -2399,6 +2465,12 @@ impl Renderer3D {
         n
     }
 
+    /// Snap the exposure to the metered value over the next frames (a jump
+    /// in weather or place).
+    pub fn reset_exposure(&mut self) {
+        self.atmo.reset = 3;
+    }
+
     pub fn render(
         &mut self,
         rs: &egui_wgpu::RenderState,
@@ -2504,11 +2576,20 @@ impl Renderer3D {
                 usage: wgpu::BufferUsages::VERTEX,
             })
         });
-        let t = self.target.as_ref().unwrap();
-        let mut draws = 0u32;
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("viewer"),
         });
+        // the game's sky: scene values, then its tables for this frame
+        let now = std::time::Instant::now();
+        let dt = self.last_frame.map(|t| (now - t).as_secs_f32()).unwrap_or(0.016);
+        self.last_frame = Some(now);
+        let sky = if self.hdr { self.sky } else { None };
+        self.atmo.update(queue, sky.as_ref(), cam.proj(aspect) * cam.view(), cam.eye(), size, dt);
+        if let Some(sky) = &sky {
+            self.atmo.compute(&mut enc, sky);
+        }
+        let t = self.target.as_ref().unwrap();
+        let mut draws = 0u32;
         if shadow_fu.is_some() {
             let mut sp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("sun shadow pass"),
@@ -2546,7 +2627,7 @@ impl Renderer3D {
             }
         }
         {
-            let c = look.clear;
+            let c = if self.hdr { [0.0; 3] } else { look.clear };
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("viewer pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2765,6 +2846,9 @@ impl Renderer3D {
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
+        if let (Some(_), Some(d)) = (&sky, &t.display) {
+            self.atmo.post(device, &mut enc, &t.resolve_view, &d.1, size);
+        }
         let t_e = std::time::Instant::now();
         let cb = enc.finish();
         RTIME[1].fetch_add(
@@ -2787,6 +2871,7 @@ impl Renderer3D {
     pub fn read_back(&self, rs: &egui_wgpu::RenderState) -> Option<(u32, u32, Vec<u8>)> {
         let t = self.target.as_ref()?;
         let [w, h] = t.size;
+        let src = t.display.as_ref().map(|d| &d.0).unwrap_or(&t.resolve);
         let row = (4 * w + 255) / 256 * 256;
         let buf = rs.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
@@ -2797,7 +2882,7 @@ impl Renderer3D {
         let mut enc = rs.device.create_command_encoder(&Default::default());
         enc.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &t.resolve,
+                texture: src,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,

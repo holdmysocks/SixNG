@@ -729,7 +729,8 @@ pub struct ModelView {
     /// The material palette of the loaded vehicle (its file, RGBA rows of
     /// 128) and the look whose rows the model's part materials carry.
     part_palette: Option<(PathBuf, Arc<Vec<u8>>)>,
-    part_ramp_done: Option<(PathBuf, usize)>,
+    /// model, look and the configuration whose wear levels the image holds
+    part_ramp_done: Option<(PathBuf, usize, String)>,
     /// Stickers the user placed on the loaded vehicle (custom liveries).
     pub livery: crate::livery::State,
     /// The part colours the uploaded wheels were coloured with.
@@ -1185,7 +1186,14 @@ impl ModelView {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let r = index_for(&ws, "packs", &idx)
-                .and_then(|(a, ix)| sixng_core::groom::catalog_cached(&work, &a, &ix.entries))
+                .and_then(|(a, ix)| {
+                    let mut cat = sixng_core::groom::catalog_cached(&work, &a, &ix.entries)?;
+                    // LOD chains by the files' names where the table of contents is readable
+                    if let Ok(t) = sixng_core::hairlink::get(&work, &a, &ix.entries) {
+                        t.relabel(&mut cat);
+                    }
+                    Ok(cat)
+                })
                 .map_err(|e| format!("{e:#}"));
             *slot.lock().unwrap() = Some(r);
             ctx.request_repaint();
@@ -1566,7 +1574,7 @@ impl ModelView {
 
     fn hair_ui(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new("Hair and fur (grooms)").default_open(!self.hair.selected.is_empty() || self.auto.find_hair || self.auto.export_hair).show(ui, |ui| {
-            ui.label(egui::RichText::new("Strand grooms from packs.rpf. Animals get their fur automatically (worked out from the order of the files and a fit to the skin, not from a stored link); for characters pick grooms here. Shown as ribbons; width and colour are display choices.").weak());
+            ui.label(egui::RichText::new("Strand grooms from packs.rpf. Characters get their hair and animals their fur automatically, read from the game's own link (where the archive's table of contents cannot be read, worked out from the order of the files and a fit to the skin instead); other grooms can be picked here. Shown as ribbons; width and colour are display choices.").weak());
             self.hair_fit_ui(ui);
             if let Some(l) = self.hair.fur.clone() {
                 let mut changed = false;
@@ -1581,7 +1589,7 @@ impl ModelView {
                         egui::ComboBox::from_id_salt(("fur_variant", k)).selected_text(if self.hair.fur_pick[k].is_empty() { "none".to_string() } else { short(&self.hair.fur_pick[k]) }).show_ui(ui, |ui| {
                             changed |= ui.selectable_value(&mut self.hair.fur_pick[k], String::new(), "none").changed();
                             for v in &opts {
-                                let label = format!("{} · {} piece(s){}", short(&v.name), v.grooms.len(), if v.known { "" } else { " · count inferred" });
+                                let label = format!("{} · {} piece(s){}", short(&v.name), v.grooms.len(), if v.known || l.read { "" } else { " · count inferred" });
                                 changed |= ui.selectable_value(&mut self.hair.fur_pick[k], v.name.clone(), label).changed();
                             }
                         });
@@ -1590,8 +1598,15 @@ impl ModelView {
                 if changed {
                     self.hair.apply_fur();
                 }
-                let with = if l.roots.len() > 1 { format!("; walked together with {}", l.roots.iter().filter(|r| **r != l.root).cloned().collect::<Vec<_>>().join(", ")) } else { String::new() };
-                ui.label(egui::RichText::new(format!("{} of {} groom pieces in this run fit the skin; {:.0} % of the pieces with a known count sit on their own slot{with}.", l.fitting, l.block, l.agreement * 100.0)).weak().small());
+                let with = if l.read {
+                    String::new()
+                } else if l.roots.len() > 1 { format!("; walked together with {}", l.roots.iter().filter(|r| **r != l.root).cloned().collect::<Vec<_>>().join(", ")) } else { String::new() };
+                let text = if l.read {
+                    format!("{} groom pieces, read from the game (each variant lists its pieces).", l.block)
+                } else {
+                    format!("{} of {} groom pieces in this run fit the skin; {:.0} % of the pieces with a known count sit on their own slot{with}. Inferred: the game's own link could not be read here.", l.fitting, l.block, l.agreement * 100.0)
+                };
+                ui.label(egui::RichText::new(text).weak().small());
             } else if !self.hair.fur_note.is_empty() {
                 ui.label(egui::RichText::new(format!("No automatic fur: {}", self.hair.fur_note)).weak().small());
             }
@@ -3063,6 +3078,10 @@ impl ModelView {
             return;
         };
         let idx = idx as usize;
+        // each part id's wear amount under this configuration
+        let wear_key = self.part_look_want.clone().unwrap_or_default();
+        let wear_amounts = part_wear_amounts(&pc["wear_records"], idx as usize, self.part_look_want.as_deref());
+        self.look.wear_levels = wear_amounts.is_some();
         // the coat of this look's body paint (clear coat, flakes)
         let coat = &pc["coat"];
         let record = coat["paint_by_look"][idx].as_u64().map(|k| &coat["records"][k as usize]).filter(|r| r.is_object());
@@ -3109,7 +3128,7 @@ impl ModelView {
         // The palette rows of this look as an image for the part materials:
         // row = part id, 128 columns (a part with a colour of its own gets
         // that colour in every column).
-        let ramp_key = (l.model.path.clone(), idx);
+        let ramp_key = (l.model.path.clone(), idx, wear_key);
         let mut ramp_new = false;
         if self.part_ramp_done.as_ref() != Some(&ramp_key) {
             let file = l.model.path.parent().map(|d| d.join(pc["palette"].as_str().unwrap_or("vehicle_palette.png")));
@@ -3131,7 +3150,21 @@ impl ModelView {
                     // material map at each pixel
                     let surfaces = pc["surfaces"][idx].as_str().filter(|s| s.len() == 2048);
                     let mut px = vec![255u8; 128 * PART_RAMP_ROWS * 4];
+                    // rows 768..: each part id's coat record, and in row
+                    // 1024 the body paint's
+                    let coat = &pc["coat"];
+                    let coats = coat["by_look"][idx].as_str().filter(|s| s.len() == 512);
+                    let record = |k: usize| Some(&coat["records"][k]).filter(|r| r.is_object());
+                    let paint = coat["paint_by_look"][idx].as_u64().and_then(|k| record(k as usize));
+                    px[1024 * 512..1025 * 512].copy_from_slice(&coat_row(paint));
                     for id in 0..256 {
+                        let own = coats.and_then(|s| usize::from_str_radix(&s[id * 2..id * 2 + 2], 16).ok()).and_then(record);
+                        px[(768 + id) * 512..(769 + id) * 512].copy_from_slice(&coat_row(own));
+                        // column 11 of the coat row: the part id's wear amount
+                        let a = wear_amounts.as_ref().map_or(0, |w| w[id]);
+                        for x in (11..128).step_by(16) {
+                            px[(768 + id) * 512 + x * 4 + 3] = a;
+                        }
                         let stored = surfaces.and_then(|s| hex4(&s[id * 8..id * 8 + 8]));
                         let s = patched_surf.iter().rev().find(|p| p.0 == id).map(|p| p.1).or(stored).unwrap_or_else(|| surface_of_code(look[id][3]));
                         px[(512 + id) * 512..(513 + id) * 512].copy_from_slice(&part_surface_row(s));
@@ -4525,8 +4558,14 @@ impl ModelView {
         }
         self.vehicle_ui(ui);
         if self.part_ramp_done.is_some() && self.loaded.as_ref().is_some_and(|l| l.model.materials.iter().any(|m| m.ramp.is_some() && m.ramp_u.is_some())) {
-            ui.add(egui::Slider::new(&mut self.look.wear, 0.0..=1.0).text("wear"))
-                .on_hover_text("Shows the second layer of the vehicle's surfaces (rust under paint, grey under bare metal), which the game's files give for every surface. Where it shows is taken from the blue channel of the parts' detail texture; how much the game shows is not known, so the amount is yours to set.");
+            if self.look.wear_levels {
+                ui.checkbox(&mut self.look.wear_from_config, "wear from the configuration")
+                    .on_hover_text("Each part shows as much wear as the vehicle's configuration gives it: its wear level (0 new to 5 worn out) picks a wear preset, whose age range (minWear to maxWear) sets the amount (the middle of the range; a preset without a range takes the average of its level). Where it shows: in patches of the game's tiling wear mask (the green channel above a threshold that falls as the amount rises) on parts whose material names one, else the blue channel of the parts' detail texture. How the game windows the mask's three channels is not decoded, so the patches are a stand-in.");
+            }
+            if !(self.look.wear_levels && self.look.wear_from_config) {
+                ui.add(egui::Slider::new(&mut self.look.wear, 0.0..=1.0).text("wear"))
+                    .on_hover_text("Shows the second layer of the vehicle's surfaces (rust under paint, grey under bare metal), which the game's files give for every surface. Where it shows is taken from the blue channel of the parts' detail texture; how much the game shows is not known, so the amount is yours to set.");
+            }
         }
         if caps.paint {
             ui.heading("Car paint");
@@ -5285,8 +5324,85 @@ fn load_parts(
 /// texture (red x 63, as the clothing shader reads it), resampled to `w` x
 /// `h`. None when the material binds none or the file is not there.
 /// Rows of the part ramp image (128 wide): 256 of the first layer's palette
-/// rows, 256 of the second layer's, 256 of surfaces (`part_surface_row`).
-const PART_RAMP_ROWS: usize = 768;
+/// rows, 256 of the second layer's, 256 of surfaces (`part_surface_row`),
+/// 256 of the parts' coats and one of the body paint's coat (`coat_row`).
+const PART_RAMP_ROWS: usize = 1025;
+
+/// One row of the part ramp image for a coat record (model.json
+/// `part_colours.coat.records`), all zero without one: the values in the
+/// alpha of the columns 0 to 10 (repeated every 16 columns), as the shader
+/// reads them. 0 clear coat intensity, 1 clear coat roughness, 2 flake
+/// orientation x 4 (0 = no flakes), 3 flake size x 4, 4 the base coat
+/// roughness when the record overrides it (0 = not), 5 anisotropy, 6 sheen
+/// intensity, 7 sheen fade, 8 sheen reflectance x 4, 9 film IOR / 4,
+/// 10 film thickness.
+fn coat_row(r: Option<&serde_json::Value>) -> Vec<u8> {
+    let mut v = [0u8; 16];
+    if let Some(r) = r.filter(|r| r.is_object()) {
+        let f = |k: &str| r[k].as_f64().unwrap_or(0.0) as f32;
+        let on = |k: &str| r[k].as_bool().unwrap_or(false);
+        let q = |x: f32| (x.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        let ([clear, clear_rough, flakes, size], base) = paint_coat(r);
+        let sheen = f("sheen_intensity");
+        let film = f("film_thickness");
+        v[..11].copy_from_slice(&[
+            q(clear),
+            q(clear_rough),
+            if flakes > 0.0 { q(flakes * 4.0).max(1) } else { 0 },
+            q(size * 4.0),
+            base.map_or(0, |b| q(b).max(1)),
+            if on("use_anisotropy") { q(f("anisotropy_intensity")) } else { 0 },
+            q(sheen),
+            if sheen > 0.0 { q(f("sheen_fade")) } else { 0 },
+            if sheen > 0.0 { q(f("sheen_reflectance") * 4.0) } else { 0 },
+            if film > 0.0 { q(f("film_ior") / 4.0) } else { 0 },
+            q(film),
+        ]);
+    }
+    (0..128).flat_map(|x| [0, 0, 0, v[x & 15]]).collect()
+}
+
+/// Average wear amount (0 to 255) of the wear presets of each level whose
+/// age is a range: the middle of their `minWear` and `maxWear`, averaged
+/// over the library's ladders. A preset whose age record is not a range
+/// takes its level's value.
+const LEVEL_WEAR: [f32; 6] = [15.0, 150.0, 197.0, 211.0, 239.0, 239.0];
+
+/// Each part id's wear amount (0 to 255) under a configuration, from
+/// model.json `part_colours.wear_records`: the part's wear level
+/// (`levels_by_config`, or `levels_default` without a configuration) picks
+/// an entry of its ladder (`ladder_by_look` of this look); the entry's wear
+/// preset names an age record; an age range gives the middle of its
+/// `minWear` and `maxWear`, anything else `LEVEL_WEAR` of the level. None
+/// when the model has no wear levels; 0 for a part id without a level.
+fn part_wear_amounts(w: &serde_json::Value, look: usize, config: Option<&str>) -> Option<[u8; 256]> {
+    let levels = match config {
+        Some(k) => w["levels_by_config"][k].as_str(),
+        None => w["levels_default"].as_str(),
+    };
+    if w["levels_by_config"].as_object().is_none_or(|m| m.is_empty()) {
+        return None;
+    }
+    let mut out = [0u8; 256];
+    let Some(levels) = levels.filter(|s| s.len() == 1024) else { return Some(out) };
+    let ladders = w["ladder_by_look"][look].as_str().filter(|s| s.len() == 512);
+    for (id, o) in out.iter_mut().enumerate() {
+        let Ok(level) = u8::from_str_radix(&levels[id * 4..id * 4 + 2], 16) else { continue };
+        if level == 255 {
+            continue;
+        }
+        let level = level.min(5) as usize;
+        let ladder = ladders.and_then(|s| usize::from_str_radix(&s[id * 2..id * 2 + 2], 16).ok()).filter(|l| *l != 255);
+        let range = ladder
+            .and_then(|l| w["ladders"][l]["wearPresets"][level].as_str())
+            .and_then(|p| w["presets"][p]["ageWearHash"].as_str())
+            .map(|a| &w["age_ranges"][a])
+            .and_then(|r| Some((r["minWear"].as_f64()?, r["maxWear"].as_f64()?)));
+        let a = range.map_or(LEVEL_WEAR[level], |(lo, hi)| ((lo + hi) * 0.5) as f32);
+        *o = (a.clamp(0.0, 255.0) + 0.5) as u8;
+    }
+    Some(out)
+}
 
 /// Four bytes from 8 hex digits.
 fn hex4(h: &str) -> Option<[u8; 4]> {
@@ -5434,6 +5550,11 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
         let first = f.subs.iter().flatten().next().copied().unwrap_or([128; 3]);
         let shaped = cache.join("shaped");
         let mut done = std::collections::HashSet::new();
+        // clothing whose textures are not in the install: the preset colour
+        // per vertex (part number in the vertex colour's green, as below)
+        if bare_tint(m, |col| f.subs.get(((col[1] >> 2) & 7) as usize).copied().flatten().or(f.subs[0]).unwrap_or(first)) {
+            done.insert(usize::MAX);
+        }
         for mi in 0..m.materials.len() {
             if !m.materials[mi].ped_shade {
                 continue;
@@ -5519,9 +5640,22 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
         (Some(c), _, _) => flat(c),
         (None, Some((p, row)), _) => std::array::from_fn(|v| p.sample(row, v as u8)),
         (None, None, Some(c)) => flat(c),
-        (None, None, None) => return false,
+        (None, None, None) => {
+            // Nothing in the install gives this item a colour: its own
+            // textures are missing and it stores no preset, tint row, flat
+            // colour or colour tag (19 items in the 292 named characters'
+            // default looks, mostly watches). A neutral dark grey instead of
+            // white; not the game's colour.
+            bare_tint(m, |_| BARE_FALLBACK);
+            return false;
+        }
     };
     let mut done = std::collections::HashSet::new();
+    // clothing whose textures are not in the install: the colour of plain
+    // cloth (shade 125) per vertex
+    if bare_tint(m, |_| lut[125]) {
+        done.insert(usize::MAX);
+    }
     for mat in m.materials.iter().filter(|x| x.ped_shade) {
         let Some(i) = mat.base else { continue };
         if !done.insert(i) {
@@ -5539,6 +5673,33 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
         im.key = format!("{}#{:?}{:?}", im.key, f.colour, f.tint);
     }
     !done.is_empty()
+}
+
+/// sRGB colour of clothing that has no texture in the install and no colour
+/// in its item either (see `colour_part`).
+const BARE_FALLBACK: [u8; 3] = [88, 88, 88];
+
+/// Colour the ped clothing materials that have no base texture (their
+/// textures are not in the install; `glb` marks them `ped_shade`) with a
+/// vertex tint, `colour(raw vertex colour)` in sRGB. Returns whether any
+/// was coloured.
+fn bare_tint(m: &mut glb::Model, colour: impl Fn([u8; 4]) -> [u8; 3]) -> bool {
+    let lin = |v: u8| {
+        let x = v as f32 / 255.0;
+        ((if x <= 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) }) * 255.0 + 0.5) as u8
+    };
+    let bare: Vec<usize> = (0..m.materials.len()).filter(|&k| m.materials[k].ped_shade && m.materials[k].base.is_none()).collect();
+    for &k in &bare {
+        let a = m.materials[k].base_factor[3];
+        m.materials[k].base_factor = [1.0, 1.0, 1.0, a];
+    }
+    for me in m.meshes.iter_mut().filter(|me| me.material.is_some_and(|k| bare.contains(&k))) {
+        for v in &mut me.verts {
+            let c = colour(v.col);
+            v.tint = [lin(c[0]), lin(c[1]), lin(c[2]), 255];
+        }
+    }
+    !bare.is_empty()
 }
 
 /// Attached accessories (a watch, a ring) are modelled at their own root
@@ -7815,7 +7976,7 @@ impl Lamps {
 /// What the viewer draws of a coat record (model.json
 /// `part_colours.coat.records`): clear coat intensity and roughness, flake
 /// orientation and size, and the base coat roughness when the record
-/// overrides it. Film, sheen and anisotropy are not drawn.
+/// overrides it. Film, sheen and anisotropy go by `coat_row`.
 fn paint_coat(r: &serde_json::Value) -> ([f32; 4], Option<f32>) {
     let f = |k: &str| r[k].as_f64().unwrap_or(0.0) as f32;
     let on = |k: &str| r[k].as_bool().unwrap_or(false);
@@ -8378,6 +8539,62 @@ fn srgb32(c: [f32; 3]) -> egui::Color32 {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn coat_records_in_the_ramp_image() {
+        use super::coat_row;
+        // no record: all zero, so the shader draws no coat
+        assert!(coat_row(None).iter().all(|b| *b == 0));
+        let r = serde_json::json!({
+            "use_clear_coat": true, "clear_coat_intensity": 0.5, "clear_coat_roughness": 0.0,
+            "use_flakes": false, "flake_coverage": 0.0, "flake_orientation": 0.0, "flake_size": 0.0,
+            "override_base_coat_roughness": true, "base_coat_roughness": 0.7,
+            "use_anisotropy": true, "anisotropy_intensity": 0.55,
+            "sheen_intensity": 0.0, "sheen_fade": 1.0, "sheen_reflectance": 0.0,
+            "film_ior": 2.6, "film_thickness": 0.2,
+        });
+        let row = coat_row(Some(&r));
+        assert_eq!(row.len(), 128 * 4);
+        let a: Vec<u8> = row.chunks_exact(4).map(|c| c[3]).collect();
+        // columns: clear coat, its roughness, flakes (off), flake size, base
+        // roughness, anisotropy, sheen (off: no fade or reflectance), film IOR / 4, thickness
+        assert_eq!(&a[..11], &[128, 0, 0, 0, 179, 140, 0, 0, 0, 166, 51]);
+        // repeated every 16 columns, with zeros between
+        assert_eq!(a[16..27], a[..11]);
+        assert!(a[11..16].iter().all(|b| *b == 0));
+        // anisotropy without useAnisotropy is not drawn
+        let mut off = r.clone();
+        off["use_anisotropy"] = false.into();
+        assert_eq!(coat_row(Some(&off))[5 * 4 + 3], 0);
+    }
+
+    #[test]
+    fn part_wear_from_the_configuration() {
+        use super::part_wear_amounts;
+        // part 0: level 1 on ladder 0, whose entry 1 has an age range 100..200;
+        // part 1: level 4, a preset whose age is not a range; part 2: no level
+        let mut levels = "ffff".repeat(256);
+        levels.replace_range(0..8, "01010407");
+        let mut ladder = "ff".repeat(256);
+        ladder.replace_range(0..4, "0000");
+        let w = serde_json::json!({
+            "levels_by_config": {"k1": levels.clone(), "k2": "0000".repeat(256)},
+            "levels_default": levels,
+            "ladder_by_look": [ladder],
+            "ladders": [{"wearPresets": ["p0", "p1", "p1", "p1", "p4", "p4"]}],
+            "presets": {"p1": {"ageWearHash": "r1"}, "p4": {"ageWearHash": "a4"}},
+            "age_ranges": {"r1": {"minWear": 100, "maxWear": 200}},
+            "ages": {"a4": {}},
+        });
+        let a = part_wear_amounts(&w, 0, Some("k1")).unwrap();
+        assert_eq!((a[0], a[1], a[2]), (150, 239, 0));
+        assert_eq!(part_wear_amounts(&w, 0, None).unwrap()[0], 150);
+        // a configuration without levels: no wear; level 0 without a ladder: the level's value
+        assert_eq!(part_wear_amounts(&w, 0, Some("nope")).unwrap(), [0; 256]);
+        assert_eq!(part_wear_amounts(&w, 0, Some("k2")).unwrap()[5], 15);
+        // a model without wear levels
+        assert_eq!(part_wear_amounts(&serde_json::json!({"ladders": []}), 0, None), None);
+    }
+
+    #[test]
     fn part_surfaces_in_the_ramp_image() {
         use super::{hex4, part_surface_row, surface_of_code, PART_RAMP_ROWS};
         assert_eq!(hex4("e6ff1a66"), Some([0xe6, 0xff, 0x1a, 0x66]));
@@ -8389,7 +8606,7 @@ mod tests {
         assert_eq!([row[3], row[7], row[11], row[15]], [1, 2, 3, 4]);
         assert_eq!(&row[..3], &[0, 0, 0]);
         // three blocks of 256 rows: the shader's row coordinates divide by this
-        assert_eq!(PART_RAMP_ROWS, 768);
+        assert_eq!(PART_RAMP_ROWS, 1025);
         // an export without surfaces: the look's code, low = high
         assert_eq!(surface_of_code(165), [255, 255, 78, 78]);
         assert_eq!(surface_of_code(49), [0, 0, 255, 255]);

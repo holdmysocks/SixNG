@@ -11,11 +11,12 @@ fn main() -> anyhow::Result<()> {
     ix.entries.par_iter().filter(|e| e.rtype.as_deref() == Some("ft") && e.name.as_deref().is_some_and(|n| re.is_match(n))).for_each(|e| {
         let Ok(r) = sixng_core::resource::Resource::load(&ar.path, e) else { return };
         let Ok(p) = sixng_core::fragphys::try_decode(&r) else { return };
-        let bones: Vec<String> = sixng_core::drawable::find_skeleton(&r).into_iter().map(|b| b.name).collect();
+        let skel = sixng_core::drawable::find_skeleton(&r);
+        let bones: Vec<String> = skel.iter().map(|b| b.name.clone()).collect();
         let j = sixng_core::fragphys::fragment_json(&p, &bones);
         let groups: Vec<_> = j["groups"].as_array().unwrap().iter().map(|g| {
             let kinds: Vec<_> = g["children"].as_array().unwrap().iter().map(|i| j["children"][i.as_u64().unwrap() as usize]["bound"]["type"].clone()).collect();
-            serde_json::json!([g["name"], g["flags"], g["flags2"], kinds, g["parent"], g["tuning"]["strength"]])
+            serde_json::json!([g["name"], g["flags"], g["flags2"], kinds, g["parent"], g["tuning"]["strength"], g["bone"].as_u64().and_then(|b| skel.get(b as usize)).map(|b| b.flags), g["tuning"]["joint_stiffness"]])
         }).collect();
         println!("{}", serde_json::json!({"name": e.name, "root": j["root_flags"], "g": groups}));
     });

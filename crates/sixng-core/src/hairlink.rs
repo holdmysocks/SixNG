@@ -17,10 +17,16 @@
 //!    of them are grooms (the rest are other files of the same resource
 //!    type, listed for hats, shoes and animals).
 //!
-//! Only a piece's densest groom has an id in the table. Its LODs
-//! (`<piece>_lod1` …) follow it in the archive; they are attached by
-//! bones and falling strand counts (`chains`), which is the one inferred
-//! part of an exact table.
+//! Only a piece's densest groom has an id in the table. Its LODs are
+//! files of their own, `<piece>_lod1` …, so they are read by name too
+//! once the piece's name is known: the placeholder's name without `_full`
+//! and one of the piece words (`PIECE_WORDS`) whose name id is the
+//! table's id. 2,859 of the 3,419 distinct groom pieces of the named
+//! human assets are named so; a search over two- and three-word compounds
+//! found no word for the rest. The LODs of the rest are attached by bones and falling strand
+//! counts (`chains`), the one inferred part of an exact table; on the
+//! named pieces that rule agrees with the names on 4,200 of 4,253 and
+//! gave too few or too many LODs on the others.
 //!
 //! Without the table of contents (another platform, another game build)
 //! the table is inferred instead, as before; all of that is a guess from
@@ -70,7 +76,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::OnceLock;
 
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 5;
 const ITEM: u32 = 0xf795_e8ba;
 const TAG_PLACEHOLDER: u32 = 0x023e_5a2f;
 const STATE_BASE: u32 = 0x44e2_1c90;
@@ -138,9 +144,30 @@ pub struct HairLinks {
     pub exact: bool,
     /// Asset GUID (16 hex digits) -> placements, most probable first.
     pub links: BTreeMap<String, Vec<Link>>,
+    /// Exact table: every groom of the archive in its LOD chain (densest
+    /// first, chains in archive order), read by name where the piece is
+    /// named (`chains`). Empty when inferred.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lods: Vec<Vec<u64>>,
 }
 
 impl HairLinks {
+    /// Set the catalog's `chain` and `lod` from `lods` (exact table); the
+    /// catalog's own are inferred from neighbours. Grooms of no chain, and
+    /// every groom when the table is inferred, keep theirs.
+    pub fn relabel(&self, cat: &mut [GroomInfo]) {
+        if self.lods.is_empty() {
+            return;
+        }
+        let at: HashMap<u64, (u32, u32)> = self.lods.iter().enumerate().flat_map(|(c, ch)| ch.iter().enumerate().map(move |(l, o)| (*o, (c as u32 + 1, l as u32)))).collect();
+        for g in cat {
+            if let Some(&(c, l)) = at.get(&g.off) {
+                g.chain = c;
+                g.lod = l;
+            }
+        }
+    }
+
     /// The grooms of hair asset `guid`: the most probable placement that
     /// has grooms, among those of body fit `fit` when given (`fr1` for a
     /// woman's head, `mr1` for a man's) and any otherwise. Check
@@ -657,17 +684,96 @@ fn game_root(a: &crate::game::ArchiveInfo) -> std::path::PathBuf {
     p
 }
 
+/// Piece words of groom files: a piece is `<placeholder without _full>_<word>`,
+/// the word also with a number (`WORD_NUMBERS`: `base2`, `top_02`). Read
+/// off the piece files the table of contents names, and for fur from a
+/// search over two-word compounds (`leg_front`, `earsflyaways`).
+const PIECE_WORDS: &[&str] = &[
+    "accessory", "accs", "arms", "baby", "babyhair", "babyhair_back", "babyhair_front", "babyhairback", "back", "back_base", "back_crown", "back_filler",
+    "backbase", "backlegflyaways", "bangs", "base", "base_babyhair", "base_back", "base_bottom", "base_braids", "base_clumps", "base_filler",
+    "base_fillerfront", "base_flyaways", "base_fringe", "base_front", "base_full", "base_hairline", "base_nape", "base_pony", "base_ponytail", "base_top",
+    "baseback", "basebottom", "basecap", "baseclumps", "basefill", "basefiller", "baseflyaways", "basefront", "basehair", "baselower", "basetop", "beard",
+    "beard_hairline", "beardbase", "beardline", "beardstache", "belly", "bellyflyaway", "bellyflyaways", "body", "body_front", "body_lower", "body_rear",
+    "bodyback", "bodybacklower", "bodyclump", "bodyclumps", "bodyfiller", "bodyflyaways", "bodyfront", "bodyfrontlower", "bodyfuzz", "bodymiddle",
+    "bodypom", "bodyupper", "bot", "bottom", "bottom_base", "bottom_braids", "bottom_clumps", "bottom_filler", "bottom_hairline", "bottom_transition",
+    "bottombase", "braid", "braid_base", "braid_filler", "braidbase", "braidbun", "braidbunloose", "braidleft", "braidloose", "braidright", "braidroots",
+    "braids", "braids_bottom", "braids_filler", "braids_fringe", "braids_loose", "braids_tie", "braids_top", "braidsback", "braidsbase",
+    "braidsbaseshort", "braidsbody", "braidsbun", "braidsfront", "braidshort", "braidsides", "braidsloose", "braidsshort", "braidtip", "brow", "brows",
+    "btm", "bun", "bun_braid", "bun_clumps", "bun_flyaways", "bun_loose", "bunbase", "buncurls", "bunfiller", "bunloose", "buntips", "buzz", "buzz_base",
+    "buzz_cap", "buzz_filler", "buzzfiller", "cap", "cap_front", "chest", "chestpom", "chin", "chop", "clump", "clumps", "clumps_right", "crown", "curls",
+    "curls_base", "curly", "curly_base", "detail", "ear", "ear_flyaways", "earflyaway", "earflyaways", "ears", "earsflyaway", "earsflyaways", "earspom",
+    "eyeflyaways", "eyelashes", "faceflyaways", "fade", "fade_filler", "fade_top", "fadelower", "fadetop", "feet", "feetflyaways", "fill", "filler",
+    "filler_back", "filler_braids", "filler_cap", "filler_front", "filler_pony", "fillerfront", "flyaway", "flyawaybody", "flyaways", "flyaways_top",
+    "flyawaytail", "fringe", "fringe_braids", "fringe_filler", "fringe_hairline", "fringefiller", "front", "front_clumps", "front_filler", "full",
+    "full_beard", "fullbody", "fuzz", "hairline", "hairtie", "hands", "head", "head_clump", "head_ears", "head_flyaways", "head_long", "head_neck",
+    "head_short", "head_top", "head_whiskers", "headclump", "headclumps", "headfiller", "headflyaway", "headflyaways", "headflyawayshairline", "headlong",
+    "headneck", "headpom", "headshort", "heart", "hooves", "left", "leg", "leg_back", "leg_front", "legback", "legflyaways", "legfront", "legs",
+    "legs_back", "legs_front", "legsback", "legsbacklower", "legsflyaways", "legsfront", "legsfrontlower", "legshort", "legsmoss", "line", "long",
+    "loose", "loosefront", "loosetop", "lower", "lowerbodyflyaways", "lowerflyaways", "main", "mainleft", "mane", "mid", "middle", "moss", "moustache",
+    "mustache", "mustache_base", "nape", "nape_filler", "neck", "neck_head", "neckfiller", "neckflyaways", "necklower", "paws", "peach", "pony",
+    "pony_base", "pony_flyaways", "pony_tie", "ponybase", "ponytail", "ponytail_base", "ponytail_braids", "ponytail_clumps", "ponytail_filler",
+    "ponytail_flyaways", "ponytail_tie", "ponytailbase", "ponytailfront", "ponytailtie", "ponytie", "rear", "rearlegflyaways", "rearpom", "right",
+    "roots", "shoe", "short", "short_base", "shoulder", "side", "sideburn", "sideburns", "sidecurls", "sidehair", "sides", "strands", "strip", "tail",
+    "tailflyaway", "tailflyaways", "tailheart", "tailpom", "tie", "top", "top_back", "top_base", "top_braids", "top_clumps", "top_filler", "top_flyaways",
+    "top_front", "top_full", "topbase", "topclumps", "topfill", "topfiller", "topflyaways", "tophair", "transition", "tube", "upper", "whisker",
+    "whiskers"
+];
+const WORD_NUMBERS: [&str; 7] = ["", "1", "2", "3", "4", "_2", "_02"];
+
+/// Name the listed piece ids (`ids`) that are `<base>_<word>` for one of
+/// the placeholder bases (names without `_full`): id -> piece name.
+pub fn piece_names<'a>(bases: impl IntoIterator<Item = &'a str>, ids: &HashSet<u64>) -> HashMap<u64, String> {
+    let mut out = HashMap::new();
+    for b in bases {
+        for w in PIECE_WORDS {
+            for n in WORD_NUMBERS {
+                let name = format!("{b}_{w}{n}");
+                let id = crate::meta7a::asset_id(&name);
+                if ids.contains(&id) {
+                    out.entry(id).or_insert(name);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The LOD chain of a named piece: its densest groom `start`, then the
+/// grooms `<name>_lod1`, `_lod2` … by name id (`file`), up to the first
+/// that is none or is another piece's start.
+pub fn lod_files(name: &str, start: u64, file: impl Fn(&u64) -> Option<u64>, starts: &HashSet<u64>) -> Vec<u64> {
+    let mut c = vec![start];
+    for k in 1..=9 {
+        match file(&crate::meta7a::asset_id(&format!("{name}_lod{k}"))) {
+            Some(o) if !c.contains(&o) && !starts.contains(&o) => c.push(o),
+            _ => break,
+        }
+    }
+    c
+}
+
 /// Group the catalog's grooms (archive order) into pieces when the densest
 /// groom of every listed piece is known (`starts`): densest groom -> its
-/// LOD chain. A groom that is no start joins one of the last three pieces
-/// by `furlink::pieces`' rule (same bones, fewer strands than the piece's
+/// LOD chain. A piece whose chain was read by name (`known`, densest ->
+/// chain) keeps it, and its LODs join no other piece. Any other groom that
+/// is no start joins one of the last three other pieces by
+/// `furlink::pieces`' rule (same bones, fewer strands than the piece's
 /// last LOD, and for a piece further back the same root box) or stands
 /// alone.
-pub fn chains(cat: &[GroomInfo], starts: &HashSet<u64>) -> HashMap<u64, Vec<u64>> {
+pub fn chains(cat: &[GroomInfo], starts: &HashSet<u64>, known: &HashMap<u64, Vec<u64>>) -> HashMap<u64, Vec<u64>> {
     let close = |a: &[[f32; 3]; 2], b: &[[f32; 3]; 2]| (0..3).all(|k| (a[0][k] - b[0][k]).abs() < 0.002 && (a[1][k] - b[1][k]).abs() < 0.002);
+    let read: HashSet<u64> = known.values().flatten().copied().collect();
+    let mut done: HashMap<u64, Vec<u64>> = HashMap::new();
     // (LODs, index of the densest in `cat`, strands of the last LOD)
     let mut out: Vec<(Vec<u64>, usize, u32)> = Vec::new();
     for (i, g) in cat.iter().enumerate() {
+        if let Some(c) = known.get(&g.off) {
+            done.insert(g.off, c.clone());
+            continue;
+        }
+        if read.contains(&g.off) {
+            continue;
+        }
         let n = out.len();
         let hit = if starts.contains(&g.off) {
             None
@@ -686,7 +792,7 @@ pub fn chains(cat: &[GroomInfo], starts: &HashSet<u64>) -> HashMap<u64, Vec<u64>
             None => out.push((vec![g.off], i, g.strands)),
         }
     }
-    out.into_iter().map(|e| (e.0[0], e.0)).collect()
+    out.into_iter().map(|e| (e.0[0], e.0)).chain(done).collect()
 }
 
 /// Build the table: exactly when the table of contents can be read,
@@ -722,8 +828,13 @@ pub fn build_exact(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::scan
     if starts.is_empty() {
         return Err(anyhow!("no groom of {} has an id of the piece table", a.id));
     }
-    let lods = chains(&cat, &starts);
     let names: HashMap<u64, String> = all.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| e.name.as_deref()).map(|n| n.to_ascii_lowercase()).map(|n| (crate::meta7a::asset_id(&n), n)).collect();
+    let listed: HashSet<u64> = table.values().flatten().copied().collect();
+    let pieces = piece_names(table.keys().filter_map(|g| names.get(g)).map(|n| n.trim_end_matches("_full")), &listed);
+    let known: HashMap<u64, Vec<u64>> = pieces.iter().filter_map(|(id, n)| file(id).map(|s| (s, lod_files(n, s, file, &starts)))).collect();
+    let lods = chains(&cat, &starts, &known);
+    let mut every: Vec<Vec<u64>> = lods.values().cloned().collect();
+    every.sort_unstable_by_key(|c| c[0]);
     let mut links: BTreeMap<String, Vec<Link>> = BTreeMap::new();
     for (guid, list) in &table {
         let name = names.get(guid).map(|s| s.as_str()).unwrap_or("");
@@ -762,9 +873,10 @@ pub fn build_exact(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::scan
     }
     Ok(HairLinks {
         version: CACHE_VERSION,
-        note: "Read from the game: an asset's GUID is the name id of its placeholder, the piece table lists its pieces by the name ids of their files, and the table of contents gives each file its id. missing = listed pieces that are no groom file of the archive. The LODs after a piece's densest groom are attached by bones and strand counts.".into(),
+        note: "Read from the game: an asset's GUID is the name id of its placeholder, the piece table lists its pieces by the name ids of their files, and the table of contents gives each file its id. missing = listed pieces that are no groom file of the archive. A piece's LODs are read by name (`<piece>_lodN`) when its piece word is known, else attached by bones and strand counts.".into(),
         exact: true,
         links,
+        lods: every,
     })
 }
 
@@ -938,6 +1050,7 @@ pub fn build_inferred(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::s
     Ok(HairLinks {
         version: CACHE_VERSION,
         exact: false,
+        lods: Vec::new(),
         note: "Inferred from name words, archive order, piece counts and geometry; not the stored link. confidence = model posterior of this asset on exactly these pieces. Under 0.5 treat the grooms as a guess; rivals > 0 = assets of the same words that could not be told apart.".into(),
         links,
     })
@@ -969,12 +1082,42 @@ mod tests {
         let g = |off: u64, strands: u32, bones: &[&str]| GroomInfo { off, id: String::new(), strands, root_triangles: 0, bones: bones.iter().map(|b| b.to_string()).collect(), root_box: [[0.0; 3], [0.1; 3]], category: String::new(), chain: 0, lod: 0 };
         // x, x_fluff (fewer strands, same bones: a piece of its own), x_fluff_lod1, x_lod1, y
         let cat = [g(1, 100, &["a"]), g(2, 60, &["a"]), g(3, 30, &["a"]), g(4, 50, &["a"]), g(5, 40, &["b"])];
-        let c = chains(&cat, &HashSet::from([1, 2, 5]));
+        let none = HashMap::new();
+        let c = chains(&cat, &HashSet::from([1, 2, 5]), &none);
         assert_eq!(c[&1], [1, 4]);
         assert_eq!(c[&2], [2, 3]);
         assert_eq!(c[&5], [5]);
         // without the ids x_fluff reads as a LOD of x
-        assert_eq!(chains(&cat, &HashSet::new())[&1], [1, 2, 3]);
+        assert_eq!(chains(&cat, &HashSet::new(), &none)[&1], [1, 2, 3]);
+        // x's LODs read by name: 3 and 4, though 3 follows x_fluff; x_fluff keeps none
+        let c = chains(&cat, &HashSet::from([1, 2, 5]), &HashMap::from([(1, vec![1, 3, 4])]));
+        assert_eq!(c[&1], [1, 3, 4]);
+        assert_eq!(c[&2], [2]);
+        assert_eq!(c[&5], [5]);
+    }
+
+    #[test]
+    fn pieces_and_lods_by_name() {
+        let base = "hairlob_fr1_018_straight_l08_non_sm_n";
+        let id = |n: &str| crate::meta7a::asset_id(n);
+        let ids = HashSet::from([id(&format!("{base}_base")), id(&format!("{base}_top_02")), 7]);
+        let p = piece_names([base], &ids);
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[&id(&format!("{base}_top_02"))], format!("{base}_top_02"));
+        // files by id: the piece 100, lod1 101, lod2 102; lod3 is another piece's start
+        let name = format!("{base}_base");
+        let files: HashMap<u64, u64> = HashMap::from([(id(&name), 100), (id(&format!("{name}_lod1")), 101), (id(&format!("{name}_lod2")), 102), (id(&format!("{name}_lod3")), 200)]);
+        let file = |i: &u64| files.get(i).copied();
+        assert_eq!(lod_files(&name, 100, file, &HashSet::from([100, 200])), [100, 101, 102]);
+    }
+
+    #[test]
+    fn relabel_by_lods() {
+        let g = |off: u64| GroomInfo { off, id: String::new(), strands: 1, root_triangles: 0, bones: Vec::new(), root_box: [[0.0; 3], [0.1; 3]], category: String::new(), chain: 9, lod: 9 };
+        let mut cat = [g(1), g(2), g(3), g(4)];
+        let t = HairLinks { lods: vec![vec![1, 3], vec![2]], ..Default::default() };
+        t.relabel(&mut cat);
+        assert_eq!(cat.iter().map(|g| (g.chain, g.lod)).collect::<Vec<_>>(), [(1, 0), (2, 0), (1, 1), (9, 9)]);
     }
 
     #[test]
