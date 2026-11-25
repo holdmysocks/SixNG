@@ -152,7 +152,8 @@ fn mesh_vertex(v: VIn) -> VOut {
         let c1 = F.view_proj * vec4(w.xyz + side, 1.0);
         let ppm = length((c1.xy / c1.w - c0.xy / c0.w) * 0.5 * F.jitter.yz);
         let rmin = min(0.5 * npx / max(ppm, 1e-3), 0.005);
-        if (uv1.y > 1.5) { uv1.x = clamp(r / rmin, 0.0, 1.0); }
+        // (a strand lit by the hair lighting keeps its profile in uv1.x: there the share rides on uv1.y, 1 .. 1.4)
+        if (uv1.y > 1.5) { uv1.x = clamp(r / rmin, 0.0, 1.0); } else if (uv1.y > 0.5) { uv1.y = 1.0 + 0.4 * clamp(r / rmin, 0.0, 1.0); }
         wp = w.xyz + side * edge * max(r, rmin);
         // the sun shadow pass (no target size) with a widening factor: the ribbon of the game's ray-traced passes,
         // flat, turned by a random direction per strand (here a hash of the strand's root normal; the game's own
@@ -405,11 +406,12 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {
     o.mask = 0xffffffffu;
     // a strand thinner than its drawn width: the game keeps a pixel with a probability equal to the
     // covered share (a dither it averages over frames); here each sample of the pixel is kept or not
-    if (M.flags.y == 12u && i.uv1.y > 1.5 && i.uv1.x < 0.999) {
+    let cov = select(clamp((i.uv1.y - 1.0) * 2.5, 0.0, 1.0), i.uv1.x, i.uv1.y > 1.5);
+    if (M.flags.y == 12u && i.uv1.y > 0.5 && cov < 0.999) {
         let j = fract(dot(i.tint.rgb, vec3(12.9898, 78.233, 37.719))) * 64.0 + F.jitter.x * 5.588238;
         var mk = 0u;
         for (var s = 0u; s < 4u; s++) {
-            if (i.uv1.x >= ign(i.clip.xy + vec2(j + f32(s) * 5.588, j + f32(s) * 9.123))) { mk |= 1u << s; }
+            if (cov >= ign(i.clip.xy + vec2(j + f32(s) * 5.588, j + f32(s) * 9.123))) { mk |= 1u << s; }
         }
         if (mk == 0u) { discard; }
         o.mask = mk;
