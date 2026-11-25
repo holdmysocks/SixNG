@@ -277,6 +277,14 @@ fn cs_histogram(@builtin(global_invocation_id) id: vec3<u32>) {
 
 var<workgroup> wh: array<u32, 128>;
 
+// least sine of elevation the incident meter counts a light above the
+// horizon at (about 20 degrees)
+const SLANT_MIN: f32 = 0.35;
+
+fn slant(y: f32) -> f32 {
+    return select(0.0, max(y, SLANT_MIN) * smoothstep(-0.02, 0.05, y), y > -0.02);
+}
+
 // share of the incident meter in the exposure (rest: the histogram)
 const INCIDENT: f32 = 0.75;
 
@@ -312,8 +320,10 @@ fn cs_exposure(@builtin(local_invocation_index) li: u32) {
     // an 18 % grey card there. It keeps a large dark or bright area (water,
     // a white wall) from swinging the exposure; the histogram trims it.
     let w3 = vec3(0.2126, 0.7152, 0.0722);
-    let e_dir = dot(S.sun_dir_e.rgb * ST.v[7].rgb, w3) * max(S.sun.y, 0.0)
-        + dot(S.moon_dir_e.rgb * ST.v[8].rgb, w3) * max(S.moon.y, 0.0);
+    // a low sun or moon still lights what faces it (slopes, walls), so
+    // its light counts as if at least SLANT_MIN up
+    let e_dir = dot(S.sun_dir_e.rgb * ST.v[7].rgb, w3) * slant(S.sun.y)
+        + dot(S.moon_dir_e.rgb * ST.v[8].rgb, w3) * slant(S.moon.y);
     let e_sky = PI * dot(ST.v[3].rgb, w3);
     let l_card = max(0.18 * (e_dir + e_sky) / PI, 1e-6);
     let ev_inc = log2(l_card * 100.0 / 12.5);

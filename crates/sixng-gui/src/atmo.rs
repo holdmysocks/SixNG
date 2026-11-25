@@ -44,8 +44,17 @@ const K_STAR: f32 = 100.0;
 const K_GLOW: f32 = 0.002;
 /// Share of the direct light that full cloud cover takes away (no clouds are drawn yet).
 const CLOUD_DIM: f32 = 0.85;
-/// Depth of the aerial-perspective volume (km).
+/// Depth of the aerial-perspective volume (km) near the ground; from
+/// higher up it reaches the horizon (`ap_depth`).
 const AP_DEPTH: f32 = 40.0;
+
+/// Depth of the aerial-perspective volume (km) for a camera `h_km` above
+/// the ground of a planet of radius `rb`: at least `AP_DEPTH`, else a
+/// little past the distance to the horizon (at most 400 km).
+fn ap_depth(rb: f32, h_km: f32) -> f32 {
+    let horizon = (2.0 * rb * h_km.max(0.0) + h_km * h_km).sqrt();
+    (horizon * 1.2).clamp(AP_DEPTH, 400.0)
+}
 /// Ground albedo for the sky's light bounced off the ground.
 const GROUND_ALBEDO: f32 = 0.15;
 
@@ -680,6 +689,7 @@ impl Atmosphere {
         };
         let mut u = sky.u;
         u.radii[2] = (cam.y * 0.001).max(0.0);
+        u.radii[3] = ap_depth(u.radii[0], u.radii[2]);
         u.expo2[3] = dt.clamp(0.0, 0.25);
         u.post2[0] = if self.reset > 0 { 1.0 } else { 0.0 };
         u.flags = [1, self.frame, size[0], size[1]];
@@ -838,6 +848,14 @@ mod tests {
     fn scene_layout() {
         // 20 vec4, flags, a matrix, the camera
         assert_eq!(std::mem::size_of::<super::SceneU>(), 21 * 16 + 64 + 16);
+    }
+
+    #[test]
+    fn ap_depth_reaches_the_horizon() {
+        assert_eq!(super::ap_depth(6360.0, 0.002), super::AP_DEPTH);
+        // from 3 km up the horizon is about 195 km away
+        let d = super::ap_depth(6360.0, 3.0);
+        assert!(d > 195.0 && d < 400.0, "{d}");
     }
 
     #[test]
