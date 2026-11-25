@@ -488,9 +488,11 @@ again**).
   the same data (per outfit: slot, drawable, how it was found, tint,
   colour, hair asset, body-shape preset, unresolved items). What is not
   game data, and is said so in the panel:
-  - **Body skin tone.** No painted body texture is stored (the game builds
-    skin at run time), so the body takes the colour of the face texture at
-    the neck.
+  - **Body skin tone.** For most characters no painted body texture is
+    stored (the game builds skin at run time), so the body takes the colour
+    of the face texture at the neck. Where the body item names a skin
+    texture that is in the install (player Jason, Lucia's legs and about
+    ten characters in all), the viewer uses it instead.
   - **Fabric shading.** The colour is shaded by the green channel of the
     garment's own packed map (`speculartex`: seams and folds, mid grey on
     plain cloth). From the clothing pixel shader (`ped_standard_muv`, read
