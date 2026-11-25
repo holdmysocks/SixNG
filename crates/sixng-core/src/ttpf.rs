@@ -779,7 +779,7 @@ mod tests {
         assert_eq!((l.block_d, l.slices, t.size), (8, 32, 524288));
         assert_eq!(t.tex_info("").depth, 32);
         // element sizes not measured on a volume, and multi-mip volumes, are rejected
-        let (d0, d1) = desc(32, 32, 1, 61, 32, 6, 1);
+        let (d0, d1) = desc(32, 32, 1, 98, 32, 6, 1);
         assert!(tex(d0, d1, 0x1000).layout().is_none());
         let (d0, d1) = desc(32, 32, 2, 10, 32, 6, 1);
         assert!(tex(d0, d1, 0x1000).layout().is_none());

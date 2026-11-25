@@ -349,6 +349,8 @@ pub fn deswizzle(src: &[u8], ew: u32, eh: u32, bpe: u32) -> Vec<u8> {
 ///   the R32 float glow).
 /// * Volumes (dimension byte 3): the 3D pattern of [`crate::gfx10::Layout::new_3d`].
 ///   The 33 x 33 x 33 RGBA16 float identity LUT decodes exactly.
+///   The 1-, 2- and 4-byte patterns were found by search on texture dictionary
+///   volumes and checked at the brick seams. Volumes with mips read as 2D.
 fn uncompressed_layout(fmt: Fmt, t: &TexInfo) -> Option<crate::gfx10::Layout> {
     use crate::gfx10::{Layout, Swizzle};
     let bpe = fmt.bytes_per_elem();
