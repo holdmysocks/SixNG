@@ -24,7 +24,9 @@ pub struct Vertex {
     /// second colour stream, GLB `_COLOR1`; 0 where the model has none),
     /// `[1]` which model of an assembled vehicle the vertex came from
     /// (0 = the vehicle itself, 1.. = fitted parts), `[2]` 1 when the model
-    /// has the stream (a mesh without it carries no stickers).
+    /// has the stream (a mesh without it carries no stickers), `[3]` on
+    /// people the vertex's region for the hide masks of clothes (first byte
+    /// of GLB `_REGION`; 0 = none).
     pub zone: [u8; 4],
 }
 
@@ -997,6 +999,12 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                 let c = d.u8x4(a as usize)?;
                 for i in 0..n.min(c.len()) {
                     v[i].zone = [c[i][3], 0, 1, 0];
+                }
+            }
+            if let Some(a) = at["_REGION"].as_u64() {
+                let c = d.u8x4(a as usize)?;
+                for i in 0..n.min(c.len()) {
+                    v[i].zone[3] = c[i][0];
                 }
             }
             if let Some(a) = at["COLOR_0"].as_u64() {

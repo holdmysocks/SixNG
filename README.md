@@ -544,11 +544,27 @@ again**).
     those rows are often placeholders); else the colour tag itself: one of
     18 words (black, blue, khaki, navy …) shown in a plain shade of ours.
     Second and third tints are not applied.
-  - **Which skin mesh.** Skin meshes come cut to the garment; which cut
-    goes with which garment is not decoded, so the whole one is used and
-    the skin triangles that lie right under a garment (top, jacket,
-    trousers, dress, shoes, gloves) are hidden, so skin does not show
-    through it.
+  - **Skin under clothes.** The game's own way (since 2026-11-25): the
+    `nude_cull` skin meshes carry a region per vertex (mesh stream 13,
+    first byte; exported as `_REGION`), every worn item names a layer
+    for its own vertices and lists, per layer, a 256-bit set of regions
+    it hides (`ped-look`: `layer`, `hides`; region n is bit n - 1). A
+    skin triangle is dropped when all its vertices are in regions that a
+    worn item hides on the skin's layer (upper body `b4d9d470`, lower
+    body `e0622b84`). Checked on one woman's 272 outfits: long sleeves
+    hide 94 to 100 % of the arm vertices, T-shirts 60 to 88 %, tank tops
+    under 20 %, long trousers all of the hips and thighs. Not decoded: a
+    second mask list per item with keys 1 to 3, and clothes hidden by
+    clothes (garments have `_cull_00` twins that carry regions; the
+    `_full` ones shown do not), so layered clothes still use a distance
+    test, as do skin meshes without regions.
+  - **Hair under headwear.** A hair item has states that name another
+    hair asset (`hathairalt`, `helmethairalt`, `beaniehairalt`,
+    `bandanahairalt`, `maskhairalt`, `hoodiehairalt`, `hairhidden`).
+    With a hat, helmet, beanie, bandana or mask in the outfit the state
+    of that name is used when the item has it (`ped-look`: `hair_state`);
+    which state the game picks is inferred from the state names, not read
+    from data. Many hair items have no such state and keep their hair.
   - 292 of the 318 named characters resolve (`sixng ped-look "^"`). Most
     by model name (116) or through their head: the outfit list has them
     under another model name, and the wardrobe that names their head is

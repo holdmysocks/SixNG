@@ -1656,7 +1656,7 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         }
         Some(crate::gltf::TriPrim {
             name, positions: m.positions, normals: m.normals, tangents: m.tangents, uvs: m.uvs.into_iter().map(|u| u.1).collect(),
-            colors: m.colors, colors1: m.colors1, tint, indices: m.indices, material, joints: m.joints, weights: m.weights, joints1: m.joints1, weights1: m.weights1,
+            colors: m.colors, colors1: m.colors1, regions: m.regions, tint, indices: m.indices, material, joints: m.joints, weights: m.weights, joints1: m.joints1, weights1: m.weights1,
         })
     };
     let nlod = info.models.iter().filter(|m| !m.part).map(|m| m.lod + 1).max().unwrap_or(1);
@@ -3409,7 +3409,7 @@ mod dictionary_tests {
     fn lowest_populated_lod_is_primary_without_reordering_other_lods() {
         let group = || crate::gltf::NodeGroup { name: "member".into(), prims: vec![crate::gltf::TriPrim {
             name: "triangle".into(), positions: vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-            normals: None, tangents: None, uvs: vec![], colors: None, colors1: None, tint: None, indices: vec![0, 1, 2],
+            normals: None, tangents: None, uvs: vec![], colors: None, colors1: None, regions: None, tint: None, indices: vec![0, 1, 2],
             material: None, joints: None, weights: None, joints1: None, weights1: None,
         }] };
         let mut groups = vec![vec![], vec![], vec![group()], vec![group()], vec![], vec![group()]];

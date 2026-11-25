@@ -88,6 +88,40 @@ pub struct Part {
     /// shared (`pick` takes the best; `pedlook` prefers the model's own fit).
     #[serde(skip)]
     pub candidates: BTreeMap<String, usize>,
+    /// Layer of the chosen state (`1d52bc91`, hex), first chain item that
+    /// names one: the layer the regions of the item's own vertices belong
+    /// to (mesh stream 13), which the hide masks of other items address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+    /// Hide masks of the chosen state (`35ff19d7`), first chain item that
+    /// stores any: layer id (hex) -> 256-bit set over that layer's regions
+    /// (hex, 64 digits, region 1 = lowest bit; see `mask_has`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hides: Vec<(String, String)>,
+    /// The second mask list of that state (`3b7601de`): layer id (hex), sub
+    /// key (1 to 3), mask. What the sub key selects is not decoded.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hides_sub: Vec<(String, u32, String)>,
+    /// Asset GUID of every state along the chain that names one: state name
+    /// (hex) -> GUID. A hair item has `base`, `hairhidden` and often
+    /// `hathairalt`, `helmethairalt`, `beaniehairalt`, `maskhairalt`,
+    /// `bandanahairalt`, `hoodiehairalt`: the hair asset worn under that
+    /// headwear.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub state_guids: Vec<(String, String)>,
+}
+
+fn mask_of(v: &Value) -> String {
+    v.as_str().map(|s| s.to_ascii_lowercase()).unwrap_or_default()
+}
+
+/// Whether a hide mask (`Part::hides`) has region `n` (1-based): bit n - 1
+/// of the set, whose hex digits run from the highest bit to the lowest.
+pub fn mask_has(mask: &str, n: u32) -> bool {
+    let Some(bit) = n.checked_sub(1) else { return false };
+    let d = mask.as_bytes();
+    let i = (bit / 4) as usize;
+    i < d.len() && (d[d.len() - 1 - i] as char).to_digit(16).is_some_and(|x| x >> (bit % 4) & 1 == 1)
 }
 
 /// A part's tint, for `outfit --tint <drawable>=<spec>`.
@@ -368,7 +402,27 @@ pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers,
             chain.iter().rev().for_each(|c| tag_words(c, pre, &mut tg));
             let tint = chain_tint(&chain);
             let preset = chain.iter().find_map(|c| c[f(0xe13e_baf8)].as_u64().filter(|&x| x != 0)).map(|x| format!("{x:08x}"));
-            parts.push(Part { item: format!("{:08x}", it[f(0x6512_1749)].as_u64().unwrap_or(0)), category, name: name.map(|p| p.0.clone()), drawable, tex_remap, tags: tg, tint, named, guid, colour, colour_tag, hair_preset, preset, state: format!("{want_state:08x}"), skins, candidates: counts });
+            let masked = chain.iter().filter_map(|c| state(c)).find(|s| [0x35ff_19d7u32, 0x3b76_01de].iter().any(|&k| s[f(k)].as_array().is_some_and(|a| !a.is_empty())));
+            let hides: Vec<(String, String)> = masked.iter().flat_map(|s| s[f(0x35ff_19d7)].as_array().cloned().unwrap_or_default()).map(|e| (format!("{:08x}", e["Key"].as_u64().unwrap_or(0)), mask_of(&e["Item"]))).collect();
+            let hides_sub: Vec<(String, u32, String)> = masked
+                .iter()
+                .flat_map(|s| s[f(0x3b76_01de)].as_array().cloned().unwrap_or_default())
+                .flat_map(|e| {
+                    let k = format!("{:08x}", e["Key"].as_u64().unwrap_or(0));
+                    e["Item"].as_array().cloned().unwrap_or_default().into_iter().map(move |x| (k.clone(), x["Key"].as_u64().unwrap_or(0) as u32, mask_of(&x["Item"])))
+                })
+                .collect();
+            let layer = chain.iter().filter_map(|c| state(c)).find_map(|s| s[f(0x1d52_bc91)].as_u64().filter(|&x| x != 0)).map(|x| format!("{x:08x}"));
+            let mut state_guids: Vec<(String, String)> = Vec::new();
+            for s in chain.iter().flat_map(|c| c[f(0xebac_f18c)].as_array().into_iter().flatten()) {
+                let name = format!("{:08x}", s["StateName"].as_u64().unwrap_or(0));
+                if let Some(g) = s[f(0xe7cb_9e1b)][f(0x41ac_f8eb)].as_str().filter(|g| g.chars().any(|ch| ch != '0')) {
+                    if !state_guids.iter().any(|x| x.0 == name) {
+                        state_guids.push((name, g.to_string()));
+                    }
+                }
+            }
+            parts.push(Part { layer, hides, hides_sub, state_guids, item: format!("{:08x}", it[f(0x6512_1749)].as_u64().unwrap_or(0)), category, name: name.map(|p| p.0.clone()), drawable, tex_remap, tags: tg, tint, named, guid, colour, colour_tag, hair_preset, preset, state: format!("{want_state:08x}"), skins, candidates: counts });
         }
         let mut tags = BTreeMap::new();
         tag_words(&v, pre, &mut tags);
@@ -379,6 +433,15 @@ pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mask_regions() {
+        // 256 bits as 64 hex digits, highest first: regions 1, 4 and 65
+        let m = format!("{}{:016x}{:016x}", "0".repeat(32), 1u64, 0b1001u64);
+        assert!(super::mask_has(&m, 1) && super::mask_has(&m, 4) && super::mask_has(&m, 65));
+        assert!(!super::mask_has(&m, 0) && !super::mask_has(&m, 2) && !super::mask_has(&m, 66) && !super::mask_has(&m, 300));
+        assert!(super::mask_has("8000000000000000", 64) && !super::mask_has("", 1));
+    }
+
     #[test]
     fn chain_tint_reads_the_item_fields() {
         let f = crate::meta7a::field_name;
