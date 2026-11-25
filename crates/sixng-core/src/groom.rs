@@ -132,9 +132,11 @@ impl Style {
     /// style offset x along the strand's normal (`up` made square to the
     /// strand) and y along normal x tangent (`swap` exchanges them). The
     /// offset's length is 0.8 mm + k (|d| - 0.8 mm), capped at |d|: the
-    /// game's k is a per-point weight from its strand generator (not read)
-    /// times the per-instance style strength.
-    pub fn apply(&self, pts: &mut [[f32; 3]], up: [f32; 3], swap: bool, k_strength: f32) {
+    /// game's k is a per-point weight from the collider damping, capped by
+    /// the per-instance style strength (`k` of the point's place on the
+    /// strand before the re-shape).
+    pub fn apply(&self, pts: &mut [[f32; 3]], up: [f32; 3], swap: bool, k: &dyn Fn([f32; 3]) -> f32) {
+        let k_strength = k;
         let k = pts.len();
         if k < 2 || self.samples.is_empty() {
             return;
@@ -153,15 +155,15 @@ impl Style {
         let src = pts.to_vec();
         for j in 0..k {
             let [x, y, z] = self.at(j as f32 / (k - 1) as f32);
-            let len = (x * x + y * y).sqrt();
-            let f = if len > 1e-9 { ((0.0008 + k_strength * (len - 0.0008)) / len).clamp(0.0, 1.0) } else { 0.0 };
-            let (x, y) = (x * f, y * f);
             let s = z.clamp(0.0, 1.0) * total;
             let i = arc.partition_point(|&a| a <= s).clamp(1, k - 1);
             let seg = (arc[i] - arc[i - 1]).max(1e-9);
             let f = ((s - arc[i - 1]) / seg).clamp(0.0, 1.0);
             let e = sub(src[i], src[i - 1]);
             let base = [src[i - 1][0] + e[0] * f, src[i - 1][1] + e[1] * f, src[i - 1][2] + e[2] * f];
+            let len = (x * x + y * y).sqrt();
+            let f = if len > 1e-9 { ((0.0008 + k_strength(base) * (len - 0.0008)) / len).clamp(0.0, 1.0) } else { 0.0 };
+            let (x, y) = (x * f, y * f);
             let l = dot(e, e).sqrt().max(1e-9);
             let t = [e[0] / l, e[1] / l, e[2] / l];
             let d = dot(up, t);
@@ -176,6 +178,60 @@ impl Style {
             let (a, b) = if swap { (y, x) } else { (x, y) };
             pts[j] = [base[0] + n[0] * a + bv[0] * b, base[1] + n[1] * a + bv[1] * b, base[2] + n[2] * a + bv[2] * b];
         }
+    }
+}
+
+/// What the style pass damps against: the game's colliders are capsules,
+/// spheres and boxes built on the CPU around the head, shoulders and hats
+/// (not stored with the groom); here the character's own surface points
+/// (head, body and garments) stand in for them. `damp` is the game's
+/// d = sat(1 - dist / falloff) with dist to the nearest point.
+pub struct Colliders {
+    cell: f32,
+    grid: std::collections::HashMap<(i32, i32, i32), Vec<[f32; 3]>>,
+    /// Changes with the points (cache key).
+    pub id: u64,
+}
+
+impl Colliders {
+    /// Distance at which a collider stops damping (metres).
+    pub const FALLOFF: f32 = 0.03;
+
+    pub fn new(points: &[[f32; 3]]) -> Colliders {
+        let cell = Self::FALLOFF;
+        let mut grid: std::collections::HashMap<(i32, i32, i32), Vec<[f32; 3]>> = Default::default();
+        let mut id = 0xcbf2_9ce4_8422_2325u64;
+        for p in points {
+            grid.entry(Self::key(cell, *p)).or_default().push(*p);
+            id = (id ^ (p[0].to_bits() as u64) << 1 ^ p[2].to_bits() as u64).wrapping_mul(0x100_0000_01b3);
+        }
+        Colliders { cell, grid, id }
+    }
+
+    fn key(cell: f32, p: [f32; 3]) -> (i32, i32, i32) {
+        ((p[0] / cell).floor() as i32, (p[1] / cell).floor() as i32, (p[2] / cell).floor() as i32)
+    }
+
+    /// 0 at `FALLOFF` or more from every point, 1 on a point.
+    pub fn damp(&self, p: [f32; 3]) -> f32 {
+        let (x, y, z) = Self::key(self.cell, p);
+        let mut best = Self::FALLOFF * Self::FALLOFF;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    for q in self.grid.get(&(x + dx, y + dy, z + dz)).into_iter().flatten() {
+                        best = best.min((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2));
+                    }
+                }
+            }
+        }
+        (1.0 - best.sqrt() / Self::FALLOFF).clamp(0.0, 1.0)
+    }
+
+    /// The style weight at `p` for the instance strength `strength`: the
+    /// game rounds the damping to thirds, k = min(1 - round(3 d) / 3, strength).
+    pub fn weight(&self, p: [f32; 3], strength: f32) -> f32 {
+        (1.0 - (3.0 * self.damp(p)).round() / 3.0).min(strength)
     }
 }
 
@@ -582,6 +638,11 @@ impl Groom {
     /// (here the densest triangle always takes a strand). Same strands for
     /// the same groom and share. Empty without B6.
     pub fn coat(&self, share: f32) -> Coat {
+        self.coat_with(share, None)
+    }
+
+    /// `coat`, with the style pass damped against `colliders`.
+    pub fn coat_with(&self, share: f32, colliders: Option<&Colliders>) -> Coat {
         use crate::hairgen;
         let k = self.points_per_strand;
         let mut c = Coat { k, points: Vec::new(), guides: Vec::new(), normals: Vec::new(), variants: Vec::new(), stored: self.stored_strands() };
@@ -616,15 +677,21 @@ impl Groom {
         // the rest pose it doubles the waves the stored strands already have,
         // so the game's strength term (not read) must hold it back there.
         // The strand's style is picked by the generator (not read); here by
-        // its variant draw among the stored records.
+        // its variant draw among the stored records. The collider damping
+        // (`Colliders`) keeps the offsets small near the skin, but even
+        // damped the pass throws strands across the face at full strength,
+        // so it stays off until the records' frame is known.
         let swap = std::env::var_os("SIXNG_STYLE_SWAP").is_some();
         // SIXNG_STYLE=<k>: the strength (1 when not a number)
         let k_style = std::env::var("SIXNG_STYLE").ok().map(|v| v.parse::<f32>().unwrap_or(1.0).clamp(0.0, 1.0));
         let off = k_style.is_none();
+        let strength = k_style.unwrap_or(1.0);
+        // per point: damped near the colliders (none: the strength alone)
+        let weight = |p: [f32; 3]| colliders.map_or(strength, |c| c.weight(p, strength));
         let style = |pts: &mut [[f32; 3]], up: [f32; 3], d: f32| {
             if !off && !self.styles.is_empty() {
                 let i = ((d * self.styles.len() as f32) as usize).min(self.styles.len() - 1);
-                self.styles[i].apply(pts, up, swap, k_style.unwrap_or(1.0));
+                self.styles[i].apply(pts, up, swap, &weight);
             }
         };
         // scattered strands
@@ -1264,8 +1331,16 @@ mod tests {
         assert!((a[0] - 0.0).abs() < 1e-4 && a[1].abs() < 1e-4 && (a[2] - 0.5).abs() < 1e-3, "{a:?}");
         // a straight strand along -z with up = +x: the tip moves 1 cm along +x
         let mut pts = [[0.0, 0.0, 0.0], [0.0, 0.0, -0.5], [0.0, 0.0, -1.0]];
-        st.apply(&mut pts, [1.0, 0.0, 0.0], false, 1.0);
+        let src = pts;
+        st.apply(&mut pts, [1.0, 0.0, 0.0], false, &|_| 1.0);
         assert!((pts[2][0] - 0.01).abs() < 1e-4 && (pts[2][2] + 1.0).abs() < 1e-4 && (pts[0][0] + 0.01).abs() < 1e-4, "{pts:?}");
+        // a collider on the root: the root's offset is damped to 0.8 mm, the tip's is not
+        let c = Colliders::new(&[[0.0, 0.0, 0.0]]);
+        assert_eq!(c.weight([0.0, 0.0, 0.0], 1.0), 0.0);
+        assert_eq!(c.weight([0.0, 0.0, -0.5], 0.7), 0.7);
+        let mut pts = src;
+        st.apply(&mut pts, [1.0, 0.0, 0.0], false, &|p| c.weight(p, 1.0));
+        assert!((pts[0][0] + 0.0008).abs() < 1e-5 && (pts[2][0] - 0.01).abs() < 1e-4, "{pts:?}");
     }
 
     #[test]
