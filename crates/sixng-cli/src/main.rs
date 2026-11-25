@@ -970,6 +970,16 @@ enum Cmd {
         #[arg(long, default_value_t = 200)]
         limit: usize,
     },
+    /// Mission and arc names for the story scenes, from the story-flow tags
+    /// in the story pack's protected rule files. Each tag that a mission id
+    /// shortens (letters left out) names that mission; the tags are cached in
+    /// <work>/index/story_flow_tags.json. Needs the cutscene catalog and, the
+    /// first time, the game executable (Windows x64) for the table of contents.
+    StoryNames {
+        /// Print the flow tags as well.
+        #[arg(long)]
+        tags: bool,
+    },
     /// Cutscenes of the story pack: per scene its cast (scene handles with
     /// the ped model each one is, and whether `outfit` can assemble it),
     /// props, cameras, the clip names of each object and the set-dressing
@@ -1357,7 +1367,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                             .map(|(k, st)| {
                                 let list: Vec<_> = e.programs[k]
                                     .iter()
-                                    .filter_map(|&n| Some((sh.sections[k].0 + n as usize, sh.programs.get(sh.sections[k].0 + n as usize)?)))
+                                    .filter_map(|&n| sh.program(e, k, n))
                                     .map(|(pi, p)| {
                                         if !full {
                                             return json!(p.name);
@@ -1398,17 +1408,30 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                                     let mut o = serde_json::Map::new();
                                     o.insert("pass".into(), json!(ps.name));
                                     for (k, st) in stages.iter().enumerate() {
-                                        if let Some(p) = ps.programs[k].and_then(|i| e.programs[k].get(i as usize)).and_then(|&n| sh.programs.get(sh.sections[k].0 + n as usize)) {
+                                        if let Some(p) = ps.programs[k].and_then(|i| e.programs[k].get(i as usize)).and_then(|&n| sh.program(e, k, n)).map(|x| x.1) {
                                             o.insert(st.to_string(), json!(p.name));
                                         }
                                     }
                                     o.insert("flags".into(), json!(ps.flags.iter().map(|b| format!("{b:02x}")).collect::<String>()));
+                                    // the state table items the pass sets, as indices into the effect's `states`
+                                    for (key, v) in [("rasterizer", ps.rasterizer()), ("depth_stencil", ps.depth_stencil()), ("blend", ps.blend()), ("stencil_ref", ps.stencil_ref())] {
+                                        if let Some(v) = v {
+                                            o.insert(key.into(), json!(v));
+                                        }
+                                    }
                                     serde_json::Value::Object(o)
                                 })
                                 .collect();
                             json!({"technique": t.name, "passes": passes})
                         })
                         .collect();
+                    let hex = |items: &[Vec<u8>]| items.iter().map(|x| x.iter().map(|b| format!("{b:02x}")).collect::<String>()).collect::<Vec<_>>();
+                    v["database"] = json!(e.database);
+                    v["states"] = json!({"rasterizer": hex(&e.states.rasterizer), "depth_stencil": hex(&e.states.depth_stencil), "blend": hex(&e.states.blend), "samplers": hex(&e.states.samplers)});
+                    v["blocks"] = e.blocks.iter().map(|b| match b {
+                        shaderfx::Block::Inline(_, len) => json!({"bytes": len}),
+                        shaderfx::Block::Shared(key) => json!({"shared": format!("{key:08x}"), "bytes": sh.databases[e.database].shared_block(*key).map(|i| sh.databases[e.database].shared_blocks[i].1)}),
+                    }).collect();
                     if let Some(t) = &e.table {
                         let mut textures: Vec<_> = t.resources.iter().filter_map(|r| Some((r.material_texture()?, r))).collect();
                         textures.sort_by_key(|x| x.0 .0);
@@ -1421,9 +1444,16 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 })
                 .collect();
             out.print(&json!({"ok": true,
-                "programs": {"total": sh.programs.len(), "vertex_or_mesh": sh.sections[0].1, "pixel": sh.sections[1].1, "geometry": sh.sections[2].1, "compute": sh.sections[5].1,
+                "databases": sh.databases.iter().map(|d| json!({"offset": d.offset, "id": format!("{:016x}", d.id), "programs": d.sections.iter().map(|s| s.1).sum::<usize>(), "vertex_or_mesh": d.sections[0].1, "pixel": d.sections[1].1, "geometry": d.sections[2].1, "compute": d.sections[5].1,
+                    "effects_stated": d.effects_stated, "effects_read": d.effects.1, "shared_blocks": d.shared_blocks.len(), "shared_table_resources": d.table.as_ref().map(|t| t.resources.len()), "shared_table_members": d.table.as_ref().map(|t| t.members.len())})).collect::<Vec<_>>(),
+                "programs": {"total": sh.programs.len(), "vertex_or_mesh": sh.section_total(0), "pixel": sh.section_total(1), "geometry": sh.section_total(2), "compute": sh.section_total(5),
                     "resources": sh.programs.iter().map(|p| p.table.resources.len()).sum::<usize>(), "constant_buffer_members": sh.programs.iter().map(|p| p.table.members.len()).sum::<usize>()},
-                "effects": {"stated": sh.effects_stated, "read": sh.effects.len(), "with_table": sh.effects.iter().filter(|e| e.table.is_some()).count(),
+                "effects": {"stated": sh.effects_stated(), "read": sh.effects.len(), "loaded_size_matches": sh.effects.iter().filter(|e| e.loaded_size == e.loaded_size_computed).count(),
+                    "state_items": {"rasterizer": sh.effects.iter().map(|e| e.states.rasterizer.len()).sum::<usize>(), "depth_stencil": sh.effects.iter().map(|e| e.states.depth_stencil.len()).sum::<usize>(), "blend": sh.effects.iter().map(|e| e.states.blend.len()).sum::<usize>(), "samplers": sh.effects.iter().map(|e| e.states.samplers.len()).sum::<usize>()},
+                    "pass_state_index_out_of_range": sh.effects.iter().map(|e| e.techniques.iter().flat_map(|t| &t.passes).filter(|ps| ps.rasterizer().is_some_and(|i| i as usize >= e.states.rasterizer.len()) || ps.depth_stencil().is_some_and(|i| i as usize >= e.states.depth_stencil.len()) || ps.blend().is_some_and(|i| i as usize >= e.states.blend.len())).count()).sum::<usize>(),
+                    "blocks_inline": sh.effects.iter().flat_map(|e| &e.blocks).filter(|b| matches!(b, shaderfx::Block::Inline(..))).count(),
+                    "blocks_shared": sh.effects.iter().flat_map(|e| &e.blocks).filter(|b| matches!(b, shaderfx::Block::Shared(_))).count(),
+                    "blocks_shared_unresolved": sh.effects.iter().map(|e| e.blocks.iter().filter(|b| matches!(b, shaderfx::Block::Shared(k) if sh.databases[e.database].shared_block(*k).is_none())).count()).sum::<usize>(), "with_table": sh.effects.iter().filter(|e| e.table.is_some()).count(),
                     "with_programs": sh.effects.iter().filter(|e| e.programs.iter().any(|l| !l.is_empty())).count(), "with_techniques": sh.effects.iter().filter(|e| !e.techniques.is_empty()).count(),
                     "techniques": sh.effects.iter().map(|e| e.techniques.len()).sum::<usize>(), "passes": sh.effects.iter().flat_map(|e| &e.techniques).map(|t| t.passes.len()).sum::<usize>(),
                     "programs_not_in_any_pass": sh.effects.iter().map(|e| (0..6).map(|k| (0..e.programs[k].len()).filter(|&i| !e.techniques.iter().flat_map(|t| &t.passes).any(|ps| ps.programs[k] == Some(i as u8))).count()).sum::<usize>()).sum::<usize>()},
@@ -1682,6 +1712,18 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     out.print(&json!({"ok": true, "dictionary": de.name, "id": de.id, "clip_count": d.clips.len(), "animations": d.animations.len(), "clips": clips}));
                 }
             }
+        }
+        Cmd::StoryNames { tags } => {
+            use sixng_core::cutscene;
+            let c = cutscene::catalog(&ws, cutscene::STORY_ARCHIVE, false, pr.clone())?;
+            let ids = cutscene::mission_ids(c.dicts.iter().filter_map(|d| cutscene::parse_dict_name(&d.name)).map(|(s, _)| s));
+            let t = sixng_core::storyflow::tags(&ws)?;
+            let n = sixng_core::storyflow::match_names(&t, &ids);
+            let mut v = json!({"ok": true, "missions_in_scenes": ids.len(), "named_missions": n.missions.len(), "named_arcs": n.arcs.len(), "arcs": n.arcs, "missions": n.missions});
+            if *tags {
+                v["tags"] = json!(t);
+            }
+            out.print(&v);
         }
         Cmd::Cutscenes { scene, name, cast, archive, rescan, summary, limit } => {
             use sixng_core::cutscene;

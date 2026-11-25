@@ -67,6 +67,7 @@ pub mod rpf9toc;
 pub mod gamecipher;
 pub mod scan;
 pub mod sectorgrid;
+pub mod storyflow;
 pub mod shaderfx;
 pub mod surface;
 pub mod timecycle;

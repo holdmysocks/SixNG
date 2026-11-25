@@ -759,9 +759,9 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             // channel is an occlusion factor on the diffuse and the specular
             // side (read from the paint shader); red and green blend the
             // surface's metalness and roughness, which the export has
-            // already done per model. Not on the Metal renderer, which
+            // already done per model. Not in a Metal 4 build, whose renderer
             // reads a packed map as roughness / metalness.
-            if t["param_hash"] == "2bb2ede8" && packed.is_none() && !opts.base_only && tiny_png(&t).is_none() && status == "ok" && cfg!(not(target_os = "macos")) {
+            if t["param_hash"] == "2bb2ede8" && packed.is_none() && !opts.base_only && tiny_png(&t).is_none() && status == "ok" && !crate::METAL4_BUILD {
                 if let Some(p) = &png {
                     packed = add_img(out_root.join(p), false, &mut images);
                     occlusion_only = packed.is_some();

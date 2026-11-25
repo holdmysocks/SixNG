@@ -113,20 +113,49 @@ pub type AxleBrakes = [(Option<String>, Option<String>); 2];
 
 /// The brakes of a configuration per axle. `named_*`: the disc (or drum)
 /// and caliper its part list names by model; `slot_models`: the models of
-/// its parts in the brake slots. The parts named by model and the slots
-/// `brakediscs` / `calipers_front` are the front axle's (a model name and
-/// a `brakediscs` part never come together; where a caliper comes both
-/// ways the name is taken, which is not confirmed). The rear axle takes
-/// the `_rear` slots, else what the front has; a rear drum without a rear
-/// caliper part gets no caliper.
+/// its parts in the brake slots. A disc named by model and the slot
+/// `brakediscs` are the front axle's (the two never come together); the
+/// rear axle takes `brakediscs_rear`, else what the front has.
+/// A caliper named by model is the vehicle's, a part in `calipers_front`
+/// or `calipers_rear` is that axle's and goes before it: 1,900
+/// configurations name a caliper and give the rear another one that way.
+/// The front part is rarer (266) and is how a vehicle with rear drums gets
+/// its front calipers without naming one; where it comes with a name (44,
+/// in 28 another model) it is taken for the front, by that symmetry and
+/// not confirmed in the game.
+/// An axle with a drum gets no caliper, whatever names one: every caliper
+/// model reaches outside both drum models (to radius 0.56 around a drum of
+/// 0.50 or 0.52), so it would clamp around the drum. 41 configurations
+/// name a caliper for a drum axle, 33 of them through a `calipers_rear`
+/// part; that the game leaves it out there is not confirmed either.
 pub fn brake_axles(named_disc: Option<&str>, named_caliper: Option<&str>, slot_models: &[(u32, String)]) -> AxleBrakes {
     let of = |slot: u32| slot_models.iter().find(|(s, _)| *s == slot).map(|(_, n)| n.clone());
     let front_disc = named_disc.map(str::to_string).or_else(|| of(BRAKE_SLOTS[0]));
-    let front_caliper = named_caliper.map(str::to_string).or_else(|| of(BRAKE_SLOTS[2]));
+    let named_caliper = named_caliper.map(str::to_string);
     let rear_disc = of(BRAKE_SLOTS[1]).or_else(|| front_disc.clone());
-    let drum = rear_disc.as_deref().is_some_and(|d| d.starts_with("drumbrake_"));
-    let rear_caliper = of(BRAKE_SLOTS[3]).or_else(|| if drum { None } else { front_caliper.clone() });
+    let drum = |d: &Option<String>| d.as_deref().is_some_and(|d| d.starts_with("drumbrake_"));
+    let front_part = of(BRAKE_SLOTS[2]);
+    let front_caliper = if drum(&front_disc) { None } else { front_part.clone().or_else(|| named_caliper.clone()) };
+    let rear_caliper = if drum(&rear_disc) { None } else { of(BRAKE_SLOTS[3]).or(named_caliper).or(front_part) };
     [(front_disc, front_caliper), (rear_disc, rear_caliper)]
+}
+
+/// The rim light slots, by joaat of their names: `lights_rims`,
+/// `lights_rims_rear`. A part in one of them has one element (bone 0) that
+/// names `caliper_rimlight` or `drumbrake_rimlight`: a ring of lights on
+/// the brake, modelled around the same unit disc as the discs and calipers
+/// (ring radius 0.607 for a disc of 0.5), the drum's one set further in.
+pub const RIM_LIGHT_SLOTS: [u32; 2] = [0x439f_ddac, 0x2ba6_699f];
+
+/// The rim light ring of a configuration per axle, `[front, rear]`, from
+/// the models of its parts in the rim light slots. The rear axle takes
+/// `lights_rims_rear`, else what the front has, as the brake discs do
+/// (not confirmed for the rings).
+pub fn rim_light_axles(slot_models: &[(u32, String)]) -> [Option<String>; 2] {
+    let of = |slot: u32| slot_models.iter().find(|(s, _)| *s == slot).map(|(_, n)| n.clone());
+    let front = of(RIM_LIGHT_SLOTS[0]);
+    let rear = of(RIM_LIGHT_SLOTS[1]).or_else(|| front.clone());
+    [front, rear]
 }
 
 fn hex32(v: &Value) -> Option<u32> {
@@ -261,7 +290,7 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
         let Some(m) = mods.get(&part_hash(p)) else { continue };
         let slot = m["slot"].as_str().unwrap_or("");
         // (brake slots: fitted at the wheels, per axle)
-        if slot == SLOT_CHASSIS || hex32(&m["slot"]).is_some_and(|s| wheels && BRAKE_SLOTS.contains(&s)) {
+        if slot == SLOT_CHASSIS || hex32(&m["slot"]).is_some_and(|s| wheels && (BRAKE_SLOTS.contains(&s) || RIM_LIGHT_SLOTS.contains(&s))) {
             continue;
         }
         for e in m["elements"].as_array().into_iter().flatten() {
@@ -498,15 +527,17 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
             .filter(|p| hex_name(p))
             .filter_map(|p| mods.get(&part_hash(p)))
             .filter_map(|m| {
-                let slot = hex32(&m["slot"]).filter(|s| BRAKE_SLOTS.contains(s))?;
+                let slot = hex32(&m["slot"]).filter(|s| BRAKE_SLOTS.contains(s) || RIM_LIGHT_SLOTS.contains(s))?;
                 let n = m["elements"].as_array()?.iter().find_map(|e| resolve(e))?.name.clone()?.to_ascii_lowercase();
                 Some((slot, n.strip_suffix("_hi").unwrap_or(&n).to_string()))
             })
             .collect();
         let axle_brakes = brake_axles(part("brakedisc_").or_else(|| part("drumbrake_")).as_deref(), part("caliper_").as_deref(), &slot_models);
+        // the rim light rings go on the brakes the same way
+        let rim_lights = rim_light_axles(&slot_models);
         // each distinct model once, with the axles it is on
         let mut brake_models: Vec<(&Entry, [bool; 2])> = Vec::new();
-        for (axle, n) in axle_brakes.iter().enumerate().flat_map(|(i, a)| [(i, &a.0), (i, &a.1)]) {
+        for (axle, n) in axle_brakes.iter().enumerate().flat_map(|(i, a)| [(i, &a.0), (i, &a.1)]).chain(rim_lights.iter().enumerate()) {
             let Some(e) = n.as_ref().and_then(|n| stems.get(n).copied()) else { continue };
             match brake_models.iter_mut().find(|b| b.0.off == e.off) {
                 Some(b) => b.1[axle] = true,
@@ -643,7 +674,35 @@ mod tests {
         // front discs with a caliper part, rear drums: the rear gets no caliper
         let b = brake_axles(Some("brakedisc_std_001"), None, &[(BRAKE_SLOTS[2], "caliper_2pot_001".into()), (BRAKE_SLOTS[1], "drumbrake_002".into())]);
         assert_eq!(b, [(s("brakedisc_std_001"), s("caliper_2pot_001")), (s("drumbrake_002"), None)]);
+        // a drum axle gets no caliper, also when a part or a name gives one
+        let b = brake_axles(Some("brakedisc_std_001"), Some("caliper_4pot_001"), &[(BRAKE_SLOTS[1], "drumbrake_001".into()), (BRAKE_SLOTS[3], "caliper_1pot_stock".into())]);
+        assert_eq!(b, [(s("brakedisc_std_001"), s("caliper_4pot_001")), (s("drumbrake_001"), None)]);
+        let b = brake_axles(None, Some("caliper_4pot_001"), &[(BRAKE_SLOTS[0], "drumbrake_001".into()), (BRAKE_SLOTS[1], "brakedisc_std_001".into())]);
+        assert_eq!(b, [(s("drumbrake_001"), None), (s("brakedisc_std_001"), s("caliper_4pot_001"))]);
+        // front drums with a front caliper part, rear discs: the part's caliper goes to the rear
+        let b = brake_axles(None, None, &[(BRAKE_SLOTS[0], "drumbrake_001".into()), (BRAKE_SLOTS[2], "caliper_2pot_001".into()), (BRAKE_SLOTS[1], "brakedisc_std_001".into())]);
+        assert_eq!(b, [(s("drumbrake_001"), None), (s("brakedisc_std_001"), s("caliper_2pot_001"))]);
+        // a named caliper and a front caliper part: the part is the front's
+        let b = brake_axles(Some("brakedisc_std_001"), Some("caliper_1pot_stock"), &[(BRAKE_SLOTS[2], "caliper_2pot_001".into()), (BRAKE_SLOTS[1], "drumbrake_002".into())]);
+        assert_eq!(b, [(s("brakedisc_std_001"), s("caliper_2pot_001")), (s("drumbrake_002"), None)]);
+        // ... and with rear discs and no rear part the rear keeps the named one
+        let b = brake_axles(Some("brakedisc_std_001"), Some("caliper_1pot_stock"), &[(BRAKE_SLOTS[2], "caliper_2pot_001".into())]);
+        assert_eq!(b, [(s("brakedisc_std_001"), s("caliper_2pot_001")), (s("brakedisc_std_001"), s("caliper_1pot_stock"))]);
         assert_eq!(brake_axles(None, None, &[]), AxleBrakes::default());
+    }
+
+    #[test]
+    fn rim_lights_per_axle() {
+        let s = |x: &str| Some(x.to_string());
+        // one part: the same ring on both axles
+        assert_eq!(rim_light_axles(&[(RIM_LIGHT_SLOTS[0], "caliper_rimlight".into())]), [s("caliper_rimlight"), s("caliper_rimlight")]);
+        // a rear part of its own (rear drums)
+        let both = [(RIM_LIGHT_SLOTS[0], "caliper_rimlight".to_string()), (RIM_LIGHT_SLOTS[1], "drumbrake_rimlight".to_string())];
+        assert_eq!(rim_light_axles(&both), [s("caliper_rimlight"), s("drumbrake_rimlight")]);
+        // brake parts are not rings
+        assert_eq!(rim_light_axles(&[(BRAKE_SLOTS[3], "caliper_2pot_001".into())]), [None, None]);
+        // and a ring is not a brake
+        assert_eq!(brake_axles(None, None, &both), AxleBrakes::default());
     }
 
     #[test]

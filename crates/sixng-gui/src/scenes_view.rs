@@ -6,8 +6,10 @@ use crate::audio_view::SceneAudio;
 use eframe::egui;
 use serde::Deserialize;
 use sixng_core::anim::ClipDictionary;
+pub use sixng_core::cutscene::mission_stage;
 use sixng_core::cutscene::{self, Catalog, Models, Scene};
 use sixng_core::export::{Progress, Workspace};
+use sixng_core::storyflow::Names;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -83,45 +85,38 @@ pub fn terms(q: &str) -> Vec<String> {
     q.split(|c: char| c.is_whitespace() || c == ',').filter(|t| !t.is_empty()).map(|t| t.to_ascii_lowercase()).collect()
 }
 
-/// Whether a scene matches: every name term is part of its name, and every
-/// cast term is part of some cast member's handle or model name.
-pub fn matches(s: &Scene, name: &[String], cast: &[String]) -> bool {
+/// Whether a scene matches: every name term is part of its name or of its
+/// story label (lower case, see [`label`]), and every cast term is part of
+/// some cast member's handle or model name.
+pub fn matches(s: &Scene, label: &str, name: &[String], cast: &[String]) -> bool {
     let n = s.name.to_ascii_lowercase();
-    name.iter().all(|t| n.contains(t.as_str()))
+    name.iter().all(|t| n.contains(t.as_str()) || label.contains(t.as_str()))
         && cast.iter().all(|t| s.cast.iter().any(|o| o.handle.to_ascii_lowercase().contains(t.as_str()) || o.model.as_deref().is_some_and(|m| m.to_ascii_lowercase().contains(t.as_str()))))
 }
 
 /// Indexes of the scenes that match the two queries, in list order.
+#[cfg(test)]
 pub fn filter(all: &[Scene], name: &str, cast: &str) -> Vec<usize> {
-    let (n, c) = (terms(name), terms(cast));
-    all.iter().enumerate().filter(|(_, s)| matches(s, &n, &c)).map(|(i, _)| i).collect()
+    filter_labelled(all, &[], name, cast)
 }
 
-/// A scene name's mission and its place in that mission, from the name:
-/// `<arc>_<mission>_<stage>_…`, where the stage is the intro (`int`,
-/// `int1a`, `intro`), a mid scene (`mcs1`, `mcs2` …) or the outro (`ext`).
-/// Returns (mission, stage rank 0 intro / 1 mid / 2 outro, stage number).
-/// Names with no stage word count as mid scenes of their first two words.
-pub fn mission_stage(name: &str) -> (String, u8, u64) {
-    let t: Vec<&str> = name.split('_').collect();
-    let num = |s: &str| s.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect::<String>().parse::<u64>().unwrap_or(0);
-    let stage = |w: &str| -> Option<(u8, u64)> {
-        let (head, tail) = w.split_at(w.find(|c: char| c.is_ascii_digit()).unwrap_or(w.len()));
-        let tail_ok = tail.is_empty() || tail.trim_start_matches(|c: char| c.is_ascii_digit()).chars().all(|c| c.is_ascii_lowercase());
-        match head {
-            "intro" if tail.is_empty() => Some((0, 0)),
-            "int" if tail_ok => Some((0, num(w))),
-            "mcs" | "rs" if !tail.is_empty() && tail_ok => Some((1, num(w))),
-            "ext" if tail_ok => Some((2, num(w))),
-            _ => None,
-        }
-    };
-    for i in 2..t.len().min(5) {
-        if let Some((r, n)) = stage(t[i]) {
-            return (t[..i].join("_"), r, n);
-        }
-    }
-    (t[..t.len().min(2)].join("_"), 1, 0)
+/// [`filter`], with the scenes' story labels (lower case, by scene index;
+/// missing ones count as empty) searched as well.
+pub fn filter_labelled(all: &[Scene], labels: &[String], name: &str, cast: &str) -> Vec<usize> {
+    let (n, c) = (terms(name), terms(cast));
+    all.iter().enumerate().filter(|(i, s)| matches(s, labels.get(*i).map_or("", String::as_str), &n, &c)).map(|(i, _)| i).collect()
+}
+
+/// A scene's story label: its arc and mission names ("Arc: Mission"), when
+/// the story flow names them.
+pub fn label(names: &Names, scene: &str) -> Option<String> {
+    names.label(&mission_stage(&scene.to_ascii_lowercase()).0)
+}
+
+/// Mission and arc names from the story pack's flow tags.
+fn load_names(ws: &Workspace, scenes: &[Scene]) -> anyhow::Result<Names> {
+    let ids = cutscene::mission_ids(scenes.iter().map(|s| s.name.as_str()));
+    sixng_core::storyflow::names(ws, &ids)
 }
 
 /// Text with its digit runs compared as numbers (`p2` before `p10`).
@@ -207,6 +202,7 @@ fn load_dialogue(work: &Path) -> anyhow::Result<DialogueRows> {
 struct LoadedScenes {
     scenes: Arc<Vec<Scene>>,
     dialogue: Result<DialogueRows, String>,
+    names: Result<Names, String>,
 }
 
 type Loaded = Option<Result<LoadedScenes, String>>;
@@ -219,6 +215,10 @@ pub struct ScenesView {
     progress: Arc<Mutex<(String, u64, u64)>>,
     scenes: Option<Arc<Vec<Scene>>>,
     dialogue: Result<DialogueRows, String>,
+    /// Arc and mission names, or why there are none.
+    names: Result<Names, String>,
+    /// Each scene's story label in lower case, for the name search.
+    labels: Vec<String>,
     error: Option<String>,
     pub name_q: String,
     pub cast_q: String,
@@ -240,6 +240,8 @@ impl ScenesView {
             progress: Default::default(),
             scenes: None,
             dialogue: Ok(BTreeMap::new()),
+            names: Ok(Names::default()),
+            labels: Vec::new(),
             error: None,
             name_q: String::new(),
             cast_q: String::new(),
@@ -278,10 +280,14 @@ impl ScenesView {
                 *prog.lock().unwrap() = (s.to_string(), d, t);
                 c2.request_repaint();
             });
-            let r = load_scenes(&ws, p)
-                .map(|scenes| LoadedScenes {
-                    scenes: Arc::new(scenes),
-                    dialogue: load_dialogue(&ws.work).map_err(|e| format!("{e:#}")),
+            let r = load_scenes(&ws, p.clone())
+                .map(|scenes| {
+                    p("mission names", 0, 1);
+                    LoadedScenes {
+                        names: load_names(&ws, &scenes).map_err(|e| format!("{e:#}")),
+                        scenes: Arc::new(scenes),
+                        dialogue: load_dialogue(&ws.work).map_err(|e| format!("{e:#}")),
+                    }
                 })
                 .map_err(|e| format!("{e:#}"));
             *slot.lock().unwrap() = Some(r);
@@ -296,8 +302,13 @@ impl ScenesView {
         if let Some(r) = self.pending.lock().unwrap().take() {
             match r {
                 Ok(loaded) => {
+                    self.labels = match &loaded.names {
+                        Ok(n) => loaded.scenes.iter().map(|s| label(n, &s.name).unwrap_or_default().to_lowercase()).collect(),
+                        Err(_) => Vec::new(),
+                    };
                     self.scenes = Some(loaded.scenes);
                     self.dialogue = loaded.dialogue;
+                    self.names = loaded.names;
                 }
                 Err(e) => self.error = Some(e),
             }
@@ -327,7 +338,7 @@ impl ScenesView {
         };
         let key = (self.name_q.clone(), self.cast_q.clone(), all.len(), self.mission_order);
         if key != self.shown_key {
-            self.shown = filter(&all, &self.name_q, &self.cast_q);
+            self.shown = filter_labelled(&all, &self.labels, &self.name_q, &self.cast_q);
             if self.mission_order {
                 sort_mission_order(&all, &mut self.shown);
             }
@@ -342,7 +353,7 @@ impl ScenesView {
             ui.heading("Scenes");
             egui::Grid::new("scenes_search").num_columns(2).show(ui, |ui| {
                 ui.label("Name");
-                ui.add(egui::TextEdit::singleline(&mut self.name_q).hint_text("words of the scene name").desired_width(250.0));
+                ui.add(egui::TextEdit::singleline(&mut self.name_q).hint_text("words of the scene or mission name").desired_width(250.0));
                 ui.end_row();
                 ui.label("Cast");
                 ui.add(egui::TextEdit::singleline(&mut self.cast_q).hint_text("lucia, player_story000_01 …").desired_width(250.0)).on_hover_text("Scenes whose cast has every word: each is part of a cast member's scene handle (lucia) or model (player_story000_00 is Lucia, player_story000_01 is Jason).");
@@ -378,6 +389,9 @@ impl ScenesView {
                 }
                 ui.label(format!("{} of {} scenes", self.shown.len(), all.len()));
             });
+            if let Err(e) = &self.names {
+                ui.label(egui::RichText::new("Mission names not available").weak().small()).on_hover_text(format!("The arc and mission names come from the story flow tags in the story pack, read through its table of contents (Windows x64, with the game executable in the game folder). {e}"));
+            }
             ui.separator();
             let row_h = ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().item_spacing.y;
             let mut sa = egui::ScrollArea::vertical().auto_shrink([false, false]);
@@ -390,7 +404,9 @@ impl ScenesView {
                 for k in rows {
                     let i = self.shown[k];
                     let s = &all[i];
-                    if ui.selectable_label(self.sel == Some(i), &s.name).on_hover_text(format!("{} cast, {} props, {} cameras", s.cast.len(), s.props.len(), s.cameras.len())).clicked() {
+                    let story = self.names.as_ref().ok().and_then(|n| label(n, &s.name)).map(|l| format!("{l}
+")).unwrap_or_default();
+                    if ui.selectable_label(self.sel == Some(i), &s.name).on_hover_text(format!("{story}{} cast, {} props, {} cameras", s.cast.len(), s.props.len(), s.cameras.len())).clicked() {
                         self.sel = Some(i);
                     }
                 }
@@ -405,14 +421,14 @@ impl ScenesView {
                 rows.get(&s.name).map(Vec::as_slice).unwrap_or_default()
             });
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                act = scene_ui(ui, s, dialogue.map_err(String::as_str));
+                act = scene_ui(ui, s, self.names.as_ref().ok(), dialogue.map_err(String::as_str));
             });
         });
         act
     }
 }
 
-fn scene_ui(ui: &mut egui::Ui, s: &Scene, dialogue: Result<&[DialogueRow], &str>) -> Option<Action> {
+fn scene_ui(ui: &mut egui::Ui, s: &Scene, names: Option<&Names>, dialogue: Result<&[DialogueRow], &str>) -> Option<Action> {
     let mut act = None;
     ui.heading(&s.name);
     egui::Grid::new("scene_facts").num_columns(2).show(ui, |ui| {
@@ -425,6 +441,11 @@ fn scene_ui(ui: &mut egui::Ui, s: &Scene, dialogue: Result<&[DialogueRow], &str>
             ui.end_row();
         }
         let (m, r, k) = mission_stage(&s.name.to_ascii_lowercase());
+        if let Some(l) = names.and_then(|n| n.label(&m)) {
+            ui.label("Story");
+            ui.label(egui::RichText::new(l).strong()).on_hover_text("Arc and mission names from the story flow tags (for example FlowHarborBoatRaceComplete), paired with the mission id because the id is a short form of the tag's words. Only tags that fit one id are used, so some missions have only their arc's name and some have none.");
+            ui.end_row();
+        }
         ui.label("Mission");
         ui.label(format!("{m}, {}", match (r, k) {
             (0, 0) => "intro".to_string(),
@@ -635,6 +656,25 @@ mod tests {
         assert_eq!(filter(&all, "", "prop_cup"), Vec::<usize>::new());
         // name and cast together
         assert_eq!(filter(&all, "beach", "lucia"), vec![1]);
+    }
+
+    #[test]
+    fn name_search_also_finds_the_story_label() {
+        let all = sample();
+        let mut names = Names::default();
+        names.arcs.insert("mtl".into(), "Harbor".into());
+        names.arcs.insert("air".into(), "Harbor".into());
+        names.missions.insert("mtl_mont".into(), "Boat Race".into());
+        let labels: Vec<String> = all.iter().map(|s| label(&names, &s.name).unwrap_or_default().to_lowercase()).collect();
+        assert_eq!(label(&names, &all[0].name).as_deref(), Some("Harbor: Boat Race"));
+        assert_eq!(label(&names, &all[1].name).as_deref(), Some("Harbor"));
+        assert_eq!(label(&names, &all[2].name), None);
+        assert_eq!(filter_labelled(&all, &labels, "boat race", ""), vec![0]);
+        assert_eq!(filter_labelled(&all, &labels, "harbor", ""), vec![0, 1]);
+        // A term may match the name and another the label.
+        assert_eq!(filter_labelled(&all, &labels, "harbor diner", ""), vec![0]);
+        assert_eq!(filter_labelled(&all, &labels, "harbor", "nate"), vec![1]);
+        assert!(filter_labelled(&all, &[], "harbor", "").is_empty());
     }
 
     #[test]

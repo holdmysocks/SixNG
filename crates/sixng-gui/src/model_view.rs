@@ -570,6 +570,8 @@ pub struct ModelView {
     brake_key: String,
     brake_loading: bool,
     veh_brake: sixng_core::vehexport::AxleBrakes,
+    /// The rim light ring per axle (`lights_rims` parts), by model name.
+    veh_rim_light: [Option<String>; 2],
     pub paint_on: bool,
     /// Side-panel controls that apply to the loaded model, keyed by (GLB path, triangles).
     caps: Option<(PathBuf, usize, Caps)>,
@@ -894,6 +896,7 @@ impl ModelView {
             brake_key: String::new(),
             brake_loading: false,
             veh_brake: Default::default(),
+            veh_rim_light: Default::default(),
             paint_on: true,
             caps: None,
             material_sel: None,
@@ -2225,6 +2228,7 @@ impl ModelView {
                     self.wheel_rim = rim.into();
                     self.wheel_tyre = tyre.into();
                     self.veh_brake = Default::default();
+                    self.veh_rim_light = Default::default();
                     self.wheel_scale = sc;
                     self.wheel_scale_rear = sc;
                 }
@@ -2254,6 +2258,7 @@ impl ModelView {
                 self.wheel_rim = rim.into();
                 self.wheel_tyre = tyre.into();
                 self.veh_brake = Default::default();
+                self.veh_rim_light = Default::default();
                 self.apply_scale(v);
             }
         }
@@ -2542,6 +2547,14 @@ impl ModelView {
             brakes = v.configs.iter().map(axles).find(|b| !none(b)).unwrap_or_default();
         }
         self.veh_brake = brakes;
+        // the rim light rings: only what this configuration's own parts give
+        let ring_models: Vec<(u32, String)> = v
+            .mods
+            .iter()
+            .filter(|m| sixng_core::vehexport::RIM_LIGHT_SLOTS.contains(&m.slot) && c.parts.contains(&m.name))
+            .filter_map(|m| Some((m.slot, m.models.iter().find_map(|h| brake_names.get(h))?.clone())))
+            .collect();
+        self.veh_rim_light = sixng_core::vehexport::rim_light_axles(&ring_models);
         self.veh_cfg = Some(i);
         self.apply_scale(v);
     }
@@ -2641,14 +2654,16 @@ impl ModelView {
             })
             .collect();
         let axles = if spots.is_empty() { Default::default() } else { self.veh_brake.clone() };
-        let key = format!("{axles:?}");
+        let rings = if spots.is_empty() { Default::default() } else { self.veh_rim_light.clone() };
+        let key = format!("{axles:?}{rings:?}");
         if key != self.brake_key {
             self.brake_key = key;
             self.brakes.clear();
             // each distinct model once, with the axles it is on
             let mut qs: Vec<(bool, [bool; 2], String)> = Vec::new();
             for (axle, a) in axles.iter().enumerate() {
-                for (d, n) in [(true, &a.0), (false, &a.1)] {
+                // (the rim light ring sits on the brake and does not turn)
+                for (d, n) in [(true, &a.0), (false, &a.1), (false, &rings[axle])] {
                     let Some(n) = n else { continue };
                     let q = format!("^{n}_hi$");
                     match qs.iter_mut().find(|x| x.0 == d && x.2 == q) {
@@ -3685,7 +3700,7 @@ impl ModelView {
         self.update_ped_clip(&ctx);
         let (globals, mut skin) = self.joint_mats();
         // Lit lamps: the light of each lamp bone rides in the bottom row of
-        // its joint matrix (see the shader). Not on the Metal renderer.
+        // its joint matrix (see the shader). Not in a Metal 4 build.
         if self.siren_dirty {
             self.siren_dirty = false;
             self.sirens = match (&self.loaded, &self.veh_lights) {
@@ -3704,7 +3719,7 @@ impl ModelView {
                 self.siren = self.siren.min(self.sirens.len());
             }
         }
-        if (self.has_lamps || !self.sirens.is_empty()) && cfg!(not(target_os = "macos")) {
+        if (self.has_lamps || !self.sirens.is_empty()) && !crate::METAL4_BUILD {
             let t = ctx.input(|i| i.time);
             if let Some(l) = &self.loaded {
                 for (i, (j, m)) in l.model.joints.iter().zip(skin.iter_mut()).enumerate() {
@@ -4848,8 +4863,8 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
                 let mat = m.materials[mi].clone();
                 // The wgpu shader draws the main sub-material's weave per
                 // pixel on opaque garments (alpha carries its texels); the
-                // Metal renderer has no such path and keeps the baked weave.
-                let detail = cfg!(not(target_os = "macos")) && std::env::var_os("SIXNG_NO_FABRIC_DETAIL").is_none() && mats.iter().all(|&k| m.materials[k].alpha_mode == "OPAQUE");
+                // Metal 4 renderer has no such path and keeps the baked weave.
+                let detail = !crate::METAL4_BUILD && std::env::var_os("SIXNG_NO_FABRIC_DETAIL").is_none() && mats.iter().all(|&k| m.materials[k].alpha_mode == "OPAQUE");
                 if let Some(main) = crate::fabric::bake(m, &mats, i, &fab, &|w, h| sub_material_map(&mat, &[cache, shaped.as_path()], w, h), detail) {
                     m.images[i].key = format!("{}#fabric{:08x}{}", m.images[i].key, f.preset.unwrap_or(0), if main.is_some() { "d" } else { "" });
                     if let Some((tile, scale, rot)) = main.and_then(|s| fab.detail(s)) {

@@ -51,6 +51,41 @@ use std::path::Path;
 
 /// The archive the story cutscenes are in.
 pub const STORY_ARCHIVE: &str = "pack/story000/story000.rpf";
+
+/// A scene name's mission and its place in that mission, from the name:
+/// `<arc>_<mission>_<stage>_…`, where the stage is the intro (`int`,
+/// `int1a`, `intro`), a mid scene (`mcs1`, `mcs2` …) or the outro (`ext`).
+/// Returns (mission, stage rank 0 intro / 1 mid / 2 outro, stage number).
+/// Names with no stage word count as mid scenes of their first two words.
+pub fn mission_stage(name: &str) -> (String, u8, u64) {
+    let t: Vec<&str> = name.split('_').collect();
+    let num = |s: &str| s.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect::<String>().parse::<u64>().unwrap_or(0);
+    let stage = |w: &str| -> Option<(u8, u64)> {
+        let (head, tail) = w.split_at(w.find(|c: char| c.is_ascii_digit()).unwrap_or(w.len()));
+        let tail_ok = tail.is_empty() || tail.trim_start_matches(|c: char| c.is_ascii_digit()).chars().all(|c| c.is_ascii_lowercase());
+        match head {
+            "intro" if tail.is_empty() => Some((0, 0)),
+            "int" if tail_ok => Some((0, num(w))),
+            "mcs" | "rs" if !tail.is_empty() && tail_ok => Some((1, num(w))),
+            "ext" if tail_ok => Some((2, num(w))),
+            _ => None,
+        }
+    };
+    for i in 2..t.len().min(5) {
+        if let Some((r, n)) = stage(t[i]) {
+            return (t[..i].join("_"), r, n);
+        }
+    }
+    (t[..t.len().min(2)].join("_"), 1, 0)
+}
+
+/// The mission ids of scene names (see [`mission_stage`]), sorted, once each.
+pub fn mission_ids<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut v: Vec<String> = names.into_iter().map(|n| mission_stage(&n.to_ascii_lowercase()).0).collect();
+    v.sort();
+    v.dedup();
+    v
+}
 /// Bumped when the cached catalog's layout or contents change.
 pub const CATALOG_VERSION: u32 = 4;
 

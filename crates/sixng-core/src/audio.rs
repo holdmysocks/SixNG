@@ -22,11 +22,16 @@
 //! count, then 16 bytes per channel (u32 id, u32 samples, u16 ?, u16 rate,
 //! u8 codec, 3 bytes ?). The data is that many blocks of the block size (the
 //! last one shorter). A block starts with 24 bytes per channel (u32 -1, u32
-//! 2 KiB-block count, u32 0, u32 samples, u32 0, u32 0), then one u32 seek
+//! 2 KiB-block count, u32 skip, u32 samples, u32 0, u32 0), then one u32 seek
 //! table per channel (one sample position per 2 KiB block), padded to 2 KiB;
 //! then each channel's 2 KiB blocks in turn, packed as in plain streams.
 //! Sample counts (channel and block) count each channel of a stereo
-//! sub-stream, so they are twice the frame count for stereo.
+//! sub-stream, so they are twice the frame count for stereo. In blocks
+//! after the first, a channel's leading packets worth `skip` samples (a
+//! multiple of 960, nonzero in about 5 % of blocks) are byte for byte the
+//! last packets of its previous block, a pre-roll for decoding from that
+//! block; they are dropped, after which a bank's channels have the same
+//! length (checked on 150 music banks of audio.rpf, 84 of 84 repeats).
 //!
 //! Codec: the 32-byte format chunk holds a codec id at 0x1C and a channel
 //! count at 0x1D: 11 Opus, 0 PCM signed 16-bit LE, 2 PCM float32 LE, 5 XMA2. In
@@ -569,7 +574,14 @@ pub fn music_channels(bank: &[u8], bank_off: u64, s: &Stream) -> Result<Vec<Musi
         let mut p = hdr;
         for (c, &n) in counts.iter().enumerate() {
             let sub = Stream { id: 0, chunks: Vec::new(), data: (p as u32, (n * BLOCK) as u32), samples: 0, rate: 0, codec: 0, channels: 0, layout: String::new() };
-            out[c].packets.extend(packets(blk, &sub));
+            // leading packets worth `skip` samples repeat the end of the
+            // previous block (decoder pre-roll): drop them
+            let mut skip = u32le(blk, 24 * c + 8).unwrap_or(0) as u64;
+            out[c].packets.extend(packets(blk, &sub).into_iter().skip_while(|pk| {
+                let drop = skip > 0;
+                skip = skip.saturating_sub(packet_samples(pk) as u64);
+                drop
+            }));
             p += n * BLOCK;
         }
     }
@@ -1070,6 +1082,48 @@ mod tests {
         assert_eq!(&w[72..76], b"data");
         assert_eq!(&w[80..], &data[..]);
         assert!(xma2_riff(&data[..100], &stream("xma2", 1, 32000, 1, 100)).is_err());
+    }
+    #[test]
+    fn music_pre_roll() {
+        // one mono sub-stream in 2 blocks of 4 KiB; the second block starts
+        // with a copy of the first block's last packet and skip = 960
+        let mut h = b"ADAT".to_vec();
+        h.extend_from_slice(&0xFF01_0001u32.to_le_bytes());
+        h.extend_from_slice(&1u32.to_le_bytes());
+        let hl = 16 + 2 + 4 + 16;
+        h.extend_from_slice(&(hl as u32).to_le_bytes());
+        h.extend_from_slice(&0u16.to_le_bytes());
+        h.extend_from_slice(&(2u32 << 29).to_le_bytes());
+        let rec = |t: u64, s: u64, o: u64| (t << 56) | (s << 28) | o;
+        let sf_len = 12 + 16;
+        let data_len = 2 * 0x1000;
+        h.extend_from_slice(&rec(0x48, sf_len as u64, hl as u64).to_le_bytes());
+        h.extend_from_slice(&rec(0x55, data_len as u64, (hl + sf_len) as u64).to_le_bytes());
+        for v in [2u32, 0x1000, 1] {
+            h.extend_from_slice(&v.to_le_bytes());
+        }
+        h.extend_from_slice(&0xAAu32.to_le_bytes());
+        h.extend_from_slice(&1920u32.to_le_bytes());
+        h.extend_from_slice(&[0, 0, 0x80, 0xBB, 0, 0, 0, 0]);
+        let d0 = h.len();
+        for (skip, pk) in [(0u32, vec![vec![0xF8u8, 1]]), (960, vec![vec![0xF8, 1], vec![0xF8, 2]])] {
+            let s = h.len();
+            for v in [u32::MAX, 1, skip, 960, 0, 0] {
+                h.extend_from_slice(&v.to_le_bytes());
+            }
+            h.resize(s + BLOCK, 0);
+            for p in pk {
+                h.extend_from_slice(&(p.len() as u16).to_le_bytes());
+                h.extend_from_slice(&p);
+            }
+            h.resize(s + 0x1000, 0);
+        }
+        let b = parse_header(&h, 0).unwrap();
+        let mut st = b.streams[0].clone();
+        st.layout = "music".into();
+        st.data = (d0 as u32, data_len as u32);
+        let c = music_channels(&h, 0, &st).unwrap();
+        assert_eq!(c[0].packets, vec![vec![0xF8, 1], vec![0xF8, 2]]);
     }
     #[test]
     fn music() {
