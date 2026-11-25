@@ -1386,7 +1386,14 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             // strand as seen from the eye, and the normal rounded across the
             // ribbon by the position u (-1 .. 1, the tangent's w) between its edges
             let side = normalize(cross(tdir, v));
-            let u_h = clamp(i.tan.w, -1.0, 1.0);
+            // the position u across the tube, as the game's tiled G-buffer resolve takes it: interleaved gradient
+            // noise at the pixel with a per-frame offset 5.58824 (frame & 63), whatever the pixel's place in the
+            // drawn ribbon (high confidence, read from that program by the shader archive work); the game's
+            // temporal anti-aliasing averages it over the tube, here the shot's accumulation frames do. (Its
+            // pixel-shader G-buffer path takes the raster position across the ribbon instead; which pieces use
+            // that path is not known.)
+            let j_h = 5.58824 * f32(u32(F.frame.x) & 63u);
+            let u_h = 2.0 * ign(floor(i.clip.xy) + vec2(j_h)) - 1.0;
             let tube = normalize(side * u_h + cross(side, tdir) * sqrt(max(1.0 - u_h * u_h, 0.0)));
             // large-scale light and dark side from the head: the root normal
             let root = normalize(i.nrm);
