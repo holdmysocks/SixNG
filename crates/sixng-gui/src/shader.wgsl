@@ -426,8 +426,9 @@ fn strand_openness(clip: vec4<f32>) -> f32 {
 // follow; here the noise is a hash and the viewer's frame accumulation
 // averages it. The game's standard lighting programs (not its hair programs)
 // use the result on the specular ambient only, through a cone test against
-// the reflection vector whose four constants are not read; the viewer scales
-// its specular ambient by the plain visibility instead (an approximation).
+// the reflection vector; the viewer keeps no bent direction and uses the
+// plain visibility in place of that test's result (an approximation), with
+// the game's strength by roughness.
 // The game's diffuse ambient is darkened by its traced probe lighting, which
 // the viewer does not have.
 fn screen_occlusion(clip: vec4<f32>, wp: vec3<f32>, n: vec3<f32>) -> f32 {
@@ -788,7 +789,10 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     let env = mix(sky(r), (F.sky_top.rgb + F.sky_hor.rgb) * 0.5, rough) * F.misc.w;
     let sh = sun_shadow(i.world, dpdx(i.world), dpdy(i.world));
     var ao_s = ao;
-    if (cls != 12u) { ao_s = ao * screen_occlusion(i.clip, i.world, n); }
+    // strength = max(0, I - 2 x roughness), I = 1 (the game's value in every weather and hour): no effect from
+    // roughness 0.5 upward, so next to none on skin
+    let occ_k = max(0.0, 1.0 - 2.0 * rough);
+    if (cls != 12u && occ_k > 0.0) { ao_s = ao * (1.0 + occ_k * (screen_occlusion(i.clip, i.world, n) - 1.0)); }
     // the game applies its horizon occlusion to the specular ambient only (never to diffuse ambient, never to hair)
     var col = direct * sh * ao_direct + kd * albedo * amb_d * ao + env * fr_v * ao_s + emissive;
     col += pearl * pow(1.0 - ndv, 2.0) * 0.6;
