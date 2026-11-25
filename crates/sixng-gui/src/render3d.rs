@@ -40,6 +40,9 @@ pub struct FrameU {
     pub misc3: [f32; 4],
     pub prev_view_proj: [[f32; 4]; 4],
     pub jitter: [f32; 4],
+    /// x: strand dither index, y, z: the target's width and height in pixels
+    /// (1e9 in the sun shadow pass, with x the strand widening factor)
+    pub frame: [f32; 4],
     /// The sun shadow map's view-projection (all zero: no shadow map).
     pub light_view_proj: [[f32; 4]; 4],
 }
@@ -52,6 +55,9 @@ struct MatU {
     /// Fabric detail tile: UV scale, rotation, the tile's mean grey value,
     /// 1 = bound.
     tile: [f32; 4],
+    /// x: how bright an emissive material lights, times the frame's
+    /// emissive level (`glb::emissive_scale`); y, z, w unused.
+    emis: [f32; 4],
 }
 
 #[repr(C)]
@@ -86,6 +92,58 @@ pub struct LineV {
     pub col: [u8; 4],
 }
 
+/// Vertex of the ground shadow (shader `GIn`).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GroundV {
+    pos: [f32; 3],
+    /// place in the blob (m from its centre), its half size
+    rect: [f32; 4],
+    /// softness (m), darkness
+    k: [f32; 2],
+}
+
+/// A soft shadow on the ground under a model. Not a shadow map: two blurred
+/// rounded boxes from the model's bounds, a dark one right under it (what
+/// the model hides of the sky) and a wider, lighter one pushed away from
+/// the sun.
+#[derive(Clone, Copy)]
+pub struct GroundShadow {
+    /// Centre of the model's footprint, on the ground.
+    pub centre: Vec3,
+    /// Half size of the footprint along x and z.
+    pub half: [f32; 2],
+    /// Height of the model over the ground.
+    pub height: f32,
+}
+
+impl GroundShadow {
+    fn verts(&self, sun: Vec3, sun_intensity: f32) -> Vec<GroundV> {
+        let m = self.half[0].min(self.half[1]);
+        // away from the sun, by a part of the model's height (most of a
+        // model's bulk is low; a low sun must not throw the blob far off)
+        let off = -Vec3::new(sun.x, 0.0, sun.z) / sun.y.max(0.4) * self.height * 0.22;
+        let mut out = Vec::with_capacity(12);
+        let mut quad = |c: Vec3, half: [f32; 2], soft: f32, dark: f32| {
+            let (ex, ez) = (half[0] + soft, half[1] + soft);
+            let v = |sx: f32, sz: f32| GroundV {
+                pos: [c.x + sx * ex, c.y, c.z + sz * ez],
+                rect: [sx * ex, sz * ez, half[0], half[1]],
+                k: [soft, dark],
+            };
+            out.extend([v(-1.0, -1.0), v(1.0, -1.0), v(1.0, 1.0), v(-1.0, -1.0), v(1.0, 1.0), v(-1.0, 1.0)]);
+        };
+        quad(
+            self.centre + off,
+            [self.half[0] + off.x.abs() * 0.5, self.half[1] + off.z.abs() * 0.5],
+            0.5 * m + 0.15 * self.height,
+            0.45 * sun_intensity.clamp(0.0, 1.0),
+        );
+        quad(self.centre, self.half, 0.35 * m, 0.65);
+        out
+    }
+}
+
 /// Lighting and view settings for one frame.
 #[derive(Clone)]
 pub struct Look {
@@ -94,6 +152,12 @@ pub struct Look {
     pub finish: u32,
     /// The vehicle's own paint finish (metalness, roughness), for finish 4.
     pub stored_finish: [f32; 2],
+    /// The coat of the vehicle's body paint, for finish 4: clear coat
+    /// intensity (0 = none) and roughness, flake orientation (0 = no
+    /// flakes) and flake size.
+    pub coat: [f32; 4],
+    /// The coat's base coat roughness, when the coat overrides it.
+    pub coat_base: Option<f32>,
     /// How much of the second layer of vehicle part surfaces shows (0 to 1).
     pub wear: f32,
     pub slot: u32,
@@ -129,6 +193,8 @@ impl Default for Look {
             rma_order: 3,
             finish: 0,
             stored_finish: [0.0, 0.12],
+            coat: [0.0; 4],
+            coat_base: None,
             wear: 0.0,
             slot: 0,
             paint: [0.55, 0.02, 0.02],
@@ -453,6 +519,9 @@ pub struct Renderer3D {
     pipe_lines: wgpu::RenderPipeline,
     pipe_lines_top: wgpu::RenderPipeline,
     pipe_sky: wgpu::RenderPipeline,
+    pipe_ground: wgpu::RenderPipeline,
+    /// Shadow to draw on the ground under the model (shaded mode only).
+    pub ground: Option<GroundShadow>,
     bgl_frame: wgpu::BindGroupLayout,
     bgl_mat: wgpu::BindGroupLayout,
     frame_ub: wgpu::Buffer,
@@ -1103,6 +1172,21 @@ impl Renderer3D {
             None,
             depth(false, wgpu::CompareFunction::Always),
         );
+        let gattrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x2];
+        let pipe_ground = mk(
+            "ground shadow",
+            &layout_frame,
+            "vs_ground",
+            "fs_ground",
+            &[Some(wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<GroundV>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &gattrs,
+            })],
+            wgpu::PrimitiveTopology::TriangleList,
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+            depth(false, wgpu::CompareFunction::Greater),
+        );
         let frame_ub = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("frame ub"),
             size: std::mem::size_of::<FrameU>() as u64,
@@ -1348,6 +1432,8 @@ impl Renderer3D {
             pipe_lines,
             pipe_lines_top,
             pipe_sky,
+            pipe_ground,
+            ground: None,
             bgl_frame,
             bgl_mat,
             frame_ub,
@@ -1659,6 +1745,7 @@ impl Uploader {
             ramp: None,
             parts: false,
             occlusion_only: false,
+            emissive_scale: 1.0,
             slots: vec![],
             gap: "ok".into(),
             shader_hash: String::new(),
@@ -1709,7 +1796,11 @@ impl Uploader {
                 // bit 11: a lamp's emissive mesh (standard_vehicle_emissive_animated_bones)
                 | if mt.name.ends_with("29648098") { 0x800 } else { 0 }
                 // bit 13: the packed map is a vehicle material map, blue = occlusion
-                | if mt.occlusion_only { 0x2000 } else { 0 };
+                | if mt.occlusion_only { 0x2000 } else { 0 }
+                // bit 14: the emissive slot holds the part ramp image, whose
+                // rows 512.. are the parts' surfaces (low and high metalness
+                // and roughness)
+                | if mt.ramp.is_some() && mt.emissive.is_none() { 0x4000 } else { 0 };
             let u = MatU {
                 base,
                 flags: [has, class_id(&mt.class), alpha, gap | mr],
@@ -1721,6 +1812,7 @@ impl Uploader {
                     (None, Some(_)) => [0.0, 0.0, 0.0, 2.0],
                     _ => [0.0; 4],
                 },
+                emis: [mt.emissive_scale, 0.0, 0.0, 0.0],
             };
             let o = k * MAT_STRIDE as usize;
             mat_bytes[o..o + std::mem::size_of::<MatU>()].copy_from_slice(bytemuck::bytes_of(&u));
@@ -1750,7 +1842,7 @@ impl Uploader {
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
-                        resource: wgpu::BindingResource::TextureView(view(mt.emissive.or(mt.ramp.filter(|_| mt.ramp_u.is_some() && mt.detail.is_none())))),
+                        resource: wgpu::BindingResource::TextureView(view(mt.emissive.or(mt.ramp))),
                     },
                     wgpu::BindGroupEntry {
                         binding: 5,
@@ -2057,14 +2149,16 @@ impl Renderer3D {
         let vp = cam.proj(aspect) * cam.view();
         let lin = |c: [f32; 3]| [c[0], c[1], c[2], 1.0];
         let mut paint1 = lin(look.paint);
-        paint1[3] = look.stored_finish[1];
+        paint1[3] = look.coat_base.unwrap_or(look.stored_finish[1]);
+        let mut sky_top = lin(look.sky_top);
+        sky_top[3] = look.coat[3];
         FrameU {
             view_proj: vp.to_cols_array_2d(),
             inv_view_proj: vp.inverse().to_cols_array_2d(),
             cam_pos: cam.eye().extend(1.0).to_array(),
             sun_dir: look.sun_dir.extend(look.sun_intensity).to_array(),
             sun_col: lin(look.sun_col),
-            sky_top: lin(look.sky_top),
+            sky_top,
             sky_hor: [
                 look.sky_hor[0],
                 look.sky_hor[1],
@@ -2093,8 +2187,9 @@ impl Renderer3D {
                 look.stored_finish[0],
             ],
             prev_view_proj: vp.to_cols_array_2d(),
-            // w: vehicle wear (0 to 1)
-            jitter: [self.dither_frame, self.target.as_ref().map_or(aspect * 1080.0, |t| t.size[0] as f32), self.target.as_ref().map_or(1080.0, |t| t.size[1] as f32), look.wear],
+            // xyz: the body paint's coat; w: vehicle wear (0 to 1)
+            jitter: [look.coat[0], look.coat[1], look.coat[2], look.wear],
+            frame: [self.dither_frame, self.target.as_ref().map_or(aspect * 1080.0, |t| t.size[0] as f32), self.target.as_ref().map_or(1080.0, |t| t.size[1] as f32), 0.0],
             light_view_proj: self.light_vp,
         }
     }
@@ -2298,7 +2393,7 @@ impl Renderer3D {
                 // strand ribbons open towards the light at their own width: the game's sun shadow pass draws strands
                 // solid and has no minimum width (a target size this large makes the minimum vanish)
                 f.cam_pos = (c + l * 1000.0).extend(1.0).to_array();
-                f.jitter = [0.0, 1.0e9, 1.0e9, f.jitter[3]];
+                f.frame = [0.0, 1.0e9, 1.0e9, 0.0];
                 shadow_fu = Some(f);
             }
         }
@@ -2327,7 +2422,7 @@ impl Renderer3D {
                         slots = (slots + 1).min(self.shadow_extra.len() as u32);
                         me.shadow_slot.store(slots, std::sync::atomic::Ordering::Relaxed);
                         let mut g = *sf;
-                        g.jitter[0] = m / n;
+                        g.frame[0] = m / n;
                         queue.write_buffer(&self.shadow_extra[slots as usize - 1].0, 0, bytemuck::bytes_of(&g));
                     }
                 }
@@ -2350,6 +2445,18 @@ impl Renderer3D {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("lines top"),
                 contents: bytemuck::cast_slice(lines_on_top),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        });
+        // the ground shadow: shaded view, seen from above the ground
+        let gv = self
+            .ground
+            .filter(|g| look.mode == 0 && cam.eye().y > g.centre.y)
+            .map(|g| g.verts(look.sun_dir, look.sun_intensity));
+        let gb = gv.as_ref().map(|v| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("ground shadow"),
+                contents: bytemuck::cast_slice(v),
                 usage: wgpu::BufferUsages::VERTEX,
             })
         });
@@ -2477,6 +2584,14 @@ impl Renderer3D {
             );
             self.fb_draws = [fm, fc];
             draws += fm + fc;
+            // on the far ground behind the model, under everything see-through
+            if let (Some(gb), Some(gv)) = (&gb, &gv) {
+                pass.set_pipeline(&self.pipe_ground);
+                pass.set_bind_group(0, &self.default_frame_bg, &[]);
+                pass.set_vertex_buffer(0, gb.slice(..));
+                pass.draw(0..gv.len() as u32, 0..1);
+                draws += 1;
+            }
             if self.decal_bias {
                 draws += Self::draw_cells(
                     &mut pass,

@@ -24,7 +24,9 @@ pub struct Vertex {
     /// second colour stream, GLB `_COLOR1`; 0 where the model has none),
     /// `[1]` which model of an assembled vehicle the vertex came from
     /// (0 = the vehicle itself, 1.. = fitted parts), `[2]` 1 when the model
-    /// has the stream (a mesh without it carries no stickers).
+    /// has the stream (a mesh without it carries no stickers), `[3]` on
+    /// people the vertex's region for the hide masks of clothes (first byte
+    /// of GLB `_REGION`; 0 = none).
     pub zone: [u8; 4],
 }
 
@@ -237,6 +239,10 @@ pub struct Material {
     /// The packed slot holds a vehicle layer's material map
     /// (`lyr0materialatex`): only its blue channel is used, as occlusion.
     pub occlusion_only: bool,
+    /// How much brighter (or dimmer) than the viewer's emissive level an
+    /// emissive material lights, from the GLB's emissive strength
+    /// (`emissive_scale`); 1 when the export does not say.
+    pub emissive_scale: f32,
     pub slots: Vec<Slot>,
     /// worst slot status: ok / lowmip / flat
     pub gap: String,
@@ -631,10 +637,8 @@ fn write_bc(sp: &Path, mips: &[(u32, u32, Vec<u8>)], bc: &crate::bc::Bc) {
         out.extend_from_slice(l);
     }
     let _ = std::fs::create_dir_all(sp.parent().unwrap());
-    let tmp = sp.with_extension("tmp");
-    if std::fs::write(&tmp, &out).is_ok() {
+    if sixng_core::atomic::write(sp, &out).is_ok() {
         BC64_BYTES.fetch_add(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        let _ = std::fs::rename(&tmp, sp);
     }
 }
 
@@ -655,23 +659,15 @@ fn reduce_to(mut img: (u32, u32, Vec<u8>), size: u32) -> (u32, u32, Vec<u8>) {
     img
 }
 
-/// Write a reduced copy (best effort, via a temporary file) and count its bytes.
+/// Write a reduced copy (best effort, temp file + rename) and count its bytes.
 fn write_small(sp: &Path, img: &(u32, u32, Vec<u8>), counter: &std::sync::atomic::AtomicU64) {
     let _ = std::fs::create_dir_all(sp.parent().unwrap());
-    let tmp = sp.with_extension("tmp");
-    if image::save_buffer_with_format(
-        &tmp,
-        &img.2,
-        img.0,
-        img.1,
-        image::ExtendedColorType::Rgba8,
-        image::ImageFormat::Png,
-    )
-    .is_ok()
+    let mut png = Vec::new();
+    let enc = image::codecs::png::PngEncoder::new(&mut png);
+    if image::ImageEncoder::write_image(enc, &img.2, img.0, img.1, image::ExtendedColorType::Rgba8).is_ok()
+        && sixng_core::atomic::write(sp, &png).is_ok()
     {
-        let n = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
-        counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-        let _ = std::fs::rename(&tmp, sp);
+        counter.fetch_add(png.len() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -895,16 +891,19 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             // channel is an occlusion factor on the diffuse and the specular
             // side (read from the paint shader); red and green blend the
             // surface's metalness and roughness, which the export has
-            // already done per model. Not on the Metal renderer, which
+            // already done per model. Not in a Metal 4 build, whose renderer
             // reads a packed map as roughness / metalness.
-            if t["param_hash"] == "2bb2ede8" && packed.is_none() && !opts.base_only && tiny_png(&t).is_none() && status == "ok" && cfg!(not(target_os = "macos")) {
+            if t["param_hash"] == "2bb2ede8" && packed.is_none() && !opts.base_only && tiny_png(&t).is_none() && status == "ok" && !crate::METAL4_BUILD {
                 if let Some(p) = &png {
                     packed = add_img(out_root.join(p), false, &mut images);
                     occlusion_only = packed.is_some();
                 }
             }
+            // The colour map lights only shaders without an emissive map of
+            // their own (`emissive_source`; older exports do not say).
             if class == "emissive"
                 && emissive.is_none()
+                && !matches!(ex["emissive_source"].as_str(), Some("none" | "emissive_map"))
                 && (role == "colour" || role == "base_colour")
             {
                 if let Some(p) = &png {
@@ -953,6 +952,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             } else {
                 (alpha_mode, base_factor)
             };
+        let emissive_scale = emissive_scale(&m);
         materials.push(Material {
             name: m["name"].as_str().unwrap_or("").into(),
             class,
@@ -974,6 +974,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             ramp: None,
             parts: ex["classification"]["stand_in"] == "parts",
             occlusion_only,
+            emissive_scale,
             slots,
             gap: gap.into(),
             shader_hash: ex["shader_name_hash"].as_str().unwrap_or("").into(),
@@ -1133,6 +1134,12 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                 let c = d.u8x4(a as usize)?;
                 for i in 0..n.min(c.len()) {
                     v[i].zone = [c[i][3], 0, 1, 0];
+                }
+            }
+            if let Some(a) = at["_REGION"].as_u64() {
+                let c = d.u8x4(a as usize)?;
+                for i in 0..n.min(c.len()) {
+                    v[i].zone[3] = c[i][0];
                 }
             }
             if let Some(a) = at["COLOR_0"].as_u64() {
@@ -1371,6 +1378,26 @@ pub fn load_anims(path: &Path) -> Result<Vec<Anim>> {
     Ok(out)
 }
 
+/// The glTF emissive strength of a material: `emissiveFactor` (its
+/// brightest channel) x `KHR_materials_emissive_strength`. 1 when the
+/// material does not say.
+pub fn gltf_emissive_strength(m: &Value) -> f32 {
+    let f = m["emissiveFactor"].as_array().map(|a| a.iter().filter_map(|v| v.as_f64()).fold(0.0f64, f64::max)).unwrap_or(1.0);
+    let x = m["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"].as_f64().unwrap_or(1.0);
+    (f * x) as f32
+}
+
+/// The viewer's scale for an emissive material, from its glTF strength
+/// (1.0 = 100 nits, from the game's `emissivemultiplier`). The game's
+/// range (a glass railing at 0.05, a bulb at 6, an LED sign at 32) is far
+/// wider than the viewer's fixed exposure shows: a linear scale makes the
+/// dim ones black and the bright ones a flat white. The square root, kept
+/// between 0.25 and 3, keeps them in order while dim lights stay visible
+/// and bright signs keep their colours.
+pub fn emissive_scale(m: &Value) -> f32 {
+    gltf_emissive_strength(m).max(0.0).sqrt().clamp(0.25, 3.0)
+}
+
 #[cfg(test)]
 mod bench {
     use super::*;
@@ -1443,5 +1470,31 @@ mod tangent_tests {
         assert!(m[0].tan[0] < -0.99);
         assert!(bitangent(&m[0])[1] < -0.99);
         assert!(v[0].tan[3] != m[0].tan[3], "mirroring flips the sign");
+    }
+}
+
+#[cfg(test)]
+mod emissive_tests {
+    use super::*;
+
+    #[test]
+    fn emissive_scale_follows_the_gltf_strength() {
+        let m = |f: f64, x: Option<f64>| {
+            let mut m = serde_json::json!({"emissiveFactor": [f, f, f]});
+            if let Some(x) = x {
+                m["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"] = serde_json::json!(x);
+            }
+            m
+        };
+        // no strength said: as before
+        assert_eq!(emissive_scale(&serde_json::json!({})), 1.0);
+        assert_eq!(emissive_scale(&m(1.0, None)), 1.0);
+        // glass railings (0.05): kept visible
+        assert_eq!(emissive_scale(&m(0.05, None)), 0.25);
+        // a bulb (6.28) is brighter than the default, an LED sign (32) brighter still, up to 3
+        let bulb = emissive_scale(&m(1.0, Some(6.28)));
+        assert!((bulb - 6.28f32.sqrt()).abs() < 1e-5);
+        assert_eq!(emissive_scale(&m(1.0, Some(32.3))), 3.0);
+        assert!((gltf_emissive_strength(&m(1.0, Some(32.3))) - 32.3).abs() < 1e-4);
     }
 }

@@ -151,7 +151,7 @@ impl App {
     /// Rebuild the views that hold the game / work folders.
     pub(crate) fn rebuild_views(&mut self) {
         self.model = crate::model_view::ModelView::new(&self.game, &self.work);
-        self.map2d = crate::map2d::Map2D::new(&self.work);
+        self.map2d = crate::map2d::Map2D::new(&self.game, &self.work);
         self.map3d = crate::map3d::Map3D::new(&self.game, &self.work);
         self.map3d.load_settings();
         self.textures = crate::texture_view::TextureView::new(&self.game, &self.work);
@@ -617,7 +617,7 @@ impl App {
                     dirs.push((rel, b, f));
                 }
                 let snap = Snapshot { when: now(), dirs };
-                let _ = std::fs::write(
+                let _ = sixng_core::atomic::write(
                     w.join("status_snapshot.json"),
                     serde_json::to_vec(&snap).unwrap_or_default(),
                 );

@@ -1,5 +1,7 @@
 //! sixng-core: GTA VI (RPF9, Xbox Series) asset extraction core.
 pub mod anim;
+pub mod atomic;
+pub mod fragphys;
 pub mod cutscene;
 pub mod audio;
 pub mod audiometa;
@@ -63,14 +65,18 @@ pub mod vehcolour;
 pub mod vehlights;
 pub mod weapon;
 pub mod rpf9;
+pub mod rpf9toc;
+pub mod gamecipher;
 pub mod scan;
 pub mod sectorgrid;
+pub mod storyflow;
 pub mod shaderfx;
 pub mod surface;
 pub mod timecycle;
+pub mod water;
 pub mod world;
 
-pub const INDEX_VERSION: &str = "6";
+pub const INDEX_VERSION: &str = "8";
 
 /// Per-user settings folder for SixNG: `%APPDATA%\SixNG` on Windows,
 /// `~/Library/Application Support/SixNG` on macOS, `$XDG_CONFIG_HOME/SixNG`

@@ -17,16 +17,17 @@
 //! other sections (A0/A1/A3-A7, B1-B3, B6, B7, Q0-Q3, the tail weights) are
 //! not decoded.
 //!
-//! Which groom belongs to which ped is not stored in any resource found so
-//! far (the 3-vertex hair / beard / brows placeholder drawables carry only
-//! their own name hash). Grooms come in LOD chains (consecutive resources
-//! with the same bones and fewer strands each time).
+//! Which grooms belong to a hair asset is stored through name ids (the
+//! asset's placeholder name, the piece table, the file ids of the table of
+//! contents): see `hairlink`. Grooms come in LOD chains (consecutive
+//! resources with the same bones and fewer strands each time).
 use crate::resource::Resource;
 use anyhow::{anyhow, bail, Result};
 
 pub const TYPE_GROOM: u8 = 3;
 pub const GROOM_TAG: u32 = 0x7d8f_3db3;
 
+#[derive(Clone)]
 pub struct Groom {
     pub strands: usize,
     pub points_per_strand: usize,
@@ -393,7 +394,7 @@ impl Groom {
     /// Ribbon GLB with one plain material of colour `rgb` (linear).
     pub fn ribbon_glb(&self, name: &str, half_width: f32, rgb: [f32; 3], extras: serde_json::Value) -> Vec<u8> {
         let (positions, normals, uv, indices) = self.ribbons(half_width);
-        let prim = crate::gltf::TriPrim { name: name.to_string(), positions, normals: Some(normals), tangents: None, uvs: vec![uv], colors: None, colors1: None, tint: None, indices, material: Some(0), joints: None, weights: None, joints1: None, weights1: None };
+        let prim = crate::gltf::TriPrim { name: name.to_string(), positions, normals: Some(normals), tangents: None, uvs: vec![uv], colors: None, colors1: None, regions: None, tint: None, indices, material: Some(0), joints: None, weights: None, joints1: None, weights1: None };
         let mat = crate::gltf::Material {
             name: "hair".into(),
             base_color_uri: None,
@@ -418,14 +419,21 @@ impl Groom {
     /// the game's own count is a run-time number, and so is the scale of
     /// the density byte (here the densest triangle always takes a strand).
     /// Clumping and curl belong to other variants of the program and are
-    /// not decoded. Same strands for the same groom and share. Empty
-    /// without B6.
+    /// not decoded; a piece that stores only clump strands (c0 = 0
+    /// everywhere) is grown from c1 the same way. Same strands for the
+    /// same groom and share. Empty without B6.
     pub fn coat(&self, share: f32) -> Coat {
         use crate::hairgen;
         let k = self.points_per_strand;
         let mut c = Coat { k, points: Vec::new(), guides: Vec::new(), normals: Vec::new(), variants: Vec::new(), stored: self.stored_strands() };
         let n = (c.stored as f32 * share.clamp(0.0, 1.0)).round() as usize;
-        let density: Vec<u8> = self.tri_counts.iter().map(|q| q[0]).collect();
+        let mut density: Vec<u8> = self.tri_counts.iter().map(|q| q[0]).collect();
+        // A piece whose strands are all clump strands (first byte 0 in every
+        // triangle, e.g. the top of a short men's cut) would grow nothing:
+        // its second count stands in, and the strands grow unclumped.
+        if density.iter().all(|&d| d == 0) {
+            density = self.tri_counts.iter().map(|q| q[1]).collect();
+        }
         let top = density.iter().copied().max().unwrap_or(0);
         if n == 0 || top == 0 || density.len() != self.roots.len() {
             return c;
@@ -585,7 +593,7 @@ impl Groom {
                 idx.extend_from_slice(&[v0, v0 + 1, v0 + 3, v0, v0 + 3, v0 + 2]);
             }
         }
-        let prim = crate::gltf::TriPrim { name: name.to_string(), positions: pos, normals: Some(nrm), tangents: Some(tan), uvs: if uv0.is_empty() { vec![] } else { vec![uv0, uv1] }, colors: None, colors1: None, tint: Some(tint), indices: idx, material: Some(0), joints: None, weights: None, joints1: None, weights1: None };
+        let prim = crate::gltf::TriPrim { name: name.to_string(), positions: pos, normals: Some(nrm), tangents: Some(tan), uvs: if uv0.is_empty() { vec![] } else { vec![uv0, uv1] }, colors: None, colors1: None, regions: None, tint: Some(tint), indices: idx, material: Some(0), joints: None, weights: None, joints1: None, weights1: None };
         let mat = crate::gltf::Material {
             name: "fur".into(),
             base_color_uri: None,
@@ -603,7 +611,7 @@ impl Groom {
         let (positions, normals, uv, indices) = self.ribbons(half_width);
         let per = self.points_per_strand * 4;
         let tint: Vec<[u8; 4]> = (0..positions.len()).map(|i| strand_rgb.get(i / per.max(1)).map_or([255; 4], |c| [c[0], c[1], c[2], 255])).collect();
-        let prim = crate::gltf::TriPrim { name: name.to_string(), positions, normals: Some(normals), tangents: None, uvs: vec![uv], colors: None, colors1: None, tint: Some(tint), indices, material: Some(0), joints: None, weights: None, joints1: None, weights1: None };
+        let prim = crate::gltf::TriPrim { name: name.to_string(), positions, normals: Some(normals), tangents: None, uvs: vec![uv], colors: None, colors1: None, regions: None, tint: Some(tint), indices, material: Some(0), joints: None, weights: None, joints1: None, weights1: None };
         let mat = crate::gltf::Material {
             name: "fur".into(),
             base_color_uri: None,
@@ -772,7 +780,7 @@ pub fn catalog_cached(work: &std::path::Path, a: &crate::game::ArchiveInfo, all:
     }
     let v = catalog(a, all)?;
     std::fs::create_dir_all(p.parent().unwrap())?;
-    std::fs::write(&p, serde_json::to_vec(&v)?)?;
+    crate::atomic::write(&p, serde_json::to_vec(&v)?)?;
     Ok(v)
 }
 
@@ -829,7 +837,7 @@ pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], o
                 extras["full_strands"] = serde_json::json!({"written": c.guides.len(), "stored": c.stored,
                     "note": "strands grown between the guides from the stored per-triangle counts (barycentric blend of three guides); the game's placement, clumping, curl and noise are not decoded"});
             }
-            if full.is_some() && std::fs::write(dir.join(format!("{:x}.growth.json", e.off)), g.growth_json().to_string()).is_err() {
+            if full.is_some() && crate::atomic::write(dir.join(format!("{:x}.growth.json", e.off)), g.growth_json().to_string()).is_err() {
                 errors.fetch_add(1, Ordering::Relaxed);
             }
             let bytes = match (ribbons, &coat) {
@@ -845,7 +853,7 @@ pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], o
                 }
             };
             let file = dir.join(format!("{:x}.glb", e.off));
-            if std::fs::write(&file, bytes).is_err() {
+            if crate::atomic::write(&file, bytes).is_err() {
                 errors.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
@@ -863,7 +871,7 @@ pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], o
         text.push_str(&r.1);
         text.push('\n');
     }
-    std::fs::write(dir.join("index.jsonl"), text)?;
+    crate::atomic::write(dir.join("index.jsonl"), text)?;
     Ok((n, errors.into_inner()))
 }
 
@@ -963,6 +971,9 @@ mod tests {
         assert_eq!(g.coat(1.0).points, c.points);
         let q = g.coat(0.25).guides.len();
         assert!((12..=13).contains(&q), "{q}");
+        // a piece of clump strands only still grows
+        let clumps = Groom { tri_counts: vec![[0, 30, 4, 0]], ..g.clone() };
+        assert_eq!(clumps.coat(1.0).guides.len(), 30);
         // 50 strands x 2 points x 2 vertices; coloured from the guides
         let glb = g.coat_glb("t", &c, 0.001, &[[255, 0, 0], [255, 0, 0], [255, 0, 0]], serde_json::json!({}));
         assert_eq!(&glb[0..4], b"glTF");

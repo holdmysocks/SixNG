@@ -187,7 +187,7 @@ pub fn get(game_root: &Path) -> Result<&'static PartSkins, String> {
             return Err("no animal material presets found in packs.rpf".into());
         }
         if let Ok(b) = serde_json::to_vec(&t) {
-            let _ = std::fs::write(&cache, b);
+            let _ = crate::atomic::write(&cache, b);
         }
         Ok(t)
     })

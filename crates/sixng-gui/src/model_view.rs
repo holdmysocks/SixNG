@@ -316,11 +316,15 @@ pub struct HairPick {
     pub slot: String,
     /// The placeholder the grooms were placed under.
     pub placeholder: String,
-    /// Model probability of the placement (0..1); under 0.5 it is a guess
-    /// and starts hidden.
+    /// 1 for a link read from the game. For an inferred one the model
+    /// probability of the placement (0..1); under 0.5 it is a guess and
+    /// starts hidden.
     pub confidence: f32,
+    /// The link was read from the game (`HairLinks::exact`), not inferred.
+    pub exact: bool,
     pub grooms: Vec<u64>,
-    /// Pieces left out because their strand roots do not lie on this head.
+    /// Pieces of an inferred link left out because their strand roots do
+    /// not lie on this head.
     pub off_head: usize,
     /// Shown when the character loads: confidence of 50 % or more, or 20 %
     /// or more with every piece rooted on this head.
@@ -394,6 +398,11 @@ pub struct PartFx {
     pub heel: bool,
     /// Heads: the painted hair layers of the outfit's hair items.
     pub under: Vec<UnderPaint>,
+    /// The layer the item's vertex regions belong to (upper body skin
+    /// `b4d9d470`, lower body skin `e0622b84`, …); 0 when not known.
+    pub region_layer: u32,
+    /// The item's hide masks: layer -> 256-bit region set (hex).
+    pub hides: Vec<(u32, String)>,
 }
 
 /// The strand count rule of a piece from its hair LOD preset (a record of the parsed presets) and the first
@@ -760,11 +769,14 @@ pub struct ModelView {
     /// bone it aims at).
     aims: Vec<(usize, usize)>,
     /// Brake disc and caliper models at the wheels.
-    brakes: Vec<(bool, GpuModel)>,
-    brake_pending: Arc<Mutex<Option<Vec<(bool, Loaded)>>>>,
+    /// (turns with the wheel, on the front / rear axle, model)
+    brakes: Vec<(bool, [bool; 2], GpuModel)>,
+    brake_pending: Arc<Mutex<Option<Vec<(bool, [bool; 2], Loaded)>>>>,
     brake_key: String,
     brake_loading: bool,
-    veh_brake: (Option<String>, Option<String>),
+    veh_brake: sixng_core::vehexport::AxleBrakes,
+    /// The rim light ring per axle (`lights_rims` parts), by model name.
+    veh_rim_light: [Option<String>; 2],
     pub paint_on: bool,
     /// Side-panel controls that apply to the loaded model, keyed by (GLB path, triangles).
     caps: Option<(PathBuf, usize, Caps)>,
@@ -824,6 +836,8 @@ pub struct ModelView {
     veh_no_wheels: bool,
     /// Bounding boxes of the loaded wheel models (rim, tyre).
     wheel_boxes: Vec<[[f32; 3]; 2]>,
+    /// Height of the lowest point of the fitted wheels (None without wheels).
+    wheel_floor: Option<f32>,
     /// Width factor per wheel mount (two-wheelers), and what it was made for.
     /// and the arch-fit factor on the whole wheel: [width, fit].
     wheel_xs: (String, Vec<[f32; 2]>),
@@ -838,6 +852,8 @@ pub struct ModelView {
     pub picker: crate::model_picker::ModelPicker,
     /// Set when the user asks to open a material's texture in the Textures tab.
     pub view_texture: Option<u64>,
+    /// Set when the user asks for a character's cutscenes (outfit prefix).
+    pub open_scenes: Option<String>,
     pub show_picker: bool,
     pub hair: Hair,
 }
@@ -1088,7 +1104,8 @@ impl ModelView {
             brake_pending: Arc::new(Mutex::new(None)),
             brake_key: String::new(),
             brake_loading: false,
-            veh_brake: (None, None),
+            veh_brake: Default::default(),
+            veh_rim_light: Default::default(),
             paint_on: true,
             caps: None,
             material_sel: None,
@@ -1127,6 +1144,7 @@ impl ModelView {
             veh_applied: String::new(),
             veh_no_wheels: false,
             wheel_boxes: Vec::new(),
+            wheel_floor: None,
             wheel_xs: (String::new(), Vec::new()),
             veh_cfg: None,
             wheel_pending: Arc::new(Mutex::new(Vec::new())),
@@ -1137,6 +1155,7 @@ impl ModelView {
             view_texture: None,
             show_picker: true,
             hair: Hair::default(),
+            open_scenes: None,
         }
     }
 
@@ -1370,7 +1389,7 @@ impl ModelView {
                             .collect();
                         g.ribbon_glb_coloured(&format!("groom_{off:x}"), hw, &cols, serde_json::json!({}))
                     };
-                    std::fs::write(&p, glb_bytes)?;
+                    sixng_core::atomic::write(&p, glb_bytes)?;
                     let mut gm = glb::load(&p, &dir)?;
                     if let Some(mut l) = lod.filter(|l| gm.meshes.len() == 1 && l.strands > 0 && gm.meshes[0].indices.len() as u32 % l.strands == 0) {
                         // the piece's extent: the largest half-size of its box
@@ -1733,12 +1752,19 @@ impl ModelView {
             self.ped_clip.loading = true;
             self.ped_clip.status = format!("loading {want} …");
             let names: Vec<String> = l.model.joints.iter().map(|j| j.name.clone()).collect();
+            let model = l.base.split_once("#outfit:").map(|x| x.1.split('#').next().unwrap_or("").to_string()).unwrap_or_default();
             let (game, work, slot, ctx2) = (PathBuf::from(&self.game), PathBuf::from(&self.work), self.ped_clip.pending.clone(), ctx.clone());
             std::thread::spawn(move || {
                 let r = (|| -> anyhow::Result<(glb::Anim, Vec<sixng_core::anim::ClipTrack>, String)> {
                     // "<dictionary>/<clip>", or a dictionary alone: then its `move` or `idle` clip, else the first that binds an animation
                     let (dq, cq) = want.rsplit_once('/').unwrap_or((want.as_str(), ""));
-                    let (_, d) = sixng_core::anim::load_dictionary(&game, &work, dq)?;
+                    // a cutscene (`cin@<scene>[/<clip>]`): its sections joined; no clip = this character's own
+                    let (d, cq) = if crate::scenes_view::is_scene(dq) {
+                        crate::scenes_view::scene_clip(&game, &work, dq, cq, &model)?
+                    } else {
+                        (sixng_core::anim::load_dictionary(&game, &work, dq)?.1, cq.to_string())
+                    };
+                    let cq = cq.as_str();
                     let c = if cq.is_empty() {
                         let bound: Vec<&sixng_core::anim::Clip> = d.clips.iter().filter(|c| c.kind == 1 && !c.bindings.is_empty()).collect();
                         ["move", "idle"].iter().find_map(|n| bound.iter().find(|c| c.short_name() == *n).copied()).or(bound.first().copied()).ok_or_else(|| anyhow::anyhow!("{} holds no clip with animation data that is decoded (its {} clip(s) bind none here)", d.name, d.clips.len()))?
@@ -1931,7 +1957,14 @@ impl ModelView {
         let l = self.loaded.as_ref()?;
         let look = l.look.as_ref()?;
         let mut reload = None;
-        ui.heading("Character");
+        ui.horizontal(|ui| {
+            ui.heading("Character");
+            if let Some((_, p)) = l.base.split_once("#outfit:") {
+                if ui.button("🎬 Open in scenes").on_hover_text("The Scenes tab, filtered to every cutscene with this character in the cast").clicked() {
+                    self.open_scenes = Some(p.split('#').next().unwrap_or(p).to_string());
+                }
+            }
+        });
         egui::Grid::new("look_grid").num_columns(2).show(ui, |ui| {
             ui.label("Outfit");
             let text = |k: usize| format!("{}: {}", k + 1, look.labels.get(k).map(String::as_str).unwrap_or("?"));
@@ -2062,7 +2095,7 @@ impl ModelView {
             if !self.ped_clip.status.is_empty() {
                 ui.label(egui::RichText::new(&self.ped_clip.status).weak().small());
             }
-            ui.label(egui::RichText::new("A clip of anim.rpf on this skeleton (`sixng clips --name <regex>` lists them). The Pose angles are added on top.").weak().small());
+            ui.label(egui::RichText::new("A clip of anim.rpf on this skeleton (`sixng clips --name <regex>` lists them), or a cutscene: cin@<scene> plays this character's clip of that scene. The Pose angles are added on top.").weak().small());
         });
         for n in &look.notes {
             ui.label(egui::RichText::new(n).weak().small());
@@ -2072,14 +2105,14 @@ impl ModelView {
             for h in &look.hair {
                 let mut on = !h.grooms.is_empty() && h.grooms.iter().all(|g| self.hair.selected.contains(g));
                 let name = h.placeholder.trim_end_matches("_full");
-                let mut text = format!("{}: {name} ({:.0} %)", h.slot, h.confidence * 100.0);
+                let mut text = if h.exact { format!("{}: {name}", h.slot) } else { format!("{}: {name} ({:.0} %)", h.slot, h.confidence * 100.0) };
                 if h.off_head > 0 {
                     text += &format!(", {} piece(s) not on this head left out", h.off_head);
                 }
                 if h.colour.is_some() {
                     text += ", stored colour";
                 }
-                if ui.checkbox(&mut on, text).on_hover_text("The strand grooms placed for this hair asset. Nothing in the game files links a hair asset to its strand files; they are placed by name words, archive order, piece counts and where the strand roots lie. The percentage is that model's probability of this placement. Shown at the start: 50 % or more, or 20 % or more when every piece is rooted on this head (a probable style, not a certain one). Pieces whose strand roots do not lie on this head are left out.").changed() {
+                if ui.checkbox(&mut on, text).on_hover_text(if h.exact { "The strand grooms of this hair asset, read from the game: the asset lists its pieces by the ids of their files." } else { "The strand grooms placed for this hair asset. The game's own link could not be read here (it needs the archive's table of contents), so they are placed by name words, archive order, piece counts and where the strand roots lie. The percentage is that model's probability of this placement. Shown at the start: 50 % or more, or 20 % or more when every piece is rooted on this head (a probable style, not a certain one). Pieces whose strand roots do not lie on this head are left out." }).changed() {
                     self.hair.selected.retain(|g| !h.grooms.contains(g));
                     if on {
                         self.hair.selected.extend(h.grooms.iter().copied());
@@ -2504,7 +2537,8 @@ impl ModelView {
                     let (rim, tyre) = self.plain_wheels();
                     self.wheel_rim = rim.into();
                     self.wheel_tyre = tyre.into();
-                    self.veh_brake = (None, None);
+                    self.veh_brake = Default::default();
+                    self.veh_rim_light = Default::default();
                     self.wheel_scale = sc;
                     self.wheel_scale_rear = sc;
                 }
@@ -2533,7 +2567,8 @@ impl ModelView {
                 let (rim, tyre) = self.plain_wheels();
                 self.wheel_rim = rim.into();
                 self.wheel_tyre = tyre.into();
-                self.veh_brake = (None, None);
+                self.veh_brake = Default::default();
+                self.veh_rim_light = Default::default();
                 self.apply_scale(v);
             }
         }
@@ -2791,12 +2826,45 @@ impl ModelView {
             }
             .into();
         }
-        // like the tyre: a configuration without brake parts takes those of
-        // another configuration of the vehicle
-        self.veh_brake = (
-            c.brake_disc.clone().or_else(|| v.configs.iter().find_map(|x| x.brake_disc.clone())),
-            c.caliper.clone().or_else(|| v.configs.iter().find_map(|x| x.caliper.clone())),
-        );
+        // Brakes per axle: named by model, or the model of a part in a
+        // brake slot (drums come that way). Like the tyre, a configuration
+        // without any brake part takes those of another configuration.
+        let brake_names: HashMap<u32, String> = self
+            .indexes
+            .lock()
+            .unwrap()
+            .values()
+            .flat_map(|ix| ix.entries.iter())
+            .filter_map(|e| e.name.as_deref())
+            .filter(|n| ["brakedisc_", "drumbrake_", "caliper_"].iter().any(|w| n.starts_with(w)))
+            .map(|n| {
+                let s = n.strip_suffix("_hi").unwrap_or(n);
+                (sixng_core::meta7a::joaat(s), s.to_string())
+            })
+            .collect();
+        let axles = |c: &crate::vehicle_db::Config| {
+            let slot_models: Vec<(u32, String)> = v
+                .mods
+                .iter()
+                .filter(|m| sixng_core::vehexport::BRAKE_SLOTS.contains(&m.slot) && c.parts.contains(&m.name))
+                .filter_map(|m| Some((m.slot, m.models.iter().find_map(|h| brake_names.get(h))?.clone())))
+                .collect();
+            sixng_core::vehexport::brake_axles(c.brake_disc.as_deref(), c.caliper.as_deref(), &slot_models)
+        };
+        let none = |b: &sixng_core::vehexport::AxleBrakes| b.iter().all(|a| a.0.is_none() && a.1.is_none());
+        let mut brakes = axles(c);
+        if none(&brakes) {
+            brakes = v.configs.iter().map(axles).find(|b| !none(b)).unwrap_or_default();
+        }
+        self.veh_brake = brakes;
+        // the rim light rings: only what this configuration's own parts give
+        let ring_models: Vec<(u32, String)> = v
+            .mods
+            .iter()
+            .filter(|m| sixng_core::vehexport::RIM_LIGHT_SLOTS.contains(&m.slot) && c.parts.contains(&m.name))
+            .filter_map(|m| Some((m.slot, m.models.iter().find_map(|h| brake_names.get(h))?.clone())))
+            .collect();
+        self.veh_rim_light = sixng_core::vehexport::rim_light_axles(&ring_models);
         self.veh_cfg = Some(i);
         self.apply_scale(v);
     }
@@ -2881,7 +2949,7 @@ impl ModelView {
         if let Some(ls) = self.brake_pending.lock().unwrap().take() {
             self.brake_loading = false;
             let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
-            self.brakes = ls.iter().map(|(disc, l)| (*disc, ren.upload(rs, &l.model, &[]))).collect();
+            self.brakes = ls.iter().map(|(disc, on, l)| (*disc, *on, ren.upload(rs, &l.model, &[]))).collect();
         }
         let spots: Vec<(String, Vec3, f32)> = self
             .loaded
@@ -2895,12 +2963,25 @@ impl ModelView {
                 Some((m["bone"].as_str()?.to_string(), Vec3::new(c[0], c[2], -c[1]), m["brake_radius"].as_f64()? as f32))
             })
             .collect();
-        let (disc, caliper) = if spots.is_empty() { (None, None) } else { self.veh_brake.clone() };
-        let key = format!("{disc:?}|{caliper:?}");
+        let axles = if spots.is_empty() { Default::default() } else { self.veh_brake.clone() };
+        let rings = if spots.is_empty() { Default::default() } else { self.veh_rim_light.clone() };
+        let key = format!("{axles:?}{rings:?}");
         if key != self.brake_key {
             self.brake_key = key;
             self.brakes.clear();
-            let qs: Vec<(bool, String)> = [(true, disc), (false, caliper)].into_iter().filter_map(|(d, n)| n.map(|n| (d, format!("^{n}_hi$")))).collect();
+            // each distinct model once, with the axles it is on
+            let mut qs: Vec<(bool, [bool; 2], String)> = Vec::new();
+            for (axle, a) in axles.iter().enumerate() {
+                // (the rim light ring sits on the brake and does not turn)
+                for (d, n) in [(true, &a.0), (false, &a.1), (false, &rings[axle])] {
+                    let Some(n) = n else { continue };
+                    let q = format!("^{n}_hi$");
+                    match qs.iter_mut().find(|x| x.0 == d && x.2 == q) {
+                        Some(x) => x.1[axle] = true,
+                        None => qs.push((d, std::array::from_fn(|i| i == axle), q)),
+                    }
+                }
+            }
             if !qs.is_empty() {
                 self.brake_loading = true;
                 let ws = Workspace::new(&self.game, &self.work);
@@ -2910,7 +2991,7 @@ impl ModelView {
                 let ctx = ctx.clone();
                 std::thread::spawn(move || {
                     // a part that does not load is left out
-                    let r: Vec<(bool, Loaded)> = qs.iter().filter_map(|(d, q)| load_query(&ws, &cache, q, 0, &idx).ok().map(|l| (*d, l))).collect();
+                    let r: Vec<(bool, [bool; 2], Loaded)> = qs.iter().filter_map(|(d, on, q)| load_query(&ws, &cache, q, 0, &idx).ok().map(|l| (*d, *on, l))).collect();
                     *slot.lock().unwrap() = Some(r);
                     ctx.request_repaint();
                 });
@@ -2920,10 +3001,11 @@ impl ModelView {
         let wheel_spin = self.wheel_spin;
         let brake_heat = self.brake_heat.clamp(0.0, 1.0);
         if let Some(ren) = &self.renderer {
-            for (is_disc, g) in self.brakes.iter_mut() {
+            for (is_disc, on, g) in self.brakes.iter_mut() {
                 let inst: Vec<render3d::Instance> = spots
                     .iter()
                     .zip(&steers)
+                    .filter(|((bone, _, _), _)| on[is_rear(bone) as usize])
                     .map(|((bone, p, r), steer)| {
                         let right = bone.strip_prefix("wheel_").map(|s| s.starts_with('r')).unwrap_or(false);
                         let mirror = if right { Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0)) } else { Mat4::IDENTITY };
@@ -2963,25 +3045,37 @@ impl ModelView {
     fn sync_part_look(&mut self, rs: &egui_wgpu::RenderState) {
         let Some(l) = self.loaded.as_mut() else {
             self.part_look_table = None;
+            (self.look.coat, self.look.coat_base) = ([0.0; 4], None);
             return;
         };
         let pc = &l.info["part_colours"];
         let default = pc["default"].as_u64();
         let Some(idx) = self.part_look_want.as_ref().and_then(|k| pc["configs"][k.as_str()].as_u64()).or(default) else {
             self.part_look_table = None;
+            (self.look.coat, self.look.coat_base) = ([0.0; 4], None);
             return;
         };
         let idx = idx as usize;
+        // the coat of this look's body paint (clear coat, flakes)
+        let coat = &pc["coat"];
+        let record = coat["paint_by_look"][idx].as_u64().map(|k| &coat["records"][k as usize]).filter(|r| r.is_object());
+        (self.look.coat, self.look.coat_base) = record.map_or(([0.0; 4], None), paint_coat);
         // What the fitted parts change in the look (a body kit's part
         // rebinds the ids of its panels, mostly to the body paint): part id
         // and its new entry.
         let mut patched: Vec<(usize, [u8; 4])> = Vec::new();
+        // and the surface (low and high metalness and roughness) of those ids
+        let mut patched_surf: Vec<(usize, [u8; 4])> = Vec::new();
         for part in l.info["fitted_parts"].as_array().into_iter().flatten().filter_map(|p| p.as_str()) {
             let d = &pc["part_patches"][part];
             let rgba = d["rgba"].as_str().unwrap_or("");
+            let surf = d["surfaces"].as_str().unwrap_or("");
             for (k, id) in d["ids"].as_array().into_iter().flatten().filter_map(|x| x.as_u64()).enumerate() {
                 if let Some(h) = rgba.get(k * 8..k * 8 + 8) {
                     patched.push((id as usize & 255, std::array::from_fn(|c| u8::from_str_radix(&h[c * 2..c * 2 + 2], 16).unwrap_or(255))));
+                }
+                if let Some(s) = surf.get(k * 8..k * 8 + 8).and_then(hex4) {
+                    patched_surf.push((id as usize & 255, s));
                 }
             }
         }
@@ -3025,8 +3119,15 @@ impl ModelView {
                     // rows 256..: the surface's second layer (colour, alpha =
                     // roughness); its metalness is the alpha of rows 0..256
                     let wear = pc["wear"][idx].as_str().filter(|w| w.len() == 2048);
-                    let mut px = vec![255u8; 128 * 512 * 4];
+                    // rows 512..: the low and high of the first layer's
+                    // metalness and roughness, which the shader blends by the
+                    // material map at each pixel
+                    let surfaces = pc["surfaces"][idx].as_str().filter(|s| s.len() == 2048);
+                    let mut px = vec![255u8; 128 * PART_RAMP_ROWS * 4];
                     for id in 0..256 {
+                        let stored = surfaces.and_then(|s| hex4(&s[id * 8..id * 8 + 8]));
+                        let s = patched_surf.iter().rev().find(|p| p.0 == id).map(|p| p.1).or(stored).unwrap_or_else(|| surface_of_code(look[id][3]));
+                        px[(512 + id) * 512..(513 + id) * 512].copy_from_slice(&part_surface_row(s));
                         let w = wear.map(|w| &w[id * 8..id * 8 + 8]);
                         let byte = |k: usize| w.and_then(|w| u8::from_str_radix(&w[k..k + 2], 16).ok());
                         let wrow = w.and_then(|w| usize::from_str_radix(&w[..4], 16).ok()).filter(|r| *r != 0xffff);
@@ -3049,7 +3150,7 @@ impl ModelView {
                         }
                         out.chunks_exact_mut(4).for_each(|c| c[3] = metal1);
                     }
-                    let im = glb::Image { key: "part ramp".into(), mips: vec![(128, 512, px)], srgb: true, bc: None };
+                    let im = glb::Image { key: "part ramp".into(), mips: vec![(128, PART_RAMP_ROWS as u32, px)], srgb: true, bc: None };
                     let at = match l.model.images.iter().position(|i| i.key == "part ramp") {
                         Some(i) => {
                             l.model.images[i] = im;
@@ -3060,7 +3161,9 @@ impl ModelView {
                             l.model.images.len() - 1
                         }
                     };
-                    for m in l.model.materials.iter_mut().filter(|m| m.parts && m.ramp_u.is_some()) {
+                    // every part material: one without a palette column map
+                    // still reads its parts' surfaces from the image
+                    for m in l.model.materials.iter_mut().filter(|m| m.parts) {
                         m.ramp = Some(at);
                     }
                     ramp_new = true;
@@ -3276,6 +3379,7 @@ impl ModelView {
             }
         }
         let mounts = self.mounts();
+        self.wheel_floor = None;
         if !self.wheels_on || self.veh_no_wheels || mounts.is_empty() {
             return;
         }
@@ -3374,6 +3478,17 @@ impl ModelView {
             self.wheel_xs = (xs_key, v);
         }
         let xs = self.wheel_xs.1.clone();
+        // where the tyres touch the ground
+        if let Some((tr, _)) = tyre_size(&self.wheel_boxes).filter(|_| !self.wheels.is_empty()) {
+            self.wheel_floor = mounts
+                .iter()
+                .enumerate()
+                .map(|(mi, (bone, p))| {
+                    let sc = xs.get(mi).map_or(1.0, |x| x[1]) * if is_rear(bone) { self.wheel_scale_rear } else { self.wheel_scale };
+                    (self.gear_at(bone) * self.steer_at(bone)).transform_point3(*p).y - tr * sc
+                })
+                .reduce(f32::min);
+        }
         let inst: Vec<render3d::Instance> = mounts
             .iter()
             .enumerate()
@@ -3657,6 +3772,13 @@ impl ModelView {
         (gl, skin)
     }
 
+    /// Height of the ground under a model whose own lowest point is at
+    /// `floor`: fitted wheels reach lower than the body they are fitted to.
+    fn ground_y(&self, floor: f32) -> f32 {
+        let on_wheels = self.wheels_on && !self.veh_no_wheels;
+        self.wheel_floor.filter(|_| on_wheels).map_or(floor, |w| w.min(floor))
+    }
+
     fn lines(&self, globals: &[Mat4]) -> (Vec<LineV>, Vec<LineV>) {
         let mut under = Vec::new();
         let mut top = Vec::new();
@@ -3715,9 +3837,10 @@ impl ModelView {
                 budget = budget.saturating_sub(m.verts.len() / step);
             }
         }
-        // ground grid
-        let lo = Vec3::from(l.model.bbox[0]);
+        // ground grid, under the tyres of a vehicle on its wheels
+        let mut lo = Vec3::from(l.model.bbox[0]);
         let hi = Vec3::from(l.model.bbox[1]);
+        lo.y = self.ground_y(lo.y);
         let ext = (hi - lo).max_element().max(1.0);
         let step = 10f32.powf((ext / 4.0).log10().floor()).max(0.1);
         let n = ((ext * 0.75) / step).ceil() as i32;
@@ -3928,7 +4051,7 @@ impl ModelView {
         self.update_ped_clip(&ctx);
         let (globals, mut skin) = self.joint_mats();
         // Lit lamps: the light of each lamp bone rides in the bottom row of
-        // its joint matrix (see the shader). Not on the Metal renderer.
+        // its joint matrix (see the shader). Not in a Metal 4 build.
         if self.siren_dirty {
             self.siren_dirty = false;
             self.sirens = match (&self.loaded, &self.veh_lights) {
@@ -3947,7 +4070,7 @@ impl ModelView {
                 self.siren = self.siren.min(self.sirens.len());
             }
         }
-        if (self.has_lamps || !self.sirens.is_empty()) && cfg!(not(target_os = "macos")) {
+        if (self.has_lamps || !self.sirens.is_empty()) && !crate::METAL4_BUILD {
             let t = ctx.input(|i| i.time);
             if let Some(l) = &self.loaded {
                 for (i, (j, m)) in l.model.joints.iter().zip(skin.iter_mut()).enumerate() {
@@ -3983,6 +4106,19 @@ impl ModelView {
             }
         }
         let show_wheels = self.wheels_on && !self.veh_no_wheels && !self.mounts().is_empty();
+        // a soft shadow on the ground the grid lies on, under the model
+        // (not under big pieces of scenery, which bring their own ground)
+        let ground = self.loaded.as_ref().and_then(|l| {
+            let mut lo = Vec3::from(l.model.bbox[0]);
+            let hi = Vec3::from(l.model.bbox[1]);
+            lo.y = self.ground_y(lo.y);
+            let size = hi - lo;
+            (size.x.max(size.z) <= 40.0 && size.min_element() > 0.0).then(|| crate::render3d::GroundShadow {
+                centre: Vec3::new((lo.x + hi.x) * 0.5, lo.y, (lo.z + hi.z) * 0.5) + Vec3::new(self.ped_clip.travel.x, 0.0, self.ped_clip.travel.z),
+                half: [size.x * 0.5, size.z * 0.5],
+                height: size.y,
+            })
+        });
         let (under, top) = self.lines(&globals);
         let settled = self.idle_for_shot();
         let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
@@ -4013,12 +4149,13 @@ impl ModelView {
         let mut models: Vec<&GpuModel> = self.gpu.iter().collect();
         if show_wheels {
             models.extend(self.wheels.iter());
-            models.extend(self.brakes.iter().map(|b| &b.1));
+            models.extend(self.brakes.iter().map(|b| &b.2));
         }
         if self.hair.show {
             models.extend(self.hair.gpu.iter());
         }
         ren.decal_bias = self.decal_bias;
+        ren.ground = ground;
         let tid = ren.render(rs, px, &self.cam, &self.look, &models, &under, &top);
         ui.painter().image(
             tid,
@@ -4303,7 +4440,7 @@ impl ModelView {
                 .on_hover_text("Place stickers (logos, lettering) on this vehicle by hand: pictures from the game's sticker textures or your own PNG files, on the panels you choose. Saved per vehicle.");
         }
         self.vehicle_ui(ui);
-        if self.part_ramp_done.is_some() && self.loaded.as_ref().is_some_and(|l| l.model.materials.iter().any(|m| m.ramp.is_some())) {
+        if self.part_ramp_done.is_some() && self.loaded.as_ref().is_some_and(|l| l.model.materials.iter().any(|m| m.ramp.is_some() && m.ramp_u.is_some())) {
             ui.add(egui::Slider::new(&mut self.look.wear, 0.0..=1.0).text("wear"))
                 .on_hover_text("Shows the second layer of the vehicle's surfaces (rust under paint, grey under bare metal), which the game's files give for every surface. Where it shows is taken from the blue channel of the parts' detail texture; how much the game shows is not known, so the amount is yours to set.");
         }
@@ -4845,6 +4982,8 @@ fn load_parts(
     let mut coloured = 0;
     // mesh ranges of the skin meshes and of the garments that cover skin
     let mut skin_meshes: Vec<std::ops::Range<usize>> = Vec::new();
+    // parts whose item names a region layer: meshes, layer, archive offset
+    let mut region_parts: Vec<(std::ops::Range<usize>, u32, u64)> = Vec::new();
     let mut cover_meshes: Vec<std::ops::Range<usize>> = Vec::new();
     let mut heel_meshes: Vec<std::ops::Range<usize>> = Vec::new();
     // per outfit part: its meshes, its joint list and the joint an attached
@@ -4933,6 +5072,9 @@ fn load_parts(
                 if f.is_some_and(|f| f.body) {
                     skin_meshes.push(mesh0..mesh0 + m.meshes.len());
                 }
+                if let Some(f) = f.filter(|f| f.region_layer != 0) {
+                    region_parts.push((mesh0..mesh0 + m.meshes.len(), f.region_layer, e.off));
+                }
                 if f.is_some_and(|f| f.covers) {
                     cover_meshes.push(mesh0..mesh0 + m.meshes.len());
                 }
@@ -4987,10 +5129,46 @@ fn load_parts(
             notes.push(format!("Heeled shoes: the feet are tilted {deg:.0} degrees at the ankle with the toes bent back level, the angle that puts most of the foot's skin on the shoe. (The game poses the foot for the shoe's heel class; that pose is not decoded.)"));
         }
     }
-    if let (Some(m), false, false) = (&mut model, skin_meshes.is_empty(), cover_meshes.is_empty()) {
-        let hidden = hide_covered_skin(m, &skin_meshes, &cover_meshes);
+    // Hiding what is worn under something, the game's way: every vertex of
+    // a part carries a region of the part's layer, and every worn item
+    // lists per layer the regions it hides. A triangle goes when all its
+    // vertices are in hidden regions. Skin meshes without regions fall back
+    // to hiding what lies right under a garment.
+    let mut by_distance: Vec<std::ops::Range<usize>> = skin_meshes.clone();
+    if let Some(m) = &mut model {
+        let (mut skin_hidden, mut cloth_hidden) = (0, 0);
+        for (range, layer, off) in &region_parts {
+            let has_regions = range.clone().filter_map(|i| m.meshes.get(i)).any(|me| me.verts.iter().any(|v| v.zone[3] != 0));
+            if !has_regions {
+                continue;
+            }
+            // Clothes under clothes stay with the distance test below: the
+            // `_full` garment meshes carry no regions (their `_cull_00`
+            // twins do) and part of those masks sits in a second list whose
+            // key is not decoded.
+            let is_skin = skin_meshes.contains(range);
+            if !is_skin {
+                continue;
+            }
+            by_distance.retain(|r| r != range);
+            let masks: Vec<&str> = fx.iter().filter(|(o, _)| *o != off).flat_map(|(_, f)| f.hides.iter()).filter(|h| h.0 == *layer).map(|h| h.1.as_str()).collect();
+            let hide: Vec<bool> = (0..256u32).map(|n| masks.iter().any(|k| sixng_core::wardrobe::mask_has(k, n))).collect();
+            for i in range.clone() {
+                let Some(me) = m.meshes.get_mut(i) else { continue };
+                let before = me.indices.len() / 3;
+                me.indices = me.indices.chunks_exact(3).filter(|t| !t.iter().all(|&i| hide[me.verts[i as usize].zone[3] as usize])).flatten().copied().collect();
+                *(if is_skin { &mut skin_hidden } else { &mut cloth_hidden }) += before - me.indices.len() / 3;
+            }
+        }
+        m.triangles = m.triangles.saturating_sub(skin_hidden + cloth_hidden);
+        if skin_hidden + cloth_hidden > 0 {
+            notes.push(format!("Worn under something: {skin_hidden} skin triangles and {cloth_hidden} triangles of clothes are hidden by the hide masks of the worn items (each item lists per layer the regions it covers; every vertex carries its region)."));
+        }
+    }
+    if let (Some(m), false, false) = (&mut model, by_distance.is_empty(), cover_meshes.is_empty()) {
+        let hidden = hide_covered_skin(m, &by_distance, &cover_meshes);
         if hidden > 0 {
-            notes.push(format!("Skin under clothes: {hidden} skin triangles that lie right under a garment are hidden, so skin does not show through it. (The game uses skin meshes cut to the garment; which cut goes with which garment is not decoded.)"));
+            notes.push(format!("Skin under clothes: {hidden} triangles of a skin mesh without regions that lie right under a garment are hidden, so skin does not show through it (by distance, not the game's masks)."));
         }
     }
     if let (Some(m), false, false) = (&mut model, under_meshes.is_empty(), outer_meshes.is_empty()) {
@@ -5022,6 +5200,40 @@ fn load_parts(
 /// Sub-material per texel of a material's base texture: its `materialid`
 /// texture (red x 63, as the clothing shader reads it), resampled to `w` x
 /// `h`. None when the material binds none or the file is not there.
+/// Rows of the part ramp image (128 wide): 256 of the first layer's palette
+/// rows, 256 of the second layer's, 256 of surfaces (`part_surface_row`).
+const PART_RAMP_ROWS: usize = 768;
+
+/// Four bytes from 8 hex digits.
+fn hex4(h: &str) -> Option<[u8; 4]> {
+    let b = h.as_bytes();
+    if b.len() != 8 || !b.iter().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(std::array::from_fn(|k| u8::from_str_radix(&h[k * 2..k * 2 + 2], 16).unwrap_or(0)))
+}
+
+/// One row of the part ramp image for a part id's surface (metalness low
+/// and high, roughness low and high): the four values in the alpha of the
+/// columns 0 to 3 (repeated along the row). Alpha is not sRGB-decoded, so
+/// the shader reads the bytes as stored.
+fn part_surface_row(s: [u8; 4]) -> Vec<u8> {
+    (0..128).flat_map(|x| [0, 0, 0, s[x & 3]]).collect()
+}
+
+/// The surface a look entry's alpha stands for when an export has no
+/// `surfaces` (see `vehcolour::surface_code`: metalness in four steps x 50 +
+/// roughness in 50 steps): low = high. The body paint (254) and ids without
+/// a part read as a plain non-metal.
+fn surface_of_code(code: u8) -> [u8; 4] {
+    if code >= 200 {
+        return [0, 0, 192, 192];
+    }
+    let (m, r) = ((code / 50) as f32 / 3.0, (code % 50) as f32 / 49.0);
+    let q = |v: f32| (v * 255.0 + 0.5) as u8;
+    [q(m), q(m), q(r), q(r)]
+}
+
 fn sub_material_map(mat: &glb::Material, roots: &[&Path], w: u32, h: u32) -> Option<Vec<u8>> {
     let want = format!("{:08x}", sixng_core::meta7a::joaat("materialid"));
     let png = mat.slots.iter().find(|s| s.param_hash == want).and_then(|s| s.png.as_ref())?;
@@ -5128,8 +5340,8 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
                 let mat = m.materials[mi].clone();
                 // The wgpu shader draws the main sub-material's weave per
                 // pixel on opaque garments (alpha carries its texels); the
-                // Metal renderer has no such path and keeps the baked weave.
-                let detail = cfg!(not(target_os = "macos")) && std::env::var_os("SIXNG_NO_FABRIC_DETAIL").is_none() && mats.iter().all(|&k| m.materials[k].alpha_mode == "OPAQUE");
+                // Metal 4 renderer has no such path and keeps the baked weave.
+                let detail = !crate::METAL4_BUILD && std::env::var_os("SIXNG_NO_FABRIC_DETAIL").is_none() && mats.iter().all(|&k| m.materials[k].alpha_mode == "OPAQUE");
                 if let Some(main) = crate::fabric::bake(m, &mats, i, &fab, &|w, h| sub_material_map(&mat, &[cache, shaped.as_path()], w, h), detail) {
                     m.images[i].key = format!("{}#fabric{:08x}{}", m.images[i].key, f.preset.unwrap_or(0), if main.is_some() { "d" } else { "" });
                     if let Some((tile, scale, rot)) = main.and_then(|s| fab.detail(s)) {
@@ -6127,7 +6339,7 @@ fn load_query_sel(
                         }
                         if oi == k {
                             let body = p.slot == "body upper" || p.slot == "body lower";
-                            fx.insert(e.off, PartFx { tint: p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t.rows[0]))).filter(|t| t.1 != 255), colour: p.colour.map(|c| [c[1], c[2], c[3]]), tag: p.colour_tag, subs: p.preset_colours.clone(), preset: p.preset.as_deref().and_then(|h| u32::from_str_radix(h, 16).ok()), head: p.slot == "head", body, skeletal: body || matches!(p.slot.as_str(), "head" | "eyes" | "teeth" | "teeth accessory"), covers: matches!(p.slot.as_str(), "top" | "outer" | "bottom" | "full" | "feet" | "gloves"), layer: match p.slot.as_str() { "outer" => 2, "top" | "bottom" | "full" => 1, _ => 0 }, heel: p.slot == "feet" && p.drawable.split('_').any(|t| matches!(t, "sh" | "mh" | "hh")), under: Vec::new(), skins: if p.slot == "head" { p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect() } else { Vec::new() } });
+                            fx.insert(e.off, PartFx { tint: p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t.rows[0]))).filter(|t| t.1 != 255), colour: p.colour.map(|c| [c[1], c[2], c[3]]), tag: p.colour_tag, subs: p.preset_colours.clone(), preset: p.preset.as_deref().and_then(|h| u32::from_str_radix(h, 16).ok()), head: p.slot == "head", body, skeletal: body || matches!(p.slot.as_str(), "head" | "eyes" | "teeth" | "teeth accessory"), covers: matches!(p.slot.as_str(), "top" | "outer" | "bottom" | "full" | "feet" | "gloves"), layer: match p.slot.as_str() { "outer" => 2, "top" | "bottom" | "full" => 1, _ => 0 }, heel: p.slot == "feet" && p.drawable.split('_').any(|t| matches!(t, "sh" | "mh" | "hh")), region_layer: p.layer.as_deref().and_then(|l| u32::from_str_radix(l, 16).ok()).unwrap_or(match p.slot.as_str() { "body upper" => 0xb4d9_d470, "body lower" => 0xe062_2b84, _ => 0 }), hides: p.hides.iter().filter_map(|(l, m)| Some((u32::from_str_radix(l, 16).ok()?, m.clone()))).collect(), under: Vec::new(), skins: if p.slot == "head" { p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect() } else { Vec::new() } });
                         }
                     }
                 }
@@ -6184,7 +6396,7 @@ fn load_query_sel(
                                 Some(HairTone { name: set, set, slot: slot.clone(), variants: [dark.clone(), dark.clone(), dark.clone(), dark] })
                             });
                             let colour = colour.or(tone.as_ref().map(|t| sixng_core::hairtone::display(t.variants[0].a)));
-                            info.hair.push(HairPick { slot: slot.clone(), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: t.uncontested(l), off_head: 0, shown: l.confidence >= 0.5 && slot != "body hair", colour, tone });
+                            info.hair.push(HairPick { slot: slot.clone(), placeholder: l.placeholder.clone(), confidence: l.confidence, exact: t.exact, grooms: t.uncontested(l), off_head: 0, shown: l.confidence >= 0.5 && slot != "body hair" && l.part != "body", colour, tone });
                             // research: SIXNG_HAIR_GROOMS=hair:10c5cc010+10c605010+... draws those pieces (first LOD offsets) for the slot
                             if let Ok(v) = std::env::var("SIXNG_HAIR_GROOMS") {
                                 for part in v.split(',') {
@@ -6212,7 +6424,7 @@ fn load_query_sel(
                     for l in extra {
                         let slot = sixng_core::pedlook::slot_of(&l.placeholder);
                         if slot == "hair" || slot == "beard" {
-                            info.hair.push(HairPick { slot: format!("other {slot}"), placeholder: l.placeholder.clone(), confidence: l.confidence, grooms: t.uncontested(l), off_head: 0, shown: false, colour: None, tone: None });
+                            info.hair.push(HairPick { slot: format!("other {slot}"), placeholder: l.placeholder.clone(), confidence: l.confidence, exact: t.exact, grooms: t.uncontested(l), off_head: 0, shown: false, colour: None, tone: None });
                         }
                     }
                 }
@@ -6254,9 +6466,10 @@ fn load_query_sel(
                 l.hat = Some(Arc::new(sixng_core::groom::Shell::new([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, top - 0.10], &hat, &head)));
                 l.notes.push("Hat: the scalp hair is pressed under the hat's lining (strand points beyond it are pulled in to 3 mm under it), so the hair does not come through the hat; an opening the hat encloses (over a cap's strap) counts as closed. A stand-in, not the game's method: the outfit asks for the plain hair, and no stored rule says how the game keeps it under the hat.".to_string());
             }
-            // Strand roots must lie on this character: pieces that do not
-            // (another head shape, a neighbour's piece) are left out. Only in
-            // the neutral body shape, where the skin is where the grooms expect it.
+            // Strand roots of an inferred link must lie on this character:
+            // pieces that do not (another head shape, a neighbour's piece)
+            // are left out. Only in the neutral body shape, where the skin is
+            // where the grooms expect it. A link read from the game is kept whole.
             if *BODY_SHAPE.lock().unwrap() == (0.0, 0.0) && !l.hair.is_empty() {
                 const CELL: f32 = 0.012;
                 let key = |p: &[f32; 3]| ((p[0] / CELL).floor() as i32, (p[1] / CELL).floor() as i32, (p[2] / CELL).floor() as i32);
@@ -6266,7 +6479,7 @@ fn load_query_sel(
                 let head_cells: std::collections::HashSet<(i32, i32, i32)> = skin.iter().filter(|(n, _)| is_head(n)).flat_map(|(_, pts)| pts.iter().map(key)).collect();
                 let all_cells: std::collections::HashSet<(i32, i32, i32)> = skin.iter().filter(|(n, _)| is_head(n) || n.starts_with("hand_") || n.starts_with("feet_")).flat_map(|(_, pts)| pts.iter().map(key)).collect();
                 if !head_cells.is_empty() {
-                    for h in &mut l.hair {
+                    for h in l.hair.iter_mut().filter(|h| !h.exact) {
                         let cells = if h.slot == "body hair" { &all_cells } else { &head_cells };
                         let all = h.grooms.len();
                         h.grooms.retain(|&off| {
@@ -6593,6 +6806,10 @@ fn load_query_sel(
                 let is_body = |o: &u64| opts.iter().any(|x| x.off == *o && x.group.starts_with("body"));
                 let mut order: Vec<&u64> = chosen.iter().filter(|o| is_body(o)).collect();
                 order.extend(chosen.iter().filter(|o| !is_body(o)));
+                // a model two chosen parts fit on the same bone goes on once
+                // (a pickup's rear bumper: of its bed part and of the part
+                // in the rear bumper slot)
+                let mut once: std::collections::HashSet<(u64, u32)> = std::collections::HashSet::new();
                 for o in order {
                     // the pickup bed is attached by name: it may sit at the origin
                     let by_name = is_body(o);
@@ -6602,6 +6819,9 @@ fn load_query_sel(
                         // lengths): only the ones whose bone this vehicle
                         // has are fitted. Bone 0 is the vehicle itself.
                         if *bone != 0 && !bind.contains_key(bone) && !by_name {
+                            continue;
+                        }
+                        if !once.insert((*off, *bone)) {
                             continue;
                         }
                         let Some(pe) = ix.entries.iter().find(|x| x.off == *off) else { continue };
@@ -7479,6 +7699,21 @@ impl Lamps {
     }
 }
 
+/// What the viewer draws of a coat record (model.json
+/// `part_colours.coat.records`): clear coat intensity and roughness, flake
+/// orientation and size, and the base coat roughness when the record
+/// overrides it. Film, sheen and anisotropy are not drawn.
+fn paint_coat(r: &serde_json::Value) -> ([f32; 4], Option<f32>) {
+    let f = |k: &str| r[k].as_f64().unwrap_or(0.0) as f32;
+    let on = |k: &str| r[k].as_bool().unwrap_or(false);
+    let clear = if on("use_clear_coat") { f("clear_coat_intensity").clamp(0.0, 1.0) } else { 0.0 };
+    let flakes = on("use_flakes") && f("flake_coverage") > 0.0;
+    (
+        [clear, f("clear_coat_roughness").clamp(0.0, 1.0), if flakes { f("flake_orientation").max(0.001) } else { 0.0 }, f("flake_size").max(0.0)],
+        on("override_base_coat_roughness").then(|| f("base_coat_roughness").clamp(0.04, 1.0)),
+    )
+}
+
 /// Outer radius and width of the tyre among the wheel models (the one with
 /// the largest radius), at unit scale.
 fn tyre_size(boxes: &[[[f32; 3]; 2]]) -> Option<(f32, f32)> {
@@ -7635,10 +7870,6 @@ fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db:
     const BODY_SLOT: u32 = 0x1c9d_d6fe;
     // asset id -> model
     let by_asset: HashMap<u64, (&String, &sixng_core::scan::Entry)> = stems.iter().map(|(stem, e)| (sixng_core::meta7a::asset_id(stem), (stem, *e))).collect();
-    const SLOTS: [&str; 24] = [
-        "bonnet", "boot", "bumper_f", "bumper_r", "exhaust", "spoiler", "splitter", "diffuser", "towing", "roof", "chassis", "skirt", "skirts", "grille", "wing", "cage", "seats", "intake", "plate", "canards", "interior", "engine", "suspension", "lights",
-    ];
-    let slot_name: HashMap<u32, &str> = SLOTS.iter().map(|s| (joaat(s), *s)).collect();
     let mut opts = Vec::new();
     let mut kits = HashMap::new();
     // the parts of the first configuration are on to begin with
@@ -7709,7 +7940,7 @@ fn vehicle_part_options(ix: &ArchiveIndex, vehicle: &str, v: &crate::vehicle_db:
             id: first.id.clone(),
             name: ms[0].0.to_string(),
             // the part that fits a pickup's bed (and its rear bumper)
-            group: if m.slot == BODY_SLOT || ms.iter().any(|x| is_body(x.0)) { "body".to_string() } else { slot_name.get(&m.slot).map(|s| s.to_string()).unwrap_or_else(|| format!("slot {:08x}", m.slot)) },
+            group: if m.slot == BODY_SLOT || ms.iter().any(|x| is_body(x.0)) { "body".to_string() } else { sixng_core::vehicles::mod_slot_name(m.slot).map(|s| s.to_string()).unwrap_or_else(|| format!("slot {:08x}", m.slot)) },
             label,
             default: first_config.contains(&m.name),
         });
@@ -8033,6 +8264,25 @@ fn srgb32(c: [f32; 3]) -> egui::Color32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn part_surfaces_in_the_ramp_image() {
+        use super::{hex4, part_surface_row, surface_of_code, PART_RAMP_ROWS};
+        assert_eq!(hex4("e6ff1a66"), Some([0xe6, 0xff, 0x1a, 0x66]));
+        assert_eq!(hex4("e6ff1a6"), None);
+        assert_eq!(hex4("e6ff1a6g"), None);
+        // the four values in the alpha of columns 0 to 3, where the shader loads them
+        let row = part_surface_row([1, 2, 3, 4]);
+        assert_eq!(row.len(), 128 * 4);
+        assert_eq!([row[3], row[7], row[11], row[15]], [1, 2, 3, 4]);
+        assert_eq!(&row[..3], &[0, 0, 0]);
+        // three blocks of 256 rows: the shader's row coordinates divide by this
+        assert_eq!(PART_RAMP_ROWS, 768);
+        // an export without surfaces: the look's code, low = high
+        assert_eq!(surface_of_code(165), [255, 255, 78, 78]);
+        assert_eq!(surface_of_code(49), [0, 0, 255, 255]);
+        assert_eq!(surface_of_code(254), [0, 0, 192, 192]);
+    }
+
     #[test]
     fn random_parts_keep_fitted_groups_fitted() {
         let opt = |off: u64, group: &str, default: bool| crate::assemble::PartOpt { off, id: String::new(), name: String::new(), group: group.into(), label: String::new(), default };

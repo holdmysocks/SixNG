@@ -1,5 +1,5 @@
 // sixng viewer shaders: PBR-lite meshes (skinned, instanced), wireframe,
-// debug lines and a procedural sky.
+// debug lines, procedural surroundings (sky, sun, ground) and a ground shadow.
 
 struct Frame {
     view_proj: mat4x4<f32>,
@@ -7,7 +7,7 @@ struct Frame {
     cam_pos: vec4<f32>,
     sun_dir: vec4<f32>,   // xyz towards the sun, w intensity
     sun_col: vec4<f32>,
-    sky_top: vec4<f32>,
+    sky_top: vec4<f32>,   // w flake size of the body paint's coat
     sky_hor: vec4<f32>,   // w exposure
     mode: vec4<u32>,      // x view mode, y packed channel order, z paint finish, w slot view
     paint1: vec4<f32>,    // primary paint colour (linear), w the vehicle's own paint roughness
@@ -16,14 +16,16 @@ struct Frame {
     misc2: vec4<f32>,     // x fog density, yzw secondary paint colour
     misc3: vec4<f32>,     // x tint palette on (1) / off (0), w the vehicle's own paint metalness
     prev_view_proj: mat4x4<f32>,
-    jitter: vec4<f32>,    // x strand dither index, y, z the target's width and height in pixels, w vehicle wear (0 to 1)
+    jitter: vec4<f32>,    // body paint's coat: x clear coat intensity, y clear coat roughness, z flake orientation (0 = no flakes); w vehicle wear (0 to 1)
+    frame: vec4<f32>,     // x strand dither index, y, z the target's width and height in pixels (1e9 in the sun shadow pass, x then the strand widening factor)
     light_vp: mat4x4<f32>, // the sun shadow map's view-projection (all zero: none)
 };
 
 struct Mat {
     base: vec4<f32>,
-    flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask
+    flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask, bit 13 = the packed map is a vehicle material map, bit 14 = the emissive slot holds the part ramp image with the parts' surfaces
     tile: vec4<f32>,      // fabric detail tile: x UV scale, y rotation, z mean grey value, w bound
+    emis: vec4<f32>,      // x emissive scale of the material (from the GLB's emissive strength)
 };
 
 @group(0) @binding(0) var<uniform> F: Frame;
@@ -151,7 +153,7 @@ fn mesh_vertex(v: VIn) -> VOut {
         side = side / max(length(side), 1e-5);
         let c0 = F.view_proj * w;
         let c1 = F.view_proj * vec4(w.xyz + side, 1.0);
-        let ppm = length((c1.xy / c1.w - c0.xy / c0.w) * 0.5 * F.jitter.yz);
+        let ppm = length((c1.xy / c1.w - c0.xy / c0.w) * 0.5 * F.frame.yz);
         let rmin = min(0.5 * npx / max(ppm, 1e-3), 0.005);
         // (a strand lit by the hair lighting keeps its profile in uv1.x: there the share rides on uv1.y, 1 .. 1.4)
         if (uv1.y > 1.5) { uv1.x = clamp(r / rmin, 0.0, 1.0); } else if (uv1.y > 0.5) { uv1.y = 1.0 + 0.4 * clamp(r / rmin, 0.0, 1.0); }
@@ -159,11 +161,11 @@ fn mesh_vertex(v: VIn) -> VOut {
         // the sun shadow pass (no target size) with a widening factor: the ribbon of the game's ray-traced passes,
         // flat, turned by a random direction per strand (here a hash of the strand's root normal; the game's own
         // hash is not read) and the factor times its own width
-        if (F.jitter.y > 1.0e8 && F.jitter.x >= 1.0) {
+        if (F.frame.y > 1.0e8 && F.frame.x >= 1.0) {
             let hsh = fract(sin(vec3(dot(v.nrm, vec3(12.9898, 78.233, 37.719)), dot(v.nrm, vec3(39.346, 11.135, 83.155)), dot(v.nrm, vec3(73.156, 52.235, 9.151)))) * 43758.5453) * 2.0 - 1.0;
             var rs = cross(td, normalize(hsh + vec3(1.0e-4, 0.0, 0.0)));
             rs = rs / max(length(rs), 1e-5);
-            wp = w.xyz + rs * edge * r * F.jitter.x;
+            wp = w.xyz + rs * edge * r * F.frame.x;
         }
     }
     o.clip = F.view_proj * vec4(wp, 1.0);
@@ -183,15 +185,57 @@ fn mesh_vertex(v: VIn) -> VOut {
     return o;
 }
 
+// The ground the surroundings show under the horizon: a plain of asphalt,
+// lit by the sun and the sky like a diffuse surface facing up. Kept darker
+// than the sky at the horizon (moonlight on it would outshine a night sky),
+// so the horizon always reads.
+fn ground_col() -> vec3<f32> {
+    let sun = F.sun_col.rgb * (F.sun_dir.w * max(normalize(F.sun_dir.xyz).y, 0.0) * 3.0 / 3.14159);
+    let g = vec3(0.185, 0.19, 0.20) * (sun + neutral(F.sky_top.rgb, 0.8) * F.misc.w);
+    let w = vec3(0.2126, 0.7152, 0.0722);
+    return g * min(1.0, 0.6 * dot(F.sky_hor.rgb, w) / max(dot(g, w), 0.00001));
+}
+
+// A glow around the sun, pow(s, n) * amp, widened by a reflection lobe of
+// width a (roughness squared): the two widths add in quadrature and the
+// peak drops by the same factor, so the glow keeps its energy.
+fn sun_glow(s: f32, n: f32, amp: f32, a: f32) -> f32 {
+    let k = 1.0 / (1.0 + 0.5 * n * a * a);
+    return amp * k * pow(s, n * k);
+}
+
+// The surroundings along d (unit length): sky from horizon to zenith with
+// the glow of the sun, and the ground under the horizon. `blur` is the
+// roughness of the surface that reflects them (0 = as seen directly): the
+// horizon line, the sky gradient and the glow widen with it. The sun's disc
+// is not part of it: the direct specular term is its reflection.
+fn environment(d: vec3<f32>, blur: f32) -> vec3<f32> {
+    let a = blur * blur;
+    let y = clamp(d.y, -1.0, 1.0);
+    let t = mix(max(y, 0.0), 0.35, min(a * 1.5, 1.0));
+    var c = mix(F.sky_hor.rgb, F.sky_top.rgb, pow(t, 0.6));
+    let s = max(dot(d, normalize(F.sun_dir.xyz)), 0.0);
+    c += F.sun_col.rgb * ((sun_glow(s, 8.0, 0.15, a) + sun_glow(s, 160.0, 0.45, a)) * F.sun_dir.w);
+    // the ground pales a little into the haze towards the horizon
+    let g = mix(ground_col(), F.sky_hor.rgb, 0.1 * exp(min(y, 0.0) * 12.0) * (1.0 - min(a * 1.5, 1.0)));
+    let w = 0.006 + 1.5 * a;
+    return mix(g, c, smoothstep(-w, w, y));
+}
+
+// The surroundings as the camera sees them: with the sun's disc.
 fn sky(d: vec3<f32>) -> vec3<f32> {
-    let t = clamp(d.y, -1.0, 1.0);
-    var c = mix(F.sky_hor.rgb, F.sky_top.rgb, pow(max(t, 0.0), 0.6));
-    if (t < 0.0) {
-        c = mix(F.sky_hor.rgb * 0.55, F.sky_hor.rgb * 0.25, min(-t * 3.0, 1.0));
-    }
-    let s = max(dot(normalize(d), normalize(F.sun_dir.xyz)), 0.0);
-    c += F.sun_col.rgb * (pow(s, 600.0) * 30.0 + pow(s, 8.0) * 0.15) * F.sun_dir.w;
-    return c;
+    let s = max(dot(d, normalize(F.sun_dir.xyz)), 0.0);
+    let disc = smoothstep(0.99972, 0.99984, s) * smoothstep(-0.006, 0.006, d.y);
+    return environment(d, 0.0) + F.sun_col.rgb * (disc * 40.0 * F.sun_dir.w);
+}
+
+// Diffuse light from the surroundings on a surface facing n: the sky,
+// mostly desaturated (its full colour tinted every shaded surface
+// blue-white), and on surfaces that face down the light the ground sends
+// back.
+fn ambient(n: vec3<f32>) -> vec3<f32> {
+    let sky_d = mix(neutral(F.sky_hor.rgb, 0.8) * 0.6, neutral(F.sky_top.rgb, 0.8), n.y * 0.5 + 0.5);
+    return mix(sky_d, ground_col(), 0.8 * smoothstep(0.0, 1.0, -n.y)) * F.misc.w;
 }
 
 fn aces(x: vec3<f32>) -> vec3<f32> {
@@ -426,7 +470,7 @@ fn ign(p: vec2<f32>) -> f32 {
 // of a linear comparison. A stand-in for the game's shadow filtering, which is not read.
 // The camera depth pre-pass at a pixel (reversed: nearer is larger; 0: nothing drawn).
 fn eye_depth(p: vec2<i32>) -> f32 {
-    let lim = vec2<i32>(F.jitter.yz) - 1;
+    let lim = vec2<i32>(F.frame.yz) - 1;
     return textureLoad(t_cam_depth, clamp(p, vec2(0), lim), 0);
 }
 
@@ -472,7 +516,7 @@ fn strand_openness(clip: vec4<f32>) -> f32 {
 // the viewer does not have.
 fn screen_occlusion(clip: vec4<f32>, wp: vec3<f32>, n: vec3<f32>) -> f32 {
     if (F.light_vp[3][3] == 0.0) { return 1.0; }
-    let size = F.jitter.yz;
+    let size = F.frame.yz;
     let toeye = F.cam_pos.xyz - wp;
     let v = toeye / max(length(toeye), 1.0e-6);
     let c0 = F.view_proj * vec4(wp, 1.0);
@@ -485,8 +529,8 @@ fn screen_occlusion(clip: vec4<f32>, wp: vec3<f32>, n: vec3<f32>) -> f32 {
     let r0 = 0.625 * size.y;
     let th = tanh(min(0.02 * z, 10.0));
     let rad = mix(clamp(r0, 1.0, 64.0), r0, th * th);
-    let phi = ign(clip.xy + vec2(F.jitter.x * 7.31, F.jitter.x * 3.17)) * 1.5708;
-    let jit = ign(clip.xy * 1.37 + vec2(F.jitter.x * 2.11, 17.0));
+    let phi = ign(clip.xy + vec2(F.frame.x * 7.31, F.frame.x * 3.17)) * 1.5708;
+    let jit = ign(clip.xy * 1.37 + vec2(F.frame.x * 2.11, 17.0));
     let ndc0 = c0.xy / c0.w;
     var sum = 0.0;
     for (var sl = 0; sl < 2; sl++) {
@@ -584,7 +628,7 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {
     // covered share (a dither it averages over frames); here each sample of the pixel is kept or not
     let cov = select(clamp((i.uv1.y - 1.0) * 2.5, 0.0, 1.0), i.uv1.x, i.uv1.y > 1.5);
     if (M.flags.y == 12u && i.uv1.y > 0.5 && cov < 0.999) {
-        let j = fract(dot(i.tint.rgb, vec3(12.9898, 78.233, 37.719))) * 64.0 + F.jitter.x * 5.588238;
+        let j = fract(dot(i.tint.rgb, vec3(12.9898, 78.233, 37.719))) * 64.0 + F.frame.x * 5.588238;
         var mk = 0u;
         for (var s = 0u; s < 4u; s++) {
             if (cov >= ign(i.clip.xy + vec2(j + f32(s) * 5.588, j + f32(s) * 9.123))) { mk |= 1u << s; }
@@ -633,8 +677,13 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     // a vehicle layer's material map: blue is occlusion, on the direct
     // light as well (the game multiplies its diffuse and specular sides)
     var ao_direct = 1.0;
+    // its red and green: where a part's metalness and roughness lie between
+    // the low and the high of its surface
+    var mat_blend = vec2(0.5);
     if ((has & 4u) != 0u && (M.flags.w & 8192u) != 0u) {
-        ao = textureSample(t_pk, samp, i.uv0).b;
+        let mm = textureSample(t_pk, samp, i.uv0);
+        mat_blend = mm.rg;
+        ao = mm.b;
         ao_direct = ao;
     } else if ((has & 4u) != 0u && F.mode.y < 3u) {
         let p = textureSample(t_pk, samp, i.uv0);
@@ -657,7 +706,7 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     if (M.tile.w > 1.5) {
         let g = textureSample(t_tile, samp, i.uv0).g;
         let id = floor(i.col.a * 255.0 + 0.5);
-        albedo = base.rgb * textureSampleLevel(t_em, samp, vec2(clamp(g, 0.004, 0.996), (id + 0.5) / 512.0), 0.0).rgb;
+        albedo = base.rgb * textureSampleLevel(t_em, samp, vec2(clamp(g, 0.004, 0.996), (id + 0.5) / 768.0), 0.0).rgb;
     }
     if (M.tile.w > 0.5 && M.tile.w < 1.5) {
         let c = cos(M.tile.y);
@@ -681,15 +730,33 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             let code = floor(ta + 0.5);
             metal = floor(code / 50.0) / 3.0;
             rough = clamp((code - floor(code / 50.0) * 50.0) / 49.0, 0.04, 1.0);
+            // With the material map and the parts' surfaces at hand
+            // (rows 512.. of the part ramp image: metalness low and high,
+            // roughness low and high in the alpha of columns 0 to 3 of the
+            // part id's row), the blend is done here per pixel, as the
+            // game's paint shader does; the code above is the same blend
+            // at the map's mean. The body paint keeps its own finish.
+            if ((M.flags.w & 24576u) == 24576u && (has & 4u) != 0u) {
+                let row = 512 + i32(floor(i.col.a * 255.0 + 0.5));
+                let m_lo = textureLoad(t_em, vec2(0, row), 0).a;
+                let m_hi = textureLoad(t_em, vec2(1, row), 0).a;
+                let r_lo = textureLoad(t_em, vec2(2, row), 0).a;
+                let r_hi = textureLoad(t_em, vec2(3, row), 0).a;
+                metal = clamp(mix(m_lo, m_hi, mat_blend.x), 0.0, 1.0);
+                rough = clamp(mix(r_lo, r_hi, mat_blend.y), 0.04, 1.0);
+            }
         }
     }
+    // the body paint's coat record (the vehicle's own finish only): clear
+    // coat intensity and roughness, flake orientation
+    var coat = vec3(0.0);
     if (painted) {
         albedo = F.paint1.rgb;
         if ((has & 16u) != 0u) { albedo = F.misc2.yzw; }
         if (F.mode.z == 0u) { metal = 0.6; rough = 0.28; }
         else if (F.mode.z == 1u) { metal = 0.0; rough = 0.8; }
         else if (F.mode.z == 2u) { metal = 1.0; rough = 0.04; albedo = mix(vec3(0.95), albedo, 0.25); }
-        else if (F.mode.z == 4u) { metal = F.misc3.w; rough = clamp(F.paint1.w, 0.04, 1.0); }
+        else if (F.mode.z == 4u) { metal = F.misc3.w; rough = clamp(F.paint1.w, 0.04, 1.0); coat = F.jitter.xyz; }
         else { metal = 0.0; rough = 0.12; }
         pearl = F.paint2.rgb * F.paint2.w;
     }
@@ -749,7 +816,7 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         }
     }
     // vehicle parts, second layer of the surface (rust under paint, grey
-    // under bare metal): rows 256.. of the part ramp image hold its colour
+    // under bare metal): rows 256..512 of the part ramp image hold its colour
     // and roughness (alpha); its metalness is the alpha of the first rows.
     // Shown where the layer detail texture's blue is high (taken as the
     // wear mask), by the amount the user sets.
@@ -757,8 +824,8 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         let d = textureSample(t_tile, samp, i.uv0);
         let id = floor(i.col.a * 255.0 + 0.5);
         let u = clamp(d.g, 0.004, 0.996);
-        let w1 = textureSampleLevel(t_em, samp, vec2(u, (id + 256.5) / 512.0), 0.0);
-        let m1 = textureSampleLevel(t_em, samp, vec2(u, (id + 0.5) / 512.0), 0.0).a;
+        let w1 = textureSampleLevel(t_em, samp, vec2(u, (id + 256.5) / 768.0), 0.0);
+        let m1 = textureSampleLevel(t_em, samp, vec2(u, (id + 0.5) / 768.0), 0.0).a;
         let k = clamp(d.b * F.jitter.w * 2.0, 0.0, 1.0);
         albedo = mix(albedo, w1.rgb, k);
         rough = clamp(mix(rough, w1.a, k), 0.04, 1.0);
@@ -781,7 +848,7 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     } else if (cls == 7u) {
         var e = albedo;
         if ((has & 8u) != 0u) { e = textureSample(t_em, samp, i.uv0).rgb; }
-        emissive = e * F.misc.y;
+        emissive = e * F.misc.y * M.emis.x;
     }
     // vehicle lamps: a lamp's own emissive mesh (bit 11) is lit only while
     // its bone is; reflectors and lenses on a lit lamp bone glow in its colour
@@ -809,7 +876,21 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     let h = normalize(v + l);
     let ndl = max(dot(n, l), 0.0);
     let ndv = max(dot(n, v), 0.001);
-    let ndh = max(dot(n, h), 0.0);
+    // Metal flakes in the base coat: each flake (a cell of a grid in space,
+    // its size from the coat record) tilts the base coat's highlight by the
+    // record's orientation spread. Flakes smaller than a pixel widen the
+    // highlight instead of sparkling.
+    var nb = n;
+    if (coat.z > 0.0 && cls != 11u) {
+        let p = i.world / (0.0006 + 0.02 * F.sky_top.w);
+        let seen = clamp(1.5 - max(length(dpdx(p)), length(dpdy(p))), 0.0, 1.0);
+        let c = floor(p);
+        let q = fract(sin(vec3(dot(c, vec3(127.1, 311.7, 74.7)), dot(c, vec3(269.5, 183.3, 246.1)), dot(c, vec3(113.5, 271.9, 124.6)))) * 43758.5453) - 0.5;
+        let spread = coat.z * 6.0;
+        nb = normalize(n + q * (2.0 * spread * seen));
+        rough = clamp(sqrt(rough * rough + spread * spread * (1.0 - seen)), 0.04, 1.0);
+    }
+    let ndh = max(dot(nb, h), 0.0);
     let a2 = rough * rough * rough * rough;
     let dd = ndh * ndh * (a2 - 1.0) + 1.0;
     let D = a2 / (3.14159 * dd * dd);
@@ -820,12 +901,10 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     let spec = D * G * Fr / max(4.0 * ndl * ndv, 0.001);
     let kd = (1.0 - Fr) * (1.0 - metal);
     let direct = (kd * albedo / 3.14159 + spec) * F.sun_col.rgb * F.sun_dir.w * ndl * 3.0;
-    // diffuse ambient from a mostly desaturated sky: the full sky colour tinted
-    // every shaded surface blue-white
-    let amb_d = mix(neutral(F.sky_hor.rgb, 0.8) * 0.6, neutral(F.sky_top.rgb, 0.8), n.y * 0.5 + 0.5) * F.misc.w;
+    let amb_d = ambient(n);
     let fr_v = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
     let r = reflect(-v, n);
-    let env = mix(sky(r), (F.sky_top.rgb + F.sky_hor.rgb) * 0.5, rough) * F.misc.w;
+    let env = environment(r, rough) * F.misc.w;
     let sh = sun_shadow(i.world, dpdx(i.world), dpdy(i.world));
     var ao_s = ao;
     // strength = max(0, I - 2 x roughness), I = 1 (the game's value in every weather and hour): no effect from
@@ -834,6 +913,22 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     if (cls != 12u && occ_k > 0.0) { ao_s = ao * (1.0 + occ_k * (screen_occlusion(i.clip, i.world, n) - 1.0)); }
     // the game applies its horizon occlusion to the specular ambient only (never to diffuse ambient, never to hair)
     var col = direct * sh * ao_direct + kd * albedo * amb_d * ao + env * fr_v * ao_s + emissive;
+    // Clear coat: a second, glossy layer over the base coat (a dielectric,
+    // 4 % at normal incidence). It mirrors the sun and the surroundings at
+    // its own roughness, and what it reflects does not reach the base coat.
+    if (coat.x > 0.0) {
+        let cr = clamp(coat.y, 0.03, 1.0);
+        let ca2 = cr * cr * cr * cr;
+        let cnh = max(dot(n, h), 0.0);
+        let cdd = cnh * cnh * (ca2 - 1.0) + 1.0;
+        let ck = (cr + 1.0) * (cr + 1.0) / 8.0;
+        let cG = (ndl / (ndl * (1.0 - ck) + ck)) * (ndv / (ndv * (1.0 - ck) + ck));
+        let cF = 0.04 + 0.96 * pow(1.0 - max(dot(h, v), 0.0), 5.0);
+        let cspec = ca2 / (3.14159 * cdd * cdd) * cG * cF / max(4.0 * ndl * ndv, 0.001);
+        let cfv = 0.04 + (max(1.0 - cr, 0.04) - 0.04) * pow(1.0 - ndv, 5.0);
+        col = (col - emissive) * (1.0 - coat.x * cfv) + emissive
+            + coat.x * (cspec * F.sun_col.rgb * F.sun_dir.w * ndl * 3.0 * sh * ao_direct + environment(r, cr) * F.misc.w * cfv * ao_s);
+    }
     col += pearl * pow(1.0 - ndv, 2.0) * 0.6;
     if (cls == 12u) {
         // strands: the fibre model on the strand's direction (the tangent)
@@ -879,7 +974,7 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             let e_g = max(e_h.y, 0.001);
             let f0_h = 0.046461;
             let fenv = clamp((0.3 + 1.4 * o_h) * mix(0.55 + 0.65 * m_h, 1.4 + 0.16 * m_h, m_h) * (e_r * (1.0 - f0_h) + e_g * f0_h), 0.0, 1.0);
-            let refl_h = mix(sky(reflect(-v, tube)), (F.sky_top.rgb + F.sky_hor.rgb) * 0.5, clamp(rg_h, 0.0, 1.0)) * F.misc.w;
+            let refl_h = environment(reflect(-v, tube), clamp(rg_h, 0.0, 1.0)) * F.misc.w;
             let spec_g = refl_h * fenv * (1.0 + (1.0 / e_g - 1.0) * f0_h);
             let amb_g = sky_h * albedo * hair_ambient(tdir, v, g0h, o_h) * (1.0 - fenv) + spec_g;
             // the game multiplies its light sum by the light's shadow (1 here without the sun shadow map)
@@ -1019,6 +1114,38 @@ fn fs_sky(i: SOut) -> @location(0) vec4<f32> {
     return vec4(aces(sky(d) * F.sky_hor.w), 1.0);
 }
 
+// ground shadow: soft dark blobs on the ground under a model (no shadow map;
+// rounded boxes from the model's bounds, see `GroundShadow`)
+struct GIn {
+    @location(0) pos: vec3<f32>,
+    @location(1) box: vec4<f32>,  // xy place in the blob (m from its centre), zw its half size
+    @location(2) k: vec2<f32>,    // softness (m), darkness
+};
+struct GOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) box: vec4<f32>,
+    @location(1) k: vec2<f32>,
+};
+
+@vertex
+fn vs_ground(v: GIn) -> GOut {
+    var o: GOut;
+    o.clip = F.view_proj * vec4(v.pos, 1.0);
+    o.box = v.box;
+    o.k = v.k;
+    return o;
+}
+
+@fragment
+fn fs_ground(i: GOut) -> @location(0) vec4<f32> {
+    // signed distance to the rounded box, then a smooth step across its edge
+    let r = min(i.box.z, i.box.w) * 0.6;
+    let q = abs(i.box.xy) - (i.box.zw - vec2(r));
+    let d = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - r;
+    let t = clamp(0.5 - d / (2.0 * i.k.x), 0.0, 1.0);
+    return vec4(0.0, 0.0, 0.0, i.k.y * t * t * (3.0 - 2.0 * t));
+}
+
 // map cells: many placements merged per area (see cells.rs). Base colour
 // only, from a 64 px texture array; each vertex carries its placement's
 // centre and distance range, outside which the placement is dropped.
@@ -1131,9 +1258,9 @@ fn fs_cell(i: COut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let spec = D * G * Fr / max(4.0 * ndl * ndv, 0.001);
     let kd = 1.0 - Fr;
     let direct = (kd * albedo / 3.14159 + spec) * F.sun_col.rgb * F.sun_dir.w * ndl * 3.0;
-    let amb_d = mix(neutral(F.sky_hor.rgb, 0.8) * 0.6, neutral(F.sky_top.rgb, 0.8), n.y * 0.5 + 0.5) * F.misc.w;
+    let amb_d = ambient(n);
     let fr_v = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
-    let env = mix(sky(reflect(-v, n)), (F.sky_top.rgb + F.sky_hor.rgb) * 0.5, rough) * F.misc.w;
+    let env = environment(reflect(-v, n), rough) * F.misc.w;
     var col = direct + kd * albedo * amb_d + env * fr_v + emissive;
     let mode = F.mode.x;
     if (mode == 1u) { col = albedo; }

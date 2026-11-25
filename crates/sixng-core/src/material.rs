@@ -10,75 +10,80 @@
 //! - known shader families, identified from the models that use them.
 use serde_json::{json, Value};
 
-/// (shader name hash, class, family description)
-const FAMILIES: &[(&str, &str, &str)] = &[
+/// (shader name hash, shader name, class, family description). The names are
+/// the game's effect names (`sixng shader-bindings`); a test checks each one
+/// against its hash. A family is `emissive` only when its shader lights
+/// something: an `emissivetex` input, or a colour map that is the light
+/// itself (`signs_emissive`, which has no other input).
+const FAMILIES: &[(&str, &str, &str, &str)] = &[
     // vehicles
-    ("4aa38282", "car_paint", "vehicle body (paint is a runtime colour; colour slot = engine-default white)"),
-    ("476ac73a", "car_paint", "vehicle body variant"),
-    ("03b27476", "opaque", "vehicle lamp reflectors (standard_vehicle_2lyr_reflector)"),
-    ("4d2b05e7", "car_paint", "vehicle body variant"),
-    ("c5cdbdd2", "car_paint", "vehicle body variant"),
-    ("389206d1", "glass", "vehicle lamp lenses and clear covers (standard_vehicle_alpha; opacity in the colour alpha)"),
-    ("29648098", "emissive", "vehicle lamps (standard_vehicle_emissive_animated_bones)"),
-    ("5a693bbe", "emissive", "vehicle lamps and lit panels (standard_vehicle_emissive_layer)"),
-    ("99ad6fc9", "opaque", "vehicle tyre (standard_vehicle_2lyr_tyre_inst)"),
-    ("fa9cc069", "window", "vehicle windows"),
-    ("4dc0ac6a", "window", "vehicle windows (helicopters, boats)"),
-    ("bd71bdbf", "window", "windscreen wiper sweep mask (windshield_wipermask): a fan over the glass that marks where the wipers clear rain; not a visible surface"),
-    ("921b19e5", "decal", "vehicle livery / sign decal"),
-    // glass
-    ("298c4c0f", "glass", "exterior window panes"),
-    ("653582a4", "glass", "exterior glass"),
-    ("6a817597", "glass", "interior glass, curtains, doors"),
-    ("db8b21bd", "glass", "glass railings, door glass"),
-    ("e3ba3129", "glass", "building doors / glazing"),
-    ("656a1cdb", "glass", "bottles and drinking glasses"),
-    ("12839ca7", "glass", "drinking glasses with liquid"),
-    ("9ceb543e", "glass", "cups with liquid"),
-    ("9f8ae601", "glass", "bottles"),
-    ("0357215a", "glass", "cups"),
-    ("d5a93b6f", "glass", "glass / sheer cloth"),
-    ("d9ec330c", "emissive", "light bulbs (clear glass)"),
+    ("4aa38282", "standard_vehicle_2lyr", "car_paint", "vehicle body (paint is a runtime colour; colour slot = engine-default white)"),
+    ("476ac73a", "standard_vehicle_2lyr_lod", "car_paint", "vehicle body, low LOD"),
+    ("03b27476", "standard_vehicle_2lyr_reflector", "opaque", "vehicle lamp reflectors"),
+    ("4d2b05e7", "standard_vehicle_2lyr_cutout", "car_paint", "vehicle body, cutout"),
+    ("c5cdbdd2", "standard_vehicle_2lyr_wheel_inst", "car_paint", "wheel rims (the export gives them a rim stand-in)"),
+    ("389206d1", "standard_vehicle_alpha", "glass", "vehicle lamp lenses and clear covers (opacity in the colour alpha)"),
+    ("29648098", "standard_vehicle_emissive_animated_bones", "emissive", "vehicle lamps"),
+    ("5a693bbe", "standard_vehicle_emissive_layer", "emissive", "vehicle lamps and lit panels"),
+    ("99ad6fc9", "standard_vehicle_2lyr_tyre_inst", "opaque", "vehicle tyre"),
+    ("fa9cc069", "standard_vehicle_glass", "window", "vehicle windows"),
+    ("4dc0ac6a", "standard_vehicle_2lyr_alpha", "window", "vehicle windows (helicopters, boats)"),
+    ("bd71bdbf", "windshield_wipermask", "window", "windscreen wiper sweep mask: a fan over the glass that marks where the wipers clear rain; not a visible surface"),
+    ("921b19e5", "standard_vehicle_2lyr_signs", "decal", "vehicle livery / sign decal"),
+    // glass and liquids
+    ("298c4c0f", "standard_glass_breakable_dirt", "glass", "exterior window panes"),
+    ("653582a4", "standard_glass_breakable_sticker", "glass", "exterior glass"),
+    ("6a817597", "standard_glass_breakable", "glass", "interior glass, curtains, doors"),
+    ("656a1cdb", "standard_alpha_liquid_open_vessel", "glass", "bottles and drinking glasses"),
+    ("12839ca7", "standard_alpha_liquid_open_vessel_opaque_liquid", "glass", "drinking glasses with liquid"),
+    ("9ceb543e", "standard_alpha_liquid_opaque_liquid", "glass", "cups with liquid"),
+    ("9f8ae601", "standard_alpha_liquid", "glass", "bottles"),
+    ("0357215a", "standard_alpha_liquid_opaque_vessel", "glass", "cups"),
+    // plain forward alpha: no emissive input
+    ("e3ba3129", "standard_alpha", "alpha", "forward alpha: building doors and glazing, signs, many props"),
+    ("d9ec330c", "standard_alpha_inst", "alpha", "forward alpha, instanced (light-bulb glass among others)"),
+    ("d5a93b6f", "standard_alpha_secmo", "alpha", "forward alpha: glass, sheer cloth"),
+    ("5b775918", "standard_anisotropy_dirt_alpha", "alpha", "forward alpha with anisotropic highlights and a dirt layer (phone screens among others)"),
     // emissive
-    ("faec4fc8", "emissive", "digital signs / screens"),
-    ("f5ba53da", "emissive", "baked lightmap overlay"),
-    ("3a09c775", "emissive", "LED lights and panels"),
-    ("3bc8ac60", "emissive", "emissive detail"),
-    ("60643f2e", "emissive", "traffic-light counter"),
-    ("5b775918", "emissive", "phone screens"),
+    ("faec4fc8", "signs_emissive", "emissive", "digital signs / screens (one colour map, which is the light)"),
+    ("60643f2e", "signs_emissive_inst", "emissive", "digital signs, instanced (traffic-light counters among others)"),
+    ("f5ba53da", "standard_emissive_lightmap_v2", "emissive", "baked lightmap overlay (emissivetex)"),
+    ("3bc8ac60", "standard_emissive_lightmap", "emissive", "baked lightmap overlay (emissivetex)"),
+    ("3a09c775", "standard_emissive_layer_pxm_inst", "emissive", "emissive layer, parallax, instanced: LED lights and panels (emissivetex)"),
+    ("db8b21bd", "standard_emissive_layer_alpha", "emissive", "forward alpha with an emissive layer: glass railings, door glass (emissivetex)"),
     // water
-    ("7f3a6aa9", "water", "water surface"),
-    ("97596162", "water", "fountain / VFX water"),
-    ("735d2de6", "water", "waterfall VFX"),
+    ("7f3a6aa9", "water_micro_geom", "water", "water surface"),
+    ("97596162", "standard_alpha_water", "water", "fountain / VFX water"),
+    ("735d2de6", "standard_alpha_waterfall", "water", "waterfall VFX"),
     // terrain / multilayer
-    ("61e09df7", "terrain_multilayer", "landscape blend (17 params)"),
-    ("360e396b", "terrain_multilayer", "landscape blend (17 params)"),
-    ("b21f1ba5", "terrain_multilayer", "landscape blend (17 params)"),
-    ("0ad54cb9", "terrain_multilayer", "landscape blend (17 params)"),
-    ("27e5c49d", "terrain_multilayer", "landscape blend (17 params)"),
-    ("61fad45c", "terrain_multilayer", "landscape blend (17 params)"),
-    ("40497278", "terrain_multilayer", "landscape blend (17 params)"),
-    ("4a579bbf", "terrain_multilayer", "landscape blend (17 params)"),
-    ("76fcff28", "terrain_multilayer", "landscape blend (17 params)"),
-    ("88a32075", "terrain_multilayer", "landscape blend (17 params)"),
-    ("388f8fb6", "terrain_multilayer", "landscape blend (17 params)"),
-    ("f8e1f225", "terrain_multilayer", "landscape blend (17 params)"),
-    ("d5bdc029", "terrain_multilayer", "landscape blend (17 params)"),
-    ("6f968246", "terrain_multilayer", "landscape blend (17 params)"),
-    ("1ae17fd6", "terrain_multilayer", "landscape blend (17 params)"),
-    ("5a71e7e1", "terrain_multilayer", "landscape blend (17 params)"),
-    ("10098c2c", "terrain_multilayer", "landscape blend (17 params)"),
-    ("7543cefc", "terrain_multilayer", "landscape blend (17 params)"),
-    ("77d8ab27", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
-    ("1251cae5", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
-    ("cd8ceb5e", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
-    ("4f0b809b", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
-    ("b217b263", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
+    ("61e09df7", "standard_uber_4lyr_dpm_dm_hbb", "terrain_multilayer", "landscape blend (17 params)"),
+    ("360e396b", "standard_uber_4lyr_spx_dm_hbb", "terrain_multilayer", "landscape blend (17 params)"),
+    ("b21f1ba5", "standard_uber_4lyr_pxm_hbb_fixuv1", "terrain_multilayer", "landscape blend (17 params)"),
+    ("0ad54cb9", "standard_uber_4lyr_dpm_dm_hbb_uv3", "terrain_multilayer", "landscape blend (17 params)"),
+    ("27e5c49d", "standard_uber_4lyr_pxm_hbb_uv3", "terrain_multilayer", "landscape blend (17 params)"),
+    ("61fad45c", "standard_uber_4lyr_dpm_dfm_dm_hbb", "terrain_multilayer", "landscape blend (17 params)"),
+    ("40497278", "standard_uber_4lyr_dpm_dfm_dm_hbb_uv3", "terrain_multilayer", "landscape blend (17 params)"),
+    ("4a579bbf", "standard_uber_4lyr_pxm_hbb", "terrain_multilayer", "landscape blend (17 params)"),
+    ("76fcff28", "standard_uber_4lyr_spx_dm_hbb_uv3", "terrain_multilayer", "landscape blend (17 params)"),
+    ("88a32075", "standard_uber_4lyr", "terrain_multilayer", "landscape blend (17 params)"),
+    ("388f8fb6", "standard_uber_4lyr_dfm_dm_hbb", "terrain_multilayer", "landscape blend (17 params)"),
+    ("f8e1f225", "standard_uber_4lyr_dfm_dm_hbb_uv3", "terrain_multilayer", "landscape blend (17 params)"),
+    ("d5bdc029", "standard_uber_4lyr_hbo_dm_hbb", "terrain_multilayer", "landscape blend (17 params)"),
+    ("6f968246", "standard_uber_4lyr_mud_dm_hbb", "terrain_multilayer", "landscape blend (17 params)"),
+    ("1ae17fd6", "standard_uber_4lyr_mud_dm_hbb_uv3", "terrain_multilayer", "landscape blend (17 params)"),
+    ("5a71e7e1", "standard_uber_4lyr_pxm", "terrain_multilayer", "landscape blend (17 params)"),
+    ("10098c2c", "standard_uber_4lyr_pxm_uv3", "terrain_multilayer", "landscape blend (17 params)"),
+    ("7543cefc", "standard_uber_4lyr_uv3", "terrain_multilayer", "landscape blend (17 params)"),
+    ("77d8ab27", "standard_2lyr", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
+    ("1251cae5", "standard_2lyr_pxm_ground", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
+    ("cd8ceb5e", "standard_2lyr_ground", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
+    ("4f0b809b", "standard_2lyr_pxm_decal_ground", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
+    ("b217b263", "standard_2lyr_pxm", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
     // other
-    ("255417c3", "cutout", "vegetation"),
-    ("e05f1a42", "decal", "road signs (distance_map)"),
-    ("89a1cf72", "opaque", "ped eyes"),
-    ("379efcef", "opaque", "ped head / skin"),
+    ("255417c3", "trees_standard_wind", "cutout", "vegetation"),
+    ("e05f1a42", "distance_map", "decal", "road signs"),
+    ("89a1cf72", "ped_standard_eye", "opaque", "ped eyes"),
+    ("379efcef", "ped_standard_head", "opaque", "ped head / skin"),
 ];
 
 /// What each known texture parameter slot holds. Roles marked "likely" come
@@ -128,7 +133,7 @@ pub fn classify(name_hash: &str, flags: &[u8]) -> Value {
     // export lights them by name).
     let name = crate::names::shader(name_hash);
     let named_emissive = fam.is_none() && name.as_deref().is_some_and(|n| n.starts_with("standard_vehicle") && n.contains("emissive"));
-    let class = fam.map(|f| f.1).unwrap_or(if named_emissive { "emissive" } else { bucket });
+    let class = fam.map(|f| f.2).unwrap_or(if named_emissive { "emissive" } else { bucket });
     // Parts whose colour is not in a texture (it comes from the vehicle
     // material palette, not decoded): a stand-in surface for converters.
     let stand_in = match (name_hash, name.as_deref()) {
@@ -173,7 +178,8 @@ pub fn classify(name_hash: &str, flags: &[u8]) -> Value {
         "decal": decal,
         "alpha_mode": alpha_mode,
         "instanced_or_batch_lod": b1 & 0x80 != 0,
-        "family": fam.map(|f| f.2),
+        "family": fam.map(|f| f.3),
+        "shader": fam.map(|f| f.1.to_string()).or(name.clone()),
         "stand_in": stand_in,
         "source": if fam.is_some() { "known shader family + record flags" } else if named_emissive { "shader name (emissive) + record flags" } else { "record flags (+0x38 byte 4)" },
         "record_flags": flags.iter().map(|x| format!("{x:02x}")).collect::<String>(),
@@ -190,6 +196,91 @@ pub fn paint_block() -> Value {
         "csp_hint": "smCarPaint: txDiffuse = white * paint colour, use dirt/scratch masks for txMaps where wanted; clear coat on",
         "beamng_hint": "instanceDiffuse + colorPaletteMap; base colour white so the paint colour shows",
     })
+}
+
+/// joaat("emissivemultiplier"): the material constant that scales how bright
+/// its emissive map (or lit colour map) is.
+pub const EMISSIVE_MULTIPLIER_PARAM: &str = "5eebed48";
+
+/// The game's `emissivemultiplier` per glTF unit of emissive strength. The
+/// values read like luminance in nits (5 on glass railings, about 600 on a
+/// bulb, about 3200 on an LED sign), so 1.0 in the glTF is 100 nits: about
+/// the white of a display, which a viewer without exposure control shows
+/// as full white.
+pub const EMISSIVE_NITS_PER_UNIT: f32 = 100.0;
+
+/// Highest glTF emissive strength written (10 000 nits).
+pub const EMISSIVE_MAX_STRENGTH: f32 = 100.0;
+
+/// How bright a lit material is in the glTF, from its `emissivemultiplier`
+/// (None when the material has none or it did not read).
+///
+/// `strength` = multiplier / [`EMISSIVE_NITS_PER_UNIT`], at most
+/// [`EMISSIVE_MAX_STRENGTH`]. Up to 1 it goes into `emissiveFactor`; above
+/// 1 the factor stays 1 and the rest goes into
+/// `KHR_materials_emissive_strength`, as that extension asks.
+///
+/// A multiplier of 0 (a traffic-light counter, among others) is a light the
+/// game switches on while it runs. It is kept lit at strength 1, like a
+/// material with no multiplier, so it does not export dark. A negative or
+/// non-finite value is treated as no multiplier.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EmissiveStrength {
+    /// The material's `emissivemultiplier`, as read.
+    pub multiplier: Option<f32>,
+    /// The glTF strength: emissiveFactor x KHR_materials_emissive_strength.
+    pub strength: f32,
+    /// `multiplier` (the multiplier divided by the unit), `default` (no
+    /// multiplier: strength 1), `runtime` (multiplier 0: strength 1) or
+    /// `capped` (over [`EMISSIVE_MAX_STRENGTH`]).
+    pub source: &'static str,
+}
+
+impl EmissiveStrength {
+    pub fn from_multiplier(multiplier: Option<f32>) -> Self {
+        let (strength, source) = match multiplier {
+            Some(m) if m.is_finite() && m > 0.0 => {
+                let s = m / EMISSIVE_NITS_PER_UNIT;
+                if s > EMISSIVE_MAX_STRENGTH {
+                    (EMISSIVE_MAX_STRENGTH, "capped")
+                } else {
+                    (s, "multiplier")
+                }
+            }
+            Some(m) if m == 0.0 => (1.0, "runtime"),
+            _ => (1.0, "default"),
+        };
+        EmissiveStrength { multiplier: multiplier.filter(|m| m.is_finite()), strength, source }
+    }
+
+    /// The glTF `emissiveFactor` (grey, at most 1).
+    pub fn factor(&self) -> f32 {
+        self.strength.min(1.0)
+    }
+
+    /// `KHR_materials_emissive_strength.emissiveStrength`, when above 1.
+    pub fn extension(&self) -> Option<f32> {
+        (self.strength > 1.0).then_some(self.strength)
+    }
+
+    /// Set the emissive factor and extension of a glTF material that lights.
+    pub fn apply(&self, m: &mut Value) {
+        let f = self.factor();
+        m["emissiveFactor"] = json!([f, f, f]);
+        match self.extension() {
+            Some(s) => m["extensions"]["KHR_materials_emissive_strength"] = json!({"emissiveStrength": s}),
+            None => {
+                if let Some(x) = m.get_mut("extensions").and_then(|x| x.as_object_mut()) {
+                    x.remove("KHR_materials_emissive_strength");
+                }
+            }
+        }
+    }
+
+    /// The record written to model.json, materials.json and the GLB extras.
+    pub fn json(&self) -> Value {
+        json!({"multiplier": self.multiplier, "strength": self.strength, "source": self.source})
+    }
 }
 
 /// glTF material fields for a classification: alpha mode and stand-in PBR
@@ -276,7 +367,7 @@ pub fn is_tyre_shader(name_hash: &str) -> bool {
 }
 
 pub fn is_paint(name_hash: &str) -> bool {
-    FAMILIES.iter().any(|f| f.0 == name_hash && f.1 == "car_paint")
+    FAMILIES.iter().any(|f| f.0 == name_hash && f.2 == "car_paint")
 }
 
 /// Layer layout of the two-layer vertex-blended families (terrain_multilayer
@@ -293,10 +384,13 @@ pub fn is_paint(name_hash: &str) -> bool {
 ///   `lyr0normaltex`, `lyr0materialbtex`, `lyr0materialatex`, `lyr1…`,
 ///   `dirtdiffusetex` for the overlay).
 ///   Confidence: high for the grouping.
-/// * COLOR0.a is the only vertex channel painted over the full 0..255 range
-///   (R is mostly a constant 255, G stays within 0..45, B has a few
-///   distinct values); A = 0 on most vertices, so A weights layer 2 over
-///   the base. Confidence: medium.
+/// * Layer weight (shader code, 2026-11-25; replaces a guess from vertex
+///   statistics that pointed at COLOR0.a): the deferred pixel programs
+///   blend `colour = lerp(layer 1, layer 2, w)` with `w` from the second
+///   vertex colour set's red (`_COLOR1.r`), the blend mask (slot 11),
+///   `blendsoftness`, `blendintensity` and `blendoffset`; see
+///   [`TWO_LAYER_BLEND`] and [`two_layer_blend`]. `_COLOR0.a` scales the
+///   dirt overlay instead.
 /// * UV sets: layer 2 follows TEXCOORD_1 (texel anisotropy matches its
 ///   textures in 108 of 117 primitives for 1251cae5, 54 of 72 for
 ///   cd8ceb5e); the base uses TEXCOORD_0 by elimination (TEXCOORD_2 is
@@ -325,33 +419,27 @@ pub fn layers(name_hash: &str, entries: &[Value]) -> Option<Value> {
     };
     let mut out = json!({
         "layers": [
-            layer("base", base, "TEXCOORD_0", "1 - COLOR0.a"),
-            layer("layer2", l2, "TEXCOORD_1", "COLOR0.a"),
+            layer("base", base, "TEXCOORD_0", "1 - w"),
+            layer("layer2", l2, "TEXCOORD_1", "w"),
         ],
+        "blend": two_layer_blend_text(),
         "overlay": {"colour_alpha": tex(overlay), "uv_set": "TEXCOORD_2", "weight": "texture alpha (grime/dirt)", "uv_note": "TEXCOORD_2 by analogy with prop_2lyr_batch, where a seam test shows it (the tiling wall dirt maps cannot be checked that way). On walls it is constant (0, 1) on most primitives (uniform dirt), exactly the horizontal position at 1 m per unit (rotated, no residual) on ground and track pieces, and an irregular second mapping on others"},
         "extra_data": tex(extra),
-        "vertex_color_channels": {"r": "unverified: a baked shading term, mostly 255 (dark blobs on ground tiles where trees stand, 23 on average on trees, 252 on interior shaders; does not follow sky visibility from its own or neighbouring placed geometry in ray tests, nor nearby batch trees, grass AO or road distance)", "g": "unverified: equal to r on 63 % of ordinary vertices; low on ground shaders and varies widely within one collision surface, so not a surface-type mask (looks painted per vertex)", "b": "tint palette index (entry within the palette row)", "a": "layer 2 weight"},
-        "confidence": {"grouping": "high", "weight_channel": "medium", "uv_layer2": "medium", "uv_base": "low", "uv_overlay": "low", "data_channels": "unknown"},
-        "note": "Derived from texture-size grouping and vertex/UV statistics, not from shader code. Blend: lerp(base, layer2, COLOR0.a), then the overlay by its alpha (TEXCOORD_2). Normal maps: DirectX green.",
+        "vertex_color_channels": {"r": "unverified: a baked shading term, mostly 255 (dark blobs on ground tiles where trees stand, 23 on average on trees, 252 on interior shaders; does not follow sky visibility from its own or neighbouring placed geometry in ray tests, nor nearby batch trees, grass AO or road distance)", "g": "unverified: equal to r on 63 % of ordinary vertices; low on ground shaders and varies widely within one collision surface, so not a surface-type mask (looks painted per vertex)", "b": "tint palette index (entry within the palette row)", "a": "multiplies the dirt overlay's alpha (shader code); not the layer weight"},
+        "vertex_color1_channels": {"r": "layer 2 weight input c (shader code; see blend)", "g": "subtracted from w for the normal blend (max(0, w - g)); not traced further", "b": "not read by the blend", "a": "not read by the blend"},
+        "confidence": {"grouping": "high", "weight_channel": "high (shader code: mesh and pixel programs)", "weight_formula": "medium-high (read in full for standard_2lyr and prop_2lyr_batch; the pxm and decal ground variants have the same code shape; not compared with a rendered image)", "uv_layer2": "medium", "uv_base": "low", "uv_overlay": "low", "data_channels": "unknown"},
+        "note": "Slots from texture-size grouping and recovered slot names; the blend from shader code: lerp(base, layer2, w) with w in blend, then the overlay by its alpha (TEXCOORD_2) times _COLOR0.a. Normal maps: DirectX green.",
     });
     if name_hash == "89c8fe07" {
-        // Unpainted vertices are A = 255 here (every granite rock, plain
-        // barriers), and A is painted down on container corner posts, edges
-        // and corrugations (more on the weathered `_b` variant): the overlay
-        // layer weight is 1 - A, the reverse of the wall shaders.
-        out["layers"][0]["weight"] = json!("COLOR0.a");
-        out["layers"][1]["weight"] = json!("1 - COLOR0.a");
-        out["vertex_color_channels"]["a"] = json!("layer-1 weight as 1 - a: 255 (unpainted) = base layer only");
         out["vertex_color_channels"]["r"] = json!("unverified on props: 0/1 part masks on containers, varies on concrete barriers (lower on upward faces)");
-        out["confidence"]["weight_channel"] = json!("medium (direction from where the painting sits, not from shader code)");
-        out["note"] = json!("Derived from recovered slot names, UV tests and where the vertex alpha is painted, not from shader code. Blend: lerp(base, layer2, 1 - COLOR0.a), sharpened by the layers' materialb alpha (height-like), then the dirt overlay by its alpha on TEXCOORD_2. Normal maps: DirectX green.");
+        out["note"] = json!("Slots from recovered slot names and UV tests; the blend from shader code (same code shape as standard_2lyr): lerp(base, layer2, w) with w in blend, then the dirt overlay by its alpha on TEXCOORD_2 times _COLOR0.a. Normal maps: DirectX green.");
         out["overlay"].as_object_mut().unwrap().remove("uv_note");
         out["confidence"]["uv_overlay"] = json!("medium");
         out["prop_2lyr"] = json!({
             "slot_names": {"p0": "lyr0diffusetex", "p6": "lyr0normaltex", "p7": "lyr0materialbtex", "p9": "lyr0materialatex", "p4": "lyr1diffusetex", "p10": "lyr1normaltex", "p5": "lyr1materialbtex", "p2": "lyr1materialatex", "p8": "dirtdiffusetex", "p1": "tintpalettetex (embedded)", "p11": "unnamed (greyscale mask, containers only)"},
             "tint": "the tintpalettetex colour is applied per vertex as COLOR_0 (tint_applied in meshes[]; props with a palette such as containers and barriers, not the rocks); multiply it into the base layer (white paint), not the rust or moss overlay, whose textures are already coloured",
             "dirt_uv": "TEXCOORD_2. On barriers and most containers it is a mapping of its own with almost no seams (27 against about 560 for TEXCOORD_0 and _1 on one barrier), and the dirt map is continuous across those seams while it reads as random across the other sets' seams. On every rock and on some containers it is parked at one point, (1, 0) or (0, 1), so the dirt there is one uniform sample (with wrap and bilinear filtering, the average of the four corner texels: alpha about 64 of 255 on the rock dirt map); sampling it as-is matches the vertex data. Not checked against shader code",
-            "note": "prop_2lyr_batch (rocks, containers, concrete barriers): same slot layout as the multilayer walls. Layer 0 is the unwrapped base (rock chunk atlas, painted metal) on TEXCOORD_0 (checked: rock UV0 triangles fall inside the atlas chunks, UV1 ones do not); layer 1 is a tiling overlay (moss, rust). materialb alpha looks like a height map in both layers (a height blend would sharpen the COLOR0.a weight). Raw COLOR0 on a container is all 1 and on a large rock R is 0/1, G 1, B about 0 and A varies, so A = 255 means base only and the overlay weight is 1 - A (see layers[].weight).",
+            "note": "prop_2lyr_batch (rocks, containers, concrete barriers): same slot layout as the multilayer walls. Layer 0 is the unwrapped base (rock chunk atlas, painted metal) on TEXCOORD_0 (checked: rock UV0 triangles fall inside the atlas chunks, UV1 ones do not); layer 1 is a tiling overlay (moss, rust). The layer weight comes from _COLOR1.r and the blend mask (slot 11), not from COLOR0.a as was guessed before (see blend); COLOR0.a scales the dirt overlay.",
         });
     }
     Some(out)
@@ -369,11 +457,103 @@ pub fn multilayer(s: &crate::drawable::Shader, entries: &[Value], fit: impl FnOn
         l["detail_uv"]["recommended"] = four_layer_detail_uv(&fit);
         four_layer_uv(&mut l, &s.constants);
         four_layer_tint(&mut l, &s.constants);
+    } else if l["blend"].is_object() {
+        two_layer_blend(&mut l, &s.constants);
     }
     if !fit.is_null() {
         l["uv_fit"] = fit;
     }
     Some(l)
+}
+
+/// Material constants of the two-layer blend: `blendsoftness`,
+/// `blendintensity`, `blendoffset`, the blend mask's channel weights
+/// (59eb15c5), the mask invert switch (f208e5ee), the mask UV pick
+/// (f50070cc), the instance-value switch (d969fac9) and the layer-2
+/// colour-alpha switch (d6de9e14).
+pub const TWO_LAYER_BLEND: [(&str, &str); 8] = [
+    ("cbc6c5b3", "blendsoftness"),
+    ("ba3b95db", "blendintensity"),
+    ("29265d05", "blendoffset"),
+    ("59eb15c5", "mask_weights"),
+    ("f208e5ee", "mask_invert"),
+    ("f50070cc", "mask_uv_pair"),
+    ("d969fac9", "instance_switch"),
+    ("d6de9e14", "layer2_alpha"),
+];
+
+/// How the two-layer shaders weight layer 2, as their deferred pixel
+/// programs compute it. Read in full in `standard_2lyr`
+/// (`PS_DeferredTextured_4dbafe93`) and `prop_2lyr_batch` (`…_aa5a1a1b`);
+/// `standard_2lyr_pxm` (`…_1d195d65`, also used by `_pxm_ground`) and
+/// `_pxm_decal_ground` (`…_0c91b99b`) have the same code, the pxm ones
+/// after a first pass that moves the mask's UV by a preliminary weight.
+/// The weight input is the pixel input COLOR1.x, which the mesh programs
+/// (`MS_VS_Transform_4dbafe93`, `…_0c91b99b`) load from mesh stream 12 (the
+/// exported `_COLOR1`), red byte; COLOR0.a reaches the pixel program as the
+/// first colour set's alpha and scales the dirt overlay.
+fn two_layer_blend_text() -> Value {
+    json!({
+        "inputs": {
+            "c": "_COLOR1.r / 255 (the second vertex colour set)",
+            "M": "the blend mask: slot 11 (extra_data), rgba, on TEXCOORD_0 when mask_uv_pair is 1, else TEXCOORD_1 (2 on 6 to 26 % of sampled materials; the mesh program packs mesh UV sets 0 and 1 into the pixel input TEXCOORD0)",
+            "b": "a per-instance value (byte 3 of the instance's record; batch props: an instance input). Not exported; 1 (byte 255) is assumed, which makes m = blendintensity",
+        },
+        "steps": [
+            "h = dot(M, mask_weights)                (mask_weights.z is replaced by b where instance_switch is 1 and b < 1)",
+            "h = 1 - h                               where mask_invert is not 0",
+            "t = saturate(c x (1 + h))",
+            "k = 1 / max(0.001, blendsoftness^2)",
+            "s = saturate(t / max(0.01, t + k x (1 - t)))",
+            "m = b if b + instance_switch < 1, else min(blendintensity, 3 b)      (b = 1: m = blendintensity)",
+            "w = saturate(s x m + blendoffset)",
+            "w = w x lyr1diffusetex.a                where layer2_alpha is not 0",
+            "colour = lerp(base, layer2, w)",
+        ],
+        "simple": "with b = 1 and the mask ignored (h = 0): w = saturate(sharpen(c) x blendintensity + blendoffset), sharpen(c) = c / (c + k (1 - c)); blendsoftness 1 gives sharpen(c) = c",
+        "source": "shader code: the deferred pixel programs of standard_2lyr and prop_2lyr_batch read in full, the pxm and decal ground ones compared; the mesh programs' export of _COLOR1.r to the pixel input checked. Not compared with a rendered image",
+        "not_read": "where the per-instance value comes from in the placements; the normal and material-map blend (they use max(0, w - _COLOR1.g))",
+    })
+}
+
+/// Resolve [`two_layer_blend_text`] for one material: its own constants
+/// (`blend.params`) and the formula with them filled in
+/// (`blend.resolved`). Leaves the general text alone when the material
+/// lacks the constants.
+fn two_layer_blend(l: &mut Value, consts: &[crate::drawable::ShaderConst]) {
+    let get = |h: &str| consts.iter().find(|c| c.hash == h).and_then(|c| c.components()).filter(|v| !v.is_empty() && v.iter().all(|x| x.is_finite())).map(<[f32]>::to_vec);
+    let one = |h: &str| get(h).map(|v| v[0]);
+    let mut params = serde_json::Map::new();
+    for (h, name) in TWO_LAYER_BLEND {
+        if let Some(v) = get(h) {
+            params.insert(name.into(), if v.len() == 1 { json!(v[0]) } else { json!(v) });
+        }
+    }
+    l["blend"]["params"] = Value::Object(params);
+    let (Some(soft), Some(int), Some(off)) = (one("cbc6c5b3"), one("ba3b95db"), one("29265d05")) else { return };
+    let g = |x: f32| format!("{}", (x as f64 * 1e4).round() / 1e4);
+    let k = 1.0 / (soft * soft).max(0.001);
+    let mask = match get("59eb15c5").filter(|v| v.len() == 4) {
+        Some(w) => {
+            let terms: Vec<String> = w.iter().zip(["M.r", "M.g", "M.b", "M.a"]).filter(|(x, _)| **x != 0.0).map(|(x, n)| if *x == 1.0 { n.to_string() } else { format!("{} {n}", g(*x)) }).collect();
+            let h = if terms.is_empty() { "0".to_string() } else { terms.join(" + ") };
+            if one("f208e5ee").is_some_and(|x| x != 0.0) { format!("1 - ({h})") } else { h }
+        }
+        None => "dot(M, mask_weights)".into(),
+    };
+    let mut w = format!("saturate(s x {} + {})", g(int.min(3.0)), g(off));
+    if one("d6de9e14").is_some_and(|x| x != 0.0) {
+        w += " x lyr1diffusetex.a";
+    }
+    l["blend"]["resolved"] = json!({
+        "h": mask,
+        "t": "saturate(c x (1 + h))",
+        "k": g(k),
+        "s": if (k - 1.0).abs() < 1e-6 { "t".to_string() } else { format!("saturate(t / max(0.01, t + {} x (1 - t)))", g(k)) },
+        "w": w,
+        "mask_uv": if one("f50070cc") == Some(1.0) { "TEXCOORD_0" } else { "TEXCOORD_1" },
+        "assumes": "instance value b = 1",
+    });
 }
 
 /// Fit each UV set as a plane over the horizontal model position
@@ -840,6 +1020,36 @@ mod paint_tests {
     use super::*;
 
     #[test]
+    fn family_names_match_their_hashes() {
+        for (h, name, class, _) in FAMILIES {
+            assert_eq!(format!("{:08x}", crate::meta7a::joaat(name)), *h, "{name}");
+            // emissive exactly when the shader is one of the emissive ones
+            assert_eq!(*class == "emissive", name.contains("emissive"), "{name} is labelled {class}");
+        }
+        let mut hashes: Vec<_> = FAMILIES.iter().map(|f| f.0).collect();
+        hashes.sort();
+        hashes.dedup();
+        assert_eq!(hashes.len(), FAMILIES.len());
+    }
+
+    #[test]
+    fn relabelled_families() {
+        let alpha = [0, 0, 0, 0, 2, 0, 0, 0];
+        for (h, class, shader) in [
+            ("d9ec330c", "alpha", "standard_alpha_inst"),
+            ("5b775918", "alpha", "standard_anisotropy_dirt_alpha"),
+            ("e3ba3129", "alpha", "standard_alpha"),
+            ("60643f2e", "emissive", "signs_emissive_inst"),
+            ("3a09c775", "emissive", "standard_emissive_layer_pxm_inst"),
+            ("db8b21bd", "emissive", "standard_emissive_layer_alpha"),
+        ] {
+            let c = classify(h, &alpha);
+            assert_eq!((c["class"].as_str(), c["shader"].as_str(), c["alpha_mode"].as_str()), (Some(class), Some(shader), Some("BLEND")), "{h}");
+            assert_eq!(gltf_fields(&c, true)["emissiveFactor"].is_null(), class != "emissive", "{h}");
+        }
+    }
+
+    #[test]
     fn paint_hex() {
         assert_eq!(parse_paint("ffffff"), Some([1.0, 1.0, 1.0]));
         assert_eq!(parse_paint("#ff000000").map(|c| c[0]), Some(0.0));
@@ -937,7 +1147,7 @@ mod paint_tests {
             }
         }
         crate::gltf::TriPrim {
-            name: String::new(), positions, normals: None, tangents: None, uvs: vec![u0, u1], colors: None, colors1: None, tint: None,
+            name: String::new(), positions, normals: None, tangents: None, uvs: vec![u0, u1], colors: None, colors1: None, regions: None, tint: None,
             indices: vec![], material: Some(0), joints: None, weights: None, joints1: None, weights1: None,
         }
     }
@@ -971,9 +1181,32 @@ mod paint_tests {
         assert_eq!(l["overlay"]["colour_alpha"]["png"], "t8.png");
         assert_eq!(l["overlay"]["uv_set"], "TEXCOORD_2");
         assert!(l["prop_2lyr"].is_object());
-        assert_eq!(l["layers"][1]["weight"], "1 - COLOR0.a");
-        assert_eq!(layers("b217b263", &entries).unwrap()["layers"][1]["weight"], "COLOR0.a");
+        assert_eq!((l["layers"][0]["weight"].as_str(), l["layers"][1]["weight"].as_str()), (Some("1 - w"), Some("w")));
+        assert_eq!(layers("b217b263", &entries).unwrap()["layers"][1]["weight"], "w");
         assert_eq!(layers("b217b263", &entries).unwrap()["overlay"]["uv_set"], "TEXCOORD_2");
+        assert!(l["blend"]["inputs"]["c"].as_str().unwrap().starts_with("_COLOR1.r"));
+    }
+
+    #[test]
+    fn two_layer_blend_from_constants() {
+        // a pipe stack's prop_2lyr_batch material: intensity 0.4, offset 0.3, softness 0.3, mask = blue
+        let k = |hash: &str, v: [f32; 4], count: u8| crate::drawable::ShaderConst { hash: hash.into(), desc: String::new(), offset: 0, values: Some(v), buffer: 7, count, ty: None };
+        let s1 = |hash: &str, x: f32| k(hash, [x, 0.0, 0.0, 0.0], 1);
+        let sh = crate::drawable::Shader { index: 0, record_off: 0, name_hash: "89c8fe07".into(), param_hashes: vec![], textures: vec![], flags: vec![],
+            constants: vec![s1("cbc6c5b3", 0.3), s1("ba3b95db", 0.4), s1("29265d05", 0.3), k("59eb15c5", [0.0, 0.0, 1.0, 0.0], 4), s1("f208e5ee", 1.0), s1("f50070cc", 2.0), s1("d969fac9", 0.0), s1("d6de9e14", 0.0)] };
+        let m = multilayer(&sh, &[], || Value::Null).unwrap();
+        let b = &m["blend"];
+        assert_eq!((b["params"]["blendintensity"].as_f64().map(|x| (x * 10.0).round()), b["params"]["mask_weights"][2].as_f64()), (Some(4.0), Some(1.0)));
+        let r = &b["resolved"];
+        assert_eq!((r["h"].as_str(), r["k"].as_str(), r["w"].as_str()), (Some("1 - (M.b)"), Some("11.1111"), Some("saturate(s x 0.4 + 0.3)")));
+        assert_eq!(r["mask_uv"], "TEXCOORD_1");
+        // softness 1: no sharpening; the layer-2 alpha switch multiplies in lyr1diffusetex.a
+        let sh = crate::drawable::Shader { constants: vec![s1("cbc6c5b3", 1.0), s1("ba3b95db", 1.0), s1("29265d05", 0.0), s1("d6de9e14", 1.0)], ..sh };
+        let r = &multilayer(&sh, &[], || Value::Null).unwrap()["blend"]["resolved"];
+        assert_eq!((r["s"].as_str(), r["w"].as_str()), (Some("t"), Some("saturate(s x 1 + 0) x lyr1diffusetex.a")));
+        // no constants: the general text only
+        let sh = crate::drawable::Shader { constants: vec![], ..sh };
+        assert!(multilayer(&sh, &[], || Value::Null).unwrap()["blend"]["resolved"].is_null());
     }
 
     #[test]
@@ -1014,6 +1247,47 @@ mod paint_tests {
         let m = gltf_fields(&json!({"class": "emissive", "alpha_mode": "OPAQUE"}), true);
         assert_eq!(m["emissiveTexture"], "base");
         assert_eq!(m["emissiveFactor"], json!([1.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn emissive_multiplier_hash() {
+        assert_eq!(format!("{:08x}", crate::names::joaat_exact("emissivemultiplier")), EMISSIVE_MULTIPLIER_PARAM);
+    }
+
+    #[test]
+    fn emissive_strength_from_multiplier() {
+        let lit = |m: Option<f32>| {
+            let mut g = gltf_fields(&json!({"class": "emissive", "alpha_mode": "OPAQUE"}), true);
+            let e = EmissiveStrength::from_multiplier(m);
+            e.apply(&mut g);
+            (e, g)
+        };
+        // glass railings (5): dim, all in the factor, no extension
+        let (e, g) = lit(Some(5.0));
+        assert_eq!((e.source, e.strength), ("multiplier", 0.05));
+        assert_eq!(g["emissiveFactor"], json!([0.05f32, 0.05f32, 0.05f32]));
+        assert!(g["extensions"].is_null());
+        // a bulb (628) and an LED sign (3225.8): factor 1, the rest in the extension
+        for (m, s) in [(628.0f32, 6.28f32), (3225.8, 32.258)] {
+            let (e, g) = lit(Some(m));
+            assert!((e.strength - s).abs() < 1e-4, "{m}");
+            assert_eq!(g["emissiveFactor"], json!([1.0, 1.0, 1.0]));
+            assert_eq!(g["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"], json!(e.strength));
+        }
+        // 0: switched on at run time, kept lit at strength 1
+        let (e, g) = lit(Some(0.0));
+        assert_eq!((e.source, e.strength, e.multiplier), ("runtime", 1.0, Some(0.0)));
+        assert_eq!(g["emissiveFactor"], json!([1.0, 1.0, 1.0]));
+        assert!(g["extensions"].is_null());
+        // none, negative or not finite: strength 1
+        for m in [None, Some(-3.0), Some(f32::NAN), Some(f32::INFINITY)] {
+            let e = EmissiveStrength::from_multiplier(m);
+            assert_eq!((e.source, e.strength), ("default", 1.0), "{m:?}");
+        }
+        // over 10 000 nits: capped
+        let e = EmissiveStrength::from_multiplier(Some(50_000.0));
+        assert_eq!((e.source, e.strength, e.extension()), ("capped", EMISSIVE_MAX_STRENGTH, Some(EMISSIVE_MAX_STRENGTH)));
+        assert_eq!(e.json()["multiplier"], json!(50_000.0));
     }
 
     #[test]

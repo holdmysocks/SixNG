@@ -606,7 +606,7 @@ pub fn export_outfit(a: &ArchiveInfo, parts: &[&Entry], name: &str, out: &Path, 
     let extras = serde_json::json!({"outfit": name, "parts": parts.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), "coordinate_system": crate::export::COORDS, "anim_only": anim_only});
     let opt = crate::gltf::GlbOptions { animations: &anims, trs_joints: true, skinned_meshes_at_root: true };
     let glb = crate::gltf::mesh_glb_with(name, &groups, &materials, &joints, extras, &opt);
-    std::fs::write(out, &glb)?;
+    crate::atomic::write(out, &glb)?;
     // weighted influences whose bone is in no skeleton (weight moved by the writer)
     let unresolved_of = |p: &TriPrim| -> usize {
         let sets = [(&p.joints, &p.weights), (&p.joints1, &p.weights1)];
@@ -656,7 +656,7 @@ mod tests {
         assert_eq!(m[3].bind[12], 9.0);
         assert_eq!(m[0].parent, None);
         let mut p = TriPrim {
-            name: "p".into(), positions: vec![[0.0; 3]; 2], normals: None, tangents: None, uvs: vec![], colors: None, colors1: None, tint: None, indices: vec![], material: None,
+            name: "p".into(), positions: vec![[0.0; 3]; 2], normals: None, tangents: None, uvs: vec![], colors: None, colors1: None, regions: None, tint: None, indices: vec![], material: None,
             joints: Some(vec![[0, 3, 2, 7], [1, 1, 1, 1]]), weights: Some(vec![[100, 100, 55, 0], [255, 0, 0, 0]]), joints1: None, weights1: None,
         };
         remap_joints(&mut p, &maps[1]);

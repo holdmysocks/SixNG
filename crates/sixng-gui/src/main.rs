@@ -21,6 +21,7 @@ mod map2d;
 mod map3d;
 mod map_cells;
 mod mem;
+mod sector_view;
 mod world3d;
 
 /// Export cache for the viewers. Bumped when the export layout changes
@@ -41,6 +42,7 @@ mod model_picker;
 mod model_view;
 mod pages;
 mod render3d;
+mod scenes_view;
 mod siren_sound;
 #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
 mod render3d_metal4;
@@ -53,6 +55,7 @@ mod vehicle_db;
 /// Command-line automation (verification screenshots):
 /// `sixng-gui --model <id|regex|glb> [--lod N] [--mode N] [--slot N] [--rma N] [--wire] [--skeleton]
 ///  [--tod H] [--paint r,g,b] [--finish N] [--pearl A] [--spin R] [--door R] [--yaw R] [--pitch R] [--zoom F]
+///  [--sector-grid [N]] (Map 2D / 3D: grid N of levels.rpf, default the world grid)
 ///  [--no-tint] [--hair hex,hex] [--hair-width MM] [--size WxH] --screenshot out.png --exit`
 #[derive(Default, Clone)]
 struct Cli {
@@ -133,7 +136,7 @@ fn load_settings() -> AppSettings {
 fn save_settings(s: &AppSettings) -> std::io::Result<()> {
     let p = settings_path().ok_or_else(|| std::io::Error::other("no settings location"))?;
     let data = serde_json::to_vec_pretty(s).unwrap();
-    match std::fs::write(&p, &data) {
+    match sixng_core::atomic::write(&p, &data) {
         Ok(()) => Ok(()),
         Err(_) => {
             // exe folder not writable: use the per-user settings folder
@@ -141,7 +144,7 @@ fn save_settings(s: &AppSettings) -> std::io::Result<()> {
                 .ok_or_else(|| std::io::Error::other("no per-user settings folder"))?
                 .join("settings.json");
             std::fs::create_dir_all(p.parent().unwrap())?;
-            std::fs::write(p, data)
+            sixng_core::atomic::write(p, data)
         }
     }
 }
@@ -170,6 +173,13 @@ fn default_game() -> String {
         .or_else(|| load_settings().game)
         .unwrap_or_default()
 }
+
+/// True in a build that can draw with the Metal 4 renderer: macOS with the
+/// opt-in `metal4-poc` feature. That renderer has no path for lit vehicle
+/// lamps, the occlusion of a vehicle material map or the per-pixel fabric
+/// weave, so those stay off in such a build. Every other build, the normal
+/// macOS one included, draws with the wgpu shader and has them.
+pub(crate) const METAL4_BUILD: bool = cfg!(all(target_os = "macos", feature = "metal4-poc"));
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -295,6 +305,7 @@ enum Tab {
     Map3D,
     Textures,
     Audio,
+    Scenes,
 }
 
 #[derive(Default)]
@@ -353,6 +364,7 @@ struct App {
     /// Job id of a `texture-users` job (the Textures tab reloads its index when it ends).
     texture_users_job: Option<u32>,
     audio: audio_view::AudioView,
+    scenes: scenes_view::ScenesView,
     shot: Option<(PathBuf, u32, bool)>,
     map3d_start: Option<[f32; 3]>,
     bake: bakejob::BakeJob,
@@ -445,11 +457,12 @@ impl App {
             thumb_budget_mb,
             setup_done: st.setup_done,
             model: model_view::ModelView::new(&game, &work),
-            map2d: map2d::Map2D::new(&work),
+            map2d: map2d::Map2D::new(&game, &work),
             map3d: map3d::Map3D::new(&game, &work),
             textures: texture_view::TextureView::new(&game, &work),
             texture_users_job: None,
             audio: audio_view::AudioView::new(&game, &work),
+            scenes: scenes_view::ScenesView::new(&game, &work),
             shot: None,
             map3d_start: None,
             bake: bakejob::BakeJob::default(),
@@ -856,6 +869,7 @@ impl App {
                 ui.selectable_value(&mut self.tab, Tab::Map3D, "🌆 Map 3D");
                 ui.selectable_value(&mut self.tab, Tab::Textures, "🖼 Textures");
                 ui.selectable_value(&mut self.tab, Tab::Audio, "🔊 Audio");
+                ui.selectable_value(&mut self.tab, Tab::Scenes, "🎬 Scenes");
                 ui.separator();
                 let n = self.jobs.active_count();
                 let jl = if n > 0 {
@@ -936,6 +950,10 @@ impl App {
                         self.tab = Tab::Jobs;
                     }
                     Some(library::Action::OpenJobs) => self.tab = Tab::Jobs,
+                    Some(library::Action::OpenScenes(m)) => {
+                        self.scenes.filter_character(&m);
+                        self.tab = Tab::Scenes;
+                    }
                     None => {}
                 }
                 return;
@@ -959,6 +977,24 @@ impl App {
             if let Some(h) = self.model.view_texture.take() {
                 self.textures.show_hash(h);
                 self.tab = Tab::Textures;
+            }
+            if let Some(m) = self.model.open_scenes.take() {
+                self.scenes.filter_character(&m);
+                self.tab = Tab::Scenes;
+            }
+            return;
+        }
+        if self.tab == Tab::Scenes {
+            let mut act = None;
+            egui::CentralPanel::default().show(ui, |ui| act = self.scenes.ui(ui));
+            match act {
+                Some(scenes_view::Action::Play { model, clip }) => self.play_scene_clip(&model, &clip, &ctx),
+                Some(scenes_view::Action::OpenAudio(address)) => {
+                    self.audio.select_stream(address);
+                    self.tab = Tab::Audio;
+                    ctx.request_repaint();
+                }
+                None => {}
             }
             return;
         }
@@ -1392,10 +1428,12 @@ impl App {
                 Tab::Model => self.model.idle(),
                 Tab::Textures => self.textures.idle(),
                 Tab::Audio => self.audio.idle(),
+                Tab::Scenes => self.scenes.idle(),
                 _ if self.setup.open => true,
                 Tab::Library => self.library.idle() && self.model.picker.loaded(),
                 Tab::Status => self.status.sizes.lock().unwrap().is_some(),
                 Tab::Jobs | Tab::Settings => true,
+                Tab::Map2D => self.map2d.data.is_some() && self.map2d.sectors.idle(),
                 _ => self.map2d.data.is_some(),
             };
         if ready && frames < 100_000 {
@@ -1405,6 +1443,20 @@ impl App {
             self.shot = Some((path, frames + 1, exit));
         }
         ctx.request_repaint();
+    }
+
+    /// A cast member's scene clip from the Scenes tab: open the character
+    /// (unless it is open) and play the clip from the start.
+    fn play_scene_clip(&mut self, model: &str, clip: &str, ctx: &egui::Context) {
+        let id = format!("packs.rpf#outfit:{model}");
+        let open = self.model.loaded.as_ref().is_some_and(|l| l.base.split("#look=").next() == Some(id.as_str()));
+        if !open {
+            self.model.open(&id, 0, ctx);
+        }
+        self.model.ped_clip.want = clip.to_string();
+        self.model.ped_clip.pos = 0.0;
+        self.model.ped_clip.playing = true;
+        self.tab = Tab::Model;
     }
 
     /// A model picked on the map: its Library item page when the model is
@@ -1438,6 +1490,7 @@ impl App {
             Some("settings") => Some(Tab::Settings),
             Some("archives") => Some(Tab::Browser),
             Some("audio") => Some(Tab::Audio),
+            Some("scenes") => Some(Tab::Scenes),
             _ => None,
         };
         if let Some(t) = page {
@@ -1453,6 +1506,17 @@ impl App {
             }
             if let Some(id) = c.get("item") {
                 self.library.show_item(id);
+            }
+            // --tab scenes [--scene <name words>] [--cast <words>]
+            if let Some(q) = c.get("scene") {
+                self.scenes.select_scene(q);
+            }
+            if let Some(q) = c.get("cast") {
+                self.scenes.cast_q = q.to_string();
+            }
+            // --order mission: the Scenes list in mission order
+            if c.get("order") == Some("mission") {
+                self.scenes.mission_order = true;
             }
             if c.has("palette") {
                 self.palette.open = true;
@@ -1543,6 +1607,10 @@ impl App {
             m3.show_roads = c.has("roads");
             m3.show_lights = c.has("lights");
             m3.show_terrain = !c.has("no-terrain");
+            if let Some(v) = c.get("sector-grid") {
+                m3.sectors.on = true;
+                m3.sectors.pick = v.parse::<usize>().map_or(usize::MAX, |n| n.saturating_sub(1));
+            }
             if c.has("no-windows") {
                 m3.show_minimap = false;
                 m3.show_stats = false;
@@ -1595,6 +1663,10 @@ impl App {
             mp.show_lights = c.has("lights");
             mp.light_int = c.has("interior-lights");
             mp.show_interiors = c.has("interiors");
+            if let Some(v) = c.get("sector-grid") {
+                mp.sectors.on = true;
+                mp.sectors.pick = v.parse::<usize>().map_or(usize::MAX, |n| n.saturating_sub(1));
+            }
             if let Some(h) = c.f("hour") {
                 mp.hour = h;
             }

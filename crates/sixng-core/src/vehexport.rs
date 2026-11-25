@@ -101,6 +101,63 @@ fn pin(prims: &mut [TriPrim], joint: Option<usize>) {
     }
 }
 
+/// The brake slots, by joaat of their names: `brakediscs`,
+/// `brakediscs_rear`, `calipers_front`, `calipers_rear`. A part in one of
+/// them has one element that names a `brakedisc_*`, `drumbrake_*` or
+/// `caliper_*` model (bone 0).
+pub const BRAKE_SLOTS: [u32; 4] = [0x814a_6407, 0xee55_7cc2, 0x98b9_b49a, 0xc98d_bea6];
+
+/// Brake models per axle, `[front, rear]`: (disc or drum, caliper), as
+/// model names without `_hi`.
+pub type AxleBrakes = [(Option<String>, Option<String>); 2];
+
+/// The brakes of a configuration per axle. `named_*`: the disc (or drum)
+/// and caliper its part list names by model; `slot_models`: the models of
+/// its parts in the brake slots. A disc named by model and the slot
+/// `brakediscs` are the front axle's (the two never come together); the
+/// rear axle takes `brakediscs_rear`, else what the front has.
+/// A caliper named by model is the vehicle's, a part in `calipers_front`
+/// or `calipers_rear` is that axle's and goes before it: 1,900
+/// configurations name a caliper and give the rear another one that way.
+/// The front part is rarer (266) and is how a vehicle with rear drums gets
+/// its front calipers without naming one; where it comes with a name (44,
+/// in 28 another model) it is taken for the front, by that symmetry and
+/// not confirmed in the game.
+/// An axle with a drum gets no caliper, whatever names one: every caliper
+/// model reaches outside both drum models (to radius 0.56 around a drum of
+/// 0.50 or 0.52), so it would clamp around the drum. 41 configurations
+/// name a caliper for a drum axle, 33 of them through a `calipers_rear`
+/// part; that the game leaves it out there is not confirmed either.
+pub fn brake_axles(named_disc: Option<&str>, named_caliper: Option<&str>, slot_models: &[(u32, String)]) -> AxleBrakes {
+    let of = |slot: u32| slot_models.iter().find(|(s, _)| *s == slot).map(|(_, n)| n.clone());
+    let front_disc = named_disc.map(str::to_string).or_else(|| of(BRAKE_SLOTS[0]));
+    let named_caliper = named_caliper.map(str::to_string);
+    let rear_disc = of(BRAKE_SLOTS[1]).or_else(|| front_disc.clone());
+    let drum = |d: &Option<String>| d.as_deref().is_some_and(|d| d.starts_with("drumbrake_"));
+    let front_part = of(BRAKE_SLOTS[2]);
+    let front_caliper = if drum(&front_disc) { None } else { front_part.clone().or_else(|| named_caliper.clone()) };
+    let rear_caliper = if drum(&rear_disc) { None } else { of(BRAKE_SLOTS[3]).or(named_caliper).or(front_part) };
+    [(front_disc, front_caliper), (rear_disc, rear_caliper)]
+}
+
+/// The rim light slots, by joaat of their names: `lights_rims`,
+/// `lights_rims_rear`. A part in one of them has one element (bone 0) that
+/// names `caliper_rimlight` or `drumbrake_rimlight`: a ring of lights on
+/// the brake, modelled around the same unit disc as the discs and calipers
+/// (ring radius 0.607 for a disc of 0.5), the drum's one set further in.
+pub const RIM_LIGHT_SLOTS: [u32; 2] = [0x439f_ddac, 0x2ba6_699f];
+
+/// The rim light ring of a configuration per axle, `[front, rear]`, from
+/// the models of its parts in the rim light slots. The rear axle takes
+/// `lights_rims_rear`, else what the front has, as the brake discs do
+/// (not confirmed for the rings).
+pub fn rim_light_axles(slot_models: &[(u32, String)]) -> [Option<String>; 2] {
+    let of = |slot: u32| slot_models.iter().find(|(s, _)| *s == slot).map(|(_, n)| n.clone());
+    let front = of(RIM_LIGHT_SLOTS[0]);
+    let rear = of(RIM_LIGHT_SLOTS[1]).or_else(|| front.clone());
+    [front, rear]
+}
+
 fn hex32(v: &Value) -> Option<u32> {
     u32::from_str_radix(v.as_str()?, 16).ok()
 }
@@ -232,7 +289,8 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
     for p in part_names.iter().filter(|p| hex_name(p)) {
         let Some(m) = mods.get(&part_hash(p)) else { continue };
         let slot = m["slot"].as_str().unwrap_or("");
-        if slot == SLOT_CHASSIS {
+        // (brake slots: fitted at the wheels, per axle)
+        if slot == SLOT_CHASSIS || hex32(&m["slot"]).is_some_and(|s| wheels && (BRAKE_SLOTS.contains(&s) || RIM_LIGHT_SLOTS.contains(&s))) {
             continue;
         }
         for e in m["elements"].as_array().into_iter().flatten() {
@@ -248,6 +306,17 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
         }
     }
     fit.sort_by_key(|f| !f.3);
+    // A model two parts fit on the same bone goes on once (a pickup's rear
+    // bumper is an element of its bed part and of the part in the rear
+    // bumper slot). What the stock pieces lose is the sum of both.
+    let mut repeated = 0;
+    let mut once: HashSet<(u64, u32)> = HashSet::new();
+    let hidden: HashSet<u32> = fit.iter().flat_map(|f| f.2.iter().copied()).collect();
+    fit.retain(|f| {
+        let new = once.insert((f.0.off, f.1));
+        repeated += usize::from(!new);
+        new
+    });
 
     let build = |e: &Entry| -> Result<(Piece, Vec<crate::gltf::Material>)> {
         let mut item = ExportedItem { id: e.id.clone(), archive: a.id.clone(), kind: e.kind.name(), rtype: e.rtype.clone(), name: e.name.clone(), status: "ok".into(), files: vec![], error: None, warnings: vec![] };
@@ -276,6 +345,13 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
         .and_then(|i| piece.part_looks["looks"][i as usize].as_str())
         .filter(|h| h.len() == 2048)
         .map(|h| (0..256).map(|i| std::array::from_fn(|k| u8::from_str_radix(&h[i * 8 + k * 2..i * 8 + k * 2 + 2], 16).unwrap_or(255))).collect());
+    // the coat record (clear coat, flakes, film, sheen) of the configuration's body paint
+    let paint_coat = cfg["parts_key"]
+        .as_str()
+        .and_then(|k| piece.part_looks["configs"][k].as_u64())
+        .or(piece.part_looks["default"].as_u64())
+        .and_then(|i| piece.part_looks["paint_coats"][i as usize].as_u64())
+        .map_or(Value::Null, |c| piece.part_looks["coat_records"][c as usize].clone());
     // parts fitted on top of the configuration change the look (a body
     // kit's panels take the body paint)
     if let Some(l) = look.as_mut() {
@@ -309,8 +385,7 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
         }
     };
 
-    // stock pieces the fitted elements replace
-    let hidden: HashSet<u32> = fit.iter().flat_map(|f| f.2.iter().copied()).collect();
+    // stock pieces the fitted elements replace (`hidden`)
     let gone: Vec<bool> = joints.iter().map(|j| hidden.contains(&joaat(&j.name.to_ascii_lowercase()))).collect();
     let mut dropped = 0;
     if gone.iter().any(|g| *g) {
@@ -451,14 +526,35 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
         // Brake discs (or drums) and calipers: modelled around a disc of
         // radius 0.5, scaled to the wheel's stored brake disc (the largest
         // of the clearly smaller collision discs on its axle line).
-        // One disc and one caliper, the first of each the configuration
-        // names by model (as the viewer does); a drum only where it names
-        // no disc. Brake models that come through a part are left out.
-        let brake_models: Vec<&Entry> = [named("brakedisc_").or_else(|| named("drumbrake_")), named("caliper_")].into_iter().flatten().collect();
-        let mut brakes: Vec<(Piece, std::result::Result<Vec<crate::gltf::Material>, usize>)> = Vec::new();
-        for e in &brake_models {
+        // Per axle a disc (or drum) and a caliper: named by model in the
+        // part list, or the model of a part in a brake slot (`brake_axles`).
+        let part = |prefix: &str| part_names.iter().find(|p| p.starts_with(prefix)).map(|p| p.to_ascii_lowercase());
+        let slot_models: Vec<(u32, String)> = part_names
+            .iter()
+            .filter(|p| hex_name(p))
+            .filter_map(|p| mods.get(&part_hash(p)))
+            .filter_map(|m| {
+                let slot = hex32(&m["slot"]).filter(|s| BRAKE_SLOTS.contains(s) || RIM_LIGHT_SLOTS.contains(s))?;
+                let n = m["elements"].as_array()?.iter().find_map(|e| resolve(e))?.name.clone()?.to_ascii_lowercase();
+                Some((slot, n.strip_suffix("_hi").unwrap_or(&n).to_string()))
+            })
+            .collect();
+        let axle_brakes = brake_axles(part("brakedisc_").or_else(|| part("drumbrake_")).as_deref(), part("caliper_").as_deref(), &slot_models);
+        // the rim light rings go on the brakes the same way
+        let rim_lights = rim_light_axles(&slot_models);
+        // each distinct model once, with the axles it is on
+        let mut brake_models: Vec<(&Entry, [bool; 2])> = Vec::new();
+        for (axle, n) in axle_brakes.iter().enumerate().flat_map(|(i, a)| [(i, &a.0), (i, &a.1)]).chain(rim_lights.iter().enumerate()) {
+            let Some(e) = n.as_ref().and_then(|n| stems.get(n).copied()) else { continue };
+            match brake_models.iter_mut().find(|b| b.0.off == e.off) {
+                Some(b) => b.1[axle] = true,
+                None => brake_models.push((e, std::array::from_fn(|i| i == axle))),
+            }
+        }
+        let mut brakes: Vec<(Piece, std::result::Result<Vec<crate::gltf::Material>, usize>, [bool; 2])> = Vec::new();
+        for (e, on) in &brake_models {
             match build(e) {
-                Ok((p, mats)) => brakes.push((p, Ok(mats))),
+                Ok((p, mats)) => brakes.push((p, Ok(mats), *on)),
                 Err(err) => warnings.push(format!("{}: {err:#}", e.name.clone().unwrap_or_default())),
             }
         }
@@ -493,7 +589,7 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
                 let sb = b.radius / 0.5;
                 let bx = b.centre[0] + fit_out[axle].copysign(b.centre[0]);
                 let mb: Mat = [if right { -sb } else { sb }, 0.0, 0.0, 0.0, 0.0, sb, 0.0, 0.0, 0.0, 0.0, sb, 0.0, bx, b.centre[1], b.centre[2], 1.0];
-                for (p, mats) in brakes.iter_mut() {
+                for (p, mats, _) in brakes.iter_mut().filter(|b| b.2[axle]) {
                     let mut prims = p.prims.clone();
                     transform(&mut prims, &mb, right);
                     pin(&mut prims, joint_of.get(&joaat(&bone.to_ascii_lowercase())).copied());
@@ -505,19 +601,19 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
             }
             placed += 1;
         }
-        wheel_report = json!({"moved_out": fit_out, "widened": fit_wide, "models": models.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), "wheels": placed, "rim_ratio": ratio, "rim_factor": rim_factor, "brake_models": brake_models.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), "wheels_with_brakes": braked, "note": "the wheel is scaled to the collision disc's radius; rim and bead are scaled about the axle by rim_factor so that the rim has the configuration's rim_ratio of the tyre's radius (1 = the models' own share). Brakes are scaled to the wheel's stored brake disc."});
+        wheel_report = json!({"moved_out": fit_out, "widened": fit_wide, "models": models.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), "wheels": placed, "rim_ratio": ratio, "rim_factor": rim_factor, "brake_models": brake_models.iter().map(|b| b.0.name.clone()).collect::<Vec<_>>(), "brakes_by_axle": {"front": {"disc": axle_brakes[0].0, "caliper": axle_brakes[0].1}, "rear": {"disc": axle_brakes[1].0, "caliper": axle_brakes[1].1}}, "wheels_with_brakes": braked, "note": "the wheel is scaled to the collision disc's radius; rim and bead are scaled about the axle by rim_factor so that the rim has the configuration's rim_ratio of the tyre's radius (1 = the models' own share). Brakes are scaled to the wheel's stored brake disc."});
     }
     if groups.iter().all(|g| g.prims.is_empty()) {
         bail!("nothing to export for {model}");
     }
-    let extras = json!({"vehicle": model, "configuration": config, "parts_key": cfg["parts_key"], "colour": cfg["colour"], "coordinate_system": crate::export::COORDS});
+    let extras = json!({"vehicle": model, "configuration": config, "parts_key": cfg["parts_key"], "colour": cfg["colour"], "paint_coat": paint_coat, "coordinate_system": crate::export::COORDS});
     let glb = crate::gltf::mesh_glb_with(&model, &groups, &materials, &joints, extras, &crate::gltf::GlbOptions { animations: &[], trs_joints: true, skinned_meshes_at_root: true });
-    std::fs::write(out, &glb)?;
+    crate::atomic::write(out, &glb)?;
     Ok(json!({
         "glb": out, "bytes": glb.len(), "vehicle": model, "configuration": config, "configurations": configs.len(),
         "pieces": reports, "joints": joints.len(), "stock_triangles_replaced": dropped,
         "part_colours": if look.is_some() { "the configuration's" } else { "as exported (the vehicle has no part colours per configuration)" },
-        "paint": paint, "wheels": wheel_report, "not_fitted": skipped, "left_out": unresolved, "warnings": warnings,
+        "paint": paint, "paint_coat": paint_coat, "wheels": wheel_report, "repeated_elements_skipped": repeated, "not_fitted": skipped, "left_out": unresolved, "warnings": warnings,
     }))
 }
 
@@ -548,7 +644,7 @@ pub fn list_parts(ix: &ArchiveIndex, vehicle: &Value) -> Value {
                     by_a.or_else(|| hex32(&e["model"]).and_then(|h| by_hash.get(&h))).map_or(Value::Null, |s| json!(s))
                 })
                 .collect();
-            json!({"part": m["name"], "slot": m["slot"], "shared": m["shared"] == true, "configurations": hex32(&m["name"]).and_then(|h| used.get(&h)).copied().unwrap_or(0), "models": models})
+            json!({"part": m["name"], "slot": m["slot"], "slot_name": hex32(&m["slot"]).and_then(crate::vehicles::mod_slot_name), "shared": m["shared"] == true, "configurations": hex32(&m["name"]).and_then(|h| used.get(&h)).copied().unwrap_or(0), "models": models})
         })
         .collect();
     out.sort_by(|a, b| a["slot"].as_str().cmp(&b["slot"].as_str()).then(a["part"].as_str().cmp(&b["part"].as_str())));
@@ -574,8 +670,51 @@ mod tests {
     }
 
     #[test]
+    fn brakes_per_axle() {
+        let s = |x: &str| Some(x.to_string());
+        // named front disc and caliper, a smaller rear caliper part
+        let b = brake_axles(Some("brakedisc_std_001"), Some("caliper_4pot_001"), &[(BRAKE_SLOTS[3], "caliper_2pot_001".into())]);
+        assert_eq!(b, [(s("brakedisc_std_001"), s("caliper_4pot_001")), (s("brakedisc_std_001"), s("caliper_2pot_001"))]);
+        // drums all round: no caliper anywhere
+        let b = brake_axles(None, None, &[(BRAKE_SLOTS[0], "drumbrake_001".into()), (BRAKE_SLOTS[1], "drumbrake_001".into())]);
+        assert_eq!(b, [(s("drumbrake_001"), None), (s("drumbrake_001"), None)]);
+        // front discs with a caliper part, rear drums: the rear gets no caliper
+        let b = brake_axles(Some("brakedisc_std_001"), None, &[(BRAKE_SLOTS[2], "caliper_2pot_001".into()), (BRAKE_SLOTS[1], "drumbrake_002".into())]);
+        assert_eq!(b, [(s("brakedisc_std_001"), s("caliper_2pot_001")), (s("drumbrake_002"), None)]);
+        // a drum axle gets no caliper, also when a part or a name gives one
+        let b = brake_axles(Some("brakedisc_std_001"), Some("caliper_4pot_001"), &[(BRAKE_SLOTS[1], "drumbrake_001".into()), (BRAKE_SLOTS[3], "caliper_1pot_stock".into())]);
+        assert_eq!(b, [(s("brakedisc_std_001"), s("caliper_4pot_001")), (s("drumbrake_001"), None)]);
+        let b = brake_axles(None, Some("caliper_4pot_001"), &[(BRAKE_SLOTS[0], "drumbrake_001".into()), (BRAKE_SLOTS[1], "brakedisc_std_001".into())]);
+        assert_eq!(b, [(s("drumbrake_001"), None), (s("brakedisc_std_001"), s("caliper_4pot_001"))]);
+        // front drums with a front caliper part, rear discs: the part's caliper goes to the rear
+        let b = brake_axles(None, None, &[(BRAKE_SLOTS[0], "drumbrake_001".into()), (BRAKE_SLOTS[2], "caliper_2pot_001".into()), (BRAKE_SLOTS[1], "brakedisc_std_001".into())]);
+        assert_eq!(b, [(s("drumbrake_001"), None), (s("brakedisc_std_001"), s("caliper_2pot_001"))]);
+        // a named caliper and a front caliper part: the part is the front's
+        let b = brake_axles(Some("brakedisc_std_001"), Some("caliper_1pot_stock"), &[(BRAKE_SLOTS[2], "caliper_2pot_001".into()), (BRAKE_SLOTS[1], "drumbrake_002".into())]);
+        assert_eq!(b, [(s("brakedisc_std_001"), s("caliper_2pot_001")), (s("drumbrake_002"), None)]);
+        // ... and with rear discs and no rear part the rear keeps the named one
+        let b = brake_axles(Some("brakedisc_std_001"), Some("caliper_1pot_stock"), &[(BRAKE_SLOTS[2], "caliper_2pot_001".into())]);
+        assert_eq!(b, [(s("brakedisc_std_001"), s("caliper_2pot_001")), (s("brakedisc_std_001"), s("caliper_1pot_stock"))]);
+        assert_eq!(brake_axles(None, None, &[]), AxleBrakes::default());
+    }
+
+    #[test]
+    fn rim_lights_per_axle() {
+        let s = |x: &str| Some(x.to_string());
+        // one part: the same ring on both axles
+        assert_eq!(rim_light_axles(&[(RIM_LIGHT_SLOTS[0], "caliper_rimlight".into())]), [s("caliper_rimlight"), s("caliper_rimlight")]);
+        // a rear part of its own (rear drums)
+        let both = [(RIM_LIGHT_SLOTS[0], "caliper_rimlight".to_string()), (RIM_LIGHT_SLOTS[1], "drumbrake_rimlight".to_string())];
+        assert_eq!(rim_light_axles(&both), [s("caliper_rimlight"), s("drumbrake_rimlight")]);
+        // brake parts are not rings
+        assert_eq!(rim_light_axles(&[(BRAKE_SLOTS[3], "caliper_2pot_001".into())]), [None, None]);
+        // and a ring is not a brake
+        assert_eq!(brake_axles(None, None, &both), AxleBrakes::default());
+    }
+
+    #[test]
     fn mirror_turns_triangles() {
-        let mut p = vec![TriPrim { name: "t".into(), positions: vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], normals: Some(vec![[1.0, 0.0, 0.0]; 3]), tangents: None, uvs: vec![], colors: None, colors1: None, tint: None, indices: vec![0, 1, 2], material: None, joints: None, weights: None, joints1: None, weights1: None }];
+        let mut p = vec![TriPrim { name: "t".into(), positions: vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], normals: Some(vec![[1.0, 0.0, 0.0]; 3]), tangents: None, uvs: vec![], colors: None, colors1: None, regions: None, tint: None, indices: vec![0, 1, 2], material: None, joints: None, weights: None, joints1: None, weights1: None }];
         let m: Mat = [-2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 5.0, 0.0, 0.0, 1.0];
         transform(&mut p, &m, true);
         assert_eq!(p[0].positions[0], [3.0, 0.0, 0.0]);

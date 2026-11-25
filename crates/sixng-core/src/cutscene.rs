@@ -51,8 +51,43 @@ use std::path::Path;
 
 /// The archive the story cutscenes are in.
 pub const STORY_ARCHIVE: &str = "pack/story000/story000.rpf";
+
+/// A scene name's mission and its place in that mission, from the name:
+/// `<arc>_<mission>_<stage>_…`, where the stage is the intro (`int`,
+/// `int1a`, `intro`), a mid scene (`mcs1`, `mcs2` …) or the outro (`ext`).
+/// Returns (mission, stage rank 0 intro / 1 mid / 2 outro, stage number).
+/// Names with no stage word count as mid scenes of their first two words.
+pub fn mission_stage(name: &str) -> (String, u8, u64) {
+    let t: Vec<&str> = name.split('_').collect();
+    let num = |s: &str| s.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect::<String>().parse::<u64>().unwrap_or(0);
+    let stage = |w: &str| -> Option<(u8, u64)> {
+        let (head, tail) = w.split_at(w.find(|c: char| c.is_ascii_digit()).unwrap_or(w.len()));
+        let tail_ok = tail.is_empty() || tail.trim_start_matches(|c: char| c.is_ascii_digit()).chars().all(|c| c.is_ascii_lowercase());
+        match head {
+            "intro" if tail.is_empty() => Some((0, 0)),
+            "int" if tail_ok => Some((0, num(w))),
+            "mcs" | "rs" if !tail.is_empty() && tail_ok => Some((1, num(w))),
+            "ext" if tail_ok => Some((2, num(w))),
+            _ => None,
+        }
+    };
+    for i in 2..t.len().min(5) {
+        if let Some((r, n)) = stage(t[i]) {
+            return (t[..i].join("_"), r, n);
+        }
+    }
+    (t[..t.len().min(2)].join("_"), 1, 0)
+}
+
+/// The mission ids of scene names (see [`mission_stage`]), sorted, once each.
+pub fn mission_ids<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut v: Vec<String> = names.into_iter().map(|n| mission_stage(&n.to_ascii_lowercase()).0).collect();
+    v.sort();
+    v.dedup();
+    v
+}
 /// Bumped when the cached catalog's layout or contents change.
-pub const CATALOG_VERSION: u32 = 3;
+pub const CATALOG_VERSION: u32 = 4;
 
 /// Struct and member hashes of the scene files.
 pub mod hashes {
@@ -125,6 +160,10 @@ pub struct SceneDict {
     /// Index entry ids of those section dictionaries.
     #[serde(default)]
     pub section_ids: Vec<String>,
+    /// How many of them are named after a longer scene name that has no
+    /// base dictionary (`<scene>fixme-<N>`), listed last.
+    #[serde(default)]
+    pub adopted_sections: usize,
     /// Clips with at least one window streamed in the section dictionaries.
     #[serde(default)]
     pub streamed: Vec<String>,
@@ -290,7 +329,9 @@ pub fn scan(a: &ArchiveInfo, ix: &ArchiveIndex, progress: crate::export::Progres
     let todo: Vec<&Entry> = ix
         .entries
         .iter()
-        .filter(|e| !e.streams.is_empty() && ((e.kind == Kind::RageObj && e.rtype.is_none() && e.name.is_none()) || (e.kind == Kind::Resource && e.sub == "7a")))
+        // every resource object, named ones too: a recovered name can be
+        // wrong (one section dictionary carries the name `jj.xl`)
+        .filter(|e| !e.streams.is_empty() && (e.kind == Kind::RageObj || (e.kind == Kind::Resource && e.sub == "7a")))
         .collect();
     let total = todo.len() as u64;
     let done = AtomicU64::new(0);
@@ -315,26 +356,31 @@ pub fn scan(a: &ArchiveInfo, ix: &ArchiveIndex, progress: crate::export::Progres
             Some(Hit::Dict(name, e.id.clone(), clips, pending))
         })
         .collect();
-    let mut sections: HashMap<String, Vec<(String, Vec<u32>)>> = HashMap::new();
+    let mut sections = Sections::new();
     let mut dicts = Vec::new();
     let mut pendings = Vec::new();
     let mut files = Vec::new();
     for h in hits {
         match h {
             Hit::Dict(name, id, clips, pending) => {
-                dicts.push(SceneDict { name, id, clips, sections: 0, section_ids: Vec::new(), streamed: Vec::new(), unjoined: Vec::new(), windows_streamed: 0, windows_missing: 0 });
+                dicts.push(SceneDict { name, id, clips, sections: 0, section_ids: Vec::new(), adopted_sections: 0, streamed: Vec::new(), unjoined: Vec::new(), windows_streamed: 0, windows_missing: 0 });
                 pendings.push(pending);
             }
             Hit::Section(s, id, keys) => sections.entry(s).or_default().push((id, keys)),
             Hit::File(f) => files.push(f),
         }
     }
+    let bases: HashSet<String> = dicts.iter().filter_map(|d| parse_dict_name(&d.name)).map(|x| x.0.to_string()).collect();
+    let adopted = adopt_sections(&bases, &mut sections);
     for (d, pending) in dicts.iter_mut().zip(pendings) {
         let s = parse_dict_name(&d.name).map(|x| x.0).unwrap_or_default();
-        let secs = sections.get(s).map(Vec::as_slice).unwrap_or_default();
+        let mut secs: Vec<(String, Vec<u32>)> = sections.get(s).cloned().unwrap_or_default();
+        secs.sort();
+        let extra = adopted.get(s).cloned().unwrap_or_default();
+        d.adopted_sections = extra.len();
+        secs.extend(extra);
         d.sections = secs.len();
         d.section_ids = secs.iter().map(|x| x.0.clone()).collect();
-        d.section_ids.sort();
         let have: HashSet<u32> = secs.iter().flat_map(|x| x.1.iter().copied()).collect();
         for (clip, keys) in pending {
             let missing = keys.iter().filter(|k| !have.contains(k)).count();
@@ -356,6 +402,28 @@ pub fn scan(a: &ArchiveInfo, ix: &ArchiveIndex, progress: crate::export::Progres
     Ok(Catalog { version: CATALOG_VERSION, archive: a.id.clone(), dicts, files })
 }
 
+/// Section dictionaries grouped by scene name: (entry id, animation keys).
+type Sections = HashMap<String, Vec<(String, Vec<u32>)>>;
+
+/// Section groups with no base dictionary of their own belong to the scene
+/// whose name is the longest prefix of theirs (`cin@mtl_mont_int_p0l_t01fixme-N`
+/// for `cin@mtl_mont_int_p0l_t01`). Moves them out of `sections` and returns
+/// them by that scene; the scene's own sections are joined first and win on a
+/// shared key.
+fn adopt_sections(bases: &HashSet<String>, sections: &mut Sections) -> Sections {
+    let mut adopted = Sections::new();
+    let mut orphans: Vec<String> = sections.keys().filter(|k| !bases.contains(*k)).cloned().collect();
+    orphans.sort();
+    for o in orphans {
+        if let Some(b) = bases.iter().filter(|b| o.starts_with(b.as_str())).max_by_key(|b| b.len()) {
+            let mut v = sections.remove(&o).unwrap_or_default();
+            v.sort();
+            adopted.entry(b.clone()).or_default().extend(v);
+        }
+    }
+    adopted
+}
+
 /// The catalog of an archive, from the cache in the index folder or
 /// scanned (and cached) when missing or out of date.
 pub fn catalog(ws: &crate::export::Workspace, archive: &str, rescan: bool, progress: crate::export::Progress) -> Result<Catalog> {
@@ -372,7 +440,7 @@ pub fn catalog(ws: &crate::export::Workspace, archive: &str, rescan: bool, progr
     }
     let ix = ws.load_index(&a)?;
     let c = scan(&a, &ix, progress)?;
-    std::fs::write(&cache, serde_json::to_vec(&c)?)?;
+    crate::atomic::write(&cache, serde_json::to_vec(&c)?)?;
     Ok(c)
 }
 
@@ -714,6 +782,20 @@ mod tests {
     }
 
     #[test]
+    fn orphan_sections_join_the_longest_prefix_scene() {
+        let bases: HashSet<String> = ["mtl_int_p0l_t01", "mtl_int_p0", "other_t01"].map(String::from).into();
+        let mut s = Sections::new();
+        s.insert("mtl_int_p0l_t01".into(), vec![("a@2".into(), vec![1])]);
+        s.insert("mtl_int_p0l_t01fixme".into(), vec![("a@9".into(), vec![2]), ("a@8".into(), vec![3])]);
+        s.insert("unrelated".into(), vec![("a@5".into(), vec![4])]);
+        let a = adopt_sections(&bases, &mut s);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a["mtl_int_p0l_t01"].iter().map(|x| x.0.as_str()).collect::<Vec<_>>(), vec!["a@8", "a@9"]);
+        // the scene's own sections stay; a group no scene name prefixes is left alone
+        assert!(s.contains_key("mtl_int_p0l_t01") && s.contains_key("unrelated") && !s.contains_key("mtl_int_p0l_t01fixme"));
+    }
+
+    #[test]
     fn clip_handles() {
         assert_eq!(split_clip_name("lucia"), ("lucia", 0, false));
         assert_eq!(split_clip_name("lucia_face"), ("lucia", 0, true));
@@ -738,6 +820,7 @@ mod tests {
             clips: ["lucia", "lucia_face", "boss", "boss_face", "prop_cup_01a", "prop_cup_01a^1", "rs_camera_1", "thing"].map(String::from).to_vec(),
             sections: 2,
             section_ids: vec!["a.rpf@11".into(), "a.rpf@12".into()],
+            adopted_sections: 0,
             streamed: vec!["boss".into()],
             unjoined: vec![],
             windows_streamed: 2,
@@ -754,7 +837,7 @@ mod tests {
             ],
         };
         // a second scene without a scene file of its own
-        let d2 = SceneDict { name: "cin@other_scene_p1_t01".into(), id: "a.rpf@30".into(), clips: ["boss", "boss_face", "ib_phone"].map(String::from).to_vec(), sections: 0, section_ids: vec![], streamed: vec![], unjoined: vec![], windows_streamed: 0, windows_missing: 0 };
+        let d2 = SceneDict { name: "cin@other_scene_p1_t01".into(), id: "a.rpf@30".into(), clips: ["boss", "boss_face", "ib_phone"].map(String::from).to_vec(), sections: 0, section_ids: vec![], adopted_sections: 0, streamed: vec![], unjoined: vec![], windows_streamed: 0, windows_missing: 0 };
         Catalog { version: CATALOG_VERSION, archive: "a.rpf".into(), dicts: vec![d, d2], files: vec![f] }
     }
 

@@ -243,6 +243,7 @@ pub struct Map3D {
     pub decal_bias: bool,
     /// Debug: also draw proxies, placeholders and degenerate models.
     pub show_proxies: bool,
+    pub sectors: crate::sector_view::SectorView,
     pub kinds: [bool; 6],
     pub lods: [bool; 6],
     pub speed: f32,
@@ -490,6 +491,7 @@ impl Map3D {
             show_stats: true,
             decal_bias: true,
             show_proxies: false,
+            sectors: crate::sector_view::SectorView::new(game, work),
             children_start: Vec::new(),
             children_list: Vec::new(),
             buckets: Vec::new(),
@@ -2536,7 +2538,11 @@ impl Map3D {
                 self.picked = self.pick(&data, self.cam.eye(), (b - a).normalize());
             }
         }
-        let (under, top) = self.overlay_lines(&data);
+        let (mut under, top) = self.overlay_lines(&data);
+        if self.sectors.on {
+            let e = rage(self.cam.eye());
+            under.extend(self.sectors.lines3d(&data, [e[0], e[1]]));
+        }
         if self.show_terrain {
             self.cam.far = 150_000.0;
             let ready = &self.bld_ready;
@@ -2849,7 +2855,7 @@ impl Map3D {
                 Some(v) => serde_json::json!(v),
                 None => serde_json::Value::Null,
             };
-            let _ = std::fs::write(&p, serde_json::to_vec_pretty(&j).unwrap_or_default());
+            let _ = sixng_core::atomic::write(&p, serde_json::to_vec_pretty(&j).unwrap_or_default());
         }
     }
 
@@ -2879,7 +2885,7 @@ impl Map3D {
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_else(|| serde_json::json!({}));
         j[key] = v;
-        let _ = std::fs::write(&p, serde_json::to_vec_pretty(&j).unwrap_or_default());
+        let _ = sixng_core::atomic::write(&p, serde_json::to_vec_pretty(&j).unwrap_or_default());
     }
 
     fn ram_ui(&mut self, ui: &mut egui::Ui) {
@@ -3053,6 +3059,7 @@ impl Map3D {
         );
         ui.checkbox(&mut self.show_roads, "roads (by speed)");
         ui.checkbox(&mut self.show_lights, "lights (exterior, by hour)");
+        self.sectors.ui(ui);
         ui.checkbox(&mut self.show_proxies, "show proxies / placeholders").on_hover_text("Debug: also draw interior-shell, shadow, light and VFX proxies, placements without a model and degenerate models");
         ui.checkbox(&mut self.decal_bias, "decal depth bias").on_hover_text("Markings, grime, signage and terrain blend layers drawn after opaque surfaces with a depth bias, by layer order");
         ui.checkbox(&mut self.show_minimap, "minimap window");
@@ -3730,7 +3737,8 @@ impl Map3D {
     fn frames_ok(&self) -> bool {
         // under memory pressure not every wanted model will load: an empty
         // queue is as good as it gets
-        (!self.show_terrain || self.world.idle())
+        self.sectors.idle()
+            && (!self.show_terrain || self.world.idle())
             && (self.pressure > 0
                 || self.keep.iter().all(|model| {
                     self.cache.contains_key(model) || {

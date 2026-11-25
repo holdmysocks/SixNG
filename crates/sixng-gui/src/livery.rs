@@ -151,7 +151,7 @@ pub fn save(path: &Path, l: &Livery) -> anyhow::Result<()> {
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d)?;
     }
-    std::fs::write(path, serde_json::to_vec_pretty(l)?)?;
+    sixng_core::atomic::write(path, serde_json::to_vec_pretty(l)?)?;
     Ok(())
 }
 
@@ -673,7 +673,7 @@ impl State {
             self.zones_key = key;
             self.dirty = true;
             if let Some(f) = self.info_once.take() {
-                let _ = std::fs::write(f, serde_json::to_vec_pretty(&self.zones.describe()).unwrap_or_default());
+                let _ = sixng_core::atomic::write(f, serde_json::to_vec_pretty(&self.zones.describe()).unwrap_or_default());
             }
         }
         let nothing = self.livery.stickers.is_empty() && self.highlight == Highlight::default();

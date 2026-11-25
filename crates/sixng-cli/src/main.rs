@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod bench;
+mod scene_dialogue;
 
 #[derive(Parser)]
 #[command(name = "sixng", version, about = "GTA VI (RPF9 / Xbox Series) asset extractor")]
@@ -175,6 +176,20 @@ enum Cmd {
         /// Skip the name-recovery pass.
         #[arg(long)]
         no_names: bool,
+    },
+    /// Read an archive's table of contents: columns, file and resource entries; archives stored inside it are followed. Windows x64 only; needs the game executable in the game folder. No index needed.
+    Toc {
+        archive: String,
+        /// List every file entry (offset, sizes, flags, key id).
+        #[arg(long)]
+        files: bool,
+    },
+    /// Extract the files the carving index cannot read (a few hundred metadata files), using the table of contents: <out>/toc_files/<archive>[@offset]/<offset>.<ext> + index.jsonl. Each file is checked against its zlib checksums and the size in the table. Same requirements as `toc`. Without archives, all of them.
+    TocExtract {
+        archives: Vec<String>,
+        /// Output directory.
+        #[arg(long, short)]
+        out: PathBuf,
     },
     /// List entries of an indexed archive.
     List {
@@ -416,7 +431,7 @@ enum Cmd {
         #[command(flatten)]
         filter: FilterArgs,
     },
-    /// Light emitters from archetype/entity light extensions, placed in world space: <out>/lights/<archive>/.
+    /// Light emitters from archetype/entity light extensions, placed in world space, plus the map files' distant / LOD lights and timecycle modifier regions: <out>/lights/<archive>/.
     Lights {
         /// Archive (default levels).
         #[arg(default_value = "levels")]
@@ -676,6 +691,35 @@ enum Cmd {
         #[arg(long, short)]
         out: Option<PathBuf>,
     },
+    /// Water system export: the water fog atlas (scattering and extinction,
+    /// textures.rpf), the water height map and the shoreline wave grid
+    /// (levels.rpf), each placed on its 32 x 66 grid of 512 m cells; the
+    /// grid definitions, ocean and shore-wave settings of common.rpf as
+    /// JSON; and every water_* timecycle key. Tiles are placed by aligning
+    /// their stored order with the decimal-string order of the cell numbers
+    /// against each grid's fallback texture, then checked by edge
+    /// continuity. Prints the counts and checks. With -o writes
+    /// <out>/water/: grids.json, timecycle_water.json, settings/*.json,
+    /// fog/ (scattering.f32, extinction.f32, cells.json with the terms per
+    /// cell, previews), height/ (height.png, cells.json) and shore/
+    /// (tiles/<cell>.png, mosaic.png, cells.json). Needs the common,
+    /// textures and levels indexes.
+    Water {
+        /// Fog mosaic texels per cell (tiles have 128).
+        #[arg(long, default_value_t = 32)]
+        fog_px: usize,
+        /// Height mosaic texels per cell (tiles have 512, 1 m each).
+        #[arg(long, default_value_t = 128)]
+        height_px: usize,
+        /// Shore mosaic texels per cell (tiles have 256).
+        #[arg(long, default_value_t = 32)]
+        shore_px: usize,
+        /// Also write each height tile at full resolution (height/tiles/).
+        #[arg(long)]
+        height_tiles: bool,
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
     /// World sector grids (the PSO files of levels.rpf with struct
     /// 9c834886). levels.rpf holds eight, in three cell sizes (1024, 512
     /// and 60 m, measured; cell = floor(world / size)). Each size has a
@@ -759,7 +803,7 @@ enum Cmd {
         #[arg(short, long)]
         out: PathBuf,
     },
-    /// Audio banks (ADAT) in an archive: scan once (index in <work>/index/audio_<archive>.json), then list banks and streams. Stream ids are hashes. A bank shows its container (the bank name hash, from the sound files or the bank list; run `audio-meta` once to record them) and the container's name where the name dictionary has one (`sixng names`); a stream shows its name where it was recovered.
+    /// Audio banks (ADAT) in an archive: scan once (index in <work>/index/audio_<archive>.json), then list banks and streams. Stream ids are hashes. A bank shows its container (the bank name hash, from the sound files or the bank list; run `audio-meta` once to record them) and the container's name where the name dictionary has one (`sixng names`); a stream shows its index in the bank and, where it has a name, the name, where it came from (`stored`: the bank's own name tag; `search`: the name search) and its full joaat (`hash`).
     Audio {
         /// Archive (default audio).
         #[arg(default_value = "audio")]
@@ -955,6 +999,16 @@ enum Cmd {
         #[arg(long, default_value_t = 200)]
         limit: usize,
     },
+    /// Mission and arc names for the story scenes, from the story-flow tags
+    /// in the story pack's protected rule files. Each tag that a mission id
+    /// shortens (letters left out) names that mission; the tags are cached in
+    /// <work>/index/story_flow_tags.json. Needs the cutscene catalog and, the
+    /// first time, the game executable (Windows x64) for the table of contents.
+    StoryNames {
+        /// Print the flow tags as well.
+        #[arg(long)]
+        tags: bool,
+    },
     /// Cutscenes of the story pack: per scene its cast (scene handles with
     /// the ped model each one is, and whether `outfit` can assemble it),
     /// props, cameras, the clip names of each object and the set-dressing
@@ -985,6 +1039,18 @@ enum Cmd {
         /// At most this many scenes (0 = all).
         #[arg(long, default_value_t = 0)]
         limit: usize,
+    },
+    /// Build the Scenes dialogue index from verified local occurrences and GXT tables.
+    SceneDialogue {
+        /// Local JSON with verified occurrence records.
+        #[arg(long)]
+        input: PathBuf,
+        /// A JSON table from `sixng text --out`. Repeat for tables in one locale.
+        #[arg(long, required = true)]
+        text_table: Vec<PathBuf>,
+        /// Output file (default <work>/scene_dialogue.json).
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Inspect a ttpf texture store: list its textures, or decode some to PNG.
     Ttpf {
@@ -1115,11 +1181,96 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 let p2 = pr.clone();
                 let id = a.id.clone();
                 let pa: Progress = Arc::new(move |s, d, tot| p2(&format!("{id}:{s}"), d, tot));
-                let ix = ws.ensure_index(&a, *force, !*no_names, pa)?;
+                let (ix, how) = ws.ensure_index_report(&a, *force, !*no_names, pa)?;
                 let named = ix.entries.iter().filter(|e| e.name.is_some()).count();
-                res.push(json!({"archive": a.id, "seconds": t.elapsed().as_secs_f64(), "stats": ix.stats, "named_entries": named}));
+                if !cli.quiet {
+                    eprintln!("{}: {}", a.id, how.summary());
+                }
+                res.push(json!({"archive": a.id, "status": how.status, "summary": how.summary(), "outcome": how,
+                    "seconds": t.elapsed().as_secs_f64(), "stats": ix.stats, "named_entries": named}));
             }
             out.print(&json!({"ok": true, "indexed": res}));
+        }
+        Cmd::Toc { archive, files } => {
+            let a = ws.resolve(archive)?;
+            let mut cipher = sixng_core::gamecipher::open(&game)?;
+            let mut f = std::fs::File::open(&a.path)?;
+            let mut list = Vec::new();
+            toc_walk(cipher.as_mut(), &mut f, 0, &mut |_, _, base, toc, entries| {
+                let enc: Vec<_> = entries.iter().filter(|e| e.crypto.is_some()).collect();
+                let mut v = json!({
+                    "base": base, "rows": toc.rows, "index_width": toc.index_width, "selector": toc.selector,
+                    "columns": toc.columns, "known_entry_column": toc.has_entries(),
+                    "files": entries.len(), "resources": entries.iter().filter(|e| e.resource.is_some()).count(), "protected": enc.len(),
+                    "protected_stored_bytes": enc.iter().map(|e| e.stored).sum::<u64>(),
+                });
+                if *files {
+                    v["entries"] = entries.iter().map(|e| json!({
+                        "row": e.row, "offset": e.offset, "stored": e.stored, "unpacked": e.unpacked, "flags": e.flags,
+                        "resource_type": e.resource.map(|r| r.1),
+                        "key_id": e.crypto.as_ref().map(|c| format!("{:08x}", c.key_id)),
+                        "pattern": e.crypto.as_ref().map(|c| c.pattern),
+                    })).collect();
+                }
+                list.push(v);
+                Ok(())
+            })?;
+            out.print(&json!({"ok": true, "archive": a.id, "tables": list}));
+        }
+        Cmd::TocExtract { archives, out: po } => {
+            let list = if archives.is_empty() {
+                ws.archives().into_iter().filter(|a| a.container == "rpf9").collect::<Vec<_>>()
+            } else {
+                archives.iter().map(|q| ws.resolve(q)).collect::<Result<Vec<_>>>()?
+            };
+            let mut cipher = sixng_core::gamecipher::open(&game)?;
+            let t = Instant::now();
+            let mut res = Vec::new();
+            let (mut total, mut failed) = (0usize, 0usize);
+            for (n, a) in list.iter().enumerate() {
+                pr(&format!("toc-extract:{}", a.id), n as u64, list.len() as u64);
+                let mut f = std::fs::File::open(&a.path)?;
+                let stem = sixng_core::game::index_stem(&a.id);
+                toc_walk(cipher.as_mut(), &mut f, 0, &mut |cipher, f, base, _, entries| {
+                    let enc: Vec<_> = entries.iter().filter(|e| e.crypto.is_some()).collect();
+                    if enc.is_empty() {
+                        return Ok(());
+                    }
+                    let name = if base == 0 { stem.clone() } else { format!("{stem}@{base:x}") };
+                    let dir = po.join("toc_files").join(&name);
+                    std::fs::create_dir_all(&dir)?;
+                    let mut index = sixng_core::atomic::AtomicFile::create(dir.join("index.jsonl"))?;
+                    let mut errors = Vec::new();
+                    let mut bytes = 0u64;
+                    for e in &enc {
+                        let c = e.crypto.as_ref().unwrap();
+                        let mut rec = json!({"row": e.row, "offset": e.offset, "stored": e.stored, "unpacked": e.unpacked,
+                            "flags": e.flags, "resource_type": e.resource.map(|r| r.1), "key_id": format!("{:08x}", c.key_id)});
+                        match sixng_core::rpf9toc::read_file(cipher, f, base, e) {
+                            Ok((data, check)) => {
+                                let ext = if e.resource.is_some() { "rsc" } else { sixng_core::rpf9toc::sniff_ext(&data) };
+                                let file = format!("{:09x}.{ext}", e.offset);
+                                sixng_core::atomic::write(dir.join(&file), &data)?;
+                                bytes += data.len() as u64;
+                                rec["file"] = json!(file);
+                                rec["check"] = json!(check);
+                            }
+                            Err(err) => {
+                                rec["error"] = json!(format!("{err:#}"));
+                                errors.push(json!({"offset": e.offset, "error": format!("{err:#}")}));
+                            }
+                        }
+                        writeln!(index, "{rec}")?;
+                    }
+                    index.commit()?;
+                    total += enc.len();
+                    failed += errors.len();
+                    res.push(json!({"archive": a.id, "base": base, "dir": dir, "files": enc.len() - errors.len(), "bytes": bytes, "errors": errors}));
+                    Ok(())
+                })?;
+            }
+            pr("toc-extract", list.len() as u64, list.len() as u64);
+            out.print(&json!({"ok": failed == 0, "files": total - failed, "failed": failed, "seconds": t.elapsed().as_secs_f64(), "archives": res}));
         }
         Cmd::List { archive, filter, ndjson, streams } => {
             let a = ws.resolve(archive)?;
@@ -1249,7 +1400,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                             .map(|(k, st)| {
                                 let list: Vec<_> = e.programs[k]
                                     .iter()
-                                    .filter_map(|&n| Some((sh.sections[k].0 + n as usize, sh.programs.get(sh.sections[k].0 + n as usize)?)))
+                                    .filter_map(|&n| sh.program(e, k, n))
                                     .map(|(pi, p)| {
                                         if !full {
                                             return json!(p.name);
@@ -1290,17 +1441,56 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                                     let mut o = serde_json::Map::new();
                                     o.insert("pass".into(), json!(ps.name));
                                     for (k, st) in stages.iter().enumerate() {
-                                        if let Some(p) = ps.programs[k].and_then(|i| e.programs[k].get(i as usize)).and_then(|&n| sh.programs.get(sh.sections[k].0 + n as usize)) {
+                                        if let Some(p) = ps.programs[k].and_then(|i| e.programs[k].get(i as usize)).and_then(|&n| sh.program(e, k, n)).map(|x| x.1) {
                                             o.insert(st.to_string(), json!(p.name));
                                         }
                                     }
                                     o.insert("flags".into(), json!(ps.flags.iter().map(|b| format!("{b:02x}")).collect::<String>()));
+                                    // the state table items the pass sets, as indices into the effect's `states`
+                                    for (key, v) in [("rasterizer", ps.rasterizer()), ("depth_stencil", ps.depth_stencil()), ("blend", ps.blend()), ("stencil_ref", ps.stencil_ref())] {
+                                        if let Some(v) = v {
+                                            o.insert(key.into(), json!(v));
+                                        }
+                                    }
+                                    // what the pass binds, by name hash
+                                    if let Some(b) = &ps.bindings {
+                                        let l = |x: &[u32]| x.iter().map(|&h| named(h)).collect::<Vec<_>>();
+                                        o.insert("bindings".into(), json!({"read": l(&b.read), "written": l(&b.written), "third": l(&b.third), "constant_buffers": l(&b.cbuffers), "word": b.word.map(|w| format!("{w:08x}"))}));
+                                    }
+                                    o.insert("blocks".into(), json!(ps.blocks()));
+                                    o.insert("tail".into(), json!(ps.tail.iter().map(|b| format!("{b:02x}")).collect::<String>()));
                                     serde_json::Value::Object(o)
                                 })
                                 .collect();
                             json!({"technique": t.name, "passes": passes})
                         })
                         .collect();
+                    let hex = |items: &[Vec<u8>]| items.iter().map(|x| x.iter().map(|b| format!("{b:02x}")).collect::<String>()).collect::<Vec<_>>();
+                    v["database"] = json!(e.database);
+                    v["states"] = json!({"rasterizer": hex(&e.states.rasterizer), "depth_stencil": hex(&e.states.depth_stencil), "blend": hex(&e.states.blend), "samplers": hex(&e.states.samplers)});
+                    // the state items read as Direct3D 11 state descriptions (one byte per field)
+                    v["states_read"] = json!({
+                        "rasterizer": e.states.rasterizer.iter().map(|x| shaderfx::rasterizer_state(x).map(|(fill, cull)| json!({"fill": fill, "cull": *["?", "none", "front", "back"].get(cull as usize).unwrap_or(&"?")}))).collect::<Vec<_>>(),
+                        "depth_stencil": e.states.depth_stencil.iter().map(|x| shaderfx::depth_stencil_state(x).map(|d| {
+                            let face = |f: [u8; 4]| json!({"fail": shaderfx::stencil_op(f[0]), "depth_fail": shaderfx::stencil_op(f[1]), "pass": shaderfx::stencil_op(f[2]), "func": shaderfx::comparison(f[3])});
+                            json!({"depth": d.depth, "depth_write": d.depth_write, "depth_func": shaderfx::comparison(d.depth_func), "stencil": d.stencil, "stencil_read_mask": d.stencil_read_mask, "stencil_write_mask": d.stencil_write_mask, "front": face(d.faces[0]), "back": face(d.faces[1])})
+                        })).collect::<Vec<_>>(),
+                        "blend": e.states.blend.iter().map(|x| shaderfx::blend_state(x).map(|(a2c, independent, t)| {
+                            // without independent blend only the first target applies
+                            let targets: Vec<_> = t.iter().take(if independent { 8 } else { 1 }).map(|t| json!({"enable": t.enable, "src": shaderfx::blend_factor(t.src), "dst": shaderfx::blend_factor(t.dst), "op": shaderfx::blend_op(t.op),
+                                "src_alpha": shaderfx::blend_factor(t.src_alpha), "dst_alpha": shaderfx::blend_factor(t.dst_alpha), "op_alpha": shaderfx::blend_op(t.op_alpha), "mask": t.mask})).collect();
+                            json!({"alpha_to_coverage": a2c, "independent": independent, "targets": targets})
+                        })).collect::<Vec<_>>(),
+                        "samplers": e.states.samplers.iter().map(|x| shaderfx::sampler_state(x).map(|s| json!({"address": s.address, "lod_bias": s.lod_bias, "anisotropy": s.anisotropy, "comparison": shaderfx::comparison(s.comparison), "filter": format!("{:02x}", s.filter), "border": s.border, "min_lod": s.min_lod, "max_lod": s.max_lod}))).collect::<Vec<_>>(),
+                    });
+                    let layout = |l: Option<&shaderfx::Layout>| l.map(|l| json!({"id": format!("{:016x}", l.id), "header": l.header.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        "entries": l.entries.iter().map(|x| json!({"hash": format!("{:08x}", x.name), "name": lookup(x.name, Ctx::Param), "kind": format!("{:02x}{:02x}", x.kind[0], x.kind[1]), "slot": x.slot})).collect::<Vec<_>>()}));
+                    let db = &sh.databases[e.database];
+                    v["blocks"] = e.blocks.iter().zip(&e.layouts).map(|(b, l)| match b {
+                        shaderfx::Block::Inline(_, len) => json!({"bytes": len, "read": layout(l.as_ref())}),
+                        shaderfx::Block::Shared(key) => json!({"shared": format!("{key:08x}"), "bytes": db.shared_block(*key).map(|i| db.shared_blocks[i].1), "read": layout(db.shared_block(*key).and_then(|i| db.shared_layouts[i].as_ref()))}),
+                    }).collect();
+                    v["second_table"] = json!(e.second.as_ref().map(|t| t.resources.iter().map(|r| named(r.name)).collect::<Vec<_>>()));
                     if let Some(t) = &e.table {
                         let mut textures: Vec<_> = t.resources.iter().filter_map(|r| Some((r.material_texture()?, r))).collect();
                         textures.sort_by_key(|x| x.0 .0);
@@ -1313,9 +1503,23 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 })
                 .collect();
             out.print(&json!({"ok": true,
-                "programs": {"total": sh.programs.len(), "vertex_or_mesh": sh.sections[0].1, "pixel": sh.sections[1].1, "geometry": sh.sections[2].1, "compute": sh.sections[5].1,
+                "databases": sh.databases.iter().map(|d| json!({"offset": d.offset, "id": format!("{:016x}", d.id), "programs": d.sections.iter().map(|s| s.1).sum::<usize>(), "vertex_or_mesh": d.sections[0].1, "pixel": d.sections[1].1, "geometry": d.sections[2].1, "compute": d.sections[5].1,
+                    "effects_stated": d.effects_stated, "effects_read": d.effects.1, "shared_blocks": d.shared_blocks.len(), "shared_table_resources": d.table.as_ref().map(|t| t.resources.len()), "shared_table_members": d.table.as_ref().map(|t| t.members.len())})).collect::<Vec<_>>(),
+                "programs": {"total": sh.programs.len(), "vertex_or_mesh": sh.section_total(0), "pixel": sh.section_total(1), "geometry": sh.section_total(2), "compute": sh.section_total(5),
                     "resources": sh.programs.iter().map(|p| p.table.resources.len()).sum::<usize>(), "constant_buffer_members": sh.programs.iter().map(|p| p.table.members.len()).sum::<usize>()},
-                "effects": {"stated": sh.effects_stated, "read": sh.effects.len(), "with_table": sh.effects.iter().filter(|e| e.table.is_some()).count(),
+                "effects": {"stated": sh.effects_stated(), "read": sh.effects.len(), "loaded_size_matches": sh.effects.iter().filter(|e| e.loaded_size == e.loaded_size_computed).count(),
+                    "state_items": {"rasterizer": sh.effects.iter().map(|e| e.states.rasterizer.len()).sum::<usize>(), "depth_stencil": sh.effects.iter().map(|e| e.states.depth_stencil.len()).sum::<usize>(), "blend": sh.effects.iter().map(|e| e.states.blend.len()).sum::<usize>(), "samplers": sh.effects.iter().map(|e| e.states.samplers.len()).sum::<usize>()},
+                    "pass_state_index_out_of_range": sh.effects.iter().map(|e| e.techniques.iter().flat_map(|t| &t.passes).filter(|ps| ps.rasterizer().is_some_and(|i| i as usize >= e.states.rasterizer.len()) || ps.depth_stencil().is_some_and(|i| i as usize >= e.states.depth_stencil.len()) || ps.blend().is_some_and(|i| i as usize >= e.states.blend.len())).count()).sum::<usize>(),
+                    "passes_with_bindings": sh.effects.iter().flat_map(|e| &e.techniques).flat_map(|t| &t.passes).filter(|ps| ps.bindings.is_some()).count(),
+                    "passes_with_binding_word": sh.effects.iter().flat_map(|e| &e.techniques).flat_map(|t| &t.passes).filter(|ps| ps.bindings.as_ref().is_some_and(|b| b.word.is_some())).count(),
+                    "pass_block_index_out_of_range": sh.effects.iter().map(|e| e.techniques.iter().flat_map(|t| &t.passes).filter(|ps| ps.blocks().iter().flatten().any(|&i| i as usize >= e.blocks.len())).count()).sum::<usize>(),
+                    "second_table_one_buffer": sh.effects.iter().filter(|e| e.second.as_ref().is_some_and(|t| t.resources.len() == 1 && t.members.is_empty())).count(),
+                    "blocks_inline_read": sh.effects.iter().flat_map(|e| &e.layouts).flatten().count(),
+                    "members_with_default": sh.effects.iter().filter_map(|e| e.table.as_ref()).chain(sh.databases.iter().filter_map(|d| d.table.as_ref())).chain(sh.programs.iter().map(|p| &p.table)).map(|t| (0..t.members.len()).filter(|&i| t.member_default(i).is_some()).count()).sum::<usize>(),
+                    "resources_with_entry": sh.effects.iter().filter_map(|e| e.table.as_ref()).chain(sh.databases.iter().filter_map(|d| d.table.as_ref())).chain(sh.programs.iter().map(|p| &p.table)).map(|t| (0..t.resources.len()).filter(|&i| t.resource_entry(i).is_some()).count()).sum::<usize>(),
+                    "blocks_inline": sh.effects.iter().flat_map(|e| &e.blocks).filter(|b| matches!(b, shaderfx::Block::Inline(..))).count(),
+                    "blocks_shared": sh.effects.iter().flat_map(|e| &e.blocks).filter(|b| matches!(b, shaderfx::Block::Shared(_))).count(),
+                    "blocks_shared_unresolved": sh.effects.iter().map(|e| e.blocks.iter().filter(|b| matches!(b, shaderfx::Block::Shared(k) if sh.databases[e.database].shared_block(*k).is_none())).count()).sum::<usize>(), "with_table": sh.effects.iter().filter(|e| e.table.is_some()).count(),
                     "with_programs": sh.effects.iter().filter(|e| e.programs.iter().any(|l| !l.is_empty())).count(), "with_techniques": sh.effects.iter().filter(|e| !e.techniques.is_empty()).count(),
                     "techniques": sh.effects.iter().map(|e| e.techniques.len()).sum::<usize>(), "passes": sh.effects.iter().flat_map(|e| &e.techniques).map(|t| t.passes.len()).sum::<usize>(),
                     "programs_not_in_any_pass": sh.effects.iter().map(|e| (0..6).map(|k| (0..e.programs[k].len()).filter(|&i| !e.techniques.iter().flat_map(|t| &t.passes).any(|ps| ps.programs[k] == Some(i as u8))).count()).sum::<usize>()).sum::<usize>()},
@@ -1575,6 +1779,18 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 }
             }
         }
+        Cmd::StoryNames { tags } => {
+            use sixng_core::cutscene;
+            let c = cutscene::catalog(&ws, cutscene::STORY_ARCHIVE, false, pr.clone())?;
+            let ids = cutscene::mission_ids(c.dicts.iter().filter_map(|d| cutscene::parse_dict_name(&d.name)).map(|(s, _)| s));
+            let t = sixng_core::storyflow::tags(&ws)?;
+            let n = sixng_core::storyflow::match_names(&t, &ids);
+            let mut v = json!({"ok": true, "missions_in_scenes": ids.len(), "named_missions": n.missions.len(), "named_arcs": n.arcs.len(), "arcs": n.arcs, "missions": n.missions});
+            if *tags {
+                v["tags"] = json!(t);
+            }
+            out.print(&v);
+        }
         Cmd::Cutscenes { scene, name, cast, archive, rescan, summary, limit } => {
             use sixng_core::cutscene;
             let t = Instant::now();
@@ -1613,6 +1829,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 "variants": sel.iter().filter(|s| s.variant_of.is_some()).count(),
                 "with_scene_file": sel.iter().filter(|s| !s.scene_files.is_empty()).count(),
                 "section_dictionaries": sel.iter().map(|s| s.sections).sum::<usize>(),
+                "section_dictionaries_adopted": c.dicts.iter().filter(|d| sel.iter().any(|s| s.dictionary_id == d.id)).map(|d| d.adopted_sections).sum::<usize>(),
                 "clips": clips + sel.iter().map(|s| s.cameras.len()).sum::<usize>(),
                 "cast": {"characters": count("character"), "peds_with_model": objs().filter(|o| o.kind == "ped" && o.model.is_some()).count(),
                     "peds_model_unresolved": objs().filter(|o| o.kind == "ped" && o.model.is_none() && o.model_id.is_some()).count(),
@@ -1634,6 +1851,10 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 o["scenes"] = json!(sel.iter().take(take).collect::<Vec<_>>());
             }
             out.print(&o);
+        }
+        Cmd::SceneDialogue { input, text_table, out: path } => {
+            let default = ws.work.join("scene_dialogue.json");
+            out.print(&scene_dialogue::generate(&ws, input, text_table, path.as_deref().unwrap_or(&default))?);
         }
         Cmd::Ttpf { store, hash, first, mip, all_slices, float, all, out: tout } => {
             let a = ws.resolve(store)?;
@@ -1673,7 +1894,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                             acc.0.extend(v.iter().flat_map(|x| x.to_le_bytes()));
                             anyhow::Ok((acc.0, ch, w, h))
                         });
-                        match r.and_then(|(bytes, ch, w, h)| std::fs::write(&p, bytes).map(|_| (ch, w, h)).map_err(Into::into)) {
+                        match r.and_then(|(bytes, ch, w, h)| sixng_core::atomic::write(&p, bytes).map(|_| (ch, w, h)).map_err(Into::into)) {
                             Ok((ch, w, h)) => res.push(json!({"hash": format!("{:016x}", t.hash), "f32": p, "w": w, "h": h, "slices": t.slices(), "channels": ch, "format": sixng_core::texture::dxgi_name(t.dxgi_format), "layout": "little-endian f32; slices in order, rows top to bottom, channels interleaved", "undecoded_bytes": skipped, "partial": skipped > 0})),
                             Err(e) => res.push(json!({"hash": format!("{:016x}", t.hash), "slices": t.slices(), "error": format!("float export: {e}")})),
                         }
@@ -1700,7 +1921,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     let failed = res.len() - ok - bcpack;
                     let idx = dir.join("index.json");
                     let note = "One PNG per texture (<hash>_m<mip>.png). partial = some of the data is in BCPack chunks that did not decode, so part of the image is blank or noise; bcpack_only = nothing decodable yet, no PNG written. Names are not recovered (64-bit hashes).";
-                    std::fs::write(&idx, serde_json::to_vec_pretty(&json!({"note": note, "store": a.id, "textures": st.textures.len(), "written": ok, "complete": ok - partial, "partial": partial, "bcpack_only": bcpack, "failed": failed, "results": res}))?)?;
+                    sixng_core::atomic::write(&idx, serde_json::to_vec_pretty(&json!({"note": note, "store": a.id, "textures": st.textures.len(), "written": ok, "complete": ok - partial, "partial": partial, "bcpack_only": bcpack, "failed": failed, "results": res}))?)?;
                     out.print(&json!({"ok": true, "store": a.id, "textures": st.textures.len(), "written": ok, "complete": ok - partial, "partial": partial, "bcpack_only": bcpack, "failed": failed, "index": idx}));
                 } else {
                     out.print(&json!(res));
@@ -1761,7 +1982,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 let cat = sixng_core::groom::catalog(&a, &ix.entries)?;
                 let dir = po.join("grooms").join(a.id.trim_end_matches(".rpf"));
                 std::fs::create_dir_all(&dir)?;
-                std::fs::write(dir.join("catalog.json"), serde_json::to_vec_pretty(&cat)?)?;
+                sixng_core::atomic::write(dir.join("catalog.json"), serde_json::to_vec_pretty(&cat)?)?;
                 let mut by: std::collections::BTreeMap<&str, usize> = Default::default();
                 for g in cat.iter().filter(|g| g.lod == 0) {
                     *by.entry(g.category.as_str()).or_default() += 1;
@@ -1799,7 +2020,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                         "link": "inferred from archive order, piece counts and distance to the skin; no resource stores it"});
                     let dir = po.join("grooms").join(a.id.trim_end_matches(".rpf"));
                     std::fs::create_dir_all(&dir)?;
-                    std::fs::write(dir.join(format!("{root}.fur.json")), serde_json::to_vec_pretty(&fur)?)?;
+                    sixng_core::atomic::write(dir.join(format!("{root}.fur.json")), serde_json::to_vec_pretty(&fur)?)?;
                 }
                 let (n, errors) = sixng_core::groom::export_grooms(&a, &ix.entries, &only, po, *roots, ribbons.map(|mm| mm / 1000.0), full.then_some(density.clamp(0.0, 1.0)), pr)?;
                 out.print(&json!({"ok": true, "archive": a.id, "grooms": n, "errors": errors, "fur": fur,
@@ -1945,8 +2166,9 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             let sel: Vec<_> = f.select(&ix)?.into_iter().filter(|e| e.sub == "7a").collect();
             let t = Instant::now();
-            let (sets, lights, placed) = export::export_lights(&ws, &a, &sel, po, pr)?;
+            let (sets, lights, placed, (tc, distant, lod)) = export::export_lights(&ws, &a, &sel, po, pr)?;
             out.print(&json!({"ok": true, "archive": a.id, "scanned": sel.len(), "light_sets": sets, "lights": lights, "placed_lights": placed,
+                "distant_lights": distant, "unpaired_lod_lights": lod, "timecycle_modifier_regions": tc,
                 "seconds": t.elapsed().as_secs_f64(), "dir": po.join("lights").join(a.id.trim_end_matches(".rpf"))}));
         }
         Cmd::FindU32 { archive, values, filter } => {
@@ -2016,7 +2238,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let sel = f.select(&ix)?;
             let t = Instant::now();
             let v = export::shader_census(&a, &sel, pr)?;
-            std::fs::write(po, serde_json::to_vec_pretty(&v)?)?;
+            sixng_core::atomic::write(po, serde_json::to_vec_pretty(&v)?)?;
             out.print(&json!({"ok": true, "archive": a.id, "scanned": sel.len(), "shaders": v.as_object().map(|o| o.len()), "seconds": t.elapsed().as_secs_f64(), "out": po}));
         }
         Cmd::TextureUsers { archives, texture } => {
@@ -2065,7 +2287,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             sixng_core::gaps::write_models_gz(&fm, &models)?;
             v["models_file"] = json!(fm.file_name().map(|x| x.to_string_lossy().to_string()));
             v["models_in_file"] = json!(models.len());
-            std::fs::write(&f, serde_json::to_vec_pretty(&v)?)?;
+            sixng_core::atomic::write(&f, serde_json::to_vec_pretty(&v)?)?;
             out.print(&json!({"ok": true, "out": f, "models_file": fm, "models": models.len(), "summary": {"materials": v["summary"]["materials"], "textures_referenced": v["summary"]["textures_referenced"]}, "seconds": v["seconds"]}));
         }
         Cmd::LinkArchetypes { archive } => {
@@ -2142,7 +2364,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     let dir = po.join("materials").join(sixng_core::game::index_stem(&a.id));
                     std::fs::create_dir_all(&dir)?;
                     let maps = |m: &std::collections::HashMap<u32, matlib::Record>| -> std::collections::BTreeMap<String, serde_json::Value> { m.iter().map(|(k, r)| (format!("{k:08x}"), rec(r))).collect() };
-                    std::fs::write(dir.join(format!("{:x}.json", e.off)), serde_json::to_vec(&json!({"id": e.id, "base_materials": maps(&lib.base), "presets": maps(&lib.presets)}))?)?;
+                    sixng_core::atomic::write(dir.join(format!("{:x}.json", e.off)), serde_json::to_vec(&json!({"id": e.id, "base_materials": maps(&lib.base), "presets": maps(&lib.presets)}))?)?;
                 }
             }
             // weapon family files of packs.rpf name presets per component
@@ -2151,7 +2373,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 anyhow::bail!("no material library (PSO with root struct 8419ab01) in {}", a.id);
             }
             std::fs::create_dir_all(ws.index_dir())?;
-            std::fs::write(matlib::path(&ws), serde_json::to_vec(&index)?)?;
+            sixng_core::atomic::write(matlib::path(&ws), serde_json::to_vec(&index)?)?;
             let resolved = |m: &std::collections::BTreeMap<String, String>| m.values().filter(|p| index.presets.contains_key(*p)).count();
             // weapon models by name: presets and base colours per sub-material (sRGB rrggbb)
             let res: Vec<regex::Regex> = weapon.iter().map(|w| regex::Regex::new(w)).collect::<std::result::Result<_, _>>()?;
@@ -2352,9 +2574,9 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                             }
                         }
                     }
-                    std::fs::write(dir.join(format!("{off}.json")), serde_json::to_vec_pretty(&doc)?)?;
+                    sixng_core::atomic::write(dir.join(format!("{off}.json")), serde_json::to_vec_pretty(&doc)?)?;
                 }
-                std::fs::write(dir.join("index.json"), serde_json::to_vec_pretty(&found.iter().map(|x| &x.0).collect::<Vec<_>>())?)?;
+                sixng_core::atomic::write(dir.join("index.json"), serde_json::to_vec_pretty(&found.iter().map(|x| &x.0).collect::<Vec<_>>())?)?;
             }
             out.print(&json!({"ok": true, "archive": a.id, "count": found.len(), "dictionaries": found.iter().map(|x| &x.0).collect::<Vec<_>>()}));
         }
@@ -2380,7 +2602,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             if let Some(po) = po {
                 let dir = po.join("timecycle");
                 std::fs::create_dir_all(&dir)?;
-                let w = |f: &str, v: &serde_json::Value| -> Result<()> { Ok(std::fs::write(dir.join(f), serde_json::to_vec_pretty(v)?)?) };
+                let w = |f: &str, v: &serde_json::Value| -> Result<()> { Ok(sixng_core::atomic::write(dir.join(f), serde_json::to_vec_pretty(v)?)?) };
                 w("modifiers.json", &json!(d.modifiers))?;
                 w("cycles.json", &json!({"hours": summary["hours"], "time_samples": d.time, "cycles": d.cycles}))?;
                 w("time_samples.json", &d.time)?;
@@ -2434,10 +2656,20 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 if let Some(c) = res.get("check") {
                     j["check"] = c.clone();
                 }
-                std::fs::write(dir.join("heightmap.json"), serde_json::to_vec_pretty(&j)?)?;
+                sixng_core::atomic::write(dir.join("heightmap.json"), serde_json::to_vec_pretty(&j)?)?;
                 res["out"] = json!(dir);
             }
             out.print(&json!({"ok": true, "result": res}));
+        }
+        Cmd::Water { fog_px, height_px, shore_px, height_tiles, out: po } => {
+            for (n, v, max) in [("--fog-px", *fog_px, 128), ("--height-px", *height_px, 512), ("--shore-px", *shore_px, 256)] {
+                if v == 0 || max % v != 0 {
+                    anyhow::bail!("{n} {v}: must divide {max}");
+                }
+            }
+            let o = sixng_core::water::Options { fog_px: *fog_px, height_px: *height_px, shore_px: *shore_px, height_tiles: *height_tiles };
+            let r = sixng_core::water::export(&ws, po.as_deref(), &o)?;
+            out.print(&json!({"ok": true, "result": r}));
         }
         Cmd::SectorGrid { archive, entry, cell_m, out: po } => {
             use sixng_core::sectorgrid as sg;
@@ -2470,14 +2702,14 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             if let Some(po) = po {
                 let dir = po.join("sector_grid");
                 std::fs::create_dir_all(&dir)?;
-                std::fs::write(dir.join("sector_grid.csv"), sg::to_csv(g))?;
+                sixng_core::atomic::write(dir.join("sector_grid.csv"), sg::to_csv(g))?;
                 sg::write_mask_png(g, &dir.join("sector_grid.png"))?;
                 let mut j = desc(id, g);
                 j["cell_rule"] = summary["cell_rule"].clone();
                 j["image"] = json!("sector_grid.png");
                 j["image_rows"] = json!("north to south: pixel (c, r) = cell (min_x + c, max_y - r)");
                 j["sectors"] = serde_json::to_value(&g.sectors)?;
-                std::fs::write(dir.join("sector_grid.json"), serde_json::to_vec(&j)?)?;
+                sixng_core::atomic::write(dir.join("sector_grid.json"), serde_json::to_vec(&j)?)?;
                 summary["out"] = json!(dir);
             }
             out.print(&json!({"ok": true, "result": summary}));
@@ -2516,14 +2748,14 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             for (key, (id, f, copies)) in &best {
                 let file: String = key.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
                 if let Some(d) = &dir {
-                    std::fs::write(d.join(format!("{file}.ttf")), sixng_core::gfxfont::to_ttf(f))?;
-                    std::fs::write(d.join(format!("{file}.typeface.json")), serde_json::to_vec(&sixng_core::gfxfont::to_typeface(f))?)?;
+                    sixng_core::atomic::write(d.join(format!("{file}.ttf")), sixng_core::gfxfont::to_ttf(f))?;
+                    sixng_core::atomic::write(d.join(format!("{file}.typeface.json")), serde_json::to_vec(&sixng_core::gfxfont::to_typeface(f))?)?;
                 }
                 let sample: String = f.glyphs.iter().filter_map(|g| char::from_u32(g.code as u32)).take(48).collect();
                 list.push(json!({"name": f.name, "bold": f.bold, "italic": f.italic, "file": file, "glyphs": f.glyphs.len(), "movie": id, "movies": copies, "chars": sample}));
             }
             if let Some(d) = &dir {
-                std::fs::write(d.join("fonts.json"), serde_json::to_vec_pretty(&list)?)?;
+                sixng_core::atomic::write(d.join("fonts.json"), serde_json::to_vec_pretty(&list)?)?;
             }
             out.print(&json!({"ok": true, "archive": a.id, "movies": movies.len(), "count": list.len(), "fonts": list}));
         }
@@ -2548,7 +2780,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let total: u64 = movies.iter().map(|m| m.size).sum();
             let secs: f64 = movies.iter().map(|m| m.seconds).sum();
             let file = dir.join("movies.json");
-            std::fs::write(&file, serde_json::to_vec_pretty(&json!({
+            sixng_core::atomic::write(&file, serde_json::to_vec_pretty(&json!({
                 "note": "Bink videos carved from the archive by their headers (4 KiB aligned; names are not recovered, so each is named by its offset). Frames are not decoded; the .bk2 files play in any Bink 2 player.",
                 "archive": a.id, "count": movies.len(), "bytes": total, "seconds": secs, "movies": movies,
             }))?)?;
@@ -2655,13 +2887,14 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let aix = sixng_core::audio::load_index(&ws.work, &a.id).ok();
             let banks: Vec<(u64, std::collections::HashSet<u32>)> = aix.as_ref().map(|ix| ix.banks.iter().map(|b| (b.off, b.streams.iter().map(|s| s.id).collect())).collect()).unwrap_or_default();
             let sizes: Vec<(u64, u64)> = aix.as_ref().map(|ix| ix.banks.iter().map(|b| (b.off, b.size)).collect()).unwrap_or_default();
-            let (ok, bad, containers, list) = sixng_core::audiometa::export(&a, &sel, &banks, &sizes, po)?;
+            let (ok, bad, containers, list, objects) = sixng_core::audiometa::export(&a, &sel, &banks, &sizes, po)?;
             // which container (bank name hash) each bank holds, for `sixng audio`
             let named = if containers.is_empty() {
                 None
             } else {
                 sixng_core::audiometa::save_containers(&ws.work, &a.id, &containers)?;
                 sixng_core::audiometa::save_groups(&ws.work, &a.id, &sixng_core::audiometa::bank_groups(&list))?;
+                sixng_core::audiometa::save_objects(&ws.work, &a.id, &objects)?;
                 let c = sixng_core::audiometa::bank_container(&containers);
                 // bank names into the name dictionary (needs `sixng names` first)
                 let streams: std::collections::BTreeMap<u64, Vec<u32>> = aix.as_ref().map(|ix| ix.banks.iter().map(|b| (b.off, b.streams.iter().map(|s| s.id).collect())).collect()).unwrap_or_default();
@@ -2701,7 +2934,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let bank_name = |off: u64| containers.get(&off).map(|h| (format!("{h:08x}"), sixng_core::names::lookup(*h, sixng_core::names::Ctx::Audio)));
             let named = ix.banks.iter().filter(|b| bank_name(b.off).is_some_and(|(_, n)| n.is_some())).count();
             // stream names recovered by `audio-meta` / `names`
-            let stream_names = sixng_core::names::load_stream_names(&ws.work, &a.id);
+            let stream_names = sixng_core::names::all_stream_names(&ws.work, &ix);
             let list: Vec<_> = ix
                 .banks
                 .iter()
@@ -2709,7 +2942,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 .take(if *limit == 0 { usize::MAX } else { *limit })
                 .map(|b| {
                     let (container, name) = bank_name(b.off).map_or((None, None), |(c, n)| (Some(c), n));
-                    json!({"bank": format!("{:x}", b.off), "container": container, "name": name, "size": b.size, "seconds": b.seconds(), "streams": b.streams.iter().filter(|s| s.layout != "none" && s.seconds() >= *min_seconds).map(|s| json!({"id": format!("{:08x}", s.id), "name": stream_names.get(&b.off).and_then(|m| m.get(&s.id)), "seconds": s.seconds(), "samples": s.samples, "rate": s.rate, "codec": s.codec, "channels": s.channels, "layout": s.layout})).collect::<Vec<_>>()})
+                    json!({"bank": format!("{:x}", b.off), "container": container, "name": name, "size": b.size, "seconds": b.seconds(), "streams": b.streams.iter().enumerate().filter(|(_, s)| s.layout != "none" && s.seconds() >= *min_seconds).map(|(i, s)| json!({"index": i, "id": format!("{:08x}", s.id), "name": stream_names.get(&b.off).and_then(|m| m.get(&s.id)), "name_from": if b.names.contains_key(&s.id) { Some("stored") } else { stream_names.get(&b.off).and_then(|m| m.get(&s.id)).map(|_| "search") }, "hash": stream_names.get(&b.off).and_then(|m| m.get(&s.id)).map(|n| format!("{:08x}", sixng_core::meta7a::joaat(n))), "seconds": s.seconds(), "samples": s.samples, "rate": s.rate, "codec": s.codec, "channels": s.channels, "layout": s.layout})).collect::<Vec<_>>()})
                 })
                 .collect();
             out.print(&json!({"ok": true, "archive": a.id, "index": audio::index_path(&ws.work, &a.id), "banks": ix.banks.len(), "banks_with_container": ix.banks.iter().filter(|b| containers.contains_key(&b.off)).count(), "banks_named": named, "streams_named": stream_names.values().map(|m| m.len()).sum::<usize>(), "streams_by_layout": layouts, "codec_bytes": codecs, "total_seconds": secs, "list": list, "seconds": t.elapsed().as_secs_f64(), "note": ix.note}));
@@ -2738,7 +2971,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 if format == "awc" {
                     std::fs::create_dir_all(dir)?;
                     let p = dir.join(format!("{:x}.awc", b.off));
-                    std::fs::write(&p, &bytes)?;
+                    sixng_core::atomic::write(&p, &bytes)?;
                     files.push(p.display().to_string());
                     continue;
                 }
@@ -2787,6 +3020,22 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             out.print(&json!({"ok": true, "entry": v}));
         }
+    }
+    Ok(())
+}
+
+type TocVisit<'a> = dyn FnMut(&mut dyn sixng_core::rpf9toc::ArchiveCipher, &mut std::fs::File, u64, &sixng_core::rpf9toc::Toc, &[sixng_core::rpf9toc::FileEntry]) -> Result<()> + 'a;
+
+/// Visit the table of contents at `base` and those of the archives stored
+/// inside it. An archive without a known entry column is visited with no
+/// entries.
+fn toc_walk(cipher: &mut dyn sixng_core::rpf9toc::ArchiveCipher, f: &mut std::fs::File, base: u64, visit: &mut TocVisit) -> Result<()> {
+    use sixng_core::rpf9toc;
+    let toc = rpf9toc::open_toc(cipher, f, base).map_err(|e| anyhow!("table of contents at {base:#x}: {e:#}"))?;
+    let entries = if toc.has_entries() { toc.files()? } else { Vec::new() };
+    visit(cipher, f, base, &toc, &entries)?;
+    for off in rpf9toc::nested_archives(f, base, &entries) {
+        toc_walk(cipher, f, base + off, visit)?;
     }
     Ok(())
 }

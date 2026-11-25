@@ -569,6 +569,9 @@ pub struct Mesh {
     pub colors: Option<Vec<[u8; 4]>>,
     /// The second colour stream (slot 12), as stored.
     pub colors1: Option<Vec<[u8; 4]>>,
+    /// Raw stream 13 (4 bytes per vertex); on people byte 0 is the vertex's
+    /// region for the hide masks of clothes.
+    pub regions: Option<Vec<[u8; 4]>>,
     pub indices: Vec<u32>,
     /// Triangles whose winding was flipped to agree with stored normals.
     pub flipped: usize,
@@ -772,6 +775,10 @@ pub fn decode_mesh(blob: &[u8], h: &MeshBlobHeader, ib: &[u8]) -> Mesh {
         .filter(|s| s.1 == 0x26)
         .and_then(|s| blob.get(s.0..s.0 + 4 * v))
         .map(|b| b.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect());
+    let regions: Option<Vec<[u8; 4]>> = stream(13)
+        .filter(|s| s.1 == 0x26)
+        .and_then(|s| blob.get(s.0..s.0 + 4 * v))
+        .map(|b| b.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect());
     let (mut indices, dropped) = decode_meshlets(ib, v);
     // Stream 8 is sized per vertex: the next section's offset (or the blob
     // end) minus this one, over the vertex count, gives its width.
@@ -869,7 +876,8 @@ pub fn decode_mesh(blob: &[u8], h: &MeshBlobHeader, ib: &[u8]) -> Mesh {
                 for u in uvs.iter_mut() { let c = u.1.clone(); u.1.extend(c); }
                 let colors: Option<Vec<[u8; 4]>> = colors.map(|c: Vec<[u8; 4]>| { let mut d = c.clone(); d.extend(c); d });
                 let colors1: Option<Vec<[u8; 4]>> = colors1.map(|c: Vec<[u8; 4]>| { let mut d = c.clone(); d.extend(c); d });
-                return Mesh { positions: pos2, normals: Some(nrm2), uvs, colors, colors1, indices, flipped: 0, dropped, axis_order: [0, 1, 2], joints: None, weights: None, joints1: None, weights1: None, joint_format: None, tangents: None, rebuilt_normals: 0 };
+                let regions: Option<Vec<[u8; 4]>> = regions.map(|c: Vec<[u8; 4]>| { let mut d = c.clone(); d.extend(c); d });
+                return Mesh { positions: pos2, normals: Some(nrm2), uvs, colors, colors1, regions, indices, flipped: 0, dropped, axis_order: [0, 1, 2], joints: None, weights: None, joints1: None, weights1: None, joint_format: None, tangents: None, rebuilt_normals: 0 };
             }
         }
     }
@@ -990,7 +998,7 @@ pub fn decode_mesh(blob: &[u8], h: &MeshBlobHeader, ib: &[u8]) -> Mesh {
             .collect::<Vec<_>>()
     });
     let joint_format = stream(8).map(|s| s.1);
-    Mesh { positions, normals, uvs, colors, colors1, indices, flipped, dropped, axis_order, joints, weights, joints1, weights1, joint_format, tangents, rebuilt_normals }
+    Mesh { positions, normals, uvs, colors, colors1, regions, indices, flipped, dropped, axis_order, joints, weights, joints1, weights1, joint_format, tangents, rebuilt_normals }
 }
 
 /// A geometry: a mesh blob paired with its meshlet index buffer.

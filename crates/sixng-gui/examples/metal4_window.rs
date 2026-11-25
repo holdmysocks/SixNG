@@ -23,6 +23,22 @@ mod metal4_egui;
 #[path = "../src/render3d.rs"]
 mod render3d;
 #[cfg(target_os = "macos")]
+mod livery {
+    pub const MAX_STICKERS: usize = 16;
+
+    #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+    #[repr(C)]
+    pub struct Record {
+        pub zones: [u32; 8],
+        pub m: [f32; 4],
+        pub o: [f32; 4],
+        pub flags: [u32; 4],
+        pub c: [[f32; 4]; 3],
+    }
+}
+#[cfg(target_os = "macos")]
+pub(crate) const METAL4_BUILD: bool = true;
+#[cfg(target_os = "macos")]
 #[path = "../src/render3d_metal4.rs"]
 mod render3d_metal4;
 
