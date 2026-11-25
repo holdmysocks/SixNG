@@ -198,7 +198,7 @@ pub fn models(game_root: &Path) -> Result<&'static Models, String> {
             return Err("no outfit lists found in packs.rpf".into());
         }
         if let Ok(b) = serde_json::to_vec(&t) {
-            let _ = std::fs::write(&cache, b);
+            let _ = crate::atomic::write(&cache, b);
         }
         Ok(t)
     })
@@ -496,7 +496,7 @@ pub fn model_names(game_root: &Path) -> Result<&'static ModelNames, String> {
         let ix = crate::scan::load_index(&ixp).map_err(|e| format!("packs.rpf index ({}): {e}; index packs.rpf first", ixp.display()))?;
         let n = build_names(game_root, &work, t, &ix);
         if let Ok(b) = serde_json::to_vec(&n) {
-            let _ = std::fs::write(&cache, b);
+            let _ = crate::atomic::write(&cache, b);
         }
         Ok(n)
     })
@@ -616,7 +616,7 @@ pub fn wardrobe_textures(game_root: &Path) -> Result<&'static WardrobeTextures, 
         }
         let t = WardrobeTextures { version: 2, by_texture };
         if let Ok(b) = serde_json::to_vec(&t) {
-            let _ = std::fs::write(&cache, b);
+            let _ = crate::atomic::write(&cache, b);
         }
         Ok(t)
     })
@@ -702,7 +702,7 @@ pub fn asset_drawables(a: &ArchiveInfo, ix: &ArchiveIndex) -> Result<&'static As
         }
         let t = AssetDrawables { version: 1, by_guid };
         if let Ok(b) = serde_json::to_vec(&t) {
-            let _ = std::fs::write(&cache, b);
+            let _ = crate::atomic::write(&cache, b);
         }
         Ok(t)
     })

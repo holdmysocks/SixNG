@@ -1239,7 +1239,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     let name = if base == 0 { stem.clone() } else { format!("{stem}@{base:x}") };
                     let dir = po.join("toc_files").join(&name);
                     std::fs::create_dir_all(&dir)?;
-                    let mut index = std::io::BufWriter::new(std::fs::File::create(dir.join("index.jsonl"))?);
+                    let mut index = sixng_core::atomic::AtomicFile::create(dir.join("index.jsonl"))?;
                     let mut errors = Vec::new();
                     let mut bytes = 0u64;
                     for e in &enc {
@@ -1250,7 +1250,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                             Ok((data, check)) => {
                                 let ext = if e.resource.is_some() { "rsc" } else { sixng_core::rpf9toc::sniff_ext(&data) };
                                 let file = format!("{:09x}.{ext}", e.offset);
-                                std::fs::write(dir.join(&file), &data)?;
+                                sixng_core::atomic::write(dir.join(&file), &data)?;
                                 bytes += data.len() as u64;
                                 rec["file"] = json!(file);
                                 rec["check"] = json!(check);
@@ -1262,7 +1262,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                         }
                         writeln!(index, "{rec}")?;
                     }
-                    index.flush()?;
+                    index.commit()?;
                     total += enc.len();
                     failed += errors.len();
                     res.push(json!({"archive": a.id, "base": base, "dir": dir, "files": enc.len() - errors.len(), "bytes": bytes, "errors": errors}));
@@ -1894,7 +1894,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                             acc.0.extend(v.iter().flat_map(|x| x.to_le_bytes()));
                             anyhow::Ok((acc.0, ch, w, h))
                         });
-                        match r.and_then(|(bytes, ch, w, h)| std::fs::write(&p, bytes).map(|_| (ch, w, h)).map_err(Into::into)) {
+                        match r.and_then(|(bytes, ch, w, h)| sixng_core::atomic::write(&p, bytes).map(|_| (ch, w, h)).map_err(Into::into)) {
                             Ok((ch, w, h)) => res.push(json!({"hash": format!("{:016x}", t.hash), "f32": p, "w": w, "h": h, "slices": t.slices(), "channels": ch, "format": sixng_core::texture::dxgi_name(t.dxgi_format), "layout": "little-endian f32; slices in order, rows top to bottom, channels interleaved", "undecoded_bytes": skipped, "partial": skipped > 0})),
                             Err(e) => res.push(json!({"hash": format!("{:016x}", t.hash), "slices": t.slices(), "error": format!("float export: {e}")})),
                         }
@@ -1921,7 +1921,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     let failed = res.len() - ok - bcpack;
                     let idx = dir.join("index.json");
                     let note = "One PNG per texture (<hash>_m<mip>.png). partial = some of the data is in BCPack chunks that did not decode, so part of the image is blank or noise; bcpack_only = nothing decodable yet, no PNG written. Names are not recovered (64-bit hashes).";
-                    std::fs::write(&idx, serde_json::to_vec_pretty(&json!({"note": note, "store": a.id, "textures": st.textures.len(), "written": ok, "complete": ok - partial, "partial": partial, "bcpack_only": bcpack, "failed": failed, "results": res}))?)?;
+                    sixng_core::atomic::write(&idx, serde_json::to_vec_pretty(&json!({"note": note, "store": a.id, "textures": st.textures.len(), "written": ok, "complete": ok - partial, "partial": partial, "bcpack_only": bcpack, "failed": failed, "results": res}))?)?;
                     out.print(&json!({"ok": true, "store": a.id, "textures": st.textures.len(), "written": ok, "complete": ok - partial, "partial": partial, "bcpack_only": bcpack, "failed": failed, "index": idx}));
                 } else {
                     out.print(&json!(res));
@@ -1982,7 +1982,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 let cat = sixng_core::groom::catalog(&a, &ix.entries)?;
                 let dir = po.join("grooms").join(a.id.trim_end_matches(".rpf"));
                 std::fs::create_dir_all(&dir)?;
-                std::fs::write(dir.join("catalog.json"), serde_json::to_vec_pretty(&cat)?)?;
+                sixng_core::atomic::write(dir.join("catalog.json"), serde_json::to_vec_pretty(&cat)?)?;
                 let mut by: std::collections::BTreeMap<&str, usize> = Default::default();
                 for g in cat.iter().filter(|g| g.lod == 0) {
                     *by.entry(g.category.as_str()).or_default() += 1;
@@ -2020,7 +2020,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                         "link": "inferred from archive order, piece counts and distance to the skin; no resource stores it"});
                     let dir = po.join("grooms").join(a.id.trim_end_matches(".rpf"));
                     std::fs::create_dir_all(&dir)?;
-                    std::fs::write(dir.join(format!("{root}.fur.json")), serde_json::to_vec_pretty(&fur)?)?;
+                    sixng_core::atomic::write(dir.join(format!("{root}.fur.json")), serde_json::to_vec_pretty(&fur)?)?;
                 }
                 let (n, errors) = sixng_core::groom::export_grooms(&a, &ix.entries, &only, po, *roots, ribbons.map(|mm| mm / 1000.0), full.then_some(density.clamp(0.0, 1.0)), pr)?;
                 out.print(&json!({"ok": true, "archive": a.id, "grooms": n, "errors": errors, "fur": fur,
@@ -2238,7 +2238,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let sel = f.select(&ix)?;
             let t = Instant::now();
             let v = export::shader_census(&a, &sel, pr)?;
-            std::fs::write(po, serde_json::to_vec_pretty(&v)?)?;
+            sixng_core::atomic::write(po, serde_json::to_vec_pretty(&v)?)?;
             out.print(&json!({"ok": true, "archive": a.id, "scanned": sel.len(), "shaders": v.as_object().map(|o| o.len()), "seconds": t.elapsed().as_secs_f64(), "out": po}));
         }
         Cmd::TextureUsers { archives, texture } => {
@@ -2287,7 +2287,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             sixng_core::gaps::write_models_gz(&fm, &models)?;
             v["models_file"] = json!(fm.file_name().map(|x| x.to_string_lossy().to_string()));
             v["models_in_file"] = json!(models.len());
-            std::fs::write(&f, serde_json::to_vec_pretty(&v)?)?;
+            sixng_core::atomic::write(&f, serde_json::to_vec_pretty(&v)?)?;
             out.print(&json!({"ok": true, "out": f, "models_file": fm, "models": models.len(), "summary": {"materials": v["summary"]["materials"], "textures_referenced": v["summary"]["textures_referenced"]}, "seconds": v["seconds"]}));
         }
         Cmd::LinkArchetypes { archive } => {
@@ -2364,7 +2364,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     let dir = po.join("materials").join(sixng_core::game::index_stem(&a.id));
                     std::fs::create_dir_all(&dir)?;
                     let maps = |m: &std::collections::HashMap<u32, matlib::Record>| -> std::collections::BTreeMap<String, serde_json::Value> { m.iter().map(|(k, r)| (format!("{k:08x}"), rec(r))).collect() };
-                    std::fs::write(dir.join(format!("{:x}.json", e.off)), serde_json::to_vec(&json!({"id": e.id, "base_materials": maps(&lib.base), "presets": maps(&lib.presets)}))?)?;
+                    sixng_core::atomic::write(dir.join(format!("{:x}.json", e.off)), serde_json::to_vec(&json!({"id": e.id, "base_materials": maps(&lib.base), "presets": maps(&lib.presets)}))?)?;
                 }
             }
             // weapon family files of packs.rpf name presets per component
@@ -2373,7 +2373,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 anyhow::bail!("no material library (PSO with root struct 8419ab01) in {}", a.id);
             }
             std::fs::create_dir_all(ws.index_dir())?;
-            std::fs::write(matlib::path(&ws), serde_json::to_vec(&index)?)?;
+            sixng_core::atomic::write(matlib::path(&ws), serde_json::to_vec(&index)?)?;
             let resolved = |m: &std::collections::BTreeMap<String, String>| m.values().filter(|p| index.presets.contains_key(*p)).count();
             // weapon models by name: presets and base colours per sub-material (sRGB rrggbb)
             let res: Vec<regex::Regex> = weapon.iter().map(|w| regex::Regex::new(w)).collect::<std::result::Result<_, _>>()?;
@@ -2574,9 +2574,9 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                             }
                         }
                     }
-                    std::fs::write(dir.join(format!("{off}.json")), serde_json::to_vec_pretty(&doc)?)?;
+                    sixng_core::atomic::write(dir.join(format!("{off}.json")), serde_json::to_vec_pretty(&doc)?)?;
                 }
-                std::fs::write(dir.join("index.json"), serde_json::to_vec_pretty(&found.iter().map(|x| &x.0).collect::<Vec<_>>())?)?;
+                sixng_core::atomic::write(dir.join("index.json"), serde_json::to_vec_pretty(&found.iter().map(|x| &x.0).collect::<Vec<_>>())?)?;
             }
             out.print(&json!({"ok": true, "archive": a.id, "count": found.len(), "dictionaries": found.iter().map(|x| &x.0).collect::<Vec<_>>()}));
         }
@@ -2602,7 +2602,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             if let Some(po) = po {
                 let dir = po.join("timecycle");
                 std::fs::create_dir_all(&dir)?;
-                let w = |f: &str, v: &serde_json::Value| -> Result<()> { Ok(std::fs::write(dir.join(f), serde_json::to_vec_pretty(v)?)?) };
+                let w = |f: &str, v: &serde_json::Value| -> Result<()> { Ok(sixng_core::atomic::write(dir.join(f), serde_json::to_vec_pretty(v)?)?) };
                 w("modifiers.json", &json!(d.modifiers))?;
                 w("cycles.json", &json!({"hours": summary["hours"], "time_samples": d.time, "cycles": d.cycles}))?;
                 w("time_samples.json", &d.time)?;
@@ -2656,7 +2656,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 if let Some(c) = res.get("check") {
                     j["check"] = c.clone();
                 }
-                std::fs::write(dir.join("heightmap.json"), serde_json::to_vec_pretty(&j)?)?;
+                sixng_core::atomic::write(dir.join("heightmap.json"), serde_json::to_vec_pretty(&j)?)?;
                 res["out"] = json!(dir);
             }
             out.print(&json!({"ok": true, "result": res}));
@@ -2702,14 +2702,14 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             if let Some(po) = po {
                 let dir = po.join("sector_grid");
                 std::fs::create_dir_all(&dir)?;
-                std::fs::write(dir.join("sector_grid.csv"), sg::to_csv(g))?;
+                sixng_core::atomic::write(dir.join("sector_grid.csv"), sg::to_csv(g))?;
                 sg::write_mask_png(g, &dir.join("sector_grid.png"))?;
                 let mut j = desc(id, g);
                 j["cell_rule"] = summary["cell_rule"].clone();
                 j["image"] = json!("sector_grid.png");
                 j["image_rows"] = json!("north to south: pixel (c, r) = cell (min_x + c, max_y - r)");
                 j["sectors"] = serde_json::to_value(&g.sectors)?;
-                std::fs::write(dir.join("sector_grid.json"), serde_json::to_vec(&j)?)?;
+                sixng_core::atomic::write(dir.join("sector_grid.json"), serde_json::to_vec(&j)?)?;
                 summary["out"] = json!(dir);
             }
             out.print(&json!({"ok": true, "result": summary}));
@@ -2748,14 +2748,14 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             for (key, (id, f, copies)) in &best {
                 let file: String = key.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
                 if let Some(d) = &dir {
-                    std::fs::write(d.join(format!("{file}.ttf")), sixng_core::gfxfont::to_ttf(f))?;
-                    std::fs::write(d.join(format!("{file}.typeface.json")), serde_json::to_vec(&sixng_core::gfxfont::to_typeface(f))?)?;
+                    sixng_core::atomic::write(d.join(format!("{file}.ttf")), sixng_core::gfxfont::to_ttf(f))?;
+                    sixng_core::atomic::write(d.join(format!("{file}.typeface.json")), serde_json::to_vec(&sixng_core::gfxfont::to_typeface(f))?)?;
                 }
                 let sample: String = f.glyphs.iter().filter_map(|g| char::from_u32(g.code as u32)).take(48).collect();
                 list.push(json!({"name": f.name, "bold": f.bold, "italic": f.italic, "file": file, "glyphs": f.glyphs.len(), "movie": id, "movies": copies, "chars": sample}));
             }
             if let Some(d) = &dir {
-                std::fs::write(d.join("fonts.json"), serde_json::to_vec_pretty(&list)?)?;
+                sixng_core::atomic::write(d.join("fonts.json"), serde_json::to_vec_pretty(&list)?)?;
             }
             out.print(&json!({"ok": true, "archive": a.id, "movies": movies.len(), "count": list.len(), "fonts": list}));
         }
@@ -2780,7 +2780,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let total: u64 = movies.iter().map(|m| m.size).sum();
             let secs: f64 = movies.iter().map(|m| m.seconds).sum();
             let file = dir.join("movies.json");
-            std::fs::write(&file, serde_json::to_vec_pretty(&json!({
+            sixng_core::atomic::write(&file, serde_json::to_vec_pretty(&json!({
                 "note": "Bink videos carved from the archive by their headers (4 KiB aligned; names are not recovered, so each is named by its offset). Frames are not decoded; the .bk2 files play in any Bink 2 player.",
                 "archive": a.id, "count": movies.len(), "bytes": total, "seconds": secs, "movies": movies,
             }))?)?;
@@ -2971,7 +2971,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 if format == "awc" {
                     std::fs::create_dir_all(dir)?;
                     let p = dir.join(format!("{:x}.awc", b.off));
-                    std::fs::write(&p, &bytes)?;
+                    sixng_core::atomic::write(&p, &bytes)?;
                     files.push(p.display().to_string());
                     continue;
                 }

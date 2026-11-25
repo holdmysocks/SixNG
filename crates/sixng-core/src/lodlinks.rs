@@ -194,7 +194,7 @@ pub fn build(ws: &Workspace, a: &ArchiveInfo, metas: &[&Entry], progress: Progre
         arch.insert(*h, (v[best], v.len(), vals));
     }
     {
-        let mut w = std::io::BufWriter::new(fs::File::create(archetype_lod_path(ws))?);
+        let mut w = crate::atomic::AtomicFile::create(archetype_lod_path(ws))?;
         let mut keys: Vec<_> = arch.keys().copied().collect();
         keys.sort();
         for h in keys {
@@ -208,6 +208,7 @@ pub fn build(ws: &Workspace, a: &ArchiveInfo, metas: &[&Entry], progress: Progre
             }
             writeln!(w, "{v}")?;
         }
+        w.commit()?;
     }
 
     // ---- indexes over files
@@ -437,7 +438,7 @@ pub fn build(ws: &Workspace, a: &ArchiveInfo, metas: &[&Entry], progress: Progre
             Some((f.id.clone(), out, st))
         })
         .collect();
-    let mut w = std::io::BufWriter::new(fs::File::create(parents_path(ws))?);
+    let mut w = crate::atomic::AtomicFile::create(parents_path(ws))?;
     let mut t = St::default();
     for (id, v, s) in &results {
         if !v.is_empty() {
@@ -455,7 +456,7 @@ pub fn build(ws: &Workspace, a: &ArchiveInfo, metas: &[&Entry], progress: Progre
         t.medium += s.medium;
         t.low += s.low;
     }
-    w.flush()?;
+    w.commit()?;
     let n_ent: usize = files.iter().map(|f| f.ents.len()).sum();
     Ok(json!({"map_files": files.len(), "entities": n_ent, "archetypes": arch.len(),
         "archetypes_with_differing_lod_dist": arch.values().filter(|x| x.2.len() > 1).count(),

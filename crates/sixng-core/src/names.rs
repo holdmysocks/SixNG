@@ -258,9 +258,7 @@ pub fn import_namehash(src: &Path, work: &Path) -> Result<serde_json::Value> {
     let d = from_namehash(&raw);
     let p = namehash_path(work);
     std::fs::create_dir_all(p.parent().unwrap())?;
-    let tmp = p.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(&d)?)?;
-    std::fs::rename(&tmp, &p)?;
+    crate::atomic::write(&p, serde_json::to_vec(&d)?)?;
     reload();
     Ok(serde_json::json!({"out": p, "hashes_in_file": raw.len(), "hashes": d.names.len(), "case_sensitive_hashes": d.exact.len()}))
 }
@@ -576,7 +574,7 @@ pub fn build(game: &Path, index_dir: &Path, work: &Path) -> Result<serde_json::V
     let text = harvest_text_words(game, index_dir).map(|(tables, words)| -> Result<serde_json::Value> {
         let p = text_words_path(work);
         std::fs::create_dir_all(p.parent().unwrap())?;
-        std::fs::write(&p, serde_json::to_vec(&words)?)?;
+        crate::atomic::write(&p, serde_json::to_vec(&words)?)?;
         Ok(serde_json::json!({"tables": tables, "words": words.len()}))
     }).transpose()?;
     // audio bank names, when `audio-meta` has recorded the banks' containers
@@ -594,9 +592,7 @@ pub fn build(game: &Path, index_dir: &Path, work: &Path) -> Result<serde_json::V
 
 fn save_dict(p: &Path, d: &Dict) -> Result<()> {
     std::fs::create_dir_all(p.parent().unwrap())?;
-    let tmp = p.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(d)?)?;
-    std::fs::rename(&tmp, p)?;
+    crate::atomic::write(p, serde_json::to_vec(d)?)?;
     reload();
     Ok(())
 }
@@ -1071,7 +1067,7 @@ fn name_audio(d: &mut Dict, work: &Path, archive: &str, banks: &BTreeMap<u64, u3
     let v: BTreeMap<String, BTreeMap<String, &String>> = sn.iter().map(|(b, m)| (format!("{b:x}"), m.iter().map(|(i, n)| (format!("{i:08x}"), n)).collect())).collect();
     let p = stream_names_path(work, archive);
     std::fs::create_dir_all(p.parent().unwrap())?;
-    std::fs::write(&p, serde_json::to_vec(&v)?)?;
+    crate::atomic::write(&p, serde_json::to_vec(&v)?)?;
     let mut r = set_bank_names(d, &extra, banks, &sn, &crate::audiometa::load_groups(work, archive).unwrap_or_default());
     r["stream_names_stored"] = embedded.values().map(|m| m.len()).sum::<usize>().into();
     r["banks_with_stored_names"] = embedded.len().into();

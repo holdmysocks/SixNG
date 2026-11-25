@@ -425,7 +425,7 @@ pub fn for_animal(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::scan:
     cache.version = CACHE_VERSION;
     cache.links.insert(root, link.clone());
     if let Ok(b) = serde_json::to_vec(&cache) {
-        let _ = std::fs::write(&cache_path, b);
+        let _ = crate::atomic::write(&cache_path, b);
     }
     Ok(link)
 }

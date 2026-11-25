@@ -462,7 +462,7 @@ pub fn run(a: &crate::game::ArchiveInfo, all: &[Entry], out: &std::path::Path, b
                     std::fs::create_dir_all(&dir)?;
                     let extras = serde_json::json!({"head_delta": r.id, "base": r.base, "head_by_order": r.head_by_order, "between": r.between, "built_from": how, "note": "normals are those of the source mesh"});
                     let p = dir.join("model.glb");
-                    std::fs::write(&p, set_positions(&std::fs::read(&src)?, &positions, extras)?)?;
+                    crate::atomic::write(&p, set_positions(&std::fs::read(&src)?, &positions, extras)?)?;
                     Ok(p.strip_prefix(out).unwrap_or(&p).to_string_lossy().replace('\\', "/"))
                 })();
                 (i, res)
@@ -482,7 +482,7 @@ pub fn run(a: &crate::game::ArchiveInfo, all: &[Entry], out: &std::path::Path, b
         s.push_str(&serde_json::to_string(r)?);
         s.push('\n');
     }
-    std::fs::write(dir.join("index.jsonl"), s)?;
+    crate::atomic::write(dir.join("index.jsonl"), s)?;
     progress("done", 4, 4);
     Ok(v)
 }

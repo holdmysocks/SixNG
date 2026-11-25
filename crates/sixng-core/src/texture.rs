@@ -618,7 +618,9 @@ fn reconstruct_bc5_z(img: &mut [u32]) {
 
 pub fn save_png(path: &Path, rgba: &[u8], w: u32, h: u32) -> Result<()> {
     let img = image::RgbaImage::from_raw(w, h, rgba.to_vec()).ok_or_else(|| anyhow!("bad image size"))?;
-    img.save(path)?;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::from_path(path)?)?;
+    crate::atomic::write(path, buf.into_inner())?;
     Ok(())
 }
 
@@ -667,7 +669,7 @@ fn save_dds_n(path: &Path, t: &TexInfo, fmt: Fmt, data: &[u8], nmips: u32, mip0_
     w32(&mut h, 1);
     w32(&mut h, 0);
     h.extend_from_slice(data);
-    std::fs::write(path, h)?;
+    crate::atomic::write(path, h)?;
     Ok(())
 }
 

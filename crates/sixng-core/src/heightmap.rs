@@ -214,7 +214,9 @@ pub fn write_png16(m: &HeightMap, path: &std::path::Path) -> Result<()> {
     let px = m.gray16_north_up();
     let img = image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_raw(m.width as u32, m.height as u32, px)
         .ok_or_else(|| anyhow::anyhow!("image size"))?;
-    img.save(path)?;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::from_path(path)?)?;
+    crate::atomic::write(path, buf.into_inner())?;
     Ok(())
 }
 
