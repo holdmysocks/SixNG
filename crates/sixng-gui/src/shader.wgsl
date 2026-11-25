@@ -21,7 +21,7 @@ struct Frame {
 
 struct Mat {
     base: vec4<f32>,
-    flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask, bit 13 = the packed map is a vehicle material map, bit 14 = the emissive slot holds the part ramp image with the parts' surfaces
+    flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask, bit 12 = an emissive shader of another class (lit by its emissive map), bit 13 = the packed map is a vehicle material map, bit 14 = the emissive slot holds the part ramp image with the parts' surfaces
     tile: vec4<f32>,      // fabric detail tile: x UV scale, y rotation, z mean grey value, w bound
     emis: vec4<f32>,      // x emissive scale of the material (from the GLB's emissive strength)
 };
@@ -434,7 +434,10 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
         }
     } else if (cls == 8u) {
         albedo = vec3(0.04, 0.12, 0.16); rough = 0.05; alpha = 0.7;
-    } else if (cls == 7u) {
+    }
+    // class 7, or an emissive shader of another class (flags.w bit 12:
+    // a bulb's emissive layer, a neon tube), which lights by its emissive map
+    if (cls == 7u || ((M.flags.w & 4096u) != 0u && (has & 8u) != 0u)) {
         var e = albedo;
         if ((has & 8u) != 0u) { e = textureSample(t_em, samp, i.uv0).rgb; }
         emissive = e * F.misc.y * M.emis.x;
