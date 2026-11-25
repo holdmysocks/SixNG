@@ -769,8 +769,11 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                     occlusion_only = packed.is_some();
                 }
             }
+            // The colour map lights only shaders without an emissive map of
+            // their own (`emissive_source`; older exports do not say).
             if class == "emissive"
                 && emissive.is_none()
+                && !matches!(ex["emissive_source"].as_str(), Some("none" | "emissive_map"))
                 && (role == "colour" || role == "base_colour")
             {
                 if let Some(p) = &png {

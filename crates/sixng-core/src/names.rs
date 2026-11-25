@@ -118,6 +118,10 @@ pub const DERIVED: &[&str] = &[
     "watersurfacedetailtexture", "surfacedetailnormal0", "surfacedetailnormal1", "surfacedetailnormal2", "surfacedetailiridescence", "interiordiffusemaskmap", "interiorlayerdiffusemap",
     // shader constants of the 4-layer ground shaders (dictionary search, 2026-11-22)
     "blendsoftness", "bumpiness", "fresnel", "puddlemaskscale", "tintblendamount", "tintbump", "tintbumpuvscalebias", "tintintensity", "tintroughnessbias", "verttintintensity",
+    // shader constants checked against the shader archive's constant buffers (2026-11-25): hardalphablend in
+    // 327 effects (standard_alpha, ped shaders), blendintensity / blendoffset / puddleheightbias in the prop
+    // batch shaders, grassopacity in the 2- and 4-layer ground shaders
+    "blendintensity", "blendoffset", "hardalphablend", "grassopacity", "puddleheightbias",
     "anisotex", "anisotexture", "blendshapedata", "bloomsource", "bloomtarget", "boxblurtexture", "bumptex", "bumptexture", "bumptexture2",
     "bumptexture_layer0", "bumptexture_layer1", "bumptexture_layer2", "bumptexture_layer3", "cableconstants", "clearcoattex", "clearcoattexture",
     "cloudmaplut", "cloudvolume", "colorlut", "depthbuffer", "depthmap", "depthtexture", "detailtexture", "diffractiontex", "diffusesampler",

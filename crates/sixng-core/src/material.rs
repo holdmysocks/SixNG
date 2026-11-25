@@ -10,75 +10,80 @@
 //! - known shader families, identified from the models that use them.
 use serde_json::{json, Value};
 
-/// (shader name hash, class, family description)
-const FAMILIES: &[(&str, &str, &str)] = &[
+/// (shader name hash, shader name, class, family description). The names are
+/// the game's effect names (`sixng shader-bindings`); a test checks each one
+/// against its hash. A family is `emissive` only when its shader lights
+/// something: an `emissivetex` input, or a colour map that is the light
+/// itself (`signs_emissive`, which has no other input).
+const FAMILIES: &[(&str, &str, &str, &str)] = &[
     // vehicles
-    ("4aa38282", "car_paint", "vehicle body (paint is a runtime colour; colour slot = engine-default white)"),
-    ("476ac73a", "car_paint", "vehicle body variant"),
-    ("03b27476", "opaque", "vehicle lamp reflectors (standard_vehicle_2lyr_reflector)"),
-    ("4d2b05e7", "car_paint", "vehicle body variant"),
-    ("c5cdbdd2", "car_paint", "vehicle body variant"),
-    ("389206d1", "glass", "vehicle lamp lenses and clear covers (standard_vehicle_alpha; opacity in the colour alpha)"),
-    ("29648098", "emissive", "vehicle lamps (standard_vehicle_emissive_animated_bones)"),
-    ("5a693bbe", "emissive", "vehicle lamps and lit panels (standard_vehicle_emissive_layer)"),
-    ("99ad6fc9", "opaque", "vehicle tyre (standard_vehicle_2lyr_tyre_inst)"),
-    ("fa9cc069", "window", "vehicle windows"),
-    ("4dc0ac6a", "window", "vehicle windows (helicopters, boats)"),
-    ("bd71bdbf", "window", "windscreen wiper sweep mask (windshield_wipermask): a fan over the glass that marks where the wipers clear rain; not a visible surface"),
-    ("921b19e5", "decal", "vehicle livery / sign decal"),
-    // glass
-    ("298c4c0f", "glass", "exterior window panes"),
-    ("653582a4", "glass", "exterior glass"),
-    ("6a817597", "glass", "interior glass, curtains, doors"),
-    ("db8b21bd", "glass", "glass railings, door glass"),
-    ("e3ba3129", "glass", "building doors / glazing"),
-    ("656a1cdb", "glass", "bottles and drinking glasses"),
-    ("12839ca7", "glass", "drinking glasses with liquid"),
-    ("9ceb543e", "glass", "cups with liquid"),
-    ("9f8ae601", "glass", "bottles"),
-    ("0357215a", "glass", "cups"),
-    ("d5a93b6f", "glass", "glass / sheer cloth"),
-    ("d9ec330c", "emissive", "light bulbs (clear glass)"),
+    ("4aa38282", "standard_vehicle_2lyr", "car_paint", "vehicle body (paint is a runtime colour; colour slot = engine-default white)"),
+    ("476ac73a", "standard_vehicle_2lyr_lod", "car_paint", "vehicle body, low LOD"),
+    ("03b27476", "standard_vehicle_2lyr_reflector", "opaque", "vehicle lamp reflectors"),
+    ("4d2b05e7", "standard_vehicle_2lyr_cutout", "car_paint", "vehicle body, cutout"),
+    ("c5cdbdd2", "standard_vehicle_2lyr_wheel_inst", "car_paint", "wheel rims (the export gives them a rim stand-in)"),
+    ("389206d1", "standard_vehicle_alpha", "glass", "vehicle lamp lenses and clear covers (opacity in the colour alpha)"),
+    ("29648098", "standard_vehicle_emissive_animated_bones", "emissive", "vehicle lamps"),
+    ("5a693bbe", "standard_vehicle_emissive_layer", "emissive", "vehicle lamps and lit panels"),
+    ("99ad6fc9", "standard_vehicle_2lyr_tyre_inst", "opaque", "vehicle tyre"),
+    ("fa9cc069", "standard_vehicle_glass", "window", "vehicle windows"),
+    ("4dc0ac6a", "standard_vehicle_2lyr_alpha", "window", "vehicle windows (helicopters, boats)"),
+    ("bd71bdbf", "windshield_wipermask", "window", "windscreen wiper sweep mask: a fan over the glass that marks where the wipers clear rain; not a visible surface"),
+    ("921b19e5", "standard_vehicle_2lyr_signs", "decal", "vehicle livery / sign decal"),
+    // glass and liquids
+    ("298c4c0f", "standard_glass_breakable_dirt", "glass", "exterior window panes"),
+    ("653582a4", "standard_glass_breakable_sticker", "glass", "exterior glass"),
+    ("6a817597", "standard_glass_breakable", "glass", "interior glass, curtains, doors"),
+    ("656a1cdb", "standard_alpha_liquid_open_vessel", "glass", "bottles and drinking glasses"),
+    ("12839ca7", "standard_alpha_liquid_open_vessel_opaque_liquid", "glass", "drinking glasses with liquid"),
+    ("9ceb543e", "standard_alpha_liquid_opaque_liquid", "glass", "cups with liquid"),
+    ("9f8ae601", "standard_alpha_liquid", "glass", "bottles"),
+    ("0357215a", "standard_alpha_liquid_opaque_vessel", "glass", "cups"),
+    // plain forward alpha: no emissive input
+    ("e3ba3129", "standard_alpha", "alpha", "forward alpha: building doors and glazing, signs, many props"),
+    ("d9ec330c", "standard_alpha_inst", "alpha", "forward alpha, instanced (light-bulb glass among others)"),
+    ("d5a93b6f", "standard_alpha_secmo", "alpha", "forward alpha: glass, sheer cloth"),
+    ("5b775918", "standard_anisotropy_dirt_alpha", "alpha", "forward alpha with anisotropic highlights and a dirt layer (phone screens among others)"),
     // emissive
-    ("faec4fc8", "emissive", "digital signs / screens"),
-    ("f5ba53da", "emissive", "baked lightmap overlay"),
-    ("3a09c775", "emissive", "LED lights and panels"),
-    ("3bc8ac60", "emissive", "emissive detail"),
-    ("60643f2e", "emissive", "traffic-light counter"),
-    ("5b775918", "emissive", "phone screens"),
+    ("faec4fc8", "signs_emissive", "emissive", "digital signs / screens (one colour map, which is the light)"),
+    ("60643f2e", "signs_emissive_inst", "emissive", "digital signs, instanced (traffic-light counters among others)"),
+    ("f5ba53da", "standard_emissive_lightmap_v2", "emissive", "baked lightmap overlay (emissivetex)"),
+    ("3bc8ac60", "standard_emissive_lightmap", "emissive", "baked lightmap overlay (emissivetex)"),
+    ("3a09c775", "standard_emissive_layer_pxm_inst", "emissive", "emissive layer, parallax, instanced: LED lights and panels (emissivetex)"),
+    ("db8b21bd", "standard_emissive_layer_alpha", "emissive", "forward alpha with an emissive layer: glass railings, door glass (emissivetex)"),
     // water
-    ("7f3a6aa9", "water", "water surface"),
-    ("97596162", "water", "fountain / VFX water"),
-    ("735d2de6", "water", "waterfall VFX"),
+    ("7f3a6aa9", "water_micro_geom", "water", "water surface"),
+    ("97596162", "standard_alpha_water", "water", "fountain / VFX water"),
+    ("735d2de6", "standard_alpha_waterfall", "water", "waterfall VFX"),
     // terrain / multilayer
-    ("61e09df7", "terrain_multilayer", "landscape blend (17 params)"),
-    ("360e396b", "terrain_multilayer", "landscape blend (17 params)"),
-    ("b21f1ba5", "terrain_multilayer", "landscape blend (17 params)"),
-    ("0ad54cb9", "terrain_multilayer", "landscape blend (17 params)"),
-    ("27e5c49d", "terrain_multilayer", "landscape blend (17 params)"),
-    ("61fad45c", "terrain_multilayer", "landscape blend (17 params)"),
-    ("40497278", "terrain_multilayer", "landscape blend (17 params)"),
-    ("4a579bbf", "terrain_multilayer", "landscape blend (17 params)"),
-    ("76fcff28", "terrain_multilayer", "landscape blend (17 params)"),
-    ("88a32075", "terrain_multilayer", "landscape blend (17 params)"),
-    ("388f8fb6", "terrain_multilayer", "landscape blend (17 params)"),
-    ("f8e1f225", "terrain_multilayer", "landscape blend (17 params)"),
-    ("d5bdc029", "terrain_multilayer", "landscape blend (17 params)"),
-    ("6f968246", "terrain_multilayer", "landscape blend (17 params)"),
-    ("1ae17fd6", "terrain_multilayer", "landscape blend (17 params)"),
-    ("5a71e7e1", "terrain_multilayer", "landscape blend (17 params)"),
-    ("10098c2c", "terrain_multilayer", "landscape blend (17 params)"),
-    ("7543cefc", "terrain_multilayer", "landscape blend (17 params)"),
-    ("77d8ab27", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
-    ("1251cae5", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
-    ("cd8ceb5e", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
-    ("4f0b809b", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
-    ("b217b263", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
+    ("61e09df7", "standard_uber_4lyr_dpm_dm_hbb", "terrain_multilayer", "landscape blend (17 params)"),
+    ("360e396b", "standard_uber_4lyr_spx_dm_hbb", "terrain_multilayer", "landscape blend (17 params)"),
+    ("b21f1ba5", "standard_uber_4lyr_pxm_hbb_fixuv1", "terrain_multilayer", "landscape blend (17 params)"),
+    ("0ad54cb9", "standard_uber_4lyr_dpm_dm_hbb_uv3", "terrain_multilayer", "landscape blend (17 params)"),
+    ("27e5c49d", "standard_uber_4lyr_pxm_hbb_uv3", "terrain_multilayer", "landscape blend (17 params)"),
+    ("61fad45c", "standard_uber_4lyr_dpm_dfm_dm_hbb", "terrain_multilayer", "landscape blend (17 params)"),
+    ("40497278", "standard_uber_4lyr_dpm_dfm_dm_hbb_uv3", "terrain_multilayer", "landscape blend (17 params)"),
+    ("4a579bbf", "standard_uber_4lyr_pxm_hbb", "terrain_multilayer", "landscape blend (17 params)"),
+    ("76fcff28", "standard_uber_4lyr_spx_dm_hbb_uv3", "terrain_multilayer", "landscape blend (17 params)"),
+    ("88a32075", "standard_uber_4lyr", "terrain_multilayer", "landscape blend (17 params)"),
+    ("388f8fb6", "standard_uber_4lyr_dfm_dm_hbb", "terrain_multilayer", "landscape blend (17 params)"),
+    ("f8e1f225", "standard_uber_4lyr_dfm_dm_hbb_uv3", "terrain_multilayer", "landscape blend (17 params)"),
+    ("d5bdc029", "standard_uber_4lyr_hbo_dm_hbb", "terrain_multilayer", "landscape blend (17 params)"),
+    ("6f968246", "standard_uber_4lyr_mud_dm_hbb", "terrain_multilayer", "landscape blend (17 params)"),
+    ("1ae17fd6", "standard_uber_4lyr_mud_dm_hbb_uv3", "terrain_multilayer", "landscape blend (17 params)"),
+    ("5a71e7e1", "standard_uber_4lyr_pxm", "terrain_multilayer", "landscape blend (17 params)"),
+    ("10098c2c", "standard_uber_4lyr_pxm_uv3", "terrain_multilayer", "landscape blend (17 params)"),
+    ("7543cefc", "standard_uber_4lyr_uv3", "terrain_multilayer", "landscape blend (17 params)"),
+    ("77d8ab27", "standard_2lyr", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
+    ("1251cae5", "standard_2lyr_pxm_ground", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
+    ("cd8ceb5e", "standard_2lyr_ground", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
+    ("4f0b809b", "standard_2lyr_pxm_decal_ground", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
+    ("b217b263", "standard_2lyr_pxm", "terrain_multilayer", "vertex-blended multilayer: ground, walls, interiors (12 params)"),
     // other
-    ("255417c3", "cutout", "vegetation"),
-    ("e05f1a42", "decal", "road signs (distance_map)"),
-    ("89a1cf72", "opaque", "ped eyes"),
-    ("379efcef", "opaque", "ped head / skin"),
+    ("255417c3", "trees_standard_wind", "cutout", "vegetation"),
+    ("e05f1a42", "distance_map", "decal", "road signs"),
+    ("89a1cf72", "ped_standard_eye", "opaque", "ped eyes"),
+    ("379efcef", "ped_standard_head", "opaque", "ped head / skin"),
 ];
 
 /// What each known texture parameter slot holds. Roles marked "likely" come
@@ -128,7 +133,7 @@ pub fn classify(name_hash: &str, flags: &[u8]) -> Value {
     // export lights them by name).
     let name = crate::names::shader(name_hash);
     let named_emissive = fam.is_none() && name.as_deref().is_some_and(|n| n.starts_with("standard_vehicle") && n.contains("emissive"));
-    let class = fam.map(|f| f.1).unwrap_or(if named_emissive { "emissive" } else { bucket });
+    let class = fam.map(|f| f.2).unwrap_or(if named_emissive { "emissive" } else { bucket });
     // Parts whose colour is not in a texture (it comes from the vehicle
     // material palette, not decoded): a stand-in surface for converters.
     let stand_in = match (name_hash, name.as_deref()) {
@@ -173,7 +178,8 @@ pub fn classify(name_hash: &str, flags: &[u8]) -> Value {
         "decal": decal,
         "alpha_mode": alpha_mode,
         "instanced_or_batch_lod": b1 & 0x80 != 0,
-        "family": fam.map(|f| f.2),
+        "family": fam.map(|f| f.3),
+        "shader": fam.map(|f| f.1.to_string()).or(name.clone()),
         "stand_in": stand_in,
         "source": if fam.is_some() { "known shader family + record flags" } else if named_emissive { "shader name (emissive) + record flags" } else { "record flags (+0x38 byte 4)" },
         "record_flags": flags.iter().map(|x| format!("{x:02x}")).collect::<String>(),
@@ -276,7 +282,7 @@ pub fn is_tyre_shader(name_hash: &str) -> bool {
 }
 
 pub fn is_paint(name_hash: &str) -> bool {
-    FAMILIES.iter().any(|f| f.0 == name_hash && f.1 == "car_paint")
+    FAMILIES.iter().any(|f| f.0 == name_hash && f.2 == "car_paint")
 }
 
 /// Layer layout of the two-layer vertex-blended families (terrain_multilayer
@@ -838,6 +844,36 @@ fn four_layer(suffix: &str, compared: bool, tex: &dyn Fn(usize) -> Value) -> Val
 #[cfg(test)]
 mod paint_tests {
     use super::*;
+
+    #[test]
+    fn family_names_match_their_hashes() {
+        for (h, name, class, _) in FAMILIES {
+            assert_eq!(format!("{:08x}", crate::meta7a::joaat(name)), *h, "{name}");
+            // emissive exactly when the shader is one of the emissive ones
+            assert_eq!(*class == "emissive", name.contains("emissive"), "{name} is labelled {class}");
+        }
+        let mut hashes: Vec<_> = FAMILIES.iter().map(|f| f.0).collect();
+        hashes.sort();
+        hashes.dedup();
+        assert_eq!(hashes.len(), FAMILIES.len());
+    }
+
+    #[test]
+    fn relabelled_families() {
+        let alpha = [0, 0, 0, 0, 2, 0, 0, 0];
+        for (h, class, shader) in [
+            ("d9ec330c", "alpha", "standard_alpha_inst"),
+            ("5b775918", "alpha", "standard_anisotropy_dirt_alpha"),
+            ("e3ba3129", "alpha", "standard_alpha"),
+            ("60643f2e", "emissive", "signs_emissive_inst"),
+            ("3a09c775", "emissive", "standard_emissive_layer_pxm_inst"),
+            ("db8b21bd", "emissive", "standard_emissive_layer_alpha"),
+        ] {
+            let c = classify(h, &alpha);
+            assert_eq!((c["class"].as_str(), c["shader"].as_str(), c["alpha_mode"].as_str()), (Some(class), Some(shader), Some("BLEND")), "{h}");
+            assert_eq!(gltf_fields(&c, true)["emissiveFactor"].is_null(), class != "emissive", "{h}");
+        }
+    }
 
     #[test]
     fn paint_hex() {
