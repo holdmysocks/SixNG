@@ -794,7 +794,7 @@ pub fn dictionaries(game_root: &std::path::Path, work: &std::path::Path) -> Resu
         })
         .collect();
     v.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
-    let _ = std::fs::write(&cache, serde_json::to_vec(&v)?);
+    let _ = crate::atomic::write(&cache, serde_json::to_vec(&v)?);
     Ok(v)
 }
 
@@ -831,7 +831,7 @@ pub fn level_dictionaries(game_root: &std::path::Path, work: &std::path::Path) -
         })
         .collect();
     v.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
-    let _ = std::fs::write(&cache, serde_json::to_vec(&v)?);
+    let _ = crate::atomic::write(&cache, serde_json::to_vec(&v)?);
     Ok(v)
 }
 

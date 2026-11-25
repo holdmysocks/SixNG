@@ -773,6 +773,6 @@ pub fn surface_categories(inp: &SurfaceInputs, out: &Path, progress: &(dyn Fn(&s
         "surfaces": s_out,
     });
     let dir = out.join("collision").join(&short);
-    std::fs::write(dir.join("surface_categories.json"), serde_json::to_string_pretty(&doc)?)?;
+    crate::atomic::write(dir.join("surface_categories.json"), serde_json::to_string_pretty(&doc)?)?;
     Ok(SurfaceSummary { ids: s_out.len(), area_covered: cov, by_confidence: by, samples })
 }

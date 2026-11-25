@@ -187,7 +187,7 @@ fn read_full(f: &mut std::fs::File, buf: &mut [u8]) -> Result<usize> {
 pub fn extract(archive: &Path, m: &Movie, dest: &Path) -> Result<()> {
     let mut f = std::fs::File::open(archive)?;
     f.seek(SeekFrom::Start(m.offset))?;
-    let mut w = std::io::BufWriter::new(std::fs::File::create(dest)?);
+    let mut w = crate::atomic::AtomicFile::create(dest)?;
     let mut left = m.size;
     let mut buf = vec![0u8; 8 << 20];
     while left > 0 {
@@ -196,7 +196,7 @@ pub fn extract(archive: &Path, m: &Movie, dest: &Path) -> Result<()> {
         w.write_all(&buf[..n])?;
         left -= n as u64;
     }
-    w.flush()?;
+    w.commit()?;
     Ok(())
 }
 

@@ -21,7 +21,6 @@
 use crate::glb;
 use glam::{Mat4, Vec3};
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -528,9 +527,7 @@ pub fn write(path: &Path, c: &CellCpu) -> std::io::Result<u64> {
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d)?;
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::File::create(&tmp)?.write_all(&b)?;
-    std::fs::rename(&tmp, path)?;
+    sixng_core::atomic::write(path, &b)?;
     CELL_BYTES.fetch_add(b.len() as u64, Ordering::Relaxed);
     Ok(b.len() as u64)
 }

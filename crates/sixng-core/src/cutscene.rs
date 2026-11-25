@@ -440,7 +440,7 @@ pub fn catalog(ws: &crate::export::Workspace, archive: &str, rescan: bool, progr
     }
     let ix = ws.load_index(&a)?;
     let c = scan(&a, &ix, progress)?;
-    std::fs::write(&cache, serde_json::to_vec(&c)?)?;
+    crate::atomic::write(&cache, serde_json::to_vec(&c)?)?;
     Ok(c)
 }
 

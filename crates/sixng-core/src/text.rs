@@ -179,14 +179,14 @@ pub fn export(a: &crate::game::ArchiveInfo, tables: &[Table], out: &std::path::P
     for t in tables {
         let m: serde_json::Map<String, serde_json::Value> = t.strings.iter().map(|(h, s)| (format!("{h:08x}"), s.clone().into())).collect();
         let file = format!("{:x}.json", t.off);
-        std::fs::write(dir.join(&file), serde_json::to_vec_pretty(&serde_json::json!({"id": t.id, "key": "joaat(lowercase label)", "strings": m}))?)?;
+        crate::atomic::write(dir.join(&file), serde_json::to_vec_pretty(&serde_json::json!({"id": t.id, "key": "joaat(lowercase label)", "strings": m}))?)?;
         let first = t.strings.values().find(|s| !s.is_empty()).map(|s| plain(s)).unwrap_or_default();
         let first: String = first.chars().take(80).collect();
         idx.push_str(&serde_json::json!({"id": t.id, "file": file, "strings": t.strings.len(), "first": first}).to_string());
         idx.push('\n');
         n += t.strings.len();
     }
-    std::fs::write(dir.join("index.jsonl"), idx)?;
+    crate::atomic::write(dir.join("index.jsonl"), idx)?;
     Ok((tables.len(), n))
 }
 
