@@ -332,6 +332,8 @@ pub struct GpuMesh {
     /// indices of it to draw this frame.
     pub strand_lod: Option<glb::StrandLod>,
     pub n_draw: std::sync::atomic::AtomicU32,
+    /// The same for the sun shadow map.
+    pub n_shadow: std::sync::atomic::AtomicU32,
 }
 
 pub struct GpuModel {
@@ -1751,6 +1753,7 @@ impl Uploader {
                     visible: true,
                     strand_lod: me.strand_lod,
                     n_draw: std::sync::atomic::AtomicU32::new(me.indices.len() as u32),
+                    n_shadow: std::sync::atomic::AtomicU32::new(me.indices.len() as u32),
                 });
             }
         }
@@ -2030,7 +2033,8 @@ impl Renderer3D {
     /// Render models (each with its own instances) and lines into the
     /// offscreen target; returns the egui texture to show.
     /// Depth of the opaque surfaces as the sun sees them (the sun shadow
-    /// map). Models skinned on the GPU are left out (their joints are bound
+    /// map). Strand pieces with the count rule draw ShadowLodScale of their
+    /// main share, as the game's sun shadow pass does. Models skinned on the GPU are left out (their joints are bound
     /// with the main pass's frame group); the character viewer poses its
     /// parts on the CPU.
     fn record_shadow(pipe: &wgpu::RenderPipeline, frame_bg: &wgpu::BindGroup, be: &mut wgpu::RenderPass<'_>, models: &[&GpuModel]) {
@@ -2054,7 +2058,7 @@ impl Renderer3D {
                 }
                 let first = (me.ib_range.start / 4) as u32;
                 let base = (me.vb_range.start / std::mem::size_of::<glb::Vertex>() as u64) as i32;
-                let cnt = if me.strand_lod.is_some() { me.n_draw.load(std::sync::atomic::Ordering::Relaxed).min(me.n_idx) } else { me.n_idx };
+                let cnt = if me.strand_lod.is_some() { me.n_shadow.load(std::sync::atomic::Ordering::Relaxed).min(me.n_idx) } else { me.n_idx };
                 if cnt > 0 {
                     be.draw_indexed(first..first + cnt, base, 0..gm.n_normal());
                 }
@@ -2215,9 +2219,10 @@ impl Renderer3D {
                 let mut f = self.frame_uniform(cam, look, aspect, 0.0);
                 f.view_proj = vp.to_cols_array_2d();
                 f.inv_view_proj = vp.inverse().to_cols_array_2d();
-                // strand ribbons open towards the light, to at least one texel of the map
+                // strand ribbons open towards the light at their own width: the game's sun shadow pass draws strands
+                // solid and has no minimum width (a target size this large makes the minimum vanish)
                 f.cam_pos = (c + l * 1000.0).extend(1.0).to_array();
-                f.jitter = [0.0, 2.0 * SHADOW_SIZE as f32, 2.0 * SHADOW_SIZE as f32, f.jitter[3]];
+                f.jitter = [0.0, 1.0e9, 1.0e9, f.jitter[3]];
                 shadow_fu = Some(f);
             }
         }
@@ -2231,6 +2236,7 @@ impl Renderer3D {
         for me in models.iter().flat_map(|gm| gm.meshes.iter()) {
             if let Some(l) = me.strand_lod {
                 me.n_draw.store(l.indices(me.n_idx, (eye - me.centre).length()), std::sync::atomic::Ordering::Relaxed);
+                me.n_shadow.store(l.shadow_indices(me.n_idx, (eye - me.centre).length()), std::sync::atomic::Ordering::Relaxed);
                 if std::env::var("SIXNG_DEBUG_HAIR").is_ok() { static ONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0); if ONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 { eprintln!("strand piece at {:.2} m: share {:.3}", (eye - me.centre).length(), l.share((eye - me.centre).length())); } }
             }
         }

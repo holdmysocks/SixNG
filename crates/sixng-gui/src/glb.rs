@@ -49,6 +49,8 @@ pub struct StrandLod {
     pub dist_scale: f32,
     pub min_dist: f32,
     pub use_curve: f32,
+    /// ShadowLodScale: the sun shadow pass draws this share of the main pass's share.
+    pub shadow_scale: f32,
 }
 
 impl StrandLod {
@@ -68,6 +70,15 @@ impl StrandLod {
         let want = (self.stored as f32 * self.share(d)).round() as u32;
         (n_idx / self.strands) * want.min(self.strands)
     }
+
+    /// Indices to draw into the sun shadow map at distance `d`.
+    pub fn shadow_indices(&self, n_idx: u32, d: f32) -> u32 {
+        if self.strands == 0 {
+            return n_idx;
+        }
+        let want = (self.stored as f32 * self.share(d) * self.shadow_scale).round() as u32;
+        (n_idx / self.strands) * want.min(self.strands)
+    }
 }
 
 #[cfg(test)]
@@ -77,7 +88,7 @@ mod strand_lod_tests {
     #[test]
     fn the_strand_count_falls_with_distance() {
         // long head hair: mean width 0.23 mm, TargetThickness 1.5, DistanceScale 1, MinDistance 0.1, UseThicknessCurve 0.5
-        let l = StrandLod { strands: 800, stored: 1000, a: 2.3e-4 * 1440.0 / 1.5, dist_scale: 1.0, min_dist: 0.1, use_curve: 0.5 };
+        let l = StrandLod { strands: 800, stored: 1000, a: 2.3e-4 * 1440.0 / 1.5, dist_scale: 1.0, min_dist: 0.1, use_curve: 0.5, shadow_scale: 0.15 };
         for (d, want) in [(0.5, 0.883), (1.0, 0.442), (2.0, 0.221), (5.0, 0.088)] {
             assert!((l.share(d) - want).abs() < 2e-3, "{d}: {}", l.share(d));
         }
@@ -86,6 +97,8 @@ mod strand_lod_tests {
         // the mesh holds the first 800 of 1000 strands, 6 indices each
         assert_eq!(l.indices(4800, 0.1), 4800);
         assert_eq!(l.indices(4800, 1.0), 6 * 442);
+        // the shadow pass: 0.15 of that share
+        assert_eq!(l.shadow_indices(4800, 1.0), 6 * 66);
     }
 }
 

@@ -1315,7 +1315,7 @@ impl ModelView {
                                     // mean strand width: that of the set's first ramp (Thickness x its curve, 16 samples), as the game takes it
                                     let mean = ((0..16).map(|i| (ps[0].width * ps[0].at(i as f32 / 15.0)[3]).max(1e-6)).sum::<f32>() / 16.0).min(0.0255);
                                     if let (Some(2.0), Some(tt), Some(ds), Some(md), Some(uc)) = (num("ThicknessCurveVersion"), num("TargetThickness"), num("DistanceScale"), num("MinDistance"), num("UseThicknessCurve")) {
-                                        lod = Some(glb::StrandLod { strands: coat.guides.len() as u32, stored: coat.stored as u32, a: mean * 1440.0 / tt.max(1e-6), dist_scale: ds, min_dist: md, use_curve: uc });
+                                        lod = Some(glb::StrandLod { strands: coat.guides.len() as u32, stored: coat.stored as u32, a: mean * 1440.0 / tt.max(1e-6), dist_scale: ds, min_dist: md, use_curve: uc, shadow_scale: num("ShadowLodScale").unwrap_or(1.0) });
                                     }
                                 }
                                 // research: SIXNG_HAIR_LOD_WIDEN=<metres> widens the strands by 1 / the count rule's share at that distance
