@@ -840,6 +840,7 @@ impl Renderer3D {
                 tex_entry(3),
                 tex_entry(4),
                 tex_entry(5),
+                tex_entry(6),
             ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1533,6 +1534,7 @@ impl Uploader {
             ped_shade: false,
             detail: None,
             ramp_u: None,
+            wear_mask: None,
             ramp: None,
             parts: false,
             occlusion_only: false,
@@ -1596,7 +1598,9 @@ impl Uploader {
                 // bit 14: the emissive slot holds the part ramp image, whose
                 // rows 512.. are the parts' surfaces (low and high metalness
                 // and roughness)
-                | if mt.ramp.is_some() && mt.emissive.is_none() { 0x4000 } else { 0 };
+                | if mt.ramp.is_some() && mt.emissive.is_none() { 0x4000 } else { 0 }
+                // bit 15: the game's wear mask is bound (binding 6)
+                | if mt.wear_mask.is_some() && mt.ramp.is_some() && mt.emissive.is_none() { 0x8000 } else { 0 };
             let u = MatU {
                 base,
                 flags: [has, class_id(&mt.class), alpha, gap | mr],
@@ -1643,6 +1647,10 @@ impl Uploader {
                     wgpu::BindGroupEntry {
                         binding: 5,
                         resource: wgpu::BindingResource::TextureView(view(mt.detail.map(|d| d.image).or(mt.ramp_u.filter(|_| mt.ramp.is_some() && mt.emissive.is_none())))),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(view(mt.wear_mask)),
                     },
                 ],
             });
