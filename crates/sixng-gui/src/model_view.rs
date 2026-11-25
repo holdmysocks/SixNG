@@ -390,6 +390,119 @@ pub struct PartFx {
     /// A shoe with a heel (name token `sh`, `mh` or `hh`; flat ones have
     /// `fh`): the feet are posed into it.
     pub heel: bool,
+    /// Heads: the painted hair layers of the outfit's hair items.
+    pub under: Vec<UnderPaint>,
+}
+
+/// A painted hair layer of the head skin: the hair colour the game paints
+/// on the scalp under the strands, and the brows under the brow strands.
+#[derive(Clone)]
+pub struct UnderPaint {
+    /// Mask texture (store hash).
+    pub mask: u64,
+    pub opacity: f32,
+    /// A scalp layer (the head's fourth texture coordinate set, first
+    /// tile); otherwise a face layer (the third set).
+    pub scalp: bool,
+    /// Colour (linear) at the mask's green 0, 0.5 and 1.
+    pub stops: [[f32; 3]; 3],
+}
+
+/// Paints the hair layers into the head's colour texture; returns how many
+/// were painted. The game has such a pass ("bake decorations" of the head
+/// effect: per layer a texture, an opacity and up to three tints, each a
+/// three-stop gradient indexed by the texture's green and weighted by its
+/// red; read once from the game's code). Here: colour = the gradient of
+/// `stops` at the mask's green, amount = the mask's red x the layer's
+/// opacity number. Not traced: where the game takes the colours from, what
+/// the layer's other numbers and its three detail textures do. Which
+/// texture coordinate set a layer uses is chosen by fit (the scalp masks
+/// cover the scalp only through the fourth set's first tile, the brow masks
+/// lie on the brows only through the third set), not read from code.
+fn bake_under(m: &mut glb::Model, layers: &[UnderPaint], game: &Path) -> usize {
+    if layers.is_empty() {
+        return 0;
+    }
+    let Ok(sets) = glb::uv_sets(&m.path) else { return 0 };
+    let lin = |x: f32| if x < 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) };
+    let enc = |x: f32| if x < 0.003_130_8 { x * 12.92 } else { 1.055 * x.powf(1.0 / 2.4) - 0.055 };
+    let mut done = 0;
+    for (k, (uv, idx)) in sets.iter().enumerate() {
+        let Some(ii) = m.meshes.get(k).and_then(|me| me.material).and_then(|mi| m.materials.get(mi)).and_then(|mt| mt.base) else { continue };
+        let img = &mut m.images[ii];
+        if img.bc.is_some() || img.mips.is_empty() {
+            continue;
+        }
+        let (w, h, srgb) = (img.mips[0].0 as usize, img.mips[0].1 as usize, img.srgb);
+        let mut px = std::mem::take(&mut img.mips[0].2);
+        for l in layers {
+            let luv = &uv[if l.scalp { 2 } else { 1 }];
+            if luv.is_empty() || luv.len() != uv[0].len() {
+                continue;
+            }
+            let Some((store, t)) = sixng_core::ttpf::global(game).get(l.mask) else { continue };
+            let Some((mk, mw, mh)) = store.data(t).ok().and_then(|d| sixng_core::ttpf::decode_rgba(t, &d, 0).ok()) else { continue };
+            let (mw, mh) = (mw as usize, mh as usize);
+            // the mask, bilinear, clamped at its edges: (red, green)
+            let at = |u: f32, v: f32| -> [f32; 2] {
+                let (x, y) = ((u * mw as f32 - 0.5).clamp(0.0, mw as f32 - 1.0), (v * mh as f32 - 0.5).clamp(0.0, mh as f32 - 1.0));
+                let (x0, y0) = (x as usize, y as usize);
+                let (x1, y1, fx, fy) = ((x0 + 1).min(mw - 1), (y0 + 1).min(mh - 1), x - x0 as f32, y - y0 as f32);
+                [0, 1].map(|c| {
+                    let p = |x: usize, y: usize| mk[(y * mw + x) * 4 + c] as f32 / 255.0;
+                    (p(x0, y0) * (1.0 - fx) + p(x1, y0) * fx) * (1.0 - fy) + (p(x0, y1) * (1.0 - fx) + p(x1, y1) * fx) * fy
+                })
+            };
+            for tri in idx.chunks_exact(3) {
+                let v = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
+                if v.iter().any(|&i| i >= luv.len()) {
+                    continue;
+                }
+                let b = v.map(|i| luv[i]);
+                // the fourth set has the face in another tile
+                if l.scalp && b.iter().any(|p| p[0] < 0.0 || p[0] > 1.0 || p[1] < 0.0 || p[1] > 1.0) {
+                    continue;
+                }
+                let a = v.map(|i| [uv[0][i][0] * w as f32, uv[0][i][1] * h as f32]);
+                let area = (a[1][0] - a[0][0]) * (a[2][1] - a[0][1]) - (a[2][0] - a[0][0]) * (a[1][1] - a[0][1]);
+                if area.abs() < 1e-6 {
+                    continue;
+                }
+                let lo = |c: usize| a.iter().map(|p| p[c]).fold(f32::MAX, f32::min).floor().max(0.0) as usize;
+                let hi = |c: usize, n: usize| (a.iter().map(|p| p[c]).fold(f32::MIN, f32::max).ceil().max(0.0) as usize).min(n.saturating_sub(1));
+                for y in lo(1)..=hi(1, h) {
+                    for x in lo(0)..=hi(0, w) {
+                        let p = [x as f32 + 0.5, y as f32 + 0.5];
+                        let e = |i: usize, j: usize| ((a[j][0] - a[i][0]) * (p[1] - a[i][1]) - (a[j][1] - a[i][1]) * (p[0] - a[i][0])) / area;
+                        let bw = [e(1, 2), e(2, 0), e(0, 1)];
+                        // a little over the edge, so the texture filter finds no unpainted texel at a seam
+                        if bw.iter().any(|x| *x < -0.02) {
+                            continue;
+                        }
+                        let [r, g] = at(bw[0] * b[0][0] + bw[1] * b[1][0] + bw[2] * b[2][0], bw[0] * b[0][1] + bw[1] * b[1][1] + bw[2] * b[2][1]);
+                        let amt = (r * l.opacity).clamp(0.0, 1.0);
+                        if amt <= 0.0 {
+                            continue;
+                        }
+                        let (s0, s1, f) = if g < 0.5 { (l.stops[0], l.stops[1], g * 2.0) } else { (l.stops[1], l.stops[2], g * 2.0 - 1.0) };
+                        let o = (y * w + x) * 4;
+                        for c in 0..3 {
+                            let col = s0[c] + (s1[c] - s0[c]) * f;
+                            let old = px[o + c] as f32 / 255.0;
+                            let old = if srgb { lin(old) } else { old };
+                            let new = old + (col - old) * amt;
+                            px[o + c] = ((if srgb { enc(new) } else { new }).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                        }
+                    }
+                }
+            }
+            // another layer or colour is another texture for the renderer's cache
+            img.key += &format!("#under{:016x}:{:.3}:{:?}", l.mask, l.opacity, l.stops.map(|s| s.map(|c| (c * 255.0) as u8)));
+            done += 1;
+        }
+        img.mips = glb::mip_chain(w as u32, h as u32, px);
+    }
+    done
 }
 
 /// A finished load, tagged with the request it answers.
@@ -4639,6 +4752,7 @@ fn load_parts(
                     }
                     if f.head {
                         tone = neck_tone(&m);
+                        bake_under(&mut m, &f.under, game);
                     }
                     // The vertices are final (posed here, or following the
                     // skin): the renderer must not skin the part that
@@ -5863,8 +5977,51 @@ fn load_query_sel(
                         }
                         if oi == k {
                             let body = p.slot == "body upper" || p.slot == "body lower";
-                            fx.insert(e.off, PartFx { tint: p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t.rows[0]))).filter(|t| t.1 != 255), colour: p.colour.map(|c| [c[1], c[2], c[3]]), tag: p.colour_tag, subs: p.preset_colours.clone(), preset: p.preset.as_deref().and_then(|h| u32::from_str_radix(h, 16).ok()), head: p.slot == "head", body, skeletal: body || matches!(p.slot.as_str(), "head" | "eyes" | "teeth" | "teeth accessory"), covers: matches!(p.slot.as_str(), "top" | "outer" | "bottom" | "full" | "feet" | "gloves"), layer: match p.slot.as_str() { "outer" => 2, "top" | "bottom" | "full" => 1, _ => 0 }, heel: p.slot == "feet" && p.drawable.split('_').any(|t| matches!(t, "sh" | "mh" | "hh")), skins: if p.slot == "head" { p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect() } else { Vec::new() } });
+                            fx.insert(e.off, PartFx { tint: p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t.rows[0]))).filter(|t| t.1 != 255), colour: p.colour.map(|c| [c[1], c[2], c[3]]), tag: p.colour_tag, subs: p.preset_colours.clone(), preset: p.preset.as_deref().and_then(|h| u32::from_str_radix(h, 16).ok()), head: p.slot == "head", body, skeletal: body || matches!(p.slot.as_str(), "head" | "eyes" | "teeth" | "teeth accessory"), covers: matches!(p.slot.as_str(), "top" | "outer" | "bottom" | "full" | "feet" | "gloves"), layer: match p.slot.as_str() { "outer" => 2, "top" | "bottom" | "full" => 1, _ => 0 }, heel: p.slot == "feet" && p.drawable.split('_').any(|t| matches!(t, "sh" | "mh" | "hh")), under: Vec::new(), skins: if p.slot == "head" { p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect() } else { Vec::new() } });
                         }
+                    }
+                }
+                // The painted hair of the head skin: each hair and brow item's own layer of the appearance library
+                // (the layer set named like the item's placeholder). Its colour is a stand-in: the item's colour set of
+                // the strand tables at the root, middle and tip (mean of the four strand variants) when the research
+                // tables are given, else the hair colour the viewer draws the strands with. SIXNG_NO_UNDER=1 leaves it out.
+                if std::env::var("SIXNG_NO_UNDER").is_err() {
+                    let table = sixng_core::hairtone::Table::load_or_build(&ws).ok();
+                    let sd = std::env::var("SIXNG_HAIR_DATA").ok().and_then(|f| Some(sixng_core::hairtone::StrandData::from_json(&serde_json::from_slice(&std::fs::read(f).ok()?).ok()?)));
+                    let force = std::env::var("SIXNG_HAIR_COLOURSET").ok().map(|n| sixng_core::meta7a::joaat(&n.to_ascii_lowercase()));
+                    let lin = |x: f32| if x < 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) };
+                    let mut under = Vec::new();
+                    for (slot, drawable, _) in &info.strands {
+                        let scalp = match slot.as_str() {
+                            "hair" => true,
+                            "brows" => false,
+                            _ => continue,
+                        };
+                        let Some(l) = table.as_ref().and_then(|t| t.under_layer(sixng_core::meta7a::joaat(drawable.to_ascii_lowercase().trim_end_matches("_full")))) else { continue };
+                        let preset = info.strand_presets.iter().find(|p| p.0 == *slot).map(|p| p.1);
+                        // research: SIXNG_UNDER_PRESET=1 takes the two colours of the appearance library's hair preset of the same
+                        // name instead (bytes taken as linear), first colour at green 0, second at green 1
+                        let lib = std::env::var("SIXNG_UNDER_PRESET").ok().and_then(|_| table.as_ref()?.variants(preset?)).filter(|v| !v[0].flag).map(|v| { let (a, b) = (v[2].a.map(|x| x as f32 / 255.0), v[2].b.map(|x| x as f32 / 255.0)); [a, [0, 1, 2].map(|q| (a[q] + b[q]) / 2.0), b] });
+                        let stops = match sd.as_ref().filter(|_| lib.is_none()).and_then(|d| d.colour_set(force.or(preset)?)) {
+                            _ if lib.is_some() => lib.unwrap(),
+                            Some(cs) => [0.0, 0.5, 1.0].map(|t| {
+                                let mut c = [0f32; 3];
+                                for r in cs.iter() {
+                                    let x = r.at(t);
+                                    (0..3).for_each(|q| c[q] += lin(x[q].clamp(0.0, 1.0)) / 4.0);
+                                }
+                                c
+                            }),
+                            None => match preset.and_then(|p| table.as_ref()?.variants(p)).filter(|v| !v[0].flag) {
+                                Some(v) => [sixng_core::hairtone::display(v[0].a).map(|x| lin(x as f32 / 255.0)); 3],
+                                None => continue,
+                            },
+                        };
+                        under.push(UnderPaint { mask: l.mask, opacity: l.opacity, scalp, stops });
+                    }
+                    if !under.is_empty() {
+                        info.notes.push(format!("Painted hair on the head skin: {} layer(s) of the hair and brow items (mask and opacity from the game's data). Their colour is a stand-in from the hair colour; where the game takes it from is not traced.", under.len()));
+                        fx.values_mut().filter(|f| f.head).for_each(|f| f.under = under.clone());
                     }
                 }
                 if let Some(p) = sixng_core::pedtint::palettes(&ws.game).ok().and_then(|ps| ps.get(&0x1e64_f584)) {

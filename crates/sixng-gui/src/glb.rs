@@ -1100,6 +1100,24 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
 /// Append another model's meshes, materials and images (for animals and
 /// characters assembled from parts). The appended meshes are drawn in their
 /// bind pose (not skinned to this model's joints).
+/// Texture coordinate sets 0, 2 and 3 and the triangle indices of every
+/// mesh primitive of a GLB, in file order (a set the primitive does not
+/// have is empty). The viewer's vertices keep sets 0 and 1 only.
+pub fn uv_sets(path: &Path) -> Result<Vec<([Vec<[f32; 2]>; 3], Vec<u32>)>> {
+    let b = std::fs::read(path)?;
+    let (j, bin) = split_glb(&b)?;
+    let d = Doc { j, bin };
+    let mut out = Vec::new();
+    for m in d.j["meshes"].as_array().into_iter().flatten() {
+        for p in m["primitives"].as_array().into_iter().flatten() {
+            let set = |k: &str| -> Vec<[f32; 2]> { p["attributes"][k].as_u64().and_then(|a| d.floats(a as usize).ok()).filter(|x| x.1 == 2).map(|x| x.0.chunks_exact(2).map(|c| [c[0], c[1]]).collect()).unwrap_or_default() };
+            let idx = p["indices"].as_u64().and_then(|a| d.u32s(a as usize).ok()).unwrap_or_default();
+            out.push(([set("TEXCOORD_0"), set("TEXCOORD_2"), set("TEXCOORD_3")], idx));
+        }
+    }
+    Ok(out)
+}
+
 pub fn merge(into: &mut Model, other: Model) {
     let empty = into.meshes.is_empty();
     let img0 = into.images.len();
