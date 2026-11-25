@@ -629,6 +629,8 @@ pub struct ModelView {
     veh_no_wheels: bool,
     /// Bounding boxes of the loaded wheel models (rim, tyre).
     wheel_boxes: Vec<[[f32; 3]; 2]>,
+    /// Height of the lowest point of the fitted wheels (None without wheels).
+    wheel_floor: Option<f32>,
     /// Width factor per wheel mount (two-wheelers), and what it was made for.
     /// and the arch-fit factor on the whole wheel: [width, fit].
     wheel_xs: (String, Vec<[f32; 2]>),
@@ -934,6 +936,7 @@ impl ModelView {
             veh_applied: String::new(),
             veh_no_wheels: false,
             wheel_boxes: Vec::new(),
+            wheel_floor: None,
             wheel_xs: (String::new(), Vec::new()),
             veh_cfg: None,
             wheel_pending: Arc::new(Mutex::new(Vec::new())),
@@ -3048,6 +3051,7 @@ impl ModelView {
             }
         }
         let mounts = self.mounts();
+        self.wheel_floor = None;
         if !self.wheels_on || self.veh_no_wheels || mounts.is_empty() {
             return;
         }
@@ -3146,6 +3150,17 @@ impl ModelView {
             self.wheel_xs = (xs_key, v);
         }
         let xs = self.wheel_xs.1.clone();
+        // where the tyres touch the ground
+        if let Some((tr, _)) = tyre_size(&self.wheel_boxes).filter(|_| !self.wheels.is_empty()) {
+            self.wheel_floor = mounts
+                .iter()
+                .enumerate()
+                .map(|(mi, (bone, p))| {
+                    let sc = xs.get(mi).map_or(1.0, |x| x[1]) * if is_rear(bone) { self.wheel_scale_rear } else { self.wheel_scale };
+                    (self.gear_at(bone) * self.steer_at(bone)).transform_point3(*p).y - tr * sc
+                })
+                .reduce(f32::min);
+        }
         let inst: Vec<render3d::Instance> = mounts
             .iter()
             .enumerate()
@@ -3429,6 +3444,13 @@ impl ModelView {
         (gl, skin)
     }
 
+    /// Height of the ground under a model whose own lowest point is at
+    /// `floor`: fitted wheels reach lower than the body they are fitted to.
+    fn ground_y(&self, floor: f32) -> f32 {
+        let on_wheels = self.wheels_on && !self.veh_no_wheels;
+        self.wheel_floor.filter(|_| on_wheels).map_or(floor, |w| w.min(floor))
+    }
+
     fn lines(&self, globals: &[Mat4]) -> (Vec<LineV>, Vec<LineV>) {
         let mut under = Vec::new();
         let mut top = Vec::new();
@@ -3487,9 +3509,10 @@ impl ModelView {
                 budget = budget.saturating_sub(m.verts.len() / step);
             }
         }
-        // ground grid
-        let lo = Vec3::from(l.model.bbox[0]);
+        // ground grid, under the tyres of a vehicle on its wheels
+        let mut lo = Vec3::from(l.model.bbox[0]);
         let hi = Vec3::from(l.model.bbox[1]);
+        lo.y = self.ground_y(lo.y);
         let ext = (hi - lo).max_element().max(1.0);
         let step = 10f32.powf((ext / 4.0).log10().floor()).max(0.1);
         let n = ((ext * 0.75) / step).ceil() as i32;
@@ -3755,6 +3778,19 @@ impl ModelView {
             }
         }
         let show_wheels = self.wheels_on && !self.veh_no_wheels && !self.mounts().is_empty();
+        // a soft shadow on the ground the grid lies on, under the model
+        // (not under big pieces of scenery, which bring their own ground)
+        let ground = self.loaded.as_ref().and_then(|l| {
+            let mut lo = Vec3::from(l.model.bbox[0]);
+            let hi = Vec3::from(l.model.bbox[1]);
+            lo.y = self.ground_y(lo.y);
+            let size = hi - lo;
+            (size.x.max(size.z) <= 40.0 && size.min_element() > 0.0).then(|| crate::render3d::GroundShadow {
+                centre: Vec3::new((lo.x + hi.x) * 0.5, lo.y, (lo.z + hi.z) * 0.5) + Vec3::new(self.ped_clip.travel.x, 0.0, self.ped_clip.travel.z),
+                half: [size.x * 0.5, size.z * 0.5],
+                height: size.y,
+            })
+        });
         let (under, top) = self.lines(&globals);
         let settled = self.idle_for_shot();
         let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
@@ -3791,6 +3827,7 @@ impl ModelView {
             models.extend(self.hair.gpu.iter());
         }
         ren.decal_bias = self.decal_bias;
+        ren.ground = ground;
         let tid = ren.render(rs, px, &self.cam, &self.look, &models, &under, &top);
         ui.painter().image(
             tid,
