@@ -431,7 +431,7 @@ enum Cmd {
         #[command(flatten)]
         filter: FilterArgs,
     },
-    /// Light emitters from archetype/entity light extensions, placed in world space: <out>/lights/<archive>/.
+    /// Light emitters from archetype/entity light extensions, placed in world space, plus the map files' distant / LOD lights and timecycle modifier regions: <out>/lights/<archive>/.
     Lights {
         /// Archive (default levels).
         #[arg(default_value = "levels")]
@@ -2100,8 +2100,9 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             let sel: Vec<_> = f.select(&ix)?.into_iter().filter(|e| e.sub == "7a").collect();
             let t = Instant::now();
-            let (sets, lights, placed) = export::export_lights(&ws, &a, &sel, po, pr)?;
+            let (sets, lights, placed, (tc, distant, lod)) = export::export_lights(&ws, &a, &sel, po, pr)?;
             out.print(&json!({"ok": true, "archive": a.id, "scanned": sel.len(), "light_sets": sets, "lights": lights, "placed_lights": placed,
+                "distant_lights": distant, "unpaired_lod_lights": lod, "timecycle_modifier_regions": tc,
                 "seconds": t.elapsed().as_secs_f64(), "dir": po.join("lights").join(a.id.trim_end_matches(".rpf"))}));
         }
         Cmd::FindU32 { archive, values, filter } => {
