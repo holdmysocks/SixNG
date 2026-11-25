@@ -283,7 +283,7 @@ fn readable_materials(model: &str, shaders: &[crate::drawable::Shader], mats: &s
                 "parameters": values,
                 "parameters_not_read": unread,
             });
-            for k in ["emissive_source", "paint", "multilayer", "stitches", "texture_fallback"] {
+            for k in ["emissive_source", "emissive_strength", "paint", "multilayer", "stitches", "texture_fallback"] {
                 if !m[k].is_null() {
                     out[k] = m[k].clone();
                 }
@@ -1051,6 +1051,22 @@ fn emissive_source_json(s: &crate::drawable::Shader, st: &ShaderTextures, c: &se
     }
 }
 
+/// How bright a material lights, from its `emissivemultiplier` constant.
+fn emissive_strength(s: &crate::drawable::Shader) -> crate::material::EmissiveStrength {
+    let m = s.constants.iter().find(|c| c.hash == crate::material::EMISSIVE_MULTIPLIER_PARAM).and_then(|c| c.components()).and_then(|v| v.first().copied());
+    crate::material::EmissiveStrength::from_multiplier(m)
+}
+
+/// `emissive_strength` of a model.json material and of the GLB extras:
+/// null for materials that do not light (or whose emissive map did not
+/// decode).
+fn emissive_strength_json(s: &crate::drawable::Shader, st: &ShaderTextures, c: &serde_json::Value) -> serde_json::Value {
+    match emissive_source(st, is_lit(s, c)) {
+        Some(EmissiveSource::Map | EmissiveSource::ColourMap) => emissive_strength(s).json(),
+        _ => serde_json::Value::Null,
+    }
+}
+
 /// `lit`: the material lights (`is_lit`). None for materials that do not.
 fn emissive_source(st: &ShaderTextures, lit: bool) -> Option<EmissiveSource> {
     if !lit {
@@ -1453,6 +1469,8 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     Some(set) => {
                         let mut v = serde_json::json!({"status": "applied", "part_set": set, "shared_part": part_looks["shared"], "shared_part_note": "true for a library part's model (a truck bed or box, a light bar ...), which several vehicles fit: its part ids mean the same piece in every vehicle's part set, and it takes the colours of the vehicle and configuration it is on. This export uses the set of the first configuration found that names the part (the vehicle is the 8 hex digits after + in part_set).", "looks": part_looks["looks"], "part_patches": part_looks["part_patches"], "tyre_colour_note": "the tyre colour slot (f3bd038d: ten parts that give the tyre, part id 35, one of ten colours; fitted by some configurations of boxville, burrito, journey, rentalbus and stanier) is not applied: what the game does with it is not decoded, and applied to the whole tyre it would make it red or light grey. Tyres keep the rubber of the part set.", "part_patches_note": "what fitting one more of the vehicle's own parts changes (part name -> ids and their look entries, 8 hex digits each, encoded like looks): a body kit's part rebinds the part ids of its panels, mostly to the body paint (alpha 254). Computed on top of the default look.", "rows": part_looks["rows"], "wear": part_looks["wear"], "wear_note": "per look, the second layer of each part id's surface (256 x 8 hex digits: palette row as in rows, then roughness and metalness, 0 to 255). Every surface record names a second colour and material (rust brown under paint, grey under bare metal, mostly rough and not metallic). It is not applied to the GLB. Where and how much the game shows it is not decoded; the blue channel of the layer detail texture looks like an edge wear mask.", "palette": part_looks["rows"].is_array().then_some("vehicle_palette.png"), "rows_note": "per look, the palette row of each part id (256 x 4 hex digits: slice x 256 + row; ffff = the part has a colour of its own, the one in looks). palette is the material palette beside this file, 128 columns wide, its slices one below the other (256 rows each). The game reads a part's row at the column the green channel of the material's layer detail texture (lyr0diffusetex) gives per pixel; looks and COLOR_0 hold the row at that texture's mean green instead.", "configs": part_looks["configs"], "default": part_looks["default"], "paint_finish": part_looks["paint_finish"], "paint_finish_note": "the body paint's finish: metalness and roughness of the surfaces of the primary-paint parts (COLOR_0 alpha 254), averaged over their vertices of every LOD; null when the model has none", "looks_note": "looks: the part colours each distinct configuration result gives, 256 x RGBA per look as hex (encoded like GLB COLOR_0, indexed by part id = _COLOR0 alpha); configs: a configuration's parts_key (vehicles.json) -> look; default: the look baked into the GLB", "note": "each vertex of the two-layer vehicle materials takes the colour of its part id (GLB COLOR_0; see the materials' classification.parts_note)"});
                         v["coat"] = part_looks["coat"].clone();
+                        v["surfaces"] = part_looks["surfaces"].clone();
+                        v["surfaces_note"] = serde_json::Value::from("per look, the first layer of each part id's surface (256 x 8 hex digits: metalness low, metalness high, roughness low, roughness high, 0 to 255). The paint shader blends low to high by the red (metalness) and green (roughness) channel of a material's lyr0materialatex (slot 2bb2ede8, sampled with the first UV set) at each pixel. The alpha of a look entry holds the same pair blended once, by the mean of that texture over the model's materials; a material whose map is not in the install has only that. A part patch has the same for its ids (surfaces).");
                         v
                     }
                     None => serde_json::json!({"status": "no part set found for this model: the two-layer materials keep their stand-in colours"}),
@@ -1473,6 +1491,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     m["parameters"] = values.into();
                     m["parameters_not_read"] = unread.into();
                     m["emissive_source"] = emissive_source_json(s, st, &c);
+                    m["emissive_strength"] = emissive_strength_json(s, st, &c);
                     if let Some(fb) = &st.fallback {
                         m["texture_fallback"] = fb.clone();
                     }
@@ -1492,7 +1511,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     }
                     m
                 }).collect::<Vec<_>>(),
-                "materials_note": "parameters: every constant value of the material, keyed by the parameter's name (its 8-digit hash where the name is not known; a repeated name gets the hash appended), with the type from the shader archive (a scalar as a number, a vector as its 2 to 4 components, int and bool as such); drawable.shaders[].constants has the same values with buffer and byte offset. parameters_not_read: parameters whose values lie outside the material's constant block. emissive_source: what lights an emissive material in the GLB (emissive_map, colour_map, or none when the shader's emissivetex did not decode), null for materials that do not light. Textures come from the data/ttdb/*.ttpf stores by 64-bit hash and are written once to <out>/textures/ttpf/<hash>.png. Roles are guessed from the shader parameter hash and the format (sRGB = colour, BC5 / known normal slots = normal map). classification.class is one of opaque/alpha/cutout/decal/glass/window/emissive/water/terrain_multilayer/car_paint, from the shader record flags and known shader families. shader_name and param_name are joaat names from <work>/names/names.json (`sixng names`), null when unknown. slot_role names the PBR map a known parameter slot holds.",
+                "materials_note": "parameters: every constant value of the material, keyed by the parameter's name (its 8-digit hash where the name is not known; a repeated name gets the hash appended), with the type from the shader archive (a scalar as a number, a vector as its 2 to 4 components, int and bool as such); drawable.shaders[].constants has the same values with buffer and byte offset. parameters_not_read: parameters whose values lie outside the material's constant block. emissive_source: what lights an emissive material in the GLB (emissive_map, colour_map, or none when the shader's emissivetex did not decode), null for materials that do not light. emissive_strength: how bright a lit material is in the GLB, from its emissivemultiplier constant (multiplier, as read). strength = multiplier / 100 (the values read like nits; 1.0 = 100 nits), at most 100; up to 1 it is the GLB emissiveFactor, above 1 the factor is 1 and KHR_materials_emissive_strength holds the strength. source: multiplier, capped (over 100), default (no multiplier: strength 1) or runtime (multiplier 0: a light the game switches on while it runs, kept lit at strength 1). Null for materials that do not light. Textures come from the data/ttdb/*.ttpf stores by 64-bit hash and are written once to <out>/textures/ttpf/<hash>.png. Roles are guessed from the shader parameter hash and the format (sRGB = colour, BC5 / known normal slots = normal map). classification.class is one of opaque/alpha/cutout/decal/glass/window/emissive/water/terrain_multilayer/car_paint, from the shader record flags and known shader families. shader_name and param_name are joaat names from <work>/names/names.json (`sixng names`), null when unknown. slot_role names the PBR map a known parameter slot holds.",
             });
             let mut j = j;
             if physics.is_some() || archetype.is_some() {
@@ -1847,6 +1866,10 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
                 }
                 _ => {}
             }
+            // How bright: the material's `emissivemultiplier`.
+            if !g["emissiveFactor"].is_null() {
+                emissive_strength(s).apply(&mut g);
+            }
             if let (Some(p), true) = (o.paint, is_paint(s, st)) {
                 g["pbrMetallicRoughness"]["baseColorFactor"] = serde_json::json!([p[0], p[1], p[2], 1.0]);
             }
@@ -1862,7 +1885,7 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         },
         extras: {
             let c = classify_shader(s, st);
-            let mut x = serde_json::json!({"shader_name_hash": s.name_hash, "shader_name": crate::names::shader(&s.name_hash), "emissive_source": emissive_source_json(s, st, &c), "classification": c, "textures": st.entries, "texture_fallback": st.fallback});
+            let mut x = serde_json::json!({"shader_name_hash": s.name_hash, "shader_name": crate::names::shader(&s.name_hash), "emissive_source": emissive_source_json(s, st, &c), "emissive_strength": emissive_strength_json(s, st, &c), "classification": c, "textures": st.entries, "texture_fallback": st.fallback});
             if let Some(t) = &st.ped_tint {
                 x["ped_tint"] = t.clone();
             }
@@ -3098,7 +3121,7 @@ pub fn export_lights(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: &
                 "falloff_exponent": l.falloff_exponent, "cone": [l.cone_inner, l.cone_outer], "corona_size": l.corona_size,
                 "corona_intensity": l.corona_intensity, "vol_intensity": l.vol_intensity, "flashiness": l.flashiness,
                 "light_fade_distance": l.light_fade_distance, "shadow_fade_distance": l.shadow_fade_distance, "time_flags": l.time_flags,
-                "night_only": l.night_only, "ext_name": format!("{:08x}", s.ext_name), "local": l.position, "v0": l.v0, "fields": l.fields,
+                "night_only": l.night_only, "ext_name": format!("{:08x}", s.ext_name), "local": l.position, "v0": l.v0, "extents": l.extents, "fields": l.fields,
                 "map": map, "entity": ei, "owner": s.owner});
             if let Some((im, ii, _)) = inst {
                 v["interior_map"] = serde_json::json!(im);
@@ -3108,10 +3131,7 @@ pub fn export_lights(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: &
             if let Some(g) = l.fields.get(&crate::meta7a::field_name(0x5812_2c00)).and_then(|x| x.as_u64()).filter(|&g| g != 0) {
                 v["light_group"] = serde_json::json!(format!("{g:08x}"));
             }
-            if l.light_type == 2 {
-                let p = l.fields.get(&crate::meta7a::field_name(0x47d5_d47a)).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
-                v["distant_intensity"] = serde_json::json!(l.intensity * crate::lights::distant_spot_factor(l.cone_inner, l.cone_outer, p));
-            }
+            v["distant_intensity"] = serde_json::json!(crate::lights::distant_intensity(l));
             writeln!(w, "{v}")?;
             placed += 1;
         }
@@ -3707,6 +3727,32 @@ mod dictionary_tests {
             assert!(!is_lit(&s, &c), "{h}");
             assert!(crate::material::gltf_fields(&c, true)["emissiveFactor"].is_null(), "{h}");
         }
+    }
+
+    #[test]
+    fn emissive_strength_comes_from_the_multiplier_constant() {
+        let shader = |name: &str, consts: serde_json::Value| -> crate::drawable::Shader {
+            serde_json::from_value(serde_json::json!({"index": 0, "record_off": 0, "name_hash": name, "param_hashes": [], "textures": [], "flags": [], "constants": consts})).unwrap()
+        };
+        let mult = |v: f32| serde_json::json!([{"hash": crate::material::EMISSIVE_MULTIPLIER_PARAM, "desc": "00400003", "offset": 0, "values": [v, 0.0, 0.0, 0.0], "buffer": 3, "count": 1}]);
+        let emissive = serde_json::json!({"class": "emissive", "alpha_mode": "OPAQUE"});
+        let slot = |h: &str| serde_json::json!({"param_hash": h});
+        let map = ShaderTextures { base: Some("a.png".into()), emissive: Some("e.png".into()), entries: vec![slot(DIFFUSE_PARAM), slot(EMISSIVE_PARAM)], ..Default::default() };
+        let missing = ShaderTextures { base: Some("a.png".into()), entries: vec![slot(DIFFUSE_PARAM), slot(EMISSIVE_PARAM)], ..Default::default() };
+        // standard_emissive_layer_pxm_inst on an LED sign
+        let s = shader("3a09c775", mult(3225.8));
+        assert_eq!(emissive_strength(&s).source, "multiplier");
+        let j = emissive_strength_json(&s, &map, &emissive);
+        assert_eq!(j["multiplier"], serde_json::json!(3225.8f32));
+        assert!((j["strength"].as_f64().unwrap() - 32.258).abs() < 1e-3);
+        // a map that did not decode does not light, so it has no strength
+        assert!(emissive_strength_json(&s, &missing, &emissive).is_null());
+        // the traffic-light counter (0) and a shader without the constant
+        assert_eq!(emissive_strength(&shader("60643f2e", mult(0.0))).source, "runtime");
+        assert_eq!(emissive_strength(&shader("60643f2e", serde_json::json!([]))).source, "default");
+        // materials that do not light have none
+        let alpha = crate::material::classify("d9ec330c", &[0, 0, 0, 0, 2, 0, 0, 0]);
+        assert!(emissive_strength_json(&shader("d9ec330c", mult(5.0)), &map, &alpha).is_null());
     }
 
     #[test]

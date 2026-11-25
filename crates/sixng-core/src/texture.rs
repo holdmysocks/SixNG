@@ -9,6 +9,7 @@
 //! +0x18 ptr  pixel data (graphics page)
 //! +0x30 ptr  name block (C string at +8)
 //! +0x38 u16  width, +0x3A u16 height, +0x3C u16 depth/array size
+//! +0x3E u8   dimension: 1 = 2D (or array), 2 = cube, 3 = 3D (volume)
 //! +0x3F u8   DXGI_FORMAT
 //! +0x42 u8   mip count
 //! ```
@@ -26,6 +27,10 @@ pub struct TexInfo {
     pub width: u32,
     pub height: u32,
     pub depth: u32,
+    /// Header dimension byte: 1 = 2D or 2D array, 2 = cube, 3 = volume
+    /// (0 when unknown).
+    #[serde(default)]
+    pub dimension: u8,
     pub mips: u32,
     pub dxgi_format: u32,
     pub format: String,
@@ -187,6 +192,7 @@ fn plausible(r: &Resource, p: usize) -> Option<TexInfo> {
         width: w,
         height: h,
         depth,
+        dimension: r.sys[p + 0x3E],
         mips,
         dxgi_format: fmt,
         format: dxgi_name(fmt),
@@ -318,28 +324,46 @@ pub fn deswizzle(src: &[u8], ew: u32, eh: u32, bpe: u32) -> Vec<u8> {
     out
 }
 
-/// Gfx10 SW_4KB_S layout of an uncompressed texture whose tiling is known:
-/// single-mip textures with 2- or 4-byte elements, and every uncompressed
-/// texture with a mip chain. Other single-mip textures (1- and 8-byte
-/// elements) keep the 16 x 16-element tiles of [`deswizzle`].
+/// Gfx10 SW_4KB_S layout of an uncompressed texture: every uncompressed
+/// texture in a texture dictionary is stored this way (2D, arrays and, with
+/// the 3D pattern, single-mip volumes), not in the 16 x 16-element tiles of
+/// [`deswizzle`]. `None` for block-compressed formats and for volumes with a
+/// mip chain.
 ///
-/// Single-mip 2/4-byte textures (R16 height maps, RGBA8 palettes and
-/// profiles, BGRA8 tiles): by neighbour smoothness over every such texture
-/// of 32 x 32 or more in textures.rpf, levels.rpf, common.rpf and the packs,
-/// SW_4KB_S is smoothest on 1,051 of 1,064; the rest are noise textures,
-/// small volumes and flat tiles, where smoothness tells nothing. Water
-/// height and shore tiles placed with it continue across 1,396 of 1,400 and
-/// 268 of 271 tile edges.
-///
-/// Mip chains (RGBA8, R8, A8, R32 float): mip k+1 matches mip k averaged 2 x 2
-/// at 41 to 67 dB on mips 0 to 1 (11 to 25 dB with 16 x 16 tiles), and on
-/// down through the packed tail for the R8 puddle layout (40 to 59 dB).
+/// * Single-mip 2/4-byte textures (R16 height maps, RGBA8 palettes and
+///   profiles, BGRA8 tiles): by neighbour smoothness over every such texture
+///   of 32 x 32 or more in textures.rpf, levels.rpf, common.rpf and the
+///   packs, SW_4KB_S is smoothest on 1,051 of 1,064; the rest are noise,
+///   volumes (read as 2D before the dimension byte was used) and flat tiles.
+///   Water height and shore tiles placed with it continue across 1,396 of
+///   1,400 and 268 of 271 tile edges.
+/// * Single-mip 1-byte textures: 4 x 4 A8 blanks read as one value and the
+///   4 x 4 R8 dither offsets as 16 distinct levels 16 apart (rows 16 bytes
+///   apart, the rest padding); a 512 x 512 R8 light-animation table reads as
+///   clean per-row curves (block-scrambled with 16 x 16 tiles).
+/// * Single-mip 8-byte textures: identical to 16 x 16 tiles up to 16 rows;
+///   the 256 x 16 RGBA16 float identity LUT decodes exactly.
+/// * Mip chains (RGBA8, R8, A8, R32 float): mip k+1 matches mip k averaged
+///   2 x 2 at 41 to 67 dB on mips 0 to 1 (11 to 25 dB with 16 x 16 tiles),
+///   and on down through the packed tail (40 to 68 dB on R8 and A8; exact on
+///   the R32 float glow).
+/// * Volumes (dimension byte 3): the 3D pattern of [`crate::gfx10::Layout::new_3d`].
+///   The 33 x 33 x 33 RGBA16 float identity LUT decodes exactly.
 fn uncompressed_layout(fmt: Fmt, t: &TexInfo) -> Option<crate::gfx10::Layout> {
+    use crate::gfx10::{Layout, Swizzle};
     let bpe = fmt.bytes_per_elem();
-    if fmt.block_dim() != 1 || bpe == 0 || !(t.mips > 1 || matches!(bpe, 2 | 4)) {
+    if fmt.block_dim() != 1 || bpe == 0 {
         return None;
     }
-    crate::gfx10::Layout::new(crate::gfx10::Swizzle::S4K, t.width, t.height, t.mips, bpe)
+    if t.dimension == 3 && t.depth > 1 {
+        if t.mips != 1 {
+            return None;
+        }
+        if let Some(l) = Layout::new_3d(Swizzle::S4K, t.width, t.height, t.depth, bpe) {
+            return Some(l);
+        }
+    }
+    Layout::new(Swizzle::S4K, t.width, t.height, t.mips, bpe).map(|l| l.with_slices(t.depth))
 }
 
 fn untile_mip(r: &Resource, t: &TexInfo, l: &crate::gfx10::Layout, m: usize) -> Result<Vec<u8>> {

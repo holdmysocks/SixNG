@@ -58,6 +58,11 @@ fn equation_3d(sw: Swizzle, bpe: u32) -> Option<&'static [(u8, u8)]> {
     Some(match (sw, bpe) {
         (Swizzle::S4K, 2) => &[(X, 0), (Z, 0), (Y, 0), (Z, 1), (Y, 1), (X, 1), (Z, 2), (Y, 2), (X, 2), (Z, 3), (Y, 3)],
         (Swizzle::S4K, 8) => &[(X, 0), (Z, 0), (Y, 0), (X, 1), (Z, 1), (Y, 1), (X, 2), (Z, 2), (Y, 2)],
+        // 8x16x8 bricks; found by trying every bit order on the 4-byte
+        // volumes of the texture dictionaries (R16G16 float directions,
+        // RGBA8 and R10G10B10A2 noise): smoothest along x, y and z on all
+        // three, by a clear margin on the direction field
+        (Swizzle::S4K, 4) => &[(X, 0), (Y, 0), (Z, 0), (Y, 1), (X, 1), (Z, 1), (Y, 2), (X, 2), (Z, 2), (Y, 3)],
         _ => return None,
     })
 }
@@ -411,7 +416,7 @@ mod tests {
 
     #[test]
     fn unmeasured_volume_element_sizes_are_rejected() {
-        for bpe in [1, 4, 16] {
+        for bpe in [1, 16] {
             assert!(Layout::new_3d(Swizzle::S4K, 32, 32, 32, bpe).is_none());
         }
         assert!(Layout::new_3d(Swizzle::D64K, 32, 32, 32, 8).is_none());

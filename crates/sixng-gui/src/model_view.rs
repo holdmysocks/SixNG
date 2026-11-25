@@ -2773,12 +2773,18 @@ impl ModelView {
         // rebinds the ids of its panels, mostly to the body paint): part id
         // and its new entry.
         let mut patched: Vec<(usize, [u8; 4])> = Vec::new();
+        // and the surface (low and high metalness and roughness) of those ids
+        let mut patched_surf: Vec<(usize, [u8; 4])> = Vec::new();
         for part in l.info["fitted_parts"].as_array().into_iter().flatten().filter_map(|p| p.as_str()) {
             let d = &pc["part_patches"][part];
             let rgba = d["rgba"].as_str().unwrap_or("");
+            let surf = d["surfaces"].as_str().unwrap_or("");
             for (k, id) in d["ids"].as_array().into_iter().flatten().filter_map(|x| x.as_u64()).enumerate() {
                 if let Some(h) = rgba.get(k * 8..k * 8 + 8) {
                     patched.push((id as usize & 255, std::array::from_fn(|c| u8::from_str_radix(&h[c * 2..c * 2 + 2], 16).unwrap_or(255))));
+                }
+                if let Some(s) = surf.get(k * 8..k * 8 + 8).and_then(hex4) {
+                    patched_surf.push((id as usize & 255, s));
                 }
             }
         }
@@ -2822,8 +2828,15 @@ impl ModelView {
                     // rows 256..: the surface's second layer (colour, alpha =
                     // roughness); its metalness is the alpha of rows 0..256
                     let wear = pc["wear"][idx].as_str().filter(|w| w.len() == 2048);
-                    let mut px = vec![255u8; 128 * 512 * 4];
+                    // rows 512..: the low and high of the first layer's
+                    // metalness and roughness, which the shader blends by the
+                    // material map at each pixel
+                    let surfaces = pc["surfaces"][idx].as_str().filter(|s| s.len() == 2048);
+                    let mut px = vec![255u8; 128 * PART_RAMP_ROWS * 4];
                     for id in 0..256 {
+                        let stored = surfaces.and_then(|s| hex4(&s[id * 8..id * 8 + 8]));
+                        let s = patched_surf.iter().rev().find(|p| p.0 == id).map(|p| p.1).or(stored).unwrap_or_else(|| surface_of_code(look[id][3]));
+                        px[(512 + id) * 512..(513 + id) * 512].copy_from_slice(&part_surface_row(s));
                         let w = wear.map(|w| &w[id * 8..id * 8 + 8]);
                         let byte = |k: usize| w.and_then(|w| u8::from_str_radix(&w[k..k + 2], 16).ok());
                         let wrow = w.and_then(|w| usize::from_str_radix(&w[..4], 16).ok()).filter(|r| *r != 0xffff);
@@ -2846,7 +2859,7 @@ impl ModelView {
                         }
                         out.chunks_exact_mut(4).for_each(|c| c[3] = metal1);
                     }
-                    let im = glb::Image { key: "part ramp".into(), mips: vec![(128, 512, px)], srgb: true, bc: None };
+                    let im = glb::Image { key: "part ramp".into(), mips: vec![(128, PART_RAMP_ROWS as u32, px)], srgb: true, bc: None };
                     let at = match l.model.images.iter().position(|i| i.key == "part ramp") {
                         Some(i) => {
                             l.model.images[i] = im;
@@ -2857,7 +2870,9 @@ impl ModelView {
                             l.model.images.len() - 1
                         }
                     };
-                    for m in l.model.materials.iter_mut().filter(|m| m.parts && m.ramp_u.is_some()) {
+                    // every part material: one without a palette column map
+                    // still reads its parts' surfaces from the image
+                    for m in l.model.materials.iter_mut().filter(|m| m.parts) {
                         m.ramp = Some(at);
                     }
                     ramp_new = true;
@@ -4098,7 +4113,7 @@ impl ModelView {
                 .on_hover_text("Place stickers (logos, lettering) on this vehicle by hand: pictures from the game's sticker textures or your own PNG files, on the panels you choose. Saved per vehicle.");
         }
         self.vehicle_ui(ui);
-        if self.part_ramp_done.is_some() && self.loaded.as_ref().is_some_and(|l| l.model.materials.iter().any(|m| m.ramp.is_some())) {
+        if self.part_ramp_done.is_some() && self.loaded.as_ref().is_some_and(|l| l.model.materials.iter().any(|m| m.ramp.is_some() && m.ramp_u.is_some())) {
             ui.add(egui::Slider::new(&mut self.look.wear, 0.0..=1.0).text("wear"))
                 .on_hover_text("Shows the second layer of the vehicle's surfaces (rust under paint, grey under bare metal), which the game's files give for every surface. Where it shows is taken from the blue channel of the parts' detail texture; how much the game shows is not known, so the amount is yours to set.");
         }
@@ -4857,6 +4872,40 @@ fn load_parts(
 /// Sub-material per texel of a material's base texture: its `materialid`
 /// texture (red x 63, as the clothing shader reads it), resampled to `w` x
 /// `h`. None when the material binds none or the file is not there.
+/// Rows of the part ramp image (128 wide): 256 of the first layer's palette
+/// rows, 256 of the second layer's, 256 of surfaces (`part_surface_row`).
+const PART_RAMP_ROWS: usize = 768;
+
+/// Four bytes from 8 hex digits.
+fn hex4(h: &str) -> Option<[u8; 4]> {
+    let b = h.as_bytes();
+    if b.len() != 8 || !b.iter().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(std::array::from_fn(|k| u8::from_str_radix(&h[k * 2..k * 2 + 2], 16).unwrap_or(0)))
+}
+
+/// One row of the part ramp image for a part id's surface (metalness low
+/// and high, roughness low and high): the four values in the alpha of the
+/// columns 0 to 3 (repeated along the row). Alpha is not sRGB-decoded, so
+/// the shader reads the bytes as stored.
+fn part_surface_row(s: [u8; 4]) -> Vec<u8> {
+    (0..128).flat_map(|x| [0, 0, 0, s[x & 3]]).collect()
+}
+
+/// The surface a look entry's alpha stands for when an export has no
+/// `surfaces` (see `vehcolour::surface_code`: metalness in four steps x 50 +
+/// roughness in 50 steps): low = high. The body paint (254) and ids without
+/// a part read as a plain non-metal.
+fn surface_of_code(code: u8) -> [u8; 4] {
+    if code >= 200 {
+        return [0, 0, 192, 192];
+    }
+    let (m, r) = ((code / 50) as f32 / 3.0, (code % 50) as f32 / 49.0);
+    let q = |v: f32| (v * 255.0 + 0.5) as u8;
+    [q(m), q(m), q(r), q(r)]
+}
+
 fn sub_material_map(mat: &glb::Material, roots: &[&Path], w: u32, h: u32) -> Option<Vec<u8>> {
     let want = format!("{:08x}", sixng_core::meta7a::joaat("materialid"));
     let png = mat.slots.iter().find(|s| s.param_hash == want).and_then(|s| s.png.as_ref())?;
@@ -7844,6 +7893,25 @@ fn srgb32(c: [f32; 3]) -> egui::Color32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn part_surfaces_in_the_ramp_image() {
+        use super::{hex4, part_surface_row, surface_of_code, PART_RAMP_ROWS};
+        assert_eq!(hex4("e6ff1a66"), Some([0xe6, 0xff, 0x1a, 0x66]));
+        assert_eq!(hex4("e6ff1a6"), None);
+        assert_eq!(hex4("e6ff1a6g"), None);
+        // the four values in the alpha of columns 0 to 3, where the shader loads them
+        let row = part_surface_row([1, 2, 3, 4]);
+        assert_eq!(row.len(), 128 * 4);
+        assert_eq!([row[3], row[7], row[11], row[15]], [1, 2, 3, 4]);
+        assert_eq!(&row[..3], &[0, 0, 0]);
+        // three blocks of 256 rows: the shader's row coordinates divide by this
+        assert_eq!(PART_RAMP_ROWS, 768);
+        // an export without surfaces: the look's code, low = high
+        assert_eq!(surface_of_code(165), [255, 255, 78, 78]);
+        assert_eq!(surface_of_code(49), [0, 0, 255, 255]);
+        assert_eq!(surface_of_code(254), [0, 0, 192, 192]);
+    }
+
     #[test]
     fn random_parts_keep_fitted_groups_fitted() {
         let opt = |off: u64, group: &str, default: bool| crate::assemble::PartOpt { off, id: String::new(), name: String::new(), group: group.into(), label: String::new(), default };
