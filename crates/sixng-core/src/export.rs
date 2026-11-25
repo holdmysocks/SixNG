@@ -2220,6 +2220,27 @@ fn export_texture(r: &Resource, t: &texture::TexInfo, dir: &Path, o: &ExportOpti
     let stem = if t.name.is_empty() { format!("tex_{:x}", t.struct_off) } else { sanitize(&t.name) };
     let mut files = Vec::new();
     // one-row textures (tint palettes) are stored linear
+    // Arrays, cubes and volumes: every slice, not just slice 0 (uncompressed
+    // textures whose slice layout is mapped).
+    let slices = match texture::slices_linear(r, t) {
+        Ok(v) => v,
+        Err(err) => {
+            item.warnings.push(format!("{}: slices: {err}", t.name));
+            None
+        }
+    };
+    if let (Some((fmt, sl)), true) = (&slices, o.png) {
+        // Slices stacked top to bottom, slice 0 first.
+        match sl[0].iter().map(|d| texture::to_rgba(*fmt, d, t.width, t.height)).collect::<Result<Vec<_>>>() {
+            Ok(rgba) => {
+                let p = dir.join(format!("{stem}_slices.png"));
+                texture::save_png(&p, &rgba.concat(), t.width, t.height * sl[0].len() as u32)?;
+                files.push(rel(dir, &p));
+                item.files.push(rel(&o.out, &p));
+            }
+            Err(err) => item.warnings.push(format!("{}: slices png: {err}", t.name)),
+        }
+    }
     match texture::mip0_linear(r, t, t.height == 1) {
         Ok((fmt, lin)) => {
             if o.png {
@@ -2233,7 +2254,12 @@ fn export_texture(r: &Resource, t: &texture::TexInfo, dir: &Path, o: &ExportOpti
                     Err(err) => item.warnings.push(format!("{}: png: {err}", t.name)),
                 }
             }
-            if o.dds {
+            if let (true, Some((_, sl))) = (o.dds, &slices) {
+                let p = dir.join(format!("{stem}.dds"));
+                texture::save_dds_slices(&p, t, fmt, sl)?;
+                files.push(rel(dir, &p));
+                item.files.push(rel(&o.out, &p));
+            } else if o.dds {
                 // Original BCn data, untiled, with the verified part of the mip chain.
                 let p = dir.join(format!("{stem}.dds"));
                 let mut mips = vec![lin.clone()];
