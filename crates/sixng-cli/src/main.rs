@@ -999,7 +999,7 @@ enum Cmd {
     /// clothing and accessory, with each texture / colour variant (wardrobe
     /// item) and the outfits that wear it. Writes `<out>/<model>/parts.json`
     /// with --out; prints the set (or, for a regex, one summary row per
-    /// character) as JSON. Needs the `texture-users` index.
+    /// character) as JSON.
     PedParts {
         /// Model name (`cs_mandy`), or a regex starting with `^` for every
         /// matching character.
