@@ -26,23 +26,33 @@
 //! Columns read so far:
 //! * `33f70dfaf2c50989` file entry, 24 bytes: u64 q (low 40 bits = offset / 16,
 //!   the rest flags), u64 stored size / 16, u64 unpacked size.
+//! * `ba180afb232d1b4b` resource entry, 20 bytes: u64 q (low 32 bits = size
+//!   of the unpacked first part, with flags in the low 4 bits; the high half
+//!   is not read), u32 stored size / 16, u32 offset / 16, u32 resource type.
+//!   Most inner archives use this instead of the file entry.
 //! * `286030a358a789fb` crypto record, 64 bytes: u32 key id, u16 type (0x11 =
-//!   stream cipher), IV at +6, five u64 at +0x18: first, on, off, ?, ?.
+//!   stream cipher), IV at +6, five u64 at +0x18: first, on, off, tail, ?.
 //!
 //! An encrypted file is one cipher stream over its stored bytes (the keystream
-//! position is the file offset), but only some spans are encrypted:
-//! `[0, first+on)` and then `on` bytes after every `off` bytes. `off` = 0 means
-//! the whole file.
+//! position is the offset in the data), but only some spans are encrypted:
+//! `[0, first+on)`, then `on` bytes after every `off` bytes, and the last
+//! `tail` bytes. `off` = 0 means everything. A resource starts with 16 zero
+//! bytes; its data, the keystream and the spans all start after them.
 //!
-//! A stored file is a row of chunks, each on a 16-byte boundary: a zlib stream
-//! for up to 64 KiB of data, or those 64 KiB as they are when they did not
-//! compress. Entry flag 0x100 means one raw deflate stream instead.
+//! Stored data is a row of chunks, each on a 16-byte boundary: a zlib stream
+//! (64 KiB of data in a file; more in a resource), or 64 KiB as they are when
+//! they did not compress. Entry flag 0x100 means one raw deflate stream
+//! instead. A resource may hold a second part after the first; that part is
+//! not read here.
 use anyhow::{anyhow, ensure, Context, Result};
 use serde::Serialize;
 use std::io::{Read, Seek, SeekFrom};
 
 pub const COL_ENTRY: u64 = 0x33f7_0dfa_f2c5_0989;
 pub const COL_CRYPTO: u64 = 0x2860_30a3_58a7_89fb;
+pub const COL_RESOURCE: u64 = 0xba18_0afb_232d_1b4b;
+/// A resource's data starts after this many zero bytes.
+pub const RESOURCE_PREFIX: usize = 16;
 /// Entry flag: the stored bytes are one raw deflate stream.
 pub const FLAG_RAW_DEFLATE: u32 = 0x100;
 const CHUNK: usize = 0x10000;
@@ -84,7 +94,7 @@ pub struct CryptoRecord {
     pub key_id: u32,
     pub kind: u16,
     pub iv: [u8; 16],
-    /// first, on, off, and two values not understood yet.
+    /// first, on, off, tail, and one value not understood yet.
     pub pattern: [u64; 5],
 }
 
@@ -97,6 +107,16 @@ pub struct FileEntry {
     pub stored: u64,
     pub unpacked: u64,
     pub crypto: Option<CryptoRecord>,
+    /// Set for a resource entry: (q, resource type). `flags` is 0 then and
+    /// `unpacked` is the size of the first part.
+    pub resource: Option<(u64, u32)>,
+}
+
+impl FileEntry {
+    /// Where the data starts in the stored bytes.
+    pub fn data_start(&self) -> usize {
+        if self.resource.is_some() { RESOURCE_PREFIX } else { 0 }
+    }
 }
 
 /// A decrypted table of contents.
@@ -244,18 +264,27 @@ impl Toc {
     }
 
     pub fn has_entries(&self) -> bool {
-        self.column(COL_ENTRY).is_some()
+        self.column(COL_ENTRY).is_some() || self.column(COL_RESOURCE).is_some()
     }
 
-    /// Every row that has a file entry.
+    /// Every row that has a file entry or a resource entry.
     pub fn files(&self) -> Result<Vec<FileEntry>> {
-        let ce = self.column(COL_ENTRY).ok_or_else(|| anyhow!("this archive has no file entry column of the known kind"))?;
-        ensure!(self.columns[ce].elem_size == 24, "file entry size {} is not 24", self.columns[ce].elem_size);
+        let ce = self.column(COL_ENTRY);
+        let cr = self.column(COL_RESOURCE);
+        ensure!(ce.is_some() || cr.is_some(), "this archive has no entry column of a known kind");
+        if let Some(c) = ce {
+            ensure!(self.columns[c].elem_size == 24, "file entry size {} is not 24", self.columns[c].elem_size);
+        }
+        if let Some(c) = cr {
+            ensure!(self.columns[c].elem_size == 20, "resource entry size {} is not 20", self.columns[c].elem_size);
+        }
         let cc = self.column(COL_CRYPTO).filter(|&c| self.columns[c].elem_size == 64);
         let mut out = Vec::new();
         for row in 0..self.rows {
-            let Some(i) = self.index(ce, row) else { continue };
-            let e = self.cell(ce, i).ok_or_else(|| anyhow!("row {row}: file entry {i} is outside the table"))?;
+            let file = ce.and_then(|c| self.index(c, row).map(|i| (c, i)));
+            let res = cr.and_then(|c| self.index(c, row).map(|i| (c, i)));
+            let Some((col, i)) = file.or(res) else { continue };
+            let e = self.cell(col, i).ok_or_else(|| anyhow!("row {row}: entry {i} is outside the table"))?;
             let q = u64le(e, 0);
             let crypto = match cc.and_then(|c| self.index(c, row).map(|i| (c, i))) {
                 None => None,
@@ -268,22 +297,36 @@ impl Toc {
                     Some(CryptoRecord { key_id: u32le(d, 0), kind: u16le(d, 4), iv: d[6..22].try_into().unwrap(), pattern })
                 }
             };
-            out.push(FileEntry {
-                row,
-                offset: (q & 0xff_ffff_ffff) << 4,
-                flags: (q >> 40) as u32,
-                stored: u64le(e, 8).checked_mul(16).ok_or_else(|| anyhow!("row {row}: stored size overflows"))?,
-                unpacked: u64le(e, 16),
-                crypto,
+            out.push(if file.is_some() {
+                FileEntry {
+                    row,
+                    offset: (q & 0xff_ffff_ffff) << 4,
+                    flags: (q >> 40) as u32,
+                    stored: u64le(e, 8).checked_mul(16).ok_or_else(|| anyhow!("row {row}: stored size overflows"))?,
+                    unpacked: u64le(e, 16),
+                    crypto,
+                    resource: None,
+                }
+            } else {
+                FileEntry {
+                    row,
+                    offset: (u32le(e, 12) as u64) << 4,
+                    flags: 0,
+                    stored: (u32le(e, 8) as u64) << 4,
+                    unpacked: q & 0xffff_fff0,
+                    crypto,
+                    resource: Some((q, u32le(e, 16))),
+                }
             });
         }
         Ok(out)
     }
 }
 
-/// The encrypted byte ranges (offset, length) of a stored file of `size` bytes.
+/// The encrypted byte ranges (offset, length) of `size` bytes of data, in
+/// order and without overlap.
 pub fn encrypted_spans(size: u64, pattern: &[u64; 5]) -> Vec<(u64, u64)> {
-    let (first, on, off) = (pattern[0], pattern[1], pattern[2]);
+    let (first, on, off, tail) = (pattern[0], pattern[1], pattern[2], pattern[3]);
     if off == 0 || on == 0 {
         return vec![(0, size)];
     }
@@ -293,6 +336,17 @@ pub fn encrypted_spans(size: u64, pattern: &[u64; 5]) -> Vec<(u64, u64)> {
     while p < size {
         out.push((p, on.min(size - p)));
         p = p.saturating_add(on).saturating_add(off);
+    }
+    if tail != 0 {
+        // The last `tail` bytes, merged into whatever they overlap.
+        let from = size.saturating_sub(tail);
+        while out.last().is_some_and(|s| s.0 >= from) {
+            out.pop();
+        }
+        match out.last_mut() {
+            Some(s) if s.0 + s.1 >= from => s.1 = size - s.0,
+            _ => out.push((from, size - from)),
+        }
     }
     out
 }
@@ -332,6 +386,12 @@ fn inflate_one(buf: &[u8], zlib: bool, limit: usize) -> Option<(Vec<u8>, usize)>
 
 /// Unpack the stored bytes of a file (after decryption) to `unpacked` bytes.
 pub fn unpack(stored: &[u8], unpacked: u64, flags: u32) -> Result<(Vec<u8>, Check)> {
+    unpack_from(stored, 0, unpacked, flags)
+}
+
+/// [`unpack`] for data that starts at `start` in `stored`.
+pub fn unpack_from(stored: &[u8], start: usize, unpacked: u64, flags: u32) -> Result<(Vec<u8>, Check)> {
+    ensure!(start <= stored.len(), "stored bytes are shorter than the {start}-byte prefix");
     let want = usize::try_from(unpacked)?;
     if flags & FLAG_RAW_DEFLATE != 0 {
         let (data, used) = inflate_one(stored, false, want).ok_or_else(|| anyhow!("the deflate stream is damaged"))?;
@@ -340,7 +400,7 @@ pub fn unpack(stored: &[u8], unpacked: u64, flags: u32) -> Result<(Vec<u8>, Chec
         return Ok((data, Check::Inflated));
     }
     let mut out: Vec<u8> = Vec::with_capacity(want.min(1 << 28));
-    let (mut p, mut raw, mut chunks) = (0usize, 0usize, 0usize);
+    let (mut p, mut raw, mut chunks) = (start, 0usize, 0usize);
     while p < stored.len() && out.len() < want {
         let left = want - out.len();
         chunks += 1;
@@ -360,13 +420,20 @@ pub fn unpack(stored: &[u8], unpacked: u64, flags: u32) -> Result<(Vec<u8>, Chec
         }
     }
     ensure!(out.len() == want, "unpacked to {} bytes, the table says {want}", out.len());
-    ensure!(p == stored.len(), "used {p:#x} of {:#x} stored bytes", stored.len());
+    ensure!(
+        p == stored.len(),
+        "used {p:#x} of {:#x} stored bytes{}",
+        stored.len(),
+        if start != 0 { " (a resource with a second part, which is not read yet)" } else { "" }
+    );
     Ok((out, if raw == chunks { Check::Stored } else { Check::Inflated }))
 }
 
-/// Decrypt the encrypted spans of a file's stored bytes in place.
-pub fn decrypt_stored(cipher: &mut dyn ArchiveCipher, stored: &mut [u8], rec: &CryptoRecord) -> Result<()> {
+/// Decrypt the encrypted spans of a file's stored bytes in place. `start` is
+/// where the data begins ([`FileEntry::data_start`]).
+pub fn decrypt_stored(cipher: &mut dyn ArchiveCipher, stored: &mut [u8], start: usize, rec: &CryptoRecord) -> Result<()> {
     ensure!(rec.kind == 0x11, "crypto record type {:#x} is not supported", rec.kind);
+    let Some(stored) = stored.get_mut(start..) else { return Ok(()) };
     let spans = encrypted_spans(stored.len() as u64, &rec.pattern);
     if spans.len() == 1 && spans[0] == (0, stored.len() as u64) {
         return cipher.stream_decrypt(rec.key_id, &rec.iv, stored);
@@ -390,9 +457,9 @@ pub fn read_file<R: Read + Seek>(cipher: &mut dyn ArchiveCipher, f: &mut R, base
     f.seek(SeekFrom::Start(base + e.offset))?;
     f.read_exact(&mut stored).context("file data is cut short")?;
     if let Some(rec) = &e.crypto {
-        decrypt_stored(cipher, &mut stored, rec)?;
+        decrypt_stored(cipher, &mut stored, e.data_start(), rec)?;
     }
-    unpack(&stored, e.unpacked, e.flags)
+    unpack_from(&stored, e.data_start(), e.unpacked, e.flags)
 }
 
 /// Offsets (from `base`) of the entries that are themselves RPF9 archives.
@@ -401,7 +468,8 @@ pub fn nested_archives<R: Read + Seek>(f: &mut R, base: u64, files: &[FileEntry]
     let mut m = [0u8; 4];
     for e in files {
         // Offset 0 is the archive's own header.
-        if e.stored < 0x40 || e.offset == 0 {
+        // A resource starts with zero bytes, so it cannot be an archive.
+        if e.stored < 0x40 || e.offset == 0 || e.resource.is_some() {
             continue;
         }
         if f.seek(SeekFrom::Start(base + e.offset)).is_ok() && f.read_exact(&mut m).is_ok() && &m == b"9FPR" {
@@ -724,6 +792,14 @@ mod tests {
         assert_eq!(encrypted_spans(0x300, &p), [(0, 0x300)]);
         assert_eq!(encrypted_spans(0x2400, &p), [(0, 0x800)]);
         assert_eq!(encrypted_spans(0x4500, &p), [(0, 0x800), (0x2400, 0x400), (0x4400, 0x100)]);
+        // A tail: on its own, touching the last span, and swallowing spans.
+        let t = [0x1000, 0x1000, 0x31000, 0x1000, 4];
+        assert_eq!(encrypted_spans(0x1800, &t), [(0, 0x1800)]);
+        assert_eq!(encrypted_spans(0x2ff0, &t), [(0, 0x2ff0)]);
+        assert_eq!(encrypted_spans(0x3070, &t), [(0, 0x2000), (0x2070, 0x1000)]);
+        assert_eq!(encrypted_spans(0x50000, &t), [(0, 0x2000), (0x33000, 0x1000), (0x4f000, 0x1000)]);
+        assert_eq!(encrypted_spans(0x33800, &t), [(0, 0x2000), (0x32800, 0x1000)]);
+        assert_eq!(encrypted_spans(0x34400, &t), [(0, 0x2000), (0x33000, 0x1400)]);
         // No gap: everything.
         assert_eq!(encrypted_spans(0x1270, &[0, 0x1000, 0, 0, 4]), [(0, 0x1270)]);
         assert_eq!(encrypted_spans(0xe00, &[0x1000, 0x1000, 0, 0x1000, 4]), [(0, 0xe00)]);
@@ -744,6 +820,35 @@ mod tests {
         assert!(open_toc(&mut Fake::default(), &mut Cursor::new(&img), 0).and_then(|t| t.files().map(|_| ())).is_err());
         // Not an archive.
         assert!(open_toc(&mut Fake::default(), &mut Cursor::new(vec![0u8; 0x100]), 0).is_err());
+    }
+
+    /// A resource: 16 zero bytes, then the data; spans and keystream start
+    /// after the prefix and the last `tail` bytes are encrypted too.
+    #[test]
+    fn resource_with_tail() {
+        let mut data = noise(CHUNK, 5); // first chunk stored as it is
+        data.extend((0..200_000u32).flat_map(|i| (i % 251).to_le_bytes()));
+        let mut plain = vec![0u8; RESOURCE_PREFIX];
+        plain.extend(pack(&data));
+        let r = rec([0x1000, 0x1000, 0x31000, 0x1000, 4], 0x1000_002d);
+        let mut stored = plain.clone();
+        let mut full = plain[RESOURCE_PREFIX..].to_vec();
+        Fake::stream(key_byte(r.key_id), &r.iv, &mut full);
+        let spans = encrypted_spans(full.len() as u64, &r.pattern);
+        assert_eq!(spans.len(), 2);
+        for (o, n) in spans {
+            let (o, n) = (o as usize, n as usize);
+            stored[RESOURCE_PREFIX + o..RESOURCE_PREFIX + o + n].copy_from_slice(&full[o..o + n]);
+        }
+        assert_eq!(&stored[..RESOURCE_PREFIX], &[0u8; RESOURCE_PREFIX]);
+        decrypt_stored(&mut Fake::default(), &mut stored, RESOURCE_PREFIX, &r).unwrap();
+        assert!(stored == plain);
+        let (got, check) = unpack_from(&stored, RESOURCE_PREFIX, data.len() as u64, 0).unwrap();
+        assert!(got == data);
+        assert_eq!(check, Check::Inflated);
+        // A second part after the first is reported, not silently dropped.
+        stored.extend_from_slice(&[1u8; 32]);
+        assert!(unpack_from(&stored, RESOURCE_PREFIX, data.len() as u64, 0).is_err());
     }
 
     #[test]

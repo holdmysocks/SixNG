@@ -176,7 +176,7 @@ enum Cmd {
         #[arg(long)]
         no_names: bool,
     },
-    /// Read an archive's table of contents: columns and file entries; archives stored inside it are followed. Windows x64 only; needs the game executable in the game folder. No index needed.
+    /// Read an archive's table of contents: columns, file and resource entries; archives stored inside it are followed. Windows x64 only; needs the game executable in the game folder. No index needed.
     Toc {
         archive: String,
         /// List every file entry (offset, sizes, flags, key id).
@@ -1145,12 +1145,13 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 let mut v = json!({
                     "base": base, "rows": toc.rows, "index_width": toc.index_width, "selector": toc.selector,
                     "columns": toc.columns, "known_entry_column": toc.has_entries(),
-                    "files": entries.len(), "protected": enc.len(),
+                    "files": entries.len(), "resources": entries.iter().filter(|e| e.resource.is_some()).count(), "protected": enc.len(),
                     "protected_stored_bytes": enc.iter().map(|e| e.stored).sum::<u64>(),
                 });
                 if *files {
                     v["entries"] = entries.iter().map(|e| json!({
                         "row": e.row, "offset": e.offset, "stored": e.stored, "unpacked": e.unpacked, "flags": e.flags,
+                        "resource_type": e.resource.map(|r| r.1),
                         "key_id": e.crypto.as_ref().map(|c| format!("{:08x}", c.key_id)),
                         "pattern": e.crypto.as_ref().map(|c| c.pattern),
                     })).collect();
@@ -1188,10 +1189,11 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     for e in &enc {
                         let c = e.crypto.as_ref().unwrap();
                         let mut rec = json!({"row": e.row, "offset": e.offset, "stored": e.stored, "unpacked": e.unpacked,
-                            "flags": e.flags, "key_id": format!("{:08x}", c.key_id)});
+                            "flags": e.flags, "resource_type": e.resource.map(|r| r.1), "key_id": format!("{:08x}", c.key_id)});
                         match sixng_core::rpf9toc::read_file(cipher, f, base, e) {
                             Ok((data, check)) => {
-                                let file = format!("{:09x}.{}", e.offset, sixng_core::rpf9toc::sniff_ext(&data));
+                                let ext = if e.resource.is_some() { "rsc" } else { sixng_core::rpf9toc::sniff_ext(&data) };
+                                let file = format!("{:09x}.{ext}", e.offset);
                                 std::fs::write(dir.join(&file), &data)?;
                                 bytes += data.len() as u64;
                                 rec["file"] = json!(file);
@@ -2889,8 +2891,8 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
 type TocVisit<'a> = dyn FnMut(&mut dyn sixng_core::rpf9toc::ArchiveCipher, &mut std::fs::File, u64, &sixng_core::rpf9toc::Toc, &[sixng_core::rpf9toc::FileEntry]) -> Result<()> + 'a;
 
 /// Visit the table of contents at `base` and those of the archives stored
-/// inside it. An archive without the known file entry column is visited with
-/// no entries.
+/// inside it. An archive without a known entry column is visited with no
+/// entries.
 fn toc_walk(cipher: &mut dyn sixng_core::rpf9toc::ArchiveCipher, f: &mut std::fs::File, base: u64, visit: &mut TocVisit) -> Result<()> {
     use sixng_core::rpf9toc;
     let toc = rpf9toc::open_toc(cipher, f, base).map_err(|e| anyhow!("table of contents at {base:#x}: {e:#}"))?;
