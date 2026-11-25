@@ -774,15 +774,22 @@ again**).
   on the shared skeleton. Clothes and accessories follow the skin under
   them (each point moves with the nearest skin vertices), because the
   data the game shapes clothes with is not decoded. Small accessories
-  move as one piece. A helper bone's scale shapes its own vertices but
-  does not carry into the bones under it (since 2026-11-25; before, the
-  rig's up-to-3x scales on the chest helpers pushed the bones below them
-  several centimetres out, which tore the chest of heavy male shapes;
-  `--body-shape` exports pose the same way).
-  This is inferred from the results, not read from the game. The game's
-  rig and its body-shape presets have no face controls, so the face does
-  not change with the sliders. Each rig also reads 14 inputs that no
-  known control drives; they stay at 0. The game has two body-shape
+  move as one piece. Bones are posed the way the game's skeleton update
+  does it (read from its code, since 2026-11-25): each bone keeps a
+  model-space rotation, translation and scale; a child's rotation is the
+  parent's times its own, its translation is the parent's plus the
+  parent's rotation applied to its own translation scaled per axis by the
+  parent's scale, and its scale is the parent's times its own, per axis.
+  So a helper bone's scale reaches the bones under it in each bone's own
+  axes, without the shear a matrix product adds; before, the matrix
+  product tore the chest of heavy male shapes. `--body-shape` exports
+  pose the same way (the joint world matrices match the game; a joint's
+  local matrix can carry shear, which TRS joint nodes cannot hold). The
+  game's rig and its body-shape presets have no face controls, so the
+  face does not change with the sliders. Each rig also reads 14 inputs
+  that no known control drives; they stay at 0. They act on the neck,
+  breasts and chest, hips and thighs, and upper arms, so they look like
+  extra shape controls. The game has two body-shape
   rigs, female and male. The body type comes from the part's fit tag:
   every tag that starts with `m` (`mr1`, `mb1`, `mo1`, `mc1`, `msk1`) gets
   the male rig and skeleton. Before 2026-11-25, only `mr1` did, and the

@@ -270,6 +270,13 @@ fn to_trs(m: &[f32; 16]) -> ([f32; 3], Quat, [f32; 3]) {
     }
     ([a(0, 3), a(1, 3), a(2, 3)], m2q(r), s)
 }
+/// Rotate v by the unit quaternion q.
+fn qrot(q: Quat, v: [f32; 3]) -> [f32; 3] {
+    let [x, y, z, w] = q;
+    // t = 2 (q.xyz x v); v' = v + w t + q.xyz x t
+    let t = [2.0 * (y * v[2] - z * v[1]), 2.0 * (z * v[0] - x * v[2]), 2.0 * (x * v[1] - y * v[0])];
+    [v[0] + w * t[0] + (y * t[2] - z * t[1]), v[1] + w * t[1] + (z * t[0] - x * t[2]), v[2] + w * t[2] + (x * t[1] - y * t[0])]
+}
 fn from_trs(t: [f32; 3], q: Quat, s: [f32; 3]) -> [f32; 16] {
     let n = (q.iter().map(|x| x * x).sum::<f32>()).sqrt().max(1e-12);
     let [x, y, z, w] = q.map(|v| v / n);
@@ -362,33 +369,31 @@ pub fn pose(bones: &[Bone], rig: &Rig, inputs: &HashMap<u32, f32>) -> Option<(Ve
             }
         }
     }
-    // A bone's scale shapes its own vertices but does not carry into its
-    // children: a child sits at its translation from the parent's unscaled
-    // frame. The rig scales helper bones by up to about 3x along one axis;
-    // passed down, that moves the child bones under them several
-    // centimetres further (torn chest folds and pointed chests on heavy
-    // shapes). Inferred from the results, not read from the game.
+    // Model transforms as the game's skeleton update builds them: each bone
+    // keeps (rotation, translation, scale) in model space, composed from its
+    // parent's as rotation = parent rotation * local rotation, translation =
+    // parent translation + parent rotation applied to (parent scale * local
+    // translation, per axis), scale = parent scale * local scale (per axis).
+    // So a helper bone's scale reaches the bones under it, in each bone's own
+    // axes, without the shear a matrix product would add. A vertex is then
+    // rotation * (scale * (inverse bind * vertex)) + translation.
     let mut out = binds.clone();
-    // each bone's model transform without its own scale
-    let mut frame = binds.clone();
+    let mut model: Vec<([f32; 3], Quat, [f32; 3])> = binds.iter().map(to_trs).collect();
     for i in 0..bones.len() {
-        // parents come before children in RAGE skeletons; fall back to bind
-        // untouched bones keep their bind offset (no scale) as it is
-        let (unscaled, s) = if touched[i] {
-            (from_trs(trs[i].0, trs[i].1, [1.0; 3]), trs[i].2)
-        } else {
-            let local = match bones[i].parent {
-                Some(p) => mul(&affine_inverse(&binds[p as usize]), &binds[i]),
-                None => binds[i],
-            };
-            (local, [1.0; 3])
+        let (lt, lq, ls) = trs[i];
+        model[i] = match bones[i].parent {
+            // parents come before children in RAGE skeletons; fall back to bind
+            Some(p) if (p as usize) < i => {
+                let (pt, pq, ps) = model[p as usize];
+                let r = qrot(pq, [ps[0] * lt[0], ps[1] * lt[1], ps[2] * lt[2]]);
+                ([pt[0] + r[0], pt[1] + r[1], pt[2] + r[2]], qmul(pq, lq), [ps[0] * ls[0], ps[1] * ls[1], ps[2] * ls[2]])
+            }
+            Some(_) => continue,
+            None => (lt, lq, ls),
         };
-        frame[i] = match bones[i].parent {
-            Some(p) if (p as usize) < i => mul(&frame[p as usize], &unscaled),
-            Some(_) => binds[i],
-            None => unscaled,
-        };
-        out[i] = if s == [1.0; 3] { frame[i] } else { mul(&frame[i], &from_trs([0.0; 3], [0.0, 0.0, 0.0, 1.0], s)) };
+        if touched[i] || bones[i].parent.is_some_and(|p| (p as usize) < i && out[p as usize] != binds[p as usize]) {
+            out[i] = from_trs(model[i].0, model[i].1, model[i].2);
+        }
     }
     Some((out, applied))
 }
@@ -511,14 +516,17 @@ mod tests {
     }
 
     #[test]
-    fn scale_does_not_carry_to_children() {
-        let bone = |i: u16, name: &str, parent: Option<u16>, z: f32| {
-            let mut b: Bone = serde_json::from_value(serde_json::json!({"index": i, "name": name, "parent": parent, "next_sibling": null, "flags": 0, "hash16": 0, "rotation": [0.0, 0.0, 0.0, 1.0], "translation": [0.0, 0.0, z], "scale": [1.0, 1.0, 1.0]})).unwrap();
-            b.bind_matrix = Some(from_trs([0.0, 0.0, z], [0.0, 0.0, 0.0, 1.0], [1.0; 3]));
+    fn scale_carries_to_children_per_axis() {
+        // child rotated by `cq` relative to its parent
+        let bone = |i: u16, name: &str, parent: Option<u16>, z: f32, q: Quat| {
+            let mut b: Bone = serde_json::from_value(serde_json::json!({"index": i, "name": name, "parent": parent, "next_sibling": null, "flags": 0, "hash16": 0, "rotation": q, "translation": [0.0, 0.0, z], "scale": [1.0, 1.0, 1.0]})).unwrap();
+            b.bind_matrix = Some(from_trs([0.0, 0.0, z], q, [1.0; 3]));
             b
         };
-        // root at 0, parent at 1 m, child 0.1 m above the parent
-        let bones = vec![bone(0, "root", None, 0.0), bone(1, "parent", Some(0), 1.0), bone(2, "child", Some(1), 1.1)];
+        let id = [0.0, 0.0, 0.0, 1.0];
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        // root at 0, parent at 1 m, child 0.1 m above the parent and turned 90 degrees about x
+        let bones = vec![bone(0, "root", None, 0.0, id), bone(1, "parent", Some(0), 1.0, id), bone(2, "child", Some(1), 1.1, [h, 0.0, 0.0, h])];
         let rig = Rig {
             registers: 4,
             inputs: HashMap::from([(7, 0)]),
@@ -527,9 +535,15 @@ mod tests {
         };
         let (m, applied) = pose(&bones, &rig, &HashMap::from([(7, 1.0)])).unwrap();
         assert_eq!(applied, 1);
-        // the parent is scaled 3x along z; the child keeps its 0.1 m offset
+        // the parent is scaled 3x along z
         assert!((m[1][10] - 3.0).abs() < 1e-5);
-        assert!((m[2][14] - 1.1).abs() < 1e-5);
-        assert!((m[2][10] - 1.0).abs() < 1e-5);
+        // the child's offset is scaled with it: 1 + 3 * 0.1
+        assert!((m[2][14] - 1.3).abs() < 1e-5);
+        // and its own z axis (pointing along -y in the model) is 3 long, its
+        // y axis (along z in the model) stays 1 long: no shear
+        let len = |c: usize| (m[2][c * 4].powi(2) + m[2][c * 4 + 1].powi(2) + m[2][c * 4 + 2].powi(2)).sqrt();
+        assert!((len(2) - 3.0).abs() < 1e-5);
+        assert!((len(1) - 1.0).abs() < 1e-5);
+        assert!((m[2][9] + 3.0).abs() < 1e-5);
     }
 }
