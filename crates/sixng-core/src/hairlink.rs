@@ -75,7 +75,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::OnceLock;
 
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
 const ITEM: u32 = 0xf795_e8ba;
 const TAG_PLACEHOLDER: u32 = 0x023e_5a2f;
 const STATE_BASE: u32 = 0x44e2_1c90;
@@ -685,31 +685,36 @@ fn game_root(a: &crate::game::ArchiveInfo) -> std::path::PathBuf {
 
 /// Piece words of groom files: a piece is `<placeholder without _full>_<word>`,
 /// the word also with a number (`WORD_NUMBERS`: `base2`, `top_02`). Read
-/// off the piece files the table of contents names.
+/// off the piece files the table of contents names, and for fur from a
+/// search over two-word compounds (`leg_front`, `earsflyaways`).
 const PIECE_WORDS: &[&str] = &[
     "accessory", "accs", "arms", "baby", "babyhair", "babyhair_back", "babyhair_front", "babyhairback", "back", "back_base", "back_crown", "back_filler",
-    "backbase", "bangs", "base", "base_babyhair", "base_back", "base_bottom", "base_braids", "base_clumps", "base_filler", "base_flyaways", "base_fringe",
-    "base_front", "base_full", "base_hairline", "base_nape", "base_pony", "base_ponytail", "base_top", "baseback", "basebottom", "basecap", "baseclumps",
-    "basefill", "basefiller", "baseflyaways", "basefront", "baselower", "basetop", "beardstache", "belly", "bellyflyaway", "bellyflyaways", "body",
-    "body_front", "body_rear", "bodyback", "bodyclump", "bodyclumps", "bodyfiller", "bodyflyaways", "bodyfront", "bodyfuzz", "bodymiddle", "bodyupper",
-    "bot", "bottom", "bottom_base", "bottom_braids", "bottom_clumps", "bottom_filler", "bottom_hairline", "bottom_transition", "bottombase", "braid",
-    "braid_base", "braid_filler", "braidbase", "braidbun", "braidleft", "braidloose", "braidright", "braidroots", "braids", "braids_bottom",
-    "braids_filler", "braids_fringe", "braids_loose", "braids_tie", "braids_top", "braidsback", "braidsbase", "braidsbody", "braidsbun", "braidsfront",
-    "braidshort", "braidsides", "braidsloose", "braidsshort", "brow", "brows", "btm", "bun", "bun_braid", "bun_clumps", "bun_flyaways", "bun_loose",
-    "bunbase", "buncurls", "bunfiller", "bunloose", "buzz", "buzz_base", "buzz_cap", "buzz_filler", "buzzfiller", "cap", "cap_front", "chest", "chin",
-    "chop", "clump", "clumps", "clumps_right", "crown", "curls", "curls_base", "curly", "curly_base", "detail", "ear", "earflyaway", "earflyaways",
-    "eyelashes", "fade", "fade_filler", "fade_top", "fadelower", "fadetop", "feet", "feetflyaways", "fill", "filler", "filler_back", "filler_braids",
-    "filler_cap", "filler_front", "filler_pony", "fillerfront", "flyaway", "flyawaybody", "flyaways", "flyaways_top", "flyawaytail", "fringe",
-    "fringe_braids", "fringe_filler", "fringe_hairline", "fringefiller", "front", "front_clumps", "front_filler", "full", "fullbody", "fuzz", "hairline",
-    "hands", "head", "head_long", "head_short", "headclump", "headclumps", "headfiller", "headflyaway", "headflyaways", "headlong", "headneck",
-    "headshort", "heart", "left", "leg", "legback", "legflyaways", "legfront", "legs", "legsback", "legsflyaways", "legsfront", "legshort", "legsmoss",
-    "line", "long", "loose", "loosefront", "loosetop", "lower", "lowerflyaways", "main", "mainleft", "mid", "middle", "moss", "moustache", "mustache",
-    "mustache_base", "nape", "nape_filler", "neck", "neckfiller", "neckflyaways", "necklower", "peach", "pony", "pony_base", "pony_flyaways", "pony_tie",
-    "ponybase", "ponytail", "ponytail_base", "ponytail_braids", "ponytail_clumps", "ponytail_filler", "ponytail_flyaways", "ponytail_tie", "ponytailbase",
-    "ponytailfront", "ponytailtie", "ponytie", "rear", "right", "roots", "shoe", "short", "short_base", "shoulder", "side", "sideburn", "sideburns",
-    "sidecurls", "sides", "strands", "strip", "tail", "tailflyaway", "tailflyaways", "tailheart", "tie", "top", "top_back", "top_base", "top_braids",
-    "top_clumps", "top_filler", "top_flyaways", "top_front", "top_full", "topbase", "topclumps", "topfill", "topfiller", "topflyaways", "transition",
-    "tube", "upper"
+    "backbase", "backlegflyaways", "bangs", "base", "base_babyhair", "base_back", "base_bottom", "base_braids", "base_clumps", "base_filler",
+    "base_flyaways", "base_fringe", "base_front", "base_full", "base_hairline", "base_nape", "base_pony", "base_ponytail", "base_top", "baseback",
+    "basebottom", "basecap", "baseclumps", "basefill", "basefiller", "baseflyaways", "basefront", "baselower", "basetop", "beard", "beardstache", "belly",
+    "bellyflyaway", "bellyflyaways", "body", "body_front", "body_lower", "body_rear", "bodyback", "bodybacklower", "bodyclump", "bodyclumps",
+    "bodyfiller", "bodyflyaways", "bodyfront", "bodyfrontlower", "bodyfuzz", "bodymiddle", "bodypom", "bodyupper", "bot", "bottom", "bottom_base",
+    "bottom_braids", "bottom_clumps", "bottom_filler", "bottom_hairline", "bottom_transition", "bottombase", "braid", "braid_base", "braid_filler",
+    "braidbase", "braidbun", "braidleft", "braidloose", "braidright", "braidroots", "braids", "braids_bottom", "braids_filler", "braids_fringe",
+    "braids_loose", "braids_tie", "braids_top", "braidsback", "braidsbase", "braidsbody", "braidsbun", "braidsfront", "braidshort", "braidsides",
+    "braidsloose", "braidsshort", "brow", "brows", "btm", "bun", "bun_braid", "bun_clumps", "bun_flyaways", "bun_loose", "bunbase", "buncurls",
+    "bunfiller", "bunloose", "buzz", "buzz_base", "buzz_cap", "buzz_filler", "buzzfiller", "cap", "cap_front", "chest", "chestpom", "chin", "chop",
+    "clump", "clumps", "clumps_right", "crown", "curls", "curls_base", "curly", "curly_base", "detail", "ear", "ear_flyaways", "earflyaway",
+    "earflyaways", "ears", "earsflyaway", "earsflyaways", "earspom", "eyeflyaways", "eyelashes", "faceflyaways", "fade", "fade_filler", "fade_top",
+    "fadelower", "fadetop", "feet", "feetflyaways", "fill", "filler", "filler_back", "filler_braids", "filler_cap", "filler_front", "filler_pony",
+    "fillerfront", "flyaway", "flyawaybody", "flyaways", "flyaways_top", "flyawaytail", "fringe", "fringe_braids", "fringe_filler", "fringe_hairline",
+    "fringefiller", "front", "front_clumps", "front_filler", "full", "fullbody", "fuzz", "hairline", "hands", "head", "head_clump", "head_ears",
+    "head_flyaways", "head_long", "head_neck", "head_short", "head_top", "head_whiskers", "headclump", "headclumps", "headfiller", "headflyaway",
+    "headflyaways", "headflyawayshairline", "headlong", "headneck", "headpom", "headshort", "heart", "hooves", "left", "leg", "leg_back", "leg_front",
+    "legback", "legflyaways", "legfront", "legs", "legs_back", "legs_front", "legsback", "legsbacklower", "legsflyaways", "legsfront", "legsfrontlower",
+    "legshort", "legsmoss", "line", "long", "loose", "loosefront", "loosetop", "lower", "lowerbodyflyaways", "lowerflyaways", "main", "mainleft", "mane",
+    "mid", "middle", "moss", "moustache", "mustache", "mustache_base", "nape", "nape_filler", "neck", "neck_head", "neckfiller", "neckflyaways",
+    "necklower", "paws", "peach", "pony", "pony_base", "pony_flyaways", "pony_tie", "ponybase", "ponytail", "ponytail_base", "ponytail_braids",
+    "ponytail_clumps", "ponytail_filler", "ponytail_flyaways", "ponytail_tie", "ponytailbase", "ponytailfront", "ponytailtie", "ponytie", "rear",
+    "rearlegflyaways", "rearpom", "right", "roots", "shoe", "short", "short_base", "shoulder", "side", "sideburn", "sideburns", "sidecurls", "sides",
+    "strands", "strip", "tail", "tailflyaway", "tailflyaways", "tailheart", "tailpom", "tie", "top", "top_back", "top_base", "top_braids", "top_clumps",
+    "top_filler", "top_flyaways", "top_front", "top_full", "topbase", "topclumps", "topfill", "topfiller", "topflyaways", "transition", "tube", "upper",
+    "whisker", "whiskers"
 ];
 const WORD_NUMBERS: [&str; 7] = ["", "1", "2", "3", "4", "_2", "_02"];
 
