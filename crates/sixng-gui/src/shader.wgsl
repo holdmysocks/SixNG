@@ -154,6 +154,15 @@ fn mesh_vertex(v: VIn) -> VOut {
         let rmin = min(0.5 * npx / max(ppm, 1e-3), 0.005);
         if (uv1.y > 1.5) { uv1.x = clamp(r / rmin, 0.0, 1.0); }
         wp = w.xyz + side * edge * max(r, rmin);
+        // the sun shadow pass (no target size) with a widening factor: the ribbon of the game's ray-traced passes,
+        // flat, turned by a random direction per strand (here a hash of the strand's root normal; the game's own
+        // hash is not read) and the factor times its own width
+        if (F.jitter.y > 1.0e8 && F.jitter.x >= 1.0) {
+            let hsh = fract(sin(vec3(dot(v.nrm, vec3(12.9898, 78.233, 37.719)), dot(v.nrm, vec3(39.346, 11.135, 83.155)), dot(v.nrm, vec3(73.156, 52.235, 9.151)))) * 43758.5453) * 2.0 - 1.0;
+            var rs = cross(td, normalize(hsh + vec3(1.0e-4, 0.0, 0.0)));
+            rs = rs / max(length(rs), 1e-5);
+            wp = w.xyz + rs * edge * r * F.jitter.x;
+        }
     }
     o.clip = F.view_proj * vec4(wp, 1.0);
     o.world = wp;

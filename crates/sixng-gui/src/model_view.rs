@@ -403,7 +403,7 @@ fn strand_lod(lp: &serde_json::Value, ramp: &sixng_core::hairtone::ParamRamp, co
     if version != 1 && version != 2 {
         return None;
     }
-    Some(glb::StrandLod { strands: coat.guides.len() as u32, stored: coat.stored as u32, version, t, target: num("TargetThickness")?, dist_scale: num("DistanceScale")?, min_dist: num("MinDistance")?, use_curve: num("UseThicknessCurve")?, cutoff: num("DistanceCutoff").unwrap_or(f32::MAX), radius: 0.0, shadow_scale: num("ShadowLodScale").unwrap_or(1.0) })
+    Some(glb::StrandLod { strands: coat.guides.len() as u32, stored: coat.stored as u32, version, t, target: num("TargetThickness")?, dist_scale: num("DistanceScale")?, min_dist: num("MinDistance")?, use_curve: num("UseThicknessCurve")?, cutoff: num("DistanceCutoff").unwrap_or(f32::MAX), radius: 0.0, shadow_scale: num("ShadowLodScale").unwrap_or(1.0), gi_scale: num("GILodScale").unwrap_or(0.0), gi_cutoff: num("GIDistanceCutoff").unwrap_or(f32::MAX) })
 }
 
 /// A painted hair layer of the head skin with its two colours: the hair

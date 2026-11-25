@@ -65,6 +65,9 @@ pub struct StrandLod {
     pub radius: f32,
     /// ShadowLodScale: the sun shadow pass draws this share of the main pass's share.
     pub shadow_scale: f32,
+    /// GILodScale and GIDistanceCutoff: the share of the drawn strands the game's ray-traced passes keep.
+    pub gi_scale: f32,
+    pub gi_cutoff: f32,
 }
 
 impl StrandLod {
@@ -99,6 +102,17 @@ impl StrandLod {
         s + (b - s) * self.use_curve.max(0.1)
     }
 
+    /// The game's ray-traced passes (its ray-traced sun shadows among them): of the `m` strands the main pass
+    /// draws, the first n = m x min(1, GILodScale) rounded down to a power of two are kept, each as a ribbon
+    /// m / n times its own width, so the summed width stays. None past the GI cutoff distance. Returns n.
+    pub fn traced_strands(&self, m: f32, d: f32, tan: f32) -> f32 {
+        let x = m * self.gi_scale.clamp(0.0, 1.0);
+        if x < 1.0 || 2.0 * d * tan > self.gi_cutoff {
+            return 0.0;
+        }
+        2f32.powf(x.log2().floor())
+    }
+
     /// Indices to draw of the mesh's `n_idx` for a share of the stored strands.
     pub fn indices(&self, n_idx: u32, share: f32) -> u32 {
         if self.strands == 0 {
@@ -116,7 +130,7 @@ mod strand_lod_tests {
     #[test]
     fn the_strand_count_falls_with_distance() {
         // long head hair: mean width 0.23 mm, TargetThickness 1.5, DistanceScale 1, MinDistance 0.1, UseThicknessCurve 0.5
-        let l = StrandLod { strands: 800, stored: 1000, version: 2, t: 2.3e-4, target: 1.5, dist_scale: 1.0, min_dist: 0.1, use_curve: 0.5, cutoff: 100.0, radius: 0.0, shadow_scale: 0.15 };
+        let l = StrandLod { strands: 800, stored: 1000, version: 2, t: 2.3e-4, target: 1.5, dist_scale: 1.0, min_dist: 0.1, use_curve: 0.5, cutoff: 100.0, radius: 0.0, shadow_scale: 0.15, gi_scale: 0.1, gi_cutoff: 100.0 };
         // a 1440-pixel view with tan(fov / 2) = 0.5
         for (d, want) in [(0.5, 0.883), (1.0, 0.442), (2.0, 0.221), (5.0, 0.088)] {
             assert!((l.share(d, 1440.0, 0.5) - want).abs() < 2e-3, "{d}: {}", l.share(d, 1440.0, 0.5));
@@ -128,12 +142,16 @@ mod strand_lod_tests {
         // the mesh holds the first 800 of 1000 strands, 6 indices each
         assert_eq!(l.indices(4800, 1.0), 4800);
         assert_eq!(l.indices(4800, 0.442), 6 * 442);
+        // ray-traced passes: of 442 drawn strands 44.2 would be kept, rounded down to 32; none past the cutoff
+        assert_eq!(l.traced_strands(442.0, 1.0, 0.5), 32.0);
+        assert_eq!(l.traced_strands(442.0, 120.0, 0.5), 0.0);
+        assert_eq!(l.traced_strands(5.0, 1.0, 0.5), 0.0);
     }
 
     #[test]
     fn fur_follows_the_first_version_of_the_rule() {
         // fur 0.21 mm wide, DistanceScale 1, UseThicknessCurve 0, extent 0.3 m
-        let l = StrandLod { strands: 1000, stored: 1000, version: 1, t: 2.1e-4, target: 1.5, dist_scale: 1.0, min_dist: 0.1, use_curve: 0.0, cutoff: 100.0, radius: 0.3, shadow_scale: 0.25 };
+        let l = StrandLod { strands: 1000, stored: 1000, version: 1, t: 2.1e-4, target: 1.5, dist_scale: 1.0, min_dist: 0.1, use_curve: 0.0, cutoff: 100.0, radius: 0.3, shadow_scale: 0.25, gi_scale: 0.0, gi_cutoff: 100.0 };
         // at 2.3 m: q = t / (2 x 0.5) = 2.1e-4, a = min(1, 960 q) = 0.2016, b = min(1, 2880 q) = 0.6048, fd = 0.217
         let f = l.share(2.3, 1440.0, 0.5);
         assert!((f - (0.2016 + (0.6048 - 0.2016) * 0.1)).abs() < 1e-3, "{f}");

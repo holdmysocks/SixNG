@@ -334,6 +334,8 @@ pub struct GpuMesh {
     pub n_draw: std::sync::atomic::AtomicU32,
     /// The same for the sun shadow map.
     pub n_shadow: std::sync::atomic::AtomicU32,
+    /// Which of the shadow pass's frame groups the mesh is drawn with (0: the plain one).
+    pub shadow_slot: std::sync::atomic::AtomicU32,
 }
 
 pub struct GpuModel {
@@ -455,6 +457,11 @@ pub struct Renderer3D {
     pub shadows: bool,
     shadow_ub: wgpu::Buffer,
     shadow_frame_bg: wgpu::BindGroup,
+    /// More frame groups for the shadow pass: one per strand piece, each with the piece's widening factor.
+    shadow_extra: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
+    /// Strands enter the shadow map by the rule of the game's ray-traced sun shadows (fewer, wider ribbons);
+    /// off: by the rule of its cascade shadow pass (SIXNG_SHADOWS=map).
+    pub shadow_traced: bool,
     pipe_shadow: wgpu::RenderPipeline,
     light_vp: [[f32; 4]; 4],
     /// Map cells: opaque, decal, decal blend, blend pipelines.
@@ -1154,7 +1161,14 @@ impl Renderer3D {
             mapped_at_creation: false,
         });
         // the shadow pass's own frame group: the light's matrices, and a 1-texel map in place of the one it draws
-        let shadow_frame_bg = frame_bind_group(device, &bgl_frame, &shadow_ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &hair_luts, &(shadow_tex(1), shadow_sampler));
+        let shadow_frame_bg = frame_bind_group(device, &bgl_frame, &shadow_ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &hair_luts, &(shadow_tex(1), shadow_sampler.clone()));
+        let shadow_extra: Vec<(wgpu::Buffer, wgpu::BindGroup)> = (0..if shadows { 15 } else { 0 })
+            .map(|_| {
+                let ub = device.create_buffer(&wgpu::BufferDescriptor { label: Some("shadow frame ub"), size: std::mem::size_of::<FrameU>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+                let bg = frame_bind_group(device, &bgl_frame, &ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &hair_luts, &(shadow_tex(1), shadow_sampler.clone()));
+                (ub, bg)
+            })
+            .collect();
         let pipe_shadow = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("sun shadow"),
             layout: Some(&layout),
@@ -1297,6 +1311,8 @@ impl Renderer3D {
             shadows,
             shadow_ub,
             shadow_frame_bg,
+            shadow_extra,
+            shadow_traced: std::env::var("SIXNG_SHADOWS").map_or(true, |v| v != "map"),
             pipe_shadow,
             light_vp: [[0.0; 4]; 4],
             hair_tried: false,
@@ -1754,6 +1770,7 @@ impl Uploader {
                     strand_lod: me.strand_lod,
                     n_draw: std::sync::atomic::AtomicU32::new(me.indices.len() as u32),
                     n_shadow: std::sync::atomic::AtomicU32::new(me.indices.len() as u32),
+                    shadow_slot: std::sync::atomic::AtomicU32::new(0),
                 });
             }
         }
@@ -2037,9 +2054,10 @@ impl Renderer3D {
     /// main share, as the game's sun shadow pass does. Models skinned on the GPU are left out (their joints are bound
     /// with the main pass's frame group); the character viewer poses its
     /// parts on the CPU.
-    fn record_shadow(pipe: &wgpu::RenderPipeline, frame_bg: &wgpu::BindGroup, be: &mut wgpu::RenderPass<'_>, models: &[&GpuModel]) {
+    fn record_shadow(pipe: &wgpu::RenderPipeline, frame_bg: &wgpu::BindGroup, extra: &[(wgpu::Buffer, wgpu::BindGroup)], be: &mut wgpu::RenderPass<'_>, models: &[&GpuModel]) {
         be.set_pipeline(pipe);
         be.set_bind_group(0, Some(frame_bg), &[]);
+        let mut slot = 0usize;
         for gm in models {
             if gm.n_normal() == 0 || gm.meshes.iter().any(|m| m.skinned) {
                 continue;
@@ -2049,6 +2067,11 @@ impl Renderer3D {
             for me in gm.meshes.iter().filter(|m| m.visible && m.n_idx > 0) {
                 if gm.mat_alpha[me.material] == 2 || matches!(gm.mat_class[me.material], 5 | 6 | 8) || gm.mat_decal[me.material].is_some() {
                     continue;
+                }
+                let want = (me.shadow_slot.load(std::sync::atomic::Ordering::Relaxed) as usize).min(extra.len());
+                if want != slot {
+                    be.set_bind_group(0, Some(if want == 0 { frame_bg } else { &extra[want - 1].1 }), &[]);
+                    slot = want;
                 }
                 be.set_bind_group(1, Some(&gm.mat_bg[me.material]), &[]);
                 if bound != Some(&me.vb) {
@@ -2233,12 +2256,28 @@ impl Renderer3D {
         }
         // strand count by distance (from the eye to the piece's centre; the model's own placement is taken as none)
         let eye = cam.eye();
+        let mut slots = 0u32;
         for me in models.iter().flat_map(|gm| gm.meshes.iter()) {
             if let Some(l) = me.strand_lod {
                 let d = (eye - me.centre).length();
                 let f = l.share(d, size[1] as f32, (cam.fov * 0.5).tan());
                 me.n_draw.store(l.indices(me.n_idx, f), std::sync::atomic::Ordering::Relaxed);
                 me.n_shadow.store(l.indices(me.n_idx, l.shadow_share(d, size[1] as f32, (cam.fov * 0.5).tan())), std::sync::atomic::Ordering::Relaxed);
+                me.shadow_slot.store(0, std::sync::atomic::Ordering::Relaxed);
+                // the ray-traced rule: the first n of the m drawn strands, each m / n times as wide (a piece of its own
+                // frame group carries the factor; pieces beyond the groups share the last one)
+                if let (true, Some(sf)) = (self.shadow_traced && !self.shadow_extra.is_empty(), shadow_fu.as_ref()) {
+                    let m = (l.stored as f32 * f).round();
+                    let n = l.traced_strands(m, d, (cam.fov * 0.5).tan());
+                    me.n_shadow.store(l.indices(me.n_idx, n / (l.stored as f32).max(1.0)), std::sync::atomic::Ordering::Relaxed);
+                    if n > 0.0 {
+                        slots = (slots + 1).min(self.shadow_extra.len() as u32);
+                        me.shadow_slot.store(slots, std::sync::atomic::Ordering::Relaxed);
+                        let mut g = *sf;
+                        g.jitter[0] = m / n;
+                        queue.write_buffer(&self.shadow_extra[slots as usize - 1].0, 0, bytemuck::bytes_of(&g));
+                    }
+                }
                 if std::env::var("SIXNG_DEBUG_HAIR").is_ok() {
                     static ONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if ONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
@@ -2279,7 +2318,7 @@ impl Renderer3D {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            Self::record_shadow(&self.pipe_shadow, &self.shadow_frame_bg, &mut sp, models);
+            Self::record_shadow(&self.pipe_shadow, &self.shadow_frame_bg, &self.shadow_extra, &mut sp, models);
         }
         {
             let c = look.clear;
