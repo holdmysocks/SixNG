@@ -2136,6 +2136,10 @@ impl ModelView {
                     if let Some(z) = self.zoom_after_load {
                         self.cam.dist *= z;
                     }
+                    // research: SIXNG_CAM_UP=<metres> raises the point the camera looks at (close-ups of a head)
+                    if let Some(u) = std::env::var("SIXNG_CAM_UP").ok().and_then(|v| v.parse::<f32>().ok()) {
+                        self.cam.target.y += u;
+                    }
                     self.material_sel = None;
                 }
                 self.status = format!(
