@@ -456,6 +456,10 @@ pub struct Renderer3D {
     pub cells: Vec<(std::sync::Arc<CellGpu>, Vec<u16>)>,
     /// LOD distance scale of the cell ranges (detail setting).
     pub lod_k: f32,
+    /// Index of the strand dither pattern (0 in the live view; screenshots
+    /// that average several frames step it, as the game's dither changes
+    /// every frame and its temporal filter averages it).
+    pub dither_frame: f32,
     /// Map view: building glass drawn dark and mostly opaque (misc3.z).
     pub map_glass: bool,
     /// Draw calls of the coverage fallbacks in the last frame: models, cells.
@@ -1218,6 +1222,7 @@ impl Renderer3D {
             bgl_cell,
             cells: Vec::new(),
             lod_k: 1.0,
+            dither_frame: 0.0,
             map_glass: false,
             fb_draws: [0, 0],
         }
@@ -1932,7 +1937,7 @@ impl Renderer3D {
             ],
             prev_view_proj: vp.to_cols_array_2d(),
             // w: vehicle wear (0 to 1)
-            jitter: [0.0, self.target.as_ref().map_or(aspect * 1080.0, |t| t.size[0] as f32), self.target.as_ref().map_or(1080.0, |t| t.size[1] as f32), look.wear],
+            jitter: [self.dither_frame, self.target.as_ref().map_or(aspect * 1080.0, |t| t.size[0] as f32), self.target.as_ref().map_or(1080.0, |t| t.size[1] as f32), look.wear],
         }
     }
 

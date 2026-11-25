@@ -377,7 +377,7 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {
     // a strand thinner than its drawn width: the game keeps a pixel with a probability equal to the
     // covered share (a dither it averages over frames); here each sample of the pixel is kept or not
     if (M.flags.y == 12u && i.uv1.y > 1.5 && i.uv1.x < 0.999) {
-        let j = fract(dot(i.tint.rgb, vec3(12.9898, 78.233, 37.719))) * 64.0;
+        let j = fract(dot(i.tint.rgb, vec3(12.9898, 78.233, 37.719))) * 64.0 + F.jitter.x * 5.588238;
         var mk = 0u;
         for (var s = 0u; s < 4u; s++) {
             if (i.uv1.x >= ign(i.clip.xy + vec2(j + f32(s) * 5.588, j + f32(s) * 9.123))) { mk |= 1u << s; }

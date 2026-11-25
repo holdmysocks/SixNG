@@ -694,6 +694,8 @@ pub struct ModelView {
     pub work: String,
     pub size: [u32; 2],
     last_shot: Option<String>,
+    /// Frames summed for an averaged screenshot (count, linear sums).
+    shot_acc: (u32, Vec<f32>),
     pub zoom_after_load: Option<f32>,
     keep_cam_once: bool,
     /// Head bone matrix the hair models were last placed with, and how many.
@@ -1015,6 +1017,7 @@ impl ModelView {
             work: work.into(),
             size: [0, 0],
             last_shot: None,
+            shot_acc: (0, Vec::new()),
             zoom_after_load: None,
             keep_cam_once: false,
             hair_head: None,
@@ -4024,8 +4027,36 @@ impl ModelView {
             let busy = self.wheel_loading || self.brake_loading || matches!(&*self.vehicles.state.lock().unwrap(), crate::vehicle_db::State::Loading(_));
             let ready = (self.gpu.is_some() && !self.loading && self.frames_since_load >= 3 && settled)
                 || (!self.loading && !self.hair.fitting && !self.auto.find_hair && !self.auto.export_hair && self.hair.settled() && self.auto.frames > 600 && !self.livery.ed.busy() && (!busy || ctx.input(|i| i.time) > 180.0));
+            // SIXNG_SHOT_FRAMES=<n> (up to 64): the screenshot is the mean of n frames, each with another strand
+            // dither pattern (the game averages its per-frame dither over time)
+            let frames = std::env::var("SIXNG_SHOT_FRAMES").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1).clamp(1, 64);
+            let mut averaged = None;
+            let ready = ready && (frames == 1 || match ren.read_back(rs) {
+                Some((w, h, px)) => {
+                    if self.shot_acc.1.len() != px.len() {
+                        self.shot_acc = (0, vec![0.0; px.len()]);
+                    }
+                    for (i, (a, p)) in self.shot_acc.1.iter_mut().zip(&px).enumerate() {
+                        let x = *p as f32 / 255.0;
+                        *a += if i % 4 == 3 { x } else { x.powf(2.2) };
+                    }
+                    self.shot_acc.0 += 1;
+                    ren.dither_frame = self.shot_acc.0 as f32;
+                    if self.shot_acc.0 >= frames {
+                        let n = self.shot_acc.0 as f32;
+                        averaged = Some((w, h, self.shot_acc.1.iter().enumerate().map(|(i, a)| { let x = a / n; ((if i % 4 == 3 { x } else { x.powf(1.0 / 2.2) }) * 255.0 + 0.5) as u8 }).collect::<Vec<u8>>()));
+                        self.shot_acc = (0, Vec::new());
+                        ren.dither_frame = 0.0;
+                        true
+                    } else {
+                        ctx.request_repaint();
+                        false
+                    }
+                }
+                None => true,
+            });
             if ready {
-                if let Some((w, h, px)) = ren.read_back(rs) {
+                if let Some((w, h, px)) = averaged.or_else(|| ren.read_back(rs)) {
                     match render3d::save_png(&path, w, h, &px) {
                         Ok(()) => self.last_shot = Some(format!("saved {}", path.display())),
                         Err(e) => self.last_shot = Some(format!("screenshot failed: {e}")),
