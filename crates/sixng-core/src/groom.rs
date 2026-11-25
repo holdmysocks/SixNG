@@ -564,10 +564,13 @@ impl Groom {
                 // with parameters: their own width at this point (metres), in place of the groom's width and taper
                 let r = pv.map_or(width * 0.5 * tap, |v| v[3] * 0.5);
                 for sg in [-1.0f32, 1.0] {
-                    pos.push([p[0] + side[0] * r * sg, p[1] + side[1] * r * sg, p[2] + side[2] * r * sg]);
+                    // with parameters the ribbon is left closed: the viewer opens it towards the eye, at least a pixel wide
+                    let rr = if pv.is_some() { 0.0 } else { r };
+                    pos.push([p[0] + side[0] * rr * sg, p[1] + side[1] * rr * sg, p[2] + side[2] * rr * sg]);
                     nrm.push(nr);
                     // w: which edge of the ribbon (-1 / +1), so the shader can round the normal across it
-                    tan.push([dir[0], dir[1], dir[2], sg]);
+                    // with parameters: the magnitude carries the half width, 2 + millimetres
+                    tan.push([dir[0], dir[1], dir[2], if pv.is_some() { sg * (2.0 + r * 1000.0) } else { sg }]);
                     if let Some(pv) = pv {
                         uv0.push([pv[0], pv[1]]);
                         // y: 1 = lit by the hair lighting; 2 + reflectance scale = by the standard lighting

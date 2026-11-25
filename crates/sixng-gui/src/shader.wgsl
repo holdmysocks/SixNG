@@ -16,7 +16,7 @@ struct Frame {
     misc2: vec4<f32>,     // x fog density, yzw secondary paint colour
     misc3: vec4<f32>,     // x tint palette on (1) / off (0), w the vehicle's own paint metalness
     prev_view_proj: mat4x4<f32>,
-    jitter: vec4<f32>,    // w vehicle wear (0 to 1)
+    jitter: vec4<f32>,    // y, z the target's width and height in pixels, w vehicle wear (0 to 1)
 };
 
 struct Mat {
@@ -128,12 +128,31 @@ fn mesh_vertex(v: VIn) -> VOut {
     let w = m * vec4(v.pos, 1.0);
     var o: VOut;
     o.lamp = lamp;
-    o.clip = F.view_proj * w;
-    o.world = w.xyz;
+    var wp = w.xyz;
+    var edge = v.tan.w;
+    var uv1 = v.uv1;
+    // a strand ribbon stored closed (|tan.w| = 2 + its half width in mm): opened towards the eye as the
+    // game does, to at least one pixel (its minimum drawn width, taken as one pixel), with the share of
+    // that width the strand really covers kept for the pixel shader (uv1.x) when it is lit as a standard surface
+    if (abs(v.tan.w) >= 2.0) {
+        let r = (abs(v.tan.w) - 2.0) * 0.001;
+        edge = sign(v.tan.w);
+        let td = normalize((m * vec4(v.tan.xyz, 0.0)).xyz);
+        var side = cross(td, normalize(F.cam_pos.xyz - w.xyz));
+        side = side / max(length(side), 1e-5);
+        let c0 = F.view_proj * w;
+        let c1 = F.view_proj * vec4(w.xyz + side, 1.0);
+        let ppm = length((c1.xy / c1.w - c0.xy / c0.w) * 0.5 * F.jitter.yz);
+        let rmin = 0.5 / max(ppm, 1e-3);
+        if (uv1.y > 1.5) { uv1.x = clamp(r / rmin, 0.0, 1.0); }
+        wp = w.xyz + side * edge * max(r, rmin);
+    }
+    o.clip = F.view_proj * vec4(wp, 1.0);
+    o.world = wp;
     o.nrm = (m * vec4(v.nrm, 0.0)).xyz;
-    o.tan = vec4((m * vec4(v.tan.xyz, 0.0)).xyz, v.tan.w);
+    o.tan = vec4((m * vec4(v.tan.xyz, 0.0)).xyz, edge);
     o.uv0 = v.uv0;
-    o.uv1 = v.uv1;
+    o.uv1 = uv1;
     o.col = v.col;
     o.extra = v.extra;
     // w: -1 on a mirrored instance (right-hand wheels): its triangles wind
@@ -335,8 +354,36 @@ fn hair_ambient(t: vec3<f32>, v: vec3<f32>, g0: f32, o: f32) -> f32 {
     return (0.31831 + 0.68169 * exp(-7.21348 * g0 * (1.0 - 0.5 * ((1.0 - f) + cos_o)))) * (0.195 + 0.91 * o);
 }
 
+struct MeshOut {
+    @location(0) col: vec4<f32>,
+    @builtin(sample_mask) mask: u32,
+};
+
+// interleaved gradient noise, as the game's strand visibility pass uses it
+fn ign(p: vec2<f32>) -> f32 {
+    return fract(52.9829 * fract(0.0671106 * p.x + 0.00583715 * p.y));
+}
+
 @fragment
-fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
+fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {
+    var o: MeshOut;
+    o.col = mesh_colour(i, ff);
+    o.mask = 0xffffffffu;
+    // a strand thinner than its drawn width: the game keeps a pixel with a probability equal to the
+    // covered share (a dither it averages over frames); here each sample of the pixel is kept or not
+    if (M.flags.y == 12u && i.uv1.y > 1.5 && i.uv1.x < 0.999) {
+        let j = fract(dot(i.tint.rgb, vec3(12.9898, 78.233, 37.719))) * 64.0;
+        var mk = 0u;
+        for (var s = 0u; s < 4u; s++) {
+            if (i.uv1.x >= ign(i.clip.xy + vec2(j + f32(s) * 5.588, j + f32(s) * 9.123))) { mk |= 1u << s; }
+        }
+        if (mk == 0u) { discard; }
+        o.mask = mk;
+    }
+    return o;
+}
+
+fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     let has = M.flags.x;
     let cls = M.flags.y;
     var base = M.base;

@@ -1926,7 +1926,7 @@ impl Renderer3D {
             ],
             prev_view_proj: vp.to_cols_array_2d(),
             // w: vehicle wear (0 to 1)
-            jitter: [0.0, 0.0, 0.0, look.wear],
+            jitter: [0.0, self.target.as_ref().map_or(aspect * 1080.0, |t| t.size[0] as f32), self.target.as_ref().map_or(1080.0, |t| t.size[1] as f32), look.wear],
         }
     }
 
