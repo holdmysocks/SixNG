@@ -87,6 +87,15 @@ pub struct Groom {
     /// shape the game's style pass gives every generated strand. Empty for
     /// most pieces.
     pub styles: Vec<Style>,
+    /// System +0x12D: how the game places its clumped strands (shader
+    /// archive reading): 0 = hashed clump centres in the root triangle
+    /// (mode 2), 1 = one strand per thread around a guide strand's root
+    /// (mode 16), 2 = clump centre at the triangle's centroid (mode 4, not
+    /// grown here), other = no clumping.
+    pub clump_type: u8,
+    /// A1, per guide strand (low 16 bits): a root triangle (index into
+    /// `roots`) with the guide as a corner. Empty when absent.
+    pub guide_tri: Vec<u32>,
 }
 
 /// One strand style record: 2D offsets across the strand along its length.
@@ -443,12 +452,17 @@ pub fn parse(r: &Resource) -> Result<Groom> {
         Some(p) if a0 > 0 => p.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect(),
         _ => Vec::new(),
     };
+    let a1 = gu32(0x04) as usize;
+    let guide_tri = match g.get(a1..a1 + s * 4) {
+        Some(p) if a1 > 0 => p.chunks_exact(4).map(|c| u16::from_le_bytes([c[0], c[1]]) as u32).collect(),
+        _ => Vec::new(),
+    };
     let a3 = gu32(0x0C) as usize;
     let pick_steps = match g.get(a3..a3 + s * 4) {
         Some(p) if a3 > 0 => p.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect(),
         _ => Vec::new(),
     };
-    Ok(Groom { tint_weight: r.sys.get(0x12C).map_or(1.0, |b| *b as f32 / 255.0), strands: s, points_per_strand: k, points, w, roots, lengths, root_uv, bones, root_box, group_box, tri_counts, width, taper, pick_steps, seed: gu32(0x7C), length_var: [f16(gu16(0x60)), f16(gu16(0x62))], head: g.get(..0xC0).map_or(Vec::new(), |h| h.to_vec()), corners, clump_scale: [0x12A, 0x12B].map(|o| r.sys.get(o).map_or(1.0, |b| *b as f32 / 255.0)), styles })
+    Ok(Groom { tint_weight: r.sys.get(0x12C).map_or(1.0, |b| *b as f32 / 255.0), strands: s, points_per_strand: k, points, w, roots, lengths, root_uv, bones, root_box, group_box, tri_counts, width, taper, pick_steps, seed: gu32(0x7C), length_var: [f16(gu16(0x60)), f16(gu16(0x62))], head: g.get(..0xC0).map_or(Vec::new(), |h| h.to_vec()), corners, clump_scale: [0x12A, 0x12B].map(|o| r.sys.get(o).map_or(1.0, |b| *b as f32 / 255.0)), styles, clump_type: r.sys.get(0x12D).copied().unwrap_or(0), guide_tri })
 }
 
 impl Groom {
@@ -643,7 +657,83 @@ impl Groom {
             let i = (x as usize).min(14);
             profile[i] + (profile[i + 1] - profile[i]) * (x - i as f32)
         };
+        // a member: starts at the centre line's root + (1 - p(0)) R T and is walked toward
+        // centre(s) + (1 - p(s)) R T with the centre line's segment lengths, cut at `len`
+        #[allow(clippy::too_many_arguments)]
+        let walk = |out: &mut Vec<[f32; 3]>, centre: &[[f32; 3]], fa: [f32; 3], fb: [f32; 3], radius: f32, tx: f32, ty: f32, len: f32, nr: [f32; 3]| {
+            let total: f32 = centre.windows(2).map(|p| { let e = sub(p[1], p[0]); dot(e, e).sqrt() }).sum::<f32>().max(1e-9);
+            // one world offset per member, scaled down the strand by the pull profile
+            let off = |f: f32| {
+                let r = (1.0 - pull(f)) * radius;
+                [r * (tx * fa[0] + ty * fb[0]), r * (tx * fa[1] + ty * fb[1]), r * (tx * fa[2] + ty * fb[2])]
+            };
+            let o = off(0.0);
+            let mut p = [centre[0][0] + o[0], centre[0][1] + o[1], centre[0][2] + o[2]];
+            out.push(p);
+            let (mut arc, mut used) = (0.0f32, 0.0f32);
+            for j in 1..centre.len() {
+                let e = sub(centre[j], centre[j - 1]);
+                let seg = dot(e, e).sqrt();
+                arc += seg;
+                let o = off(arc / total);
+                let target = [centre[j][0] + o[0], centre[j][1] + o[1], centre[j][2] + o[2]];
+                let step = seg.min((len - used).max(0.0));
+                let step = if step > 0.000_976_562_5 { step } else { 0.0 };
+                used += step;
+                let dir = unit(sub(target, p), unit(e, nr));
+                p = [p[0] + dir[0] * step, p[1] + dir[1] * step, p[2] + dir[2] * step];
+                out.push(p);
+            }
+        };
         let clump_seed = self.head.get(0x80..0x84).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])) ^ self.seed;
+        let mode16 = self.clump_type == 1 && self.guide_tri.len() == self.strands && self.corners.len() == self.strands && self.strands > 0;
+        if mode16 {
+            // Mode 16: one strand per thread. Thread m picks guide idx by hash; its clump centre line is
+            // guide idx itself, so the strand starts at C = root(idx) + (1 - p(0)) R T and follows the guide's
+            // shape, pulled back toward it by the profile. The offset axes: A = the surface direction of the
+            // root triangle's u axis (from the corner guides' root UVs), B = A x N. R = the guide's byte 1 (mm).
+            let total: u32 = self.tri_counts.iter().map(|q| q[1] as u32).sum();
+            let n16 = (total as f32 * share).round() as u32;
+            for m in 0..n16 {
+                let mut draws = hairgen::Draws(clump_seed ^ m.wrapping_mul(0x9e37_79b9).wrapping_add(0x7f4a_7c15));
+                let idx = ((draws.next() * self.strands as f32) as usize).min(self.strands - 1);
+                let Some(&t) = self.roots.get(self.guide_tri[idx] as usize) else { continue };
+                let nr = normal(t);
+                let centre: Vec<[f32; 3]> = self.points[idx * k..idx * k + k].to_vec();
+                let head = sub(centre[1.min(k - 1)], centre[0]);
+                let in_plane = |a: [f32; 3]| sub(a, scale(nr, dot(a, nr)));
+                let u_axis = (self.root_uv.len() == self.strands)
+                    .then(|| {
+                        let (p0, p1, p2) = (self.points[t[0] as usize * k], self.points[t[1] as usize * k], self.points[t[2] as usize * k]);
+                        let (u0, u1, u2) = (self.root_uv[t[0] as usize], self.root_uv[t[1] as usize], self.root_uv[t[2] as usize]);
+                        let (e1, e2) = (sub(p1, p0), sub(p2, p0));
+                        let (du1, dv1, du2, dv2) = (u1[0] - u0[0], u1[1] - u0[1], u2[0] - u0[0], u2[1] - u0[1]);
+                        let det = du1 * dv2 - du2 * dv1;
+                        (det.abs() > 1e-12).then(|| in_plane(scale(sub(scale(e1, dv2), scale(e2, dv1)), 1.0 / det)))
+                    })
+                    .flatten();
+                let fa = unit(u_axis.unwrap_or_else(|| in_plane(head)), unit(in_plane(head), [1.0, 0.0, 0.0]));
+                let fb = unit(cross(fa, nr), [0.0, 1.0, 0.0]);
+                let radius = 0.001 * self.corners[idx][1] as f32;
+                let (tx, ty) = ((draws.next() * 2.0 - 1.0) * self.clump_scale[0], (draws.next() * 2.0 - 1.0) * self.clump_scale[1]);
+                let (d_len, d_var) = (draws.next(), draws.next());
+                let len = if self.lengths.len() == self.strands { hairgen::length(self.lengths[idx], d_len, self.length_var) } else { f32::MAX };
+                walk(&mut c.points, &centre, fa, fb, radius, tx, ty, len, nr);
+                let at = c.points.len() - k;
+                style(&mut c.points[at..], nr, d_var);
+                // the strand's guide weights: all on guide idx (its colour, UV and bones)
+                let w = match t.iter().position(|&x| x as usize == idx) {
+                    Some(0) => [1.0, 0.0, 0.0],
+                    Some(1) => [0.0, 1.0, 0.0],
+                    Some(_) => [0.0, 0.0, 1.0],
+                    None => [1.0 / 3.0; 3],
+                };
+                c.normals.push(nr);
+                c.guides.push((t, w));
+                c.variants.push(hairgen::variant(d_var, steps(t, w)));
+            }
+            return c;
+        }
         let mut acc = 0.0f32;
         for (ti, (&t, q)) in self.roots.iter().zip(&self.tri_counts).enumerate() {
             let (members, clumps) = (q[1] as u32, q[2].max(1) as u32);
@@ -660,7 +750,6 @@ impl Groom {
                 let head = sub(centre[1.min(k - 1)], centre[0]);
                 let fa = unit(sub(head, scale(nr, dot(head, nr))), { let g0 = self.points[t[0] as usize * k]; unit(sub(self.points[t[1] as usize * k], g0), [1.0, 0.0, 0.0]) });
                 let fb = unit(cross(fa, nr), [0.0, 1.0, 0.0]);
-                let total: f32 = centre.windows(2).map(|p| { let e = sub(p[1], p[0]); dot(e, e).sqrt() }).sum::<f32>().max(1e-9);
                 let m = members / clumps + u32::from(ck < members % clumps);
                 for mi in 0..m {
                     acc += share;
@@ -672,28 +761,7 @@ impl Groom {
                     let (tx, ty) = ((draws.next() * 2.0 - 1.0) * self.clump_scale[0], (draws.next() * 2.0 - 1.0) * self.clump_scale[1]);
                     let (d_len, d_var) = (draws.next(), draws.next());
                     let len = length(t, b, d_len);
-                    // one world offset per member, scaled down the strand by the pull profile
-                    let off = |f: f32| {
-                        let r = (1.0 - pull(f)) * radius;
-                        [r * (tx * fa[0] + ty * fb[0]), r * (tx * fa[1] + ty * fb[1]), r * (tx * fa[2] + ty * fb[2])]
-                    };
-                    let o = off(0.0);
-                    let mut p = [centre[0][0] + o[0], centre[0][1] + o[1], centre[0][2] + o[2]];
-                    c.points.push(p);
-                    let (mut arc, mut used) = (0.0f32, 0.0f32);
-                    for j in 1..k {
-                        let e = sub(centre[j], centre[j - 1]);
-                        let seg = dot(e, e).sqrt();
-                        arc += seg;
-                        let o = off(arc / total);
-                        let target = [centre[j][0] + o[0], centre[j][1] + o[1], centre[j][2] + o[2]];
-                        let step = seg.min((len - used).max(0.0));
-                        let step = if step > 0.000_976_562_5 { step } else { 0.0 };
-                        used += step;
-                        let dir = unit(sub(target, p), unit(e, nr));
-                        p = [p[0] + dir[0] * step, p[1] + dir[1] * step, p[2] + dir[2] * step];
-                        c.points.push(p);
-                    }
+                    walk(&mut c.points, &centre, fa, fb, radius, tx, ty, len, nr);
                     let at = c.points.len() - k;
                     style(&mut c.points[at..], nr, d_var);
                     c.normals.push(nr);
@@ -1144,6 +1212,8 @@ mod tests {
             corners: vec![],
             clump_scale: [1.0; 2],
             styles: vec![],
+            clump_type: 0,
+            guide_tri: vec![],
         };
         let c = g.coat(1.0);
         assert_eq!(c.guides.len(), 7);
@@ -1206,7 +1276,7 @@ mod tests {
     }
     #[test]
     fn segments() {
-        let g = Groom { tint_weight: 1.0, strands: 2, points_per_strand: 3, points: vec![[0.0; 3]; 6], w: vec![0.0; 6], roots: vec![[0, 1, 1]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![] };
+        let g = Groom { tint_weight: 1.0, strands: 2, points_per_strand: 3, points: vec![[0.0; 3]; 6], w: vec![0.0; 6], roots: vec![[0, 1, 1]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![] };
         assert_eq!(g.segments(), vec![0, 1, 1, 2, 3, 4, 4, 5]);
         assert_eq!(g.root_indices(), vec![0, 3, 3]);
     }
@@ -1214,7 +1284,7 @@ mod tests {
     fn coat_from_strand_counts() {
         // one root triangle of three 2-point guides, 40 + 10 stored strands
         let pts = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.1], [1.0, 0.0, 0.0], [1.0, 0.0, 0.1], [0.0, 1.0, 0.0], [0.0, 1.0, 0.1]];
-        let g = Groom { tint_weight: 1.0, strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![[40, 10, 1, 0]], width: 0.0003, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![] };
+        let g = Groom { tint_weight: 1.0, strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![[40, 10, 1, 0]], width: 0.0003, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![] };
         assert_eq!(g.stored_strands(), 50);
         let c = g.coat(1.0);
         assert_eq!((c.guides.len(), c.points.len(), c.stored), (50, 100, 50));
