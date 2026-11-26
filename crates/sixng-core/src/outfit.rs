@@ -562,7 +562,10 @@ pub fn export_outfit(a: &ArchiveInfo, parts: &[&Entry], name: &str, out: &Path, 
     let mut part_joints: Vec<Vec<Joint>> = Vec::new();
     let mut reports = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    let main = a;
     for e in parts {
+        // a content-pack part (the anatomical inserts, `packparts`) is read from its own archive
+        let a = &*crate::packparts::archive_of(main, e);
         let mut item = ExportedItem { id: e.id.clone(), archive: a.id.clone(), kind: e.kind.name(), rtype: e.rtype.clone(), name: e.name.clone(), status: "ok".into(), files: vec![], error: None, warnings: vec![] };
         let r = crate::resource::Resource::load(&a.path, e)?;
         let info = crate::drawable::describe(&r);

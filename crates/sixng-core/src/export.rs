@@ -754,7 +754,7 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                             e["width"] = et.width.into();
                             e["height"] = et.height.into();
                             e["format"] = et.format.clone().into();
-                            if let Some(sr) = crate::material::slot_role(&t.param_hash) {
+                            if let Some(sr) = crate::material::slot_role_in(&s.name_hash, &t.param_hash) {
                                 e["slot_role"] = sr.into();
                             }
                             match texture::embedded_rgba(r, et) {
@@ -784,7 +784,7 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                             e["status"] = "not in any ttpf store".into();
                             let role = unresolved_role(&t.param_hash);
                             e["role_guess"] = role.into();
-                            if let Some(sr) = crate::material::slot_role(&t.param_hash) {
+                            if let Some(sr) = crate::material::slot_role_in(&s.name_hash, &t.param_hash) {
                                 e["slot_role"] = sr.into();
                             }
                             e["texture_fallback"] = serde_json::json!({"reason": UNRESOLVED, "pending_role": role});
@@ -815,7 +815,7 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                     "data (linear)"
                 };
                 e["role_guess"] = role.into();
-                if let Some(r) = crate::material::slot_role(&t.param_hash) {
+                if let Some(r) = crate::material::slot_role_in(&s.name_hash, &t.param_hash) {
                     e["slot_role"] = r.into();
                 }
                 if !o.png {
@@ -2484,6 +2484,9 @@ pub fn export_placements(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], ou
                     }
                     if let Some(p) = ps.and_then(|m| m.get(&(i as u64))) {
                         lod["parent"] = p.clone();
+                    }
+                    if let Some(t) = arch_lod.get(&en.archetype).and_then(|al| crate::lodlinks::time_json(al.time_flags)) {
+                        j["time"] = t;
                     }
                 }
             }
