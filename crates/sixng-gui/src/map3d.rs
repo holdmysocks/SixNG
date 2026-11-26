@@ -471,6 +471,8 @@ struct Stats {
     models_wanted: usize,
     /// the model-count cap is full and nothing more may load
     capped: bool,
+    /// the last request list was longer than the queue holds
+    more_queued: bool,
     models_ready: usize,
     queued: usize,
     inflight: usize,
@@ -1506,6 +1508,8 @@ impl Map3D {
                 .partial_cmp(&b.prio)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        // the queue holds the first 4000; the frame asks again once it drains
+        self.stats.more_queued = reqs.len() > 4000;
         reqs.truncate(4000);
         let nq = reqs.len();
         *self.shared.queue.lock().unwrap() = reqs;
@@ -2464,6 +2468,14 @@ impl Map3D {
             }
             None => self.vel_at = Some((Vec3::from(rage(eye)), Instant::now())),
             _ => {}
+        }
+        // the queue held only part of the requests: ask for the rest once it
+        // has drained (a still camera never reruns the update otherwise)
+        if self.stats.more_queued
+            && self.shared.queue.lock().unwrap().is_empty()
+            && self.shared.inflight.lock().unwrap().is_empty()
+        {
+            self.dirty = true;
         }
         // entities on their grace time: look again when it may have run out
         if !self.retire.is_empty()
