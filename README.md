@@ -434,8 +434,18 @@ restyle the hair:
    from root to tip. Variant: a random value against three per-guide
    thresholds gives each strand one of four colour ramps.
 
-Not in the export yet: how the hair is pressed under a hat (export the model without the
-hat and add the hat afterwards), and the game's run-time strand count (it
+Under a hat in the outfit the scalp pieces are pressed in as the viewer
+does (a stand-in, not the game's method; see the model viewer below): the
+guides before the strands are grown and the grown strands after, every
+point beyond the hat's lining pulled to 3 mm under it; then every strand
+is followed from its root against the hat's own triangles, and a point
+whose segment crosses the hat goes back under it (the coarse press alone
+let tufts through the side of a cap). Their extras name the hat
+(`under_hat`) and the summary the points moved (`hat_pressed`). On
+Jason's look 1 (a cap worn backwards, over his long hair) 411,913 of
+1.19 M points move, and 2 of 1.1 M strand segments still cross the cap
+(one strand at its lower edge; 69,923 with the press alone). Not in the export yet:
+the game's run-time strand count (it
 draws fewer strands at a distance; the export writes all it stores). To
 restyle in Blender, edit the hidden `_guides` objects and grow new strands
 from them with Blender's Interpolate Hair Curves node (it blends nearby
@@ -807,8 +817,10 @@ again**).
   swatches to click (`--hair-colour r,g,b`), and lists the character's
   other hair styles (its own placeholders that have grooms placed) to
   tick (`--hair-style TEXT`). Under a hat the scalp hair is pressed in: strand
-  points beyond the hat's lining are pulled to 3 mm under it, and an
-  opening the hat encloses (over a cap's strap) counts as closed. This
+  points beyond the hat's lining are pulled to 3 mm under it (then each
+  strand is checked against the hat's triangles, so none comes through
+  it), and an opening the hat encloses (over a cap's strap) counts as
+  closed. This
   is a stand-in, not the game's method: of the 6,886 outfits with a hat
   and hair, 6,840 ask for the plain hair state, and no stored rule
   says how the game keeps it under the hat. Hair items do have other
@@ -962,10 +974,19 @@ again**).
   `head_*` faces) the game's material data names the head, and that face
   is used. Other heads (`a_head_base_*`, crowd `hc_*` heads, characters
   whose materials are in archives not indexed yet) get a face of the same
-  sex, body type and ethnicity from that library. The viewer shows
+  sex, body type and ethnicity from that library. Since 2026-11-25 a
+  `cs_` head that no preset lists takes the face of the same character's
+  other head first: the ped model table gives each model a character name,
+  and when exactly one model carries the head's name without `cs_`, its
+  head with the same sex, body type and ethnicity code is used (ages may
+  differ between young and middle-aged, not into old or child). Of the 29
+  such `cs_` heads this links one, `cs_lucia`, which now shows Lucia's
+  player face instead of another woman's; the rest have no character
+  model, or only a head of another age, body type or ethnicity. The viewer shows
   **Head skin ◀ n / N ▶** to switch through the faces; exports take the
   **Head skin** number next to Body shape, or `extract --head-skin N`.
-  `model.json` records the choice (`head_skin`: linked or auto, index,
+  `model.json` records the choice (`head_skin`: linked, character (with
+  the donor head as `group`) or auto, index,
   count, texture hashes). The table is built from the `packs` index on
   first use (about 5 s) and kept in `<work>/index/head_skins.json`.
   **Other head maps** (2026-11-24): a face's material data holds colour
@@ -1196,6 +1217,35 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   models smaller than three of their texels. Models and map cells cast (opaque and cut-out surfaces);
   skinned, see-through and decal surfaces do not. Only what the camera
   draws casts: a caster just outside the view leaves no shadow.
+- **Clouds** (HDR map): one cumulus layer between the timecycle's
+  `local_atmosphere_cloud_height` and `_height_top` (200 and 1500 m). Its
+  cover is a drifting noise field (drift from
+  `local_atmosphere_cloud_wind_velocity_scale`), thresholded by the
+  weather's cloud cover; the sky and every surface behind the layer are
+  seen through it, and its shadow moves over the ground. A cloud has a
+  dome-shaped top whose height follows its cover and a base that rises
+  where it thins, and is sampled along the whole ray through the layer
+  (8 to 48 samples for the sky, at most 10 for the ground behind the
+  layer), the step growing with the distance (120 m plus 4 % of the
+  distance, more where the samples would not reach the end) from a
+  start set per pixel by interleaved gradient noise with a little white
+  noise (no slices; less grain); a cloud thins out at its rim. A cloud is lit by
+  the sun or moon through the cloud above it (forward-peaked) and by the
+  sky. Our choices: the noise (2.5 km features), the extinction (0.004 per
+  m at full density) and the drift speed (12 m/s at scale 1); the game's
+  cloud map and noise textures are not used. `--no-clouds`, or the
+  **clouds** checkbox, turns them off.
+- **Terrain ground** (HDR map): the baked map tiles hold only a colour by
+  height with their own hill shading (the bake's terrain layer), and cells
+  the bake left out are filled flat green from the game's height map. The
+  land is drawn as a ground made up from height, slope and noise instead:
+  sand just above the sea, dry grass and scrub inland, darker woods in
+  patches, rock on steep slopes, lit by the scene with the terrain's own
+  normals. The tiles' hill shading, which holds relief finer than the
+  terrain mesh (embankments, building pads), is kept at half strength: the
+  tile's brightness over the bake's colour for that height. The tiles'
+  water paint still marks the sea (our choice; the game's terrain
+  materials are not decoded).
 - **Placed lights** (HDR map): the map's exterior lights that are on at
   the hour (their hour mask and night flag) light the scene and glow. Those
   within about 500 m of the camera are shaded on every surface: inverse
@@ -1230,13 +1280,16 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   share of the slope drawn as waves (60 %). Not yet: shallow water over
   the seabed, foam, shore waves, refraction and underwater fog.
 - **Map cells** (far placements merged per area): a placement more than
-  0.6× the HD distance from the camera can be drawn from its cell instead
-  of one by one. A cell holds one LOD level's placements in one square of
+  0.3× the HD distance from the camera can be drawn from its cell instead
+  of one by one (`SIXNG_CELLS_NEAR` sets another fraction). The cells are
+  built for 0.6×; drawing them from 0.3× showed no visible change
+  downtown from 60 m and took the frame there from 25 to 44 fps (draws
+  6,859 to 3,706: the CPU cost of a frame follows its draw count). A cell holds one LOD level's placements in one square of
   the map (128 m for HD, 256 m for LOD, 512–2048 m for SLOD1–4), merged
   into a few batches with one draw each:
   - geometry is placed in the cell, from the low drawable LOD where a model
     has one, and simplified by vertex clustering to about two pixels at
-    the nearest distance the cell draws it;
+    0.6× the HD distance;
   - base-colour textures go in at 64 px, in BC3 texture arrays;
   - each vertex carries its placement's index. The vertex shader checks
     that placement's own LOD distance range, so LOD hand-offs stay per
@@ -1363,7 +1416,7 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   (they showed as floating black boxes); the model viewer still shows them.
 
 Map 3D screenshots: `--tab map3d --center X,Y --height H --yaw DEG --pitch
-DEG [--quality low|medium|high|ultra] [--detail 0-1] [--tod H] [--weather W] [--no-shadows] [--no-placed-lights] [--lights]
+DEG [--quality low|medium|high|ultra] [--detail 0-1] [--tod H] [--weather W] [--no-shadows] [--no-clouds] [--no-placed-lights] [--lights]
 [--roads] [--no-terrain] [--fog F] [--max-tex PX] [--no-textures]
 [--no-hd-fallback] [--kinds a,b] [--lods a,b] [--ram-cap GB]
 [--no-windows] [--no-decal-bias] [--show-proxies] [--fly X,Y,H,SECONDS]
