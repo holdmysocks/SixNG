@@ -286,6 +286,9 @@ pub struct Light {
     /// The timecycle values used (for display and checks).
     pub light_dir_mult: f32,
     pub ambient_sky_intensity: f32,
+    /// Share of the sun or moon light bounced back from lit surroundings
+    /// (`ambient_bounce_intensity`, as is: not normalised to Sunny 12:00).
+    pub bounce: f32,
 }
 
 /// Latitude of the sun path, degrees north (the game's sun path is not decoded).
@@ -385,6 +388,7 @@ fn raw(t: &Table, w: &Weather, hour: f32) -> Light {
         exposure_ev: g("postfx_exposure", 0.0),
         light_dir_mult: mult,
         ambient_sky_intensity: amb_i,
+        bounce: g("ambient_bounce_intensity", 0.5).clamp(0.0, 4.0),
     }
 }
 

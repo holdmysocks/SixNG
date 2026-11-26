@@ -874,6 +874,11 @@ type GroomList = Result<Vec<sixng_core::groom::GroomInfo>, String>;
 /// Most strands an animal's interpolated coat is drawn with (a cat's short
 /// body coat stores about 365,000). Fewer strands are drawn wider.
 const COAT_STRANDS: usize = 90_000;
+
+/// Parameter set (fibre widths, roughness, translucency) per hair slot when
+/// none is given: the sets checked against the game frames of one character (asset catalogue
+/// property 2259149558 is not read per asset yet).
+const DEFAULT_PARAMSETS: [(&str, &str); 3] = [("hair", "Long_HighGloss_000"), ("brows", "Eyebrows_MidGloss_000"), ("lashes", "Eyelashes_MidGloss_000")];
 /// Skin samples: position (RAGE model space) and linear colour.
 pub type SkinColours = Arc<Vec<([f32; 3], [u8; 3])>>;
 
@@ -1229,7 +1234,7 @@ impl ModelView {
             self.hair.loading = false;
             match r {
                 Ok(models) => {
-                    let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+                    let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
                     // strands are lit with the game's hair tables
                     if let Some(note) = ren.load_hair_luts(rs, std::path::Path::new(&self.game)) {
                         eprintln!("[hair] {note}");
@@ -1280,31 +1285,38 @@ impl ModelView {
         let collide = self.hair.collide.clone();
         let rig = self.hair.rig.clone();
         let tones = if self.hair.stored_colours { self.hair.tones.clone() } else { HashMap::new() };
-        // research, until the game's ramp files are read by SixNG itself: SIXNG_HAIR_DATA=<json of the four
-        // parsed tables> makes every hair piece of a character take the colour set its wardrobe item names.
+        // The game's strand tables (colour and parameter ramps and sets, hair LOD presets) are read from the
+        // game's own files (`hairtables`, cached in the index folder) when the hair is built. Overrides for
+        // research: SIXNG_HAIR_DATA=<json> and SIXNG_HAIR_LOD=<json> take parsed tables from files;
         // SIXNG_HAIR_COLOURSET=<name> forces one colour set; SIXNG_HAIR_PARAMSETS=hair=<set>,brows=<set>
-        // names the parameter set per slot (the asset property that names it is not read here yet);
-        // SIXNG_FUR_SETS=<colour set>,<parameter set> gives an animal's strands those sets.
+        // names the parameter set per slot (default: `DEFAULT_PARAMSETS`; the asset property that names it
+        // is not read yet); SIXNG_FUR_SETS=<colour set>,<parameter set> gives an animal's strands those sets.
         let joaat = sixng_core::meta7a::joaat;
-        let strand_data: Option<Arc<sixng_core::hairtone::StrandData>> = std::env::var("SIXNG_HAIR_DATA").ok().and_then(|f| {
-            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(f).ok()?).ok()?;
-            Some(Arc::new(sixng_core::hairtone::StrandData::from_json(&v)))
-        });
+        let env_data: Option<serde_json::Value> = std::env::var("SIXNG_HAIR_DATA").ok().and_then(|f| serde_json::from_slice(&std::fs::read(f).ok()?).ok());
         // SIXNG_HAIR_SUM=1 lights every strand by the hair lighting, whatever its set's UseStandardBsdf says
         let force_hair_sum = std::env::var("SIXNG_HAIR_SUM").is_ok();
-        if std::env::var("SIXNG_DEBUG_HAIR").is_ok() { eprintln!("strand tables: {:?}", strand_data.as_ref().map(|d| d.counts())); }
         let force_colour: Option<u32> = std::env::var("SIXNG_HAIR_COLOURSET").ok().map(|n| joaat(&n.to_ascii_lowercase()));
-        let slot_params: HashMap<String, u32> = std::env::var("SIXNG_HAIR_PARAMSETS").ok().map(|s| s.split(',').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_string(), joaat(&v.to_ascii_lowercase()))).collect()).unwrap_or_default();
+        let slot_params: HashMap<String, u32> = std::env::var("SIXNG_HAIR_PARAMSETS").ok().map(|s| s.split(',').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_string(), joaat(&v.to_ascii_lowercase()))).collect()).unwrap_or_else(|| DEFAULT_PARAMSETS.iter().map(|(k, v)| (k.to_string(), joaat(&v.to_ascii_lowercase()))).collect());
         // SIXNG_HAIR_LOD=<json of the parsed hair LOD presets> applies the game's strand count rule to a character's pieces
         // (head hair by the preset Default: whether its items name another one is not traced; brows, lashes, beard and
         // body hair by the presets of those names) and to an animal's fur given with SIXNG_FUR_SETS (the preset Animal)
-        let lod_presets: Option<serde_json::Value> = std::env::var("SIXNG_HAIR_LOD").ok().and_then(|f| serde_json::from_slice(&std::fs::read(f).ok()?).ok());
+        let env_lod: Option<serde_json::Value> = std::env::var("SIXNG_HAIR_LOD").ok().and_then(|f| serde_json::from_slice(&std::fs::read(f).ok()?).ok());
         let fur_sets: Option<(u32, u32)> = std::env::var("SIXNG_FUR_SETS").ok().and_then(|s| s.split_once(',').map(|(c, p)| (joaat(&c.to_ascii_lowercase()), joaat(&p.to_ascii_lowercase()))));
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<Vec<glb::Model>> {
                 let (a, ix) = index_for(&ws, "packs", &idx)?;
                 std::fs::create_dir_all(&dir)?;
+                // the game's tables (unless given by file); without them the hair keeps its stored preset colours
+                let game_tables = if env_data.is_some() && env_lod.is_some() { None } else {
+                    match sixng_core::hairtables::load_or_build(&ws, &a) {
+                        Ok(v) => Some(v),
+                        Err(e) => { eprintln!("[hair] strand tables not read: {e:#}"); None }
+                    }
+                };
+                let strand_data: Option<Arc<sixng_core::hairtone::StrandData>> = env_data.as_ref().or(game_tables.as_ref()).map(|v| Arc::new(sixng_core::hairtone::StrandData::from_json(v)));
+                let lod_presets: Option<serde_json::Value> = env_lod.clone().or_else(|| game_tables.as_ref().map(|v| v["lod_presets"].clone()));
+                if std::env::var("SIXNG_DEBUG_HAIR").is_ok() { eprintln!("strand tables: {:?}, LOD presets {}", strand_data.as_ref().map(|d| d.counts()), lod_presets.as_ref().and_then(|v| v.as_object()).map_or(0, |m| m.len())); }
                 // research: SIXNG_NO_STRANDS=1 draws no strand pieces (to see the skin under them)
                 let grooms: Vec<(u64, sixng_core::groom::Groom)> = sel.iter().filter(|_| std::env::var("SIXNG_NO_STRANDS").is_err()).map(|&off| sixng_core::groom::load(&a, &ix.entries, off).map(|g| (off, g))).collect::<anyhow::Result<_>>()?;
                 let stored: usize = grooms.iter().map(|g| g.1.stored_strands()).sum();
@@ -2434,7 +2446,7 @@ impl ModelView {
                         .as_ref()
                         .map(|o| o.source == l.source)
                         .unwrap_or(false);
-                let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+                let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
                 let mut g = ren.upload(rs, &l.model, &[]);
                 ren.ensure_edges(rs, &mut g, &l.model);
                 if !keep_cam {
@@ -2990,7 +3002,7 @@ impl ModelView {
     fn update_brakes(&mut self, rs: &egui_wgpu::RenderState, ctx: &egui::Context) {
         if let Some(ls) = self.brake_pending.lock().unwrap().take() {
             self.brake_loading = false;
-            let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+            let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
             self.brakes = ls.iter().map(|(disc, on, l)| (*disc, *on, ren.upload(rs, &l.model, &[]))).collect();
         }
         let spots: Vec<(String, Vec3, f32)> = self
@@ -3264,7 +3276,7 @@ impl ModelView {
             }
         }
         self.part_look_done = Some((l.model.path.clone(), idx));
-        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
         let mut g = ren.upload(rs, &l.model, &[]);
         ren.ensure_edges(rs, &mut g, &l.model);
         self.gpu = Some(g);
@@ -3296,7 +3308,7 @@ impl ModelView {
             return;
         }
         let (Some(l), Some(g)) = (&self.loaded, self.gpu.as_mut()) else { return };
-        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
         let parts: Vec<String> = l.info["assembled_from"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
         let key = crate::livery::vehicle_key(&crate::vehicle_db::model_key(&l.source));
         self.livery.sync(rs, ren, g, &l.model, &key, &parts, Path::new(&self.game), Path::new(&self.work), &cache);
@@ -3422,7 +3434,7 @@ impl ModelView {
             }
             let c = self.rim_colour;
             self.rim_applied = c;
-            let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+            let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
             self.wheels = self
                 .wheel_src
                 .iter()
@@ -4206,14 +4218,14 @@ impl ModelView {
         });
         let (under, top) = self.lines(&globals);
         let settled = self.idle_for_shot();
-        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
         if let Some(g) = &self.gpu {
             if !skin.is_empty() {
                 ren.set_joints(rs, g, &skin);
             }
         }
         self.update_hair(rs, &ctx);
-        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
         // an animal's fur is bound to its skin and takes the same joint matrices
         if self.hair.rig.is_some() && !skin.is_empty() {
             for g in &self.hair.gpu {
@@ -4241,7 +4253,12 @@ impl ModelView {
         }
         ren.decal_bias = self.decal_bias;
         ren.ground = ground;
+        // a still view settles into the mean of many dither patterns (SIXNG_ACCUM=0: each frame on its own)
+        ren.accumulate = std::env::var("SIXNG_ACCUM").map_or(true, |v| v != "0");
         let tid = ren.render(rs, px, &self.cam, &self.look, &models, &under, &top);
+        if ren.accumulating() {
+            ctx.request_repaint();
+        }
         ui.painter().image(
             tid,
             rect,
@@ -4342,6 +4359,8 @@ impl ModelView {
             // dither pattern (the game averages its per-frame dither over time)
             let frames = std::env::var("SIXNG_SHOT_FRAMES").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1).clamp(1, 64);
             let mut averaged = None;
+            // a plain shot waits for the still-camera mean to settle
+            let ready = ready && (frames > 1 || !ren.accumulating());
             let ready = ready && (frames == 1 || match ren.read_back(rs) {
                 Some((w, h, px)) => {
                     if self.shot_acc.1.len() != px.len() {
@@ -4600,8 +4619,8 @@ impl ModelView {
                     .on_hover_text("Each part shows wear as the game works it out: the vehicle's configuration gives the part a wear level (0 new to 5 worn out), which picks a wear preset. Its age record sets the wear amount, and the preset's control intensities and rust windows say how much of each channel of the game's tiling wear mask turns to the worn layer (the game's packing of these values is read from its code). Not read: a per-part random sample and the vertex colours the game also multiplies in, and the per-vehicle pick within the age record's range (the middle is taken).");
             }
             if self.look.wear_levels && self.look.wear_from_config {
-                ui.checkbox(&mut self.look.primer, "primer layer")
-                    .on_hover_text("Also draws the game's second wear layer, the primer, by its rules: its mask texture scaled per channel by the wear preset's primer intensities, summed and windowed by primerStart / primerEnd, where the first layer is not. Off by default: the game also scales the mask by per-part random samples and a per-vehicle amount, which are not decoded and taken as 1, so some parts (a truck bed) show far more primer than in the game. The primer's colour is a stand-in grey.");
+                ui.add(egui::Slider::new(&mut self.look.primer_amount, 0.0..=1.0).text("primer amount"))
+                    .on_hover_text("The game's second wear layer, the primer, drawn by its rules: its mask texture scaled per channel by the wear preset's primer intensities, summed, times this amount, and windowed by primerStart / primerEnd, where the first layer is not. The game takes the amount per vehicle while it runs (from the spawn data, or from a file that is not shipped), so it is yours to set; 0 (the default) turns the layer off. The primer's colour is a stand-in grey.");
             }
             if !(self.look.wear_levels && self.look.wear_from_config) {
                 ui.add(egui::Slider::new(&mut self.look.wear, 0.0..=1.0).text("wear"))
@@ -5154,8 +5173,9 @@ fn load_parts(
     // accessory was moved onto
     let mut rig_parts: Vec<(std::ops::Range<usize>, Vec<glb::Joint>, Option<usize>)> = Vec::new();
     let mut named_parts: Vec<(std::ops::Range<usize>, Vec<(String, Option<usize>)>)> = Vec::new();
-    let mut under_meshes: Vec<std::ops::Range<usize>> = Vec::new();
-    let mut outer_meshes: Vec<std::ops::Range<usize>> = Vec::new();
+    // per garment: its meshes and how far out it is worn (`levels`)
+    let mut layered: Vec<(std::ops::Range<usize>, u8)> = Vec::new();
+    let levels = garment_levels(parts.iter().map(|e| e.off), fx);
     // Body shape: the skin and head are posed by the game's rig; clothes
     // and accessories follow the skin under them (`Wrap`).
     let shape = if fx.is_empty() { (0.0, 0.0) } else { *BODY_SHAPE.lock().unwrap() };
@@ -5249,10 +5269,8 @@ fn load_parts(
                     // (empty for a part without bones, which then rides on the bone nearest to it)
                     named_parts.push((mesh0..mesh0 + m.meshes.len(), m.joints.iter().map(|j| (j.name.clone(), j.parent)).collect()));
                 }
-                match f.map_or(0, |f| f.layer) {
-                    1 => under_meshes.push(mesh0..mesh0 + m.meshes.len()),
-                    2 => outer_meshes.push(mesh0..mesh0 + m.meshes.len()),
-                    _ => {}
+                if let Some(&l) = levels.get(&e.off) {
+                    layered.push((mesh0..mesh0 + m.meshes.len(), l));
                 }
                 if f.is_some_and(|f| f.heel) {
                     heel_meshes.push(mesh0..mesh0 + m.meshes.len());
@@ -5333,15 +5351,23 @@ fn load_parts(
         }
     }
     if let (Some(m), false, false) = (&mut model, by_distance.is_empty(), cover_meshes.is_empty()) {
-        let hidden = hide_covered_skin(m, &by_distance, &cover_meshes);
+        let hidden = hide_covered_skin(m, &by_distance, &cover_meshes, 0.015);
         if hidden > 0 {
             notes.push(format!("Skin under clothes: {hidden} triangles of a skin mesh without regions that lie right under a garment are hidden, so skin does not show through it (by distance, not the game's masks)."));
         }
     }
-    if let (Some(m), false, false) = (&mut model, under_meshes.is_empty(), outer_meshes.is_empty()) {
-        let hidden = hide_covered_skin(m, &under_meshes, &outer_meshes);
+    if let Some(m) = &mut model {
+        // each level of clothes, inside out, hidden where the levels over it cover it
+        let mut ls: Vec<u8> = layered.iter().map(|x| x.1).collect();
+        ls.sort();
+        ls.dedup();
+        let mut hidden = 0;
+        for &l in ls.iter().rev().skip(1).rev() {
+            let pick = |f: &dyn Fn(u8) -> bool| layered.iter().filter(|x| f(x.1)).map(|x| x.0.clone()).collect::<Vec<_>>();
+            hidden += hide_covered_skin(m, &pick(&|x| x == l), &pick(&|x| x > l), 0.03);
+        }
         if hidden > 0 {
-            notes.push(format!("Layers: {hidden} triangles of the clothes worn under the jacket are hidden where the jacket covers them, so they do not show through it."));
+            notes.push(format!("Layers: {hidden} triangles of clothes worn under other clothes (under a jacket, or a t-shirt under an open shirt) are hidden where the clothes over them cover them, so they do not show through. Which is worn over which: a jacket over the rest, and an item whose hide masks name another item's layer over that item."));
         }
     }
     if let (Some(m), true, false) = (&mut model, rig_parts.is_empty(), named_parts.is_empty()) {
@@ -6198,12 +6224,43 @@ fn rig_character(m: &mut glb::Model, parts: &[(std::ops::Range<usize>, Vec<glb::
     true
 }
 
+/// How far out each shown garment is worn, for hiding what is under it:
+/// tops, bottoms and one-pieces start at 1 and jackets at 8; an item whose
+/// hide masks name the region layer of another shown garment (an open
+/// shirt naming the t-shirt under it) is put one level over that one.
+fn garment_levels(shown: impl Iterator<Item = u64>, fx: &HashMap<u64, PartFx>) -> HashMap<u64, u8> {
+    let shown: Vec<u64> = shown.filter(|o| fx.get(o).is_some_and(|f| f.layer > 0)).collect();
+    let mut level: HashMap<u64, u8> = shown.iter().map(|o| (*o, if fx[o].layer == 2 { 8 } else { 1 })).collect();
+    // a few rounds settle chains (jacket over shirt over t-shirt); two items
+    // that name each other's layer say nothing about which is over
+    for _ in 0..shown.len() {
+        let mut changed = false;
+        for &x in &shown {
+            for &y in &shown {
+                let (fx_x, fx_y) = (&fx[&x], &fx[&y]);
+                if x != y && fx_y.region_layer != 0 && fx_x.hides.iter().any(|h| h.0 == fx_y.region_layer)
+                    && !(fx_x.region_layer != 0 && fx_y.hides.iter().any(|h| h.0 == fx_x.region_layer))
+                    && level[&x] <= level[&y]
+                {
+                    level.insert(x, level[&y] + 1);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    level
+}
+
 /// Hide the skin triangles that lie right under a garment: a skin vertex is
 /// covered when a point of a garment surface is within 9 mm of the line
-/// through the vertex along its normal, between 15 mm inside and 50 mm
-/// outside the skin; a triangle goes when all three vertices are covered.
-/// Returns the number of triangles hidden.
-fn hide_covered_skin(m: &mut glb::Model, skin: &[std::ops::Range<usize>], cover: &[std::ops::Range<usize>]) -> usize {
+/// through the vertex along its normal, between `inside` (15 mm for skin;
+/// 30 mm for clothes under clothes, which poke further through at the
+/// armpits) inside and 50 mm outside the skin; a triangle goes when all
+/// three vertices are covered. Returns the number of triangles hidden.
+fn hide_covered_skin(m: &mut glb::Model, skin: &[std::ops::Range<usize>], cover: &[std::ops::Range<usize>], inside: f32) -> usize {
     use glam::Vec3;
     const CELL: f32 = 0.02;
     const STEP: f32 = 0.008;
@@ -6236,7 +6293,7 @@ fn hide_covered_skin(m: &mut glb::Model, skin: &[std::ops::Range<usize>], cover:
                     for g in v {
                         let d = *g - p;
                         let along = d.dot(n);
-                        if (-0.015..=0.05).contains(&along) && (d - n * along).length_squared() < 0.009 * 0.009 {
+                        if (-inside..=0.05).contains(&along) && (d - n * along).length_squared() < 0.009 * 0.009 {
                             return true;
                         }
                     }
@@ -6454,8 +6511,11 @@ impl Wrap {
     }
 
     /// Offset at a point: the inverse-square-distance mean of the six
-    /// nearest skin vertices (searched up to about 30 cm away).
-    fn at(&self, p: [f32; 3]) -> [f32; 3] {
+    /// nearest skin vertices (searched up to about 30 cm away). With the
+    /// point's normal, the offset along it is at least the largest of those
+    /// six, so where the skin swells unevenly (a belly at full weight) a
+    /// garment is not left inside it.
+    fn at(&self, p: [f32; 3], n: Option<[f32; 3]>) -> [f32; 3] {
         let k = Self::key(p);
         let mut best: Vec<(f32, u32)> = Vec::new();
         let mut r = 1;
@@ -6493,7 +6553,18 @@ impl Wrap {
             }
             wsum += w;
         }
-        o.map(|x| x / wsum)
+        let mut o = o.map(|x| x / wsum);
+        if let Some(n) = n.filter(|n| (n[0] * n[0] + n[1] * n[1] + n[2] * n[2] - 1.0).abs() < 0.1) {
+            let dot = |d: [f32; 3]| d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
+            let out = best.iter().take(6).map(|(_, i)| dot(self.pts[*i as usize].1)).fold(f32::MIN, f32::max);
+            let gap = out - dot(o);
+            if out > 0.0 && gap > 0.0 {
+                for c in 0..3 {
+                    o[c] += n[c] * gap;
+                }
+            }
+        }
+        o
     }
 
     /// Move a part with the skin. Small parts (a watch, glasses, a ring)
@@ -6502,12 +6573,12 @@ impl Wrap {
     fn apply(&self, m: &mut glb::Model) {
         use glam::Vec3;
         let size = (Vec3::from(m.bbox[1]) - Vec3::from(m.bbox[0])).length();
-        let rigid = (size < 0.3).then(|| self.at(((Vec3::from(m.bbox[0]) + Vec3::from(m.bbox[1])) * 0.5).to_array()));
+        let rigid = (size < 0.3).then(|| self.at(((Vec3::from(m.bbox[0]) + Vec3::from(m.bbox[1])) * 0.5).to_array(), None));
         let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
         for me in &mut m.meshes {
             let mut sum = Vec3::ZERO;
             for v in &mut me.verts {
-                let o = rigid.unwrap_or_else(|| self.at(v.pos));
+                let o = rigid.unwrap_or_else(|| self.at(v.pos, Some(v.nrm)));
                 for c in 0..3 {
                     v.pos[c] += o[c];
                 }
@@ -8774,6 +8845,19 @@ mod tests {
         let mut off = r.clone();
         off["use_anisotropy"] = false.into();
         assert_eq!(coat_row(Some(&off))[5 * 4 + 3], 0);
+    }
+
+    #[test]
+    fn garment_levels_follow_the_hide_masks() {
+        let fx = |layer: u8, region: u32, hides: &[u32]| PartFx { layer, region_layer: region, hides: hides.iter().map(|&h| (h, String::new())).collect(), ..Default::default() };
+        // an open shirt naming the t-shirt's layer, both tops, under a jacket that names neither
+        let m: HashMap<u64, PartFx> = [(1, fx(1, 0xa, &[])), (2, fx(1, 0xb, &[0xa])), (3, fx(2, 0xc, &[])), (4, fx(0, 0, &[0xa]))].into_iter().collect();
+        let l = garment_levels([1, 2, 3, 4].into_iter(), &m);
+        assert_eq!((l[&1], l[&2], l[&3]), (1, 2, 8));
+        assert!(!l.contains_key(&4));
+        // items naming each other's layer stay level
+        let m: HashMap<u64, PartFx> = [(1, fx(1, 0xa, &[0xb])), (2, fx(1, 0xb, &[0xa]))].into_iter().collect();
+        assert!(garment_levels([1, 2].into_iter(), &m).values().all(|&v| v == 1));
     }
 
     #[test]
