@@ -313,6 +313,12 @@ enum Cmd {
         /// Only these groom offsets (hex, comma-separated).
         #[arg(long, value_delimiter = ',')]
         only: Vec<String>,
+        /// With --full: the model GLB the grooms sit on (`outfit` writes
+        /// one; or a head drawable exported on its own). Each grown groom's
+        /// mesh then names the head UV set (TEXCOORD_n) its root UVs are in
+        /// (head_uv_set), for scripts/blender_hair_curves.py --model.
+        #[arg(long)]
+        head: Option<PathBuf>,
         /// Only list the grooms (catalog with LOD chains and region) to <out>/grooms/<archive>/catalog.json.
         #[arg(long)]
         list: bool,
@@ -1799,14 +1805,9 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                         let bones = cat.iter().find(|c| c.off == *off).map(|c| c.bones.clone()).unwrap_or_default();
                         let name = format!("{}_{off:x}", slot.replace(' ', "_"));
                         let mut ex = json!({"slot": slot, "placeholder": placeholder, "groom": format!("{off:x}"), "bones": bones});
-                        let uv_set = head.as_ref().and_then(|h| Some((h, sixng_core::hairexport::root_uv_set(&g, h)?)));
-                        if let Some((h, (set, err))) = uv_set {
-                            ex["head_mesh"] = json!(h.name);
-                            ex["head_uv_set"] = json!(set);
-                            ex["head_uv_error"] = json!(err);
-                        }
+                        let uv_set = sixng_core::hairexport::tag_uv_set(&g, head.as_ref(), &mut ex);
                         let (p, mut sum) = sixng_core::hairexport::piece(&g, &name, &o, ex);
-                        sum["head_uv_set"] = json!(uv_set.map(|u| u.1 .0));
+                        sum["head_uv_set"] = json!(uv_set);
                         sum["slot"] = json!(slot);
                         sum["placeholder"] = json!(placeholder);
                         sum["confidence"] = json!(confidence);
@@ -2129,7 +2130,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             out.print(&json!({"ok": true, "archive": a.id, "scanned": sel.len(), "tiles": n, "tiles_with_roads": roads,
                 "seconds": t.elapsed().as_secs_f64(), "index": po.join("navmesh").join(a.id.trim_end_matches(".rpf")).join("index.jsonl")}));
         }
-        Cmd::Grooms { archive, roots, ribbons, full, density, animal, only, list, out: po } => {
+        Cmd::Grooms { archive, roots, ribbons, full, density, animal, only, list, head, out: po } => {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
             let t = Instant::now();
@@ -2180,7 +2181,11 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     std::fs::create_dir_all(&dir)?;
                     sixng_core::atomic::write(dir.join(format!("{root}.fur.json")), serde_json::to_vec_pretty(&fur)?)?;
                 }
-                let (n, errors) = sixng_core::groom::export_grooms(&a, &ix.entries, &only, po, *roots, ribbons.map(|mm| mm / 1000.0), full.then_some(density.clamp(0.0, 1.0)), pr)?;
+                let head = match head {
+                    Some(p) => Some(sixng_core::hairexport::head_from_glb(&std::fs::read(p)?).ok_or_else(|| anyhow!("--head: no mesh in {}", p.display()))?),
+                    None => None,
+                };
+                let (n, errors) = sixng_core::groom::export_grooms(&a, &ix.entries, &only, po, *roots, ribbons.map(|mm| mm / 1000.0), full.then_some(density.clamp(0.0, 1.0)), head.as_ref(), pr)?;
                 out.print(&json!({"ok": true, "archive": a.id, "grooms": n, "errors": errors, "fur": fur,
                     "seconds": t.elapsed().as_secs_f64(), "index": po.join("grooms").join(a.id.trim_end_matches(".rpf")).join("index.jsonl")}));
             }

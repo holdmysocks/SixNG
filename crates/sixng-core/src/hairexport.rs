@@ -108,6 +108,20 @@ fn prim(g: &Groom, name: String, k: usize, points: &[[f32; 3]], uv: &[[f32; 2]],
     StrandPrim { name, k: kk, positions: pos, uv: uvs, attrs: vec![("_WIDTH".into(), width), ("_CLUMP".into(), cl), ("_VARIANT".into(), var)], extras }
 }
 
+/// `extras` with `head_mesh`, `head_uv_set` and `head_uv_error` when the
+/// groom's root UVs match one of the head's UV sets (`root_uv_set`).
+/// Returns the set.
+pub fn tag_uv_set(g: &Groom, head: Option<&HeadUvs>, extras: &mut Value) -> Option<usize> {
+    let h = head?;
+    let (set, err) = root_uv_set(g, h)?;
+    if !h.name.is_empty() {
+        extras["head_mesh"] = json!(h.name);
+    }
+    extras["head_uv_set"] = json!(set);
+    extras["head_uv_error"] = json!(err);
+    Some(set)
+}
+
 /// Root UV of every coat strand (blended from its guides).
 pub fn coat_uvs(g: &Groom, c: &Coat) -> Vec<[f32; 2]> {
     c.guides
@@ -185,15 +199,17 @@ pub fn placeholder_grooms(work: &std::path::Path, a: &crate::game::ArchiveInfo, 
 /// A character's head mesh read back from its model GLB: the vertex
 /// positions (glTF space) and every UV set (`TEXCOORD_n`).
 pub struct HeadUvs {
-    /// The head's node name (the Blender object name after import).
+    /// The head's node name (the Blender object name after import); empty
+    /// when the file has no head-named mesh.
     pub name: String,
     pub pos: Vec<[f32; 3]>,
     pub sets: Vec<Vec<[f32; 2]>>,
 }
 
 /// The head mesh of a model GLB: the largest mesh named like a head
-/// drawable (`…_head_…` or `head_…`, not its eyes). None when there is
-/// none.
+/// drawable (`…_head_…` or `head_…`, not its eyes), or in a file with no
+/// such name (a head drawable exported on its own) its largest mesh. None
+/// when there is none.
 pub fn head_from_glb(b: &[u8]) -> Option<HeadUvs> {
     if b.len() < 20 || &b[0..4] != b"glTF" {
         return None;
@@ -216,10 +232,11 @@ pub fn head_from_glb(b: &[u8]) -> Option<HeadUvs> {
         Some(raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
     };
     let is_head = |n: &str| (n.contains("_head_") || n.starts_with("head_")) && !n.contains("eyes");
+    let named = doc["nodes"].as_array()?.iter().any(|n| n["mesh"].is_u64() && n["name"].as_str().is_some_and(is_head));
     let mut best: Option<HeadUvs> = None;
     for node in doc["nodes"].as_array()? {
         let (Some(name), Some(mi)) = (node["name"].as_str(), node["mesh"].as_u64()) else { continue };
-        if !is_head(name) {
+        if named && !is_head(name) {
             continue;
         }
         let Some(prim) = doc["meshes"][mi as usize]["primitives"].get(0) else { continue };
@@ -231,7 +248,8 @@ pub fn head_from_glb(b: &[u8]) -> Option<HeadUvs> {
             sets.push(u.chunks_exact(2).map(|c| [c[0], c[1]]).collect::<Vec<[f32; 2]>>());
         }
         if best.as_ref().is_none_or(|h| pos.len() > h.pos.len()) {
-            best = Some(HeadUvs { name: name.to_string(), pos, sets });
+            // a head drawable on its own has generic mesh names: no name to give
+            best = Some(HeadUvs { name: if named { name.to_string() } else { String::new() }, pos, sets });
         }
     }
     best

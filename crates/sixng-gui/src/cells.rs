@@ -639,7 +639,7 @@ mod tests {
             srgb: true,
             bc: None,
         };
-        let mesh = glb::Mesh { strand_lod: None,
+        let mesh = glb::Mesh { strand_lod: None, region2: Vec::new(),
             name: String::new(),
             verts: vec![
                 glb::Vertex {

@@ -39,6 +39,8 @@ fn tyre_material(name: &str) -> bool {
 }
 /// Default rim colour: a plain alloy (the true per-vehicle colour is not decoded).
 const RIM_ALLOY: [f32; 3] = [0.6, 0.6, 0.62];
+/// The second region layer of body skins (see `glb::Mesh::region2`): the waist strip both halves carry.
+const SKIN_LAYER2: u32 = 0x2758_22c4;
 pub const SLOTS: [&str; 4] = ["base colour", "normal", "packed RMA", "emissive"];
 
 /// Which side-panel controls do something for a model.
@@ -351,6 +353,8 @@ pub struct HairTone {
     pub set: u32,
     /// hair, brows, lashes, beard ...
     pub slot: String,
+    /// The strand parameter set the hair asset names (`hairsets`; 0: none read).
+    pub param: u32,
     pub variants: [sixng_core::hairtone::Preset; 4],
 }
 
@@ -875,10 +879,9 @@ type GroomList = Result<Vec<sixng_core::groom::GroomInfo>, String>;
 /// body coat stores about 365,000). Fewer strands are drawn wider.
 const COAT_STRANDS: usize = 90_000;
 
-/// Parameter set (fibre widths, roughness, translucency) per hair slot when
-/// none is given: the sets checked against the game frames of one character (asset catalogue
-/// property 2259149558 is not read per asset yet).
-const DEFAULT_PARAMSETS: [(&str, &str); 3] = [("hair", "Long_HighGloss_000"), ("brows", "Eyebrows_MidGloss_000"), ("lashes", "Eyelashes_MidGloss_000")];
+/// Parameter set (fibre widths, roughness, translucency) per hair slot for a piece whose hair asset
+/// is not known (each asset names its own, `hairsets`): the sets one character's assets name.
+const DEFAULT_PARAMSETS: [(&str, &str); 3] = [("hair", "Long_HighGloss_000"), ("brows", "Eyebrows_MidGloss_000"), ("lashes", "Eyelashes_HighGloss_002")];
 /// Skin samples: position (RAGE model space) and linear colour.
 pub type SkinColours = Arc<Vec<([f32; 3], [u8; 3])>>;
 
@@ -1289,14 +1292,22 @@ impl ModelView {
         // game's own files (`hairtables`, cached in the index folder) when the hair is built. Overrides for
         // research: SIXNG_HAIR_DATA=<json> and SIXNG_HAIR_LOD=<json> take parsed tables from files;
         // SIXNG_HAIR_COLOURSET=<name> forces one colour set; SIXNG_HAIR_PARAMSETS=hair=<set>,brows=<set>
-        // names the parameter set per slot (default: `DEFAULT_PARAMSETS`; the asset property that names it
-        // is not read yet); SIXNG_FUR_SETS=<colour set>,<parameter set> gives an animal's strands those sets.
+        // names the parameter set per slot over the one the hair asset names (`hairsets`; for a piece of no
+        // known asset: `DEFAULT_PARAMSETS`); SIXNG_FUR_SETS=<colour set>,<parameter set> gives an animal's strands those sets.
         let joaat = sixng_core::meta7a::joaat;
         let env_data: Option<serde_json::Value> = std::env::var("SIXNG_HAIR_DATA").ok().and_then(|f| serde_json::from_slice(&std::fs::read(f).ok()?).ok());
         // SIXNG_HAIR_SUM=1 lights every strand by the hair lighting, whatever its set's UseStandardBsdf says
         let force_hair_sum = std::env::var("SIXNG_HAIR_SUM").is_ok();
         let force_colour: Option<u32> = std::env::var("SIXNG_HAIR_COLOURSET").ok().map(|n| joaat(&n.to_ascii_lowercase()));
-        let slot_params: HashMap<String, u32> = std::env::var("SIXNG_HAIR_PARAMSETS").ok().map(|s| s.split(',').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_string(), joaat(&v.to_ascii_lowercase()))).collect()).unwrap_or_else(|| DEFAULT_PARAMSETS.iter().map(|(k, v)| (k.to_string(), joaat(&v.to_ascii_lowercase()))).collect());
+        let env_params: Option<HashMap<String, u32>> = std::env::var("SIXNG_HAIR_PARAMSETS").ok().map(|s| s.split(',').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_string(), joaat(&v.to_ascii_lowercase()))).collect());
+        let default_params: HashMap<String, u32> = DEFAULT_PARAMSETS.iter().map(|(k, v)| (k.to_string(), joaat(&v.to_ascii_lowercase()))).collect();
+        // the parameter set of a piece: the forced one, else its asset's, else the slot's default
+        let param_of = move |t: &HairTone| -> Option<u32> {
+            match &env_params {
+                Some(m) => m.get(&t.slot).copied(),
+                None => (t.param != 0).then_some(t.param).or_else(|| default_params.get(&t.slot).copied()),
+            }
+        };
         // SIXNG_HAIR_LOD=<json of the parsed hair LOD presets> applies the game's strand count rule to a character's pieces
         // (head hair by the preset Default: whether its items name another one is not traced; brows, lashes, beard and
         // body hair by the presets of those names) and to an animal's fur given with SIXNG_FUR_SETS (the preset Animal)
@@ -1379,12 +1390,13 @@ impl ModelView {
                             // (or the forced one) and the parameter set named for its slot
                             (Some(t), Some(d)) if d.colour_set(force_colour.unwrap_or(t.set)).is_some() => {
                                 let cs = d.colour_set(force_colour.unwrap_or(t.set)).unwrap();
-                                let ps = slot_params.get(&t.slot).and_then(|n| d.param_set(*n));
+                                let pn = param_of(t);
+                                let ps = pn.and_then(|n| d.param_set(n));
                                 // the piece type, by the game's hair LOD presets (TargetThickness 1.5 hair and fur, 0.5 brows,
                                 // lashes, beard, 0.25 body hair): it sets how many strands the game draws at a distance; not used yet
                                 let thick = match t.slot.as_str() { "brows" | "lashes" | "beard" => 1.0, "bodyhair" => 2.0, _ => 0.0 };
-                                let lit = slot_params.get(&t.slot).and_then(|n| d.param_flags(*n)).filter(|_| !force_hair_sum).map_or(1.0, |(std, fs)| if std { 2.0 + fs } else { 1.0 });
-                                if std::env::var("SIXNG_DEBUG_HAIR").is_ok() { eprintln!("coat {off:x}: slot {:?} lighting flag {lit} (sets flags {:?}, forced hair sum {force_hair_sum})", t.slot, slot_params.get(&t.slot).map(|n| d.param_flags(*n))); }
+                                let lit = pn.and_then(|n| d.param_flags(n)).filter(|_| !force_hair_sum).map_or(1.0, |(std, fs)| if std { 2.0 + fs } else { 1.0 });
+                                if std::env::var("SIXNG_DEBUG_HAIR").is_ok() { eprintln!("coat {off:x}: slot {:?} lighting flag {lit} (sets flags {:?}, forced hair sum {force_hair_sum})", t.slot, pn.map(|n| d.param_flags(n))); }
                                 if let (Some(ps), Some(lp)) = (ps, lod_presets.as_ref()) {
                                     lod = strand_lod(&lp[match t.slot.as_str() { "brows" => "Brows", "lashes" => "Lashes", "beard" => "Beard", "body hair" => "BodyHair", _ => "Default" }], &ps[0], &coat);
                                 }
@@ -1582,13 +1594,22 @@ impl ModelView {
         let ws = Workspace::new(&self.game, &self.work);
         let (idx, sel, slot, ctx) = (self.indexes.clone(), self.hair.selected.clone(), self.hair.export_done.clone(), ctx.clone());
         let full = self.hair.export_full.then_some(self.hair.density.clamp(0.05, 1.0));
+        let (shown, cache): (Vec<u64>, PathBuf) = (self.loaded.as_ref().map_or_else(Vec::new, |l| l.selected.clone()), self.cache_dir());
         // a folder per model, so an earlier `sixng grooms` export and its index stay as they are
         let model: String = self.loaded.as_ref().map_or("grooms", |l| l.source.split_whitespace().next().unwrap_or("").rsplit([':', '#', '/']).find(|s| !s.is_empty() && !s.starts_with("look=")).unwrap_or("grooms")).chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
         let out = Path::new(&self.work).join("out").join("hair").join(model);
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<String> {
                 let (a, ix) = index_for(&ws, "packs", &idx)?;
-                let (written, errors) = sixng_core::groom::export_grooms(&a, &ix.entries, &sel, &out, false, None, full, sixng_core::export::no_progress())?;
+                // the shown character's head as the viewer exported it, to name the
+                // head UV set the root UVs are in (`hairexport::tag_uv_set`)
+                let head = shown
+                    .iter()
+                    .filter_map(|o| ix.entries.iter().find(|e| e.off == *o))
+                    .filter(|e| e.name.as_deref().is_some_and(sixng_core::headskin::is_head))
+                    .find_map(|e| std::fs::read(cache.join("models").join(sixng_core::game::index_stem(&a.id)).join(export::export_base_name(e)).join("model.glb")).ok())
+                    .and_then(|b| sixng_core::hairexport::head_from_glb(&b));
+                let (written, errors) = sixng_core::groom::export_grooms(&a, &ix.entries, &sel, &out, false, None, full, head.as_ref(), sixng_core::export::no_progress())?;
                 let dir = out.join("grooms").join("packs");
                 Ok(format!("{written} groom(s) written to {}{}{}", dir.display(), if full.is_some() { " with the full strand set and a growth.json each" } else { " (guide strands)" }, if errors > 0 { format!("; {errors} failed") } else { String::new() }))
             })()
@@ -1644,7 +1665,7 @@ impl ModelView {
                         let ctx = ui.ctx().clone();
                         self.start_hair_export(&ctx);
                     }
-                    ui.checkbox(&mut self.hair.export_full, "full strands").on_hover_text("Write the strands the groom stores per root triangle, grown between its guides, instead of the guide strands alone (same as `sixng grooms --full`; the density slider below sets the share). The game's own clumping, curl and noise are not decoded, so the result is smoother than in game.");
+                    ui.checkbox(&mut self.hair.export_full, "full strands").on_hover_text("Write the strands the groom stores per root triangle, grown between its guides, instead of the guide strands alone, with clumping, curl and noise as the viewer draws them (same as `sixng grooms --full`; the density slider below sets the share). Each groom names the head UV set its root UVs are in, for scripts/blender_hair_curves.py.");
                     if self.hair.exporting {
                         ui.spinner();
                         ui.label("exporting (the first run reads the groom list, about a minute) …");
@@ -5354,10 +5375,18 @@ fn load_parts(
             // in the Parts panel leaves the skin under it whole
             let masks: Vec<&str> = fx.iter().filter(|(o, _)| *o != off && parts.iter().any(|e| e.off == **o)).flat_map(|(_, f)| f.hides.iter()).filter(|h| h.0 == *layer).map(|h| h.1.as_str()).collect();
             let hide: Vec<bool> = (0..256u32).map(|n| masks.iter().any(|k| sixng_core::wardrobe::mask_has(k, n))).collect();
+            // The second byte of a body skin's regions is a region in a second layer, shared by the
+            // two halves: the strip round the waist that both carry. Each half hides it there, so
+            // the upper half's copy goes when the lower half is worn and the two do not fight.
+            let masks2: Vec<&str> = fx.iter().filter(|(o, _)| *o != off && parts.iter().any(|e| e.off == **o)).flat_map(|(_, f)| f.hides.iter()).filter(|h| h.0 == SKIN_LAYER2).map(|h| h.1.as_str()).collect();
+            let hide2: Vec<bool> = (0..256u32).map(|n| n != 0 && masks2.iter().any(|k| sixng_core::wardrobe::mask_has(k, n))).collect();
             for i in range.clone() {
                 let Some(me) = m.meshes.get_mut(i) else { continue };
                 let before = me.indices.len() / 3;
-                me.indices = me.indices.chunks_exact(3).filter(|t| !t.iter().all(|&i| hide[me.verts[i as usize].zone[3] as usize])).flatten().copied().collect();
+                let r2 = std::mem::take(&mut me.region2);
+                let gone = |i: u32| hide[me.verts[i as usize].zone[3] as usize] || r2.get(i as usize).is_some_and(|&r| hide2[r as usize]);
+                me.indices = me.indices.chunks_exact(3).filter(|t| !t.iter().all(|&i| gone(i))).flatten().copied().collect();
+                me.region2 = r2;
                 *(if is_skin { &mut skin_hidden } else { &mut cloth_hidden }) += before - me.indices.len() / 3;
             }
         }
@@ -6944,6 +6973,7 @@ fn load_query_sel(
                     Ok(t) => {
                         // the hair colour preset of each strand part, with its noise texture
                         let presets = if info.strand_presets.is_empty() { None } else { sixng_core::hairtone::Table::load_or_build(&ws).map_err(|e| info.notes.push(format!("Hair colours: {e}"))).ok() };
+                        let asset_sets = sixng_core::hairsets::get(&ws.work, &a, &ix.entries);
                         for (slot, placeholder, guid) in &info.strands {
                             // by the item's hair asset, else by the character's own placeholder
                             // research: SIXNG_STRANDS_BY_NAME=1 takes the placement under the item's own placeholder name before the asset's best one
@@ -6951,14 +6981,26 @@ fn load_query_sel(
                             let Some(l) = by_name.or_else(|| u64::from_str_radix(guid, 16).ok().and_then(|g| t.resolve(g, look.fit.as_deref()))).or_else(|| guid.is_empty().then(|| t.by_placeholder(placeholder)).flatten()) else { continue };
                             let colour = info.strand_tints.iter().find(|t| t.0 == *slot && t.1 == 0x1e64_f584).and_then(|t| Some(sixng_core::pedtint::palettes(&ws.game).ok()?.get(&t.1)?.sample(t.2, 128)));
                             // presets whose colours are white are not hair colours (their flag is set)
-                            let tone = info.strand_presets.iter().find(|p| p.0 == *slot).and_then(|p| Some((p.1, presets.as_ref()?.variants(p.1)?))).filter(|(_, v)| !v[0].flag).map(|(name, variants)| HairTone { name, set: { let cat = match slot.as_str() { "hair" => "864b03ae", "brows" => "7c50ad43", "lashes" => "83a664e7", "beard" => "44d2709f", "body hair" => "a228cc57", _ => "" }; look.outfits[k].strand_colours.iter().find(|c| c.0 == cat).and_then(|c| u32::from_str_radix(&c.1, 16).ok()).unwrap_or(name) }, slot: slot.clone(), variants });
+                            let tone = info.strand_presets.iter().find(|p| p.0 == *slot).and_then(|p| Some((p.1, presets.as_ref()?.variants(p.1)?))).filter(|(_, v)| !v[0].flag).map(|(name, variants)| HairTone { name, set: { let cat = match slot.as_str() { "hair" => "864b03ae", "brows" => "7c50ad43", "lashes" => "83a664e7", "beard" => "44d2709f", "body hair" => "a228cc57", _ => "" }; look.outfits[k].strand_colours.iter().find(|c| c.0 == cat).and_then(|c| u32::from_str_radix(&c.1, 16).ok()).unwrap_or(name) }, slot: slot.clone(), param: 0, variants });
                             // a piece whose item names no colour preset (lashes): the colour set the outfit's colour item gives its
                             // category, when there is one; the stand-in colours here are only used without the strand tables
                             let tone = tone.or_else(|| {
                                 let cat = match slot.as_str() { "hair" => "864b03ae", "brows" => "7c50ad43", "lashes" => "83a664e7", "beard" => "44d2709f", "body hair" => "a228cc57", _ => return None };
                                 let set = look.outfits[k].strand_colours.iter().find(|c| c.0 == cat).and_then(|c| u32::from_str_radix(&c.1, 16).ok())?;
                                 let dark = sixng_core::hairtone::Preset { a: [20, 14, 10], b: [20, 14, 10], texture: 0, flag: false, values: Default::default() };
-                                Some(HairTone { name: set, set, slot: slot.clone(), variants: [dark.clone(), dark.clone(), dark.clone(), dark] })
+                                Some(HairTone { name: set, set, slot: slot.clone(), param: 0, variants: [dark.clone(), dark.clone(), dark.clone(), dark] })
+                            });
+                            // the strand sets the hair asset itself names: its parameter set, and its colour set for a
+                            // piece whose item and outfit name none
+                            let asset = u64::from_str_radix(guid, 16).ok().and_then(|g| asset_sets.of(g));
+                            let tone = tone.or_else(|| {
+                                let set = asset.map(|s| s.colour).filter(|&c| c != 0)?;
+                                let dark = sixng_core::hairtone::Preset { a: [20, 14, 10], b: [20, 14, 10], texture: 0, flag: false, values: Default::default() };
+                                Some(HairTone { name: set, set, slot: slot.clone(), param: 0, variants: [dark.clone(), dark.clone(), dark.clone(), dark] })
+                            });
+                            let tone = tone.map(|mut t| {
+                                t.param = asset.map_or(0, |s| s.param);
+                                t
                             });
                             let colour = colour.or(tone.as_ref().map(|t| sixng_core::hairtone::display(t.variants[0].a)));
                             info.hair.push(HairPick { slot: slot.clone(), placeholder: l.placeholder.clone(), confidence: l.confidence, exact: t.exact, grooms: t.uncontested(l), off_head: 0, shown: l.confidence >= 0.5 && slot != "body hair" && l.part != "body", colour, tone });
