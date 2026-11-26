@@ -86,6 +86,12 @@ struct Shadow {
 @group(0) @binding(13) var t_shadow: texture_depth_2d_array;
 @group(0) @binding(14) var samp_shadow: sampler_comparison;
 
+// The water maps (atmo.rs `set_water_maps`): A = ground height (m) and the
+// water fog's scattering (rgb), B = its extinction (rgb) and 1 where
+// loaded; both in the timecycle's units, over the box S.water5.
+@group(0) @binding(24) var t_water_a: texture_2d<f32>;
+@group(0) @binding(25) var t_water_b: texture_2d<f32>;
+
 fn hdr() -> bool { return S.flags.x == 1u; }
 
 // How lit p is in cascade c (1 lit, 0 shadowed; -1 outside the cascade).
@@ -290,6 +296,44 @@ fn footprint(p: vec3<f32>) -> f32 {
 
 // Radiance leaving the water surface at p towards the camera; `fp` from
 // `footprint` (taken in uniform control flow by the caller).
+// Scale from the timecycle's water units to coefficients per metre (atmo.rs
+// K_WATER).
+const K_WATER: f32 = 0.03;
+// The sea's surface height (world y, m) for the depth over the seabed: the
+// beaches and dunes reach down to about -4 m (world3d SEA_FLOOR); our
+// choice, not decoded.
+const SEA_LEVEL: f32 = -4.0;
+// Below this height a water surface is the sea plane (world3d, drawn under
+// the terrain), whose water stands at SEA_LEVEL.
+const SEA_PLANE_BELOW: f32 = -6.0;
+// Reflectance of the bed under shallow water (sand and mud; our choice).
+const BED_ALBEDO: vec3<f32> = vec3(0.30, 0.26, 0.19);
+
+struct WaterHere {
+    ground: f32,
+    scat: vec3<f32>,
+    ext: vec3<f32>,
+    ok: bool,
+};
+
+// The water maps at world point p (none outside them or before they load).
+fn water_here(p: vec3<f32>) -> WaterHere {
+    var w: WaterHere;
+    w.ok = false;
+    let b = S.water5;
+    if (b.z <= b.x || b.w <= b.y) { return w; }
+    // world (x, up, -y) to the map's x, y
+    let uv = vec2((p.x - b.x) / (b.z - b.x), (b.w + p.z) / (b.w - b.y));
+    if (any(uv < vec2(0.0)) || any(uv > vec2(1.0))) { return w; }
+    let a = textureSampleLevel(t_water_a, lin_clamp, uv, 0.0);
+    let e = textureSampleLevel(t_water_b, lin_clamp, uv, 0.0);
+    w.ground = a.x;
+    w.scat = a.yzw;
+    w.ext = e.rgb;
+    w.ok = e.a > 0.5 && a.x > -250.0;
+    return w;
+}
+
 fn water_shade(p: vec3<f32>, fp: f32) -> vec3<f32> {
     let o = F.cam_pos.xyz;
     let dist = length(o - p);
@@ -321,9 +365,25 @@ fn water_shade(p: vec3<f32>, fp: f32) -> vec3<f32> {
     let glint = D * G * fh / max(4.0 * ndl * ndv, 1e-3) * sun * ndl;
     // the water body: light going down, scattered back up (a third of
     // the single-scattering albedo, the usual ocean-colour rule)
-    let ssa = S.water1.rgb / max(S.water0.rgb, vec3(1e-5));
+    var ssa = S.water1.rgb / max(S.water0.rgb, vec3(1e-5));
     let e_down = sun * max(l.y, 0.0) * 0.98 + PI * sky_ambient(vec3(0.0, 1.0, 0.0));
-    let body = 0.33 * ssa * e_down / PI * S.water3.rgb;
+    // the place's own water (the fog atlas) and the bed under it (the
+    // water height map): light reaching the bed and coming back through
+    // the water adds the bed's colour where the water is shallow
+    let wh = water_here(p);
+    var body = vec3(0.0);
+    if (wh.ok) {
+        ssa = clamp(wh.scat / max(wh.ext, vec3(1e-5)), vec3(0.0), vec3(1.0));
+        let surf = select(p.y, SEA_LEVEL, p.y < SEA_PLANE_BELOW);
+        let depth = max(surf - wh.ground, 0.0);
+        // the view ray refracted into the water (n = 1.33)
+        let mu = sqrt(max(1.0 - (1.0 - ndv * ndv) / 1.7689, 0.04));
+        let t = exp(-wh.ext * K_WATER * depth * (1.0 + 1.0 / mu));
+        let deep = 0.33 * ssa * e_down / PI * S.water3.rgb;
+        body = mix(deep, BED_ALBEDO * e_down / PI, t);
+    } else {
+        body = 0.33 * ssa * e_down / PI * S.water3.rgb;
+    }
     return fr * refl + glint + (1.0 - fr) * body;
 }
 

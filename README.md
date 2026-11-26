@@ -1187,8 +1187,17 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   (wet sand, beaches). A water plane under the terrain reaches the
   horizon. Our choices: the scale from the timecycle's water
   units to coefficients per metre (0.03), the wind direction, and the
-  share of the slope drawn as waves (60 %). Not yet: shallow water over
-  the seabed, foam, shore waves, refraction and underwater fog.
+  share of the slope drawn as waves (60 %).
+  Where the game's water maps are loaded (the fog atlas's and the water
+  height map's whole-map fallbacks, read once and cached in
+  `<work>/cache/water_view_v1.bin`), each place takes its own water: the
+  body colour from the fog atlas's scattering over extinction there, and
+  the bed shows through shallow water (the water height map's ground under
+  the surface, light down to the bed and back up through the water's
+  extinction). Inland water meshes (lakes, marsh, canals) are measured from
+  their own surface, the sea from 4 m below 0 (where the beaches end).
+  Our choices: the bed's reflectance (sand and mud, 0.30 0.26 0.19) and the
+  sea's level. Not yet: foam, shore waves, refraction and underwater fog.
 - **Map cells** (far placements merged per area): a placement more than
   0.6× the HD distance from the camera can be drawn from its cell instead
   of one by one. A cell holds one LOD level's placements in one square of

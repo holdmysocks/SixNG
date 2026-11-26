@@ -46,6 +46,8 @@ struct Scene {
     water2: vec4<f32>,
     water3: vec4<f32>,
     water4: vec4<f32>,
+    // the water maps' world box (map x, y: min, max; zero until loaded)
+    water5: vec4<f32>,
 };
 
 // State the GPU keeps between frames: [0] x exposure (multiplier on
