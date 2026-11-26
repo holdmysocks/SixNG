@@ -919,7 +919,7 @@ mod tests {
     <Item key="BODYSHAPE_BEACHBELLIES"><BodyShapeVariations><Item><BodyShapePreset>PED_BODYSHAPE_BELLY</BodyShapePreset></Item></BodyShapeVariations></Item>
   </BodyShapeVariationProfiles>"#;
         assert_eq!(preset_from_xml(xml, "Average").unwrap(), vec![("gcweightback".to_string(), 0.0)]);
-        assert_eq!(preset_from_xml(xml, "BeachBellies").unwrap(), vec![("gcbutt".to_string(), 0.75), ("gcweightbelly".to_string(), 0.5)]);
+        assert_eq!(preset_from_xml(xml, "BeachBellies").unwrap(), vec![("gccleavage".to_string(), 0.5), ("gcbutt".to_string(), 0.75), ("gcweightbelly".to_string(), 0.5)]);
         assert!(preset_from_xml(xml, "Nope").is_err());
         // an unnamed profile word, as its joaat
         let h = format!("{:08x}", crate::meta7a::joaat("BeachBellies"));
