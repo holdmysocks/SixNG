@@ -27,6 +27,11 @@
 //!   archive. Checked against the files that do have a parent hash: 95 %
 //!   pick the same file (the misses are state variants of one LOD at the
 //!   same place).
+//! * Time archetypes (`CTimeArchetypeDef` `76b0c56c`) are archetypes
+//!   with the same base layout plus `timeFlags` `8609d52c`, whose low 24
+//!   bits are the in-game hours the model is shown (bit h = hour h). Only
+//!   a few dozen exist (shop open/shut variants, beach loungers); they are
+//!   read with the plain archetypes and keep their mask.
 //! * An entity's `lodDist` of -1 means "use the archetype's `lodDist`";
 //!   explicit values equal the archetype value for most entities and
 //!   override it for the rest.
@@ -58,6 +63,27 @@ pub struct ArchLod {
     /// The 64-bit keys at +0x08, +0x10 and +0x28 (0 = none); one of them
     /// keys the archetype's entry in the tunable-object table of data.
     pub tuning_keys: [u64; 3],
+    /// `timeFlags` of a time archetype (`CTimeArchetypeDef`); None for a
+    /// plain archetype.
+    pub time_flags: Option<u32>,
+}
+
+/// Struct hash of `CTimeArchetypeDef` (a `CBaseArchetypeDef` plus
+/// `timeFlags`).
+pub const TIME_ARCHETYPE_DEF: u32 = 0x76b0_c56c;
+/// Field hash of `timeFlags`.
+pub const TIME_FLAGS_FIELD: u32 = 0x8609_d52c;
+
+/// In-game hours (0..=23) a `timeFlags` mask shows the model in.
+pub fn time_hours(time_flags: u32) -> Vec<u8> {
+    (0..24u8).filter(|h| time_flags >> h & 1 != 0).collect()
+}
+
+/// JSON for an archetype's time mask: `time_flags` (hex, low 24 bits) and
+/// `hours`, or None for a plain archetype.
+pub fn time_json(time_flags: Option<u32>) -> Option<serde_json::Value> {
+    let t = time_flags?;
+    Some(json!({"time_flags": format!("{:06x}", t & 0xFF_FFFF), "hours": time_hours(t)}))
 }
 
 pub struct Ent {
@@ -95,8 +121,9 @@ pub fn read_file(a: &ArchiveInfo, e: &Entry) -> Option<FileRec> {
     let ents_o = m.objects(ENTITY);
     let root = m.objects(MAPDATA);
     let arch_o = m.objects(ARCHETYPE_DEF);
+    let time_o = m.objects(TIME_ARCHETYPE_DEF);
     let has_props = !m.objects(crate::batches::PROP_BATCH).is_empty();
-    if ents_o.is_empty() && root.is_empty() && arch_o.is_empty() && !has_props {
+    if ents_o.is_empty() && root.is_empty() && arch_o.is_empty() && time_o.is_empty() && !has_props {
         return None;
     }
     let (name_hash, parent_hash, region) = match root.first() {
@@ -122,11 +149,16 @@ pub fn read_file(a: &ArchiveInfo, e: &Entry) -> Option<FileRec> {
             }
         })
         .collect();
+    let base = |o: usize, time_flags: Option<u32>| {
+        (r.u32(o + 0x74), ArchLod { lod_dist: r.f32(o + 0x38), hd_texture_dist: r.f32(o + 0x70), bs_radius: r.f32(o + 0x64), bs_centre: [r.f32(o + 0x58), r.f32(o + 0x5C), r.f32(o + 0x60)], flags: Some(r.u32(o + 0x68)), tuning_keys: [r.u64(o + 0x08), r.u64(o + 0x10), r.u64(o + 0x28)], time_flags })
+    };
     let archs = arch_o
         .iter()
-        .map(|&o| {
-            (r.u32(o + 0x74), ArchLod { lod_dist: r.f32(o + 0x38), hd_texture_dist: r.f32(o + 0x70), bs_radius: r.f32(o + 0x64), bs_centre: [r.f32(o + 0x58), r.f32(o + 0x5C), r.f32(o + 0x60)], flags: Some(r.u32(o + 0x68)), tuning_keys: [r.u64(o + 0x08), r.u64(o + 0x10), r.u64(o + 0x28)] })
-        })
+        .map(|&o| base(o, None))
+        .chain(time_o.iter().map(|&o| {
+            let t = m.scalars_by_hash(TIME_ARCHETYPE_DEF, o, &[]).get(&TIME_FLAGS_FIELD).and_then(|v| v.as_u64()).map(|x| x as u32);
+            base(o, Some(t.unwrap_or(0)))
+        }))
         .collect();
     let mut props = Vec::new();
     if has_props {
@@ -191,7 +223,10 @@ pub fn build(ws: &Workspace, a: &ArchiveInfo, metas: &[&Entry], progress: Progre
         }
         let best = c.iter().max_by(|x, y| x.1 .0.cmp(&y.1 .0).then(f32::from_bits(*x.0).total_cmp(&f32::from_bits(*y.0)))).map(|x| x.1 .1).unwrap_or(0);
         let vals: Vec<f32> = c.keys().map(|b| f32::from_bits(*b)).collect();
-        arch.insert(*h, (v[best], v.len(), vals));
+        let mut l = v[best];
+        // a time archetype keeps its mask even if a plain definition of the same hash wins
+        l.time_flags = l.time_flags.or_else(|| v.iter().find_map(|x| x.time_flags));
+        arch.insert(*h, (l, v.len(), vals));
     }
     {
         let mut w = crate::atomic::AtomicFile::create(archetype_lod_path(ws))?;
@@ -205,6 +240,9 @@ pub fn build(ws: &Workspace, a: &ArchiveInfo, metas: &[&Entry], progress: Progre
                 "flags": l.flags, "tuning_keys": l.tuning_keys.iter().map(|k| format!("{k:016x}")).collect::<Vec<_>>()});
             if vals.len() > 1 {
                 v["lod_dist_values"] = json!(vals);
+            }
+            if let Some(t) = time_json(l.time_flags) {
+                v["time"] = t;
             }
             writeln!(w, "{v}")?;
         }
@@ -482,7 +520,7 @@ pub fn load_archetype_lod_from(index_dir: &std::path::Path) -> HashMap<u32, Arch
         let f = |k: &str| v[k].as_f64().unwrap_or(-1.0) as f32;
         let c = |i: usize| v["bs_centre"][i].as_f64().unwrap_or(0.0) as f32;
         let k = |i: usize| v["tuning_keys"][i].as_str().and_then(|x| u64::from_str_radix(x, 16).ok()).unwrap_or(0);
-        m.insert(h, ArchLod { lod_dist: f("lod_dist"), hd_texture_dist: f("hd_texture_dist"), bs_radius: f("bs_radius"), bs_centre: [c(0), c(1), c(2)], flags: v["flags"].as_u64().map(|x| x as u32), tuning_keys: [k(0), k(1), k(2)] });
+        m.insert(h, ArchLod { lod_dist: f("lod_dist"), hd_texture_dist: f("hd_texture_dist"), bs_radius: f("bs_radius"), bs_centre: [c(0), c(1), c(2)], flags: v["flags"].as_u64().map(|x| x as u32), tuning_keys: [k(0), k(1), k(2)], time_flags: v["time"]["time_flags"].as_str().and_then(|x| u32::from_str_radix(x, 16).ok()) });
     }
     m
 }
@@ -514,4 +552,40 @@ pub fn load_parents_from(index_dir: &std::path::Path) -> HashMap<String, HashMap
         }
     }
     m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn time_hours_from_mask() {
+        // beach loungers: 07:00 to 20:59
+        assert_eq!(time_hours(0x1f_ff80), (7..=20).collect::<Vec<u8>>());
+        // shut variant: wraps past midnight
+        assert_eq!(time_hours(0xf8_007f), vec![0, 1, 2, 3, 4, 5, 6, 19, 20, 21, 22, 23]);
+        // bits above 23 are not hours
+        assert_eq!(time_hours(0xff00_00e0), vec![5, 6, 7]);
+        assert!(time_hours(0).is_empty());
+        assert_eq!(time_json(None), None);
+        assert_eq!(time_json(Some(0xe0)).unwrap(), json!({"time_flags": "0000e0", "hours": [5, 6, 7]}));
+    }
+
+    #[test]
+    fn archetype_lod_reads_time_flags() {
+        let d = std::env::temp_dir().join(format!("sixng_lodlinks_time_{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        fs::write(
+            d.join("archetype_lod.jsonl"),
+            "{\"archetype\":\"03d83f1e\",\"lod_dist\":60.0,\"flags\":128,\"time\":{\"time_flags\":\"1fff80\",\"hours\":[7]}}
+{\"archetype\":\"00000001\",\"lod_dist\":10.0}
+",
+        )
+        .unwrap();
+        let m = load_archetype_lod_from(&d);
+        let _ = fs::remove_dir_all(&d);
+        assert_eq!(m[&0x03d8_3f1e].time_flags, Some(0x1f_ff80));
+        assert_eq!(m[&0x03d8_3f1e].lod_dist, 60.0);
+        assert_eq!(m[&1].time_flags, None);
+    }
 }
