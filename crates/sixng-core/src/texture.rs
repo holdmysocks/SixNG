@@ -370,6 +370,18 @@ fn uncompressed_layout(fmt: Fmt, t: &TexInfo) -> Option<crate::gfx10::Layout> {
     Layout::new(Swizzle::S4K, t.width, t.height, t.mips, bpe).map(|l| l.with_slices(t.depth))
 }
 
+/// Layout of a block-compressed volume (dimension byte 3): 4x4 blocks as
+/// 16-byte elements in the 3D `SW_4KB_S` pattern, with the mip chain of
+/// [`crate::gfx10::Layout::new_3d_mips`]. Measured on the one such volume
+/// (BC5); `None` for 8-byte blocks (BC1, BC4), which no volume uses.
+fn bc_volume_layout(fmt: Fmt, t: &TexInfo) -> Option<crate::gfx10::Layout> {
+    let bd = fmt.block_dim();
+    if bd == 1 || fmt.bytes_per_elem() != 16 || t.dimension != 3 || t.depth <= 1 {
+        return None;
+    }
+    crate::gfx10::Layout::new_3d_mips(crate::gfx10::Swizzle::S4K, t.width.div_ceil(bd), t.height.div_ceil(bd), t.depth, t.mips, fmt.bytes_per_elem())
+}
+
 fn untile_mip(r: &Resource, t: &TexInfo, l: &crate::gfx10::Layout, m: usize) -> Result<Vec<u8>> {
     let start = t.data_off as usize;
     if start >= r.gfx.len() {
@@ -383,7 +395,7 @@ fn untile_mip(r: &Resource, t: &TexInfo, l: &crate::gfx10::Layout, m: usize) -> 
 /// `[mip][slice]`: the layers of a 2D array or cube, or the depth slices of
 /// each mip of a volume (half as many per mip). `None` when the texture has
 /// one slice or its layout is not mapped (uncompressed arrays with mips,
-/// block-compressed volumes).
+/// block-compressed volumes with element sizes not measured in 3D).
 ///
 /// Uncompressed arrays give mip 0 only. Block-compressed arrays and cubes
 /// give the mips of [`exportable_mips`]: in the texture dictionaries they are
@@ -404,10 +416,11 @@ pub fn slices_linear(r: &Resource, t: &TexInfo) -> Result<Option<(Fmt, Vec<Vec<V
         }
         let n = l.mips.len();
         (l, n)
+    } else if t.dimension == 3 {
+        let Some(l) = bc_volume_layout(fmt, t) else { return Ok(None) };
+        let n = l.mips.len();
+        (l, n)
     } else {
-        if t.dimension == 3 {
-            return Ok(None);
-        }
         let bd = fmt.block_dim();
         let base = crate::gfx10::Layout::new(crate::gfx10::Swizzle::S4K, t.width.div_ceil(bd), t.height.div_ceil(bd), t.mips, fmt.bytes_per_elem());
         let Some(l) = base.and_then(|l| l.with_cube_copies(t.depth, 1, Some(0))) else { return Ok(None) };
@@ -458,7 +471,7 @@ pub fn mip0_linear(r: &Resource, t: &TexInfo, linear_input: bool) -> Result<(Fmt
         }
     }
     if !linear_input {
-        if let Some(l) = uncompressed_layout(fmt, t) {
+        if let Some(l) = uncompressed_layout(fmt, t).or_else(|| bc_volume_layout(fmt, t)) {
             return untile_mip(r, t, &l, 0).map(|d| (fmt, d));
         }
     }
