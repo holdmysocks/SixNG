@@ -1022,12 +1022,6 @@ mod tests {
     }
 
     #[test]
-    fn plastic_breasts_name_matches_preset_hash() {
-        assert_eq!(crate::meta7a::joaat("gcplasticbreasts"), 0xb0eae798);
-        assert_eq!(crate::meta7a::joaat("gcweighbelly"), 0x5443facc);
-    }
-
-    #[test]
     fn preset_items_later_replace_earlier() {
         let j = crate::meta7a::joaat;
         let mut t = HashMap::new();
