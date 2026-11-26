@@ -1446,6 +1446,12 @@ impl metal4_app::UiApp for App {
                 self.work
             );
         }
+        if let Err(error) = renderer.set_model_cache_dir(&self.work) {
+            eprintln!(
+                "[metal-io] model cache disabled because {} could not be initialized: {error:#}",
+                self.work
+            );
+        }
         Ok(())
     }
 }

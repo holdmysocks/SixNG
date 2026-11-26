@@ -432,11 +432,12 @@ pub const CONTROLS: &[(&str, u32, Option<u32>)] = &[
     ("gcbutt", 0x5a502ae2, None),
     ("gcbreasts", 0x377b0101, Some(0x48f90678)),
     // Shape controls found in the same preset PSO (2026-11-26); names by
-    // joaat of the control id, except the one whose name is not recovered.
+    // joaat of the control id (gcplasticbreasts = b0eae798, found by a word
+    // search and checked by its look: large, round, high-set breasts at 1).
     ("gcbreastheight", 0xf9bc636e, Some(0x12b6dd5f)),
     ("gcbreastspacing", 0xb3e7142f, Some(0x36c800c8)),
     ("gcchestheight", 0xa064c82b, Some(0x9b89a2b0)),
-    ("gc_b0eae798", 0x8a7d0c78, Some(0xb2efcb7f)),
+    ("gcplasticbreasts", 0x8a7d0c78, Some(0xb2efcb7f)),
     ("gccleavage", 0xf9dc7b4c, Some(0xc7717edf)),
     ("gcbellyround", 0xa1aede2a, None),
     ("gchipwidth", 0x6c83d62b, None),
@@ -560,6 +561,9 @@ pub fn outfit_preset(game_root: &Path, word: Option<&str>, items: &[String]) -> 
 }
 
 /// `preset_items` on a table of item hash -> (control hash, value).
+/// Controls not in `CONTROLS` are dropped, as the game's rig ignores them:
+/// six athletic presets set `gcweighbelly` (5443facc), a misspelling of
+/// `gcweightbelly` that no rig reads.
 pub fn preset_from_items(table: &HashMap<u32, Vec<(u32, f32)>>, items: &[String]) -> Result<Vec<(String, f32)>, String> {
     let mut vals: Vec<(&str, f32)> = Vec::new();
     let mut found = false;
@@ -1004,6 +1008,12 @@ mod tests {
         assert_eq!(m.get(&0xf9dc7b4c), Some(&0.5));
         assert_eq!(m.get(&0x6c83d62b), Some(&0.9));
         assert!(!m.contains_key(&0x9c978205) || m[&0x9c978205] == 0.0);
+    }
+
+    #[test]
+    fn plastic_breasts_name_matches_preset_hash() {
+        assert_eq!(crate::meta7a::joaat("gcplasticbreasts"), 0xb0eae798);
+        assert_eq!(crate::meta7a::joaat("gcweighbelly"), 0x5443facc);
     }
 
     #[test]
