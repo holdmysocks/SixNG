@@ -756,6 +756,15 @@ pub fn wardrobe_textures(game_root: &Path) -> Result<&'static WardrobeTextures, 
     .map_err(|e| e.clone())
 }
 
+/// One variation's skinned items: drawable when found, GUID, skins.
+type BodySet = Vec<(Option<String>, Option<String>, Vec<(String, String)>)>;
+
+/// A body item on a whole-body mesh: (mesh, its fit, skins).
+type Worn<'a> = (String, String, &'a [(String, String)]);
+
+/// Key -> skin lists with how often they are worn (`AssetDrawables::body`).
+pub type SkinCounts = HashMap<String, Vec<(Vec<(String, String)>, u32)>>;
+
 /// Drawables by asset GUID, over every wardrobe resource: an item names
 /// its drawable by GUID only (`States` -> `Asset` -> `Drawable`), and the
 /// drawable is found through the item's textures. Where an item's own
@@ -766,6 +775,16 @@ pub struct AssetDrawables {
     version: u32,
     /// GUID (hex) -> the drawables its items resolved to, with how often.
     pub by_guid: HashMap<String, Vec<(String, u32)>>,
+    /// Whole-body skin mesh (`hand_mr1_000_nude_cull` …) -> the skin lists
+    /// (colour, normal; item first) of the body items that wear it, with how
+    /// often.
+    #[serde(default)]
+    pub body: SkinCounts,
+    /// "<mesh> <its first colour texture> <other mesh>" -> the skin lists
+    /// the other whole-body mesh wears in the same body set, with how often:
+    /// which lower body goes with an upper body and the other way round.
+    #[serde(default)]
+    pub body_pairs: SkinCounts,
 }
 
 impl AssetDrawables {
@@ -778,17 +797,17 @@ impl AssetDrawables {
 }
 
 /// The asset table (built from every wardrobe resource on first use, a
-/// few minutes, then cached as `<work>/index/asset_drawables.json`).
+/// few minutes, then cached as `<work>/index/asset_drawables_v2.json`; version 1, without the body skins, was `asset_drawables.json`, which older builds still use).
 pub fn asset_drawables(a: &ArchiveInfo, ix: &ArchiveIndex) -> Result<&'static AssetDrawables, String> {
     static T: OnceLock<Result<AssetDrawables, String>> = OnceLock::new();
     T.get_or_init(|| {
         let work = crate::names::work_dir().ok_or("no work directory")?;
-        let cache = work.join("index").join("asset_drawables.json");
+        let cache = work.join("index").join("asset_drawables_v2.json");
         let ixp = crate::scan::index_path(&work.join("index"), "packs.rpf");
         let stamp = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
         if let Ok(b) = std::fs::read(&cache) {
             if let Ok(t) = serde_json::from_slice::<AssetDrawables>(&b) {
-                if t.version == 1 && stamp(&cache) >= stamp(&ixp) {
+                if t.version == 6 && stamp(&cache) >= stamp(&ixp) {
                     return Ok(t);
                 }
             }
@@ -797,30 +816,50 @@ pub fn asset_drawables(a: &ArchiveInfo, ix: &ArchiveIndex) -> Result<&'static As
         let pre = crate::wardrobe::prefixes(ix.entries.iter().filter(|e| e.kind == crate::classify::Kind::RageObj).filter_map(|e| e.name.as_deref()));
         let names: HashSet<String> = ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| e.name.as_ref().map(|n| n.to_ascii_lowercase())).collect();
         let exists = |n: &str| names.contains(n);
-        let found: Vec<(String, String)> = ix
+        // per resource: (GUID, drawable) of each item, and per variation its
+        // skinned items (drawable when found, GUID, skins)
+        // a GUID is the name id of the item's own drawable (as in `look_row`)
+        let ids: HashMap<u64, &String> = names.iter().map(|n| (crate::meta7a::asset_id(n), n)).collect();
+        type Found = (Vec<(String, String)>, Vec<BodySet>);
+        let per: Vec<Found> = ix
             .entries
             .par_iter()
             .filter(|e| e.sub == "7a")
-            .flat_map_iter(|e| {
-                let mut v = Vec::new();
-                let Ok(r) = Resource::load_meta(&a.path, e) else { return v };
-                let Some(m) = Meta::parse(&r) else { return v };
+            .map(|e| {
+                let (mut v, mut sets) = (Vec::new(), Vec::new());
+                let Ok(r) = Resource::load_meta(&a.path, e) else { return (v, sets) };
+                let Some(m) = Meta::parse(&r) else { return (v, sets) };
                 if m.objects(VARIATION).is_empty() {
-                    return v;
+                    return (v, sets);
                 }
                 // each item once per resource, whatever the number of outfits that wear it
                 let mut seen = HashSet::new();
                 for var in crate::wardrobe::variations(&m, &pre, tu, &a.id) {
+                    let mut set: BodySet = Vec::new();
                     for p in &var.parts {
+                        let d = choose(p, None, &exists).map(|x| x.0);
+                        if !p.skins.is_empty() {
+                            let own = p.guid.as_deref().and_then(|g| ids.get(&u64::from_str_radix(g, 16).ok()?)).map(|n| (*n).clone());
+                            set.push((own.or_else(|| d.clone()), p.guid.clone(), p.skins.clone()));
+                        }
                         let Some(g) = p.guid.as_ref().filter(|_| seen.insert(p.item.clone())) else { continue };
-                        if let Some((d, _)) = choose(p, None, &exists) {
+                        if let Some(d) = d {
                             v.push((g.clone(), d));
                         }
                     }
+                    if !set.is_empty() {
+                        sets.push(set);
+                    }
                 }
-                v
+                (v, sets)
             })
             .collect();
+        let mut sets = Vec::new();
+        let mut found = Vec::new();
+        for (v, s) in per {
+            found.extend(v);
+            sets.extend(s);
+        }
         let mut by_guid: HashMap<String, Vec<(String, u32)>> = HashMap::new();
         for (g, d) in found {
             let v = by_guid.entry(g).or_default();
@@ -832,7 +871,10 @@ pub fn asset_drawables(a: &ArchiveInfo, ix: &ArchiveIndex) -> Result<&'static As
         if by_guid.is_empty() {
             return Err("no wardrobe item of packs.rpf resolved to a drawable".into());
         }
-        let t = AssetDrawables { version: 1, by_guid };
+        let mut t = AssetDrawables { version: 6, by_guid, ..Default::default() };
+        let (body, body_pairs) = body_skin_table(&t, &sets, &exists);
+        t.body = body;
+        t.body_pairs = body_pairs;
         if let Ok(b) = serde_json::to_vec(&t) {
             let _ = crate::atomic::write(&cache, b);
         }
@@ -840,6 +882,56 @@ pub fn asset_drawables(a: &ArchiveInfo, ix: &ArchiveIndex) -> Result<&'static As
     })
     .as_ref()
     .map_err(|e| e.clone())
+}
+
+/// The whole-body skins of the body sets: per variation, its items on a
+/// whole-body mesh (found by name or textures, else through the GUID table),
+/// counted per mesh and per upper/lower pair.
+fn body_skin_table(t: &AssetDrawables, sets: &[BodySet], exists: &dyn Fn(&str) -> bool) -> (SkinCounts, SkinCounts) {
+    fn add(m: &mut SkinCounts, k: String, skins: &[(String, String)]) {
+        let v = m.entry(k).or_default();
+        match v.iter_mut().find(|x| x.0 == skins) {
+            Some(x) => x.1 += 1,
+            None => v.push((skins.to_vec(), 1)),
+        }
+    }
+    let (mut body, mut pairs) = (HashMap::new(), HashMap::new());
+    for set in sets {
+        // every whole-body mesh an item may be: the one its textures match
+        // (often another fit's: a `nude_cull` mesh is never matched by
+        // textures) and those of its GUID, as the mesh a look adds
+        let norm = |d: &str| -> Option<(String, String)> {
+            let w = item_word(d);
+            if !matches!(w, "hand" | "feet") {
+                return None;
+            }
+            let fit = d.split('_').find(|x| crate::outfit::is_fit(x))?;
+            Some((whole_body(w, fit, exists).unwrap_or_else(|| d.to_string()), fit.to_string()))
+        };
+        let mut worn: Vec<Worn> = Vec::new();
+        for (d, g, skins) in set {
+            let guid = g.as_deref().and_then(|g| t.by_guid.get(g)).into_iter().flatten().map(|x| x.0.as_str());
+            for (m, fit) in d.as_deref().into_iter().chain(guid).filter_map(norm) {
+                if !worn.iter().any(|x| x.0 == m && x.2 == skins.as_slice()) {
+                    worn.push((m, fit, skins.as_slice()));
+                }
+            }
+        }
+        for (d, _, skins) in &worn {
+            add(&mut body, d.clone(), skins);
+        }
+        for (d, fit, skins) in &worn {
+            for (o, ofit, other) in &worn {
+                if fit == ofit && item_word(o) != item_word(d) {
+                    add(&mut pairs, format!("{d} {} {o}", skins[0].0), other);
+                }
+            }
+        }
+    }
+    for v in body.values_mut().chain(pairs.values_mut()) {
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    }
+    (body, pairs)
 }
 
 /// Whether the outfit list has this model (a character prefix such as
@@ -915,6 +1007,12 @@ pub struct LookPart {
     /// named after the head) or "default" (the whole skin mesh of the fit,
     /// added when the outfit resolves no body).
     pub found_by: &'static str,
+    /// Whole-body meshes added as "default" only: their skin is an
+    /// approximation from other characters' body sets ("paired": the one
+    /// worn with the other body part's skin; "tone": the one whose colour is
+    /// nearest the face's; "common": the most worn one).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skin_from: Option<&'static str>,
     /// The item's category (plural word or hex), when it has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
@@ -1196,9 +1294,101 @@ pub fn look(game_root: &Path, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -
     if let Some(r) = cache.lock().unwrap().get(&key) {
         return r.clone();
     }
-    let r = look_uncached(game_root, a, ix, &key).map(dressed_first);
+    let r = look_uncached(game_root, a, ix, &key).map(|l| approx_body_skins(game_root, a, ix, l)).map(dressed_first);
     cache.lock().unwrap().insert(key, r.clone());
     r
+}
+
+/// Mean colour (sRGB, 0..1) of a stored texture from a small mip.
+fn mean_rgb(set: &crate::ttpf::TtpfSet, hash: u64) -> Option<[f32; 3]> {
+    let (s, t) = set.get(hash)?;
+    let l = t.layout()?;
+    let best = s.best_mip(t)? as usize;
+    let mut m = best;
+    while m + 1 < l.mips.len() && (t.width >> (m + 1)) >= 32 && (t.height >> (m + 1)) >= 32 {
+        m += 1;
+    }
+    let decode = |m: usize| {
+        let (a, b) = l.mip_span(m);
+        let part = s.read(t.virt + a, b - a).ok()?;
+        let mut buf = vec![0u8; a as usize];
+        buf.extend_from_slice(&part);
+        crate::ttpf::decode_rgba(t, &buf, m as u32).ok()
+    };
+    let (rgba, _, _) = decode(m).or_else(|| decode(best))?;
+    let mut c = [0f64; 3];
+    for px in rgba.chunks_exact(4) {
+        for k in 0..3 {
+            c[k] += px[k] as f64;
+        }
+    }
+    let n = (rgba.len() / 4).max(1) as f64 * 255.0;
+    Some(c.map(|x| (x / n) as f32))
+}
+
+/// Whole-body meshes added as "default" (no body set resolved) carry no
+/// skin of their own. They get one from the body sets of other characters
+/// (`AssetDrawables::body`): the skin worn with the other body part's skin
+/// when that part has one, else the one whose mean colour is nearest the
+/// face texture's (then the other part is paired with it). A mesh no body
+/// set wears (`feet_mk1`) keeps none.
+fn approx_body_skins(game_root: &Path, a: &ArchiveInfo, ix: &ArchiveIndex, mut l: Look) -> Look {
+    let open = |p: &LookPart| p.found_by == "default" && p.skins.is_empty();
+    if !l.outfits.iter().chain(&l.other_variations).any(|o| o.parts.iter().any(open)) {
+        return l;
+    }
+    let Ok(t) = asset_drawables(a, ix) else { return l };
+    let set = crate::ttpf::global(game_root);
+    let hex = |s: &str| u64::from_str_radix(s, 16).unwrap_or(0);
+    let stored = |s: &[(String, String)]| s.iter().any(|(al, _)| set.get(hex(al)).is_some());
+    let mut means: HashMap<u64, Option<[f32; 3]>> = HashMap::new();
+    let mut mean = |h: u64| *means.entry(h).or_insert_with(|| mean_rgb(set, h));
+    for o in l.outfits.iter_mut().chain(l.other_variations.iter_mut()) {
+        if !o.parts.iter().any(open) {
+            continue;
+        }
+        // the face: the head item's skin, else the head skin table's choice
+        let face = o.parts.iter().find(|p| p.slot == "head").and_then(|h| {
+            let own = h.skins.iter().map(|x| hex(&x.0)).find(|&x| set.get(x).is_some());
+            own.or_else(|| crate::headskin::get(game_root).ok()?.choose(&h.drawable, 0, |x| set.get(x).is_some()).map(|c| c.skin.albedo))
+        });
+        let face = face.and_then(&mut mean);
+        for _ in 0..2 {
+            // pair with the other body part's skin
+            for i in 0..o.parts.len() {
+                if !open(&o.parts[i]) {
+                    continue;
+                }
+                let d = o.parts[i].drawable.clone();
+                let other = o.parts.iter().filter(|q| matches!(q.slot.as_str(), "body upper" | "body lower") && q.slot != o.parts[i].slot && !q.skins.is_empty()).find_map(|q| t.body_pairs.get(&format!("{} {} {d}", q.drawable, q.skins[0].0)));
+                if let Some(s) = other.and_then(|v| v.iter().find(|x| stored(&x.0))) {
+                    o.parts[i].skins = s.0.clone();
+                    o.parts[i].skin_from = Some("paired");
+                }
+            }
+            // nothing to pair with: the upper body first, by the face's tone
+            let Some(i) = (0..o.parts.len()).filter(|&i| open(&o.parts[i])).min_by_key(|&i| o.parts[i].slot != "body upper") else { break };
+            let cands: Vec<&(Vec<(String, String)>, u32)> = t.body.get(&o.parts[i].drawable).into_iter().flatten().filter(|x| stored(&x.0)).collect();
+            if cands.is_empty() {
+                break;
+            }
+            let dist = |c: &[f32; 3], f: &[f32; 3]| (0..3).map(|k| (c[k] - f[k]).powi(2)).sum::<f32>();
+            let by_tone = face.and_then(|f| {
+                cands
+                    .iter()
+                    .filter_map(|x| Some((*x, mean(x.0.iter().map(|s| hex(&s.0)).find(|&h| set.get(h).is_some())?)?)))
+                    .min_by(|a, b| dist(&a.1, &f).total_cmp(&dist(&b.1, &f)))
+                    .map(|x| x.0)
+            });
+            let (pick, how) = match by_tone {
+                Some(x) => (x, "tone"),
+                None => (cands[0], "common"),
+            };
+            o.parts[i].skins = pick.0.clone();
+            o.parts[i].skin_from = Some(how);
+        }
+    }
+    l
 }
 
 /// The outfit list's order is kept, except that the first outfit (the one
@@ -1459,7 +1649,7 @@ fn own_look(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Option<Look> {
     let names: HashSet<String> = ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| e.name.as_ref().map(|n| n.to_ascii_lowercase())).collect();
     let exists = |n: &str| names.contains(n);
     let mut parts: Vec<LookPart> = Vec::new();
-    let plain = |slot: String, drawable: String, found_by: &'static str| LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: String::new(), guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, layer_set: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by, category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, state_guids: vec![] };
+    let plain = |slot: String, drawable: String, found_by: &'static str| LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: String::new(), guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, layer_set: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by, category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, skin_from: None, state_guids: vec![] };
     for o in opts.iter().filter(|o| o.default || is_strand_word(item_word(&o.name))) {
         let slot = slot_of(&o.name);
         // one hair, one beard …: the first of each
@@ -1615,10 +1805,10 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
                     continue;
                 }
                 let slot_is_hair = slot == "hair";
-                parts.push(LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: p.item.clone(), guid: p.guid.clone(), tint: p.tint.clone(), colour: p.colour, colour_tag: p.colour_tag, hair_preset: p.hair_preset.clone(), layer_set: p.layer_set.clone(), preset: p.preset.clone(), preset_colours: p.preset.as_deref().and_then(|h| presets?.colours(h)).map(|v| v.into_iter().map(|c| c.map(|c| [c[0], c[1], c[2]])).collect()).unwrap_or_default(), tex_remap: p.tex_remap.clone(), skins: p.skins.clone(), found_by, category: p.category.clone(), layer: p.layer.clone(), hides: p.hides.clone(), hides_sub: p.hides_sub.clone(), hair_state: None, state_guids: if slot_is_hair { p.state_guids.clone() } else { vec![] } });
+                parts.push(LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: p.item.clone(), guid: p.guid.clone(), tint: p.tint.clone(), colour: p.colour, colour_tag: p.colour_tag, hair_preset: p.hair_preset.clone(), layer_set: p.layer_set.clone(), preset: p.preset.clone(), preset_colours: p.preset.as_deref().and_then(|h| presets?.colours(h)).map(|v| v.into_iter().map(|c| c.map(|c| [c[0], c[1], c[2]])).collect()).unwrap_or_default(), tex_remap: p.tex_remap.clone(), skins: p.skins.clone(), found_by, category: p.category.clone(), layer: p.layer.clone(), hides: p.hides.clone(), hides_sub: p.hides_sub.clone(), hair_state: None, skin_from: None, state_guids: if slot_is_hair { p.state_guids.clone() } else { vec![] } });
             }
         }
-        let plain = |slot: &str, drawable: String, found_by: &'static str| LookPart { slot: slot.into(), drawable, item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, layer_set: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by, category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, state_guids: vec![] };
+        let plain = |slot: &str, drawable: String, found_by: &'static str| LookPart { slot: slot.into(), drawable, item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, layer_set: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by, category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, skin_from: None, state_guids: vec![] };
         // another variation of the wardrobe: only what it holds itself
         if !listed {
             let main: Vec<String> = parts.iter().filter(|p| ["full", "outer", "top", "bottom"].contains(&p.slot.as_str())).map(|p| pretty(item_word(&p.drawable))).collect();
@@ -1702,7 +1892,7 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
 mod tests {
     #[test]
     fn cull_twins_and_masks_follow_the_hide_masks() {
-        let part = |d: &str, layer: &str, hides: Vec<(&str, &str)>| LookPart { slot: "top".into(), drawable: d.into(), item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by: "x", category: None, layer: Some(layer.into()), hides: hides.into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(), hides_sub: vec![], hair_state: None, state_guids: vec![], layer_set: None };
+        let part = |d: &str, layer: &str, hides: Vec<(&str, &str)>| LookPart { slot: "top".into(), drawable: d.into(), item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by: "x", category: None, layer: Some(layer.into()), hides: hides.into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(), hides_sub: vec![], hair_state: None, state_guids: vec![], layer_set: None, skin_from: None };
         let parts = vec![
             part("tshirt_mr1_000_full", "15793985", vec![]),
             part("shirt_mr1_000_full", "752a6eba", vec![("15793985", "0a00"), ("275822c4", "0001")]),
@@ -1723,6 +1913,27 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn body_skin_pairs() {
+        let sk = |a: &str| vec![(a.to_string(), "n".to_string())];
+        let mut t = AssetDrawables::default();
+        t.by_guid.insert("g1".into(), vec![("feet_mr1_000_nude_cull".into(), 1)]);
+        let exists = |_: &str| true;
+        let sets = vec![
+            // upper found by textures, lower only through its GUID
+            vec![(Some("hand_mr1_000_nude_cull".to_string()), None, sk("u1")), (None, Some("g1".to_string()), sk("l1")), (Some("top_mr1_001_full".to_string()), None, sk("x"))],
+            vec![(Some("hand_mr1_000_nude_cull".to_string()), None, sk("u1")), (Some("feet_mr1_000_nude_cull".to_string()), None, sk("l1"))],
+            vec![(Some("hand_mr1_000_nude_cull".to_string()), None, sk("u2"))],
+        ];
+        let (body, pairs) = body_skin_table(&t, &sets, &exists);
+        // clothes are not whole-body meshes
+        assert_eq!(body.len(), 2);
+        assert_eq!(body["hand_mr1_000_nude_cull"], vec![(sk("u1"), 2), (sk("u2"), 1)]);
+        assert_eq!(pairs["hand_mr1_000_nude_cull u1 feet_mr1_000_nude_cull"], vec![(sk("l1"), 2)]);
+        assert_eq!(pairs["feet_mr1_000_nude_cull l1 hand_mr1_000_nude_cull"], vec![(sk("u1"), 2)]);
+        assert!(!pairs.keys().any(|k| k.contains(" u2 ")));
+    }
 
     #[test]
     fn model_names_from_scene_handles() {

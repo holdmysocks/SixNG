@@ -609,8 +609,22 @@ again**).
     `textures.rpf` maps the named hash to the stored one (see the bulk
     texture store row). Before 2026-11-25 only 19 characters had both
     body textures; the rest took the colour of the face texture at the
-    neck, which is still the fallback for the few body items with no
-    texture.
+    neck.
+    Since 2026-11-26 the characters whose outfit data names no body set
+    (a few cutscene characters such as `cs_ghost`, `cs_kent_paul` and
+    `cs_papa_audacity`, whose whole-body meshes are added as "default")
+    get an **approximate** skin from other characters' body sets: the
+    lower-body skin other characters wear with this one's upper-body skin
+    (and the other way round), else the skin of that mesh whose mean
+    colour is nearest the face texture's. The table comes from the same
+    pass over every wardrobe as the asset table (cached in
+    `asset_drawables_v2.json`); an item counts for the whole-body mesh its
+    GUID names (the GUID is the name id of its drawable). The look gives
+    `skin_from` (`paired`, `tone` or `common`) and the viewer says so in
+    its notes. That covers all 26 body parts that had no skin (17 adult
+    `mr1` parts on 10 characters, 9 child lower bodies `feet_mk1`, which
+    only one body set wears); the face colour at the neck stays the
+    fallback.
   - **Fabric shading.** The colour is shaded by the green channel of the
     garment's own packed map (`speculartex`: seams and folds, mid grey on
     plain cloth). From the clothing pixel shader (`ped_standard_muv`, read
@@ -742,7 +756,7 @@ again**).
     drawable and whose own
     textures lead to no model takes the model another wardrobe's item
     with the same asset GUID resolved to (`found_by: asset id`; the table
-    is built once, a few minutes, as `<work>/index/asset_drawables.json`).
+    is built once, a few minutes, as `<work>/index/asset_drawables_v2.json`).
     Game-wide 68.5 % of the shoe items resolve by their own textures and
     half of the rest share a GUID with one that does. One-piece swimwear
     and bodysuits count as a one-piece garment and the sports base layers
