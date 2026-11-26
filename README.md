@@ -1390,13 +1390,7 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   own band, but only on pixels no real surface has covered. Real surfaces write a stencil
   mark as they draw; the fallbacks draw after them and only where the
   mark is missing (far-field terrain, ocean or sky), with back faces
-  culled so a coarse block the camera is inside stays invisible. Since
-  2026-11-26 a fallback pixel is depth-tested 4 m plus 1 % of its distance
-  (at most 30 m) behind where it lies, so the flat ground patches and
-  water pieces of a nearby SLOD4 tile stay under the terrain they
-  duplicate (they showed as hard-edged green squares and diamond-tiled
-  water a few hundred metres from the camera), while its blocks that
-  stand above the ground still fill gaps. Before,
+  culled so a coarse block the camera is inside stays invisible. Before,
   such areas showed flat far-field terrain next to the camera while the
   same LODs farther away were drawn. Needs the 32-bit depth + stencil
   format (most desktop GPUs); without it the fallbacks draw plainly.

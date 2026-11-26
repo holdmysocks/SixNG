@@ -858,21 +858,6 @@ fn skin_matrix(v: VIn) -> mat4x4<f32> {
     return s * (1.0 / tw);
 }
 
-// Coverage fallbacks: how far (m) behind its surface a fallback pixel is
-// depth-tested: a base plus a share of the distance, capped. A coarse LOD's
-// ground patch or water piece lying on the terrain then stays under it,
-// while its blocks that stand up above the ground still fill the gaps.
-const FB_PUSH_M: f32 = 4.0;
-const FB_PUSH_K: f32 = 0.01;
-const FB_PUSH_MAX: f32 = 30.0;
-
-fn fb_push(w: vec3<f32>) -> vec3<f32> {
-    let r = w - F.cam_pos.xyz;
-    let l = length(r);
-    let p = min(FB_PUSH_M + FB_PUSH_K * l, FB_PUSH_MAX);
-    return F.cam_pos.xyz + r * (1.0 + p / max(l, 1.0));
-}
-
 fn mesh_vertex(v: VIn) -> VOut {
     let model = mat4x4<f32>(v.m0, v.m1, v.m2, v.m3);
     // The bottom row of a joint matrix is (0, 0, 0, 1). The viewer puts the
@@ -925,11 +910,7 @@ fn mesh_vertex(v: VIn) -> VOut {
             wp = w.xyz + rs * edge * r * F.frame.x;
         }
     }
-    // a coverage fallback (extra.w = 1) is tested a little behind where it
-    // lies, so its flat ground and water pieces lose to the terrain they
-    // duplicate; shading keeps the true position
-    let fbp = v.extra.w > 0.5 && F.frame.y < 1.0e8;
-    o.clip = F.view_proj * vec4(select(wp, fb_push(wp), fbp), 1.0);
+    o.clip = F.view_proj * vec4(wp, 1.0);
     o.world = wp;
     o.nrm = (m * vec4(v.nrm, 0.0)).xyz;
     o.tan = vec4((m * vec4(v.tan.xyz, 0.0)).xyz, edge);
@@ -2307,7 +2288,7 @@ fn cell_vert(v: CIn, fb: bool) -> COut {
         o.clip = vec4(2.0, 2.0, 2.0, 1.0);
         return o;
     }
-    o.clip = F.view_proj * vec4(select(w, fb_push(w), fb), 1.0);
+    o.clip = F.view_proj * vec4(w, 1.0);
     o.world = w;
     o.nrm = v.nrm.xyz;
     o.uv = v.uv;
