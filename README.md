@@ -434,8 +434,18 @@ restyle the hair:
    from root to tip. Variant: a random value against three per-guide
    thresholds gives each strand one of four colour ramps.
 
-Not in the export yet: how the hair is pressed under a hat (export the model without the
-hat and add the hat afterwards), and the game's run-time strand count (it
+Under a hat in the outfit the scalp pieces are pressed in as the viewer
+does (a stand-in, not the game's method; see the model viewer below): the
+guides before the strands are grown and the grown strands after, every
+point beyond the hat's lining pulled to 3 mm under it; then every strand
+is followed from its root against the hat's own triangles, and a point
+whose segment crosses the hat goes back under it (the coarse press alone
+let tufts through the side of a cap). Their extras name the hat
+(`under_hat`) and the summary the points moved (`hat_pressed`). On
+Jason's look 1 (a cap worn backwards, over his long hair) 411,913 of
+1.19 M points move, and 2 of 1.1 M strand segments still cross the cap
+(one strand at its lower edge; 69,923 with the press alone). Not in the export yet:
+the game's run-time strand count (it
 draws fewer strands at a distance; the export writes all it stores). To
 restyle in Blender, edit the hidden `_guides` objects and grow new strands
 from them with Blender's Interpolate Hair Curves node (it blends nearby
@@ -807,8 +817,10 @@ again**).
   swatches to click (`--hair-colour r,g,b`), and lists the character's
   other hair styles (its own placeholders that have grooms placed) to
   tick (`--hair-style TEXT`). Under a hat the scalp hair is pressed in: strand
-  points beyond the hat's lining are pulled to 3 mm under it, and an
-  opening the hat encloses (over a cap's strap) counts as closed. This
+  points beyond the hat's lining are pulled to 3 mm under it (then each
+  strand is checked against the hat's triangles, so none comes through
+  it), and an opening the hat encloses (over a cap's strap) counts as
+  closed. This
   is a stand-in, not the game's method: of the 6,886 outfits with a hat
   and hair, 6,840 ask for the plain hair state, and no stored rule
   says how the game keeps it under the hat. Hair items do have other
@@ -962,10 +974,19 @@ again**).
   `head_*` faces) the game's material data names the head, and that face
   is used. Other heads (`a_head_base_*`, crowd `hc_*` heads, characters
   whose materials are in archives not indexed yet) get a face of the same
-  sex, body type and ethnicity from that library. The viewer shows
+  sex, body type and ethnicity from that library. Since 2026-11-25 a
+  `cs_` head that no preset lists takes the face of the same character's
+  other head first: the ped model table gives each model a character name,
+  and when exactly one model carries the head's name without `cs_`, its
+  head with the same sex, body type and ethnicity code is used (ages may
+  differ between young and middle-aged, not into old or child). Of the 29
+  such `cs_` heads this links one, `cs_lucia`, which now shows Lucia's
+  player face instead of another woman's; the rest have no character
+  model, or only a head of another age, body type or ethnicity. The viewer shows
   **Head skin ◀ n / N ▶** to switch through the faces; exports take the
   **Head skin** number next to Body shape, or `extract --head-skin N`.
-  `model.json` records the choice (`head_skin`: linked or auto, index,
+  `model.json` records the choice (`head_skin`: linked, character (with
+  the donor head as `group`) or auto, index,
   count, texture hashes). The table is built from the `packs` index on
   first use (about 5 s) and kept in `<work>/index/head_skins.json`.
   **Other head maps** (2026-11-24): a face's material data holds colour
@@ -1196,6 +1217,17 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   models smaller than three of their texels. Models and map cells cast (opaque and cut-out surfaces);
   skinned, see-through and decal surfaces do not. Only what the camera
   draws casts: a caster just outside the view leaves no shadow.
+- **Terrain ground** (HDR map): the baked map tiles hold only a colour by
+  height with their own hill shading (the bake's terrain layer), and cells
+  the bake left out are filled flat green from the game's height map. The
+  land is drawn as a ground made up from height, slope and noise instead:
+  sand just above the sea, dry grass and scrub inland, darker woods in
+  patches, rock on steep slopes, lit by the scene with the terrain's own
+  normals. The tiles' hill shading, which holds relief finer than the
+  terrain mesh (embankments, building pads), is kept at half strength: the
+  tile's brightness over the bake's colour for that height. The tiles'
+  water paint still marks the sea (our choice; the game's terrain
+  materials are not decoded).
 - **Placed lights** (HDR map): the map's exterior lights that are on at
   the hour (their hour mask and night flag) light the scene and glow. Those
   within about 500 m of the camera are shaded on every surface: inverse
