@@ -4600,8 +4600,8 @@ impl ModelView {
                     .on_hover_text("Each part shows wear as the game works it out: the vehicle's configuration gives the part a wear level (0 new to 5 worn out), which picks a wear preset. Its age record sets the wear amount, and the preset's control intensities and rust windows say how much of each channel of the game's tiling wear mask turns to the worn layer (the game's packing of these values is read from its code). Not read: a per-part random sample and the vertex colours the game also multiplies in, and the per-vehicle pick within the age record's range (the middle is taken).");
             }
             if self.look.wear_levels && self.look.wear_from_config {
-                ui.checkbox(&mut self.look.primer, "primer layer")
-                    .on_hover_text("Also draws the game's second wear layer, the primer, by its rules: its mask texture scaled per channel by the wear preset's primer intensities, summed and windowed by primerStart / primerEnd, where the first layer is not. Off by default: the game also scales the mask by per-part random samples and a per-vehicle amount, which are not decoded and taken as 1, so some parts (a truck bed) show far more primer than in the game. The primer's colour is a stand-in grey.");
+                ui.add(egui::Slider::new(&mut self.look.primer_amount, 0.0..=1.0).text("primer amount"))
+                    .on_hover_text("The game's second wear layer, the primer, drawn by its rules: its mask texture scaled per channel by the wear preset's primer intensities, summed, times this amount, and windowed by primerStart / primerEnd, where the first layer is not. The game takes the amount per vehicle while it runs (from the spawn data, or from a file that is not shipped), so it is yours to set; 0 (the default) turns the layer off. The primer's colour is a stand-in grey.");
             }
             if !(self.look.wear_levels && self.look.wear_from_config) {
                 ui.add(egui::Slider::new(&mut self.look.wear, 0.0..=1.0).text("wear"))
