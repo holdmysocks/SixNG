@@ -1238,7 +1238,7 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
                 // byte (the vertex colours, as for the first layer), summed,
                 // windowed, and
                 // only where the first layer is not.
-                // (only when the user turns it on: F.jitter.w = -2)
+                // (only when the user sets an amount a > 0: F.jitter.w = -1 - a)
                 let t = select(pm, m, textureLoad(t_em, vec2(31, row), 0).a > 0.5);
                 let cross = textureLoad(t_em, vec2(28, row), 0).a;
                 // scale (25 + c), bias (40 + c), gamma (43 + c)
@@ -1252,10 +1252,13 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
                 let lr = lv.x;
                 let lg = lv.y;
                 let lb = lv.z;
-                let pb = clamp(lr + lg + lb, 0.0, 1.0);
+                // the summed level times the primer amount (the game's
+                // per-vehicle amount, I[0x224], which is runtime data)
+                let p_amt = clamp(-F.jitter.w - 1.0, 0.0, 1.0);
+                let pb = clamp((lr + lg + lb) * p_amt, 0.0, 1.0);
                 let ps = textureLoad(t_em, vec2(29, row), 0).a;
                 let pw = max(textureLoad(t_em, vec2(30, row), 0).a, 1.0 / 255.0);
-                w3 = select(0.0, (1.0 - k) * clamp((pb - ps) / pw, 0.0, 1.0), F.jitter.w < -1.5);
+                w3 = select(0.0, (1.0 - k) * clamp((pb - ps) / pw, 0.0, 1.0), p_amt > 0.0);
                 p_rough = textureLoad(t_em, vec2(32, row), 0).a;
                 p_metal = textureLoad(t_em, vec2(33, row), 0).a;
             } else {
