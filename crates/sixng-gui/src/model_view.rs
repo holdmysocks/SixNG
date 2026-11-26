@@ -4331,9 +4331,12 @@ impl ModelView {
         }
         self.update_hair(rs, &ctx);
         let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
-        // an animal's fur is bound to its skin and takes the same joint matrices
+        // an animal's fur is bound to its skin and takes the same joint
+        // matrices; right after a switch from a character, `hair.gpu` still
+        // holds the character's hair (one-matrix buffers) until the fur has
+        // loaded, so only models built for this skeleton take them
         if self.hair.rig.is_some() && !skin.is_empty() {
-            for g in &self.hair.gpu {
+            for g in self.hair.gpu.iter().filter(|g| crate::render3d::joints_fit(g.joints_buf.size(), skin.len())) {
                 ren.set_joints(rs, g, &skin);
             }
         }

@@ -2331,7 +2331,13 @@ impl Renderer3D {
         gm.frame_bg = frame_bind_group(&rs.device, &self.bgl_frame, &self.frame_ub, &gm.joints_buf, &self.sampler, buf, pictures.unwrap_or(&self.stickers.view), &self.stickers.sampler, &self.atmo.binds, &self.hair_luts, &self.sun_map);
     }
 
+    /// Write a skeleton's joint matrices into a model's joints buffer. A
+    /// model uploaded for another skeleton (fewer joints) is left alone:
+    /// the write would overrun its buffer (a wgpu validation panic).
     pub fn set_joints(&self, rs: &egui_wgpu::RenderState, gm: &GpuModel, mats: &[Mat4]) {
+        if !joints_fit(gm.joints_buf.size(), mats.len()) {
+            return;
+        }
         let v: Vec<f32> = mats.iter().flat_map(|m| m.to_cols_array()).collect();
         rs.queue
             .write_buffer(&gm.joints_buf, 0, bytemuck::cast_slice(&v));
@@ -3454,4 +3460,25 @@ pub fn save_png(path: &std::path::Path, w: u32, h: u32, rgba: &[u8]) -> anyhow::
     }
     image::save_buffer(path, rgba, w, h, image::ExtendedColorType::Rgba8)?;
     Ok(())
+}
+
+/// Does a joints buffer of `bytes` hold `n` joint matrices?
+pub fn joints_fit(bytes: u64, n: usize) -> bool {
+    (n as u64) * 64 <= bytes
+}
+
+#[cfg(test)]
+mod joints_tests {
+    use super::joints_fit;
+
+    #[test]
+    fn joints_fit_the_buffer() {
+        // a model without joints gets a one-matrix buffer
+        assert!(joints_fit(64, 1));
+        assert!(joints_fit(64, 0));
+        // an animal's 129-joint skin into a character hair model's buffer
+        assert!(!joints_fit(64, 129));
+        assert!(joints_fit(129 * 64, 129));
+        assert!(joints_fit(135 * 64, 129));
+    }
 }

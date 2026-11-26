@@ -112,7 +112,7 @@ impl Budget {
             soft: (total as f64 * 0.20) as u64,
             hard: (total as f64 * 0.30) as u64,
             textures: (total / 16).clamp(GB / 2, 3 * GB),
-            models: (gb as usize * 120).clamp(800, 8000),
+            models: (gb as usize * 180).clamp(800, 12000),
             keep_free: (total / 8).clamp(GB, 4 * GB),
         }
     }
@@ -236,7 +236,7 @@ impl Budget {
         self.soft = cap;
         self.hard = (cap as f64 * 1.3) as u64;
         self.textures = self.textures.min(cap / 3);
-        self.models = self.models.min((cap_gb.max(1.0) * 600.0) as usize);
+        self.models = self.models.min((cap_gb.max(1.0) * 900.0) as usize);
         self
     }
 }
