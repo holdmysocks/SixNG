@@ -1843,6 +1843,16 @@ impl App {
                 m.auto.hair_colour = Some(m.hair.colour);
             }
         }
+        // --hair-pieces "brows:r,g,b;lashes:r,g,b" (0..255): own colours per hair piece
+        if let Some(v) = c.get("hair-pieces") {
+            for e in v.split(';') {
+                let Some((slot, rgb)) = e.split_once(':') else { continue };
+                let v: Vec<f32> = rgb.split(',').filter_map(|x| x.trim().parse::<f32>().ok()).collect();
+                if v.len() == 3 {
+                    m.auto.hair_pieces.push((slot.trim().to_string(), [v[0] / 255.0, v[1] / 255.0, v[2] / 255.0]));
+                }
+            }
+        }
         // --pose rest|down|walk|sit|wave: a character's pose
         if let Some(p) = c.get("pose").and_then(|n| model_view::PedPose::preset(&n.replace('-', " "))) {
             m.ped_pose = p;
