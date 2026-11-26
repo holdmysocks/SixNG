@@ -353,11 +353,17 @@ picks, or the first; `--hair-slots` for others such as `chesthairfull`,
 character by its placeholder name) it holds the full strand set the game
 grows from the guide strands, as line strips (with the curl and noise
 the viewer draws), and the guides as
-`<piece>_guides`. Every point carries the strand's root UV (`TEXCOORD_0`, the
-groom's own layout), its width in metres (`_WIDTH`), its clump (`_CLUMP`, 0
+`<piece>_guides`. Every point carries the strand's root UV (`TEXCOORD_0`, a
+coordinate in one of the head mesh's UV sets; see below), its width in metres (`_WIDTH`), its clump (`_CLUMP`, 0
 = none) and its colour variant (`_VARIANT`, 0-3: which of the four colour
 ramps of its colour set the game uses); each mesh's extras give the points
-per strand, the slot, placeholder, bones and groom offset. Size:
+per strand, the slot, placeholder, bones and groom offset, and
+`head_mesh` / `head_uv_set`: which of the exported head's UV sets
+(`TEXCOORD_n`) the root UVs are in. The groom does not say which: the
+export matches the root UVs against every set of the head at the guide
+roots. On Jason scalp hair is in set 3 and brows, lashes and beard in set
+2, to a median 0.000 to 0.023 (the next best set is 0.06 or more off).
+Size:
 `--hair-density 0..1` (share of the stored strands), `--hair-max N` (strands
 per piece) and `--hair-points N` (points per strand, resampled along the
 strand). Jason's default look (`player_story000_01 --look 0`): 11 pieces,
@@ -368,12 +374,17 @@ attributes per groom.
 (`blender --python scripts/blender_hair_curves.py -- <hair.glb> --model
 <model.glb> [--save <file.blend>]`): one per piece, with `radius`, `clump`,
 `variant` and `root_uv`. With `--model` each object is parented to the head
-bone of the armature and gets the head mesh as its surface, with
-`surface_uv_coordinate` taken from the head mesh under each root, so
-Blender's hair tools and the Deform Curves on Surface node work on it (the
-groom's own root UVs do not follow the head's UV map). The guides come in
+bone of the armature and gets the head mesh as its surface: its surface
+UV map is the head's UV set `head_uv_set` (the importer names `TEXCOORD_n`
+`UVMap`, `UVMap.001` …) and `surface_uv_coordinate` is the game's own root
+UV, so Blender's hair tools and the Deform Curves on Surface node work on
+it. A piece whose set was not found, or whose set overlaps itself under
+its roots (one of Jason's lash pieces: a UV there names more than one
+place), takes the head's first UV map under each root instead. The guides come in
 hidden, in a collection of their own. Checked in Blender 5.3: strand roots
-lie a median 0.1 to 0.8 mm from the head surface. The material is a plain
+lie a median 0.1 to 0.8 mm from the head surface, and the head point at
+each strand's surface UV lies a median 0.1 to 1.2 mm from its root (2 to
+4 mm on the scalp pieces whose guide roots sit that far above the skin). The material is a plain
 hair BSDF: the export carries no hair colour.
 
 How the game grows the strands (`hairgen`, `Groom::coat`), to rebuild or
