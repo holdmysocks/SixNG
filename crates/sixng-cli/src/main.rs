@@ -1716,6 +1716,39 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     offs.push(o);
                 }
             }
+            // --parts and the default parts: the hide masks of each picked
+            // garment come from its item in the character's wardrobe (the
+            // first outfit or variation that wears it), as for --look
+            if look_parts.is_empty() && !animal {
+                if let Ok(l) = sixng_core::pedlook::look(&ws.game, &a, &ix, &prefix) {
+                    let worn: Vec<&sixng_core::pedlook::LookPart> = l.outfits.iter().chain(&l.other_variations).flat_map(|o| &o.parts).filter(|p| !p.strands).collect();
+                    let name_of = |off: u64| ix.entries.iter().find(|e| e.off == off).and_then(|e| e.name.as_ref()).map(|n| n.to_ascii_lowercase());
+                    let (mut ps, mut at) = (Vec::new(), Vec::new());
+                    for (j, &off) in offs.iter().enumerate() {
+                        if let Some(p) = name_of(off).and_then(|n| worn.iter().find(|p| p.drawable == n)) {
+                            ps.push((*p).clone());
+                            at.push(j);
+                        }
+                    }
+                    let names: std::collections::HashSet<String> = ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| e.name.as_ref().map(|n| n.to_ascii_lowercase())).collect();
+                    let twins = sixng_core::pedlook::cull_twins(&ps, |n| names.contains(n));
+                    let twin_of = sixng_core::outfit::dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
+                        let n = e.name.as_ref()?.to_ascii_lowercase();
+                        twins.values().any(|t| *t == n).then_some((n, e))
+                    }));
+                    for (i, p) in ps.iter().enumerate() {
+                        let (own, waist) = sixng_core::pedlook::hidden_masks(&ps, i);
+                        let mut name = p.drawable.clone();
+                        if let Some(e) = twins.get(&name).and_then(|t| twin_of.get(t)) {
+                            offs[at[i]] = e.off;
+                            name = twins[&p.drawable].clone();
+                        }
+                        if !own.is_empty() || !waist.is_empty() {
+                            hidden.insert(name, (own, waist));
+                        }
+                    }
+                }
+            }
             let sel: Vec<&sixng_core::scan::Entry> = offs.iter().filter_map(|o| ix.entries.iter().find(|e| e.off == *o)).collect();
             let glb = glb.clone().unwrap_or_else(|| PathBuf::from(format!("{prefix}.glb")));
             let oa = OutArgs { out: glb.parent().map(|p| p.to_path_buf()).unwrap_or_default(), tex: tex.clone(), raw: false, force: true, no_embedded_textures: false, dry_run: false, body_shape: body_shape.clone(), head_skin: *head_skin, paint: None };
