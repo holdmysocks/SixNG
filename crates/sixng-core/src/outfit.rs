@@ -569,6 +569,21 @@ pub fn export_outfit(a: &ArchiveInfo, parts: &[&Entry], name: &str, out: &Path, 
         let mut b = crate::export::build_drawable(a, e, &r, &info, &dir, false, &o, &mut item);
         let pname = e.name.clone().unwrap_or_else(|| e.id.clone());
         let mut prims: Vec<TriPrim> = b.lod_groups.drain(..).next().unwrap_or_default().into_iter().flat_map(|g| g.prims).collect();
+        // worn under something: the triangles whose vertices all lie in
+        // regions the other parts hide (skin, and clothes drawn as their
+        // `_cull_00` twin)
+        let mut hidden_tris = 0;
+        if let Some((own, waist)) = o.part_hidden.get(&pname.to_ascii_lowercase()) {
+            let hide: Vec<bool> = (0..256u32).map(|n| n != 0 && own.iter().any(|k| crate::wardrobe::mask_has(k, n))).collect();
+            let hide2: Vec<bool> = (0..256u32).map(|n| n != 0 && waist.iter().any(|k| crate::wardrobe::mask_has(k, n))).collect();
+            for p in &mut prims {
+                let Some(r) = p.regions.as_ref() else { continue };
+                let gone = |i: u32| r.get(i as usize).is_some_and(|r| hide[r[0] as usize] || hide2[r[1] as usize]);
+                let before = p.indices.len();
+                p.indices = p.indices.chunks_exact(3).filter(|t| !t.iter().all(|&i| gone(i))).flatten().copied().collect();
+                hidden_tris += (before - p.indices.len()) / 3;
+            }
+        }
         let off = materials.len();
         for p in &mut prims {
             p.material = p.material.map(|m| m + off);
@@ -576,7 +591,7 @@ pub fn export_outfit(a: &ArchiveInfo, parts: &[&Entry], name: &str, out: &Path, 
         }
         let verts: usize = prims.iter().map(|p| p.positions.len()).sum();
         let skinned = prims.iter().any(|p| p.joints.is_some()) && !b.joints.is_empty();
-        reports.push(serde_json::json!({"name": pname, "id": e.id, "vertices": verts, "triangles": prims.iter().map(|p| p.indices.len() / 3).sum::<usize>(), "joints": b.joints.len(), "skinned": skinned, "warnings": item.warnings}));
+        reports.push(serde_json::json!({"name": pname, "id": e.id, "vertices": verts, "triangles": prims.iter().map(|p| p.indices.len() / 3).sum::<usize>(), "joints": b.joints.len(), "skinned": skinned, "hidden_triangles": hidden_tris, "warnings": item.warnings}));
         warnings.extend(item.warnings.iter().map(|w| format!("{pname}: {w}")));
         materials.extend(b.materials.drain(..).map(|mut m| {
             m.name = format!("{pname}/{}", m.name);
@@ -732,7 +747,7 @@ mod tests {
         let parts = outfit_parts(&ix, "player_story000_00");
         assert!(parts.len() >= 5, "{} parts", parts.len());
         let out = std::env::temp_dir().join("sixng_outfit_real").join("outfit.glb");
-        let o = ExportOptions { out: out.parent().unwrap().into(), png: false, dds: false, raw: false, force: true, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default() };
+        let o = ExportOptions { out: out.parent().unwrap().into(), png: false, dds: false, raw: false, force: true, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default(), part_hidden: Default::default() };
         let r = export_outfit(&a, &parts, "player_story000_00", &out, &o, &[(&d, clip)], false, false).unwrap();
         println!("{}", serde_json::to_string_pretty(&r).unwrap());
         assert_eq!(r["unresolved_influences"], 0);
