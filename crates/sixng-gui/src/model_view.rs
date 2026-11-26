@@ -3245,6 +3245,9 @@ impl ModelView {
                     // rows 256..: the surface's second layer (colour, alpha =
                     // roughness); its metalness is the alpha of rows 0..256
                     let wear = pc["wear"][idx].as_str().filter(|w| w.len() == 2048);
+                    // each part id's second-layer colour (sRGB), which the
+                    // game's shader uses as the first wear layer's tint
+                    let wear_tint = pc["wear_tint"][idx].as_str().filter(|w| w.len() == 256 * 6);
                     // rows 512..: the low and high of the first layer's
                     // metalness and roughness, which the shader blends by the
                     // material map at each pixel
@@ -3291,6 +3294,24 @@ impl ModelView {
                         // window (primerGradientStart, width)
                         px[(768 + id) * 512 + 46 * 4 + 3] = pw.primer_gradient_start;
                         px[(768 + id) * 512 + 47 * 4 + 3] = pw.primer_gradient_width;
+                        // columns 50 to 64: W2's window starts, widths and
+                        // divisors per channel R, G, B, D4, then the 4th
+                        // channel's scale and its window in the first layer;
+                        // 65 to 67: the first layer's tint (linear, from
+                        // the second layer's colour record), 68: 255 when
+                        // the part has that tint and a palette row (else
+                        // W2 is 0)
+                        let tint = wear_tint.and_then(|t| hex3(&t[id * 6..id * 6 + 6]));
+                        let lin = |v: u8| {
+                            let c = v as f32 / 255.0;
+                            ((if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }) * 255.0 + 0.5) as u8
+                        };
+                        let has_row = wear.and_then(|w| usize::from_str_radix(&w[id * 8..id * 8 + 4], 16).ok()).is_some_and(|r| r != 0xffff);
+                        let t = tint.unwrap_or([0; 3]);
+                        let extra = pw.w2_start.iter().chain(&pw.w2_width).chain(&pw.w2_div).copied().chain([pw.d4_scale, pw.d4_start, pw.d4_width, lin(t[0]), lin(t[1]), lin(t[2]), if tint.is_some() && has_row { 255 } else { 0 }]);
+                        for (c, v) in extra.enumerate() {
+                            px[(768 + id) * 512 + (50 + c) * 4 + 3] = v;
+                        }
                         let set = primer_set(primer_sets.as_ref().map_or(1, |m| m[id]), self.look.primer_set);
                         let prow = primer_rows.and_then(|s| usize::from_str_radix(&s[id * 12 + set * 4..id * 12 + set * 4 + 4], 16).ok()).filter(|r| *r != 0xffff);
                         let out3 = &mut px[(1025 + id) * 512..(1026 + id) * 512];
@@ -5579,6 +5600,24 @@ const LEVEL_WEAR: [f32; 6] = [15.0, 150.0, 197.0, 211.0, 239.0, 239.0];
 /// window on the scaled mask (`rustStart` / `rustEnd`, `B`, `C`).
 const WEAR_CONTROL: [[u32; 3]; 3] = [[0x262c_839d, 0xb18a_6db5, 0x1b6a_3e09], [0x9b82_6e47, 0x1e68_8003, 0x1c58_826f], [0xb770_a627, 0xf97f_84c3, 0x4d46_aee9]];
 const WEAR_WINDOW: [[u32; 2]; 3] = [[0x8f02_219f, 0x7a2d_3f04], [0x9d7c_73e7, 0x1170_352b], [0x39ab_ac47, 0x9970_c52a]];
+/// The wear preset bytes of the first wear layer's palette weight W2 (the
+/// game's shader blends the layer's tint into its palette colour by it):
+/// per channel R, G, B and the 4th channel D4 the window start and end
+/// (preset +0x38/39, +0x3c/3d, +0x40/41, +0x4f/50), their activation start
+/// and end on the wear amount (+0x46/47, +0x48/49, +0x4a/4b, +0x51/52) and
+/// the divisor byte (+0x4c, +0x4d, +0x4e, +0x53; the shader multiplies each
+/// window by 255 / byte). Packer at rva 0x37766a0 (part record +80, +84,
+/// +88).
+const W2_WINDOW: [[u32; 2]; 4] = [[0x951a_7677, 0xb588_96f4], [0x87df_7517, 0x7c99_9233], [0x4549_efed, 0x8c27_314e], [0xbe3b_1bd2, 0x0ee0_92f0]];
+const W2_ACTIVATION: [[u32; 2]; 4] = [[0x8482_c039, 0x4cac_ba9c], [0x851c_6b0b, 0xac8e_3a46], [0x91c6_845f, 0x9ae0_16ea], [0x80c7_dae3, 0x356e_05be]];
+const W2_DIVISOR: [u32; 4] = [0xfcf8_c89c, 0xeeee_2c87, 0xd948_013b, 0xa21f_3ea9];
+/// The 4th wear channel D4: the preset byte that scales it (f86ce666,
+/// +0x21; the game packs f16(v0 x byte / 255) at part record +52 and the
+/// shader multiplies it by the layer detail texture's blue), and its window
+/// in the first layer's weight (eb7223d6, d54c040a, +0x22 / +0x23; record
+/// +64 bytes 2 and 3).
+const D4_SCALE: u32 = 0xf86c_e666;
+const D4_WINDOW: [u32; 2] = [0xeb72_23d6, 0xd54c_040a];
 /// The age record's wear amount range (`fe5d32e7` +0x0c, +0x10): the game
 /// takes a per-vehicle value between them.
 const AGE_WEAR: [u32; 2] = [0x4e71_efc8, 0xb5fc_dec9];
@@ -5646,6 +5685,15 @@ struct PartWear {
     /// column (`primerGradientStart`, `primerGradientEnd` - start)
     primer_gradient_start: u8,
     primer_gradient_width: u8,
+    /// the 4th channel's scale (0 to 255 for 0 to 1) and its window in the
+    /// first layer's weight
+    d4_scale: u8,
+    d4_start: u8,
+    d4_width: u8,
+    /// W2's window start and width and divisor byte per channel R, G, B, D4
+    w2_start: [u8; 4],
+    w2_width: [u8; 4],
+    w2_div: [u8; 4],
 }
 
 /// Each part id's wear under a configuration, from model.json
@@ -5733,6 +5781,24 @@ fn part_wear(w: &serde_json::Value, look: usize, config: Option<&str>) -> Option
             o.start[c] = trunc(ws);
             o.width[c] = trunc((we - ws).max(1.0e-4));
         }
+        // the 4th channel: its scale (the game's f16 of v0 x byte, here a
+        // byte) and its window, packed like the rust windows
+        o.d4_scale = (v0 * b(D4_SCALE) * 255.0 + 0.5) as u8;
+        let [ds, de] = D4_WINDOW.map(b);
+        (o.d4_start, o.d4_width) = (trunc(ds), trunc((de - ds).max(1.0e-4)));
+        // W2 (rva 0x37766a0, part record +80, +84): per channel the
+        // activation a = sat((v0 - start) / max(1e-4, end - start)), then
+        // the window start a x s and width a x e - a x s (one fused
+        // multiply-subtract, no floor), each x 255 truncated to its low byte
+        for c in 0..4 {
+            let [s, e] = W2_ACTIVATION[c].map(b);
+            let a = ((v0 - s) / (e - s).max(1.0e-4)).clamp(0.0, 1.0);
+            let [ws, we] = W2_WINDOW[c].map(b);
+            let lo = a * ws;
+            o.w2_start[c] = wrap(lo);
+            o.w2_width[c] = wrap(a.mul_add(we, -lo));
+            o.w2_div[c] = field(p, W2_DIVISOR[c]).unwrap_or(0.0) as u8;
+        }
     }
     Some(out)
 }
@@ -5767,6 +5833,15 @@ fn primer_surface(global: &serde_json::Value) -> [u8; 4] {
 }
 
 /// Four bytes from 8 hex digits.
+/// Three bytes from 6 hex digits.
+fn hex3(h: &str) -> Option<[u8; 3]> {
+    let b = h.as_bytes();
+    if b.len() != 6 || !b.iter().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(std::array::from_fn(|k| u8::from_str_radix(&h[k * 2..k * 2 + 2], 16).unwrap_or(0)))
+}
+
 fn hex4(h: &str) -> Option<[u8; 4]> {
     let b = h.as_bytes();
     if b.len() != 8 || !b.iter().all(|c| c.is_ascii_hexdigit()) {
@@ -9142,6 +9217,9 @@ mod tests {
             "presets": {"p1": {"ageWearHash": "r1"}, "p4": {"ageWearHash": "a4", "controlIntensityA": 255, "b18a6db5": 127.5, "1b6a3e09": 255, "rustStart": 51, "rustEnd": 102,
                 "rustStartB": 12, "rustEndB": 44, "primerGradientStart": 19, "primerGradientEnd": 255,
                 "primerIntensityB": 102, "4eb87881": 0, "26007b2d": 255, "primerStart": 10, "primerEnd": 127, "8ed71149": 51, "eff390bd": true,
+                "951a7677": 51, "b58896f4": 153, "8482c039": 0, "4cacba9c": 255, "fcf8c89c": 200,
+                "87df7517": 102, "7c999233": 51, "851c6b0b": 0, "ac8e3a46": 255,
+                "f86ce666": 128, "eb7223d6": 25, "d54c040a": 76,
                 "879774bd": "cr"}},
             "colour_ranges": {"cr": {"minGreen": 102, "maxGreen": 153, "fb2b7f54": 0, "c5801a83": 102, "7e3dffd5": 255, "c82d2173": 255}},
             "age_ranges": {"r1": {"minWear": 100, "maxWear": 200}},
@@ -9161,6 +9239,12 @@ mod tests {
         // than the bytes' difference, 19..255 the difference itself
         assert_eq!((a[1].start[1], a[1].width[1]), (12, 31));
         assert_eq!((a[1].primer_gradient_start, a[1].primer_gradient_width), (19, 236));
+        // W2 channel R: activation 0.8, start 0.8 x 51, width 0.8 x (153 -
+        // 51), truncated; channel G ends before it starts: its width wraps
+        // round (0.8 x -51 = -40.8 -> -40 -> 216); B and D4 not activated
+        assert_eq!((a[1].w2_start, a[1].w2_width, a[1].w2_div), ([40, 81, 0, 0], [81, 216, 0, 0], [200, 0, 0, 0]));
+        // the 4th channel: scale 0.8 x 128, window 25 with width 51
+        assert_eq!((a[1].d4_scale, a[1].d4_start, a[1].d4_width), (102, 25, 51));
         assert_eq!(super::primer_surface(&serde_json::json!({"primerPalette": {"roughnessLow": 0.45, "roughnessHigh": 0.78, "metallicLow": 0.0, "metallicHigh": 0.0}})), [0, 0, 114, 198]);
         assert_eq!(super::primer_surface(&serde_json::json!({})), [0, 0, 153, 153]);
         assert_eq!(part_wear(&w, 0, None).unwrap()[0].amount, 150);

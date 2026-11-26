@@ -798,6 +798,17 @@ fn wear_gamma(l: f32, g: f32) -> f32 {
     return pow(l, 100.0 / max(0.001, 100.0 * g * g));
 }
 
+// One window of the game's W2 weight (the first wear layer's palette
+// weight): sat((x - start) / width x 255 / divisor), start, width and the
+// divisor byte as 0 to 1. A zero width or divisor is the game's infinite
+// reciprocal: 1 above the start, else 0.
+fn w2_term(x: f32, st: f32, wd: f32, dv: f32) -> f32 {
+    let y = x - st;
+    if (y <= 0.0) { return 0.0; }
+    if (wd <= 0.0 || dv <= 0.0) { return 1.0; }
+    return clamp(y / (wd * dv), 0.0, 1.0);
+}
+
 fn wear_threshold(a: f32) -> f32 {
     let c = 0.45 * a * a;
     if (c < 0.05) { return mix(1.01, 0.98, c / 0.05); }
@@ -1703,11 +1714,19 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     if (wear_on && wear_amt > 0.0) {
         var u = 0.5;
         var k = 0.0;
+        // the layer detail texture (lyr0diffusetex): the game reads the
+        // first wear layer's palette column from its red (the base paint's
+        // from its green) and the 4th wear channel from its blue
+        var dt = vec4(0.0);
         if (M.tile.w > 1.5) {
-            let d = textureSample(t_tile, samp, i.uv0);
-            u = clamp(d.g, 0.004, 0.996);
-            k = clamp(d.b * wear_amt * 2.0, 0.0, 1.0);
+            dt = textureSample(t_tile, samp, i.uv0);
+            u = clamp(dt.r, 0.004, 0.996);
+            k = clamp(dt.b * wear_amt * 2.0, 0.0, 1.0);
         }
+        // the first wear layer's palette weight W2 (1: its palette colour,
+        // 0: its tint) and its tint, linear (columns 65 to 67)
+        var w2 = 1.0;
+        var tint = vec3(0.0);
         let id = floor(i.col.a * 255.0 + 0.5);
         // the primer's weight (layer B) and its roughness and metalness
         var w3 = 0.0;
@@ -1726,6 +1745,7 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
                 // windows summed (columns 16 to 24 of the part's coat row)
                 let row = 768 + i32(id);
                 var s = 0.0;
+                var ml = vec3(0.0);
                 for (var c = 0; c < 3; c++) {
                     let sc = textureLoad(t_em, vec2(16 + c, row), 0).a;
                     let st = textureLoad(t_em, vec2(19 + c, row), 0).a;
@@ -1736,9 +1756,27 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
                     // bias), raised to (1 / gamma)^2, as the game does
                     let bi = textureLoad(t_em, vec2(34 + c, row), 0).a;
                     let lv = wear_gamma(clamp(i.col[c] * (m[c] * sc + bi), 0.0, 1.0), textureLoad(t_em, vec2(37 + c, row), 0).a);
+                    ml[c] = lv;
                     s += clamp((lv - st) / wd, 0.0, 1.0);
                 }
+                // the 4th channel D4: the part's scale (column 62) times
+                // the detail texture's blue, not levelled; its window
+                // (columns 63, 64) adds to the first layer's weight
+                let d4 = textureLoad(t_em, vec2(62, row), 0).a * dt.b;
+                let d4w = max(textureLoad(t_em, vec2(64, row), 0).a, 1.0 / 255.0);
+                s += clamp((d4 - textureLoad(t_em, vec2(63, row), 0).a) / d4w, 0.0, 1.0);
                 k = clamp(s, 0.0, 1.0);
+                // W2: per channel R, G, B a window (start 50 + c, width
+                // 54 + c, divisor 58 + c) on the same levels, summed, and
+                // the larger of that and D4's window; 0 where the part has
+                // no tint and palette row (column 68)
+                var w2s = 0.0;
+                for (var c = 0; c < 3; c++) {
+                    w2s += w2_term(ml[c], textureLoad(t_em, vec2(50 + c, row), 0).a, textureLoad(t_em, vec2(54 + c, row), 0).a, textureLoad(t_em, vec2(58 + c, row), 0).a);
+                }
+                let w2d = w2_term(d4, textureLoad(t_em, vec2(53, row), 0).a, textureLoad(t_em, vec2(57, row), 0).a, textureLoad(t_em, vec2(61, row), 0).a);
+                w2 = select(0.0, max(clamp(w2s, 0.0, 1.0), w2d), textureLoad(t_em, vec2(68, row), 0).a > 0.5);
+                tint = vec3(textureLoad(t_em, vec2(65, row), 0).a, textureLoad(t_em, vec2(66, row), 0).a, textureLoad(t_em, vec2(67, row), 0).a);
                 // The game's second wear layer, the primer (columns 25 to
                 // 33): its mask (or the wear mask, column 31) per channel
                 // scaled, the first channel less the other two by the cross
@@ -1783,7 +1821,9 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         let w1 = textureSampleLevel(t_em, samp, vec2(u, (id + 256.5) / RAMP_ROWS), 0.0);
         let m1 = textureSampleLevel(t_em, samp, vec2(u, (id + 0.5) / RAMP_ROWS), 0.0).a;
         let w0 = 1.0 - k - w3;
-        albedo = albedo * w0 + w1.rgb * k + p_col * w3;
+        // the game's first layer colour: its tint blended to its palette
+        // colour by W2
+        albedo = albedo * w0 + mix(tint, w1.rgb, w2) * k + p_col * w3;
         rough = clamp(rough * w0 + w1.a * k + p_rough * w3, 0.04, 1.0);
         metal = metal * w0 + m1 * k + p_metal * w3;
         pearl = pearl * w0;

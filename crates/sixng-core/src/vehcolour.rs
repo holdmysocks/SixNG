@@ -93,13 +93,15 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// 28: `wear_records.levels_by_config` and `levels_default` (each part id's
 /// wear level per configuration: the entry of its ladder).
 /// 29: `primer` (each part id's primer palette rows per primer set).
-pub const EXPORT_VERSION: u32 = 29;
+/// 30: `wear_tint` (the colour of each part id's second layer).
+pub const EXPORT_VERSION: u32 = 30;
 /// Layout version of `<work>/index/vehicle_parts.json`.
 /// 21: a part's coat and the library's coat records.
 /// 22: the surfaces' wear ladders and detail sets, and the wear records.
 /// 23: each configuration's wear levels.
 /// 24: each part's primer palette rows.
-pub const FORMAT: u32 = 24;
+/// 25: each part's second-layer colour.
+pub const FORMAT: u32 = 25;
 
 const PART_SET: u32 = 0xf142_44fd;
 const SET_COLOURS: u32 = 0x7847_6477;
@@ -397,6 +399,11 @@ pub struct Part {
     /// colour record), None when that record has no row.
     #[serde(default)]
     pub wear_row: Option<u16>,
+    /// That colour record's colour (sRGB bytes): the game packs it as the
+    /// second layer's tint, which its paint shader shows where the layer's
+    /// palette weight (W2) is low.
+    #[serde(default)]
+    pub wear_rgb: [u8; 3],
     /// Roughness and metalness, low and high, of the second layer (the
     /// surface's `174770cc` names a `307f162c` record).
     #[serde(default)]
@@ -557,11 +564,13 @@ struct Library {
 }
 
 impl Library {
-    /// The second layer of a surface: palette row, roughness, metalness.
-    fn wear_of(&self, surface: u32) -> (Option<u16>, [f32; 2], [f32; 2]) {
-        let Some(&(c, r)) = self.wear.get(&surface) else { return (None, [0.5, 0.5], [0.0, 0.0]) };
+    /// The second layer of a surface: palette row, colour, roughness,
+    /// metalness.
+    fn wear_of(&self, surface: u32) -> (Option<u16>, [u8; 3], [f32; 2], [f32; 2]) {
+        let Some(&(c, r)) = self.wear.get(&surface) else { return (None, [0; 3], [0.5, 0.5], [0.0, 0.0]) };
         let row = self.colours.get(&c).filter(|(mode, row, _)| (0..8).contains(mode) && *row >= 0).map(|(mode, row, _)| *mode as u16 * 256 + (*row as u16 & 255));
-        (row, self.rough.get(&r).copied().unwrap_or([0.5, 0.5]), self.metal.get(&r).copied().unwrap_or([0.0, 0.0]))
+        let rgb = self.colours.get(&c).map_or([0; 3], |c| c.2);
+        (row, rgb, self.rough.get(&r).copied().unwrap_or([0.5, 0.5]), self.metal.get(&r).copied().unwrap_or([0.0, 0.0]))
     }
 
     /// The primer's palette rows of a part, per primer set: its colour
@@ -773,10 +782,10 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
                         let rec = lib.surfaces.get(&surface);
                         let rough = rec.and_then(|r| lib.rough.get(r)).copied().unwrap_or([0.5, 0.5]);
                         let metal = rec.and_then(|r| lib.metal.get(r)).copied().unwrap_or([0.0, 0.0]);
-                        let (wear_row, wear_rough, wear_metal) = lib.wear_of(surface);
+                        let (wear_row, wear_rgb, wear_rough, wear_metal) = lib.wear_of(surface);
                         let coat = num(c, ENTRY_COAT).unwrap_or(0) as u32;
                         let primer = lib.primer_of(colour, surface);
-                        Part { colour, surface, row, mode, rgb, rough, metal, wear_row, wear_rough, wear_metal, coat, primer }
+                        Part { colour, surface, row, mode, rgb, rough, metal, wear_row, wear_rgb, wear_rough, wear_metal, coat, primer }
                     })
                     .collect();
                 sets.push((name.to_string(), parts));
@@ -1066,7 +1075,7 @@ fn apply_config(lib: &Library, own: &HashMap<u32, Vec<u32>>, parts: &[u32], set:
             if surface && s != 0 {
                 if let Some((r, rec)) = lib.surfaces.get(&s).and_then(|rec| lib.rough.get(rec).map(|r| (r, rec))) {
                     (p.surface, p.rough, p.metal) = (s, *r, lib.metal.get(rec).copied().unwrap_or([0.0, 0.0]));
-                    (p.wear_row, p.wear_rough, p.wear_metal) = lib.wear_of(s);
+                    (p.wear_row, p.wear_rgb, p.wear_rough, p.wear_metal) = lib.wear_of(s);
                 }
             }
             if let Some(k) = coats.get(&ch).filter(|k| coat && lib.coats.contains_key(k)) {
@@ -1207,6 +1216,7 @@ impl Tables {
         let looks: Vec<Value> = names.iter().map(|n| hex(n).map_or(Value::Null, Value::String)).collect();
         let rows: Vec<Value> = names.iter().map(|n| self.sets.get(*n).map_or(Value::Null, |p| Value::String(row_table(p)))).collect();
         let wear: Vec<Value> = names.iter().map(|n| self.sets.get(*n).map_or(Value::Null, |p| Value::String(wear_table(p, mat)))).collect();
+        let wear_tint: Vec<Value> = names.iter().map(|n| self.sets.get(*n).map_or(Value::Null, |p| Value::String(wear_tint_table(p)))).collect();
         let surfaces: Vec<Value> = names.iter().map(|n| self.sets.get(*n).map_or(Value::Null, |p| Value::String(surface_table(p)))).collect();
         let primer: Vec<Value> = names.iter().map(|n| self.sets.get(*n).map_or(Value::Null, |p| Value::String(primer_table(p)))).collect();
         // the coat records the looks use, and per look the index of each part id's
@@ -1251,6 +1261,7 @@ impl Tables {
             "part_patches": patches,
             "rows": rows,
             "wear": wear,
+            "wear_tint": wear_tint,
             "surfaces": surfaces,
             "primer": primer,
             "coats": coats,
@@ -1403,6 +1414,12 @@ pub fn wear_table(parts: &[Part], mat: [f32; 2]) -> String {
         .collect()
 }
 
+/// The colour of each of the 256 part ids' second layer, 6 hex digits each
+/// (sRGB red, green, blue; 000000 without one).
+pub fn wear_tint_table(parts: &[Part]) -> String {
+    (0..256).map(|i| parts.get(i).map_or([0; 3], |p| p.wear_rgb).iter().map(|b| format!("{b:02x}")).collect::<String>()).collect()
+}
+
 /// The primer's palette rows of each of the 256 part ids, 12 hex digits
 /// each: per primer set 0 to 2 the row (4 digits: slice x 256 + row, `ffff`
 /// = none).
@@ -1458,6 +1475,10 @@ mod tests {
         assert_eq!(t.len(), 256 * 12);
         assert_eq!(&t[..12], "01e80507ffff");
         assert_eq!(&t[12..24], "ffffffffffff");
+        // the second layer's colour: 6 hex digits per part id
+        let t = wear_tint_table(&[Part { wear_rgb: [0x5a, 0x32, 0x1e], ..Default::default() }]);
+        assert_eq!(t.len(), 256 * 6);
+        assert_eq!(&t[..12], "5a321e000000");
     }
 
     #[test]
