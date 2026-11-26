@@ -35,6 +35,7 @@ mod world3d;
 pub const GUI_CACHE: &str = "gui_cache_v4";
 mod audio_view;
 mod bakejob;
+mod clip_picker;
 mod jobs;
 mod library;
 mod mapbake;
