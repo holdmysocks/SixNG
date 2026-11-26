@@ -3404,6 +3404,10 @@ impl Map3D {
         // stays open)
         static KEEP_TICKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let keep_ticks = *KEEP_TICKS.get_or_init(|| std::env::var("SIXNG_MAP_TICKS").is_ok_and(|v| v != "0"));
+        if keep_ticks {
+            // keep drawing frames (an idle window draws none, so it would log no ticks)
+            ctx.request_repaint();
+        }
         if (self.auto.screenshot.is_some() || keep_ticks)
             && self
                 .perf
