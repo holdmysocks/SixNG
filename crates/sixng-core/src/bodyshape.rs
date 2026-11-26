@@ -528,12 +528,16 @@ pub fn preset_from_xml(xml: &str, tag: &str) -> Result<Vec<(String, f32)>, Strin
 /// by an outfit's `BodyShapePreset` variation) whose values name preset
 /// items of the body-shape preset PSO in `anim.rpf`. The game reads these
 /// five keys together (static list at .rdata 0x651eab4, gathered by fn
-/// 0x3e47f90).
+/// 0x3e47f90 along a kit's parent chain). The tag-key table in packs.rpf
+/// (the PSO with struct 91315b01) gives the first four mode 0 (the values
+/// of every record in the chain) and 63d3733d mode 1 (the first record that
+/// has it).
 pub const PRESET_ITEM_KEYS: [u32; 5] = [0x3631_3cc7, 0x0248_4ea6, 0x6b3f_b5a6, 0x179c_8d5c, 0x63d3_733d];
 
 /// Control values of an outfit's body-shape preset items (hex hashes from
-/// its body-shape kits' `PRESET_ITEM_KEYS` tags, by key and then by kit, as
-/// the game gathers them in fn 0x3e47f90). Each item of the preset PSO
+/// its body-shape kits' `PRESET_ITEM_KEYS` tags: kits in include order,
+/// each kit's in key order, as the game gathers them per kit in fn
+/// 0x3e47f90). Each item of the preset PSO
 /// (struct 890b5009) lists control values and the rig input values they
 /// give; the game stores each input's value over the old one (fn 0x4f95310),
 /// so a later item's value for a control replaces an earlier one (Mandy's

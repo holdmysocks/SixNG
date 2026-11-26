@@ -993,7 +993,9 @@ again**).
   2026-11-26 read the way the game does it: the outfit's `BodyShapePreset`
   variation includes body-shape kits, and their tags name preset items of
   the body-shape preset PSO in `anim.rpf` that list control values, applied
-  key by key with a later value replacing an earlier one; Mandy opens with
+  kit by kit in include order, a later value replacing an earlier one; an
+  outfit that includes two presets gets both, the later one winning where
+  they set the same control; Mandy opens with
   muscle 0.2, fuller hips, thighs and breasts, Lucia with fuller hips,
   thighs and butt, Jason muscular. The `Average` / `Skinny` words are only
   labels: the same word gives different values per character. An outfit
