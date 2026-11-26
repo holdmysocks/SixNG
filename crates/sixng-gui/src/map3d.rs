@@ -3421,8 +3421,11 @@ impl Map3D {
     }
 
     fn automation(&mut self, ctx: &egui::Context, rs: &egui_wgpu::RenderState, rect: egui::Rect) {
-        // automation runs: a memory line every 2 s
-        if self.auto.screenshot.is_some()
+        // automation runs: a memory line every 2 s (SIXNG_MAP_TICKS=1: also after the run's screenshot, while the app
+        // stays open)
+        static KEEP_TICKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let keep_ticks = *KEEP_TICKS.get_or_init(|| std::env::var("SIXNG_MAP_TICKS").is_ok_and(|v| v != "0"));
+        if (self.auto.screenshot.is_some() || keep_ticks)
             && self
                 .perf
                 .last_tick
@@ -3466,6 +3469,7 @@ impl Map3D {
                     format!("{} {} {}", r[0].swap(0, Ordering::Relaxed) / n, r[1].swap(0, Ordering::Relaxed) / n, r[2].swap(0, Ordering::Relaxed) / n).replace(' ', "|")
                 }
             );
+            let line = format!("{line} | gpu ms/frame sky|shadows|main|post {}", crate::gpu_time::take_line());
             let line = format!("{line} | draws {} (shadow {}) | {} ({} placements) | {} fallbacks ({:?} draws, by level unlinked/linked {:?}) | wait: terrain idle {}, keep missing {}, inflight {}", self.stats.draws, self.renderer.as_ref().map_or(0, |r| r.shadow_draws), self.cells.summary(), self.stats.in_cells, self.stats.n_fb, self.renderer.as_ref().map_or([0, 0], |r| r.fb_draws), self.stats.fb_lvl, self.world.idle(), self.keep.iter().filter(|m| !self.cache.contains_key(m)).count(), self.stats.inflight);
             eprintln!("{line}");
         }

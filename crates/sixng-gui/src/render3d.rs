@@ -680,6 +680,8 @@ pub struct Renderer3D {
     accum: Option<crate::accum::Accum>,
     /// Frames in the running mean, and the key of the view they show.
     accum_n: u32,
+    /// GPU time by part of the frame (automation tick lines)
+    gpu_timer: Option<crate::gpu_time::GpuTimer>,
     accum_key: u64,
     /// Changes made outside `render` (joints, instances) since the last frame.
     accum_bump: std::sync::atomic::AtomicU64,
@@ -1697,6 +1699,7 @@ impl Renderer3D {
             accumulate: false,
             accum: None,
             accum_n: 0,
+            gpu_timer: crate::gpu_time::GpuTimer::new(&rs.device, &rs.queue),
             accum_key: 0,
             accum_bump: std::sync::atomic::AtomicU64::new(0),
             map_glass: false,
@@ -2885,7 +2888,7 @@ impl Renderer3D {
         for gm in models {
             for me in &gm.meshes {
                 if let Some(l) = me.strand_lod {
-                    let f = l.share((eye - me.centre).length(), size[1] as f32, (cam.fov * 0.5).tan());
+                    let f = l.share((eye - me.centre).length(), crate::glb::STRAND_RULE_LINES, (cam.fov * 0.5).tan());
                     let n = l.indices(me.n_idx, f).max(1);
                     let k = (me.n_idx as f32 / n as f32).clamp(1.0, 50.0);
                     let at = me.material as u64 * MAT_STRIDE + std::mem::offset_of!(MatU, strand) as u64;
@@ -2897,9 +2900,12 @@ impl Renderer3D {
         for me in models.iter().flat_map(|gm| gm.meshes.iter()) {
             if let Some(l) = me.strand_lod {
                 let d = (eye - me.centre).length();
-                let f = l.share(d, size[1] as f32, (cam.fov * 0.5).tan());
+                // the game's rule counts in a fixed 1440-line reference view (an integer global, read from its LOD
+                // function), not in the target's own lines: a small window draws as many strands as a large one
+                let lines = crate::glb::STRAND_RULE_LINES;
+                let f = l.share(d, lines, (cam.fov * 0.5).tan());
                 me.n_draw.store(l.indices(me.n_idx, f), std::sync::atomic::Ordering::Relaxed);
-                me.n_shadow.store(l.indices(me.n_idx, l.shadow_share(d, size[1] as f32, (cam.fov * 0.5).tan())), std::sync::atomic::Ordering::Relaxed);
+                me.n_shadow.store(l.indices(me.n_idx, l.shadow_share(d, lines, (cam.fov * 0.5).tan())), std::sync::atomic::Ordering::Relaxed);
                 me.shadow_slot.store(0, std::sync::atomic::Ordering::Relaxed);
                 // the ray-traced rule: the first n of the m drawn strands, each m / n times as wide (a piece of its own
                 // frame group carries the factor; pieces beyond the groups share the last one)
@@ -2964,11 +2970,20 @@ impl Renderer3D {
         let dt = self.last_frame.map(|t| (now - t).as_secs_f32()).unwrap_or(0.016);
         self.last_frame = Some(now);
         let sky = if self.hdr { self.sky } else { None };
+        let gslot = self.gpu_timer.as_mut().and_then(|g| g.begin(device));
+        let gmark = |g: &Option<crate::gpu_time::GpuTimer>, enc: &mut wgpu::CommandEncoder, i: u32| {
+            if let (Some(g), Some(_)) = (g, gslot) {
+                g.mark(enc, i);
+            }
+        };
+        gmark(&self.gpu_timer, &mut enc, 0);
         self.atmo.update(queue, sky.as_ref(), cam.proj(aspect) * cam.view(), cam.eye(), size, dt);
         if let Some(sky) = &sky {
             self.atmo.compute(&mut enc, sky);
         }
+        gmark(&self.gpu_timer, &mut enc, 1);
         self.render_shadows(queue, &mut enc, cam, look, &fu, aspect, models);
+        gmark(&self.gpu_timer, &mut enc, 2);
         let t = self.target.as_ref().unwrap();
         let mut draws = 0u32;
         if shadow_fu.is_some() {
@@ -3233,11 +3248,16 @@ impl Renderer3D {
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
+        gmark(&self.gpu_timer, &mut enc, 3);
         if let (Some(_), Some(d)) = (&sky, &t.display) {
             self.atmo.post(device, &mut enc, &t.resolve_view, &d.1, size);
         }
         if let (Some(a), Some(at)) = (&self.accum, &t.accum) {
             a.run(&mut enc, at, self.accum_n);
+        }
+        gmark(&self.gpu_timer, &mut enc, 4);
+        if let (Some(g), Some(slot)) = (&self.gpu_timer, gslot) {
+            g.end(&mut enc, slot);
         }
         let t_e = std::time::Instant::now();
         let cb = enc.finish();
@@ -3247,6 +3267,9 @@ impl Renderer3D {
         );
         let t_s = std::time::Instant::now();
         queue.submit([cb]);
+        if let (Some(g), Some(slot)) = (&self.gpu_timer, gslot) {
+            g.after_submit(slot);
+        }
         RTIME[2].fetch_add(
             t_s.elapsed().as_micros() as u64,
             std::sync::atomic::Ordering::Relaxed,
