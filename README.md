@@ -1380,12 +1380,11 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   model yet (unresolved archetype hashes; about 88 % around downtown), so
   large HD models stay visible out to 1.75× the HD distance and the LOD
   level is skipped. SLOD placements mostly carry a placeholder unit-cube
-  bbox, so they are never culled by screen size. Flat HD pieces (a box at most a tenth
-  as tall as it is wide, or under 4 m: water plants, ground patches and
-  cards) are left out of this and keep the game's own LOD distance (130 m
-  for the water plants): the terrain covers the ground they lie on, and
-  kept out to about 1 km they drew as flat green squares and diamond
-  patterns over the fields (since 2026-11-26).
+  bbox, so they are never culled by screen size. Water-plant tiles (`*_waterveg`) are left out
+  of this and keep the game's own LOD distance (130 m): kept out to about
+  1 km they drew as flat green squares and diamond patterns over the
+  fields (since 2026-11-26). The HD ground tiles beside them have the same
+  size and almost the same LOD distance, so they are told apart by name.
 - **Coverage fallbacks** (no holes near the camera): a SLOD placement (or
   a LOD with HD fallback off) with nothing finer to hand over to (no LOD
   link, or children that all lack a model) keeps drawing nearer than its

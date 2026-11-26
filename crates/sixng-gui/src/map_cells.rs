@@ -156,7 +156,7 @@ fn static_range(
     let band = |e: &crate::mapbake::EntRec, rad: f32| -> (f32, f32) {
         let l = e.lod.min(5) as usize;
         let lo = if l == 0 { 0.0 } else { rn[l - 1] * 0.92 };
-        let hi = if l == 0 && e.lod_dist > 0.0 && map3d::flat_piece(e) {
+        let hi = if l == 0 && e.lod_dist > 0.0 && map3d::own_lod_only(data.name(e.name)) {
             e.lod_dist.min(rn[0])
         } else if l == 0 && d.hd_fallback && rad >= 10.0 {
             rn[1].min(rn[0] * 1.75)
@@ -238,7 +238,7 @@ fn static_range(
 }
 
 /// Cell format prefix of the cache directories (older ones are deleted).
-const TAG_FORMAT: &str = "v9_";
+const TAG_FORMAT: &str = "v10_";
 
 fn tag_of(d: &Detail) -> String {
     format!(
