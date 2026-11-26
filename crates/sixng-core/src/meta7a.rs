@@ -396,6 +396,19 @@ impl<'a> Meta<'a> {
                 }
                 json!((0..n).filter_map(|i| self.value(sd, el, p + i * esz, depth)).collect::<Vec<_>>())
             }
+            // Fixed-capacity array with a count: `extra` elements of the
+            // referenced member, then a u32 count of the used ones (the
+            // game pads the rest after loading).
+            0x53 => {
+                let el = sd.members.get(m.reference as usize)?;
+                let esz = self.elem_size(el);
+                let cap = m.extra as usize;
+                if esz == 0 || cap > 100_000 {
+                    return Some(json!({"inline_array": cap, "elem_type": el.ty}));
+                }
+                let n = (r.u32(p + cap * esz) as usize).min(cap);
+                json!((0..n).filter_map(|i| self.value(sd, el, p + i * esz, depth)).collect::<Vec<_>>())
+            }
             // Half float (2 bytes).
             0x20 => json!(half(r.u16(p))),
             _ => json!({"type": m.ty, "sub": m.sub, "hex": r.sys.get(p..p + 16).map(|b| b.iter().map(|x| format!("{x:02x}")).collect::<String>())}),

@@ -820,7 +820,7 @@ pub struct ModelView {
     pub ped_clip: PedClip,
     /// Animals: the clip dictionaries of the species shown (root name, the
     /// names), from the cached dictionary list.
-    animal_clips: Option<(String, Vec<String>)>,
+    clip_picker: crate::clip_picker::ClipPicker,
     /// Pose of the character shown (degrees), see `PedPose`.
     pub ped_pose: PedPose,
     /// Body shape of the character shown (`BODY_SHAPE` when it was loaded).
@@ -1150,7 +1150,7 @@ impl ModelView {
             hair_head: None,
             hair_head_n: 0,
             ped_clip: PedClip::default(),
-            animal_clips: None,
+            clip_picker: Default::default(),
             ped_pose: PedPose::default(),
             body_shape_shown: (0.0, 0.0),
             wheels_on: true,
@@ -1839,8 +1839,7 @@ impl ModelView {
                     };
                     let cq = cq.as_str();
                     let c = if cq.is_empty() {
-                        let bound: Vec<&sixng_core::anim::Clip> = d.clips.iter().filter(|c| c.kind == 1 && !c.bindings.is_empty()).collect();
-                        ["move", "idle"].iter().find_map(|n| bound.iter().find(|c| c.short_name() == *n).copied()).or(bound.first().copied()).ok_or_else(|| anyhow::anyhow!("{} holds no clip with animation data that is decoded (its {} clip(s) bind none here)", d.name, d.clips.len()))?
+                        sixng_core::anim::default_clip(&d).ok_or_else(|| anyhow::anyhow!("{} holds no clip with animation data that is decoded (its {} clip(s) bind none here)", d.name, d.clips.len()))?
                     } else {
                         d.clip(cq).ok_or_else(|| anyhow::anyhow!("no clip {cq:?} in {}; it has: {}", d.name, d.clips.iter().map(|c| c.short_name()).collect::<Vec<_>>().join(", ")))?
                     };
@@ -1967,48 +1966,10 @@ impl ModelView {
     /// pick from, and the same playback controls as a character has.
     fn animal_clip_ui(&mut self, ui: &mut egui::Ui) {
         let Some(l) = self.loaded.as_ref().filter(|l| l.look.is_none() && l.takes_clips()) else { return };
-        let root = l.source.split_whitespace().next().unwrap_or("").rsplit([':', '#', '/']).find(|s| !s.is_empty()).unwrap_or("").to_ascii_lowercase();
-        if self.animal_clips.as_ref().is_none_or(|c| c.0 != root) {
-            // the species word of `crm_cat_feral_m_00` is `cat`; some dictionaries use two words (`bengal_tiger`)
-            let t: Vec<&str> = root.split('_').collect();
-            let words: Vec<String> = match t.as_slice() {
-                [_, a, b, ..] => vec![format!("{b}_{a}"), format!("{a}_{b}"), a.to_string()],
-                [_, a] => vec![a.to_string()],
-                _ => vec![],
-            };
-            // only the cached list: building it reads every clip dictionary (about a minute)
-            let cached = Path::new(&self.work).join("index").join(sixng_core::anim::DICT_CACHE).exists();
-            let all = if cached { sixng_core::anim::dictionaries(Path::new(&self.game), Path::new(&self.work)).unwrap_or_default() } else { Vec::new() };
-            let names = words
-                .iter()
-                .map(|w| all.iter().filter(|d| d.name.starts_with("gameplay@creatures@") && d.name.split('@').any(|p| p == w)).map(|d| d.name.clone()).collect::<Vec<_>>())
-                .find(|v| !v.is_empty())
-                .unwrap_or_default();
-            self.animal_clips = Some((root.clone(), names));
-        }
-        let names = self.animal_clips.as_ref().map(|c| c.1.clone()).unwrap_or_default();
+        let fit = sixng_core::anim::ClipFit::Animal(l.source.clone());
         egui::CollapsingHeader::new("Animation").default_open(true).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.ped_clip.want).hint_text("<dictionary>[/<clip>]").desired_width(250.0));
-                if ui.button("None").clicked() {
-                    self.ped_clip.want.clear();
-                    self.ped_clip.playing = false;
-                }
-            });
-            if names.is_empty() {
-                ui.label(egui::RichText::new("No clip dictionaries listed for this animal. The list comes from `sixng clips` (run it once; it reads anim.rpf for about a minute), by the species word of the animal's name.").weak().small());
-            } else {
-                // the part of the name after the species: `normal@walk@slow`
-                let tail = |n: &str| n.split('@').skip(5).collect::<Vec<_>>().join("@");
-                let current = self.ped_clip.want.split('/').next().unwrap_or("").to_string();
-                egui::ComboBox::from_id_salt("animal_clip_dict").selected_text(if names.contains(&current) { tail(&current) } else { format!("{} clip dictionaries", names.len()) }).width(260.0).show_ui(ui, |ui| {
-                    for n in &names {
-                        if ui.selectable_label(*n == current, tail(n)).on_hover_text(n).clicked() {
-                            self.ped_clip.want = n.clone();
-                            self.ped_clip.playing = true;
-                        }
-                    }
-                });
+            if self.clip_picker.ui(ui, &mut self.ped_clip.want, fit, &self.game, &self.work) {
+                self.ped_clip.playing = !self.ped_clip.want.trim().is_empty();
             }
             if self.ped_clip.anim.is_some() {
                 ui.horizontal(|ui| {
@@ -2148,18 +2109,14 @@ impl ModelView {
         });
         egui::CollapsingHeader::new("Animation").default_open(true).show(ui, |ui| {
             let female = look.model.is_empty() || l.parts.iter().any(|p| l.selected.contains(&p.off) && p.name.contains("_fr1_"));
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.ped_clip.want).hint_text("<dictionary>/<clip>").desired_width(250.0));
-                if ui.button("Walk").on_hover_text("A walk clip of the game for this body type").clicked() {
-                    self.ped_clip.want = format!("gameplay@locomotion@{}_character@{}@normal@standing@walk@stance_neutral/move", if female { "female" } else { "male" }, if female { "kat" } else { "raul" });
-                    self.ped_clip.playing = true;
-                    self.ped_pose = PedPose::default();
-                }
-                if ui.button("None").clicked() {
-                    self.ped_clip.want.clear();
-                    self.ped_clip.playing = false;
-                }
-            });
+            if self.clip_picker.ui(ui, &mut self.ped_clip.want, sixng_core::anim::ClipFit::Person, &self.game, &self.work) {
+                self.ped_clip.playing = !self.ped_clip.want.trim().is_empty();
+            }
+            if ui.button("Walk").on_hover_text("A walk clip of the game for this body type").clicked() {
+                self.ped_clip.want = format!("gameplay@locomotion@{}_character@{}@normal@standing@walk@stance_neutral/move", if female { "female" } else { "male" }, if female { "kat" } else { "raul" });
+                self.ped_clip.playing = true;
+                self.ped_pose = PedPose::default();
+            }
             if self.ped_clip.anim.is_some() {
                 ui.horizontal(|ui| {
                     if ui.button(if self.ped_clip.playing { "⏸" } else { "▶" }).clicked() {
@@ -2172,7 +2129,7 @@ impl ModelView {
             if !self.ped_clip.status.is_empty() {
                 ui.label(egui::RichText::new(&self.ped_clip.status).weak().small());
             }
-            ui.label(egui::RichText::new("A clip of anim.rpf on this skeleton (`sixng clips --name <regex>` lists them), or a cutscene: cin@<scene> plays this character's clip of that scene. The Pose angles are added on top.").weak().small());
+            ui.label(egui::RichText::new("A clip of anim.rpf on this skeleton: pick a dictionary (type words of its name to narrow the list), then a clip in it; greyed clips store their animation data elsewhere and do not play. ✏ takes a typed or pasted name, also a cutscene: cin@<scene> plays this character's clip of that scene. The Pose angles are added on top.").weak().small());
         });
         for n in &look.notes {
             ui.label(egui::RichText::new(n).weak().small());
@@ -7176,15 +7133,26 @@ fn load_query_sel(
             // own; strand and card hair are not colliders).
             if !l.hair.is_empty() {
                 let rig = |k: &str| parts.iter().any(|p| p.name.as_deref().is_some_and(|n| n.contains(k)));
-                let bound = if rig("_fr1_") { Some("defaultfemale_fr1_000_bounds") } else if rig("_mr1_") { Some("defaultmale_mr1_000_bounds") } else { None };
-                let shapes = bound.map(|b| body_tapers(&a, &ix.entries, b, &model.joints)).unwrap_or_default();
+                let bound = if rig("_fr1_") { Some(("defaultfemale_fr1_000_bounds", "female")) } else if rig("_mr1_") { Some(("defaultmale_mr1_000_bounds", "male")) } else { None };
+                let mut shapes = bound.map(|(b, _)| body_tapers(&a, &ix.entries, b, &model.joints)).unwrap_or_default();
+                // A garment's own bound is named after its drawable:
+                // `char_bipedbounds_<sex>_<drawable>`. Its pieces are added
+                // to the body's (they enclose it where the garment is).
+                let mut worn = 0;
+                if let (Some((_, sex)), false) = (bound, shapes.is_empty()) {
+                    for n in parts.iter().filter_map(|p| p.name.as_deref()) {
+                        let t = body_tapers(&a, &ix.entries, &format!("char_bipedbounds_{sex}_{}", n.to_ascii_lowercase()), &model.joints);
+                        worn += usize::from(!t.is_empty());
+                        shapes.extend(t);
+                    }
+                }
                 if std::env::var("SIXNG_DEBUG_HAIR").is_ok() {
                     for t in &shapes {
                         eprintln!("body piece {:?} {:?} r {:.3} {:.3}", t.a, t.b, t.ra, t.rb);
                     }
                 }
                 if !shapes.is_empty() {
-                    l.notes.push(format!("Hair styling is damped near the {} pieces of the body bound ({}), as the game does. Garment bounds are not used.", shapes.len(), bound.unwrap_or_default()));
+                    l.notes.push(format!("Hair styling is damped near the {} pieces of the body bound ({}) and of {worn} garment bounds, as the game does. A garment's bound is found by its name (`char_bipedbounds_<sex>_<garment>`); that the game damps hair against it is inferred, and the 3 cm falloff is a guess.", shapes.len(), bound.map(|b| b.0).unwrap_or_default()));
                     l.collide = Some(Arc::new(sixng_core::groom::Colliders::shapes(shapes)));
                 } else {
                     let hairy = ["hair", "brows", "beard", "lashes", "body hair", "eyes", "eyecaps", "teeth", "teeth accessory"];

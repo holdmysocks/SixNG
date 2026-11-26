@@ -51,8 +51,7 @@ fn equation(sw: Swizzle, bpe: u32) -> Option<&'static [(u8, u8)]> {
 /// texture, low bit first. From AMD addrlib (Gfx10 swizzle patterns, MIT):
 /// the `SW_4K_S3` pattern (non-XOR, so no pipe/bank bits), with the
 /// byte-within-element bits dropped. Only the element sizes measured on the
-/// install are mapped: 1, 2, 4 and 8 bytes. No volume in the stores uses
-/// 16-byte elements, so they are rejected.
+/// install are mapped: 1, 2, 4, 8 and 16 bytes (the last as 4x4 BC blocks).
 fn equation_3d(sw: Swizzle, bpe: u32) -> Option<&'static [(u8, u8)]> {
     Some(match (sw, bpe) {
         (Swizzle::S4K, 2) => &[(X, 0), (Z, 0), (Y, 0), (Z, 1), (Y, 1), (X, 1), (Z, 2), (Y, 2), (X, 2), (Z, 3), (Y, 3)],
@@ -68,6 +67,11 @@ fn equation_3d(sw: Swizzle, bpe: u32) -> Option<&'static [(u8, u8)]> {
         // (about 9 levels on every axis); every relabelling of it is 2.5 to 3
         // times rougher at the seams
         (Swizzle::S4K, 1) => &[(X, 0), (X, 1), (Z, 0), (Y, 0), (Z, 1), (Y, 1), (X, 2), (Z, 2), (Y, 2), (X, 3), (Z, 3), (Y, 3)],
+        // 4x8x8 bricks of 16-byte elements; found the same way on the BC5
+        // 128x128x128 cloud volume (BC blocks as elements). Brick seams
+        // match the inside on every axis (12.5 / 12.6, 12.5 / 13.5,
+        // 3.6 / 3.7 endpoint levels); the next orders are 30 to 37 at seams
+        (Swizzle::S4K, 16) => &[(Z, 0), (Y, 0), (X, 0), (Z, 1), (Y, 1), (X, 1), (Z, 2), (Y, 2)],
         _ => return None,
     })
 }
@@ -173,28 +177,37 @@ impl Layout {
     /// (`block_d` deep) holds its own chain, smallest first: the mip-tail
     /// block, then that layer of every mip too large for the tail, mip 0
     /// last. Layers are `slice_bytes` apart; a mip with fewer layers leaves
-    /// its place in the later layers empty. Tail mips (at most half a brick
-    /// wide) sit at 256-byte slots of the tail block, largest first: bytes
-    /// 2048, 768, 512 and 256, each at the element those bytes address.
+    /// its place in the later layers empty. Tail mips (no wider than a
+    /// brick and at most half a brick high) sit at 256-byte slots of the tail
+    /// block, largest first: bytes 2048, 768, 512, 256 and 0, each at the
+    /// element those bytes address. A tail mip deeper than a brick continues
+    /// in the tail blocks of the next layers.
     ///
-    /// Measured on the one volume with mips in the install (R8 32x32x32,
-    /// 6 mips): mip 0 is as smooth across the layer seam as inside a brick,
-    /// mip 1 matches mip 0 averaged 2x2x2 at 35 dB, mips 2 to 4 match the
-    /// mip above at 33 to 43 dB in their slots, and the tail's nonzero bytes
-    /// are exactly those slots. Chains are only mapped for 1-byte elements
-    /// and up to 4 tail mips; `None` otherwise.
+    /// Measured on the two volumes with mips in the install:
+    /// * R8 32x32x32, 6 mips: mip 0 is as smooth across the layer seam as
+    ///   inside a brick, mip 1 matches mip 0 averaged 2x2x2 at 35 dB, mips 2
+    ///   to 4 match the mip above at 33 to 43 dB in their slots, and the
+    ///   tail's nonzero bytes are exactly those slots.
+    /// * BC5 128x128x128, 8 mips (32x32 blocks, 43 blocks a layer): the empty
+    ///   blocks of the later layers sit where the shorter mips end, mips 1
+    ///   and 2 track the mip above (correlation 0.996 and 0.983 on block
+    ///   endpoints), mips 3 to 6 fit their slots, and the one tail element
+    ///   left over is element 0, mip 7's slot.
+    ///
+    /// Chains are only mapped for those element sizes (1 and 16 bytes) and
+    /// up to 5 tail mips; `None` otherwise.
     pub fn new_3d_mips(sw: Swizzle, w: u32, h: u32, d: u32, mips: u32, bpe: u32) -> Option<Layout> {
-        const TAIL_SLOTS: [u64; 4] = [2048, 768, 512, 256];
+        const TAIL_SLOTS: [u64; 5] = [2048, 768, 512, 256, 0];
         let eq = equation_3d(sw, bpe)?;
         let n = |a: u8| eq.iter().filter(|e| e.0 == a).count() as u32;
         let (bw, bh, bd) = (1u32 << n(X), 1u32 << n(Y), 1u32 << n(Z));
         let bs = (bw * bh * bd * bpe) as u64;
         let (nm, d) = (mips.max(1) as usize, d.max(1));
-        if nm > 1 && bpe != 1 {
+        if nm > 1 && bpe != 1 && bpe != 16 {
             return None;
         }
         let dims: Vec<(u32, u32, u32)> = (0..nm).map(|i| ((w >> i).max(1), (h >> i).max(1), (d >> i).max(1))).collect();
-        let first = if nm == 1 { 1 } else { dims.iter().position(|&(mw, mh, md)| mw <= bw / 2 && mh <= bh && md <= bd).unwrap_or(nm) };
+        let first = if nm == 1 { 1 } else { dims.iter().position(|&(mw, mh, _)| mw <= bw && mh <= bh / 2).unwrap_or(nm) };
         if nm - first > TAIL_SLOTS.len() {
             return None;
         }
@@ -470,10 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn unmeasured_volume_element_sizes_are_rejected() {
-        for bpe in [16] {
-            assert!(Layout::new_3d(Swizzle::S4K, 32, 32, 32, bpe).is_none());
-        }
+    fn volumes_need_s4k() {
         assert!(Layout::new_3d(Swizzle::D64K, 32, 32, 32, 8).is_none());
     }
 
@@ -490,6 +500,15 @@ mod tests {
         assert_eq!([2, 3, 4, 5].map(|m| l.addr(m, 0, 0, 0)), [2048, 768, 512, 256]);
         // chains are only mapped for 1-byte elements
         assert!(Layout::new_3d_mips(Swizzle::S4K, 32, 32, 32, 6, 2).is_none());
+        // BC5 128x128x128 with 8 mips (32x32 blocks): per 8-deep layer the
+        // tail, mip 2 (2 bricks), mip 1 (8), mip 0 (32); mip 3 spans two
+        // layers' tails, mip 7 sits at byte 0.
+        let l = Layout::new_3d_mips(Swizzle::S4K, 32, 32, 128, 8, 16).unwrap();
+        assert_eq!((l.block_w, l.block_h, l.block_d, l.slice_bytes, l.total), (4, 8, 8, 43 * 4096, 16 * 43 * 4096));
+        assert_eq!((l.addr(0, 0, 0, 0), l.addr(1, 0, 0, 0), l.addr(2, 0, 0, 0)), (11 * 4096, 3 * 4096, 4096));
+        let tails: Vec<_> = l.mips[3..].iter().map(|p| p.tail.unwrap()).collect();
+        assert_eq!(tails, [(0, 4), (2, 2), (2, 0), (0, 2), (0, 0)]);
+        assert_eq!(l.addr(3, 8, 0, 0), 43 * 4096 + 2048);
         // single mip: unchanged
         assert_eq!(Layout::new_3d_mips(Swizzle::S4K, 32, 32, 32, 1, 1).unwrap().total, 8 * 4096);
     }
