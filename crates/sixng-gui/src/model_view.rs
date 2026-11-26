@@ -39,6 +39,8 @@ fn tyre_material(name: &str) -> bool {
 }
 /// Default rim colour: a plain alloy (the true per-vehicle colour is not decoded).
 const RIM_ALLOY: [f32; 3] = [0.6, 0.6, 0.62];
+/// The second region layer of body skins (see `glb::Mesh::region2`): the waist strip both halves carry.
+const SKIN_LAYER2: u32 = 0x2758_22c4;
 pub const SLOTS: [&str; 4] = ["base colour", "normal", "packed RMA", "emissive"];
 
 /// Which side-panel controls do something for a model.
@@ -5347,10 +5349,18 @@ fn load_parts(
             // in the Parts panel leaves the skin under it whole
             let masks: Vec<&str> = fx.iter().filter(|(o, _)| *o != off && parts.iter().any(|e| e.off == **o)).flat_map(|(_, f)| f.hides.iter()).filter(|h| h.0 == *layer).map(|h| h.1.as_str()).collect();
             let hide: Vec<bool> = (0..256u32).map(|n| masks.iter().any(|k| sixng_core::wardrobe::mask_has(k, n))).collect();
+            // The second byte of a body skin's regions is a region in a second layer, shared by the
+            // two halves: the strip round the waist that both carry. Each half hides it there, so
+            // the upper half's copy goes when the lower half is worn and the two do not fight.
+            let masks2: Vec<&str> = fx.iter().filter(|(o, _)| *o != off && parts.iter().any(|e| e.off == **o)).flat_map(|(_, f)| f.hides.iter()).filter(|h| h.0 == SKIN_LAYER2).map(|h| h.1.as_str()).collect();
+            let hide2: Vec<bool> = (0..256u32).map(|n| n != 0 && masks2.iter().any(|k| sixng_core::wardrobe::mask_has(k, n))).collect();
             for i in range.clone() {
                 let Some(me) = m.meshes.get_mut(i) else { continue };
                 let before = me.indices.len() / 3;
-                me.indices = me.indices.chunks_exact(3).filter(|t| !t.iter().all(|&i| hide[me.verts[i as usize].zone[3] as usize])).flatten().copied().collect();
+                let r2 = std::mem::take(&mut me.region2);
+                let gone = |i: u32| hide[me.verts[i as usize].zone[3] as usize] || r2.get(i as usize).is_some_and(|&r| hide2[r as usize]);
+                me.indices = me.indices.chunks_exact(3).filter(|t| !t.iter().all(|&i| gone(i))).flatten().copied().collect();
+                me.region2 = r2;
                 *(if is_skin { &mut skin_hidden } else { &mut cloth_hidden }) += before - me.indices.len() / 3;
             }
         }
