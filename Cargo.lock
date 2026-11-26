@@ -3440,7 +3440,7 @@ checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 
 [[package]]
 name = "sixng-cli"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3454,7 +3454,7 @@ dependencies = [
 
 [[package]]
 name = "sixng-core"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "bcpack-rs",
@@ -3470,7 +3470,7 @@ dependencies = [
 
 [[package]]
 name = "sixng-gui"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "bytemuck",
