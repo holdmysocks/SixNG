@@ -75,6 +75,22 @@ static TEXTURE_CACHE_WRITERS_ACTIVE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static TEXTURE_CACHE_MISS_LOGS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+// ===== 模型 buffer 缓存（SXMTLIO2）=====
+const GPU_MODEL_CACHE_DIR: &str = "metal_io_models_v2";
+const GPU_MODEL_CACHE_CAP: u64 = 4 * 1024 * 1024 * 1024; // 模型比贴图大：4GiB
+const GPU_MODEL_CACHE_MAGIC: &[u8; 8] = b"SXMTLIO2";
+const GPU_MODEL_CACHE_FIXED_HEADER: usize = 48;
+static MODEL_CACHE_WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static MODEL_CACHE_WRITERS_ACTIVE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+struct CacheModelBuffers {
+    path: PathBuf,
+    key: String,
+    vertex: Vec<u8>,
+    index: Vec<u8>,
+}
 #[cfg(test)]
 static LAST_TEXTURE_CACHE_WRITE: std::sync::Mutex<
     Option<std::sync::mpsc::Receiver<anyhow::Result<Option<PathBuf>>>>,
@@ -244,6 +260,103 @@ fn crc32_update(mut crc: u32, bytes: &[u8]) -> u32 {
         }
     }
     crc
+}
+
+/// identity = 模型文件名 + 源版本 + vertex/index 内容 CRC。
+/// 名+版本是身份；加 CRC 作正确性兜底——内容一变 identity 就变、文件名就变，避免误命中。
+fn model_identity(model: &glb::Model, vertex: &[u8], index: &[u8]) -> String {
+    let name = model
+        .path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model");
+    format!(
+        "{name}|source={}|v={:08x}|i={:08x}",
+        env!("CARGO_PKG_VERSION"),
+        crc32(vertex),
+        crc32(index),
+    )
+}
+
+fn model_cache_path(dir: &Path, identity: &str) -> PathBuf {
+    dir.join(format!("{:016x}.buf", cache_key(identity)))
+}
+
+/// 原子写缓存：头 + vertex ++ index，tmp + rename。仿 write_texture_cache_entry。
+fn write_model_cache_entry(dir: &Path, entry: &CacheModelBuffers) -> anyhow::Result<Option<PathBuf>> {
+    let _guard = MODEL_CACHE_WRITER.lock().unwrap();
+    let path = if entry.path.is_absolute() {
+        entry.path.clone()
+    } else {
+        dir.join(&entry.path)
+    };
+    if path.exists() {
+        return Ok(None);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut header = Vec::with_capacity(GPU_MODEL_CACHE_FIXED_HEADER);
+    header.extend_from_slice(GPU_MODEL_CACHE_MAGIC);
+    header.extend_from_slice(&1u32.to_le_bytes());                    // [8..12] version
+    header.extend_from_slice(&(entry.vertex.len() as u64).to_le_bytes()); // [12..20] vlen
+    header.extend_from_slice(&(entry.index.len() as u64).to_le_bytes());  // [20..28] ilen
+    header.extend_from_slice(&crc32(&entry.vertex).to_le_bytes());    // [28..32] vcrc
+    header.extend_from_slice(&crc32(&entry.index).to_le_bytes());     // [32..36] icrc
+    header.extend_from_slice(&crc32(entry.key.as_bytes()).to_le_bytes()); // [36..40] kcrc
+    header.resize(GPU_MODEL_CACHE_FIXED_HEADER, 0);
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let result = (|| -> anyhow::Result<()> {
+        let mut f = OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        f.write_all(&header)?;
+        f.write_all(&entry.vertex)?;
+        f.write_all(&entry.index)?;
+        f.sync_all()?;
+        fs::rename(&temp, &path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result.map(|()| Some(path))
+}
+
+/// 校验缓存头，返回 (payload_offset, vertex_len, index_len)。仿 cache_matches。
+fn model_cache_matches(path: &Path, identity: &str) -> anyhow::Result<(u64, u64, u64)> {
+    let mut f = File::open(path)?;
+    let mut fixed = [0u8; GPU_MODEL_CACHE_FIXED_HEADER];
+    f.read_exact(&mut fixed)?;
+    anyhow::ensure!(&fixed[..8] == GPU_MODEL_CACHE_MAGIC, "model cache magic mismatch");
+    anyhow::ensure!(
+        u32::from_le_bytes(fixed[8..12].try_into()?) == 1,
+        "model cache version mismatch"
+    );
+    let vlen = u64::from_le_bytes(fixed[12..20].try_into()?);
+    let ilen = u64::from_le_bytes(fixed[20..28].try_into()?);
+    anyhow::ensure!(vlen != 0, "zero vertex length");
+    anyhow::ensure!(
+        u32::from_le_bytes(fixed[36..40].try_into()?) == crc32(identity.as_bytes()),
+        "model cache identity mismatch"
+    );
+    let expected = GPU_MODEL_CACHE_FIXED_HEADER as u64 + vlen + ilen;
+    anyhow::ensure!(f.metadata()?.len() == expected, "model cache file length mismatch");
+    Ok((GPU_MODEL_CACHE_FIXED_HEADER as u64, vlen, ilen))
+}
+
+/// 按 4GiB 上限 + LRU 裁剪模型缓存目录。复用纹理的通用裁剪器。
+fn trim_model_cache_dir(dir: &Path, cap: u64) -> anyhow::Result<()> {
+    let mut entries = Vec::new();
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_file() && entry.path().extension().is_some_and(|ext| ext == "buf") {
+            entries.push((metadata.modified().ok(), entry.path(), metadata.len()));
+        }
+    }
+    trim_texture_cache_entries(entries, cap, None)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1007,6 +1120,9 @@ pub struct Renderer3D4 {
     residency: ResidencySet,
     texture_cache_dir: Option<PathBuf>,
     validated_texture_caches: HashMap<PathBuf, (u64, std::time::SystemTime, u64, usize)>,
+    model_cache_dir: Option<PathBuf>,
+    // (payload_offset, modified, vertex_len, index_len)
+    validated_model_caches: HashMap<PathBuf, (u64, std::time::SystemTime, u64, u64)>,
     pipeline: metal_rust::metal::RenderPipelineState,
     temporal_pipeline: metal_rust::metal::RenderPipelineState,
     line_pipeline: metal_rust::metal::RenderPipelineState,
@@ -1184,6 +1300,8 @@ impl Renderer3D4 {
             residency,
             texture_cache_dir: None,
             validated_texture_caches: HashMap::new(),
+            model_cache_dir: None,
+            validated_model_caches: HashMap::new(),
             pipeline,
             temporal_pipeline,
             line_pipeline,
@@ -1222,6 +1340,17 @@ impl Renderer3D4 {
         fs::create_dir_all(&dir)?;
         trim_texture_cache_dir(&dir, GPU_TEXTURE_CACHE_CAP, None)?;
         self.texture_cache_dir = Some(dir);
+        Ok(())
+    }
+
+    pub fn set_model_cache_dir(&mut self, cache_dir: impl AsRef<Path>) -> anyhow::Result<()> {
+        if self.io_queue.is_none() {
+            bail!("Metal I/O command queue is unavailable");
+        }
+        let dir = cache_dir.as_ref().join(GPU_MODEL_CACHE_DIR);
+        fs::create_dir_all(&dir)?;
+        trim_model_cache_dir(&dir, GPU_MODEL_CACHE_CAP)?;
+        self.model_cache_dir = Some(dir);
         Ok(())
     }
 
@@ -1446,6 +1575,89 @@ impl Renderer3D4 {
         Ok(())
     }
 
+    /// 从缓存文件把 vertex/index 两段直接 load_buffer 到 PRIVATE buffer。
+    /// 照抄 load_texture_from_cache 里的 file-to-buffer test 分支（已验证链路可用），
+    /// 目标改 PRIVATE；upload_shared 返回后立刻要画，必须 commit().wait() 同步。
+    fn load_model_buffers_from_cache(
+        &self,
+        path: &Path,
+        identity: &str,
+        vertex_buffer: &metal_rust::metal::Buffer,
+        index_buffer: &metal_rust::metal::Buffer,
+        vertex_len: usize,
+        index_len: usize,
+    ) -> anyhow::Result<()> {
+        let io_queue = self
+            .io_queue
+            .as_ref()
+            .context("Metal I/O command queue is unavailable")?;
+        let (payload_offset, vlen, ilen) = model_cache_matches(path, identity)?;
+        anyhow::ensure!(
+            vlen as usize == vertex_len && ilen as usize == index_len,
+            "model cache segment length mismatch"
+        );
+        let handle = self.device.new_io_file_handle(path, None)?;
+        let mut cmd = io_queue.command_buffer()?;
+        cmd.set_label(Some("SixNG GPU model buffer cache load"));
+        // 目标 PRIVATE buffer：绑定层不拦 storageMode（详见骨架 §5 坑 2）。
+        cmd.load_buffer(
+            vertex_buffer,
+            0,
+            vertex_len,
+            &handle,
+            usize::try_from(payload_offset)?,
+        )?;
+        cmd.load_buffer(
+            index_buffer,
+            0,
+            index_len,
+            &handle,
+            usize::try_from(payload_offset + vlen)?,
+        )?;
+        cmd.commit().wait()?;
+        Ok(())
+    }
+
+    /// 未命中时后台线程写缓存，仿 queue_texture_cache_write。
+    fn queue_model_cache_write(&self, model: &glb::Model, vertex: &[u8], index: &[u8]) {
+        let Some(dir) = self.model_cache_dir.clone() else {
+            return;
+        };
+        if MODEL_CACHE_WRITERS_ACTIVE
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |active| (active < 2).then_some(active + 1),
+            )
+            .is_err()
+        {
+            return; // 最多 2 个写线程，避免大文件拥塞
+        }
+        let entry_size = GPU_MODEL_CACHE_FIXED_HEADER as u64
+            + vertex.len() as u64
+            + index.len() as u64;
+        if entry_size > GPU_MODEL_CACHE_CAP {
+            MODEL_CACHE_WRITERS_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::Release);
+            return;
+        }
+        let identity = model_identity(model, vertex, index);
+        let cache_path = model_cache_path(&dir, &identity);
+        let entry = CacheModelBuffers {
+            path: cache_path,
+            key: identity,
+            vertex: vertex.to_vec(),
+            index: index.to_vec(),
+        };
+        std::thread::spawn(move || {
+            let _ = std::panic::catch_unwind(|| {
+                if let Ok(Some(_)) = write_model_cache_entry(&dir, &entry) {
+                    let _ = trim_model_cache_dir(&dir, GPU_MODEL_CACHE_CAP);
+                }
+            });
+            MODEL_CACHE_WRITERS_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        });
+    }
+
     fn validate_texture_cache_entry(
         &mut self,
         path: &Path,
@@ -1628,7 +1840,41 @@ impl Renderer3D4 {
         let index_buffer = self
             .device
             .new_buffer(index_bytes.len().max(4), ResourceOptions::PRIVATE)?;
-        let vertex_staging = if vertex_bytes.is_empty() {
+
+        // ---- 模型缓存命中尝试：任何失败都退回 staging，绝不阻塞渲染 ----
+        let mut loaded_from_cache = false;
+        if let Some(dir) = self.model_cache_dir.clone() {
+            let identity = model_identity(model, &vertex_bytes, &index_bytes);
+            let path = model_cache_path(&dir, &identity);
+            match self.load_model_buffers_from_cache(
+                &path,
+                &identity,
+                &vertex_buffer,
+                &index_buffer,
+                vertex_bytes.len(),
+                index_bytes.len(),
+            ) {
+                Ok(()) => {
+                    loaded_from_cache = true;
+                    // LRU touch：命中即刷新 modified，避免被裁剪
+                    if let Ok(file) = OpenOptions::new().write(true).open(&path) {
+                        let _ = file.set_modified(std::time::SystemTime::now());
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[metal-io] model cache load failed for {}: {error:#}; using staging",
+                        model.path.display()
+                    );
+                    self.validated_model_caches.remove(&path);
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+        if !loaded_from_cache {
+            self.queue_model_cache_write(model, &vertex_bytes, &index_bytes);
+        }
+        let vertex_staging = if loaded_from_cache || vertex_bytes.is_empty() {
             None
         } else {
             Some(
@@ -1636,7 +1882,7 @@ impl Renderer3D4 {
                     .new_buffer_with_bytes(vertex_bytes, ResourceOptions::SHARED)?,
             )
         };
-        let index_staging = if index_bytes.is_empty() {
+        let index_staging = if loaded_from_cache || index_bytes.is_empty() {
             None
         } else {
             Some(
