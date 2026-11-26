@@ -1653,7 +1653,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             // the hide masks below are worked out over them
             let mut look_outfit: Vec<sixng_core::pedlook::LookPart> = Vec::new();
             // the outfit's body-shape preset (its tag), used unless --body-shape is given
-            let mut look_preset: Option<String> = None;
+            let mut look_preset: Option<(Option<String>, Vec<String>)> = None;
             let mut look_parts: Vec<(u64, sixng_core::pedlook::LookPart)> = match look {
                 Some(k) => match sixng_core::pedlook::look(&ws.game, &a, &ix, &prefix) {
                     // not a listed model either: the error below names the part rule
@@ -1664,12 +1664,19 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                         None => bail!("{prefix} has {} outfits (--look 0..{})", l.outfits.len(), l.outfits.len().saturating_sub(1)),
                         Some(o) => {
                             look_outfit = o.parts.clone();
-                            look_preset = o.body_shape.clone();
+                            look_preset = Some((o.body_shape.clone(), o.body_preset_items.clone()));
                             let ps = &o.parts;
-                            let by_name = sixng_core::outfit::dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
+                            let mut by_name = sixng_core::outfit::dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
                                 let n = e.name.as_ref()?.to_ascii_lowercase();
                                 ps.iter().any(|p| !p.strands && p.drawable == n).then_some((n, e))
                             }));
+                            // the parts in a content pack (the anatomical inserts, `packparts`)
+                            let packs = sixng_core::packparts::get(&ws.game);
+                            for p in ps.iter().filter(|p| !p.strands) {
+                                if let (false, Some(e)) = (by_name.contains_key(&p.drawable), packs.by_name(&p.drawable)) {
+                                    by_name.insert(p.drawable.clone(), e);
+                                }
+                            }
                             ps.iter().filter(|p| !p.strands).filter_map(|p| Some((by_name.get(&p.drawable)?.off, p.clone()))).collect()
                         }
                     },
@@ -1697,7 +1704,9 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                                 let n = e.name.as_ref()?.to_ascii_lowercase();
                                 re.is_match(&n).then_some((n, e))
                             }));
-                            any.values().next().map(|e| e.off).ok_or_else(|| anyhow!("no part of {prefix} and no drawable in {} matches {p:?} (see --list)", a.id))?
+                            // then the content packs' ped drawables (`packparts`)
+                            let pack = || sixng_core::packparts::get(&ws.game).entries.iter().find(|e| e.name.as_deref().is_some_and(|n| re.is_match(&n.to_ascii_lowercase())));
+                            any.values().next().copied().or_else(pack).map(|e| e.off).ok_or_else(|| anyhow!("no part of {prefix} and no drawable in {} or the content packs matches {p:?} (see --list)", a.id))?
                         }
                     };
                     v.push(off);
@@ -1758,15 +1767,22 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     *off = e.off;
                 }
             }
-            let sel: Vec<&sixng_core::scan::Entry> = offs.iter().filter_map(|o| ix.entries.iter().find(|e| e.off == *o)).collect();
+            let sel: Vec<&sixng_core::scan::Entry> = offs
+                .iter()
+                .filter_map(|o| match sixng_core::packparts::is_pack_key(*o) {
+                    true => sixng_core::packparts::loaded().and_then(|t| t.entries.iter().find(|e| e.off == *o)),
+                    false => ix.entries.iter().find(|e| e.off == *o),
+                })
+                .collect();
             let glb = glb.clone().unwrap_or_else(|| PathBuf::from(format!("{prefix}.glb")));
             // without --body-shape a --look outfit is posed in its own preset
             let body_shape = match (body_shape, &look_preset) {
                 (Some(s), _) => Some(s.clone()),
-                (None, Some(tag)) => match sixng_core::bodyshape::preset_controls(&ws.game, tag) {
-                    Ok(c) => Some(c.iter().filter(|(_, v)| *v != 0.0).map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join(",")).filter(|s| !s.is_empty()),
-                    Err(e) => {
-                        eprintln!("body-shape preset {tag}: {e} (exported neutral)");
+                (None, Some((tag, items))) => match sixng_core::bodyshape::outfit_preset(&ws.game, tag.as_deref(), items) {
+                    None => None,
+                    Some(Ok(c)) => Some(c.iter().filter(|(_, v)| *v != 0.0).map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join(",")).filter(|s| !s.is_empty()),
+                    Some(Err(e)) => {
+                        eprintln!("body-shape preset {}: {e} (exported neutral)", tag.as_deref().unwrap_or("of the outfit"));
                         None
                     }
                 },
@@ -1849,7 +1865,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             for (_, p) in &look_parts {
                 // a head's face and a body item's painted skin, where stored
-                if matches!(p.slot.as_str(), "head" | "body upper" | "body lower") && !p.skins.is_empty() {
+                if (matches!(p.slot.as_str(), "head" | "body upper" | "body lower") || sixng_core::pedlook::is_skin_insert(&p.slot)) && !p.skins.is_empty() {
                     eo.part_skins.insert(p.drawable.clone(), p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect());
                 }
                 if p.colour.is_none() && p.preset_colours.iter().any(|c| c.is_some()) {

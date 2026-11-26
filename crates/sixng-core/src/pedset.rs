@@ -192,8 +192,16 @@ pub fn of(game_root: &std::path::Path, a: &crate::game::ArchiveInfo, ix: &crate:
     }
 }
 
+/// A legacy whole-character mesh: head, body and clothes in one drawable
+/// (`cs_ricky_diaz_legacypedcs_mr1_000_fullbody_ws00_full`,
+/// `legacypedworld_fr1_005_fullbody_ws00_full`).
+pub fn is_whole_body(drawable: &str) -> bool {
+    crate::pedlook::item_word(drawable).starts_with("legacyped") && drawable.split('_').any(|t| t == "fullbody")
+}
+
 /// The set of a model with no outfit data: each of its own drawables once,
-/// worn by no outfit. Not `complete`: nothing says these parts make a whole
+/// worn by no outfit. Not `complete`, unless one of them is a whole-character
+/// mesh (`is_whole_body`): otherwise nothing says these parts make a whole
 /// character. None when the model has no drawable of its own.
 pub fn own_set(model: &str, display: Option<String>, archive: &str, names: Vec<String>) -> Option<PartSet> {
     if names.is_empty() {
@@ -204,11 +212,12 @@ pub fn own_set(model: &str, display: Option<String>, archive: &str, names: Vec<S
         .map(|n| {
             let slot = crate::pedlook::slot_of(&n);
             let strands = crate::pedlook::is_strand_word(crate::pedlook::item_word(&n));
-            SetPart { kind: kind_of(&slot), slot, drawable: n, strands, found_by: "own", variants: vec![SetVariant { item: String::new(), guid: None, category: None, tint: None, colour: None, colour_tag: None, preset: None, preset_colours: vec![], hair_preset: None, tex_remap: vec![], outfits: vec![] }] }
+            SetPart { kind: if is_whole_body(&n) { "body" } else { kind_of(&slot) }, slot, drawable: n, strands, found_by: "own", variants: vec![SetVariant { item: String::new(), guid: None, category: None, tint: None, colour: None, colour_tag: None, preset: None, preset_colours: vec![], hair_preset: None, tex_remap: vec![], outfits: vec![] }] }
         })
         .collect();
     parts.sort_by(|a, b| (kind_rank(a.kind), &a.slot, &a.drawable).cmp(&(kind_rank(b.kind), &b.slot, &b.drawable)));
-    let fit = parts.iter().find(|p| p.slot == "head").and_then(|h| h.drawable.split('_').find(|t| crate::outfit::is_fit(t)).map(str::to_string));
+    let whole = parts.iter().any(|p| is_whole_body(&p.drawable));
+    let fit = parts.iter().find(|p| p.slot == "head" || is_whole_body(&p.drawable)).and_then(|h| h.drawable.split('_').find(|t| crate::outfit::is_fit(t)).map(str::to_string));
     Some(PartSet {
         model: model.to_string(),
         display,
@@ -216,9 +225,13 @@ pub fn own_set(model: &str, display: Option<String>, archive: &str, names: Vec<S
         fit,
         outfits: vec![],
         parts,
-        complete: false,
+        complete: whole,
         unresolved: 0,
-        note: Some("The outfit data does not cover this model, and its own parts are not a whole character: these are the drawables of its own, worn by no outfit.".into()),
+        note: Some(if whole {
+            "The outfit data does not cover this model. It is one legacy mesh: head, body and clothes in a single drawable.".into()
+        } else {
+            "The outfit data does not cover this model, and its own parts are not a whole character: these are the drawables of its own, worn by no outfit.".into()
+        }),
     })
 }
 
@@ -231,7 +244,7 @@ mod tests {
     }
 
     fn outfit(id: &str, parts: Vec<LookPart>, unresolved: Vec<String>) -> Outfit {
-        Outfit { id: id.into(), outfit_type: String::new(), scale: 0.0, label: id.into(), body_shape: None, parts, strand_colours: vec![], unresolved, not_shown: vec![], variations: vec![id.into()] }
+        Outfit { id: id.into(), outfit_type: String::new(), scale: 0.0, label: id.into(), body_shape: None, body_preset_items: vec![], parts, strand_colours: vec![], unresolved, not_shown: vec![], variations: vec![id.into()] }
     }
 
     #[test]
@@ -269,5 +282,16 @@ mod tests {
         assert_eq!(s.fit.as_deref(), Some("fr1"));
         assert!(s.parts.iter().all(|p| p.variants.len() == 1 && p.variants[0].outfits.is_empty()));
         assert!(own_set("cs_nobody", None, "packs", vec![]).is_none());
+    }
+
+    #[test]
+    fn a_legacy_whole_body_mesh_is_a_complete_set() {
+        assert!(is_whole_body("cs_ricky_diaz_legacypedcs_mr1_000_fullbody_ws00_full"));
+        assert!(is_whole_body("legacypedworld_fr1_005_fullbody_ws00_full"));
+        assert!(!is_whole_body("gmt_fullbody_wetsuit_u_hang_01a"));
+        assert!(!is_whole_body("cs_roxy_legacyheadcs_fr1_000_head_ws00_full"));
+        let s = own_set("cs_ricky_diaz", None, "packs", vec!["cs_ricky_diaz_legacypedcs_mr1_000_fullbody_ws00_full".to_string()]).unwrap();
+        assert!(s.complete);
+        assert_eq!((s.parts[0].kind, s.fit.as_deref()), ("body", Some("mr1")));
     }
 }

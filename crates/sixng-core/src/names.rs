@@ -12,7 +12,8 @@
 //!   (the shader list, meta field names, enum values, material names);
 //! * `shaders`: NUL-terminated identifiers in `shaders.rpf` (technique,
 //!   sampler, texture and variable names);
-//! * `derived`: the built-in list;
+//! * `derived`: the built-in lists, including the meta field and struct
+//!   names matched against the executable's parser table (`names_exe.txt`);
 //! * `audio`: from `audio.rpf` (when indexed): identifiers of its text
 //!   entries, NUL-delimited names in its metadata files (wave slot names),
 //!   and the dotted audio pack names (`Core.RadioStation.news`);
@@ -101,6 +102,12 @@ pub const DERIVED_EXACT: &[&str] = &["fMass", "fInitialDragCoeff", "fDriveBiasFr
     // One- to three-word PascalCase search, 2026-11-23
     "Tiles", "TileName", "TileNameOverrides", "TilePresets", "TilePresetNames", "TransmissionProfiles", "TransmissionProfileName", "TransmissionProfileOverrides",
     "FloatParameters", "ColorParameters", "UIntParameters", "TextureNameParameters", "garmentPreset"];
+
+/// Meta field and struct names matched against the executable's parser
+/// table (`names_exe.txt`, case-sensitive joaat; see the file's header).
+pub fn exe_names() -> impl Iterator<Item = &'static str> {
+    include_str!("names_exe.txt").lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'))
+}
 
 pub const DERIVED: &[&str] = &[
     // parameter names of the layered-material library (`matlib`): lower-case joaat, domain-vocabulary search, 2026-11-23
@@ -290,6 +297,12 @@ fn loaded() -> std::sync::Arc<Loaded> {
             }
         }
         for n in DERIVED_EXACT {
+            let v = exact.entry(joaat_exact(n)).or_default();
+            if !v.iter().any(|(x, _)| x == n) {
+                v.push((n.to_string(), "derived".into()));
+            }
+        }
+        for n in exe_names() {
             let v = exact.entry(joaat_exact(n)).or_default();
             if !v.iter().any(|(x, _)| x == n) {
                 v.push((n.to_string(), "derived".into()));
@@ -1093,6 +1106,14 @@ pub fn add_bank_names(work: &Path, archive: &str, banks: &BTreeMap<u64, u32>, st
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exe_names_parse() {
+        let v: Vec<&str> = super::exe_names().collect();
+        assert!(v.len() > 3000);
+        assert!(v.iter().all(|n| !n.contains(char::is_whitespace)));
+        assert!(v.contains(&"priorityLevel"));
+    }
+
     use super::*;
     #[test]
     fn namehash_import() {

@@ -780,6 +780,9 @@ fn map_finish_added(col0: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
 @group(1) @binding(6) var t_wear: texture_2d<f32>;
 // vehicle parts: the primer's mask (the wear mask when the model has none)
 @group(1) @binding(7) var t_primer: texture_2d<f32>;
+// vehicle parts: the game's dust and scratch mask (`dusttexture`, flags.w
+// bit 4; the wear mask when the model has none)
+@group(1) @binding(8) var t_dust: texture_2d<f32>;
 
 
 // How often the wear mask repeats across a part's UV0 (the age records'
@@ -796,6 +799,41 @@ const WEAR_TILING: f32 = 5.0;
 // 100 g^2) for the gamma byte g (0 to 1).
 fn wear_gamma(l: f32, g: f32) -> f32 {
     return pow(l, 100.0 / max(0.001, 100.0 * g * g));
+}
+
+// One window of the game's W2 weight (the first wear layer's palette
+// weight): sat((x - start) / width x 255 / divisor), start, width and the
+// divisor byte as 0 to 1. A zero width or divisor is the game's infinite
+// reciprocal: 1 above the start, else 0.
+fn w2_term(x: f32, st: f32, wd: f32, dv: f32) -> f32 {
+    let y = x - st;
+    if (y <= 0.0) { return 0.0; }
+    if (wd <= 0.0 || dv <= 0.0) { return 1.0; }
+    return clamp(y / (wd * dv), 0.0, 1.0);
+}
+
+// The first wear layer's levels summed (the game's M_R + M_G + M_B): each
+// mask channel times the vertex colour's, scaled and biased and raised to
+// the gamma, as in the shader's first layer (columns 16 + c, 34 + c, 37 + c
+// of the part's coat row `row`).
+fn wear_level_sum(m: vec3<f32>, col: vec3<f32>, row: i32) -> f32 {
+    var s = 0.0;
+    for (var c = 0; c < 3; c++) {
+        let sc = textureLoad(t_em, vec2(16 + c, row), 0).a;
+        let bi = textureLoad(t_em, vec2(34 + c, row), 0).a;
+        s += wear_gamma(clamp(col[c] * (m[c] * sc + bi), 0.0, 1.0), textureLoad(t_em, vec2(37 + c, row), 0).a);
+    }
+    return s;
+}
+
+// The game's edge window on the summed wear level (edgeStart and edgeEnd
+// of the part's edge record, columns 70 and 71): sat((x - start) / (end -
+// start)); an empty window is a step at its start.
+fn wear_edge(x: f32, row: i32) -> f32 {
+    let es = textureLoad(t_em, vec2(70, row), 0).a;
+    let d = textureLoad(t_em, vec2(71, row), 0).a - es;
+    if (d <= 0.0) { return select(0.0, 1.0, x > es); }
+    return clamp((x - es) / d, 0.0, 1.0);
 }
 
 fn wear_threshold(a: f32) -> f32 {
@@ -1694,6 +1732,11 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     // With the game's wear mask bound, the second layer shows where the
     // mask's green is above the part's threshold (`wear_threshold`), in
     // patches; the detail texture then only gives the palette column.
+    // the wear mask's UV and its screen derivatives (taken here, in uniform
+    // control flow), for the edge bump's extra samples
+    let wear_uv = i.uv0 * WEAR_TILING;
+    let wear_dx = dpdx(wear_uv);
+    let wear_dy = dpdy(wear_uv);
     var wear_amt = F.jitter.w;
     let wear_mask = (M.flags.w & 0x8000u) != 0u;
     let wear_on = M.tile.w > 1.5 || wear_mask;
@@ -1703,11 +1746,25 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     if (wear_on && wear_amt > 0.0) {
         var u = 0.5;
         var k = 0.0;
+        // the layer detail texture (lyr0diffusetex): the game reads the
+        // first wear layer's palette column from its red (the base paint's
+        // from its green) and the 4th wear channel from its blue
+        var dt = vec4(0.0);
         if (M.tile.w > 1.5) {
-            let d = textureSample(t_tile, samp, i.uv0);
-            u = clamp(d.g, 0.004, 0.996);
-            k = clamp(d.b * wear_amt * 2.0, 0.0, 1.0);
+            dt = textureSample(t_tile, samp, i.uv0);
+            u = clamp(dt.r, 0.004, 0.996);
+            k = clamp(dt.b * wear_amt * 2.0, 0.0, 1.0);
         }
+        // the first wear layer's palette weight W2 (1: its palette colour,
+        // 0: its tint) and its tint, linear (columns 65 to 67)
+        var w2 = 1.0;
+        var tint = vec3(0.0);
+        // the dust and scratch mask's added roughness (k3) and clear-coat
+        // loss (k1), and its gains per layer (base, primer, first wear
+        // layer), applied once the layers' weights are known
+        var dust_k1 = 0.0;
+        var dust_k3 = 0.0;
+        var dust_g = vec3(0.0);
         let id = floor(i.col.a * 255.0 + 0.5);
         // the primer's weight (layer B) and its roughness and metalness
         var w3 = 0.0;
@@ -1726,6 +1783,7 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
                 // windows summed (columns 16 to 24 of the part's coat row)
                 let row = 768 + i32(id);
                 var s = 0.0;
+                var ml = vec3(0.0);
                 for (var c = 0; c < 3; c++) {
                     let sc = textureLoad(t_em, vec2(16 + c, row), 0).a;
                     let st = textureLoad(t_em, vec2(19 + c, row), 0).a;
@@ -1736,9 +1794,47 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
                     // bias), raised to (1 / gamma)^2, as the game does
                     let bi = textureLoad(t_em, vec2(34 + c, row), 0).a;
                     let lv = wear_gamma(clamp(i.col[c] * (m[c] * sc + bi), 0.0, 1.0), textureLoad(t_em, vec2(37 + c, row), 0).a);
+                    ml[c] = lv;
                     s += clamp((lv - st) / wd, 0.0, 1.0);
                 }
+                // the 4th channel D4: the part's scale (column 62) times
+                // the detail texture's blue, not levelled; its window
+                // (columns 63, 64) adds to the first layer's weight
+                let d4 = textureLoad(t_em, vec2(62, row), 0).a * dt.b;
+                let d4w = max(textureLoad(t_em, vec2(64, row), 0).a, 1.0 / 255.0);
+                s += clamp((d4 - textureLoad(t_em, vec2(63, row), 0).a) / d4w, 0.0, 1.0);
                 k = clamp(s, 0.0, 1.0);
+                // W2: per channel R, G, B a window (start 50 + c, width
+                // 54 + c, divisor 58 + c) on the same levels, summed, and
+                // the larger of that and D4's window; 0 where the part has
+                // no tint and palette row (column 68)
+                var w2s = 0.0;
+                for (var c = 0; c < 3; c++) {
+                    w2s += w2_term(ml[c], textureLoad(t_em, vec2(50 + c, row), 0).a, textureLoad(t_em, vec2(54 + c, row), 0).a, textureLoad(t_em, vec2(58 + c, row), 0).a);
+                }
+                let w2d = w2_term(d4, textureLoad(t_em, vec2(53, row), 0).a, textureLoad(t_em, vec2(57, row), 0).a, textureLoad(t_em, vec2(61, row), 0).a);
+                w2 = select(0.0, max(clamp(w2s, 0.0, 1.0), w2d), textureLoad(t_em, vec2(68, row), 0).a > 0.5);
+                // The game's edge term (its part flag bit 17 is never set,
+                // so always the bump): where the levels sum above 0, the
+                // mask is sampled again one screen footprint L along each
+                // wear UV axis, the edge window of each summed level taken,
+                // and 0.01 x (edge there - edge here) / (L + 1e-4) x the
+                // edge intensity (column 69) added to the tangent-space
+                // normal: the worn patches sit lower than the paint.
+                let ei = textureLoad(t_em, vec2(69, row), 0).a;
+                if (ei > 0.0 && ml.x + ml.y + ml.z > 0.0 && tl > 0.1) {
+                    let fl = max(length(wear_dx), length(wear_dy));
+                    let mx = textureSampleGrad(t_wear, samp, wear_uv + vec2(fl, 0.0), wear_dx, wear_dy).rgb;
+                    let my = textureSampleGrad(t_wear, samp, wear_uv + vec2(0.0, fl), wear_dx, wear_dy).rgb;
+                    let e0 = wear_edge(clamp(ml.x + ml.y + ml.z, 0.0, 1.0), row);
+                    let ex = wear_edge(clamp(wear_level_sum(mx, i.col.rgb, row), 0.0, 1.0), row);
+                    let ey = wear_edge(clamp(wear_level_sum(my, i.col.rgb, row), 0.0, 1.0), row);
+                    let g = 0.01 * vec2(ex - e0, ey - e0) / (fl + 1.0e-4) * ei;
+                    let et = normalize(i.tan.xyz - n * dot(n, i.tan.xyz));
+                    let eb = cross(n, et) * select(1.0, -1.0, i.tan.w < 0.0);
+                    n = normalize(n + et * g.x + eb * g.y);
+                }
+                tint = vec3(textureLoad(t_em, vec2(65, row), 0).a, textureLoad(t_em, vec2(66, row), 0).a, textureLoad(t_em, vec2(67, row), 0).a);
                 // The game's second wear layer, the primer (columns 25 to
                 // 33): its mask (or the wear mask, column 31) per channel
                 // scaled, the first channel less the other two by the cross
@@ -1775,6 +1871,34 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
                 // first layer's are
                 p_metal = mix(textureLoad(t_em, vec2(32, row), 0).a, textureLoad(t_em, vec2(33, row), 0).a, mat_blend.x);
                 p_rough = mix(textureLoad(t_em, vec2(48, row), 0).a, textureLoad(t_em, vec2(49, row), 0).a, mat_blend.y);
+                // the clear coat worn off with the paint: each wear layer
+                // takes 10 x byte / 255 of it per unit of weight (column
+                // 72: the age record's aa7d4fbd x 25.5, truncated)
+                coat.x = max(coat.x - (k + w3) * 10.0 * textureLoad(t_em, vec2(72, row), 0).a, 0.0);
+                // The game's dust and scratch mask (columns 73 to 88): the
+                // mask at the part's tiling, its red and blue (scratches)
+                // times the red and blue curves, its green (dust) times the
+                // vertex colour's green, scaled and biased. The flag bits
+                // pick which of them take off clear coat (bits 18, 21, and
+                // the dust always: the shader tests bit 0, which is set
+                // whenever wear is on) and add roughness (bits 20, 23, 26).
+                // The game's per-vehicle contrast and offset of the mask
+                // (I[0x2c], I[0x30], I[0x4c], I[0x50]) are runtime state:
+                // 1, 1, 0, 0 here.
+                if ((M.flags.w & 16u) != 0u) {
+                    // the tiling: byte x 50 / 255 (column value x 50)
+                    let til = textureLoad(t_em, vec2(73, row), 0).a * 50.0;
+                    let dk = til / WEAR_TILING;
+                    let t = textureSampleGrad(t_dust, samp, i.uv0 * til, wear_dx * dk, wear_dy * dk).rgb;
+                    let dr = t.r * textureLoad(t_em, vec2(74, row), 0).a;
+                    let db = t.b * textureLoad(t_em, vec2(75, row), 0).a;
+                    let dg = clamp((textureLoad(t_em, vec2(78, row), 0).a * i.col.g + textureLoad(t_em, vec2(79, row), 0).a) * t.g, 0.0, 1.0);
+                    let lo = u32(textureLoad(t_em, vec2(87, row), 0).a * 255.0 + 0.5);
+                    let hi = u32(textureLoad(t_em, vec2(88, row), 0).a * 255.0 + 0.5);
+                    dust_k1 = clamp(f32((lo >> 0u) & 1u) * dr + f32((lo >> 3u) & 1u) * db + dg, 0.0, 1.0) * 10.0 * textureLoad(t_em, vec2(83, row), 0).a;
+                    dust_k3 = clamp(f32((lo >> 2u) & 1u) * dr + f32((lo >> 5u) & 1u) * db + f32((hi >> 2u) & 1u) * dg, 0.0, 1.0);
+                    dust_g = vec3(textureLoad(t_em, vec2(80, row), 0).a, textureLoad(t_em, vec2(81, row), 0).a, textureLoad(t_em, vec2(82, row), 0).a);
+                }
             } else {
                 let t = wear_threshold(wear_amt);
                 k = smoothstep(t, t + 0.08, m.g);
@@ -1783,8 +1907,14 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         let w1 = textureSampleLevel(t_em, samp, vec2(u, (id + 256.5) / RAMP_ROWS), 0.0);
         let m1 = textureSampleLevel(t_em, samp, vec2(u, (id + 0.5) / RAMP_ROWS), 0.0).a;
         let w0 = 1.0 - k - w3;
-        albedo = albedo * w0 + w1.rgb * k + p_col * w3;
+        // the game's first layer colour: its tint blended to its palette
+        // colour by W2
+        albedo = albedo * w0 + mix(tint, w1.rgb, w2) * k + p_col * w3;
         rough = clamp(rough * w0 + w1.a * k + p_rough * w3, 0.04, 1.0);
+        // the dust and scratch mask: roughness added by each layer's gain
+        // and weight, clear coat taken off the base paint
+        rough = clamp(rough + dust_k3 * dot(dust_g, vec3(w0, w3, k)), 0.04, 1.0);
+        coat.x = clamp(coat.x - dust_k1 * w0 * dust_g.x, 0.0, 1.0);
         metal = metal * w0 + m1 * k + p_metal * w3;
         pearl = pearl * w0;
     }

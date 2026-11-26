@@ -197,13 +197,14 @@ impl Style {
 /// spheres and boxes built on the CPU from the character's body bound (its
 /// ragdoll pieces on the head, neck, shoulders and chest) and hats, not
 /// stored with the groom. `Colliders::shapes` takes the body bound's round
-/// pieces (`Taper`); without a body bound, `Colliders::new` stands in with
+/// pieces (`Taper`), and `with_boxes` its boxes (`Cuboid`); without a body bound, `Colliders::new` stands in with
 /// the character's own surface points (head, body and garments). `damp` is
 /// the game's d = sat(1 - dist / falloff), dist to the nearest surface.
 pub struct Colliders {
     cell: f32,
     grid: std::collections::HashMap<(i32, i32, i32), Vec<[f32; 3]>>,
     shapes: Vec<Taper>,
+    boxes: Vec<Cuboid>,
     /// Changes with the points or shapes (cache key).
     pub id: u64,
 }
@@ -231,6 +232,24 @@ impl Taper {
     }
 }
 
+/// A box: centre, unit axes and half extents along them, model space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Cuboid {
+    pub centre: [f32; 3],
+    pub axes: [[f32; 3]; 3],
+    pub half: [f32; 3],
+}
+
+impl Cuboid {
+    /// Distance from `p` to the surface (negative inside).
+    pub fn dist(&self, p: [f32; 3]) -> f32 {
+        let d = [p[0] - self.centre[0], p[1] - self.centre[1], p[2] - self.centre[2]];
+        let q: [f32; 3] = std::array::from_fn(|i| (d[0] * self.axes[i][0] + d[1] * self.axes[i][1] + d[2] * self.axes[i][2]).abs() - self.half[i]);
+        let out = q.iter().map(|v| v.max(0.0).powi(2)).sum::<f32>().sqrt();
+        out + q[0].max(q[1]).max(q[2]).min(0.0)
+    }
+}
+
 impl Colliders {
     /// Distance at which a collider stops damping (metres).
     pub const FALLOFF: f32 = 0.03;
@@ -243,7 +262,7 @@ impl Colliders {
             grid.entry(Self::key(cell, *p)).or_default().push(*p);
             id = (id ^ (p[0].to_bits() as u64) << 1 ^ p[2].to_bits() as u64).wrapping_mul(0x100_0000_01b3);
         }
-        Colliders { cell, grid, shapes: Vec::new(), id }
+        Colliders { cell, grid, shapes: Vec::new(), boxes: Vec::new(), id }
     }
 
     /// Colliders from the body bound's round pieces.
@@ -254,7 +273,18 @@ impl Colliders {
                 id = (id ^ v.to_bits() as u64).wrapping_mul(0x100_0000_01b3);
             }
         }
-        Colliders { cell: Self::FALLOFF, grid: Default::default(), shapes, id }
+        Colliders { cell: Self::FALLOFF, grid: Default::default(), shapes, boxes: Vec::new(), id }
+    }
+
+    /// Adds the bound's boxes to the shapes.
+    pub fn with_boxes(mut self, boxes: Vec<Cuboid>) -> Colliders {
+        for b in &boxes {
+            for v in b.centre.iter().chain(b.axes.iter().flatten()).chain(&b.half) {
+                self.id = (self.id ^ v.to_bits() as u64).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        self.boxes = boxes;
+        self
     }
 
     fn key(cell: f32, p: [f32; 3]) -> (i32, i32, i32) {
@@ -264,8 +294,8 @@ impl Colliders {
     /// 0 at `FALLOFF` or more from every point (shape surface), 1 on a
     /// point (on or inside a shape).
     pub fn damp(&self, p: [f32; 3]) -> f32 {
-        if !self.shapes.is_empty() {
-            let d = self.shapes.iter().map(|t| t.dist(p)).fold(f32::MAX, f32::min);
+        if !self.shapes.is_empty() || !self.boxes.is_empty() {
+            let d = self.shapes.iter().map(|t| t.dist(p)).chain(self.boxes.iter().map(|b| b.dist(p))).fold(f32::MAX, f32::min);
             return (1.0 - d / Self::FALLOFF).clamp(0.0, 1.0);
         }
         let (x, y, z) = Self::key(self.cell, p);
@@ -1690,6 +1720,16 @@ mod tests {
         assert_eq!(c.weight([0.1, 0.0, 0.0], 1.0), 0.0);
         assert!((c.weight([0.112, 0.0, 0.0], 1.0) - 1.0 / 3.0).abs() < 1e-6);
         assert_eq!(c.weight([0.2, 0.0, 0.0], 0.7), 0.7);
+        // a box turned 90 degrees about z: half extents 0.1 along +y, 0.2 along -x, 0.3 along z
+        let b = Cuboid { centre: [1.0, 0.0, 0.0], axes: [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], half: [0.1, 0.2, 0.3] };
+        assert!((b.dist([1.0, 0.15, 0.0]) - 0.05).abs() < 1e-6);
+        assert!((b.dist([1.25, 0.0, 0.0]) - 0.05).abs() < 1e-6);
+        assert!((b.dist([1.0, 0.0, 0.0]) + 0.1).abs() < 1e-6);
+        // past a corner: the distance to the corner
+        assert!((b.dist([1.23, 0.14, 0.0]) - 0.05).abs() < 1e-6);
+        let c = Colliders::shapes(vec![t]).with_boxes(vec![b]);
+        assert_eq!(c.weight([1.0, 0.1, 0.0], 1.0), 0.0);
+        assert_eq!(c.weight([0.112, 0.0, 0.0], 1.0), Colliders::shapes(vec![t]).weight([0.112, 0.0, 0.0], 1.0));
     }
 
     #[test]

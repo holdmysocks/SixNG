@@ -654,12 +654,13 @@ pub fn body_from(controls: &[(String, f32)]) -> BodyShape {
     s
 }
 
-/// The game's shape for an outfit's body-shape preset tag (neutral when the
-/// outfit has none; `None` when the preset cannot be read).
-fn preset_shape(game: &Path, tag: Option<&str>) -> Option<BodyShape> {
-    match tag {
+/// The game's shape for an outfit's body-shape preset (its preset items, or
+/// its profile word; neutral when the outfit has none; `None` when the
+/// preset cannot be read).
+fn preset_shape(game: &Path, tag: Option<&str>, items: &[String]) -> Option<BodyShape> {
+    match sixng_core::bodyshape::outfit_preset(game, tag, items) {
         None => Some(NEUTRAL_BODY),
-        Some(t) => sixng_core::bodyshape::preset_controls(game, t).ok().map(|c| body_from(&c)),
+        Some(r) => r.ok().map(|c| body_from(&c)),
     }
 }
 /// Last head exported for the viewer: (variant, variant count, source).
@@ -2114,7 +2115,7 @@ impl ModelView {
             }
         });
         if let Some(p) = &look.body_shape {
-            let how = if look.body_preset.is_some() { "the sliders open in its values" } else { "not a profile of the body-type XML in common.rpf (or common.rpf is not indexed); the sliders open neutral" };
+            let how = if look.body_preset.is_some() { "the sliders open in its values" } else { "its values could not be read (anim.rpf and common.rpf need to be indexed); the sliders open neutral" };
             ui.label(egui::RichText::new(format!("Body-shape preset of this outfit: {p} ({how}).")).weak().small());
         }
         if shape != before {
@@ -3245,6 +3246,9 @@ impl ModelView {
                     // rows 256..: the surface's second layer (colour, alpha =
                     // roughness); its metalness is the alpha of rows 0..256
                     let wear = pc["wear"][idx].as_str().filter(|w| w.len() == 2048);
+                    // each part id's second-layer colour (sRGB), which the
+                    // game's shader uses as the first wear layer's tint
+                    let wear_tint = pc["wear_tint"][idx].as_str().filter(|w| w.len() == 256 * 6);
                     // rows 512..: the low and high of the first layer's
                     // metalness and roughness, which the shader blends by the
                     // material map at each pixel
@@ -3291,6 +3295,31 @@ impl ModelView {
                         // window (primerGradientStart, width)
                         px[(768 + id) * 512 + 46 * 4 + 3] = pw.primer_gradient_start;
                         px[(768 + id) * 512 + 47 * 4 + 3] = pw.primer_gradient_width;
+                        // columns 50 to 64: W2's window starts, widths and
+                        // divisors per channel R, G, B, D4, then the 4th
+                        // channel's scale and its window in the first layer;
+                        // 65 to 67: the first layer's tint (linear, from
+                        // the second layer's colour record), 68: 255 when
+                        // the part has that tint and a palette row (else
+                        // W2 is 0)
+                        let tint = wear_tint.and_then(|t| hex3(&t[id * 6..id * 6 + 6]));
+                        let lin = |v: u8| {
+                            let c = v as f32 / 255.0;
+                            ((if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }) * 255.0 + 0.5) as u8
+                        };
+                        let has_row = wear.and_then(|w| usize::from_str_radix(&w[id * 8..id * 8 + 4], 16).ok()).is_some_and(|r| r != 0xffff);
+                        let t = tint.unwrap_or([0; 3]);
+                        // 69 to 72: the edge record's intensity, start and
+                        // end, and the clear-coat loss byte
+                        let extra = pw.w2_start.iter().chain(&pw.w2_width).chain(&pw.w2_div).copied().chain([pw.d4_scale, pw.d4_start, pw.d4_width, lin(t[0]), lin(t[1]), lin(t[2]), if tint.is_some() && has_row { 255 } else { 0 }, pw.edge_intensity, pw.edge_start, pw.edge_end, pw.coat_loss]);
+                        for (c, v) in extra.enumerate() {
+                            px[(768 + id) * 512 + (50 + c) * 4 + 3] = v;
+                        }
+                        // columns 73 to 88: the dust and scratch mask's
+                        // bytes (PartWear::dust)
+                        for (c, v) in pw.dust.iter().enumerate() {
+                            px[(768 + id) * 512 + (73 + c) * 4 + 3] = *v;
+                        }
                         let set = primer_set(primer_sets.as_ref().map_or(1, |m| m[id]), self.look.primer_set);
                         let prow = primer_rows.and_then(|s| usize::from_str_radix(&s[id * 12 + set * 4..id * 12 + set * 4 + 4], 16).ok()).filter(|r| *r != 0xffff);
                         let out3 = &mut px[(1025 + id) * 512..(1026 + id) * 512];
@@ -5237,19 +5266,26 @@ fn split_parts(q: &str) -> (&str, Option<Vec<u64>>) {
 /// placed on the model's bind pose, in RAGE model space (Z-up). The joints
 /// are the game's bone frames turned to Y-up (C M C^T), so the game frame
 /// is C^T W C.
-fn body_tapers(a: &sixng_core::game::ArchiveInfo, entries: &[sixng_core::scan::Entry], name: &str, joints: &[glb::Joint]) -> Vec<sixng_core::groom::Taper> {
-    let Some(e) = entries.iter().find(|e| e.rtype.as_deref() == Some("ft") && e.name.as_deref() == Some(name)) else { return Vec::new() };
-    let Ok(r) = sixng_core::resource::Resource::load(&a.path, e) else { return Vec::new() };
+fn body_tapers(a: &sixng_core::game::ArchiveInfo, entries: &[sixng_core::scan::Entry], name: &str, joints: &[glb::Joint]) -> (Vec<sixng_core::groom::Taper>, Vec<sixng_core::groom::Cuboid>) {
+    let Some(e) = entries.iter().find(|e| e.rtype.as_deref() == Some("ft") && e.name.as_deref() == Some(name)) else { return Default::default() };
+    let Ok(r) = sixng_core::resource::Resource::load(&a.path, e) else { return Default::default() };
     let c = Mat4::from_cols_array(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
     let bone: HashMap<u32, Mat4> = joints.iter().map(|j| (sixng_core::meta7a::joaat(&j.name), c.transpose() * Mat4::from_cols_array(&j.ibm).inverse() * c)).collect();
-    sixng_core::fragphys::body_pieces(&r)
-        .into_iter()
-        .filter_map(|p| {
-            let m = *bone.get(&p.bone_hash)? * Mat4::from_cols_array(&p.local);
+    let (mut tapers, mut boxes) = (Vec::new(), Vec::new());
+    for p in sixng_core::fragphys::body_pieces(&r) {
+        let Some(b) = bone.get(&p.bone_hash) else { continue };
+        let m = *b * Mat4::from_cols_array(&p.local);
+        if p.kind == 3 {
+            let [lo, hi] = p.bbox.map(Vec3::from);
+            let axes = [m.x_axis, m.y_axis, m.z_axis].map(|v| v.truncate());
+            let half: [f32; 3] = std::array::from_fn(|i| (hi[i] - lo[i]) / 2.0 * axes[i].length());
+            boxes.push(sixng_core::groom::Cuboid { centre: m.transform_point3((lo + hi) / 2.0).into(), axes: axes.map(|v| v.normalize_or_zero().into()), half });
+        } else {
             let h = p.length / 2.0;
-            Some(sixng_core::groom::Taper { a: m.transform_point3(Vec3::new(0.0, h, 0.0)).into(), b: m.transform_point3(Vec3::new(0.0, -h, 0.0)).into(), ra: p.r_pos, rb: p.r_neg })
-        })
-        .collect()
+            tapers.push(sixng_core::groom::Taper { a: m.transform_point3(Vec3::new(0.0, h, 0.0)).into(), b: m.transform_point3(Vec3::new(0.0, -h, 0.0)).into(), ra: p.r_pos, rb: p.r_neg });
+        }
+    }
+    (tapers, boxes)
 }
 
 fn load_parts(
@@ -5288,6 +5324,9 @@ fn load_parts(
     let mut named_parts: Vec<(std::ops::Range<usize>, Vec<(String, Option<usize>)>)> = Vec::new();
     // per garment: its meshes and how far out it is worn (`levels`)
     let mut layered: Vec<(std::ops::Range<usize>, u8)> = Vec::new();
+    // per merged mesh of a garment: its vertex positions before it followed
+    // the shaped skin (`keep_layer_order`)
+    let mut unshaped: HashMap<usize, Vec<[f32; 3]>> = HashMap::new();
     let levels = garment_levels(parts.iter().map(|e| e.off), fx);
     // Body shape: the skin and head are posed by the game's rig; clothes
     // and accessories follow the skin under them (`Wrap`).
@@ -5326,10 +5365,12 @@ fn load_parts(
                     first = lods;
                 }
                 let mut attached = None;
+                let mut pre: Option<Vec<Vec<[f32; 3]>>> = None;
                 if let Some(f) = f {
                     if !f.skeletal {
                         attached = place_attached(&mut m);
                         if let Some(w) = &wrap {
+                            pre = Some(m.meshes.iter().map(|me| me.verts.iter().map(|v| v.pos).collect()).collect());
                             w.apply(&mut m);
                         }
                     }
@@ -5390,6 +5431,9 @@ fn load_parts(
                 }
                 if let Some(&l) = levels.get(&e.off) {
                     layered.push((mesh0..mesh0 + m.meshes.len(), l));
+                    for (i, v) in pre.take().into_iter().flatten().enumerate() {
+                        unshaped.insert(mesh0 + i, v);
+                    }
                 }
                 if f.is_some_and(|f| f.heel) {
                     heel_meshes.push(mesh0..mesh0 + m.meshes.len());
@@ -5436,6 +5480,22 @@ fn load_parts(
     // lists per layer the regions it hides. A triangle goes when all its
     // vertices are in hidden regions. Skin meshes without regions fall back
     // to hiding what lies right under a garment.
+    // Body shape: each garment follows the skin on its own, so on a heavy or
+    // muscled body a garment worn under another can come out in front of it
+    // (a t-shirt through an open shirt's pocket). Put it back behind.
+    if let (Some(m), false) = (&mut model, unshaped.is_empty()) {
+        let mut ls: Vec<u8> = layered.iter().map(|x| x.1).collect();
+        ls.sort();
+        ls.dedup();
+        let mut moved = 0;
+        for &l in ls.iter().rev().skip(1) {
+            let pick = |f: &dyn Fn(u8) -> bool| layered.iter().filter(|x| f(x.1)).map(|x| x.0.clone()).collect::<Vec<_>>();
+            moved += keep_layer_order(m, &pick(&|x| x == l), &pick(&|x| x > l), &unshaped);
+        }
+        if moved > 0 {
+            notes.push(format!("Body shape and layers: {moved} vertices of clothes worn under other clothes are kept behind the clothes over them, as far behind as on the neutral body."));
+        }
+    }
     let mut by_distance: Vec<std::ops::Range<usize>> = skin_meshes.clone();
     if let Some(m) = &mut model {
         let (mut skin_hidden, mut cloth_hidden) = (0, 0);
@@ -5582,6 +5642,53 @@ const LEVEL_WEAR: [f32; 6] = [15.0, 150.0, 197.0, 211.0, 239.0, 239.0];
 /// window on the scaled mask (`rustStart` / `rustEnd`, `B`, `C`).
 const WEAR_CONTROL: [[u32; 3]; 3] = [[0x262c_839d, 0xb18a_6db5, 0x1b6a_3e09], [0x9b82_6e47, 0x1e68_8003, 0x1c58_826f], [0xb770_a627, 0xf97f_84c3, 0x4d46_aee9]];
 const WEAR_WINDOW: [[u32; 2]; 3] = [[0x8f02_219f, 0x7a2d_3f04], [0x9d7c_73e7, 0x1170_352b], [0x39ab_ac47, 0x9970_c52a]];
+/// The wear preset bytes of the first wear layer's palette weight W2 (the
+/// game's shader blends the layer's tint into its palette colour by it):
+/// per channel R, G, B and the 4th channel D4 the window start and end
+/// (preset +0x38/39, +0x3c/3d, +0x40/41, +0x4f/50), their activation start
+/// and end on the wear amount (+0x46/47, +0x48/49, +0x4a/4b, +0x51/52) and
+/// the divisor byte (+0x4c, +0x4d, +0x4e, +0x53; the shader multiplies each
+/// window by 255 / byte). Packer at rva 0x37766a0 (part record +80, +84,
+/// +88).
+const W2_WINDOW: [[u32; 2]; 4] = [[0x951a_7677, 0xb588_96f4], [0x87df_7517, 0x7c99_9233], [0x4549_efed, 0x8c27_314e], [0xbe3b_1bd2, 0x0ee0_92f0]];
+const W2_ACTIVATION: [[u32; 2]; 4] = [[0x8482_c039, 0x4cac_ba9c], [0x851c_6b0b, 0xac8e_3a46], [0x91c6_845f, 0x9ae0_16ea], [0x80c7_dae3, 0x356e_05be]];
+const W2_DIVISOR: [u32; 4] = [0xfcf8_c89c, 0xeeee_2c87, 0xd948_013b, 0xa21f_3ea9];
+/// The 4th wear channel D4: the preset byte that scales it (f86ce666,
+/// +0x21; the game packs f16(v0 x byte / 255) at part record +52 and the
+/// shader multiplies it by the layer detail texture's blue), and its window
+/// in the first layer's weight (eb7223d6, d54c040a, +0x22 / +0x23; record
+/// +64 bytes 2 and 3).
+const D4_SCALE: u32 = 0xf86c_e666;
+/// The wear preset's link to its edge record (`487f0f4c`: edgeIntensity,
+/// edgeStart, edgeEnd), which the game packs into part record +40 (rva
+/// 0x1a0d7a0: f16 of the intensity, start and end x 255 truncated).
+const PRESET_EDGE: u32 = 0x7f1f_e0a2;
+/// The age record's clear-coat loss (aa7d4fbd, +0xf0): the game packs
+/// trunc(25.5 x value) into part record +56 byte 3, and its shader takes
+/// 10 x byte / 255 of the clear coat per unit of each wear layer's weight.
+const AGE_COAT_LOSS: u32 = 0xaa7d_4fbd;
+/// The age record's curves (`fe5d32e7`) the game packs for the dust and
+/// scratch mask (rva 0x37766a0; age floats at +k .. +k+16): per curve its
+/// min, max, start, end and exponent. The value at wear amount v0 is
+/// lerp(min, max, sat((v0^exp - start) / max(1e-5, end - start))).
+/// sunBleach (+0x30), baseBleach (+0x58), +0x44, +0x6c, redScratch (+0x8c),
+/// blueScratch (+0xa4), +0xc8, +0xdc.
+const AGE_CURVES: [[&str; 5]; 8] = [
+    ["c8482ad4", "e50025b1", "sunBleachStart", "sunBleachEnd", "3ef91ac2"],
+    ["baseBleachMin", "baseBleachMax", "baseBleachStart", "baseBleachEnd", "63ab1a06"],
+    ["db62bdc3", "a53b57b9", "6a4efd46", "ded82b1b", "a1a33c04"],
+    ["90294599", "38c12016", "cec65eaa", "16356415", "e921e50c"],
+    ["1da6a331", "5b934fe3", "redScratchStart", "redScratchEnd", "d1f62b9a"],
+    ["a1e80b6a", "46123d7b", "blueScratchStart", "blueScratchEnd", "79d86748"],
+    ["0c9cba21", "8c08b137", "1978a268", "1dce80e3", "aac54cc0"],
+    ["5ccb8f95", "7a78f02e", "8ed733ec", "90baf5cf", "8243d8af"],
+];
+/// The age record's bools the game packs as part flag bits 18 to 23 and
+/// 24 to 26 (age +0xbf..+0xc4, +0xbc..+0xbe): which mask channel (red,
+/// blue, the dust green) drives the clear-coat loss, a third G-buffer value
+/// and the added roughness.
+const AGE_DUST_BITS: [&str; 9] = ["6d9d81b3", "f4c2b82b", "32e128c3", "0e6ac3da", "6a2b9ab4", "11379ec6", "3ca53c6d", "2d6ae1aa", "a06d3fe0"];
+const D4_WINDOW: [u32; 2] = [0xeb72_23d6, 0xd54c_040a];
 /// The age record's wear amount range (`fe5d32e7` +0x0c, +0x10): the game
 /// takes a per-vehicle value between them.
 const AGE_WEAR: [u32; 2] = [0x4e71_efc8, 0xb5fc_dec9];
@@ -5649,6 +5756,27 @@ struct PartWear {
     /// column (`primerGradientStart`, `primerGradientEnd` - start)
     primer_gradient_start: u8,
     primer_gradient_width: u8,
+    /// the 4th channel's scale (0 to 255 for 0 to 1) and its window in the
+    /// first layer's weight
+    d4_scale: u8,
+    d4_start: u8,
+    d4_width: u8,
+    /// W2's window start and width and divisor byte per channel R, G, B, D4
+    w2_start: [u8; 4],
+    w2_width: [u8; 4],
+    w2_div: [u8; 4],
+    /// the edge record's intensity (0 to 255 for 0 to 1), start and end
+    edge_intensity: u8,
+    edge_start: u8,
+    edge_end: u8,
+    /// the clear coat lost per unit of wear weight, x 10 / 255
+    coat_loss: u8,
+    /// the dust and scratch mask, as the game packs it: part record +92
+    /// bytes 3, 1, 2 (tiling x 255 / 50, red and blue intensities), +0
+    /// bytes 0, 1, +4 bytes 0, 1 (dust scale and bias), +56 bytes 0 to 2
+    /// (gains per layer: base, primer, first), +60 bytes 0 to 3, and the
+    /// flag bits 18 to 23 and 24 to 26
+    dust: [u8; 16],
 }
 
 /// Each part id's wear under a configuration, from model.json
@@ -5736,6 +5864,70 @@ fn part_wear(w: &serde_json::Value, look: usize, config: Option<&str>) -> Option
             o.start[c] = trunc(ws);
             o.width[c] = trunc((we - ws).max(1.0e-4));
         }
+        // the 4th channel: its scale (the game's f16 of v0 x byte, here a
+        // byte) and its window, packed like the rust windows
+        o.d4_scale = (v0 * b(D4_SCALE) * 255.0 + 0.5) as u8;
+        let [ds, de] = D4_WINDOW.map(b);
+        (o.d4_start, o.d4_width) = (trunc(ds), trunc((de - ds).max(1.0e-4)));
+        // W2 (rva 0x37766a0, part record +80, +84): per channel the
+        // activation a = sat((v0 - start) / max(1e-4, end - start)), then
+        // the window start a x s and width a x e - a x s (one fused
+        // multiply-subtract, no floor), each x 255 truncated to its low byte
+        for c in 0..4 {
+            let [s, e] = W2_ACTIVATION[c].map(b);
+            let a = ((v0 - s) / (e - s).max(1.0e-4)).clamp(0.0, 1.0);
+            let [ws, we] = W2_WINDOW[c].map(b);
+            let lo = a * ws;
+            o.w2_start[c] = wrap(lo);
+            o.w2_width[c] = wrap(a.mul_add(we, -lo));
+            o.w2_div[c] = field(p, W2_DIVISOR[c]).unwrap_or(0.0) as u8;
+        }
+        // the edge record (none in the export: no edge term)
+        if let Some(e) = p[sixng_core::meta7a::field_name(PRESET_EDGE)].as_str().map(|k| &w["edges"][k]).filter(|e| e.is_object()) {
+            let f = |k: &str| e[k].as_f64().unwrap_or(0.0) as f32;
+            o.edge_intensity = (f("edgeIntensity").clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            o.edge_start = wrap(f("edgeStart"));
+            o.edge_end = wrap(f("edgeEnd"));
+        }
+        let loss = age.map(|a| &w["ages"][a]).and_then(|r| field(r, AGE_COAT_LOSS)).unwrap_or(0.0) as f32;
+        o.coat_loss = (loss * 25.5) as i32 as u8;
+        // the dust and scratch mask, from the age record (none for an age
+        // range record): the game's packing of part record +0, +4, +56,
+        // +60, +92 and the flag bits
+        if let Some(r) = age.map(|a| &w["ages"][a]).filter(|r| r.is_object()) {
+            let af = |k: &str| r[k].as_f64().unwrap_or(0.0) as f32;
+            let crv = |k: usize| {
+                let [lo, hi, s, e, x] = AGE_CURVES[k].map(af);
+                lo + (hi - lo) * ((v0.powf(x) - s) / (e - s).max(1.0e-5)).clamp(0.0, 1.0)
+            };
+            let bb = |x: f32| (x * 255.0) as i32 as u8;
+            let tenth = |x: f32| (x * 25.5) as i32 as u8;
+            let signed = |x: f32| (127.5 + 127.5 * x) as i32 as u8;
+            // the tiling: the middle of minTiling .. maxTiling (the game
+            // picks a per-vehicle point), x 5.1 truncated
+            let tiling = ((af("minTiling") + af("maxTiling")) * 0.5 * 5.1) as i32 as u8;
+            let bit = |k: &str, b: u32| if r[k].as_bool() == Some(true) { 1u8 << b } else { 0 };
+            let lo_bits = (0..6).fold(0, |m, i| m | bit(AGE_DUST_BITS[i], i as u32));
+            let hi_bits = (0..3).fold(0, |m, i| m | bit(AGE_DUST_BITS[6 + i], i as u32));
+            o.dust = [
+                tiling,
+                bb(crv(4)),
+                bb(crv(5)),
+                bb(crv(0)),
+                bb(crv(1)),
+                bb(crv(2)),
+                bb(crv(3)),
+                bb(af("91b26647")),
+                bb(af("cf9f9929")),
+                bb(af("inclineComponentsScale")),
+                tenth(crv(6)),
+                signed(crv(4) * af("193c7eb1")),
+                tenth(crv(7)),
+                signed(crv(5) * af("2c04933e")),
+                lo_bits,
+                hi_bits,
+            ];
+        }
     }
     Some(out)
 }
@@ -5770,6 +5962,15 @@ fn primer_surface(global: &serde_json::Value) -> [u8; 4] {
 }
 
 /// Four bytes from 8 hex digits.
+/// Three bytes from 6 hex digits.
+fn hex3(h: &str) -> Option<[u8; 3]> {
+    let b = h.as_bytes();
+    if b.len() != 6 || !b.iter().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(std::array::from_fn(|k| u8::from_str_radix(&h[k * 2..k * 2 + 2], 16).unwrap_or(0)))
+}
+
 fn hex4(h: &str) -> Option<[u8; 4]> {
     let b = h.as_bytes();
     if b.len() != 8 || !b.iter().all(|c| c.is_ascii_hexdigit()) {
@@ -6419,6 +6620,85 @@ fn garment_levels(shown: impl Iterator<Item = u64>, fx: &HashMap<u64, PartFx>) -
     level
 }
 
+/// Keeps the `inner` meshes behind the `outer` ones after both followed the
+/// shaped skin. An inner vertex that lay behind an outer garment's surface on
+/// the neutral body (an outer vertex within 6 cm, at most 2 cm to the side
+/// along that vertex's normal, turned to face the way the inner vertex does)
+/// is put back as far behind it; with several outer surfaces there (a
+/// jacket's shell over its pocket bag), the one that asks most; the nearest
+/// outer vertex counts however far to the side it is. Vertices only
+/// move inward. `unshaped` holds each mesh's positions before shaping.
+/// Returns how many vertices moved.
+fn keep_layer_order(m: &mut glb::Model, inner: &[std::ops::Range<usize>], outer: &[std::ops::Range<usize>], unshaped: &HashMap<usize, Vec<[f32; 3]>>) -> usize {
+    use glam::Vec3;
+    const REACH: f32 = 0.06;
+    const SIDE: f32 = 0.02;
+    let key = |p: Vec3| ((p.x / REACH).floor() as i32, (p.y / REACH).floor() as i32, (p.z / REACH).floor() as i32);
+    // outer vertices: neutral position, shaped position, normal
+    let mut grid: HashMap<(i32, i32, i32), Vec<(Vec3, Vec3, Vec3)>> = HashMap::new();
+    for i in outer.iter().cloned().flatten() {
+        let (Some(me), Some(pre)) = (m.meshes.get(i), unshaped.get(&i)) else { continue };
+        for (v, q) in me.verts.iter().zip(pre) {
+            let n = Vec3::from(v.nrm);
+            if (n.length() - 1.0).abs() < 0.1 {
+                grid.entry(key(Vec3::from(*q))).or_default().push((Vec3::from(*q), Vec3::from(v.pos), n));
+            }
+        }
+    }
+    if grid.is_empty() {
+        return 0;
+    }
+    let mut moved = 0;
+    for i in inner.iter().cloned().flatten() {
+        let (Some(me), Some(pre)) = (m.meshes.get_mut(i), unshaped.get(&i)) else { continue };
+        for (v, p) in me.verts.iter_mut().zip(pre) {
+            let (p, p2, vn) = (Vec3::from(*p), Vec3::from(v.pos), Vec3::from(v.nrm));
+            let k = key(p);
+            let mut push: Option<(f32, Vec3)> = None;
+            let mut nearest: Option<(f32, (Vec3, Vec3, Vec3))> = None;
+            // a two-sided garment's inner face points at the body: take the
+            // side facing the way the inner garment does (outward). Returns
+            // how far the vertex is to move back behind that surface.
+            let need = |(q, q2, n): (Vec3, Vec3, Vec3), side: f32| -> Option<(f32, Vec3)> {
+                let n = if n.dot(vn) < 0.0 { -n } else { n };
+                let d = p - q;
+                let s = d.dot(n);
+                if s >= 0.0 || (d - n * s).length() > side {
+                    return None;
+                }
+                Some(((p2 - q2).dot(n) - s, n)).filter(|x| x.0 > 0.0)
+            };
+            for x in -1..=1 {
+                for y in -1..=1 {
+                    for z in -1..=1 {
+                        for &o in grid.get(&(k.0 + x, k.1 + y, k.2 + z)).into_iter().flatten() {
+                            let d2 = (p - o.0).length_squared();
+                            if d2 >= REACH * REACH {
+                                continue;
+                            }
+                            if nearest.is_none_or(|b| d2 < b.0) {
+                                nearest = Some((d2, o));
+                            }
+                            if let Some(w) = need(o, SIDE).filter(|w| push.is_none_or(|b| w.0 > b.0)) {
+                                push = Some(w);
+                            }
+                        }
+                    }
+                }
+            }
+            // the nearest outer vertex counts however far to the side it is
+            if let Some(w) = nearest.and_then(|(_, o)| need(o, f32::MAX)).filter(|w| push.is_none_or(|b| w.0 > b.0)) {
+                push = Some(w);
+            }
+            if let Some((need, n)) = push {
+                v.pos = (p2 - n * need).to_array();
+                moved += 1;
+            }
+        }
+    }
+    moved
+}
+
 /// Hide the skin triangles that lie right under a garment: a skin vertex is
 /// covered when a point of a garment surface is within 9 mm of the line
 /// through the vertex along its normal, between `inside` (15 mm for skin;
@@ -6923,7 +7203,11 @@ fn pick<'a>(
     };
     let parts = chosen
         .iter()
-        .filter_map(|off| ix.entries.iter().find(|e| e.off == *off))
+        .filter_map(|off| match sixng_core::packparts::is_pack_key(*off) {
+            // a content-pack part (see `packparts`)
+            true => sixng_core::packparts::loaded().and_then(|t| t.entries.iter().find(|e| e.off == *off)),
+            false => ix.entries.iter().find(|e| e.off == *off),
+        })
         .collect();
     (chosen, parts)
 }
@@ -7015,6 +7299,18 @@ fn load_query_sel(
                             swap.values().any(|t| *t == n).then_some((n, e))
                         })));
                     }
+                    // the parts that are in a content pack (the anatomical inserts): their entries carry a
+                    // part key (`packparts::KEY_BIT`) and are loaded from their own archive
+                    let packs = sixng_core::packparts::get(&ws.game);
+                    for o in &look.outfits {
+                        for p in &o.parts {
+                            if !b.contains_key(&p.drawable) {
+                                if let Some(e) = packs.by_name(&p.drawable) {
+                                    b.insert(p.drawable.clone(), e);
+                                }
+                            }
+                        }
+                    }
                     b
                 };
                 opts.iter_mut().for_each(|o| o.default = false);
@@ -7050,7 +7346,8 @@ fn load_query_sel(
                             None => opts.push(crate::assemble::PartOpt { off: e.off, id: e.id.clone(), name: drawable.clone(), group: p.slot.clone(), label: drawable.trim_start_matches(&format!("{prefix}_")).to_string(), default: oi == k }),
                         }
                         if oi == k {
-                            let body = p.slot == "body upper" || p.slot == "body lower";
+                            // the anatomical inserts are skin too: the body's skin tone, under the clothes
+                            let body = p.slot == "body upper" || p.slot == "body lower" || sixng_core::pedlook::is_skin_insert(&p.slot);
                             if let Some(how) = p.skin_from.filter(|_| body) {
                                 let why = match how {
                                     "paired" => "the one other characters wear with this outfit's other body skin",
@@ -7164,10 +7461,15 @@ fn load_query_sel(
                     }
                 }
                 let o = &look.outfits[k];
-                info.body_shape = o.body_shape.clone();
+                info.body_shape = match (&o.body_shape, o.body_preset_items.len()) {
+                    (Some(w), 0) => Some(w.clone()),
+                    (Some(w), n) => Some(format!("{w}, {n} preset item(s) from anim.rpf")),
+                    (None, 0) => None,
+                    (None, n) => Some(format!("{n} preset item(s) from anim.rpf")),
+                };
                 // the outfit's own body shape, when it is opened (a reload of
                 // the same outfit keeps the sliders; `--body` keeps its shape)
-                info.body_preset = preset_shape(&ws.game, o.body_shape.as_deref());
+                info.body_preset = preset_shape(&ws.game, o.body_shape.as_deref(), &o.body_preset_items);
                 let key = format!("{archive}#outfit:{prefix}#look={k}");
                 let mut last = BODY_PRESET_FOR.lock().unwrap();
                 if *last != key {
@@ -7241,26 +7543,30 @@ fn load_query_sel(
             if !l.hair.is_empty() {
                 let rig = |k: &str| parts.iter().any(|p| p.name.as_deref().is_some_and(|n| n.contains(k)));
                 let bound = if rig("_fr1_") { Some(("defaultfemale_fr1_000_bounds", "female")) } else if rig("_mr1_") { Some(("defaultmale_mr1_000_bounds", "male")) } else { None };
-                let mut shapes = bound.map(|(b, _)| body_tapers(&a, &ix.entries, b, &model.joints)).unwrap_or_default();
+                let (mut shapes, mut boxes) = bound.map(|(b, _)| body_tapers(&a, &ix.entries, b, &model.joints)).unwrap_or_default();
                 // A garment's own bound is named after its drawable:
                 // `char_bipedbounds_<sex>_<drawable>`. Its pieces are added
                 // to the body's (they enclose it where the garment is).
                 let mut worn = 0;
                 if let (Some((_, sex)), false) = (bound, shapes.is_empty()) {
                     for n in parts.iter().filter_map(|p| p.name.as_deref()) {
-                        let t = body_tapers(&a, &ix.entries, &format!("char_bipedbounds_{sex}_{}", n.to_ascii_lowercase()), &model.joints);
-                        worn += usize::from(!t.is_empty());
+                        let (t, bx) = body_tapers(&a, &ix.entries, &format!("char_bipedbounds_{sex}_{}", n.to_ascii_lowercase()), &model.joints);
+                        worn += usize::from(!t.is_empty() || !bx.is_empty());
                         shapes.extend(t);
+                        boxes.extend(bx);
                     }
                 }
                 if std::env::var("SIXNG_DEBUG_HAIR").is_ok() {
                     for t in &shapes {
                         eprintln!("body piece {:?} {:?} r {:.3} {:.3}", t.a, t.b, t.ra, t.rb);
                     }
+                    for b in &boxes {
+                        eprintln!("body box {:?} half {:.3?}", b.centre, b.half);
+                    }
                 }
                 if !shapes.is_empty() {
-                    l.notes.push(format!("Hair styling is damped near the {} pieces of the body bound ({}) and of {worn} garment bounds, as the game does. A garment's bound is found by its name (`char_bipedbounds_<sex>_<garment>`); that the game damps hair against it is inferred, and the 3 cm falloff is a guess.", shapes.len(), bound.map(|b| b.0).unwrap_or_default()));
-                    l.collide = Some(Arc::new(sixng_core::groom::Colliders::shapes(shapes)));
+                    l.notes.push(format!("Hair styling is damped near the {} round pieces and {} boxes of the body bound ({}) and of {worn} garment bounds, as the game does. A garment's bound is found by its name (`char_bipedbounds_<sex>_<garment>`); that the game damps hair against it is inferred, and the 3 cm falloff is a guess.", shapes.len(), boxes.len(), bound.map(|b| b.0).unwrap_or_default()));
+                    l.collide = Some(Arc::new(sixng_core::groom::Colliders::shapes(shapes).with_boxes(boxes)));
                 } else {
                     let hairy = ["hair", "brows", "beard", "lashes", "body hair", "eyes", "eyecaps", "teeth", "teeth accessory"];
                     let pts: Vec<[f32; 3]> = skin.iter().filter(|(n, _)| !l.hats.contains(&n.to_ascii_lowercase()) && !hairy.contains(&sixng_core::pedlook::slot_of(&n.to_ascii_lowercase()).as_str())).flat_map(|(_, p)| p.iter().copied()).collect();
@@ -8869,6 +9175,8 @@ fn export_load_shaped(
     skins: &[(u64, u64)],
     shape: BodyShape,
 ) -> anyhow::Result<(glb::Model, Vec<PathBuf>, serde_json::Value)> {
+    // a content-pack part of an outfit is read from its own archive
+    let a = &*sixng_core::packparts::archive_of(a, e);
     let shaped = shape != NEUTRAL_BODY;
     let shaped_dir = cache.join("shaped");
     let cache = if shaped { shaped_dir.as_path() } else { cache };
@@ -9145,10 +9453,16 @@ mod tests {
             "presets": {"p1": {"ageWearHash": "r1"}, "p4": {"ageWearHash": "a4", "controlIntensityA": 255, "b18a6db5": 127.5, "1b6a3e09": 255, "rustStart": 51, "rustEnd": 102,
                 "rustStartB": 12, "rustEndB": 44, "primerGradientStart": 19, "primerGradientEnd": 255,
                 "primerIntensityB": 102, "4eb87881": 0, "26007b2d": 255, "primerStart": 10, "primerEnd": 127, "8ed71149": 51, "eff390bd": true,
+                "951a7677": 51, "b58896f4": 153, "8482c039": 0, "4cacba9c": 255, "fcf8c89c": 200,
+                "87df7517": 102, "7c999233": 51, "851c6b0b": 0, "ac8e3a46": 255,
+                "f86ce666": 128, "eb7223d6": 25, "d54c040a": 76, "7f1fe0a2": "e1",
                 "879774bd": "cr"}},
             "colour_ranges": {"cr": {"minGreen": 102, "maxGreen": 153, "fb2b7f54": 0, "c5801a83": 102, "7e3dffd5": 255, "c82d2173": 255}},
             "age_ranges": {"r1": {"minWear": 100, "maxWear": 200}},
-            "ages": {"a4": {"4e71efc8": 0.6, "b5fcdec9": 1.0}},
+            "ages": {"a4": {"4e71efc8": 0.6, "b5fcdec9": 1.0, "aa7d4fbd": 2.0, "minTiling": 6.0, "maxTiling": 7.0,
+                "1da6a331": 0.0, "5b934fe3": 0.5, "redScratchStart": 0.0, "redScratchEnd": 1.0, "d1f62b9a": 1.0, "193c7eb1": 1.0,
+                "91b26647": 1.0, "6d9d81b3": true, "a06d3fe0": true}},
+            "edges": {"e1": {"edgeIntensity": 0.275, "edgeStart": 0.05, "edgeEnd": 0.8}},
         });
         let a = part_wear(&w, 0, Some("k1")).unwrap();
         assert_eq!((a[0].amount, a[1].amount, a[2]), (150, 204, PartWear::default()));
@@ -9164,6 +9478,20 @@ mod tests {
         // than the bytes' difference, 19..255 the difference itself
         assert_eq!((a[1].start[1], a[1].width[1]), (12, 31));
         assert_eq!((a[1].primer_gradient_start, a[1].primer_gradient_width), (19, 236));
+        // W2 channel R: activation 0.8, start 0.8 x 51, width 0.8 x (153 -
+        // 51), truncated; channel G ends before it starts: its width wraps
+        // round (0.8 x -51 = -40.8 -> -40 -> 216); B and D4 not activated
+        assert_eq!((a[1].w2_start, a[1].w2_width, a[1].w2_div), ([40, 81, 0, 0], [81, 216, 0, 0], [200, 0, 0, 0]));
+        // the 4th channel: scale 0.8 x 128, window 25 with width 51
+        assert_eq!((a[1].d4_scale, a[1].d4_start, a[1].d4_width), (102, 25, 51));
+        // the edge record: intensity 0.275, start and end x 255 truncated;
+        // the clear-coat loss 25.5 x 2
+        assert_eq!((a[1].edge_intensity, a[1].edge_start, a[1].edge_end, a[1].coat_loss), (70, 12, 204, 51));
+        // the dust and scratch mask: tiling 6.5 x 5.1, the red scratch
+        // curve 0.5 x v0 = 0.4 (x 255; signed with its multiplier 1:
+        // 127.5 + 127.5 x 0.4), base gain 1, flag bits 18 and 26; curves
+        // without fields are 0 (signed: 127)
+        assert_eq!(a[1].dust, [33, 102, 0, 0, 0, 0, 0, 255, 0, 0, 0, 178, 0, 127, 1, 4]);
         assert_eq!(super::primer_surface(&serde_json::json!({"primerPalette": {"roughnessLow": 0.45, "roughnessHigh": 0.78, "metallicLow": 0.0, "metallicHigh": 0.0}})), [0, 0, 114, 198]);
         assert_eq!(super::primer_surface(&serde_json::json!({})), [0, 0, 153, 153]);
         assert_eq!(part_wear(&w, 0, None).unwrap()[0].amount, 150);
