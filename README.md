@@ -1415,7 +1415,10 @@ baked map (`entities.bin`; bake first with `--bake-map`):
     placement.
 
   Built cells are cached in `<work>/gui_cache_v4/cells` (capped at 4 GB),
-  so a revisited area loads with one file read per cell. Until a cell has
+  so a revisited area loads with one file read per cell. The cache is
+  keyed by the bake (a fingerprint of `entities.bin` and `strings.json`),
+  so after a re-bake cells are built again and those of the old bake are
+  deleted. Until a cell has
   loaded, its placements load and draw one by one as before. A cell the
   camera comes close to keeps drawing until its placements' models have
   loaded. LOD and SLOD cells are small and built on demand. HD cells are
