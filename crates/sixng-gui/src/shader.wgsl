@@ -137,6 +137,43 @@ fn sun_shadow(p: vec3<f32>) -> f32 {
     return 1.0;
 }
 
+// The colour of land filled from the height map (world3d FILLED_LAND), linear.
+const TILE_FILLED: vec3<f32> = vec3(0.155, 0.262, 0.102);
+
+fn ground_hash(p: vec2<f32>) -> f32 {
+    let q = fract(p * vec2(0.1031, 0.1030));
+    let d = dot(q, q.yx + 33.33);
+    return fract((q.x + q.y) * (q.x + d));
+}
+
+fn ground_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(ground_hash(i), ground_hash(i + vec2(1.0, 0.0)), u.x),
+               mix(ground_hash(i + vec2(0.0, 1.0)), ground_hash(i + vec2(1.0, 1.0)), u.x), u.y);
+}
+
+// Reflectance of made-up ground at p (world, true height) with normal n:
+// sand near the sea, dry grass and scrub inland, darker woods in patches,
+// rock on steep slopes (our choice: no map tile shows these cells).
+fn filled_ground(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    let big = ground_noise(p.xz / 380.0);
+    let mid = ground_noise(p.xz / 60.0 + 7.3);
+    let fine = ground_noise(p.xz / 9.0 + 3.1);
+    let sand = vec3(0.42, 0.36, 0.25);
+    let grass = vec3(0.17, 0.19, 0.09);
+    let scrub = vec3(0.12, 0.13, 0.07);
+    let woods = vec3(0.06, 0.08, 0.04);
+    let rock = vec3(0.24, 0.22, 0.19);
+    var c = mix(grass, scrub, smoothstep(0.35, 0.65, mid));
+    c = mix(c, woods, smoothstep(0.55, 0.7, big) * 0.85);
+    // the beach band just above the sea
+    c = mix(sand, c, smoothstep(-2.5, 0.5, p.y + (mid - 0.5) * 2.0));
+    c = mix(c, rock, smoothstep(0.3, 0.5, 1.0 - n.y));
+    return c * (0.8 + 0.4 * fine);
+}
+
 // share of a baked map tile's colour taken as the ground's reflectance
 const TILE_ALBEDO: f32 = 0.6;
 // how far the map's terrain is drawn under its real height (world3d SINK, m)
@@ -1544,6 +1581,13 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             let lsh = normalize(F.sun_dir.xyz);
             let tsh = sun_shadow(i.world + vec3(0.0, TILE_SINK, 0.0) + lsh * 0.5);
             col = albedo * TILE_ALBEDO * (sun_e_shadowed(i.world, tsh) * (0.5 + 0.5 * ndl) / 3.14159 + amb_d);
+            // land filled from the game's height map where no map tile was
+            // baked (flat TILE_FILLED): a ground made up from height, slope
+            // and noise, lit without the tiles' baked hill shading
+            if ((M.flags.x & 1u) == 0u && length(M.base.rgb - TILE_FILLED) < 0.01) {
+                let g = filled_ground(i.world + vec3(0.0, TILE_SINK, 0.0), n);
+                col = g * (sun_e_shadowed(i.world, tsh) * max(ndl, 0.0) / 3.14159 + amb_d);
+            }
             // the tiles' painted water (the map's water and no-data colour)
             // is shaded as the game's water on sea cells (no height, or deeper
             // than the beaches: vertex alpha 0, blending over a shore cell); on cells with a
