@@ -1207,6 +1207,7 @@ drag
 dragMax
 dragMin
 Draw
+drawableAssetName
 DrawPresets
 DrawPriority
 DrawScale
@@ -1635,6 +1636,7 @@ fProbeWidth
 fPropRadius
 fpsClip
 fRadiusFactor
+fragmentAssetName
 FragName
 frameCount
 FrameDuration
@@ -2337,6 +2339,15 @@ MainPosition
 maleTags
 Manifest
 manifest
+MAP_ENTITY_TYPE_ANIMATED_BUILDING
+MAP_ENTITY_TYPE_BUILDING
+MAP_ENTITY_TYPE_COMPOSITE_ENTITY
+MAP_ENTITY_TYPE_DUMMY_OBJECT
+MAP_ENTITY_TYPE_GRASS_BATCH
+MAP_ENTITY_TYPE_INTERIOR_INSTANCE
+MAP_ENTITY_TYPE_PROP_BATCH
+MAP_ENTITY_TYPE_UNINITIALIZED
+MapEntityType
 MapFlags
 Mapping
 Mappings
@@ -2495,6 +2506,7 @@ Models
 models
 ModelSets
 ModelTag
+modelVariationHash
 Modifier
 ModifierId
 modifierId
@@ -2699,6 +2711,7 @@ parent
 ParentId
 parentId
 parentIndex
+parentInstance
 parentName
 parentOffset
 ParentOverrides
@@ -2948,11 +2961,13 @@ RagdollDatas
 RagdollDuration
 ragdollScale
 rage__eLodType
+rage__fwArchetypeDef
 rage__fwArchetypeDef__eAssetType
 rage__fwAudioSettings
 rage__fwControllerSettings
 rage__fwControlPresets
 rage__fwDofSets
+rage__fwEntityDef
 rage__fwGrassInstanceListDef
 rage__fwGrassInstanceListDef__InstanceData
 rage__fwInstancedMapData
