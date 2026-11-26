@@ -612,6 +612,10 @@ pub struct Renderer3D {
     pipe_wire: wgpu::RenderPipeline,
     pipe_lines: wgpu::RenderPipeline,
     pipe_lines_top: wgpu::RenderPipeline,
+    /// Coronas of the map's placed lights (lights.rs), added in HDR.
+    pipe_glow: wgpu::RenderPipeline,
+    /// The coronas to draw this frame (Map 3D; empty elsewhere).
+    pub glows: Vec<crate::lights::Glow>,
     pipe_sky: wgpu::RenderPipeline,
     pipe_ground: wgpu::RenderPipeline,
     /// Shadow to draw on the ground under the model (shaded mode only).
@@ -1313,6 +1317,25 @@ impl Renderer3D {
             Some(wgpu::BlendState::ALPHA_BLENDING),
             depth(false, wgpu::CompareFunction::Always),
         );
+        let gattrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
+        let gbufs = [Some(wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<crate::lights::Glow>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &gattrs,
+        })];
+        let pipe_glow = mk(
+            "glow",
+            &layout_frame,
+            "vs_glow",
+            "fs_glow",
+            &gbufs,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            Some(wgpu::BlendState {
+                color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+                alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+            }),
+            depth(false, wgpu::CompareFunction::GreaterEqual),
+        );
         let pipe_sky = mk(
             "sky",
             &layout_frame,
@@ -1631,6 +1654,8 @@ impl Renderer3D {
             pipe_wire,
             pipe_lines,
             pipe_lines_top,
+            pipe_glow,
+            glows: Vec::new(),
             pipe_sky,
             pipe_ground,
             ground: None,
@@ -2754,6 +2779,12 @@ impl Renderer3D {
         self.atmo.reset = 3;
     }
 
+    /// Uploads the placed lights near the camera for the HDR shading
+    /// (lights.rs `pack`; an empty grid turns them off).
+    pub fn set_lights(&self, queue: &wgpu::Queue, lights: &[crate::lights::GpuLight], grid: &[u32]) {
+        self.atmo.set_lights(queue, lights, grid);
+    }
+
     pub fn render(
         &mut self,
         rs: &egui_wgpu::RenderState,
@@ -2869,6 +2900,13 @@ impl Renderer3D {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("lines"),
                 contents: bytemuck::cast_slice(lines),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        });
+        let glow_b = (self.hdr && !self.glows.is_empty()).then(|| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("glows"),
+                contents: bytemuck::cast_slice(&self.glows),
                 usage: wgpu::BufferUsages::VERTEX,
             })
         });
@@ -3144,6 +3182,12 @@ impl Renderer3D {
                         }
                     }
                 }
+            }
+            if let Some(gb) = &glow_b {
+                pass.set_pipeline(&self.pipe_glow);
+                pass.set_bind_group(0, &self.default_frame_bg, &[]);
+                pass.set_vertex_buffer(0, gb.slice(..));
+                pass.draw(0..4, 0..self.glows.len() as u32);
             }
             if let Some(lb) = &lb {
                 pass.set_pipeline(&self.pipe_lines);
