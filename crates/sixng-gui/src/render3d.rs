@@ -166,11 +166,12 @@ pub struct Look {
     pub wear_from_config: bool,
     /// The shown vehicle has wear levels (set by the model view).
     pub wear_levels: bool,
-    /// With `wear_from_config`: also draw the second wear layer (the
-    /// primer). Off by default: its per-part colour-range samples and the
-    /// per-vehicle amount are not decoded and taken as 1, which shows far
-    /// more primer than the game on some parts.
-    pub primer: bool,
+    /// With `wear_from_config`: the amount of the second wear layer (the
+    /// primer), 0 (off, the default) to 1. The game takes it per vehicle at
+    /// run time (spawn data, or a record of a file that is not shipped), so
+    /// it is the user's to set; it scales the primer's summed mask level
+    /// before its window.
+    pub primer_amount: f32,
     pub slot: u32,
     pub paint: [f32; 3],
     pub paint2nd: [f32; 3],
@@ -185,6 +186,9 @@ pub struct Look {
     pub sky_hor: [f32; 3],
     pub exposure: f32,
     pub ambient: f32,
+    /// Share of the sun light the lit ground and surroundings send back to
+    /// the model (the timecycle's `ambient_bounce_intensity`; sun_col.w).
+    pub bounce: f32,
     pub wet: f32,
     pub emissive: f32,
     pub fog: f32,
@@ -193,6 +197,10 @@ pub struct Look {
     pub tint: bool,
     pub clear: [f32; 3],
 }
+
+/// The timecycle's `ambient_bounce_intensity` where no weather is picked
+/// (its default in the map's scene too).
+pub const BOUNCE: f32 = 0.5;
 
 impl Default for Look {
     fn default() -> Self {
@@ -209,7 +217,7 @@ impl Default for Look {
             wear: 0.0,
             wear_from_config: true,
             wear_levels: false,
-            primer: false,
+            primer_amount: 0.0,
             slot: 0,
             paint: [0.55, 0.02, 0.02],
             paint2nd: [0.6, 0.6, 0.62],
@@ -223,6 +231,7 @@ impl Default for Look {
             sky_hor: [0.75, 0.82, 0.9],
             exposure: 1.0,
             ambient: 0.9,
+            bounce: BOUNCE,
             wet: 0.0,
             emissive: 2.0,
             fog: 0.0,
@@ -263,6 +272,7 @@ impl Look {
         let sky_l = (0.2126 * self.sky_hor[0] + 0.7152 * self.sky_hor[1] + 0.0722 * self.sky_hor[2])
             / (0.2126 * def.sky_hor[0] + 0.7152 * def.sky_hor[1] + 0.0722 * def.sky_hor[2]);
         self.ambient = (l.ambient * def.ambient / sky_l.max(0.05)).min(2.0);
+        self.bounce = l.bounce;
         self.emissive = 1.5 + 6.0 * (1.0 - l.day);
         // a viewer's stand-in for eye adaptation: brighten dark scenes by
         // part of their darkness, plus the timecycle's exposure offset
@@ -297,6 +307,7 @@ impl Look {
             dusk * 0.7,
         );
         self.ambient = 0.25 + 0.5 * day.sqrt();
+        self.bounce = BOUNCE;
         self.emissive = 1.5 + 6.0 * (1.0 - day);
         self.exposure = 1.0 + 1.5 * (1.0 - day.sqrt());
         if el < 0.0 {
@@ -2366,7 +2377,7 @@ impl Renderer3D {
             inv_view_proj: vp.inverse().to_cols_array_2d(),
             cam_pos: cam.eye().extend(1.0).to_array(),
             sun_dir: look.sun_dir.extend(look.sun_intensity).to_array(),
-            sun_col: lin(look.sun_col),
+            sun_col: [look.sun_col[0], look.sun_col[1], look.sun_col[2], look.bounce],
             sky_top,
             sky_hor: [
                 look.sky_hor[0],
@@ -2398,8 +2409,8 @@ impl Renderer3D {
             prev_view_proj: vp.to_cols_array_2d(),
             // xyz: the body paint's coat; w: vehicle wear (0 to 1)
             // w < 0: each part's own wear amount from the part ramp image
-            // -2: the same, and the primer layer too
-            jitter: [look.coat[0], look.coat[1], look.coat[2], if look.wear_from_config && look.wear_levels { if look.primer { -2.0 } else { -1.0 } } else { look.wear }],
+            // -1 - a (a > 0): the same, and the primer layer at amount a
+            jitter: [look.coat[0], look.coat[1], look.coat[2], if look.wear_from_config && look.wear_levels { -1.0 - look.primer_amount.clamp(0.0, 1.0) } else { look.wear }],
             frame: [self.dither_frame, self.target.as_ref().map_or(aspect * 1080.0, |t| t.size[0] as f32), self.target.as_ref().map_or(1080.0, |t| t.size[1] as f32), 0.0],
             light_view_proj: self.light_vp,
         }

@@ -7,10 +7,12 @@ Each strand piece of the GLB becomes one hair curves object with these
 attributes:
 
 - `radius` (point): half the strand's width,
-- `root_uv` (curve): the root UV the groom stores (its own layout, not
-  the head mesh's UV map),
-- `surface_uv_coordinate` (curve, with --model): the UV of the head mesh
-  under the strand's root, for Blender's hair tools,
+- `root_uv` (curve): the root UV the groom stores, a coordinate in one of
+  the head mesh's UV sets (the GLB names it per piece: `head_uv_set`),
+- `surface_uv_coordinate` (curve, with --model): the same root UV, with
+  that UV set as the object's surface UV map, for Blender's hair tools
+  (pieces whose set was not found, or where it overlaps itself under the
+  roots, get the head's first UV map under each root instead),
 - `clump` (curve, int): the strand's clump (1-based; 0 = not in a clump),
 - `variant` (curve, int): the strand's colour variant (0-3).
 
@@ -29,7 +31,7 @@ import sys
 import bpy
 from mathutils import Vector
 from mathutils.bvhtree import BVHTree
-from mathutils.geometry import barycentric_transform
+from mathutils.geometry import barycentric_transform, intersect_point_tri_2d
 
 # when run from the Scripting tab: ["<hair.glb>", "--model", "<model.glb>"]
 ARGS = []
@@ -73,7 +75,7 @@ def hair_material():
         bsdf = nt.nodes.new("ShaderNodeBsdfHairPrincipled")
         bsdf.parametrization = "MELANIN"
         # a neutral brown: the export carries no hair colour
-        bsdf.inputs["Redness"].default_value = 0.3
+        bsdf.inputs["Melanin Redness"].default_value = 0.3
         nt.links.new(bsdf.outputs[0], out.inputs[0])
     return m
 
@@ -157,10 +159,38 @@ def surface_uvs(ob, head):
     return out
 
 
+def uv_misplacement(ob, head, layer, uv, samples=100):
+    """Median distance (metres) from sample strand roots to the head point
+    their UV names in `layer`; large where the UV set overlaps itself."""
+    me = head.data
+    me.calc_loop_triangles()
+    uvl = me.uv_layers[layer].data
+    mw = head.matrix_world
+    tris = []
+    for t in me.loop_triangles:
+        q = [uvl[lp].uv.copy() for lp in t.loops]
+        tris.append((q, t.vertices, min(u.x for u in q), max(u.x for u in q), min(u.y for u in q), max(u.y for u in q)))
+    cv = ob.data
+    pos = cv.attributes["position"].data
+    d = []
+    for i in range(0, len(cv.curves), max(1, len(cv.curves) // samples)):
+        u = Vector((uv[2 * i], uv[2 * i + 1]))
+        root = ob.matrix_world @ pos[cv.curves[i].first_point_index].vector
+        for q, vs, x0, x1, y0, y1 in tris:
+            if x0 <= u.x <= x1 and y0 <= u.y <= y1 and intersect_point_tri_2d(u, q[0], q[1], q[2]):
+                at = barycentric_transform(u.to_3d(), *[w.to_3d() for w in q], *[mw @ me.vertices[v].co for v in vs])
+                d.append((at - root).length)
+                break
+        else:
+            d.append(float("inf"))
+    d.sort()
+    return d[len(d) // 2] if d else float("inf")
+
+
 def attach(made):
     arm = next((o for o in bpy.data.objects if o.type == "ARMATURE"), None)
-    head = head_mesh()
     for ob, ex in made:
+        head = bpy.data.objects.get(ex.get("head_mesh", "")) or head_mesh()
         world = ob.matrix_world.copy()
         if arm is not None:
             # the groom's head bone where it names one, else its first bone the armature has
@@ -173,8 +203,25 @@ def attach(made):
             ob.matrix_world = world
         if head is not None and head.data.uv_layers:
             ob.data.surface = head
-            ob.data.surface_uv_map = head.data.uv_layers[0].name
-            add_attr(ob.data, "surface_uv_coordinate", "FLOAT2", "CURVE", surface_uvs(ob, head))
+            layers = head.data.uv_layers
+            n = ex.get("head_uv_set")
+            uv = None
+            if n is not None and n < len(layers) and "root_uv" in ob.data.attributes:
+                # the game's own root UVs, in the head UV set they belong to
+                # (glTF TEXCOORD_n comes in as the n-th UV map), unless that
+                # set overlaps itself where the strands grow (some lashes):
+                # then a UV does not name one place on the head
+                uv = [0.0] * (2 * len(ob.data.curves))
+                ob.data.attributes["root_uv"].data.foreach_get("vector", uv)
+                if uv_misplacement(ob, head, layers[n].name, uv) > 0.005:
+                    print(f"{ob.name}: its UV set overlaps itself under the roots; using the first UV map")
+                    uv = None
+            if uv is not None:
+                ob.data.surface_uv_map = layers[n].name
+                add_attr(ob.data, "surface_uv_coordinate", "FLOAT2", "CURVE", uv)
+            else:
+                ob.data.surface_uv_map = layers[0].name
+                add_attr(ob.data, "surface_uv_coordinate", "FLOAT2", "CURVE", surface_uvs(ob, head))
 
 
 def main(argv):

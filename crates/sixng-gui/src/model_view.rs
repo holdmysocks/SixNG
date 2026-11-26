@@ -4600,8 +4600,8 @@ impl ModelView {
                     .on_hover_text("Each part shows wear as the game works it out: the vehicle's configuration gives the part a wear level (0 new to 5 worn out), which picks a wear preset. Its age record sets the wear amount, and the preset's control intensities and rust windows say how much of each channel of the game's tiling wear mask turns to the worn layer (the game's packing of these values is read from its code). Not read: a per-part random sample and the vertex colours the game also multiplies in, and the per-vehicle pick within the age record's range (the middle is taken).");
             }
             if self.look.wear_levels && self.look.wear_from_config {
-                ui.checkbox(&mut self.look.primer, "primer layer")
-                    .on_hover_text("Also draws the game's second wear layer, the primer, by its rules: its mask texture scaled per channel by the wear preset's primer intensities, summed and windowed by primerStart / primerEnd, where the first layer is not. Off by default: the game also scales the mask by per-part random samples and a per-vehicle amount, which are not decoded and taken as 1, so some parts (a truck bed) show far more primer than in the game. The primer's colour is a stand-in grey.");
+                ui.add(egui::Slider::new(&mut self.look.primer_amount, 0.0..=1.0).text("primer amount"))
+                    .on_hover_text("The game's second wear layer, the primer, drawn by its rules: its mask texture scaled per channel by the wear preset's primer intensities, summed, times this amount, and windowed by primerStart / primerEnd, where the first layer is not. The game takes the amount per vehicle while it runs (from the spawn data, or from a file that is not shipped), so it is yours to set; 0 (the default) turns the layer off. The primer's colour is a stand-in grey.");
             }
             if !(self.look.wear_levels && self.look.wear_from_config) {
                 ui.add(egui::Slider::new(&mut self.look.wear, 0.0..=1.0).text("wear"))
@@ -5154,8 +5154,9 @@ fn load_parts(
     // accessory was moved onto
     let mut rig_parts: Vec<(std::ops::Range<usize>, Vec<glb::Joint>, Option<usize>)> = Vec::new();
     let mut named_parts: Vec<(std::ops::Range<usize>, Vec<(String, Option<usize>)>)> = Vec::new();
-    let mut under_meshes: Vec<std::ops::Range<usize>> = Vec::new();
-    let mut outer_meshes: Vec<std::ops::Range<usize>> = Vec::new();
+    // per garment: its meshes and how far out it is worn (`levels`)
+    let mut layered: Vec<(std::ops::Range<usize>, u8)> = Vec::new();
+    let levels = garment_levels(parts.iter().map(|e| e.off), fx);
     // Body shape: the skin and head are posed by the game's rig; clothes
     // and accessories follow the skin under them (`Wrap`).
     let shape = if fx.is_empty() { (0.0, 0.0) } else { *BODY_SHAPE.lock().unwrap() };
@@ -5249,10 +5250,8 @@ fn load_parts(
                     // (empty for a part without bones, which then rides on the bone nearest to it)
                     named_parts.push((mesh0..mesh0 + m.meshes.len(), m.joints.iter().map(|j| (j.name.clone(), j.parent)).collect()));
                 }
-                match f.map_or(0, |f| f.layer) {
-                    1 => under_meshes.push(mesh0..mesh0 + m.meshes.len()),
-                    2 => outer_meshes.push(mesh0..mesh0 + m.meshes.len()),
-                    _ => {}
+                if let Some(&l) = levels.get(&e.off) {
+                    layered.push((mesh0..mesh0 + m.meshes.len(), l));
                 }
                 if f.is_some_and(|f| f.heel) {
                     heel_meshes.push(mesh0..mesh0 + m.meshes.len());
@@ -5333,15 +5332,23 @@ fn load_parts(
         }
     }
     if let (Some(m), false, false) = (&mut model, by_distance.is_empty(), cover_meshes.is_empty()) {
-        let hidden = hide_covered_skin(m, &by_distance, &cover_meshes);
+        let hidden = hide_covered_skin(m, &by_distance, &cover_meshes, 0.015);
         if hidden > 0 {
             notes.push(format!("Skin under clothes: {hidden} triangles of a skin mesh without regions that lie right under a garment are hidden, so skin does not show through it (by distance, not the game's masks)."));
         }
     }
-    if let (Some(m), false, false) = (&mut model, under_meshes.is_empty(), outer_meshes.is_empty()) {
-        let hidden = hide_covered_skin(m, &under_meshes, &outer_meshes);
+    if let Some(m) = &mut model {
+        // each level of clothes, inside out, hidden where the levels over it cover it
+        let mut ls: Vec<u8> = layered.iter().map(|x| x.1).collect();
+        ls.sort();
+        ls.dedup();
+        let mut hidden = 0;
+        for &l in ls.iter().rev().skip(1).rev() {
+            let pick = |f: &dyn Fn(u8) -> bool| layered.iter().filter(|x| f(x.1)).map(|x| x.0.clone()).collect::<Vec<_>>();
+            hidden += hide_covered_skin(m, &pick(&|x| x == l), &pick(&|x| x > l), 0.03);
+        }
         if hidden > 0 {
-            notes.push(format!("Layers: {hidden} triangles of the clothes worn under the jacket are hidden where the jacket covers them, so they do not show through it."));
+            notes.push(format!("Layers: {hidden} triangles of clothes worn under other clothes (under a jacket, or a t-shirt under an open shirt) are hidden where the clothes over them cover them, so they do not show through. Which is worn over which: a jacket over the rest, and an item whose hide masks name another item's layer over that item."));
         }
     }
     if let (Some(m), true, false) = (&mut model, rig_parts.is_empty(), named_parts.is_empty()) {
@@ -6198,12 +6205,43 @@ fn rig_character(m: &mut glb::Model, parts: &[(std::ops::Range<usize>, Vec<glb::
     true
 }
 
+/// How far out each shown garment is worn, for hiding what is under it:
+/// tops, bottoms and one-pieces start at 1 and jackets at 8; an item whose
+/// hide masks name the region layer of another shown garment (an open
+/// shirt naming the t-shirt under it) is put one level over that one.
+fn garment_levels(shown: impl Iterator<Item = u64>, fx: &HashMap<u64, PartFx>) -> HashMap<u64, u8> {
+    let shown: Vec<u64> = shown.filter(|o| fx.get(o).is_some_and(|f| f.layer > 0)).collect();
+    let mut level: HashMap<u64, u8> = shown.iter().map(|o| (*o, if fx[o].layer == 2 { 8 } else { 1 })).collect();
+    // a few rounds settle chains (jacket over shirt over t-shirt); two items
+    // that name each other's layer say nothing about which is over
+    for _ in 0..shown.len() {
+        let mut changed = false;
+        for &x in &shown {
+            for &y in &shown {
+                let (fx_x, fx_y) = (&fx[&x], &fx[&y]);
+                if x != y && fx_y.region_layer != 0 && fx_x.hides.iter().any(|h| h.0 == fx_y.region_layer)
+                    && !(fx_x.region_layer != 0 && fx_y.hides.iter().any(|h| h.0 == fx_x.region_layer))
+                    && level[&x] <= level[&y]
+                {
+                    level.insert(x, level[&y] + 1);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    level
+}
+
 /// Hide the skin triangles that lie right under a garment: a skin vertex is
 /// covered when a point of a garment surface is within 9 mm of the line
-/// through the vertex along its normal, between 15 mm inside and 50 mm
-/// outside the skin; a triangle goes when all three vertices are covered.
-/// Returns the number of triangles hidden.
-fn hide_covered_skin(m: &mut glb::Model, skin: &[std::ops::Range<usize>], cover: &[std::ops::Range<usize>]) -> usize {
+/// through the vertex along its normal, between `inside` (15 mm for skin;
+/// 30 mm for clothes under clothes, which poke further through at the
+/// armpits) inside and 50 mm outside the skin; a triangle goes when all
+/// three vertices are covered. Returns the number of triangles hidden.
+fn hide_covered_skin(m: &mut glb::Model, skin: &[std::ops::Range<usize>], cover: &[std::ops::Range<usize>], inside: f32) -> usize {
     use glam::Vec3;
     const CELL: f32 = 0.02;
     const STEP: f32 = 0.008;
@@ -6236,7 +6274,7 @@ fn hide_covered_skin(m: &mut glb::Model, skin: &[std::ops::Range<usize>], cover:
                     for g in v {
                         let d = *g - p;
                         let along = d.dot(n);
-                        if (-0.015..=0.05).contains(&along) && (d - n * along).length_squared() < 0.009 * 0.009 {
+                        if (-inside..=0.05).contains(&along) && (d - n * along).length_squared() < 0.009 * 0.009 {
                             return true;
                         }
                     }
@@ -8788,6 +8826,19 @@ mod tests {
         let mut off = r.clone();
         off["use_anisotropy"] = false.into();
         assert_eq!(coat_row(Some(&off))[5 * 4 + 3], 0);
+    }
+
+    #[test]
+    fn garment_levels_follow_the_hide_masks() {
+        let fx = |layer: u8, region: u32, hides: &[u32]| PartFx { layer, region_layer: region, hides: hides.iter().map(|&h| (h, String::new())).collect(), ..Default::default() };
+        // an open shirt naming the t-shirt's layer, both tops, under a jacket that names neither
+        let m: HashMap<u64, PartFx> = [(1, fx(1, 0xa, &[])), (2, fx(1, 0xb, &[0xa])), (3, fx(2, 0xc, &[])), (4, fx(0, 0, &[0xa]))].into_iter().collect();
+        let l = garment_levels([1, 2, 3, 4].into_iter(), &m);
+        assert_eq!((l[&1], l[&2], l[&3]), (1, 2, 8));
+        assert!(!l.contains_key(&4));
+        // items naming each other's layer stay level
+        let m: HashMap<u64, PartFx> = [(1, fx(1, 0xa, &[0xb])), (2, fx(1, 0xb, &[0xa]))].into_iter().collect();
+        assert!(garment_levels([1, 2].into_iter(), &m).values().all(|&v| v == 1));
     }
 
     #[test]

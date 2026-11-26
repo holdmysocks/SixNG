@@ -984,7 +984,9 @@ enum Cmd {
         /// the game grows from the guide strands, as line strips with the
         /// root UV (TEXCOORD_0), width (_WIDTH, metres), clump (_CLUMP, 0 =
         /// none) and colour variant (_VARIANT) on every point, and the
-        /// guides as <piece>_guides. scripts/blender_hair_curves.py makes
+        /// guides as <piece>_guides. The root UVs are coordinates in one of
+        /// the head mesh's UV sets; each piece's extras name it
+        /// (head_uv_set, matched against the exported head). scripts/blender_hair_curves.py makes
         /// Blender hair curves of it.
         #[arg(long)]
         hair: bool,
@@ -1789,12 +1791,22 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 let cat = sixng_core::groom::catalog_cached(&ws.work, &a, &ix.entries)?;
                 let o = sixng_core::hairexport::Options { density: *hair_density, max_strands: *hair_max, points: *hair_points, guides: !*hair_no_guides };
                 let (mut prims, mut rows) = (Vec::new(), Vec::new());
+                // the head as written, to find which of its UV sets the root UVs are in
+                let head = std::fs::read(&glb).ok().and_then(|b| sixng_core::hairexport::head_from_glb(&b));
                 for (slot, placeholder, grooms, confidence) in &pieces {
                     for off in grooms {
                         let g = sixng_core::groom::load(&a, &ix.entries, *off)?;
                         let bones = cat.iter().find(|c| c.off == *off).map(|c| c.bones.clone()).unwrap_or_default();
                         let name = format!("{}_{off:x}", slot.replace(' ', "_"));
-                        let (p, mut sum) = sixng_core::hairexport::piece(&g, &name, &o, json!({"slot": slot, "placeholder": placeholder, "groom": format!("{off:x}"), "bones": bones}));
+                        let mut ex = json!({"slot": slot, "placeholder": placeholder, "groom": format!("{off:x}"), "bones": bones});
+                        let uv_set = head.as_ref().and_then(|h| Some((h, sixng_core::hairexport::root_uv_set(&g, h)?)));
+                        if let Some((h, (set, err))) = uv_set {
+                            ex["head_mesh"] = json!(h.name);
+                            ex["head_uv_set"] = json!(set);
+                            ex["head_uv_error"] = json!(err);
+                        }
+                        let (p, mut sum) = sixng_core::hairexport::piece(&g, &name, &o, ex);
+                        sum["head_uv_set"] = json!(uv_set.map(|u| u.1 .0));
                         sum["slot"] = json!(slot);
                         sum["placeholder"] = json!(placeholder);
                         sum["confidence"] = json!(confidence);
