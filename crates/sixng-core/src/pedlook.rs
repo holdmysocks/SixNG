@@ -1947,8 +1947,13 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
                     strand_colours.push(c);
                 }
             }
+            // the preset's profile word (e.g. `Average`) is the tag under key
+            // c2cfc00a; other tags of a preset variation are its gender and
+            // flags (`female`, `true`), not a shape
             if v.tags.values().flatten().any(|w| w == "BodyShapePreset") {
-                body_shape = v.tags.iter().filter(|(_, w)| !w.iter().any(|x| x == "BodyShapePreset")).flat_map(|(_, w)| w.first()).next().cloned();
+                if let Some(w) = v.tags.get("c2cfc00a").and_then(|w| w.first()) {
+                    body_shape = Some(w.clone());
+                }
             }
             for p in &v.parts {
                 let by_asset = || Some((assets?.pick(p.guid.as_deref()?, fit.as_deref(), &exists)?, "asset id"));

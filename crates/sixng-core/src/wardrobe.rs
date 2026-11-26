@@ -169,7 +169,12 @@ fn tag_words(v: &Value, pre: &HashMap<u32, (String, String)>, out: &mut BTreeMap
             .into_iter()
             .flatten()
             .filter_map(|x| x.as_u64())
-            .filter_map(|x| pre.get(&(x as u32)).map(|p| p.0.clone()).or_else(|| crate::names::lookup(x as u32, crate::names::Ctx::Field).filter(|n| !n.is_empty())))
+            .filter_map(|x| {
+                pre.get(&(x as u32)).map(|p| p.0.clone()).or_else(|| crate::names::lookup(x as u32, crate::names::Ctx::Field).filter(|n| !n.is_empty()))
+                    // a body-shape preset's profile word is kept as its hash
+                    // when unnamed (`bodyshape::preset_controls` matches it)
+                    .or_else(|| (k == 0xc2cf_c00a).then(|| format!("{x:08x}")))
+            })
             .collect();
         if !words.is_empty() {
             out.insert(format!("{k:08x}"), words);
