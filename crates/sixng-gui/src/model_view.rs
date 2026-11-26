@@ -654,12 +654,13 @@ pub fn body_from(controls: &[(String, f32)]) -> BodyShape {
     s
 }
 
-/// The game's shape for an outfit's body-shape preset tag (neutral when the
-/// outfit has none; `None` when the preset cannot be read).
-fn preset_shape(game: &Path, tag: Option<&str>) -> Option<BodyShape> {
-    match tag {
+/// The game's shape for an outfit's body-shape preset (its preset items, or
+/// its profile word; neutral when the outfit has none; `None` when the
+/// preset cannot be read).
+fn preset_shape(game: &Path, tag: Option<&str>, items: &[String]) -> Option<BodyShape> {
+    match sixng_core::bodyshape::outfit_preset(game, tag, items) {
         None => Some(NEUTRAL_BODY),
-        Some(t) => sixng_core::bodyshape::preset_controls(game, t).ok().map(|c| body_from(&c)),
+        Some(r) => r.ok().map(|c| body_from(&c)),
     }
 }
 /// Last head exported for the viewer: (variant, variant count, source).
@@ -2114,7 +2115,7 @@ impl ModelView {
             }
         });
         if let Some(p) = &look.body_shape {
-            let how = if look.body_preset.is_some() { "the sliders open in its values" } else { "not a profile of the body-type XML in common.rpf (or common.rpf is not indexed); the sliders open neutral" };
+            let how = if look.body_preset.is_some() { "the sliders open in its values" } else { "its values could not be read (anim.rpf and common.rpf need to be indexed); the sliders open neutral" };
             ui.label(egui::RichText::new(format!("Body-shape preset of this outfit: {p} ({how}).")).weak().small());
         }
         if shape != before {
@@ -5265,19 +5266,26 @@ fn split_parts(q: &str) -> (&str, Option<Vec<u64>>) {
 /// placed on the model's bind pose, in RAGE model space (Z-up). The joints
 /// are the game's bone frames turned to Y-up (C M C^T), so the game frame
 /// is C^T W C.
-fn body_tapers(a: &sixng_core::game::ArchiveInfo, entries: &[sixng_core::scan::Entry], name: &str, joints: &[glb::Joint]) -> Vec<sixng_core::groom::Taper> {
-    let Some(e) = entries.iter().find(|e| e.rtype.as_deref() == Some("ft") && e.name.as_deref() == Some(name)) else { return Vec::new() };
-    let Ok(r) = sixng_core::resource::Resource::load(&a.path, e) else { return Vec::new() };
+fn body_tapers(a: &sixng_core::game::ArchiveInfo, entries: &[sixng_core::scan::Entry], name: &str, joints: &[glb::Joint]) -> (Vec<sixng_core::groom::Taper>, Vec<sixng_core::groom::Cuboid>) {
+    let Some(e) = entries.iter().find(|e| e.rtype.as_deref() == Some("ft") && e.name.as_deref() == Some(name)) else { return Default::default() };
+    let Ok(r) = sixng_core::resource::Resource::load(&a.path, e) else { return Default::default() };
     let c = Mat4::from_cols_array(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
     let bone: HashMap<u32, Mat4> = joints.iter().map(|j| (sixng_core::meta7a::joaat(&j.name), c.transpose() * Mat4::from_cols_array(&j.ibm).inverse() * c)).collect();
-    sixng_core::fragphys::body_pieces(&r)
-        .into_iter()
-        .filter_map(|p| {
-            let m = *bone.get(&p.bone_hash)? * Mat4::from_cols_array(&p.local);
+    let (mut tapers, mut boxes) = (Vec::new(), Vec::new());
+    for p in sixng_core::fragphys::body_pieces(&r) {
+        let Some(b) = bone.get(&p.bone_hash) else { continue };
+        let m = *b * Mat4::from_cols_array(&p.local);
+        if p.kind == 3 {
+            let [lo, hi] = p.bbox.map(Vec3::from);
+            let axes = [m.x_axis, m.y_axis, m.z_axis].map(|v| v.truncate());
+            let half: [f32; 3] = std::array::from_fn(|i| (hi[i] - lo[i]) / 2.0 * axes[i].length());
+            boxes.push(sixng_core::groom::Cuboid { centre: m.transform_point3((lo + hi) / 2.0).into(), axes: axes.map(|v| v.normalize_or_zero().into()), half });
+        } else {
             let h = p.length / 2.0;
-            Some(sixng_core::groom::Taper { a: m.transform_point3(Vec3::new(0.0, h, 0.0)).into(), b: m.transform_point3(Vec3::new(0.0, -h, 0.0)).into(), ra: p.r_pos, rb: p.r_neg })
-        })
-        .collect()
+            tapers.push(sixng_core::groom::Taper { a: m.transform_point3(Vec3::new(0.0, h, 0.0)).into(), b: m.transform_point3(Vec3::new(0.0, -h, 0.0)).into(), ra: p.r_pos, rb: p.r_neg });
+        }
+    }
+    (tapers, boxes)
 }
 
 fn load_parts(
@@ -7350,10 +7358,15 @@ fn load_query_sel(
                     }
                 }
                 let o = &look.outfits[k];
-                info.body_shape = o.body_shape.clone();
+                info.body_shape = match (&o.body_shape, o.body_preset_items.len()) {
+                    (Some(w), 0) => Some(w.clone()),
+                    (Some(w), n) => Some(format!("{w}, {n} preset item(s) from anim.rpf")),
+                    (None, 0) => None,
+                    (None, n) => Some(format!("{n} preset item(s) from anim.rpf")),
+                };
                 // the outfit's own body shape, when it is opened (a reload of
                 // the same outfit keeps the sliders; `--body` keeps its shape)
-                info.body_preset = preset_shape(&ws.game, o.body_shape.as_deref());
+                info.body_preset = preset_shape(&ws.game, o.body_shape.as_deref(), &o.body_preset_items);
                 let key = format!("{archive}#outfit:{prefix}#look={k}");
                 let mut last = BODY_PRESET_FOR.lock().unwrap();
                 if *last != key {
@@ -7427,26 +7440,30 @@ fn load_query_sel(
             if !l.hair.is_empty() {
                 let rig = |k: &str| parts.iter().any(|p| p.name.as_deref().is_some_and(|n| n.contains(k)));
                 let bound = if rig("_fr1_") { Some(("defaultfemale_fr1_000_bounds", "female")) } else if rig("_mr1_") { Some(("defaultmale_mr1_000_bounds", "male")) } else { None };
-                let mut shapes = bound.map(|(b, _)| body_tapers(&a, &ix.entries, b, &model.joints)).unwrap_or_default();
+                let (mut shapes, mut boxes) = bound.map(|(b, _)| body_tapers(&a, &ix.entries, b, &model.joints)).unwrap_or_default();
                 // A garment's own bound is named after its drawable:
                 // `char_bipedbounds_<sex>_<drawable>`. Its pieces are added
                 // to the body's (they enclose it where the garment is).
                 let mut worn = 0;
                 if let (Some((_, sex)), false) = (bound, shapes.is_empty()) {
                     for n in parts.iter().filter_map(|p| p.name.as_deref()) {
-                        let t = body_tapers(&a, &ix.entries, &format!("char_bipedbounds_{sex}_{}", n.to_ascii_lowercase()), &model.joints);
-                        worn += usize::from(!t.is_empty());
+                        let (t, bx) = body_tapers(&a, &ix.entries, &format!("char_bipedbounds_{sex}_{}", n.to_ascii_lowercase()), &model.joints);
+                        worn += usize::from(!t.is_empty() || !bx.is_empty());
                         shapes.extend(t);
+                        boxes.extend(bx);
                     }
                 }
                 if std::env::var("SIXNG_DEBUG_HAIR").is_ok() {
                     for t in &shapes {
                         eprintln!("body piece {:?} {:?} r {:.3} {:.3}", t.a, t.b, t.ra, t.rb);
                     }
+                    for b in &boxes {
+                        eprintln!("body box {:?} half {:.3?}", b.centre, b.half);
+                    }
                 }
                 if !shapes.is_empty() {
-                    l.notes.push(format!("Hair styling is damped near the {} pieces of the body bound ({}) and of {worn} garment bounds, as the game does. A garment's bound is found by its name (`char_bipedbounds_<sex>_<garment>`); that the game damps hair against it is inferred, and the 3 cm falloff is a guess.", shapes.len(), bound.map(|b| b.0).unwrap_or_default()));
-                    l.collide = Some(Arc::new(sixng_core::groom::Colliders::shapes(shapes)));
+                    l.notes.push(format!("Hair styling is damped near the {} round pieces and {} boxes of the body bound ({}) and of {worn} garment bounds, as the game does. A garment's bound is found by its name (`char_bipedbounds_<sex>_<garment>`); that the game damps hair against it is inferred, and the 3 cm falloff is a guess.", shapes.len(), boxes.len(), bound.map(|b| b.0).unwrap_or_default()));
+                    l.collide = Some(Arc::new(sixng_core::groom::Colliders::shapes(shapes).with_boxes(boxes)));
                 } else {
                     let hairy = ["hair", "brows", "beard", "lashes", "body hair", "eyes", "eyecaps", "teeth", "teeth accessory"];
                     let pts: Vec<[f32; 3]> = skin.iter().filter(|(n, _)| !l.hats.contains(&n.to_ascii_lowercase()) && !hairy.contains(&sixng_core::pedlook::slot_of(&n.to_ascii_lowercase()).as_str())).flat_map(|(_, p)| p.iter().copied()).collect();

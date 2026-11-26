@@ -490,8 +490,8 @@ pub const ROOT_FLAGS: &[(u32, &str, bool)] = &[
 /// length of the segment between the two centres; its bbox y half extent
 /// is length / 2 + the larger radius on every piece checked. Kind 0 is a
 /// sphere of the margin's radius. The larger radius is at the hip end of
-/// the thigh pieces, which is +y. Boxes (hands) and kind 13 (feet) are
-/// left out.
+/// the thigh pieces, which is +y. Kind 3 is a box filling its bbox
+/// (`bbox`, in the piece's frame). Kind 13 (feet) is left out.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BodyPiece {
     /// joaat of the bone name (`SKEL_Head`).
@@ -503,9 +503,11 @@ pub struct BodyPiece {
     pub r_pos: f32,
     pub r_neg: f32,
     pub length: f32,
+    /// The piece's bbox (min, max) in its own frame: +0x30 and +0x20.
+    pub bbox: [[f32; 3]; 2],
 }
 
-/// The round pieces of a body bound fragment (`BodyPiece`).
+/// The round pieces and boxes of a body bound fragment (`BodyPiece`).
 pub fn body_pieces(r: &Resource) -> Vec<BodyPiece> {
     let Ok(f) = try_decode(r) else { return Vec::new() };
     let n = r.sys.len();
@@ -523,8 +525,14 @@ pub fn body_pieces(r: &Resource) -> Vec<BodyPiece> {
         let (r_pos, r_neg, length) = match kind {
             0 => (margin, margin, 0.0),
             2 => (r.f32(b + 0x70), r.f32(b + 0x74), r.f32(b + 0x78)),
+            3 => (0.0, 0.0, 0.0),
             _ => continue,
         };
+        let v3 = |o: usize| [r.f32(b + o), r.f32(b + o + 4), r.f32(b + o + 8)];
+        let bbox = [v3(0x30), v3(0x20)];
+        if !(0..3).all(|i| bbox[0][i].is_finite() && bbox[1][i].is_finite() && bbox[0][i] <= bbox[1][i] && bbox[1][i] - bbox[0][i] < 2.0) {
+            continue;
+        }
         if ![r_pos, r_neg, length].iter().all(|v| v.is_finite() && *v >= 0.0 && *v < 2.0) {
             continue;
         }
@@ -540,7 +548,7 @@ pub fn body_pieces(r: &Resource) -> Vec<BodyPiece> {
         if !finite(&local) {
             continue;
         }
-        out.push(BodyPiece { bone_hash, local, kind, r_pos, r_neg, length });
+        out.push(BodyPiece { bone_hash, local, kind, r_pos, r_neg, length, bbox });
     }
     out
 }

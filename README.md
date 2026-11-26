@@ -989,11 +989,18 @@ again**).
 - **Body sliders** (weight −1…1, muscle 0…1, breasts −1…1 and butt 0…1,
   the game's `gcbreasts` and `gcbutt` controls, and under **Regions** the
   12 weight and 12 muscle regions; the overall weight and muscle set every
-  region): an outfit opens in its own body-shape preset, read from
-  `common.rpf`'s body-type XML (the outfit's `BodyShapePreset` tag, e.g.
-  `Average`, names a profile `BODYSHAPE_<tag>`; its first preset gives the
-  control values; an outfit whose word names no profile, such as
-  Lucia's and Jason's `Skinny`, opens neutral), **Reset** goes back to it
+  region): an outfit opens in its own body-shape preset (since
+  2026-11-26 read the way the game does it: the outfit's `BodyShapePreset`
+  variation includes body-shape kits, and their tags name preset items of
+  the body-shape preset PSO in `anim.rpf` that list control values, applied
+  kit by kit in include order, a later value replacing an earlier one; an
+  outfit that includes two presets gets both, the later one winning where
+  they set the same control; Mandy opens with
+  muscle 0.2, fuller hips, thighs and breasts, Lucia with fuller hips,
+  thighs and butt, Jason muscular. The `Average` / `Skinny` words are only
+  labels: the same word gives different values per character. An outfit
+  without kits falls back to `common.rpf`'s body-type XML profile
+  `BODYSHAPE_<word>`), **Reset** goes back to it
   and **Neutral** sets every control to 0. `outfit --look` exports use the preset too unless
   `--body-shape` is given. `--body <w>,<m>[,<b>,<t>]` or `--body` with a
   `--body-shape` spec sets the shape for screenshots instead of the
