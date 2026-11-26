@@ -148,8 +148,64 @@ fn sun_shadow(p: vec3<f32>) -> f32 {
     return 1.0;
 }
 
-// share of a baked map tile's colour taken as the ground's reflectance
-const TILE_ALBEDO: f32 = 0.6;
+fn ground_hash(p: vec2<f32>) -> f32 {
+    let q = fract(p * vec2(0.1031, 0.1030));
+    let d = dot(q, q.yx + 33.33);
+    return fract((q.x + q.y) * (q.x + d));
+}
+
+fn ground_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(ground_hash(i), ground_hash(i + vec2(1.0, 0.0)), u.x),
+               mix(ground_hash(i + vec2(0.0, 1.0)), ground_hash(i + vec2(1.0, 1.0)), u.x), u.y);
+}
+
+// Reflectance of made-up ground at p (world, true height) with normal n:
+// sand near the sea, dry grass and scrub inland, darker woods in patches,
+// rock on steep slopes (our choice: the map tiles hold no ground types).
+fn filled_ground(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    let big = ground_noise(p.xz / 380.0);
+    let mid = ground_noise(p.xz / 60.0 + 7.3);
+    let fine = ground_noise(p.xz / 23.0 + 3.1);
+    let sand = vec3(0.42, 0.36, 0.25);
+    let grass = vec3(0.17, 0.19, 0.09);
+    let scrub = vec3(0.12, 0.13, 0.07);
+    let woods = vec3(0.06, 0.08, 0.04);
+    let rock = vec3(0.24, 0.22, 0.19);
+    var c = mix(grass, scrub, smoothstep(0.35, 0.65, mid));
+    c = mix(c, woods, smoothstep(0.55, 0.7, big) * 0.85);
+    // the beach band just above the sea
+    c = mix(sand, c, smoothstep(-2.5, 0.5, p.y + (mid - 0.5) * 2.0));
+    c = mix(c, rock, smoothstep(0.3, 0.5, 1.0 - n.y));
+    return c * (0.88 + 0.24 * fine);
+}
+
+// The map bake's colour by height (mapbake `hypso`, sRGB 0 to 1).
+fn tile_hypso(z: f32) -> vec3<f32> {
+    var zs = array<f32, 7>(-50.0, 0.0, 15.0, 60.0, 150.0, 350.0, 800.0);
+    var cs = array<vec3<f32>, 7>(
+        vec3(0.20, 0.35, 0.55), vec3(0.55, 0.60, 0.45), vec3(0.50, 0.62, 0.38),
+        vec3(0.62, 0.66, 0.42), vec3(0.70, 0.62, 0.45), vec3(0.62, 0.55, 0.48),
+        vec3(0.95, 0.95, 0.95));
+    for (var k = 0; k < 6; k++) {
+        if (z <= zs[k + 1]) {
+            return mix(cs[k], cs[k + 1], clamp((z - zs[k]) / (zs[k + 1] - zs[k]), 0.0, 1.0));
+        }
+    }
+    return cs[6];
+}
+
+// Relief factor (about 1 on flat ground) from a tile texel (linear) at
+// height z: the bake's hill shade (0.35 to 1.1, 0.85 on the flat).
+fn tile_relief(tile: vec3<f32>, z: f32) -> f32 {
+    let srgb = pow(max(tile, vec3(0.0)), vec3(1.0 / 2.2));
+    let h = tile_hypso(z);
+    let shade = dot(srgb, vec3(0.3, 0.6, 0.1)) / max(dot(h, vec3(0.3, 0.6, 0.1)), 0.05);
+    return mix(1.0, clamp(shade / 0.85, 0.4, 1.4), 0.5);
+}
+
 // how far the map's terrain is drawn under its real height (world3d SINK, m)
 const TILE_SINK: f32 = 1.5;
 
@@ -1618,7 +1674,18 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             // just under it don't blotch it at a low sun
             let lsh = normalize(F.sun_dir.xyz);
             let tsh = sun_shadow(i.world + vec3(0.0, TILE_SINK, 0.0) + lsh * 0.5);
-            col = albedo * TILE_ALBEDO * ((sun_e_shadowed(i.world, tsh) * (0.5 + 0.5 * ndl) + local_e(i.world, n)) / 3.14159 + amb_d);
+            // the baked tiles hold only a colour by height and their own hill
+            // shading (mapbake's terrain layer), and filled cells a flat
+            // green: the land is drawn as a ground made up from height, slope
+            // and noise instead, lit by the scene (the tiles' paint still
+            // marks the sea below)
+            let g = filled_ground(i.world + vec3(0.0, TILE_SINK, 0.0), n);
+            // the tiles' hill shading holds relief finer than the terrain
+            // mesh (embankments, pads): its share of the tile's brightness
+            // over the bake's colour for this height, at half strength
+            // (cells filled from the height map have no tile: none)
+            let rel = select(1.0, tile_relief(base.rgb, i.world.y + TILE_SINK), (M.flags.x & 1u) != 0u);
+            col = g * rel * ((sun_e_shadowed(i.world, tsh) * max(ndl, 0.0) + local_e(i.world, n)) / 3.14159 + amb_d);
             // the tiles' painted water (the map's water and no-data colour)
             // is shaded as the game's water on sea cells (no height, or deeper
             // than the beaches: vertex alpha 0, blending over a shore cell); on cells with a
