@@ -7133,15 +7133,26 @@ fn load_query_sel(
             // own; strand and card hair are not colliders).
             if !l.hair.is_empty() {
                 let rig = |k: &str| parts.iter().any(|p| p.name.as_deref().is_some_and(|n| n.contains(k)));
-                let bound = if rig("_fr1_") { Some("defaultfemale_fr1_000_bounds") } else if rig("_mr1_") { Some("defaultmale_mr1_000_bounds") } else { None };
-                let shapes = bound.map(|b| body_tapers(&a, &ix.entries, b, &model.joints)).unwrap_or_default();
+                let bound = if rig("_fr1_") { Some(("defaultfemale_fr1_000_bounds", "female")) } else if rig("_mr1_") { Some(("defaultmale_mr1_000_bounds", "male")) } else { None };
+                let mut shapes = bound.map(|(b, _)| body_tapers(&a, &ix.entries, b, &model.joints)).unwrap_or_default();
+                // A garment's own bound is named after its drawable:
+                // `char_bipedbounds_<sex>_<drawable>`. Its pieces are added
+                // to the body's (they enclose it where the garment is).
+                let mut worn = 0;
+                if let (Some((_, sex)), false) = (bound, shapes.is_empty()) {
+                    for n in parts.iter().filter_map(|p| p.name.as_deref()) {
+                        let t = body_tapers(&a, &ix.entries, &format!("char_bipedbounds_{sex}_{}", n.to_ascii_lowercase()), &model.joints);
+                        worn += usize::from(!t.is_empty());
+                        shapes.extend(t);
+                    }
+                }
                 if std::env::var("SIXNG_DEBUG_HAIR").is_ok() {
                     for t in &shapes {
                         eprintln!("body piece {:?} {:?} r {:.3} {:.3}", t.a, t.b, t.ra, t.rb);
                     }
                 }
                 if !shapes.is_empty() {
-                    l.notes.push(format!("Hair styling is damped near the {} pieces of the body bound ({}), as the game does. Garment bounds are not used.", shapes.len(), bound.unwrap_or_default()));
+                    l.notes.push(format!("Hair styling is damped near the {} pieces of the body bound ({}) and of {worn} garment bounds, as the game does. A garment's bound is found by its name (`char_bipedbounds_<sex>_<garment>`); that the game damps hair against it is inferred, and the 3 cm falloff is a guess.", shapes.len(), bound.map(|b| b.0).unwrap_or_default()));
                     l.collide = Some(Arc::new(sixng_core::groom::Colliders::shapes(shapes)));
                 } else {
                     let hairy = ["hair", "brows", "beard", "lashes", "body hair", "eyes", "eyecaps", "teeth", "teeth accessory"];
