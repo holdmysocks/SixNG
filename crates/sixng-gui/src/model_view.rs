@@ -4253,7 +4253,12 @@ impl ModelView {
         }
         ren.decal_bias = self.decal_bias;
         ren.ground = ground;
+        // a still view settles into the mean of many dither patterns (SIXNG_ACCUM=0: each frame on its own)
+        ren.accumulate = std::env::var("SIXNG_ACCUM").map_or(true, |v| v != "0");
         let tid = ren.render(rs, px, &self.cam, &self.look, &models, &under, &top);
+        if ren.accumulating() {
+            ctx.request_repaint();
+        }
         ui.painter().image(
             tid,
             rect,
@@ -4354,6 +4359,8 @@ impl ModelView {
             // dither pattern (the game averages its per-frame dither over time)
             let frames = std::env::var("SIXNG_SHOT_FRAMES").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1).clamp(1, 64);
             let mut averaged = None;
+            // a plain shot waits for the still-camera mean to settle
+            let ready = ready && (frames > 1 || !ren.accumulating());
             let ready = ready && (frames == 1 || match ren.read_back(rs) {
                 Some((w, h, px)) => {
                     if self.shot_acc.1.len() != px.len() {
