@@ -26,6 +26,16 @@ use std::time::Instant;
 
 /// Near ring (fraction of the HD band) drawn per placement.
 pub const NEAR: f32 = 0.6;
+
+/// The near ring the cells draw outside of: `NEAR`, or
+/// `SIXNG_CELLS_NEAR` (a fraction of the HD band, for measuring draw
+/// counts; the cells' contents and simplification stay as for `NEAR`).
+fn near_ring() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SIXNG_CELLS_NEAR").ok().and_then(|v| v.parse::<f32>().ok()).filter(|v| *v > 0.05 && *v <= 1.0).unwrap_or(NEAR)
+    })
+}
 /// GPU bytes of loaded cells kept before the least recently drawn go.
 const GPU_CAP: u64 = 2560 << 20;
 /// Longest a cell keeps drawing after the camera came close (s).
@@ -590,7 +600,7 @@ impl Cells {
         }
         let ix = self.index.clone().unwrap();
         let k = d.radii[0] / 330.0;
-        let near = NEAR * d.radii[0];
+        let near = near_ring() * d.radii[0];
         let dir = Self::dir(work).join(&ix.tag);
         let now = Instant::now();
         // handovers whose placements have all loaded end now
