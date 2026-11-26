@@ -1839,6 +1839,8 @@ impl App {
             let v: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse::<f32>().ok()).collect();
             if v.len() == 3 {
                 m.hair.colour = [v[0] / 255.0, v[1] / 255.0, v[2] / 255.0];
+                // kept over the stored colours of the character's hair
+                m.auto.hair_colour = Some(m.hair.colour);
             }
         }
         // --pose rest|down|walk|sit|wave: a character's pose
