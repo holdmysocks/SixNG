@@ -257,18 +257,26 @@ fn cloud_hash(p: vec2<f32>) -> f32 {
     return fract((q.x + q.y) * (q.x + d));
 }
 
-// The cover noise: four octaves of value noise baked once (atmo.rs) into a
-// texture that repeats every CLOUD_PERIOD noise cells.
-@group(0) @binding(26) var t_cloud_noise: texture_2d<f32>;
-@group(0) @binding(27) var rep_lin: sampler;
-const CLOUD_PERIOD: f32 = 32.0;
+fn cloud_vnoise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(cloud_hash(i), cloud_hash(i + vec2(1.0, 0.0)), u.x),
+               mix(cloud_hash(i + vec2(0.0, 1.0)), cloud_hash(i + vec2(1.0, 1.0)), u.x), u.y);
+}
 
 // Cloud density (0 to 1) of the column over world (x, z).
 fn cloud_density(xz: vec2<f32>) -> f32 {
     let cover = S.cloud0.x;
     if (cover <= 0.01) { return 0.0; }
-    let q = (xz - S.cloud1.xy * S.water4.w) / S.cloud1.w;
-    let f = textureSampleLevel(t_cloud_noise, rep_lin, q / CLOUD_PERIOD, 0.0).r;
+    var q = (xz - S.cloud1.xy * S.water4.w) / S.cloud1.w;
+    var f = 0.0;
+    var a = 0.5;
+    for (var k = 0; k < 4; k++) {
+        f += a * cloud_vnoise(q);
+        q = q * 2.03 + vec2(17.1, 9.2);
+        a *= 0.5;
+    }
     // more cover lowers the threshold; the noise sum is about 0.2 to 0.8
     let t = mix(0.74, 0.18, cover);
     return smoothstep(t, t + 0.3, f);
