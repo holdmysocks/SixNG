@@ -1169,6 +1169,17 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   models smaller than three of their texels. Models and map cells cast (opaque and cut-out surfaces);
   skinned, see-through and decal surfaces do not. Only what the camera
   draws casts: a caster just outside the view leaves no shadow.
+- **Placed lights** (HDR map): the map's exterior lights that are on at
+  the hour (their hour mask and night flag) light the scene and glow. Those
+  within about 500 m of the camera are shaded on every surface: inverse
+  square, windowed to zero at the light's range, at most 32 lights per
+  12 m cell of a grid around the camera, brightest first. Every lit light
+  within 600 m, and the brighter ones (intensity 50 or more) to 3 km, draw
+  a corona: the light's irradiance at the eye spread over a small Gaussian
+  of at least a pixel, dimmed by the haze. Our choices: one intensity unit
+  gives 1 lux at 1 m, all lights shine as points (spot cones and the
+  falloff exponent are not used yet). `--no-placed-lights`, or the
+  **placed lights shine** checkbox, turns them off.
 - **Water** (HDR map): the sea and the game's water meshes are shaded
   from the timecycle's `water_*` values. Wind waves set the normal: the
   peak wavelength comes from `water_ocean_beaufort_scale` and
@@ -1323,7 +1334,7 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   (they showed as floating black boxes); the model viewer still shows them.
 
 Map 3D screenshots: `--tab map3d --center X,Y --height H --yaw DEG --pitch
-DEG [--quality low|medium|high|ultra] [--detail 0-1] [--tod H] [--weather W] [--no-shadows] [--lights]
+DEG [--quality low|medium|high|ultra] [--detail 0-1] [--tod H] [--weather W] [--no-shadows] [--no-placed-lights] [--lights]
 [--roads] [--no-terrain] [--fog F] [--max-tex PX] [--no-textures]
 [--no-hd-fallback] [--kinds a,b] [--lods a,b] [--ram-cap GB]
 [--no-windows] [--no-decal-bias] [--show-proxies] [--fly X,Y,H,SECONDS]

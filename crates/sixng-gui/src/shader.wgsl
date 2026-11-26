@@ -86,6 +86,16 @@ struct Shadow {
 @group(0) @binding(13) var t_shadow: texture_depth_2d_array;
 @group(0) @binding(14) var samp_shadow: sampler_comparison;
 
+// The map's placed lights near the camera (lights.rs): the lights, and a
+// grid over them (header: origin x, z and cell size as f32 bits, cells per
+// side; per cell the first index and count; then the index list).
+struct Light {
+    pos_range: vec4<f32>,
+    col_fe: vec4<f32>,
+};
+@group(0) @binding(22) var<storage, read> LT: array<Light>;
+@group(0) @binding(23) var<storage, read> LG: array<u32>;
+
 fn hdr() -> bool { return S.flags.x == 1u; }
 
 // How lit p is in cascade c (1 lit, 0 shadowed; -1 outside the cascade).
@@ -353,6 +363,54 @@ fn map_finish(col0: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
         col = mix(lit, col, tf);
     }
     return min(col * SCN.v[0].x, vec3(30000.0));
+}
+
+// Illuminance (lux) of a placed light of intensity 1 at 1 m: our choice,
+// tuned by eye against the night timecycle (not decoded).
+const LIGHT_K: f32 = 1.0;
+// a light's sphere: nothing nearer than this (m)
+const LIGHT_NEAR: f32 = 0.25;
+
+// Illuminance on a surface at p facing n from the placed lights whose
+// range reaches p: inverse square, windowed to zero at the range.
+fn local_e(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    if (!hdr()) { return vec3(0.0); }
+    let cells = LG[3];
+    if (cells == 0u) { return vec3(0.0); }
+    let o = vec2(bitcast<f32>(LG[0]), bitcast<f32>(LG[1]));
+    let cs = bitcast<f32>(LG[2]);
+    let g = (p.xz - o) / cs;
+    if (any(g < vec2(0.0)) || any(g >= vec2(f32(cells)))) { return vec3(0.0); }
+    let c = u32(g.y) * cells + u32(g.x);
+    let first = LG[4u + c * 2u];
+    let count = LG[4u + c * 2u + 1u];
+    let base = 4u + cells * cells * 2u;
+    var e = vec3(0.0);
+    for (var k = 0u; k < count; k++) {
+        let l = LT[LG[base + first + k]];
+        let d = l.pos_range.xyz - p;
+        let d2 = max(dot(d, d), LIGHT_NEAR * LIGHT_NEAR);
+        let q = d2 / (l.pos_range.w * l.pos_range.w);
+        let win = clamp(1.0 - q * q, 0.0, 1.0);
+        let ndl = max(dot(n, d * inverseSqrt(d2)), 0.0);
+        e += l.col_fe.rgb * (LIGHT_K * win * win * ndl / d2);
+    }
+    return e;
+}
+
+// The map's frame for light added over a surface (the coronas): its
+// transmittance through the haze and fog, then the exposure.
+fn map_finish_added(col0: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
+    let v = p - F.cam_pos.xyz;
+    let d_km = length(v) * 0.001;
+    let c = F.view_proj * vec4(p, 1.0);
+    let ndc = c.xy / max(c.w, 1e-6);
+    let uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    let z = sqrt(clamp(d_km / max(S.radii.w, 0.001), 0.0, 1.0));
+    let ap = textureSampleLevel(t_ap, lin_clamp, vec3(uv, max(z - 0.5 / AP_N, 0.5 / AP_N)), 0.0);
+    let k = clamp(d_km / ap_depth(0.0), 0.0, 1.0);
+    let t = mix(1.0, ap.a, k) * height_fog(p);
+    return min(col0 * t * SCN.v[0].x, vec3(30000.0));
 }
 
 @group(1) @binding(0) var<uniform> M: Mat;
@@ -1404,7 +1462,7 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     let Fr = f0 + (1.0 - f0) * pow(1.0 - max(dot(h, v), 0.0), 5.0);
     let spec = D * G * Fr / max(4.0 * ndl * ndv, 0.001);
     let kd = (1.0 - Fr) * (1.0 - metal);
-    let direct = (kd * albedo / 3.14159 + spec) * sun_e(i.world) * ndl;
+    let direct = (kd * albedo / 3.14159 + spec) * sun_e(i.world) * ndl + kd * albedo / 3.14159 * local_e(i.world, n);
     let amb_d = ambient(n);
     let fr_v = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
     let r = reflect(-v, n);
@@ -1538,7 +1596,7 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             // just under it don't blotch it at a low sun
             let lsh = normalize(F.sun_dir.xyz);
             let tsh = sun_shadow(i.world + vec3(0.0, TILE_SINK, 0.0) + lsh * 0.5);
-            col = albedo * TILE_ALBEDO * (sun_e_shadowed(i.world, tsh) * (0.5 + 0.5 * ndl) / 3.14159 + amb_d);
+            col = albedo * TILE_ALBEDO * ((sun_e_shadowed(i.world, tsh) * (0.5 + 0.5 * ndl) + local_e(i.world, n)) / 3.14159 + amb_d);
             // the tiles' painted water (the map's water and no-data colour)
             // is shaded as the game's water on sea cells (no height, or deeper
             // than the beaches: vertex alpha 0, blending over a shore cell); on cells with a
@@ -1826,7 +1884,7 @@ fn fs_cell(i: COut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let Fr = f0 + (1.0 - f0) * pow(1.0 - max(dot(h, v), 0.0), 5.0);
     let spec = D * G * Fr / max(4.0 * ndl * ndv, 0.001);
     let kd = 1.0 - Fr;
-    let direct = (kd * albedo / 3.14159 + spec) * sun_e(i.world) * ndl;
+    let direct = (kd * albedo / 3.14159 + spec) * sun_e(i.world) * ndl + kd * albedo / 3.14159 * local_e(i.world, n);
     let amb_d = ambient(n);
     let fr_v = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
     let env = environment(reflect(-v, n), rough) * F.misc.w;
@@ -1858,4 +1916,56 @@ fn fs_shadow_cell(i: COut) {
     if ((i.lf.y & 3u) == 1u && a < 0.5) {
         discard;
     }
+}
+
+// Coronas of the map's placed lights (lights.rs `Glow`): a camera-facing
+// sprite per light, added to the HDR target. The light's irradiance at the
+// eye (intensity / d^2) is spread over a Gaussian of at least a pixel, so a
+// far light shrinks to a dim point instead of flickering.
+struct GlowIn {
+    @location(0) pos: vec4<f32>,
+    @location(1) col: vec4<f32>,
+};
+struct GlowOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) rad: vec3<f32>,
+    @location(2) world: vec3<f32>,
+};
+
+// world radius of a corona's core (m)
+const GLOW_R: f32 = 0.12;
+
+@vertex
+fn vs_glow(g: GlowIn, @builtin(vertex_index) vi: u32) -> GlowOut {
+    var o: GlowOut;
+    let corner = vec2(f32(vi & 1u), f32((vi >> 1u) & 1u)) * 2.0 - 1.0;
+    let c = F.view_proj * vec4(g.pos.xyz, 1.0);
+    let d = max(length(g.pos.xyz - F.cam_pos.xyz), 0.5);
+    // angle of one pixel (rad), from the inverse view-projection
+    let h = max(F.frame.z, 1.0);
+    let a = F.inv_view_proj * vec4(0.0, 0.0, 1.0, 1.0);
+    let b = F.inv_view_proj * vec4(0.0, 2.0 / h, 1.0, 1.0);
+    let pix = length(normalize(b.xyz / b.w - F.cam_pos.xyz) - normalize(a.xyz / a.w - F.cam_pos.xyz));
+    // sigma of the Gaussian in pixels; the sprite reaches 3 sigma
+    let sig_px = max(GLOW_R / d / max(pix, 1e-6), 0.7);
+    let half_px = 3.0 * sig_px;
+    let w = max(F.frame.y, 1.0);
+    o.clip = c + vec4(corner.x * half_px * 2.0 / w, corner.y * half_px * 2.0 / h, 0.0, 0.0) * c.w;
+    o.uv = corner * 3.0;
+    // radiance at the centre: the irradiance at the eye over the Gaussian's solid angle
+    let e_eye = g.col.rgb * LIGHT_K * g.pos.w / (d * d);
+    let sig_rad = sig_px * pix;
+    o.rad = e_eye / (2.0 * PI * sig_rad * sig_rad);
+    o.world = g.pos.xyz;
+    if (c.w <= 0.0) { o.clip = vec4(0.0, 0.0, -1.0, 1.0); }
+    return o;
+}
+
+@fragment
+fn fs_glow(i: GlowOut) -> @location(0) vec4<f32> {
+    let r2 = dot(i.uv, i.uv);
+    if (r2 > 9.0) { discard; }
+    let l = i.rad * exp(-0.5 * r2);
+    return vec4(map_finish_added(l, i.world), 0.0);
 }
