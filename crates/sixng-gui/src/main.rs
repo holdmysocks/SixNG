@@ -233,6 +233,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wgpu_options: wgpu_options(cli.has("no-vsync"), cli.get("gpu").map(|s| s.to_string())),
         ..Default::default()
     };
+    GPU_LOST_DIALOG.store(!cli.has("exit"), std::sync::atomic::Ordering::Relaxed);
+    exit_on_panic_after_gpu_loss();
     eframe::run_native(
         "SixNG Extractor",
         opts,
@@ -260,6 +262,76 @@ fn watch_gpu_loss(device: &eframe::egui_wgpu::wgpu::Device) {
         GPU_LOST.store(true, std::sync::atomic::Ordering::Release);
     });
     device.on_uncaptured_error(Arc::new(gpu_error));
+}
+
+/// Whether the GPU device has been lost.
+pub(crate) fn gpu_lost() -> bool {
+    GPU_LOST.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The exit code after a device loss (a panic exits with 101).
+const GPU_LOST_EXIT: i32 = 3;
+
+/// Show the restart message box after a device loss (off with `--exit`, for
+/// unattended runs).
+static GPU_LOST_DIALOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// After a device loss nothing can draw any more: egui-wgpu's next frame
+/// panics when its staging buffers cannot be made, and eframe gives the app
+/// no way to skip that paint. So say so in a native message box, which needs
+/// no GPU, and exit with [`GPU_LOST_EXIT`] before another frame is painted.
+/// The first caller shows the box; any other thread that gets here waits.
+fn exit_after_gpu_loss() -> ! {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let msg = "The GPU device was lost (a driver reset, or out of GPU memory), so the viewer cannot draw any more. Restart the viewer.";
+        eprintln!("[gpu] {msg} Exiting with code {GPU_LOST_EXIT}.");
+        if GPU_LOST_DIALOG.load(std::sync::atomic::Ordering::Relaxed) {
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Error)
+                .set_title("SixNG Extractor")
+                .set_description(msg)
+                .set_buttons(rfd::MessageButtons::Ok)
+                .show();
+        }
+        std::process::exit(GPU_LOST_EXIT);
+    });
+    loop {
+        std::thread::park();
+    }
+}
+
+/// A panic once the device is lost (in egui-wgpu, or on a thread that still
+/// uploads to the device) is the loss and not a bug: exit as
+/// [`exit_after_gpu_loss`] does instead of with the panic's code.
+fn exit_on_panic_after_gpu_loss() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if gpu_lost() {
+            eprintln!("[gpu] after the device loss: {info}");
+            exit_after_gpu_loss();
+        }
+        default(info);
+    }));
+}
+
+/// `SIXNG_TEST_GPU_LOSS=<frames>`: destroy the device after that many frames,
+/// to test the device-loss path without a driver fault.
+fn test_gpu_loss(rs: Option<&eframe::egui_wgpu::RenderState>) {
+    static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let (Some(rs), Some(n)) = (rs, std::env::var("SIXNG_TEST_GPU_LOSS").ok().and_then(|v| v.parse::<u64>().ok())) else {
+        return;
+    };
+    if FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 == n {
+        eprintln!("[gpu] SIXNG_TEST_GPU_LOSS: destroying the device");
+        // a driver fault marks the device invalid and calls the lost callback
+        // in one step; destroy() calls it only once the queue has drained
+        // (from a later poll), so set the flag first, as the callback would,
+        // and wait for the callback to log the reason
+        GPU_LOST.store(true, std::sync::atomic::Ordering::Release);
+        rs.device.destroy();
+        let _ = rs.device.poll(eframe::egui_wgpu::wgpu::PollType::wait_indefinitely());
+    }
 }
 
 /// The uncaptured-error handler: as wgpu's default (a panic) while the
@@ -906,11 +978,6 @@ impl App {
             self.cli_started = true;
             self.apply_cli(&ctx);
         }
-        if GPU_LOST.load(std::sync::atomic::Ordering::Acquire) {
-            egui::Panel::top("gpu_lost").show(ui, |ui| {
-                ui.colored_label(egui::Color32::from_rgb(230, 80, 70), "The GPU device was lost (a driver reset, or out of GPU memory): the 3D views no longer draw. Restart the viewer.");
-            });
-        }
         egui::Panel::top("tabs").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Library, "🏠 Library");
@@ -1408,16 +1475,29 @@ impl App {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if gpu_lost() {
+            exit_after_gpu_loss();
+        }
         self.logic_inner(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // before the 3D views, screenshots and frame timers touch the device,
+        // and before egui-wgpu paints this frame
+        if gpu_lost() {
+            exit_after_gpu_loss();
+        }
+        test_gpu_loss(frame.wgpu_render_state());
         self.ui_inner(
             ui,
             frame.wgpu_render_state(),
             #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
             None,
         );
+        // lost while this frame drew: egui-wgpu would paint it next
+        if gpu_lost() {
+            exit_after_gpu_loss();
+        }
     }
 }
 
@@ -1443,6 +1523,12 @@ impl metal4_app::UiApp for App {
         if let Err(error) = renderer.set_texture_cache_dir(&self.work) {
             eprintln!(
                 "[metal-io] texture cache disabled because {} could not be initialized: {error:#}",
+                self.work
+            );
+        }
+        if let Err(error) = renderer.set_model_cache_dir(&self.work) {
+            eprintln!(
+                "[metal-io] model cache disabled because {} could not be initialized: {error:#}",
                 self.work
             );
         }

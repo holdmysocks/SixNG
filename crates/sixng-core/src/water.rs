@@ -1342,6 +1342,47 @@ fn shader_json(s: &crate::drawable::Shader, set: &crate::ttpf::TtpfSet) -> Value
     json!({"shader": crate::names::shader(&s.name_hash).unwrap_or_else(|| s.name_hash.clone()), "flags": s.flags, "textures": tex, "constants": consts})
 }
 
+/// How a tile's water height texture reads. A texel holds the surface
+/// height relative to the placing entity: `z = origin z + (2 v - 1) H`,
+/// where `H` is the largest distance of a surface vertex from the origin's
+/// height (0.5 on a flat tile), and 0 marks texels without water. Checked
+/// by sampling the texture under every surface vertex (nearest texel,
+/// texels of 0 skipped). Returns (H, check).
+fn height_texture_check(t: &InlandTile, set: &crate::ttpf::TtpfSet) -> Option<(f32, Value)> {
+    let (store, tx) = set.get(t.height_tex?)?;
+    if t.uvs.len() != t.positions.len() || tx.width < 8 {
+        return None;
+    }
+    let (f, ch, w, h) = store.data(tx).ok().and_then(|d| crate::ttpf::decode_float_slice(tx, &d, 0, 0).ok())?;
+    let surface = t.z_percentiles()[2] - 0.05;
+    let e = t.position[2];
+    let top: Vec<usize> = (0..t.positions.len()).filter(|&i| t.positions[i][2] >= surface).collect();
+    let hr = top.iter().map(|&i| (t.positions[i][2] - e).abs()).fold(0.0f32, f32::max);
+    let mut vals = Vec::new();
+    let mut err: Vec<f32> = top
+        .iter()
+        .filter_map(|&i| {
+            let [u, v] = t.uvs[i];
+            if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+                return None;
+            }
+            let (x, y) = (((u * w as f32) as u32).min(w - 1), ((v * h as f32) as u32).min(h - 1));
+            let val = f[((y * w + x) * ch) as usize];
+            (val > 0.01).then(|| {
+                vals.push(val);
+                (e + (2.0 * val - 1.0) * hr - t.positions[i][2]).abs()
+            })
+        })
+        .collect();
+    err.sort_by(f32::total_cmp);
+    let at = |q: f32| err.get(((err.len().max(1) - 1) as f32 * q) as usize).copied();
+    // share of texels with water
+    let wet = (0..(w * h) as usize).filter(|&k| f[k * ch as usize] > 0.0).count() as f32 / (w * h) as f32;
+    vals.sort_by(f32::total_cmp);
+    let median_value = vals.get(vals.len().saturating_sub(1) / 2).copied();
+    Some((hr, json!({"samples": err.len(), "median_error_m": at(0.5), "p95_error_m": at(0.95), "median_value": median_value, "wet_texel_share": wet})))
+}
+
 /// Every inland water surface placed on the map: the drawables of
 /// levels.rpf whose name gives an [`inland_kind`], placed by the map files'
 /// entities (not interior or group-local ones). Each is a tile of at most
@@ -1521,6 +1562,7 @@ fn write_inland(dir: &std::path::Path, tiles: &[InlandTile], check: &Value, set:
         })
         .collect();
     let tex_json = |h: Option<u64>| h.and_then(|h| pngs.get(&h)).cloned().unwrap_or(Value::Null);
+    let hchecks: Vec<Option<(f32, Value)>> = tiles.par_iter().map(|t| height_texture_check(t, set)).collect();
     let kind_name = |k: &str| INLAND_KINDS.iter().find(|(c, _)| *c == k).map_or("unknown", |(_, n)| *n);
     let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
     for t in tiles {
@@ -1528,12 +1570,14 @@ fn write_inland(dir: &std::path::Path, tiles: &[InlandTile], check: &Value, set:
     }
     let rows: Vec<Value> = tiles
         .iter()
-        .map(|t| {
+        .zip(&hchecks)
+        .map(|(t, hc)| {
             let z = t.z_percentiles();
             json!({"name": t.name, "kind": kind_name(t.kind), "kind_code": t.kind, "map_file": t.map_file,
                 "position": t.position, "rotation_world": t.rotation, "scale_xy_z": t.scale, "bbox": t.bbox(),
                 "surface_z": z[2], "z_percentiles_0_5_50_95_100": z, "triangles": t.indices.len() / 3, "vertices": t.positions.len(),
                 "shading": {"shader": t.shader["shader"], "flow_texture": tex_json(t.flow), "water_height_texture": tex_json(t.height_tex),
+                    "water_height_scale_m": hc.as_ref().map(|h| h.0), "water_height_check": hc.as_ref().map(|h| h.1.clone()),
                     "ripple_scale": t.shader["constants"]["ripplescale"], "ripple_bumpiness": t.shader["constants"]["ripplebumpiness"], "uv0": !t.uvs.is_empty()},
                 "shader": t.shader})
         })
@@ -1554,11 +1598,18 @@ fn write_inland(dir: &std::path::Path, tiles: &[InlandTile], check: &Value, set:
     crate::atomic::write(&dir.join("inland.glb"), crate::gltf::mesh_glb("inland_water", &groups, &mats, &[], json!({"coordinates": "world space"})))?;
     let kinds: serde_json::Map<String, Value> = counts.iter().map(|(k, n)| (kind_name(k).to_string(), json!(n))).collect();
     let still = tiles.iter().filter(|t| t.flow.and_then(|h| pngs.get(&h)).is_some_and(|v| v["width"] == 4)).count();
-    let rep = json!({"tiles": tiles.len(), "kinds": kinds, "flow_textures": tiles.iter().filter_map(|t| t.flow).collect::<std::collections::HashSet<_>>().len(), "tiles_with_placeholder_flow": still, "check_against_height_map": check});
+    let sloped: Vec<(f32, f32)> = hchecks.iter().flatten().filter(|(h, c)| *h > 0.05 && c["samples"].as_u64().unwrap_or(0) > 0).map(|(h, c)| (*h, c["median_error_m"].as_f64().unwrap_or(f64::MAX) as f32)).collect();
+    let flat: Vec<&Value> = hchecks.iter().flatten().filter(|(h, _)| *h <= 0.05).map(|(_, c)| c).collect();
+    let half = flat.iter().filter(|c| c["median_value"].as_f64().is_some_and(|v| (v - 0.5).abs() < 0.02)).count();
+    // flat tiles whose texture under the surface is not 0.5: the scale of their values is not known
+    let height_check = json!({"flat_tiles": flat.len(), "flat_tiles_reading_half": half, "sloped_tiles": sloped.len(),
+        "sloped_median_error_under_10pct_of_scale": sloped.iter().filter(|(h, e)| *e <= 0.1 * h).count(),
+        "sloped_median_error_under_3pct_of_scale": sloped.iter().filter(|(h, e)| *e <= 0.03 * h).count()});
+    let rep = json!({"tiles": tiles.len(), "kinds": kinds, "water_height_texture_check": height_check, "flow_textures": tiles.iter().filter_map(|t| t.flow).collect::<std::collections::HashSet<_>>().len(), "tiles_with_placeholder_flow": still, "check_against_height_map": check});
     write_json(&dir.join("inland.json"), &json!({
         "about": "Inland water surfaces (rivers, canals, creeks, reservoirs, ponds): the map's water drawables placed in world space, LOD 0. One tile per placement, at most 64 m across.",
         "coordinates": "RAGE world space, Z-up, metres; inland.glb is the same geometry in glTF Y-up (x, z, -y)",
-        "shading": "Every tile draws with the water_micro_geom shader. Its flow texture (BC3: flow direction in red and green around 128; 4 x 4 placeholder on still tiles) and water height texture (R16 float, 0 to 1) cover the tile's 64 m square: on the surface vertices UV0 is world x / 64 and -world y / 64 (u east, v south). Skirt vertices below the surface carry other UVs. `shader` lists every texture and constant of the shader; hex keys are parameter names not yet known.",
+        "shading": "Every tile draws with the water_micro_geom shader. Its flow texture (BC3: flow direction in red and green around 128; 4 x 4 placeholder on still tiles) and water height texture (R16 float, 0 to 1: surface height = origin z + (2 v - 1) * water_height_scale_m, where the scale is the largest distance of a surface vertex from the origin's height; 0.5 on flat tiles; 0 where there is no water, a mask that covers the mesh and reaches a little under the banks) cover the tile's 64 m square: on the surface vertices UV0 is world x / 64 and -world y / 64 (u east, v south). Skirt vertices below the surface carry other UVs. `shader` lists every texture and constant of the shader; hex keys are parameter names not yet known.",
         "summary": rep, "tiles": rows}))?;
     Ok(rep)
 }
