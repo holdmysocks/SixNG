@@ -1251,9 +1251,12 @@ pub fn load(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], off: u64) 
 /// empty). With `full` (a share of the stored strand count, 0..1) a groom
 /// that stores per-triangle counts is written as the full strand set
 /// grown from its guides (`Groom::coat`) instead of the guides alone, and
-/// every groom gets `<offset>.growth.json` (`Groom::growth_json`).
+/// every groom gets `<offset>.growth.json` (`Groom::growth_json`). With
+/// `head` (the head the grooms sit on, `hairexport::head_from_glb`) each
+/// grown groom names the head UV set its root UVs are in
+/// (`hairexport::tag_uv_set`).
 /// Returns (grooms written, errors).
-pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], only: &[u64], out: &std::path::Path, roots: bool, ribbons: Option<f32>, full: Option<f32>, progress: crate::export::Progress) -> Result<(usize, usize)> {
+pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], only: &[u64], out: &std::path::Path, roots: bool, ribbons: Option<f32>, full: Option<f32>, head: Option<&crate::hairexport::HeadUvs>, progress: crate::export::Progress) -> Result<(usize, usize)> {
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     // the cached list when there is a work folder (reading it anew takes minutes)
@@ -1299,7 +1302,9 @@ pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], o
                 // the grown strands with their root UV, width, clump and variant (`hairexport`)
                 (None, Some(_)) => {
                     let o = crate::hairexport::Options { density: full.unwrap_or(1.0), guides: false, ..Default::default() };
-                    let (prims, _) = crate::hairexport::piece(&g, &name, &o, serde_json::json!({"source": e.id}));
+                    let mut ex = serde_json::json!({"source": e.id, "groom": format!("{:x}", e.off), "bones": info.bones});
+                    crate::hairexport::tag_uv_set(&g, head, &mut ex);
+                    let (prims, _) = crate::hairexport::piece(&g, &name, &o, None, ex);
                     crate::gltf::strands_glb(&name, &prims, extras)
                 }
                 (Some(hw), None) => g.ribbon_glb(&name, hw, [0.08, 0.05, 0.03], extras),
@@ -1317,7 +1322,7 @@ pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], o
             Some((e.off, serde_json::json!({"id": e.id, "file": format!("{:x}.glb", e.off), "strands": g.strands, "points_per_strand": g.points_per_strand,
                 "stored_strands": g.stored_strands(), "written_strands": coat.as_ref().map_or(g.strands, |c| c.guides.len()), "strand_width_m": g.width,
                 "root_triangles": g.roots.len(), "total_length_m": (len * 1000.0).round() / 1000.0, "bones": info.bones, "category": info.category, "chain": info.chain, "lod": info.lod,
-                "root_box": g.root_box, "roots_in_box": g.roots_in_box(), "continuous": g.continuous()}).to_string(), true))
+                "root_box": g.root_box, "roots_in_box": g.roots_in_box(), "continuous": g.continuous(), "head_uv_set": head.and_then(|h| crate::hairexport::root_uv_set(&g, h)).map(|u| u.0)}).to_string(), true))
         })
         .collect();
     rows.sort_by_key(|r| r.0);

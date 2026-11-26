@@ -740,7 +740,7 @@ pub struct ModelView {
     /// 128) and the look whose rows the model's part materials carry.
     part_palette: Option<(PathBuf, Arc<Vec<u8>>)>,
     /// model, look and the configuration whose wear levels the image holds
-    part_ramp_done: Option<(PathBuf, usize, String)>,
+    part_ramp_done: Option<(PathBuf, usize, String, u8)>,
     /// Stickers the user placed on the loaded vehicle (custom liveries).
     pub livery: crate::livery::State,
     /// The part colours the uploaded wheels were coloured with.
@@ -1594,13 +1594,22 @@ impl ModelView {
         let ws = Workspace::new(&self.game, &self.work);
         let (idx, sel, slot, ctx) = (self.indexes.clone(), self.hair.selected.clone(), self.hair.export_done.clone(), ctx.clone());
         let full = self.hair.export_full.then_some(self.hair.density.clamp(0.05, 1.0));
+        let (shown, cache): (Vec<u64>, PathBuf) = (self.loaded.as_ref().map_or_else(Vec::new, |l| l.selected.clone()), self.cache_dir());
         // a folder per model, so an earlier `sixng grooms` export and its index stay as they are
         let model: String = self.loaded.as_ref().map_or("grooms", |l| l.source.split_whitespace().next().unwrap_or("").rsplit([':', '#', '/']).find(|s| !s.is_empty() && !s.starts_with("look=")).unwrap_or("grooms")).chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
         let out = Path::new(&self.work).join("out").join("hair").join(model);
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<String> {
                 let (a, ix) = index_for(&ws, "packs", &idx)?;
-                let (written, errors) = sixng_core::groom::export_grooms(&a, &ix.entries, &sel, &out, false, None, full, sixng_core::export::no_progress())?;
+                // the shown character's head as the viewer exported it, to name the
+                // head UV set the root UVs are in (`hairexport::tag_uv_set`)
+                let head = shown
+                    .iter()
+                    .filter_map(|o| ix.entries.iter().find(|e| e.off == *o))
+                    .filter(|e| e.name.as_deref().is_some_and(sixng_core::headskin::is_head))
+                    .find_map(|e| std::fs::read(cache.join("models").join(sixng_core::game::index_stem(&a.id)).join(export::export_base_name(e)).join("model.glb")).ok())
+                    .and_then(|b| sixng_core::hairexport::head_from_glb(&b));
+                let (written, errors) = sixng_core::groom::export_grooms(&a, &ix.entries, &sel, &out, false, None, full, head.as_ref(), sixng_core::export::no_progress())?;
                 let dir = out.join("grooms").join("packs");
                 Ok(format!("{written} groom(s) written to {}{}{}", dir.display(), if full.is_some() { " with the full strand set and a growth.json each" } else { " (guide strands)" }, if errors > 0 { format!("; {errors} failed") } else { String::new() }))
             })()
@@ -1656,7 +1665,7 @@ impl ModelView {
                         let ctx = ui.ctx().clone();
                         self.start_hair_export(&ctx);
                     }
-                    ui.checkbox(&mut self.hair.export_full, "full strands").on_hover_text("Write the strands the groom stores per root triangle, grown between its guides, instead of the guide strands alone (same as `sixng grooms --full`; the density slider below sets the share). The game's own clumping, curl and noise are not decoded, so the result is smoother than in game.");
+                    ui.checkbox(&mut self.hair.export_full, "full strands").on_hover_text("Write the strands the groom stores per root triangle, grown between its guides, instead of the guide strands alone, with clumping, curl and noise as the viewer draws them (same as `sixng grooms --full`; the density slider below sets the share). Each groom names the head UV set its root UVs are in, for scripts/blender_hair_curves.py.");
                     if self.hair.exporting {
                         ui.spinner();
                         ui.label("exporting (the first run reads the groom list, about a minute) …");
@@ -3173,7 +3182,7 @@ impl ModelView {
         // The palette rows of this look as an image for the part materials:
         // row = part id, 128 columns (a part with a colour of its own gets
         // that colour in every column).
-        let ramp_key = (l.model.path.clone(), idx, wear_key);
+        let ramp_key = (l.model.path.clone(), idx, wear_key, self.look.primer_set);
         let mut ramp_new = false;
         if self.part_ramp_done.as_ref() != Some(&ramp_key) {
             let file = l.model.path.parent().map(|d| d.join(pc["palette"].as_str().unwrap_or("vehicle_palette.png")));
@@ -3194,6 +3203,9 @@ impl ModelView {
                     // metalness and roughness, which the shader blends by the
                     // material map at each pixel
                     let surfaces = pc["surfaces"][idx].as_str().filter(|s| s.len() == 2048);
+                    // rows 1025..1281: each part id's primer palette row
+                    let primer_rows = pc["primer"][idx].as_str().filter(|s| s.len() == 256 * 12);
+                    let primer_sets = primer_set_masks(&pc["wear_records"], self.part_look_want.as_deref());
                     let mut px = vec![255u8; 128 * PART_RAMP_ROWS * 4];
                     // rows 768..: each part id's coat record, and in row
                     // 1024 the body paint's
@@ -3225,6 +3237,17 @@ impl ModelView {
                         // layer, then of the primer, per channel
                         for (c, v) in pw.bias.iter().chain(&pw.gamma).chain(&pw.primer_bias).chain(&pw.primer_gamma).enumerate() {
                             px[(768 + id) * 512 + (34 + c) * 4 + 3] = *v;
+                        }
+                        // columns 46 and 47: the primer's palette column
+                        // window (primerGradientStart, width)
+                        px[(768 + id) * 512 + 46 * 4 + 3] = pw.primer_gradient_start;
+                        px[(768 + id) * 512 + 47 * 4 + 3] = pw.primer_gradient_width;
+                        let set = primer_set(primer_sets.as_ref().map_or(1, |m| m[id]), self.look.primer_set);
+                        let prow = primer_rows.and_then(|s| usize::from_str_radix(&s[id * 12 + set * 4..id * 12 + set * 4 + 4], 16).ok()).filter(|r| *r != 0xffff);
+                        let out3 = &mut px[(1025 + id) * 512..(1026 + id) * 512];
+                        match prow.and_then(|r| pal.get(r * 512..r * 512 + 512)) {
+                            Some(src) => out3.copy_from_slice(src),
+                            None => out3.chunks_exact_mut(4).for_each(|c| c.copy_from_slice(&[PRIMER_GREY, PRIMER_GREY, PRIMER_GREY, 255])),
                         }
                         let stored = surfaces.and_then(|s| hex4(&s[id * 8..id * 8 + 8]));
                         let s = patched_surf.iter().rev().find(|p| p.0 == id).map(|p| p.1).or(stored).unwrap_or_else(|| surface_of_code(look[id][3]));
@@ -4632,7 +4655,9 @@ impl ModelView {
             }
             if self.look.wear_levels && self.look.wear_from_config {
                 ui.add(egui::Slider::new(&mut self.look.primer_amount, 0.0..=1.0).text("primer amount"))
-                    .on_hover_text("The game's second wear layer, the primer, drawn by its rules: its mask texture scaled per channel by the wear preset's primer intensities, summed, times this amount, and windowed by primerStart / primerEnd, where the first layer is not. The game takes the amount per vehicle while it runs (from the spawn data, or from a file that is not shipped), so it is yours to set; 0 (the default) turns the layer off. The primer's colour is a stand-in grey.");
+                    .on_hover_text("The game's second wear layer, the primer, drawn by its rules: its mask texture scaled per channel by the wear preset's primer intensities, summed, times this amount, and windowed by primerStart / primerEnd, where the first layer is not. The game takes the amount per vehicle while it runs (from the spawn data, or from a file that is not shipped), so it is yours to set; 0 (the default) turns the layer off. Its colour is the part's primer palette row, read at the column the summed mask gives through the preset's primerGradientStart / primerGradientEnd.");
+                ui.add(egui::Slider::new(&mut self.look.primer_set, 0..=2).text("primer set"))
+                    .on_hover_text("Which of the three primer colours a part takes when its configuration allows several (primerSets): the game picks one per vehicle at random. Parts allowed only one keep it.");
             }
             if !(self.look.wear_levels && self.look.wear_from_config) {
                 ui.add(egui::Slider::new(&mut self.look.wear, 0.0..=1.0).text("wear"))
@@ -5416,7 +5441,10 @@ fn load_parts(
 /// Rows of the part ramp image (128 wide): 256 of the first layer's palette
 /// rows, 256 of the second layer's, 256 of surfaces (`part_surface_row`),
 /// 256 of the parts' coats and one of the body paint's coat (`coat_row`).
-const PART_RAMP_ROWS: usize = 1025;
+const PART_RAMP_ROWS: usize = 1281;
+/// The primer's colour where a part has no primer palette row: a grey
+/// (sRGB byte of linear 0.2).
+const PRIMER_GREY: u8 = 124;
 
 /// One row of the part ramp image for a coat record (model.json
 /// `part_colours.coat.records`), all zero without one: the values in the
@@ -5529,6 +5557,10 @@ struct PartWear {
     primer_start: u8,
     primer_width: u8,
     primer_on_wear_mask: bool,
+    /// the window on the primer's summed mask that gives its palette
+    /// column (`primerGradientStart`, `primerGradientEnd` - start)
+    primer_gradient_start: u8,
+    primer_gradient_width: u8,
 }
 
 /// Each part id's wear under a configuration, from model.json
@@ -5597,6 +5629,8 @@ fn part_wear(w: &serde_json::Value, look: usize, config: Option<&str>) -> Option
         (o.primer_start, o.primer_width) = (byte(ps), byte(pe - ps));
         o.primer_cross = byte(b(PRIMER_CROSS));
         o.primer_on_wear_mask = p[sixng_core::meta7a::field_name(PRIMER_ON_WEAR_MASK)].as_bool() == Some(true);
+        let g = |k: &str| p[k].as_f64().unwrap_or(0.0).clamp(0.0, 255.0) as u8;
+        (o.primer_gradient_start, o.primer_gradient_width) = (g("primerGradientStart"), g("primerGradientEnd").saturating_sub(g("primerGradientStart")));
         for c in 0..3 {
             let [i, s, e] = WEAR_CONTROL[c].map(b);
             let act = ((v0 - s) / (e - s).max(1.0e-4)).clamp(0.0, 1.0);
@@ -5610,6 +5644,22 @@ fn part_wear(w: &serde_json::Value, look: usize, config: Option<&str>) -> Option
         }
     }
     Some(out)
+}
+
+/// Each part id's `primerSets` mask under a configuration (the low byte
+/// of its `levels_by_config` entry, or of `levels_default`); None when the
+/// model has no wear levels.
+fn primer_set_masks(w: &serde_json::Value, config: Option<&str>) -> Option<Vec<u8>> {
+    let levels = config.and_then(|k| w["levels_by_config"][k].as_str()).or_else(|| w["levels_default"].as_str()).filter(|s| s.len() == 1024)?;
+    Some((0..256).map(|id| u8::from_str_radix(&levels[id * 4 + 2..id * 4 + 4], 16).unwrap_or(1)).collect())
+}
+
+/// The primer set a part takes (rva 0x55bd870): the first of an order of
+/// the sets 0, 1, 2 that its `primerSets` mask allows, else 0. The game's
+/// order is a per-vehicle random one (rva 0x9aea00); here it starts at
+/// `first` and goes on in turn.
+fn primer_set(mask: u8, first: u8) -> usize {
+    (0..3).map(|k| (first as usize + k) % 3).find(|s| mask & (1 << s) != 0).unwrap_or(0)
 }
 
 /// The roughness and metalness (0 to 255 each) of the library's primer
@@ -8894,6 +8944,22 @@ mod tests {
     }
 
     #[test]
+    fn primer_set_from_the_mask() {
+        use super::{primer_set, primer_set_masks};
+        // one allowed set: always that one
+        assert_eq!(primer_set(1, 2), 0);
+        assert_eq!(primer_set(2, 0), 1);
+        // all three: the chosen first set
+        assert_eq!((0..3).map(|f| primer_set(7, f)).collect::<Vec<_>>(), [0, 1, 2]);
+        // none: set 0
+        assert_eq!(primer_set(0, 1), 0);
+        let levels = "0307".to_string() + &"0101".repeat(255);
+        let w = serde_json::json!({"levels_default": levels});
+        assert_eq!(primer_set_masks(&w, None).map(|m| (m[0], m[1])), Some((7, 1)));
+        assert_eq!(primer_set_masks(&serde_json::json!({}), None), None);
+    }
+
+    #[test]
     fn part_wear_from_the_configuration() {
         use super::{part_wear, PartWear};
         // part 0: level 1 on ladder 0, whose entry 1 has an age range 100..200;
@@ -8946,7 +9012,7 @@ mod tests {
         assert_eq!([row[3], row[7], row[11], row[15]], [1, 2, 3, 4]);
         assert_eq!(&row[..3], &[0, 0, 0]);
         // three blocks of 256 rows: the shader's row coordinates divide by this
-        assert_eq!(PART_RAMP_ROWS, 1025);
+        assert_eq!(PART_RAMP_ROWS, 1281);
         // an export without surfaces: the look's code, low = high
         assert_eq!(surface_of_code(165), [255, 255, 78, 78]);
         assert_eq!(surface_of_code(49), [0, 0, 255, 255]);
