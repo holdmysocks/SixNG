@@ -730,7 +730,7 @@ impl Groom {
         // blend of their +0x24 bytes. Without the table: the root normal.
         // SIXNG_STYLE_TWIST=-1 turns the other way.
         let twist_sign = std::env::var("SIXNG_STYLE_TWIST").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0);
-        let style = |pts: &mut [[f32; 3]], nr: [f32; 3], d: f32, guides: &[(usize, f32)]| {
+        let style = |pts: &mut [[f32; 3]], nr: [f32; 3], d: f32, guides: &[(usize, f32)], frame: Option<[f32; 3]>| {
             if off || self.styles.is_empty() {
                 return;
             }
@@ -743,7 +743,7 @@ impl Groom {
             let e1 = unit(cross(nr, if nr[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0] }), [1.0, 0.0, 0.0]);
             let e2 = cross(nr, e1);
             let phi = (d * 7919.0).fract() * std::f32::consts::TAU;
-            let r0 = [e1[0] * phi.cos() + e2[0] * phi.sin(), e1[1] * phi.cos() + e2[1] * phi.sin(), e1[2] * phi.cos() + e2[2] * phi.sin()];
+            let r0 = frame.unwrap_or([e1[0] * phi.cos() + e2[0] * phi.sin(), e1[1] * phi.cos() + e2[1] * phi.sin(), e1[2] * phi.cos() + e2[2] * phi.sin()]);
             let tangents: Vec<[f32; 3]> = {
                 let n = pts.len();
                 (0..n).map(|j| unit(sub(pts[(j + 1).min(n - 1)], pts[j.saturating_sub(1)]), nr)).collect()
@@ -773,7 +773,7 @@ impl Groom {
                 let at = c.points.len();
                 c.points.extend(hairgen::grow(k, length(t, w, d_len), |j| blend(t, w, j)));
                 hairgen::apply_style(&mut c.points[at..], &curl, seed, d_len, normal(t));
-                style(&mut c.points[at..], normal(t), d_var, &[(t[0] as usize, w[0]), (t[1] as usize, w[1]), (t[2] as usize, w[2])]);
+                style(&mut c.points[at..], normal(t), d_var, &[(t[0] as usize, w[0]), (t[1] as usize, w[1]), (t[2] as usize, w[2])], None);
                 c.normals.push(normal(t));
                 c.guides.push((t, w));
                 c.variants.push(hairgen::variant(d_var, steps(t, w)));
@@ -856,7 +856,9 @@ impl Groom {
                 walk(&mut c.points, &centre, fa, fb, radius, tx, ty, len, nr);
                 let at = c.points.len() - k;
                 hairgen::apply_style(&mut c.points[at..], &curl, mseed, d_len, nr);
-                style(&mut c.points[at..], nr, d_var, &[(idx, 1.0)]);
+                // the style frame starts on the root frame's axis, the same for every strand of guide idx (the
+                // generator carries it along from the root frame): the guide's strands curl together into one ringlet
+                style(&mut c.points[at..], nr, d_var, &[(idx, 1.0)], Some(fa));
                 // the strand's guide weights: all on guide idx (its colour, UV and bones)
                 let w = match t.iter().position(|&x| x as usize == idx) {
                     Some(0) => [1.0, 0.0, 0.0],
@@ -904,7 +906,7 @@ impl Groom {
                     walk(&mut c.points, &centre, fa, fb, radius, tx, ty, len, nr);
                     let at = c.points.len() - k;
                     hairgen::apply_style(&mut c.points[at..], &curl, mseed, d_len, nr);
-                    style(&mut c.points[at..], nr, d_var, &[(t[0] as usize, b[0]), (t[1] as usize, b[1]), (t[2] as usize, b[2])]);
+                    style(&mut c.points[at..], nr, d_var, &[(t[0] as usize, b[0]), (t[1] as usize, b[1]), (t[2] as usize, b[2])], None);
                     c.normals.push(nr);
                     c.guides.push((t, b));
                     c.variants.push(hairgen::variant(d_var, steps(t, b)));
