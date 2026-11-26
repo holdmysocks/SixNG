@@ -1289,6 +1289,40 @@ fn strand_openness(clip: vec4<f32>) -> f32 {
 // the game's strength by roughness.
 // The game's diffuse ambient is darkened by its traced probe lighting, which
 // the viewer does not have.
+// Whether the mirror direction r from wp runs into the drawn scene within a short reach, by a march
+// through the camera depth pre-pass: 1 blocked, 0 open. The game's specular ambient is its traced
+// reflections, which see the body itself where a ray from the skin meets it (under the jaw, the neck);
+// the viewer's surroundings are a plain sky and ground with nothing of the model in them. The march
+// stands in for that trace on screen, with what lies behind the drawn surfaces taken as 2 to 8 cm
+// thick. The first step and the thickness are random per pixel and frame, so that the frame
+// accumulation turns the edges of what one march finds into gradual ones (a fixed march left
+// hard-edged patches, such as on the collarbone from rays reaching the chin).
+fn reflection_blocked(clip: vec4<f32>, wp: vec3<f32>, r: vec3<f32>) -> f32 {
+    if (F.light_vp[3][3] == 0.0) { return 0.0; }
+    let size = F.frame.yz;
+    let j0 = ign(clip.xy + vec2(F.frame.x * 5.23, F.frame.x * 1.91));
+    let j1 = ign(clip.xy * 0.73 + vec2(F.frame.x * 3.37, 29.0));
+    let thick = 0.02 + 0.06 * j1;
+    var t = 0.006 + 0.008 * j0;
+    for (var k = 0; k < 14; k++) {
+        let p = wp + r * t;
+        let c = F.view_proj * vec4(p, 1.0);
+        if (c.w <= 1.0e-4) { return 0.0; }
+        let ndc = c.xyz / c.w;
+        let q = vec2((ndc.x * 0.5 + 0.5) * size.x, (0.5 - ndc.y * 0.5) * size.y);
+        if (q.x < 0.0 || q.y < 0.0 || q.x >= size.x || q.y >= size.y) { return 0.0; }
+        let dep = eye_depth(vec2<i32>(q));
+        if (dep > 0.0) {
+            let w4 = F.inv_view_proj * vec4(ndc.xy, dep, 1.0);
+            let front = (F.view_proj * vec4(w4.xyz / w4.w, 1.0)).w;
+            let behind = c.w - front;
+            if (behind > 0.0 && behind < thick) { return 1.0; }
+        }
+        t = t * 1.3;
+    }
+    return 0.0;
+}
+
 fn screen_occlusion(clip: vec4<f32>, wp: vec3<f32>, n: vec3<f32>) -> f32 {
     if (F.light_vp[3][3] == 0.0) { return 1.0; }
     let size = F.frame.yz;
@@ -1885,8 +1919,15 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     // roughness 0.5 upward, so next to none on skin
     let occ_k = max(0.0, 1.0 - 2.0 * rough);
     if (cls != 12u && occ_k > 0.0) { ao_s = ao * (1.0 + occ_k * (screen_occlusion(i.clip, i.world, n) - 1.0)); }
+    // From roughness 0.5 up the cone test is off and only the traced reflections keep the model's own
+    // body out of the mirrored surroundings: where the mirror ray meets the model, what it sees is that
+    // surface in the ambient light (taken with this pixel's colour) instead of the sky and ground.
+    var env_s = env;
+    if (cls != 12u && occ_k == 0.0) {
+        env_s = mix(env, albedo * amb_d, reflection_blocked(i.clip, i.world + n * 0.002, r));
+    }
     // the game applies its horizon occlusion to the specular ambient only (never to diffuse ambient, never to hair)
-    var col = direct * sh * ao_direct + kd * albedo * amb_d * ao + env * fr_v * ao_s + emissive;
+    var col = direct * sh * ao_direct + kd * albedo * amb_d * ao + env_s * fr_v * ao_s + emissive;
     // Sheen (velvet, suede): fibres standing on the surface catch light
     // towards the silhouette. The reflectance is the share seen head-on;
     // the fade sets how fast it grows towards the edge.
