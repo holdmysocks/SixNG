@@ -5380,7 +5380,8 @@ fn load_parts(
             let hide: Vec<bool> = (0..256u32).map(|n| masks.iter().any(|k| sixng_core::wardrobe::mask_has(k, n))).collect();
             // The second byte of a body skin's regions is a region in a second layer, shared by the
             // two halves: the strip round the waist that both carry. Each half hides it there, so
-            // the upper half's copy goes when the lower half is worn and the two do not fight.
+            // the upper half's copy goes when the lower half is worn and the two do not fight. Only
+            // on skin: a garment's second byte is not that layer (a shoe would go).
             let masks2: Vec<&str> = fx.iter().filter(|(o, _)| *o != off && parts.iter().any(|e| e.off == **o)).flat_map(|(_, f)| f.hides.iter()).filter(|h| h.0 == SKIN_LAYER2).map(|h| h.1.as_str()).collect();
             let hide2: Vec<bool> = (0..256u32).map(|n| n != 0 && is_skin && masks2.iter().any(|k| sixng_core::wardrobe::mask_has(k, n))).collect();
             for i in range.clone() {
