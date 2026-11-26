@@ -6923,7 +6923,11 @@ fn pick<'a>(
     };
     let parts = chosen
         .iter()
-        .filter_map(|off| ix.entries.iter().find(|e| e.off == *off))
+        .filter_map(|off| match sixng_core::packparts::is_pack_key(*off) {
+            // a content-pack part (see `packparts`)
+            true => sixng_core::packparts::loaded().and_then(|t| t.entries.iter().find(|e| e.off == *off)),
+            false => ix.entries.iter().find(|e| e.off == *off),
+        })
         .collect();
     (chosen, parts)
 }
@@ -7015,6 +7019,18 @@ fn load_query_sel(
                             swap.values().any(|t| *t == n).then_some((n, e))
                         })));
                     }
+                    // the parts that are in a content pack (the anatomical inserts): their entries carry a
+                    // part key (`packparts::KEY_BIT`) and are loaded from their own archive
+                    let packs = sixng_core::packparts::get(&ws.game);
+                    for o in &look.outfits {
+                        for p in &o.parts {
+                            if !b.contains_key(&p.drawable) {
+                                if let Some(e) = packs.by_name(&p.drawable) {
+                                    b.insert(p.drawable.clone(), e);
+                                }
+                            }
+                        }
+                    }
                     b
                 };
                 opts.iter_mut().for_each(|o| o.default = false);
@@ -7050,7 +7066,8 @@ fn load_query_sel(
                             None => opts.push(crate::assemble::PartOpt { off: e.off, id: e.id.clone(), name: drawable.clone(), group: p.slot.clone(), label: drawable.trim_start_matches(&format!("{prefix}_")).to_string(), default: oi == k }),
                         }
                         if oi == k {
-                            let body = p.slot == "body upper" || p.slot == "body lower";
+                            // the anatomical inserts are skin too: the body's skin tone, under the clothes
+                            let body = p.slot == "body upper" || p.slot == "body lower" || sixng_core::pedlook::is_skin_insert(&p.slot);
                             if let Some(how) = p.skin_from.filter(|_| body) {
                                 let why = match how {
                                     "paired" => "the one other characters wear with this outfit's other body skin",
@@ -8869,6 +8886,8 @@ fn export_load_shaped(
     skins: &[(u64, u64)],
     shape: BodyShape,
 ) -> anyhow::Result<(glb::Model, Vec<PathBuf>, serde_json::Value)> {
+    // a content-pack part of an outfit is read from its own archive
+    let a = &*sixng_core::packparts::archive_of(a, e);
     let shaped = shape != NEUTRAL_BODY;
     let shaped_dir = cache.join("shaped");
     let cache = if shaped { shaped_dir.as_path() } else { cache };
