@@ -131,8 +131,18 @@ after saving new folders.
 
 ## Disk space
 
-The install is about 224 GB. Indexes are small: `levels.rpf` gives about
-95 MB of JSON. Output sizes depend on what you extract:
+The install is about 224 GB. With every archive indexed and the side tables
+built, `work/index` takes about **3.3 GB**:
+
+- about 2.4 GB of scan segments (`<archive>.segs/`, `levels.segs` alone is
+  about 1.2 GB). Keep them: they let a newer SixNG upgrade an index in place
+  instead of scanning the archive again.
+- about 0.5 GB of index JSON (`levels.json` is about 104 MB).
+- about 0.5 GB of side tables, mostly `lod_parents.jsonl` (about 320 MB, from
+  `sixng lod-links`), `vehicle_parts.json` (about 200 MB) and
+  `archetype_lod.jsonl` (about 90 MB).
+
+Output sizes depend on what you extract:
 
 | Extract | Items | Approximate output |
 |---------|-------|--------------------|
