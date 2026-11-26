@@ -654,12 +654,13 @@ pub fn body_from(controls: &[(String, f32)]) -> BodyShape {
     s
 }
 
-/// The game's shape for an outfit's body-shape preset tag (neutral when the
-/// outfit has none; `None` when the preset cannot be read).
-fn preset_shape(game: &Path, tag: Option<&str>) -> Option<BodyShape> {
-    match tag {
+/// The game's shape for an outfit's body-shape preset (its preset items, or
+/// its profile word; neutral when the outfit has none; `None` when the
+/// preset cannot be read).
+fn preset_shape(game: &Path, tag: Option<&str>, items: &[String]) -> Option<BodyShape> {
+    match sixng_core::bodyshape::outfit_preset(game, tag, items) {
         None => Some(NEUTRAL_BODY),
-        Some(t) => sixng_core::bodyshape::preset_controls(game, t).ok().map(|c| body_from(&c)),
+        Some(r) => r.ok().map(|c| body_from(&c)),
     }
 }
 /// Last head exported for the viewer: (variant, variant count, source).
@@ -2114,7 +2115,7 @@ impl ModelView {
             }
         });
         if let Some(p) = &look.body_shape {
-            let how = if look.body_preset.is_some() { "the sliders open in its values" } else { "not a profile of the body-type XML in common.rpf (or common.rpf is not indexed); the sliders open neutral" };
+            let how = if look.body_preset.is_some() { "the sliders open in its values" } else { "its values could not be read (anim.rpf and common.rpf need to be indexed); the sliders open neutral" };
             ui.label(egui::RichText::new(format!("Body-shape preset of this outfit: {p} ({how}).")).weak().small());
         }
         if shape != before {
@@ -7263,10 +7264,15 @@ fn load_query_sel(
                     }
                 }
                 let o = &look.outfits[k];
-                info.body_shape = o.body_shape.clone();
+                info.body_shape = match (&o.body_shape, o.body_preset_items.len()) {
+                    (Some(w), 0) => Some(w.clone()),
+                    (Some(w), n) => Some(format!("{w}, {n} preset item(s) from anim.rpf")),
+                    (None, 0) => None,
+                    (None, n) => Some(format!("{n} preset item(s) from anim.rpf")),
+                };
                 // the outfit's own body shape, when it is opened (a reload of
                 // the same outfit keeps the sliders; `--body` keeps its shape)
-                info.body_preset = preset_shape(&ws.game, o.body_shape.as_deref());
+                info.body_preset = preset_shape(&ws.game, o.body_shape.as_deref(), &o.body_preset_items);
                 let key = format!("{archive}#outfit:{prefix}#look={k}");
                 let mut last = BODY_PRESET_FOR.lock().unwrap();
                 if *last != key {

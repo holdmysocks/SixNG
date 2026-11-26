@@ -231,7 +231,7 @@ mod tests {
     }
 
     fn outfit(id: &str, parts: Vec<LookPart>, unresolved: Vec<String>) -> Outfit {
-        Outfit { id: id.into(), outfit_type: String::new(), scale: 0.0, label: id.into(), body_shape: None, parts, strand_colours: vec![], unresolved, not_shown: vec![], variations: vec![id.into()] }
+        Outfit { id: id.into(), outfit_type: String::new(), scale: 0.0, label: id.into(), body_shape: None, body_preset_items: vec![], parts, strand_colours: vec![], unresolved, not_shown: vec![], variations: vec![id.into()] }
     }
 
     #[test]
