@@ -469,6 +469,8 @@ pub const QUALITY: [(&str, f32, f32, f32, u32, usize); 4] = [
 struct Stats {
     entities: usize,
     models_wanted: usize,
+    /// the model-count cap is full and nothing more may load
+    capped: bool,
     models_ready: usize,
     queued: usize,
     inflight: usize,
@@ -1455,6 +1457,41 @@ impl Map3D {
                 prio: p,
             })
             .collect();
+        // never ask for more models than the count cap holds: past it each
+        // load only evicts another wanted model, which is then asked for
+        // again, and the view never settles. A full cache still takes a
+        // model that comes before a resident one in load order (that one
+        // makes room); the rest wait.
+        let mut resident: Vec<f32> = self
+            .cache
+            .iter()
+            .filter(|(_, s)| matches!(s, Slot::Ready { .. }))
+            .map(|(m, _)| prio.get(m).copied().unwrap_or(f32::MAX))
+            .collect();
+        let room = self.budget.models.saturating_sub(resident.len() + inflight.len());
+        let mut capped = false;
+        if reqs.len() > room {
+            reqs.sort_by(|a, b| {
+                a.prio
+                    .partial_cmp(&b.prio)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            // resident load order, last first
+            resident.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            let mut take = room;
+            let mut worst = resident.into_iter();
+            while take < reqs.len() {
+                match worst.next() {
+                    Some(w) if reqs[take].prio < w => take += 1,
+                    _ => break,
+                }
+            }
+            reqs.truncate(take);
+            capped = true;
+        }
+        // at the cap with nothing left that may load: as complete as the
+        // view gets (frames_ok)
+        self.stats.capped = capped && reqs.is_empty() && inflight.is_empty();
         // sharper reloads wait until every wanted model has its first load:
         // a complete view first, then detail (full-size decodes are ~10x the
         // cost of a first load)
@@ -3504,7 +3541,7 @@ impl Map3D {
                 }
             );
             let line = format!("{line} | gpu ms/frame sky|shadows|main|post {}", crate::gpu_time::take_line());
-            let line = format!("{line} | draws {} (shadow {}) | {} ({} placements) | {} fallbacks ({:?} draws, by level unlinked/linked {:?}) | wait: terrain idle {}, keep missing {}, inflight {}", self.stats.draws, self.renderer.as_ref().map_or(0, |r| r.shadow_draws), self.cells.summary(), self.stats.in_cells, self.stats.n_fb, self.renderer.as_ref().map_or([0, 0], |r| r.fb_draws), self.stats.fb_lvl, self.world.idle(), self.keep.iter().filter(|m| !self.cache.contains_key(m)).count(), self.stats.inflight);
+            let line = format!("{line} | draws {} (shadow {}) | {} ({} placements) | {} fallbacks ({:?} draws, by level unlinked/linked {:?}) | wait: terrain idle {}, keep missing {}{}, inflight {}", self.stats.draws, self.renderer.as_ref().map_or(0, |r| r.shadow_draws), self.cells.summary(), self.stats.in_cells, self.stats.n_fb, self.renderer.as_ref().map_or([0, 0], |r| r.fb_draws), self.stats.fb_lvl, self.world.idle(), self.keep.iter().filter(|m| !self.cache.contains_key(m)).count(), if self.stats.capped { " (model cap full)" } else { "" }, self.stats.inflight);
             eprintln!("{line}");
         }
         if self.perf.near_s.is_none()
@@ -3962,6 +3999,8 @@ impl Map3D {
             && self.sectors.idle()
             && (!self.show_terrain || self.world.idle())
             && (self.pressure > 0
+                // the model-count cap is full and the nearest models are in
+                || self.stats.capped
                 || self.keep.iter().all(|model| {
                     self.cache.contains_key(model) || {
                         #[cfg(all(target_os = "macos", feature = "metal4-poc"))]

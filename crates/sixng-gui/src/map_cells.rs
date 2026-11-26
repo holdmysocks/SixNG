@@ -253,6 +253,12 @@ fn build_index(data: &MapData, cs: &[u32], cl: &[u32], d: &Detail, tag: String) 
     // placements that can never be outside the near ring when drawn stay per placement
     let near_n = NEAR * 0.85 * 330.0;
     let mut by_cell: HashMap<CellKey, (Vec<u32>, f32, f32)> = HashMap::new();
+    // debug: SIXNG_MAP_CELL_LEVELS=2,3 merges only those placement levels
+    // (0 HD .. 5 SLOD4); the others draw per placement, where they can be
+    // picked
+    let levels: Option<Vec<u8>> = std::env::var("SIXNG_MAP_CELL_LEVELS")
+        .ok()
+        .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect());
     for i in 0..data.ents.len() {
         let Some((lo, hi, fb)) = static_range(data, cs, cl, d, i) else {
             continue;
@@ -262,6 +268,9 @@ fn build_index(data: &MapData, cs: &[u32], cl: &[u32], d: &Detail, tag: String) 
             continue;
         }
         let e = &data.ents[i];
+        if levels.as_ref().is_some_and(|l| !l.contains(&e.lod.min(5))) {
+            continue;
+        }
         let key = CellKey::of(e.lod.min(5), e.pos[0], e.pos[1]);
         let c = by_cell.entry(key).or_insert((Vec::new(), f32::MAX, 0.0));
         c.0.push(i as u32);

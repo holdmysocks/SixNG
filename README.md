@@ -1388,7 +1388,9 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   built while the camera is slow (under 15 m/s); while flying, only HD
   cells already on disk are used. Cells need BC textures and the default
   view settings (every kind and LOD level, no proxies);
-  `SIXNG_MAP_NO_CELLS=1` turns them off.
+  `SIXNG_MAP_NO_CELLS=1` turns them off, and `SIXNG_MAP_CELL_LEVELS=2,3`
+  merges only those levels (0 HD to 5 SLOD4); the rest draw per placement,
+  where they can be picked.
 - **Texture streaming**: a model first loads with 64 px base-colour
   textures only (normal and data maps come with the sharper reload), read
   from block-compressed 64 px copies in `<work>/gui_cache_v4/bc64` (a few
@@ -1481,7 +1483,10 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   (the soft cap) the streamer loads only nearby models at 64 px and drops
   everything off screen; above 30 % (the hard cap) it also drops the
   farthest visible models. The texture budget is RAM/16 (0.5–3 GB) and the
-  model cap is 120 per GB (800–8,000). The **Memory** panel shows usage
+  model cap is 180 per GB (800–12,000). When a view wants more models
+  than the cap holds, the nearest load first and the view counts as
+  complete once the cap is full (the tick line says "model cap full").
+  The **Memory** panel shows usage
   against the caps; untick **automatic** to set your own limit with the
   slider. It is saved in `<work>/gui_settings.json`. The process figure
   includes memory the graphics driver commits for GPU buffers and
