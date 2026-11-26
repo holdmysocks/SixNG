@@ -3309,7 +3309,9 @@ impl ModelView {
                         };
                         let has_row = wear.and_then(|w| usize::from_str_radix(&w[id * 8..id * 8 + 4], 16).ok()).is_some_and(|r| r != 0xffff);
                         let t = tint.unwrap_or([0; 3]);
-                        let extra = pw.w2_start.iter().chain(&pw.w2_width).chain(&pw.w2_div).copied().chain([pw.d4_scale, pw.d4_start, pw.d4_width, lin(t[0]), lin(t[1]), lin(t[2]), if tint.is_some() && has_row { 255 } else { 0 }]);
+                        // 69 to 72: the edge record's intensity, start and
+                        // end, and the clear-coat loss byte
+                        let extra = pw.w2_start.iter().chain(&pw.w2_width).chain(&pw.w2_div).copied().chain([pw.d4_scale, pw.d4_start, pw.d4_width, lin(t[0]), lin(t[1]), lin(t[2]), if tint.is_some() && has_row { 255 } else { 0 }, pw.edge_intensity, pw.edge_start, pw.edge_end, pw.coat_loss]);
                         for (c, v) in extra.enumerate() {
                             px[(768 + id) * 512 + (50 + c) * 4 + 3] = v;
                         }
@@ -5628,6 +5630,14 @@ const W2_DIVISOR: [u32; 4] = [0xfcf8_c89c, 0xeeee_2c87, 0xd948_013b, 0xa21f_3ea9
 /// in the first layer's weight (eb7223d6, d54c040a, +0x22 / +0x23; record
 /// +64 bytes 2 and 3).
 const D4_SCALE: u32 = 0xf86c_e666;
+/// The wear preset's link to its edge record (`487f0f4c`: edgeIntensity,
+/// edgeStart, edgeEnd), which the game packs into part record +40 (rva
+/// 0x1a0d7a0: f16 of the intensity, start and end x 255 truncated).
+const PRESET_EDGE: u32 = 0x7f1f_e0a2;
+/// The age record's clear-coat loss (aa7d4fbd, +0xf0): the game packs
+/// trunc(25.5 x value) into part record +56 byte 3, and its shader takes
+/// 10 x byte / 255 of the clear coat per unit of each wear layer's weight.
+const AGE_COAT_LOSS: u32 = 0xaa7d_4fbd;
 const D4_WINDOW: [u32; 2] = [0xeb72_23d6, 0xd54c_040a];
 /// The age record's wear amount range (`fe5d32e7` +0x0c, +0x10): the game
 /// takes a per-vehicle value between them.
@@ -5705,6 +5715,12 @@ struct PartWear {
     w2_start: [u8; 4],
     w2_width: [u8; 4],
     w2_div: [u8; 4],
+    /// the edge record's intensity (0 to 255 for 0 to 1), start and end
+    edge_intensity: u8,
+    edge_start: u8,
+    edge_end: u8,
+    /// the clear coat lost per unit of wear weight, x 10 / 255
+    coat_loss: u8,
 }
 
 /// Each part id's wear under a configuration, from model.json
@@ -5810,6 +5826,15 @@ fn part_wear(w: &serde_json::Value, look: usize, config: Option<&str>) -> Option
             o.w2_width[c] = wrap(a.mul_add(we, -lo));
             o.w2_div[c] = field(p, W2_DIVISOR[c]).unwrap_or(0.0) as u8;
         }
+        // the edge record (none in the export: no edge term)
+        if let Some(e) = p[sixng_core::meta7a::field_name(PRESET_EDGE)].as_str().map(|k| &w["edges"][k]).filter(|e| e.is_object()) {
+            let f = |k: &str| e[k].as_f64().unwrap_or(0.0) as f32;
+            o.edge_intensity = (f("edgeIntensity").clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            o.edge_start = wrap(f("edgeStart"));
+            o.edge_end = wrap(f("edgeEnd"));
+        }
+        let loss = age.map(|a| &w["ages"][a]).and_then(|r| field(r, AGE_COAT_LOSS)).unwrap_or(0.0) as f32;
+        o.coat_loss = (loss * 25.5) as i32 as u8;
     }
     Some(out)
 }
@@ -9258,11 +9283,12 @@ mod tests {
                 "primerIntensityB": 102, "4eb87881": 0, "26007b2d": 255, "primerStart": 10, "primerEnd": 127, "8ed71149": 51, "eff390bd": true,
                 "951a7677": 51, "b58896f4": 153, "8482c039": 0, "4cacba9c": 255, "fcf8c89c": 200,
                 "87df7517": 102, "7c999233": 51, "851c6b0b": 0, "ac8e3a46": 255,
-                "f86ce666": 128, "eb7223d6": 25, "d54c040a": 76,
+                "f86ce666": 128, "eb7223d6": 25, "d54c040a": 76, "7f1fe0a2": "e1",
                 "879774bd": "cr"}},
             "colour_ranges": {"cr": {"minGreen": 102, "maxGreen": 153, "fb2b7f54": 0, "c5801a83": 102, "7e3dffd5": 255, "c82d2173": 255}},
             "age_ranges": {"r1": {"minWear": 100, "maxWear": 200}},
-            "ages": {"a4": {"4e71efc8": 0.6, "b5fcdec9": 1.0}},
+            "ages": {"a4": {"4e71efc8": 0.6, "b5fcdec9": 1.0, "aa7d4fbd": 2.0}},
+            "edges": {"e1": {"edgeIntensity": 0.275, "edgeStart": 0.05, "edgeEnd": 0.8}},
         });
         let a = part_wear(&w, 0, Some("k1")).unwrap();
         assert_eq!((a[0].amount, a[1].amount, a[2]), (150, 204, PartWear::default()));
@@ -9284,6 +9310,9 @@ mod tests {
         assert_eq!((a[1].w2_start, a[1].w2_width, a[1].w2_div), ([40, 81, 0, 0], [81, 216, 0, 0], [200, 0, 0, 0]));
         // the 4th channel: scale 0.8 x 128, window 25 with width 51
         assert_eq!((a[1].d4_scale, a[1].d4_start, a[1].d4_width), (102, 25, 51));
+        // the edge record: intensity 0.275, start and end x 255 truncated;
+        // the clear-coat loss 25.5 x 2
+        assert_eq!((a[1].edge_intensity, a[1].edge_start, a[1].edge_end, a[1].coat_loss), (70, 12, 204, 51));
         assert_eq!(super::primer_surface(&serde_json::json!({"primerPalette": {"roughnessLow": 0.45, "roughnessHigh": 0.78, "metallicLow": 0.0, "metallicHigh": 0.0}})), [0, 0, 114, 198]);
         assert_eq!(super::primer_surface(&serde_json::json!({})), [0, 0, 153, 153]);
         assert_eq!(part_wear(&w, 0, None).unwrap()[0].amount, 150);
