@@ -1203,11 +1203,11 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   weather's cloud cover; the sky and every surface behind the layer are
   seen through it, and its shadow moves over the ground. A cloud has a
   dome-shaped top whose height follows its cover and a base that rises
-  where it thins, and is sampled every 120 m along each ray (8 to 32
-  samples for the sky, at most 10 for the ground behind the layer, never
-  more than 250 m apart) from a start set per pixel by interleaved
-  gradient noise (no slices, no grain); a cloud thins out to nothing at
-  its rim. A cloud is lit by
+  where it thins, and is sampled every 120 m along each ray (8 to 48
+  samples for the sky, at most 10 for the ground behind the layer; near
+  the eye at most 150 m apart, farther out 3 % of the distance) from a
+  start set per pixel by interleaved gradient noise with a little white
+  noise (no slices; less grain); a cloud thins out at its rim. A cloud is lit by
   the sun or moon through the cloud above it (forward-peaked) and by the
   sky. Our choices: the noise (2.5 km features), the extinction (0.004 per
   m at full density) and the drift speed (12 m/s at scale 1); the game's

@@ -233,17 +233,18 @@ fn cloud_density3(p: vec3<f32>) -> f32 {
     // not curtains down to the layer's floor
     let base = 0.3 * (1.0 - c);
     // thinning out to nothing at the cloud's rim (no hard edge)
-    return (0.4 + 0.6 * c) * smoothstep(0.0, 0.25, c) * smoothstep(base, base + 0.06, h) * dome;
+    return (0.4 + 0.6 * c) * smoothstep(0.0, 0.08, c) * smoothstep(base, base + 0.06, h) * dome;
 }
 
 // Samples along a ray through the cloud layer: one per CLOUD_STEP_M of
 // path, from 8 to CLOUD_STEPS (each pixel starts at its own offset, so the
 // steps do not show as slices).
-const CLOUD_STEPS: i32 = 32;
+const CLOUD_STEPS: i32 = 48;
 // The same for the ground seen through the layer (every surface fragment).
 const CLOUD_STEPS_GROUND: i32 = 10;
 const CLOUD_STEP_M: f32 = 120.0;
-const CLOUD_DT_MAX: f32 = 250.0;
+const CLOUD_DT_MAX: f32 = 150.0;
+const CLOUD_DT_FAR: f32 = 0.03;
 
 // Light scattered towards the eye by the clouds along a ray from o in
 // direction d up to tmax (rgb), and the ray's transmittance through them (a).
@@ -268,14 +269,14 @@ fn clouds_along(o: vec3<f32>, d: vec3<f32>, tmax: f32, max_steps: i32, px: vec2<
     if (t1 <= t0) { return vec4(0.0, 0.0, 0.0, 1.0); }
     let len = t1 - t0;
     let steps = clamp(i32(ceil(len / CLOUD_STEP_M)), min(8, max_steps), max_steps);
-    // samples at most CLOUD_DT_MAX apart: a long grazing path (towards the
-    // horizon) is sampled over its first part only, where a cloud in the
-    // way is thick enough to hide what lies behind it; spread thinner, a
-    // thin cloud would be hit by one pixel and missed by the next (grain)
-    let dt = min(len / f32(steps), CLOUD_DT_MAX);
-    // the pixel's start in the first step: interleaved gradient noise, an
-    // even, fine pattern (white noise per pixel shows as grain)
-    let jit = ign(px);
+    // samples at most CLOUD_DT_MAX apart near the eye, and a fixed share
+    // of the distance farther out (a far cloud is small on screen, and a
+    // long grazing path still reaches the clouds near the horizon)
+    let dt = min(len / f32(steps), max(CLOUD_DT_MAX, t0 * CLOUD_DT_FAR));
+    // the pixel's start in the first step: interleaved gradient noise with
+    // a little white noise (each alone shows: one as grain, the other as a
+    // diagonal hatch)
+    let jit = fract(ign(px) + 0.35 * cloud_hash(px * 1.37));
     let l = normalize(F.sun_dir.xyz);
     let lup = smoothstep(-0.05, 0.05, l.y);
     let c = dot(d, l);
