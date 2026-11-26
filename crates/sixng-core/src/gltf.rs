@@ -32,7 +32,9 @@ pub struct TriPrim {
     pub colors1: Option<Vec<[u8; 4]>>,
     /// Raw mesh stream 13, written as `_REGION`. On people its first byte is
     /// the region of the vertex (1 to 255) that the hide masks of clothes
-    /// address (`wardrobe::Part::hides`); the other bytes are 0 there.
+    /// address (`wardrobe::Part::hides`). On body skins the second byte is a
+    /// region in a second layer that both halves share (the waist strip);
+    /// the other bytes are 0.
     pub regions: Option<Vec<[u8; 4]>>,
     /// Per-vertex colour (linear RGBA8) written as COLOR_0, which glTF
     /// multiplies into the base colour: the model's tint palette entry.
@@ -627,14 +629,15 @@ pub fn lines_glb(name: &str, positions: &[[f32; 3]], width: &[f32], uv: &[[f32; 
 }
 
 /// One strand piece of `strands_glb`: `positions` are n strands of `k`
-/// points each, strand-major (RAGE space). `uv` (TEXCOORD_0) and every
-/// `attrs` entry (custom attributes, names starting with `_`) hold one
-/// value per point when not empty.
+/// points each, strand-major (RAGE space). `uv` (TEXCOORD_0), `colour`
+/// (COLOR_0, linear RGBA) and every `attrs` entry (custom attributes,
+/// names starting with `_`) hold one value per point when not empty.
 pub struct StrandPrim {
     pub name: String,
     pub k: usize,
     pub positions: Vec<[f32; 3]>,
     pub uv: Vec<[f32; 2]>,
+    pub colour: Vec<[f32; 4]>,
     pub attrs: Vec<(String, Vec<f32>)>,
     pub extras: Value,
 }
@@ -652,6 +655,9 @@ pub fn strands_glb(name: &str, prims: &[StrandPrim], extras: Value) -> Vec<u8> {
         let mut attrs = json!({"POSITION": b.vec3(&pos, true)});
         if p.uv.len() == n {
             attrs["TEXCOORD_0"] = json!(b.vec2(&p.uv));
+        }
+        if p.colour.len() == n {
+            attrs["COLOR_0"] = json!(b.vec4(&p.colour));
         }
         for (key, v) in p.attrs.iter().filter(|a| a.1.len() == n) {
             attrs[key.as_str()] = json!(b.scalar(v));

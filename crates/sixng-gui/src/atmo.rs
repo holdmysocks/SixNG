@@ -334,9 +334,12 @@ pub struct SceneBinds {
     /// timecycle units), loaded (1) or not (0).
     pub water_a: wgpu::TextureView,
     pub water_b: wgpu::TextureView,
+    /// The placed lights near the camera and their grid (lights.rs).
+    pub lights: wgpu::Buffer,
+    pub light_grid: wgpu::Buffer,
 }
 
-/// Bind group layout entries 6 to 14 of the mesh shaders' group 0.
+/// Bind group layout entries 6 to 14, 22 and 23 of the mesh shaders' group 0.
 pub fn frame_layout_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
     let vis = wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT;
     let tex = |b: u32, dim: wgpu::TextureViewDimension| wgpu::BindGroupLayoutEntry {
@@ -407,11 +410,26 @@ pub fn frame_layout_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
         },
         tex(24, wgpu::TextureViewDimension::D2),
         tex(25, wgpu::TextureViewDimension::D2),
+        storage_fs(22),
+        storage_fs(23),
     ]
 }
 
+fn storage_fs(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
 impl SceneBinds {
-    pub fn entries(&self) -> [wgpu::BindGroupEntry<'_>; 11] {
+    pub fn entries(&self) -> [wgpu::BindGroupEntry<'_>; 13] {
         [
             wgpu::BindGroupEntry { binding: 6, resource: self.scene_ub.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&self.trans) },
@@ -424,6 +442,8 @@ impl SceneBinds {
             wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::Sampler(&self.shadow_cmp) },
             wgpu::BindGroupEntry { binding: 24, resource: wgpu::BindingResource::TextureView(&self.water_a) },
             wgpu::BindGroupEntry { binding: 25, resource: wgpu::BindingResource::TextureView(&self.water_b) },
+            wgpu::BindGroupEntry { binding: 22, resource: self.lights.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 23, resource: self.light_grid.as_entire_binding() },
         ]
     }
 }
@@ -747,6 +767,19 @@ impl Atmosphere {
                 shadow_cmp: shadows.cmp.clone(),
                 water_a: water_views[0].clone(),
                 water_b: water_views[1].clone(),
+                // zeroed: a grid of 0 cells, no lights
+                lights: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("placed lights"),
+                    size: (crate::lights::MAX_LIGHTS * std::mem::size_of::<crate::lights::GpuLight>()) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                light_grid: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("light grid"),
+                    size: (crate::lights::GRID_WORDS * 4) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
             },
             _ms: ms,
             hist,
@@ -792,6 +825,17 @@ impl Atmosphere {
             );
         }
         self.water_box = m.world_box;
+    }
+
+    /// Uploads the placed lights near the camera (from `lights::pack`); an
+    /// empty grid turns them off.
+    pub fn set_lights(&self, queue: &wgpu::Queue, lights: &[crate::lights::GpuLight], grid: &[u32]) {
+        if !lights.is_empty() {
+            queue.write_buffer(&self.binds.lights, 0, bytemuck::cast_slice(&lights[..lights.len().min(crate::lights::MAX_LIGHTS)]));
+        }
+        let off = [0u32; crate::lights::HEADER];
+        let grid = if grid.len() < crate::lights::HEADER { &off[..] } else { &grid[..grid.len().min(crate::lights::GRID_WORDS)] };
+        queue.write_buffer(&self.binds.light_grid, 0, bytemuck::cast_slice(grid));
     }
 
     pub fn update(&mut self, queue: &wgpu::Queue, sky: Option<&Sky>, view_proj: Mat4, cam: Vec3, size: [u32; 2], dt: f32) {

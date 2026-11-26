@@ -788,6 +788,10 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                     continue;
                 };
                 e["store"] = store.label().into();
+                if tx.hash != h {
+                    // a de-duplicated texture: stored once under another hash
+                    e["stored_as"] = format!("{:016x}", tx.hash).into();
+                }
                 e["width"] = tx.width.into();
                 e["height"] = tx.height.into();
                 e["format"] = texture::dxgi_name(tx.dxgi_format).into();
@@ -1493,6 +1497,8 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                         v["coat"] = part_looks["coat"].clone();
                         v["wear_records"] = part_looks["wear_records"].clone();
                         v["wear_records_note"] = serde_json::Value::from("the game's wear records the parts reach (vehicle material library, as stored; links as 8 hex digits). Each part id's surface names a wear ladder and a detail set: ladder_by_look and detail_by_look give per look the index into ladders and details of each part id (256 x 2 hex digits, ff = none). A ladder lists six surfaces (materialPresets) and six wear presets (wearPresets, see presets: dustIntensity, rust, primer and control intensities). A preset names an age record (ageWearHash: in ages, or in age_ranges with minWear / maxWear), an edge record (7f1fe0a2, in edges) and two colour range records (879774bd, 02a27216, in colour_ranges). details: detailIndex0 / 1 are probably slices of the detail texture arrays (0cd27763, 7c0055b9), which no material binds. global: the library's shared dirt settings. levels_by_config (configuration key, as in configs) gives each part id's wear level and primer sets under that configuration (256 x 4 hex digits: level 0 to 5, then a bit mask; ffff = none); the level is the entry of its ladder's materialPresets and wearPresets. levels_default is the levels most configurations give. The configuration parts that set the levels sit in slots named wear, wear_interior, wear_engine, wear_wheels and six more. A dirt level and what the shader does with these values are not decoded; nothing here is applied to the GLB.");
+                        v["primer"] = part_looks["primer"].clone();
+                        v["primer_note"] = serde_json::Value::from("per look, the palette rows of each part id's primer (the game's second wear layer) for primer sets 0, 1 and 2 (256 x 12 hex digits: three rows as in rows, ffff = none). They are the part's colour record's primer entries of its surface's primerType; a set the record leaves empty takes set 0. A part's set is the first of a per-vehicle random order of 0, 1, 2 that its primerSets mask (levels_by_config) allows. The shader reads the row at the column the primer's summed mask gives through the wear preset's primerGradientStart / primerGradientEnd window. Not applied to the GLB.");
                         v["surfaces"] = part_looks["surfaces"].clone();
                         v["surfaces_note"] = serde_json::Value::from("per look, the first layer of each part id's surface (256 x 8 hex digits: metalness low, metalness high, roughness low, roughness high, 0 to 255). The paint shader blends low to high by the red (metalness) and green (roughness) channel of a material's lyr0materialatex (slot 2bb2ede8, sampled with the first UV set) at each pixel. The alpha of a look entry holds the same pair blended once, by the mean of that texture over the model's materials; a material whose map is not in the install has only that. A part patch has the same for its ids (surfaces).");
                         v

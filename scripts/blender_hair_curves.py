@@ -1,7 +1,7 @@
-"""Make Blender hair curves of a strand GLB written by `sixng outfit --hair`
-(or `sixng grooms --full`).
+"""Make Blender hair curves of strand GLBs written by `sixng outfit --hair`
+(or `sixng grooms --full`, one file per groom).
 
-    blender --python scripts/blender_hair_curves.py -- <hair.glb> [--model <model.glb>] [--save <file.blend>]
+    blender --python scripts/blender_hair_curves.py -- <hair.glb> [<hair.glb> ...] [--model <model.glb>] [--save <file.blend>]
 
 Each strand piece of the GLB becomes one hair curves object with these
 attributes:
@@ -14,7 +14,9 @@ attributes:
   (pieces whose set was not found, or where it overlaps itself under the
   roots, get the head's first UV map under each root instead),
 - `clump` (curve, int): the strand's clump (1-based; 0 = not in a clump),
-- `variant` (curve, int): the strand's colour variant (0-3).
+- `variant` (curve, int): the strand's colour variant (0-3),
+- `colour` (point, when the GLB has COLOR_0): the strand's colour, linear
+  RGB; such pieces get a hair material that uses it.
 
 Guide strands (`<piece>_guides`) come in hidden, in a collection of their
 own, for restyling. With --model the model GLB is imported first. Each hair
@@ -61,21 +63,37 @@ def accessor(doc, buf, i):
 
 def add_attr(curves, name, kind, domain, values):
     at = curves.attributes.get(name) or curves.attributes.new(name, kind, domain)
-    field = {"FLOAT": "value", "INT": "value", "FLOAT2": "vector"}[kind]
+    field = {"FLOAT": "value", "INT": "value", "FLOAT2": "vector", "FLOAT_COLOR": "color"}[kind]
     at.data.foreach_set(field, values)
 
 
-def hair_material():
-    m = bpy.data.materials.get("strand_hair")
+def hair_material(coloured):
+    """The strands' material: with `coloured`, a Principled Hair BSDF whose
+    colour is the `colour` attribute (the export's COLOR_0) through a Gamma
+    node; else a neutral brown."""
+    name = "strand_hair_colour" if coloured else "strand_hair"
+    m = bpy.data.materials.get(name)
     if m is None:
-        m = bpy.data.materials.new("strand_hair")
+        m = bpy.data.materials.new(name)
         nt = m.node_tree
         nt.nodes.clear()
         out = nt.nodes.new("ShaderNodeOutputMaterial")
         bsdf = nt.nodes.new("ShaderNodeBsdfHairPrincipled")
-        bsdf.parametrization = "MELANIN"
-        # a neutral brown: the export carries no hair colour
-        bsdf.inputs["Melanin Redness"].default_value = 0.3
+        if coloured:
+            bsdf.parametrization = "COLOR"
+            at = nt.nodes.new("ShaderNodeAttribute")
+            at.attribute_name = "colour"
+            # the BSDF takes its colour as the hair's overall (multiple
+            # scattering) colour, in which the game's strand colours come
+            # out pale (a dark brown renders near white); squared they keep
+            # their shade (set gamma 1 for the colours as they are)
+            gamma = nt.nodes.new("ShaderNodeGamma")
+            gamma.inputs["Gamma"].default_value = 2.0
+            nt.links.new(at.outputs["Color"], gamma.inputs["Color"])
+            nt.links.new(gamma.outputs[0], bsdf.inputs["Color"])
+        else:
+            bsdf.parametrization = "MELANIN"
+            bsdf.inputs["Melanin Redness"].default_value = 0.3
         nt.links.new(bsdf.outputs[0], out.inputs[0])
     return m
 
@@ -117,11 +135,16 @@ def build(path):
             if key in attrs:
                 vals, _ = accessor(doc, buf, attrs[key])
                 add_attr(cv, name, "INT", "CURVE", [int(vals[s * k]) for s in range(n)])
+        coloured = "COLOR_0" in attrs
+        if coloured:
+            # linear RGBA per point
+            col, _ = accessor(doc, buf, attrs["COLOR_0"])
+            add_attr(cv, "colour", "FLOAT_COLOR", "POINT", col)
         ob = bpy.data.objects.new(mesh["name"], cv)
-        for key in ("slot", "placeholder", "groom", "grown", "share"):
+        for key in ("slot", "placeholder", "groom", "grown", "share", "colour_set"):
             if key in ex:
                 ob[key] = ex[key] if not isinstance(ex[key], (list, dict)) else json.dumps(ex[key])
-        cv.materials.append(hair_material())
+        cv.materials.append(hair_material(coloured))
         made.append((ob, ex))
     return made
 
@@ -226,15 +249,19 @@ def attach(made):
 
 def main(argv):
     if not argv:
-        raise SystemExit("usage: blender --python blender_hair_curves.py -- <hair.glb> [--model <model.glb>] [--save <file.blend>]")
-    hair, model, save = argv[0], None, None
-    if "--model" in argv:
-        model = argv[argv.index("--model") + 1]
-    if "--save" in argv:
-        save = argv[argv.index("--save") + 1]
+        raise SystemExit("usage: blender --python blender_hair_curves.py -- <hair.glb> [<hair.glb> ...] [--model <model.glb>] [--save <file.blend>]")
+    model, save, hair = None, None, []
+    it = iter(argv)
+    for a in it:
+        if a == "--model":
+            model = next(it)
+        elif a == "--save":
+            save = next(it)
+        else:
+            hair.append(a)
     if model:
         bpy.ops.import_scene.gltf(filepath=model)
-    made = build(hair)
+    made = [m for h in hair for m in build(h)]
     coll = bpy.data.collections.new("hair")
     guides = bpy.data.collections.new("hair guides")
     bpy.context.scene.collection.children.link(coll)

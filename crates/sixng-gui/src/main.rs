@@ -17,6 +17,7 @@ mod bc;
 mod cells;
 mod fabric;
 mod glb;
+mod lights;
 mod livery;
 mod livery_ui;
 mod map2d;
@@ -1612,6 +1613,9 @@ impl App {
             if c.has("no-shadows") {
                 m3.no_shadows = true;
             }
+            if c.has("no-placed-lights") {
+                m3.placed_lights = false;
+            }
             if let Some(v) = c.f("fog") {
                 m3.look.fog = v;
             }
@@ -1747,6 +1751,9 @@ impl App {
         }
         if let Some(v) = c.f("primer-amount") {
             m.look.primer_amount = (v as f32).clamp(0.0, 1.0);
+        }
+        if let Some(v) = c.f("primer-set") {
+            m.look.primer_set = v.clamp(0.0, 2.0) as u8;
         }
         if let Some(v) = c.get("fit-parts") {
             m.fit_parts_once = Some(v.to_string());
