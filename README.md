@@ -1453,6 +1453,12 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   Our choices: the bed's reflectance (sand and mud, 0.22 0.20 0.15), the
   sea's level, and the foam (depth, bands, 0.75 reflectance). Not yet: the
   shoreline grid's wave placement, refraction and underwater fog.
+- **Fewer draws per model** (since 2026-11-26): a model's meshes share one
+  vertex and one index buffer, and their indices address the whole vertex
+  buffer, so neighbouring meshes are drawn as one range. In the main pass
+  that joins neighbouring meshes with the same material; in the sun
+  shadow pass it joins all neighbouring solid meshes, whatever their
+  material (only cut-out ones need theirs).
 - **Map cells** (far placements merged per area): a placement more than
   0.3× the HD distance from the camera can be drawn from its cell instead
   of one by one (`SIXNG_CELLS_NEAR` sets another fraction). The cells are
