@@ -3341,6 +3341,11 @@ impl ModelView {
                         for (c, v) in extra.enumerate() {
                             px[(768 + id) * 512 + (50 + c) * 4 + 3] = v;
                         }
+                        // columns 73 to 88: the dust and scratch mask's
+                        // bytes (PartWear::dust)
+                        for (c, v) in pw.dust.iter().enumerate() {
+                            px[(768 + id) * 512 + (73 + c) * 4 + 3] = *v;
+                        }
                         let set = primer_set(primer_sets.as_ref().map_or(1, |m| m[id]), self.look.primer_set);
                         let prow = primer_rows.and_then(|s| usize::from_str_radix(&s[id * 12 + set * 4..id * 12 + set * 4 + 4], 16).ok()).filter(|r| *r != 0xffff);
                         let out3 = &mut px[(1025 + id) * 512..(1026 + id) * 512];
@@ -5688,6 +5693,27 @@ const PRESET_EDGE: u32 = 0x7f1f_e0a2;
 /// trunc(25.5 x value) into part record +56 byte 3, and its shader takes
 /// 10 x byte / 255 of the clear coat per unit of each wear layer's weight.
 const AGE_COAT_LOSS: u32 = 0xaa7d_4fbd;
+/// The age record's curves (`fe5d32e7`) the game packs for the dust and
+/// scratch mask (rva 0x37766a0; age floats at +k .. +k+16): per curve its
+/// min, max, start, end and exponent. The value at wear amount v0 is
+/// lerp(min, max, sat((v0^exp - start) / max(1e-5, end - start))).
+/// sunBleach (+0x30), baseBleach (+0x58), +0x44, +0x6c, redScratch (+0x8c),
+/// blueScratch (+0xa4), +0xc8, +0xdc.
+const AGE_CURVES: [[&str; 5]; 8] = [
+    ["c8482ad4", "e50025b1", "sunBleachStart", "sunBleachEnd", "3ef91ac2"],
+    ["baseBleachMin", "baseBleachMax", "baseBleachStart", "baseBleachEnd", "63ab1a06"],
+    ["db62bdc3", "a53b57b9", "6a4efd46", "ded82b1b", "a1a33c04"],
+    ["90294599", "38c12016", "cec65eaa", "16356415", "e921e50c"],
+    ["1da6a331", "5b934fe3", "redScratchStart", "redScratchEnd", "d1f62b9a"],
+    ["a1e80b6a", "46123d7b", "blueScratchStart", "blueScratchEnd", "79d86748"],
+    ["0c9cba21", "8c08b137", "1978a268", "1dce80e3", "aac54cc0"],
+    ["5ccb8f95", "7a78f02e", "8ed733ec", "90baf5cf", "8243d8af"],
+];
+/// The age record's bools the game packs as part flag bits 18 to 23 and
+/// 24 to 26 (age +0xbf..+0xc4, +0xbc..+0xbe): which mask channel (red,
+/// blue, the dust green) drives the clear-coat loss, a third G-buffer value
+/// and the added roughness.
+const AGE_DUST_BITS: [&str; 9] = ["6d9d81b3", "f4c2b82b", "32e128c3", "0e6ac3da", "6a2b9ab4", "11379ec6", "3ca53c6d", "2d6ae1aa", "a06d3fe0"];
 const D4_WINDOW: [u32; 2] = [0xeb72_23d6, 0xd54c_040a];
 /// The age record's wear amount range (`fe5d32e7` +0x0c, +0x10): the game
 /// takes a per-vehicle value between them.
@@ -5771,6 +5797,12 @@ struct PartWear {
     edge_end: u8,
     /// the clear coat lost per unit of wear weight, x 10 / 255
     coat_loss: u8,
+    /// the dust and scratch mask, as the game packs it: part record +92
+    /// bytes 3, 1, 2 (tiling x 255 / 50, red and blue intensities), +0
+    /// bytes 0, 1, +4 bytes 0, 1 (dust scale and bias), +56 bytes 0 to 2
+    /// (gains per layer: base, primer, first), +60 bytes 0 to 3, and the
+    /// flag bits 18 to 23 and 24 to 26
+    dust: [u8; 16],
 }
 
 /// Each part id's wear under a configuration, from model.json
@@ -5885,6 +5917,43 @@ fn part_wear(w: &serde_json::Value, look: usize, config: Option<&str>) -> Option
         }
         let loss = age.map(|a| &w["ages"][a]).and_then(|r| field(r, AGE_COAT_LOSS)).unwrap_or(0.0) as f32;
         o.coat_loss = (loss * 25.5) as i32 as u8;
+        // the dust and scratch mask, from the age record (none for an age
+        // range record): the game's packing of part record +0, +4, +56,
+        // +60, +92 and the flag bits
+        if let Some(r) = age.map(|a| &w["ages"][a]).filter(|r| r.is_object()) {
+            let af = |k: &str| r[k].as_f64().unwrap_or(0.0) as f32;
+            let crv = |k: usize| {
+                let [lo, hi, s, e, x] = AGE_CURVES[k].map(af);
+                lo + (hi - lo) * ((v0.powf(x) - s) / (e - s).max(1.0e-5)).clamp(0.0, 1.0)
+            };
+            let bb = |x: f32| (x * 255.0) as i32 as u8;
+            let tenth = |x: f32| (x * 25.5) as i32 as u8;
+            let signed = |x: f32| (127.5 + 127.5 * x) as i32 as u8;
+            // the tiling: the middle of minTiling .. maxTiling (the game
+            // picks a per-vehicle point), x 5.1 truncated
+            let tiling = ((af("minTiling") + af("maxTiling")) * 0.5 * 5.1) as i32 as u8;
+            let bit = |k: &str, b: u32| if r[k].as_bool() == Some(true) { 1u8 << b } else { 0 };
+            let lo_bits = (0..6).fold(0, |m, i| m | bit(AGE_DUST_BITS[i], i as u32));
+            let hi_bits = (0..3).fold(0, |m, i| m | bit(AGE_DUST_BITS[6 + i], i as u32));
+            o.dust = [
+                tiling,
+                bb(crv(4)),
+                bb(crv(5)),
+                bb(crv(0)),
+                bb(crv(1)),
+                bb(crv(2)),
+                bb(crv(3)),
+                bb(af("91b26647")),
+                bb(af("cf9f9929")),
+                bb(af("inclineComponentsScale")),
+                tenth(crv(6)),
+                signed(crv(4) * af("193c7eb1")),
+                tenth(crv(7)),
+                signed(crv(5) * af("2c04933e")),
+                lo_bits,
+                hi_bits,
+            ];
+        }
     }
     Some(out)
 }
@@ -9416,7 +9485,9 @@ mod tests {
                 "879774bd": "cr"}},
             "colour_ranges": {"cr": {"minGreen": 102, "maxGreen": 153, "fb2b7f54": 0, "c5801a83": 102, "7e3dffd5": 255, "c82d2173": 255}},
             "age_ranges": {"r1": {"minWear": 100, "maxWear": 200}},
-            "ages": {"a4": {"4e71efc8": 0.6, "b5fcdec9": 1.0, "aa7d4fbd": 2.0}},
+            "ages": {"a4": {"4e71efc8": 0.6, "b5fcdec9": 1.0, "aa7d4fbd": 2.0, "minTiling": 6.0, "maxTiling": 7.0,
+                "1da6a331": 0.0, "5b934fe3": 0.5, "redScratchStart": 0.0, "redScratchEnd": 1.0, "d1f62b9a": 1.0, "193c7eb1": 1.0,
+                "91b26647": 1.0, "6d9d81b3": true, "a06d3fe0": true}},
             "edges": {"e1": {"edgeIntensity": 0.275, "edgeStart": 0.05, "edgeEnd": 0.8}},
         });
         let a = part_wear(&w, 0, Some("k1")).unwrap();
@@ -9442,6 +9513,11 @@ mod tests {
         // the edge record: intensity 0.275, start and end x 255 truncated;
         // the clear-coat loss 25.5 x 2
         assert_eq!((a[1].edge_intensity, a[1].edge_start, a[1].edge_end, a[1].coat_loss), (70, 12, 204, 51));
+        // the dust and scratch mask: tiling 6.5 x 5.1, the red scratch
+        // curve 0.5 x v0 = 0.4 (x 255; signed with its multiplier 1:
+        // 127.5 + 127.5 x 0.4), base gain 1, flag bits 18 and 26; curves
+        // without fields are 0 (signed: 127)
+        assert_eq!(a[1].dust, [33, 102, 0, 0, 0, 0, 0, 255, 0, 0, 0, 178, 0, 127, 1, 4]);
         assert_eq!(super::primer_surface(&serde_json::json!({"primerPalette": {"roughnessLow": 0.45, "roughnessHigh": 0.78, "metallicLow": 0.0, "metallicHigh": 0.0}})), [0, 0, 114, 198]);
         assert_eq!(super::primer_surface(&serde_json::json!({})), [0, 0, 153, 153]);
         assert_eq!(part_wear(&w, 0, None).unwrap()[0].amount, 150);

@@ -780,6 +780,9 @@ fn map_finish_added(col0: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
 @group(1) @binding(6) var t_wear: texture_2d<f32>;
 // vehicle parts: the primer's mask (the wear mask when the model has none)
 @group(1) @binding(7) var t_primer: texture_2d<f32>;
+// vehicle parts: the game's dust and scratch mask (`dusttexture`, flags.w
+// bit 4; the wear mask when the model has none)
+@group(1) @binding(8) var t_dust: texture_2d<f32>;
 
 
 // How often the wear mask repeats across a part's UV0 (the age records'
@@ -1756,6 +1759,12 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         // 0: its tint) and its tint, linear (columns 65 to 67)
         var w2 = 1.0;
         var tint = vec3(0.0);
+        // the dust and scratch mask's added roughness (k3) and clear-coat
+        // loss (k1), and its gains per layer (base, primer, first wear
+        // layer), applied once the layers' weights are known
+        var dust_k1 = 0.0;
+        var dust_k3 = 0.0;
+        var dust_g = vec3(0.0);
         let id = floor(i.col.a * 255.0 + 0.5);
         // the primer's weight (layer B) and its roughness and metalness
         var w3 = 0.0;
@@ -1866,6 +1875,30 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
                 // takes 10 x byte / 255 of it per unit of weight (column
                 // 72: the age record's aa7d4fbd x 25.5, truncated)
                 coat.x = max(coat.x - (k + w3) * 10.0 * textureLoad(t_em, vec2(72, row), 0).a, 0.0);
+                // The game's dust and scratch mask (columns 73 to 88): the
+                // mask at the part's tiling, its red and blue (scratches)
+                // times the red and blue curves, its green (dust) times the
+                // vertex colour's green, scaled and biased. The flag bits
+                // pick which of them take off clear coat (bits 18, 21, and
+                // the dust always: the shader tests bit 0, which is set
+                // whenever wear is on) and add roughness (bits 20, 23, 26).
+                // The game's per-vehicle contrast and offset of the mask
+                // (I[0x2c], I[0x30], I[0x4c], I[0x50]) are runtime state:
+                // 1, 1, 0, 0 here.
+                if ((M.flags.w & 16u) != 0u) {
+                    // the tiling: byte x 50 / 255 (column value x 50)
+                    let til = textureLoad(t_em, vec2(73, row), 0).a * 50.0;
+                    let dk = til / WEAR_TILING;
+                    let t = textureSampleGrad(t_dust, samp, i.uv0 * til, wear_dx * dk, wear_dy * dk).rgb;
+                    let dr = t.r * textureLoad(t_em, vec2(74, row), 0).a;
+                    let db = t.b * textureLoad(t_em, vec2(75, row), 0).a;
+                    let dg = clamp((textureLoad(t_em, vec2(78, row), 0).a * i.col.g + textureLoad(t_em, vec2(79, row), 0).a) * t.g, 0.0, 1.0);
+                    let lo = u32(textureLoad(t_em, vec2(87, row), 0).a * 255.0 + 0.5);
+                    let hi = u32(textureLoad(t_em, vec2(88, row), 0).a * 255.0 + 0.5);
+                    dust_k1 = clamp(f32((lo >> 0u) & 1u) * dr + f32((lo >> 3u) & 1u) * db + dg, 0.0, 1.0) * 10.0 * textureLoad(t_em, vec2(83, row), 0).a;
+                    dust_k3 = clamp(f32((lo >> 2u) & 1u) * dr + f32((lo >> 5u) & 1u) * db + f32((hi >> 2u) & 1u) * dg, 0.0, 1.0);
+                    dust_g = vec3(textureLoad(t_em, vec2(80, row), 0).a, textureLoad(t_em, vec2(81, row), 0).a, textureLoad(t_em, vec2(82, row), 0).a);
+                }
             } else {
                 let t = wear_threshold(wear_amt);
                 k = smoothstep(t, t + 0.08, m.g);
@@ -1878,6 +1911,10 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         // colour by W2
         albedo = albedo * w0 + mix(tint, w1.rgb, w2) * k + p_col * w3;
         rough = clamp(rough * w0 + w1.a * k + p_rough * w3, 0.04, 1.0);
+        // the dust and scratch mask: roughness added by each layer's gain
+        // and weight, clear coat taken off the base paint
+        rough = clamp(rough + dust_k3 * dot(dust_g, vec3(w0, w3, k)), 0.04, 1.0);
+        coat.x = clamp(coat.x - dust_k1 * w0 * dust_g.x, 0.0, 1.0);
         metal = metal * w0 + m1 * k + p_metal * w3;
         pearl = pearl * w0;
     }

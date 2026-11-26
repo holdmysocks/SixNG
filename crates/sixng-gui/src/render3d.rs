@@ -1091,6 +1091,7 @@ impl Renderer3D {
                 tex_entry(5),
                 tex_entry(6),
                 tex_entry(7),
+                tex_entry(8),
             ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -2016,6 +2017,7 @@ impl Uploader {
             ramp_u: None,
             wear_mask: None,
             primer_mask: None,
+            dust_mask: None,
             ramp: None,
             parts: false,
             occlusion_only: false,
@@ -2081,7 +2083,9 @@ impl Uploader {
                 // and roughness)
                 | if mt.ramp.is_some() && mt.emissive.is_none() { 0x4000 } else { 0 }
                 // bit 15: the game's wear mask is bound (binding 6)
-                | if mt.wear_mask.is_some() && mt.ramp.is_some() && mt.emissive.is_none() { 0x8000 } else { 0 };
+                | if mt.wear_mask.is_some() && mt.ramp.is_some() && mt.emissive.is_none() { 0x8000 } else { 0 }
+                // bit 4: the game's dust and scratch mask is bound (binding 8)
+                | if mt.dust_mask.is_some() && mt.wear_mask.is_some() && mt.ramp.is_some() && mt.emissive.is_none() { 0x10 } else { 0 };
             let u = MatU {
                 base,
                 flags: [has, class_id(&mt.class), alpha, gap | mr],
@@ -2137,6 +2141,10 @@ impl Uploader {
                     wgpu::BindGroupEntry {
                         binding: 7,
                         resource: wgpu::BindingResource::TextureView(view(mt.primer_mask.or(mt.wear_mask))),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: wgpu::BindingResource::TextureView(view(mt.dust_mask.or(mt.wear_mask))),
                     },
                 ],
             });
