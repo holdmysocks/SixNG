@@ -1653,7 +1653,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             // the hide masks below are worked out over them
             let mut look_outfit: Vec<sixng_core::pedlook::LookPart> = Vec::new();
             // the outfit's body-shape preset (its tag), used unless --body-shape is given
-            let mut look_preset: Option<String> = None;
+            let mut look_preset: Option<(Option<String>, Vec<String>)> = None;
             let mut look_parts: Vec<(u64, sixng_core::pedlook::LookPart)> = match look {
                 Some(k) => match sixng_core::pedlook::look(&ws.game, &a, &ix, &prefix) {
                     // not a listed model either: the error below names the part rule
@@ -1664,7 +1664,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                         None => bail!("{prefix} has {} outfits (--look 0..{})", l.outfits.len(), l.outfits.len().saturating_sub(1)),
                         Some(o) => {
                             look_outfit = o.parts.clone();
-                            look_preset = o.body_shape.clone();
+                            look_preset = Some((o.body_shape.clone(), o.body_preset_items.clone()));
                             let ps = &o.parts;
                             let by_name = sixng_core::outfit::dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
                                 let n = e.name.as_ref()?.to_ascii_lowercase();
@@ -1763,10 +1763,11 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             // without --body-shape a --look outfit is posed in its own preset
             let body_shape = match (body_shape, &look_preset) {
                 (Some(s), _) => Some(s.clone()),
-                (None, Some(tag)) => match sixng_core::bodyshape::preset_controls(&ws.game, tag) {
-                    Ok(c) => Some(c.iter().filter(|(_, v)| *v != 0.0).map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join(",")).filter(|s| !s.is_empty()),
-                    Err(e) => {
-                        eprintln!("body-shape preset {tag}: {e} (exported neutral)");
+                (None, Some((tag, items))) => match sixng_core::bodyshape::outfit_preset(&ws.game, tag.as_deref(), items) {
+                    None => None,
+                    Some(Ok(c)) => Some(c.iter().filter(|(_, v)| *v != 0.0).map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join(",")).filter(|s| !s.is_empty()),
+                    Some(Err(e)) => {
+                        eprintln!("body-shape preset {}: {e} (exported neutral)", tag.as_deref().unwrap_or("of the outfit"));
                         None
                     }
                 },
