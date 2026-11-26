@@ -1179,7 +1179,9 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   land is drawn as a ground made up from height, slope and noise instead:
   sand just above the sea, dry grass and scrub inland, darker woods in
   patches, rock on steep slopes, lit by the scene with the terrain's own
-  normals. The tiles' water paint still marks the sea (our choice; the
+  normals. The tiles' hill shading, which holds relief finer than the
+  terrain mesh (embankments, building pads), is kept at half strength: the
+  tile's brightness over the bake's colour for that height. The tiles' water paint still marks the sea (our choice; the
   game's terrain materials are not decoded).
 - **Water** (HDR map): the sea and the game's water meshes are shaded
   from the timecycle's `water_*` values. Wind waves set the normal: the
