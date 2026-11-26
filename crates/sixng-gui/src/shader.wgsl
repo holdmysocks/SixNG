@@ -372,6 +372,7 @@ fn water_shade(p: vec3<f32>, fp: f32) -> vec3<f32> {
     // the water adds the bed's colour where the water is shallow
     let wh = water_here(p);
     var body = vec3(0.0);
+    var foam = 0.0;
     if (wh.ok) {
         ssa = clamp(wh.scat / max(wh.ext, vec3(1e-5)), vec3(0.0), vec3(1.0));
         let surf = select(p.y, SEA_LEVEL, p.y < SEA_PLANE_BELOW);
@@ -381,10 +382,40 @@ fn water_shade(p: vec3<f32>, fp: f32) -> vec3<f32> {
         let t = exp(-wh.ext * K_WATER * depth * (1.0 + 1.0 / mu));
         let deep = 0.33 * ssa * e_down / PI * S.water3.rgb;
         body = mix(deep, BED_ALBEDO * e_down / PI, t);
+        // foam where the water turns shallow: bands rolling in towards the
+        // shallower water, broken up along the shore
+        let shore = 1.0 - smoothstep(0.0, FOAM_DEPTH, depth);
+        if (shore > 0.0 && surf - wh.ground > -0.5) {
+            let tm = S.water4.w;
+            let brk = foam_noise(p.xz * 0.35 + vec2(tm * 0.05, 0.0)) * foam_noise(p.xz * 0.09 - vec2(0.0, tm * 0.02));
+            let band = pow(0.5 + 0.5 * sin(depth * 4.5 + tm * 1.3 + 6.0 * foam_noise(p.xz * 0.05)), 5.0);
+            foam = clamp(shore * (0.25 + 0.75 * band) * (0.4 + 1.2 * brk), 0.0, 1.0);
+        }
     } else {
         body = 0.33 * ssa * e_down / PI * S.water3.rgb;
     }
-    return fr * refl + glint + (1.0 - fr) * body;
+    let water = fr * refl + glint + (1.0 - fr) * body;
+    return mix(water, FOAM_ALBEDO * e_down / PI, foam * 0.85);
+}
+
+// Depth (m) under which the water foams, and the foam's reflectance (our
+// choices).
+const FOAM_DEPTH: f32 = 1.6;
+const FOAM_ALBEDO: f32 = 0.75;
+
+fn foam_hash(p: vec2<f32>) -> f32 {
+    let q = fract(p * vec2(0.1031, 0.1030));
+    let d = dot(q, q.yx + 33.33);
+    return fract((q.x + q.y) * (q.x + d));
+}
+
+// Smooth value noise (0 to 1) for the foam.
+fn foam_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(foam_hash(i), foam_hash(i + vec2(1.0, 0.0)), u.x),
+               mix(foam_hash(i + vec2(0.0, 1.0)), foam_hash(i + vec2(1.0, 1.0)), u.x), u.y);
 }
 
 // The map's frame: aerial perspective (froxel volume), height fog, then

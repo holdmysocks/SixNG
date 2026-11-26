@@ -1196,8 +1196,11 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   the surface, light down to the bed and back up through the water's
   extinction). Inland water meshes (lakes, marsh, canals) are measured from
   their own surface, the sea from 4 m below 0 (where the beaches end).
-  Our choices: the bed's reflectance (sand and mud, 0.30 0.26 0.19) and the
-  sea's level. Not yet: foam, shore waves, refraction and underwater fog.
+  Where the water is shallower than 1.6 m it foams: bands that roll in
+  towards the shallower water, broken up by noise along the shore.
+  Our choices: the bed's reflectance (sand and mud, 0.30 0.26 0.19), the
+  sea's level, and the foam (depth, bands, 0.75 reflectance). Not yet: the
+  shoreline grid's wave placement, refraction and underwater fog.
 - **Map cells** (far placements merged per area): a placement more than
   0.6× the HD distance from the camera can be drawn from its cell instead
   of one by one. A cell holds one LOD level's placements in one square of
