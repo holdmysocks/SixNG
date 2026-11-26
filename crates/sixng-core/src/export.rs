@@ -2548,6 +2548,10 @@ pub struct BatchSummary {
 /// * `batch_props.bin`: 44 bytes per prop instance, little-endian:
 ///   position f32 x3, world rotation quaternion f32 x4 (x, y, z, w),
 ///   scale f32 x3, tint u8 x4 (RGBA);
+/// * `batch_props_layer.bin`: 2 bytes per prop instance, same order as
+///   `batch_props.bin`: `layer_blend` (the 2-layer shaders' per-instance
+///   value b = byte / 255) and `layer_aux` (read beside it), see
+///   `batches::PropInstance`; a separate file so the 44-byte records stay;
 /// * `batch_grass.bin`: 20 bytes per grass instance: position f32 x3,
 ///   normal x / y u8 (n = b / 255 * 2 - 1, z positive), colour u8 x3,
 ///   scale u8, ambient occlusion u8, one pad byte.
@@ -2562,6 +2566,7 @@ pub fn export_batches(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: 
     struct W {
         meta: crate::atomic::AtomicFile,
         props: crate::atomic::AtomicFile,
+        props_layer: crate::atomic::AtomicFile,
         grass: crate::atomic::AtomicFile,
         np: usize,
         ng: usize,
@@ -2570,6 +2575,7 @@ pub fn export_batches(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: 
     let w = std::sync::Mutex::new(W {
         meta: crate::atomic::AtomicFile::create(dir.join("batches.jsonl"))?,
         props: crate::atomic::AtomicFile::create(dir.join("batch_props.bin"))?,
+        props_layer: crate::atomic::AtomicFile::create(dir.join("batch_props_layer.bin"))?,
         grass: crate::atomic::AtomicFile::create(dir.join("batch_grass.bin"))?,
         np: 0,
         ng: 0,
@@ -2604,6 +2610,7 @@ pub fn export_batches(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: 
                 }
                 buf.extend_from_slice(&i.tint);
                 let _ = w.props.write_all(&buf);
+                let _ = w.props_layer.write_all(&[i.layer_blend, i.layer_aux]);
             }
             w.np += b.instances.len();
             w.s.prop_batches += 1;
@@ -2633,6 +2640,7 @@ pub fn export_batches(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: 
     let w = w.into_inner().unwrap();
     w.meta.commit()?;
     w.props.commit()?;
+    w.props_layer.commit()?;
     w.grass.commit()?;
     Ok(w.s)
 }

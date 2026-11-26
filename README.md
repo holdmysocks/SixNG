@@ -644,7 +644,13 @@ again**).
     abdomen) and now replaces the mesh's. Of the 2,645
     characters with a body skin, 1,042 change (1,798 body parts); 1,288
     parts already had the same map, and 2,204 whose item names no stored
-    normal map keep the mesh's.
+    normal map keep the mesh's. The same change applies to heads whose
+    outfit item names their face: 1,138 heads now take the face's own
+    normal map (wrinkles, brow and age detail) over the head mesh's,
+    which is generic, and on some heads (`cs_benedict_halifax`) is not a
+    normal map at all. Heads that borrow a face from another character
+    through the head skin table keep their mesh's normal map when it is
+    stored (22 heads), so they don't take another person's wrinkles.
   - **Fabric shading.** The colour is shaded by the green channel of the
     garment's own packed map (`speculartex`: seams and folds, mid grey on
     plain cloth). From the clothing pixel shader (`ped_standard_muv`, read
@@ -1008,9 +1014,22 @@ again**).
   local matrix can carry shear, which TRS joint nodes cannot hold). The
   game's rig and its body-shape presets have no face controls, so the
   face does not change with the sliders. Each rig also reads 14 inputs
-  that no known control drives; they stay at 0. They act on the neck,
-  breasts and chest, hips and thighs, and upper arms, so they look like
-  extra shape controls. The game has two body-shape
+  that no control drove before 2026-11-26. They come from 11 more
+  controls in the same preset PSO (`anim.rpf@106153000`), each item of
+  which pairs control values with the rig input values they set:
+  `gcbreastheight`, `gcbreastspacing`, `gcchestheight`, `gccleavage`
+  (male rig only; the body-type XML's `GCCleavage`), `gchipheight` (-1..1,
+  a negative value drives the other input by its size), `gcbellyround`,
+  `gchipwidth`, `gcheadscale`, `gcmusclebiceps`, `gcmuscletriceps`
+  (0..1) and one whose name is not recovered, `gc_b0eae798` (-1..1, lower
+  chest and breast size). Every item that sets one control alone sets its
+  input to exactly the control's value (8 to 15 items each). The names
+  are joaat of the control ids; the rig inputs themselves have other
+  hashes. One input, `5ebebbe7` (head and neck), is set by no item; it is
+  probably the negative side of `gcheadscale` and stays at 0.
+  `gcheadscale` scales the head bone (1.5 at 0.5); the game also has
+  head-scale compensation rigs, which are not run here. `allmuscle` keeps
+  to the twelve regional muscle controls. The game has two body-shape
   rigs, female and male. The body type comes from the part's fit tag:
   every tag that starts with `m` (`mr1`, `mb1`, `mo1`, `mc1`, `msk1`) gets
   the male rig and skeleton. Before 2026-11-25, only `mr1` did, and the
@@ -1396,7 +1415,10 @@ baked map (`entities.bin`; bake first with `--bake-map`):
     placement.
 
   Built cells are cached in `<work>/gui_cache_v4/cells` (capped at 4 GB),
-  so a revisited area loads with one file read per cell. Until a cell has
+  so a revisited area loads with one file read per cell. The cache is
+  keyed by the bake (a fingerprint of `entities.bin` and `strings.json`),
+  so after a re-bake cells are built again and those of the old bake are
+  deleted. Until a cell has
   loaded, its placements load and draw one by one as before. A cell the
   camera comes close to keeps drawing until its placements' models have
   loaded. LOD and SLOD cells are small and built on demand. HD cells are
@@ -1404,7 +1426,9 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   built while the camera is slow (under 15 m/s); while flying, only HD
   cells already on disk are used. Cells need BC textures and the default
   view settings (every kind and LOD level, no proxies);
-  `SIXNG_MAP_NO_CELLS=1` turns them off.
+  `SIXNG_MAP_NO_CELLS=1` turns them off, and `SIXNG_MAP_CELL_LEVELS=2,3`
+  merges only those levels (0 HD to 5 SLOD4); the rest draw per placement,
+  where they can be picked.
 - **Texture streaming**: a model first loads with 64 px base-colour
   textures only (normal and data maps come with the sharper reload), read
   from block-compressed 64 px copies in `<work>/gui_cache_v4/bc64` (a few
@@ -1497,7 +1521,10 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   (the soft cap) the streamer loads only nearby models at 64 px and drops
   everything off screen; above 30 % (the hard cap) it also drops the
   farthest visible models. The texture budget is RAM/16 (0.5–3 GB) and the
-  model cap is 120 per GB (800–8,000). The **Memory** panel shows usage
+  model cap is 180 per GB (800–12,000). When a view wants more models
+  than the cap holds, the nearest load first and the view counts as
+  complete once the cap is full (the tick line says "model cap full").
+  The **Memory** panel shows usage
   against the caps; untick **automatic** to set your own limit with the
   slider. It is saved in `<work>/gui_settings.json`. The process figure
   includes memory the graphics driver commits for GPU buffers and
@@ -1835,7 +1862,7 @@ Status key:
 
 | CSP need | Status | Notes |
 |----------|--------|-------|
-| Instancing and placements (archetype, transform, LODs) | **works (transform); partial (LODs)** | `sixng placements` writes every entity with its model name, entry id, a ready-made glTF transform and its tint palette row (`tint_row`, see textures above). Models are still exported once per archetype, never baked. LOD parent/child links are in the per-entity fields but not interpreted. Interiors: `sixng interiors` gives each of the 2,590 interior instances a world transform and its entity list. **Instanced batches** (grass, weeds, debris, fences, reflectors, `*_batch_slod` LODs): `--batches[-only]` writes `batches.jsonl` (one line per batch: archetype, model name, bbox, LOD distance, `first` / `count` into the binary) plus `batch_props.bin` (44 B per instance: position f32×3, quaternion xyzw f32×4, scale f32×3, tint RGBA u8×4) and `batch_grass.bin` (20 B per instance: position f32×3, normal x/y u8, colour u8×3, scale u8, AO u8, pad). All 906,922 batches decode, 99.76 % with model names. Fixed 2026-11-23 (two causes; together 130,066 of 24.9 M prop instances in 23,352 batches came out with positions of 0 or 1e10–1e35 and scales of 0, 1e3–1e18 or inf, now 0): (1) a pool reference whose byte offset is 0x500–0x5FF or 0x600–0x6FF with a zero low byte (`0x5000_0003` = block 3, offset 0x500) also reads as a system or graphics pointer, and the pointer reading won; pool references now resolve first, for every meta pointer (this also fixes about 950 entity and 4,500 archetype and other extension arrays). (2) When a map file's system stream fills whole 64 KiB chunks (105 files in `levels`, 2 in the minigame pack), its graphics page is a separate zlib stream a few KiB further on, not stored data right after the system stream; `load_meta` now looks for a stream that inflates to the block extent (or that rounded up to 64 KiB) there. Re-export `batch_props.bin` (and anything built from it) made before then. |
+| Instancing and placements (archetype, transform, LODs) | **works (transform); partial (LODs)** | `sixng placements` writes every entity with its model name, entry id, a ready-made glTF transform and its tint palette row (`tint_row`, see textures above). Models are still exported once per archetype, never baked. LOD parent/child links are in the per-entity fields but not interpreted. Interiors: `sixng interiors` gives each of the 2,590 interior instances a world transform and its entity list. **Instanced batches** (grass, weeds, debris, fences, reflectors, `*_batch_slod` LODs): `--batches[-only]` writes `batches.jsonl` (one line per batch: archetype, model name, bbox, LOD distance, `first` / `count` into the binary) plus `batch_props.bin` (44 B per instance: position f32×3, quaternion xyzw f32×4, scale f32×3, tint RGBA u8×4), `batch_props_layer.bin` (2 B per instance in the same order: `layer_blend`, the 2-layer shaders' per-instance value b = byte / 255, then `layer_aux`, read beside it) and `batch_grass.bin` (20 B per instance: position f32×3, normal x/y u8, colour u8×3, scale u8, AO u8, pad). All 906,922 batches decode, 99.76 % with model names. Fixed 2026-11-23 (two causes; together 130,066 of 24.9 M prop instances in 23,352 batches came out with positions of 0 or 1e10–1e35 and scales of 0, 1e3–1e18 or inf, now 0): (1) a pool reference whose byte offset is 0x500–0x5FF or 0x600–0x6FF with a zero low byte (`0x5000_0003` = block 3, offset 0x500) also reads as a system or graphics pointer, and the pointer reading won; pool references now resolve first, for every meta pointer (this also fixes about 950 entity and 4,500 archetype and other extension arrays). (2) When a map file's system stream fills whole 64 KiB chunks (105 files in `levels`, 2 in the minigame pack), its graphics page is a separate zlib stream a few KiB further on, not stored data right after the system stream; `load_meta` now looks for a stream that inflates to the block extent (or that rounded up to 64 KiB) there. Re-export `batch_props.bin` (and anything built from it) made before then. |
 | Trees and bushes separately, with LODs and placements | **works (placements); partial (LODs)** | Tree and plant models export like any drawable, and their instances (e.g. `veg_pot_hedge_lrg_02` × 25 in one sample) come out of `sixng placements` with scale. |
 | Light emitters (position, colour, range, cone, night flag) | **works** | `sixng lights`: 774,847 placed lights in world space, interiors included. Intensity, falloff (range), falloff exponent, cone, corona, volumetric and fade fields are named from the game's own field hashes. |
 | Collision split by surface type; walls identifiable | **works (split); partial (names)** | `sixng collision`: one GLB per bounds file, one primitive per surface id, in world coordinates. Surface ids are named by `sixng annotate` (221 of 389 ids, 64 % of triangles); inferred categories (`sixng surfaces`) cover 98.3 % of area, each with a confidence (90.8 % high or medium), from plants and props standing on each surface, path-link density, slope and height. Interior collision: `sixng interiors` links 70.7 % of interior archetypes (`collision_linked`, ~91 % precision on the ordered links); its second pass links the rest by fitting the interior's entities onto candidate collision floors, for 97.8 % in all, 79.3 % at high or medium confidence. |
