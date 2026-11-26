@@ -1785,11 +1785,16 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             if *hair && !*anim_only {
                 // the strand pieces of the outfit, then the extra styles
                 let slots: Vec<String> = if hair_slots.iter().any(|s| s == "all") { Vec::new() } else { hair_slots.clone() };
-                let mut pieces = match sixng_core::pedlook::look(&ws.game, &a, &ix, &prefix) {
-                    Ok(l) => sixng_core::hairexport::character_grooms(&ws.work, &a, &ix.entries, &l, look.unwrap_or(0), &slots).map_err(|e| anyhow!(e))?,
+                let ped = sixng_core::pedlook::look(&ws.game, &a, &ix, &prefix);
+                let mut pieces = match &ped {
+                    Ok(l) => sixng_core::hairexport::character_grooms(&ws.work, &a, &ix.entries, l, look.unwrap_or(0), &slots).map_err(|e| anyhow!(e))?,
                     Err(_) if !hair_style.is_empty() => Vec::new(),
                     Err(e) => bail!("--hair: no outfit list for {prefix}: {e}"),
                 };
+                // the colours the viewer gives each slot: the game's strand tables, else the items' presets
+                let outfit_of = ped.as_ref().ok().and_then(|l| l.outfits.get(look.unwrap_or(0)));
+                let tables = sixng_core::hairtables::load_or_build(&ws, &a).map_err(|e| eprintln!("--hair: strand tables not read: {e:#}")).ok().map(|v| sixng_core::hairtone::StrandData::from_json(&v));
+                let presets = sixng_core::hairtone::Table::load_or_build(&ws).ok();
                 for st in hair_style {
                     let re = regex::RegexBuilder::new(st).case_insensitive(true).build()?;
                     pieces.extend(sixng_core::hairexport::placeholder_grooms(&ws.work, &a, &ix.entries, &re).map_err(|e| anyhow!(e))?);
@@ -1806,8 +1811,14 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                         let name = format!("{}_{off:x}", slot.replace(' ', "_"));
                         let mut ex = json!({"slot": slot, "placeholder": placeholder, "groom": format!("{off:x}"), "bones": bones});
                         let uv_set = sixng_core::hairexport::tag_uv_set(&g, head.as_ref(), &mut ex);
-                        let (p, mut sum) = sixng_core::hairexport::piece(&g, &name, &o, ex);
+                        let colour = outfit_of.and_then(|of| sixng_core::hairexport::slot_colour(of, slot, tables.as_ref(), presets.as_ref()));
+                        if let Some((c, set)) = &colour {
+                            ex["colour_set"] = json!(format!("{set:08x}"));
+                            ex["colour_source"] = json!(match c { sixng_core::hairexport::HairColour::Set(_) => "strand tables", sixng_core::hairexport::HairColour::Presets(_) => "item presets" });
+                        }
+                        let (p, mut sum) = sixng_core::hairexport::piece(&g, &name, &o, colour.as_ref().map(|c| &c.0), ex);
                         sum["head_uv_set"] = json!(uv_set);
+                        sum["colour_set"] = json!(colour.as_ref().map(|c| format!("{:08x}", c.1)));
                         sum["slot"] = json!(slot);
                         sum["placeholder"] = json!(placeholder);
                         sum["confidence"] = json!(confidence);

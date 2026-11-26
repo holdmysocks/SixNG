@@ -356,8 +356,13 @@ the viewer draws), and the guides as
 `<piece>_guides`. Every point carries the strand's root UV (`TEXCOORD_0`, a
 coordinate in one of the head mesh's UV sets; see below), its width in metres (`_WIDTH`), its clump (`_CLUMP`, 0
 = none) and its colour variant (`_VARIANT`, 0-3: which of the four colour
-ramps of its colour set the game uses); each mesh's extras give the points
-per strand, the slot, placeholder, bones and groom offset, and
+ramps of its colour set the game uses), and the grown strands their colour
+(`COLOR_0`, linear RGB, root to tip of the strand's variant), the colour
+the viewer gives the slot: the outfit's colour set for the slot, else the
+one the item names, from the game's strand tables, else the item's own
+colour presets; each mesh's extras give the points
+per strand, the slot, placeholder, bones and groom offset, the colour set
+(`colour_set`, its name hash, and `colour_source`), and
 `head_mesh` / `head_uv_set`: which of the exported head's UV sets
 (`TEXCOORD_n`) the root UVs are in. The groom does not say which: the
 export matches the root UVs against every set of the head at the guide
@@ -380,7 +385,11 @@ and a few match no set of the head they are shown on.
 (`blender --python scripts/blender_hair_curves.py -- <hair.glb> [<hair.glb>
 …] --model <model.glb> [--save <file.blend>]`; several files for the
 per-groom files of `grooms --full`): one per piece, with `radius`, `clump`,
-`variant` and `root_uv`. With `--model` each object is parented to the head
+`variant`, `root_uv` and, when the file has colours, `colour`, which drives
+the piece's hair material (Principled Hair BSDF, colour parametrization,
+the colour squared by a Gamma node: the BSDF reads its colour as the
+hair's overall colour, and the game's colours as they are render far too
+pale; pieces without colours get a plain brown one). With `--model` each object is parented to the head
 bone of the armature and gets the head mesh as its surface: its surface
 UV map is the head's UV set `head_uv_set` (the importer names `TEXCOORD_n`
 `UVMap`, `UVMap.001` …) and `surface_uv_coordinate` is the game's own root
@@ -391,8 +400,7 @@ place), takes the head's first UV map under each root instead. The guides come i
 hidden, in a collection of their own. Checked in Blender 5.3: strand roots
 lie a median 0.1 to 0.8 mm from the head surface, and the head point at
 each strand's surface UV lies a median 0.1 to 1.2 mm from its root (2 to
-4 mm on the scalp pieces whose guide roots sit that far above the skin). The material is a plain
-hair BSDF: the export carries no hair colour.
+4 mm on the scalp pieces whose guide roots sit that far above the skin).
 
 How the game grows the strands (`hairgen`, `Groom::coat`), to rebuild or
 restyle the hair:
