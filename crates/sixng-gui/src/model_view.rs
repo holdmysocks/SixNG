@@ -298,6 +298,8 @@ pub struct LookInfo {
     pub strand_tints: Vec<(String, u32, u8)>,
     /// Hair colour preset (name hash) of the strand parts, by slot.
     pub strand_presets: Vec<(String, u32)>,
+    /// Painted hair layer set per strand item (slot, tag `023e5a2f` along the item's chain).
+    pub strand_layer_sets: Vec<(String, u32)>,
     /// What the viewer did or could not do (skin tone source, unresolved items).
     pub notes: Vec<String>,
     /// Strand hair found for the outfit's hair assets (`hairlink`).
@@ -6920,6 +6922,9 @@ fn load_query_sel(
                                 if let Some(h) = p.hair_preset.as_deref().and_then(|h| u32::from_str_radix(h, 16).ok()) {
                                     info.strand_presets.push((p.slot.clone(), h));
                                 }
+                                if let Some(h) = p.layer_set.as_deref().and_then(|h| u32::from_str_radix(h, 16).ok()) {
+                                    info.strand_layer_sets.push((p.slot.clone(), h));
+                                }
                             }
                             continue;
                         }
@@ -6937,8 +6942,9 @@ fn load_query_sel(
                         }
                     }
                 }
-                // The painted hair of the head skin: the layers of each hair and brow item's layer set (named like the
-                // item's placeholder, its tag 023e5a2f), slot i coloured by preset i of the item's colour preset set (its
+                // The painted hair of the head skin: the layers of each hair and brow item's layer set (its tag 023e5a2f
+                // along the item's chain, often but not always the placeholder's name; the name where the tag is
+                // missing), slot i coloured by preset i of the item's colour preset set (its
                 // tag f7b14eb8). That the game's per-character entry is filled from these two tags is read from the data,
                 // not from its code. SIXNG_NO_UNDER=1 leaves the layers out.
                 if std::env::var("SIXNG_NO_UNDER").is_err() {
@@ -6947,7 +6953,8 @@ fn load_query_sel(
                     for (slot, drawable, _) in &info.strands {
                         let Some(t) = table.as_ref() else { continue };
                         let Some(set) = info.strand_presets.iter().find(|p| p.0 == *slot).map(|p| p.1) else { continue };
-                        for l in t.under_layers(sixng_core::meta7a::joaat(drawable.to_ascii_lowercase().trim_end_matches("_full"))) {
+                        let key = info.strand_layer_sets.iter().find(|p| p.0 == *slot).map(|p| p.1).unwrap_or_else(|| sixng_core::meta7a::joaat(drawable.to_ascii_lowercase().trim_end_matches("_full")));
+                        for l in t.under_layers(key) {
                             // a preset with its flag set draws the skin's own colour: nothing to paint
                             let Some(p) = t.slot_preset(set, l.slot).filter(|p| !p.flag) else { continue };
                             under.push(UnderPaint { layer: l.clone(), a: p.a.map(|x| x as f32 / 255.0), b: p.b.map(|x| x as f32 / 255.0) });
