@@ -1347,7 +1347,7 @@ fn look_stand_in(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) ->
                 let slot = slot_of(x);
                 let strands = is_strand_word(item_word(x));
                 o.parts.retain(|p| p.slot != slot);
-                o.parts.push(LookPart { strands, slot, drawable: (*x).clone(), item: String::new(), guid: strands.then(|| format!("{:016x}", crate::meta7a::asset_id(x))), tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by: "own", category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, state_guids: vec![] });
+                o.parts.push(LookPart { strands, slot, drawable: (*x).clone(), item: String::new(), guid: strands.then(|| format!("{:016x}", crate::meta7a::asset_id(x))), tint: None, colour: None, colour_tag: None, hair_preset: None, layer_set: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by: "own", category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, state_guids: vec![] });
             }
         }
         l.other_variations.clear();
@@ -1399,7 +1399,7 @@ fn look_stand_in_hair(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &st
     l.outfits.sort_by_key(|o| (!everyday(o), !wears(o)));
     for o in &mut l.outfits {
         o.parts.retain(|p| p.slot != "hair");
-        o.parts.push(LookPart { strands: true, slot: "hair".into(), drawable: hair.clone(), item: String::new(), guid: Some(format!("{:016x}", crate::meta7a::asset_id(&hair))), tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by: "own", category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, state_guids: vec![] });
+        o.parts.push(LookPart { strands: true, slot: "hair".into(), drawable: hair.clone(), item: String::new(), guid: Some(format!("{:016x}", crate::meta7a::asset_id(&hair))), tint: None, colour: None, colour_tag: None, hair_preset: None, layer_set: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by: "own", category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, state_guids: vec![] });
     }
     l.other_variations.clear();
     let who = model_names(&crate::export::game_root(a)).ok().and_then(|m| m.names.get(&h).cloned()).unwrap_or_else(|| format!("ped_0x{h:08x}"));
