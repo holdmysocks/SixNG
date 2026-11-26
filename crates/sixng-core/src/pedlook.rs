@@ -1702,7 +1702,7 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
 mod tests {
     #[test]
     fn cull_twins_and_masks_follow_the_hide_masks() {
-        let part = |d: &str, layer: &str, hides: Vec<(&str, &str)>| LookPart { slot: "top".into(), drawable: d.into(), item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by: "x", category: None, layer: Some(layer.into()), hides: hides.into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(), hides_sub: vec![], hair_state: None, state_guids: vec![] };
+        let part = |d: &str, layer: &str, hides: Vec<(&str, &str)>| LookPart { slot: "top".into(), drawable: d.into(), item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by: "x", category: None, layer: Some(layer.into()), hides: hides.into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(), hides_sub: vec![], hair_state: None, state_guids: vec![], layer_set: None };
         let parts = vec![
             part("tshirt_mr1_000_full", "15793985", vec![]),
             part("shirt_mr1_000_full", "752a6eba", vec![("15793985", "0a00"), ("275822c4", "0001")]),
