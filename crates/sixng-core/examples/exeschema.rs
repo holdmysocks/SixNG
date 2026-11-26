@@ -3,10 +3,12 @@
 //! every meta struct the game can load, including the many that no shipped
 //! meta file's own schema describes.
 //!
-//! exeschema <exe> <out.json> [<struct hash> ...]
+//! exeschema [--work <work dir>] <exe> <out.json> [<struct hash> ...]
 //!
-//! The listed struct hashes are also printed as flattened layouts (base
-//! struct members first).
+//! Output: `{"structs": [...], "enums": [...]}`. The listed struct hashes
+//! are also printed as flattened layouts (base struct members first). With
+//! `--work`, hashes are named from that work folder's name dictionary as
+//! well as the built-in lists.
 //!
 //! Layout (found by hand, checked against the schemas of the levels' meta
 //! files: 233 of their 234 structs are in the table, and with base structs
@@ -27,6 +29,11 @@
 //!   struct of a struct member or element record 12 bytes into its record,
 //!   and `call <getter>; mov rcx, <this>; mov rdx, rax; call <link>` sets
 //!   the base struct.
+//! - Enum and bitset member records hold, at +20, a pointer to a 0x20-byte
+//!   enum object: u64 pointer to its value table, two u64 (0 in the file),
+//!   u32 enum name hash, u16 value count. Value table entries are 12 bytes:
+//!   u32 value name hash (case-sensitive joaat), s32 value, u32 0; the
+//!   table ends with {0, -1, -1}.
 use std::collections::HashMap;
 
 const ITEM: u32 = 0x063f_a3f2;
@@ -109,6 +116,8 @@ struct Mem {
     strukt: Option<u32>,
     /// element records (rva) of an array or map
     items: Vec<u32>,
+    /// enum object (pointer) of an enum or bitset member
+    enm: Option<u64>,
 }
 
 struct Def {
@@ -120,9 +129,17 @@ struct Def {
 }
 
 fn main() -> anyhow::Result<()> {
-    let a: Vec<String> = std::env::args().collect();
+    let mut a: Vec<String> = std::env::args().collect();
+    if let Some(i) = a.iter().position(|x| x == "--work") {
+        let w = a
+            .get(i + 1)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("--work needs a folder"))?;
+        sixng_core::names::set_work_dir(std::path::Path::new(&w));
+        a.drain(i..i + 2);
+    }
     if a.len() < 3 {
-        anyhow::bail!("usage: exeschema <exe> <out.json> [<struct hash> ...]");
+        anyhow::bail!("usage: exeschema [--work <work dir>] <exe> <out.json> [<struct hash> ...]");
     }
     let m = std::fs::read(&a[1])?;
     let pe = Pe::new(&m).ok_or_else(|| anyhow::anyhow!("not a PE file"))?;
@@ -140,6 +157,15 @@ fn main() -> anyhow::Result<()> {
             .then(|| (r - dva as i64 + dro as i64) as usize)
     };
     let ptr = |p: u64| -> Option<usize> { p.checked_sub(pe.base).and_then(|r| dat(r as i64)) };
+    // any section's raw data
+    let file_of = |p: u64| -> Option<usize> {
+        let r = p.checked_sub(pe.base)? as u32;
+        pe.secs
+            .iter()
+            .find(|s| r >= s.1 && r < s.1 + s.4)
+            .map(|s| (r - s.1 + s.3) as usize)
+            .filter(|&o| o + 0x20 <= m.len())
+    };
     let rel = |i: usize, len: usize| -> i64 {
         tva + (i + len) as i64
             + i32::from_le_bytes(text[i + len - 4..i + len].try_into().unwrap()) as i64
@@ -215,6 +241,10 @@ fn main() -> anyhow::Result<()> {
                         rec: drva(q),
                         strukt: None,
                         items: Vec::new(),
+                        enm: (ty == 0x0e || ty == 0x0f)
+                            .then(|| u64le(&m, q + 20))
+                            .flatten()
+                            .filter(|&p| file_of(p).is_some()),
                     });
                 }
             }
@@ -287,9 +317,17 @@ fn main() -> anyhow::Result<()> {
                 continue;
             }
             let k = j + 5;
-            if text[k..k + 3] == [0x48, 0x89, 0x05] {
+            // mov [rip + x], rax; or mov rcx, rax; ...; mov [rip + x], rcx
+            let st = if text[k..k + 3] == [0x48, 0x89, 0x05] {
+                Some(k)
+            } else if text[k..k + 3] == [0x48, 0x89, 0xc1] {
+                (k + 3..k + 9).find(|&q| text[q..q + 3] == [0x48, 0x89, 0x0d])
+            } else {
+                None
+            };
+            if let Some(q) = st {
                 if let Some(b) = slot_of(rel(j, 5)) {
-                    stores.push(((rel(k, 7) - 12) as u32, b));
+                    stores.push(((rel(q, 7) - 12) as u32, b));
                 }
             }
             if let Some(q) = text[k..k + 8]
@@ -333,10 +371,38 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
+    // Enum objects and their value tables.
+    let mut enums: HashMap<u64, (u32, Vec<(u32, i32)>)> = HashMap::new();
+    for mm in defs.values().flat_map(|d| d.members.iter()) {
+        let Some(p) = mm.enm else { continue };
+        if enums.contains_key(&p) {
+            continue;
+        }
+        let o = file_of(p).unwrap();
+        let (hash, n) = (
+            u32le(&m, o + 24).unwrap_or(0),
+            u16le(&m, o + 28).unwrap_or(0) as usize,
+        );
+        let mut vals = Vec::new();
+        if let Some(t) = u64le(&m, o).and_then(file_of) {
+            for k in 0..n.min(4096) {
+                let (Some(h), Some(v)) = (u32le(&m, t + 12 * k), u32le(&m, t + 12 * k + 4)) else {
+                    break;
+                };
+                if h == 0 && v == u32::MAX {
+                    break;
+                }
+                vals.push((h, v as i32));
+            }
+        }
+        enums.insert(p, (hash, vals));
+    }
     let nm: usize = defs.values().map(|d| d.members.len()).sum();
     eprintln!(
-        "{} structs, {nm} members ({bad_rec} odd records), {nb} base links, {ns} struct references",
-        defs.len()
+        "{} structs, {nm} members ({bad_rec} odd records), {nb} base links, {ns} struct references, {} enums ({} values)",
+        defs.len(),
+        enums.len(),
+        enums.values().map(|e| e.1.len()).sum::<usize>()
     );
 
     // Output, by struct hash.
@@ -370,6 +436,9 @@ fn main() -> anyhow::Result<()> {
                     if !mm.items.is_empty() {
                         v["items"] = mm.items.iter().map(|&r| item(r)).collect();
                     }
+                    if let Some(e) = mm.enm.and_then(|p| enums.get(&p)) {
+                        v["enum"] = format!("{:08x}", e.0).into();
+                    }
                     v
                 })
                 .collect();
@@ -383,7 +452,33 @@ fn main() -> anyhow::Result<()> {
             v
         })
         .collect();
-    std::fs::write(&a[2], serde_json::to_vec_pretty(&out)?)?;
+    let mut el: Vec<&(u32, Vec<(u32, i32)>)> = enums.values().collect();
+    el.sort_by_key(|e| e.0);
+    el.dedup_by_key(|e| e.0);
+    let eout: Vec<serde_json::Value> = el
+        .iter()
+        .map(|(h, vals)| {
+            let vs: Vec<_> = vals
+                .iter()
+                .map(|&(vh, v)| {
+                    let mut j = serde_json::json!({"hash": format!("{vh:08x}"), "value": v});
+                    if let Some(n) = name(vh) {
+                        j["name"] = n.into();
+                    }
+                    j
+                })
+                .collect();
+            let mut j = serde_json::json!({"hash": format!("{h:08x}"), "values": vs});
+            if let Some(n) = name(*h) {
+                j["name"] = n.into();
+            }
+            j
+        })
+        .collect();
+    std::fs::write(
+        &a[2],
+        serde_json::to_vec_pretty(&serde_json::json!({"structs": out, "enums": eout}))?,
+    )?;
 
     for h in &a[3..] {
         let h = u32::from_str_radix(h.trim_start_matches("0x"), 16)?;
@@ -432,6 +527,17 @@ fn main() -> anyhow::Result<()> {
                     type_name(mm.ty),
                     name(mm.hash).unwrap_or(format!("{:08x}", mm.hash))
                 );
+                if let Some((eh, vals)) = mm.enm.and_then(|p| enums.get(&p)) {
+                    let vs: Vec<String> = vals
+                        .iter()
+                        .map(|&(vh, v)| format!("{}={v}", name(vh).unwrap_or(format!("{vh:08x}"))))
+                        .collect();
+                    println!(
+                        "              {} {{{}}}",
+                        name(*eh).unwrap_or(format!("{eh:08x}")),
+                        vs.join(", ")
+                    );
+                }
             }
         }
     }
