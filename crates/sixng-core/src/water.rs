@@ -705,11 +705,14 @@ pub struct Options {
     pub shore_px: usize,
     /// Also write every height tile at its own resolution.
     pub height_tiles: bool,
+    /// Also export the inland water surfaces ([`inland_tiles`]); scans
+    /// every map file of levels.rpf.
+    pub inland: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { fog_px: 32, height_px: 128, shore_px: 32, height_tiles: false }
+        Options { fog_px: 32, height_px: 128, shore_px: 32, height_tiles: false, inland: false }
     }
 }
 
@@ -1120,6 +1123,8 @@ pub fn export(ws: &crate::export::Workspace, out: Option<&std::path::Path>, o: &
     let shore_check = check_shore(&shr, &shore_natives, &placement);
     let hm = crate::heightmap::load_all(ws, "common").ok().and_then(|m| crate::heightmap::best(&m).map(|i| m[i].1.clone()));
     let height_check = hm.as_ref().map(|m| check_heights(&hgt, m));
+    let inland = if o.inland { Some(inland_tiles(ws)?) } else { None };
+    let inland_check = inland.as_ref().map(|t| check_inland(t, &hgt));
 
     let mut rep = json!({
         "grids": grids.iter().map(|(s, g)| { let mut j = g.to_json(); j["source"] = json!(s); j }).collect::<Vec<_>>(),
@@ -1129,6 +1134,9 @@ pub fn export(ws: &crate::export::Workspace, out: Option<&std::path::Path>, o: &
         "timecycle_variables": tc_keys["variables"], "timecycle_cycles": tc_keys["cycles"].as_array().map(Vec::len),
         "timecycle_modifiers_with_water_keys": tc_keys["modifiers"].as_array().map(Vec::len),
     });
+    if let (Some(t), Some(c)) = (&inland, &inland_check) {
+        rep["inland"] = json!({"tiles": t.len(), "check_against_height_map": c});
+    }
     let Some(out) = out else { return Ok(summary(&rep)) };
     let dir = out.join("water");
     for d in ["fog", "height", "shore/tiles", "settings"] {
@@ -1230,11 +1238,228 @@ pub fn export(ws: &crate::export::Workspace, out: Option<&std::path::Path>, o: &
     sr["mosaic"] = mosaic(&shr, "mosaic.png", "RGBA8 PNG, point-sampled");
     sr["check_against_placement_data"] = rep["shore_check"].clone();
     write_json(&dir.join("shore/cells.json"), &sr)?;
+    if let (Some(t), Some(c)) = (&inland, &inland_check) {
+        rep["inland"] = write_inland(&dir.join("inland"), t, c)?;
+    }
     rep["out"] = json!(dir);
     Ok(summary(&rep))
 }
 
 /// The report without the per-tile records.
+/// Kinds of inland water surface, from the drawable name
+/// `<area>_water_<region>_<kind>_<n>`: code, name.
+pub const INLAND_KINDS: &[(&str, &str)] = &[
+    ("rvr", "river"),
+    ("cnl", "canal"),
+    ("crk", "creek"),
+    ("rsr", "reservoir"),
+    ("glf", "golf course pond"),
+    ("stm", "stream"),
+    ("dtc", "ditch"),
+    ("mill", "mill pond"),
+    ("drn", "drain"),
+    ("nuc", "power plant water"),
+];
+
+/// The kind code of an inland water surface drawable, from its name: the
+/// part after `_water_<region>_` (region `lo`, `fh`, `nb`, `ma`, ...).
+/// `None` for other names and for LOD models (`lod` / `slod` anywhere in
+/// the name).
+pub fn inland_kind(name: &str) -> Option<&'static str> {
+    let n = name.to_ascii_lowercase();
+    if n.contains("lod") {
+        return None;
+    }
+    let rest = &n[n.find("_water_")? + 7..];
+    let mut parts = rest.split('_');
+    let region = parts.next()?;
+    let kind = parts.next()?;
+    parts.next()?;
+    if !(2..=3).contains(&region.len()) || !region.bytes().all(|b| b.is_ascii_lowercase()) {
+        return None;
+    }
+    INLAND_KINDS.iter().find(|(c, _)| *c == kind).map(|(c, _)| *c)
+}
+
+/// One placed inland water surface: its mesh (LOD 0) in world space.
+pub struct InlandTile {
+    pub name: String,
+    pub kind: &'static str,
+    /// Map file (entry id) that places it.
+    pub map_file: String,
+    pub position: [f32; 3],
+    /// Entity rotation (x, y, z, w), world.
+    pub rotation: [f32; 4],
+    pub scale: [f32; 2],
+    /// World-space vertices (RAGE, Z-up, metres) and triangles.
+    pub positions: Vec<[f32; 3]>,
+    pub indices: Vec<u32>,
+}
+
+impl InlandTile {
+    /// Min and max corner of the world-space vertices.
+    pub fn bbox(&self) -> [[f32; 3]; 2] {
+        let mut b = [[f32::MAX; 3], [f32::MIN; 3]];
+        for v in &self.positions {
+            for c in 0..3 {
+                b[0][c] = b[0][c].min(v[c]);
+                b[1][c] = b[1][c].max(v[c]);
+            }
+        }
+        b
+    }
+    /// Vertex heights at the 0, 5, 50, 95 and 100th percentiles. The
+    /// median is the surface height; banks and slopes widen the spread.
+    pub fn z_percentiles(&self) -> [f32; 5] {
+        let mut z: Vec<f32> = self.positions.iter().map(|v| v[2]).collect();
+        z.sort_by(f32::total_cmp);
+        let at = |f: f32| z.get(((z.len().max(1) - 1) as f32 * f) as usize).copied().unwrap_or(0.0);
+        [at(0.0), at(0.05), at(0.5), at(0.95), at(1.0)]
+    }
+}
+
+/// Every inland water surface placed on the map: the drawables of
+/// levels.rpf whose name gives an [`inland_kind`], placed by the map files'
+/// entities (not interior or group-local ones). Each is a tile of at most
+/// 64 m; the install has 958, each placed once.
+pub fn inland_tiles(ws: &crate::export::Workspace) -> Result<Vec<InlandTile>> {
+    use rayon::prelude::*;
+    let lv = ws.resolve("levels")?;
+    let ix = ws.load_index(&lv)?;
+    let mut water: std::collections::HashMap<u32, (String, &'static str, &crate::scan::Entry)> = std::collections::HashMap::new();
+    for e in &ix.entries {
+        if let (Some(n), Some("dr")) = (&e.name, e.rtype.as_deref()) {
+            if let Some(k) = inland_kind(n) {
+                water.insert(crate::meta7a::joaat(n), (n.clone(), k, e));
+            }
+        }
+    }
+    let metas: Vec<&crate::scan::Entry> = ix.entries.iter().filter(|e| e.sub == "7a").collect();
+    let scans = crate::export::scan_meta(&lv, &metas, false, std::sync::Arc::new(|_: &str, _: u64, _: u64| {}));
+    let mut placed = Vec::new();
+    for s in scans.iter().filter(|s| !s.group) {
+        for (i, &(arch, p, q, sxy, sz)) in s.ents.iter().enumerate() {
+            if !s.interior.contains(&i) && water.contains_key(&arch) {
+                placed.push((arch, p, q, [sxy, sz], s.id.clone()));
+            }
+        }
+    }
+    let mut tiles: Vec<InlandTile> = placed
+        .into_par_iter()
+        .filter_map(|(arch, p, q, sc, file)| {
+            let (name, kind, e) = &water[&arch];
+            let r = crate::resource::Resource::load(&lv.path, e).ok()?;
+            let bufs = crate::drawable::find_buffers(&r);
+            let geoms = crate::drawable::find_geometries(&r, &bufs);
+            let lod0: std::collections::HashSet<usize> = crate::drawable::find_models(&r, &geoms).iter().filter(|m| m.lod == 0 && !m.part).flat_map(|m| m.geometries.clone()).collect();
+            let slice = |i: usize| {
+                let b = &bufs[i];
+                let end = (b.gfx_off + b.bytes).min(r.gfx.len() as u64) as usize;
+                &r.gfx[(b.gfx_off as usize).min(end)..end]
+            };
+            let (mut positions, mut indices) = (Vec::new(), Vec::new());
+            for (gi, g) in geoms.iter().enumerate() {
+                if !lod0.is_empty() && !lod0.contains(&gi) {
+                    continue;
+                }
+                let Some(h) = bufs[g.vertex_buffer].mesh_blob.as_ref() else { continue };
+                let m = crate::drawable::decode_mesh(slice(g.vertex_buffer), h, slice(g.index_buffer));
+                let base = positions.len() as u32;
+                indices.extend(m.indices.iter().map(|i| i + base));
+                positions.extend(m.positions.iter().map(|v| {
+                    let w = crate::lights::rotate(q, [v[0] * sc[0], v[1] * sc[0], v[2] * sc[1]]);
+                    [w[0] + p[0], w[1] + p[1], w[2] + p[2]]
+                }));
+            }
+            (!indices.is_empty()).then(|| InlandTile { name: name.clone(), kind, map_file: file, position: p, rotation: q, scale: sc, positions, indices })
+        })
+        .collect();
+    tiles.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(tiles)
+}
+
+/// Inland surfaces against the water height map (ground, river and lake
+/// beds): for each tile the height map is sampled on a 9 x 9 grid over its
+/// box. A surface sits above the lowest ground under it (the bed) and
+/// below the highest (the banks).
+pub fn check_inland(tiles: &[InlandTile], hgt: &Layer) -> Value {
+    let (m, _) = hgt.mosaic();
+    let b = hgt.grid.world_box();
+    let mpt = hgt.grid.tile / hgt.px as f32;
+    let ground = |x: f32, y: f32| -> Option<f32> {
+        let (c, r) = (((x - b[0]) / mpt).floor(), ((b[3] - y) / mpt).floor());
+        (c >= 0.0 && r >= 0.0 && (c as usize) < m.w && (r as usize) < m.h).then(|| height_m(m.at(c as usize, r as usize, 0)))
+    };
+    let mut per: std::collections::BTreeMap<&str, Vec<(f32, f32, bool)>> = Default::default();
+    for t in tiles {
+        let bb = t.bbox();
+        let z = t.z_percentiles()[2];
+        let g: Vec<f32> = (0..81).filter_map(|i| ground(bb[0][0] + (bb[1][0] - bb[0][0]) * (i % 9) as f32 / 8.0, bb[0][1] + (bb[1][1] - bb[0][1]) * (i / 9) as f32 / 8.0)).collect();
+        if g.is_empty() {
+            continue;
+        }
+        let lo = g.iter().copied().fold(f32::MAX, f32::min);
+        let hi = g.iter().copied().fold(f32::MIN, f32::max);
+        per.entry(t.kind).or_default().push((z - lo, hi - z, lo <= z && z <= hi));
+    }
+    let med = |mut v: Vec<f32>| {
+        v.sort_by(f32::total_cmp);
+        v.get(v.len() / 2).copied().unwrap_or(0.0)
+    };
+    let kinds: serde_json::Map<String, Value> = per
+        .into_iter()
+        .map(|(k, v)| {
+            let between = v.iter().filter(|x| x.2).count();
+            (k.to_string(), json!({"tiles": v.len(), "between_bed_and_banks": between,
+                "median_surface_above_lowest_ground_m": med(v.iter().map(|x| x.0).collect()),
+                "median_highest_ground_above_surface_m": med(v.iter().map(|x| x.1).collect())}))
+        })
+        .collect();
+    json!({"method": "height map sampled on a 9 x 9 grid over each tile's box; surface = median vertex height", "kinds": kinds})
+}
+
+/// `inland/inland.json` and `inland/inland.glb` (one node per kind, one
+/// primitive per tile, world space).
+fn write_inland(dir: &std::path::Path, tiles: &[InlandTile], check: &Value) -> Result<Value> {
+    use crate::gltf::{Material, NodeGroup, TriPrim};
+    std::fs::create_dir_all(dir)?;
+    let kind_name = |k: &str| INLAND_KINDS.iter().find(|(c, _)| *c == k).map_or("unknown", |(_, n)| *n);
+    let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+    for t in tiles {
+        *counts.entry(t.kind).or_default() += 1;
+    }
+    let rows: Vec<Value> = tiles
+        .iter()
+        .map(|t| {
+            let z = t.z_percentiles();
+            json!({"name": t.name, "kind": kind_name(t.kind), "kind_code": t.kind, "map_file": t.map_file,
+                "position": t.position, "rotation_world": t.rotation, "scale_xy_z": t.scale, "bbox": t.bbox(),
+                "surface_z": z[2], "z_percentiles_0_5_50_95_100": z, "triangles": t.indices.len() / 3, "vertices": t.positions.len()})
+        })
+        .collect();
+    let mut mats = Vec::new();
+    let mut groups = Vec::new();
+    for k in counts.keys() {
+        mats.push(Material { name: kind_name(k).to_string(), base_color_uri: None, normal_uri: None,
+            gltf: json!({"pbrMetallicRoughness": {"baseColorFactor": [0.1, 0.35, 0.6, 1.0], "metallicFactor": 0.0, "roughnessFactor": 0.1}}), extras: json!({"kind_code": k}) });
+        let mi = mats.len() - 1;
+        let prims = tiles.iter().filter(|t| t.kind == *k).map(|t| TriPrim {
+            name: t.name.clone(), positions: t.positions.clone(), normals: None, tangents: None, uvs: vec![],
+            colors: None, colors1: None, regions: None, tint: None, indices: t.indices.clone(), material: Some(mi),
+            joints: None, weights: None, joints1: None, weights1: None,
+        }).collect();
+        groups.push(NodeGroup { name: kind_name(k).to_string(), prims });
+    }
+    crate::atomic::write(&dir.join("inland.glb"), crate::gltf::mesh_glb("inland_water", &groups, &mats, &[], json!({"coordinates": "world space"})))?;
+    let kinds: serde_json::Map<String, Value> = counts.iter().map(|(k, n)| (kind_name(k).to_string(), json!(n))).collect();
+    let rep = json!({"tiles": tiles.len(), "kinds": kinds, "check_against_height_map": check});
+    write_json(&dir.join("inland.json"), &json!({
+        "about": "Inland water surfaces (rivers, canals, creeks, reservoirs, ponds): the map's water drawables placed in world space, LOD 0. One tile per placement, at most 64 m across.",
+        "coordinates": "RAGE world space, Z-up, metres; inland.glb is the same geometry in glTF Y-up (x, z, -y)",
+        "summary": rep, "tiles": rows}))?;
+    Ok(rep)
+}
+
 fn summary(rep: &Value) -> Value {
     let mut r = rep.clone();
     for k in ["fog_scattering", "fog_extinction", "height", "shore"] {
@@ -1249,6 +1474,21 @@ fn summary(rep: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inland_kinds_from_names() {
+        assert_eq!(inland_kind("lo_rvr_01_water_lo_rvr_01a"), Some("rvr"));
+        assert_eq!(inland_kind("lo_cnl_01_water_fh_rsr_01m_001"), Some("rsr"));
+        assert_eq!(inland_kind("nb_cnl_01_water_nb_glf_01a"), Some("glf"));
+        assert_eq!(inland_kind("lo_rvr_04_water_nb_mill_01"), Some("mill"));
+        // LOD models, pools, scum decals and props are not surfaces
+        assert_eq!(inland_kind("vr_01_water_lo_rvr_01a_01_lod"), None);
+        assert_eq!(inland_kind("lo_cnl_01_water_pool_d_slod"), None);
+        assert_eq!(inland_kind("ap_14_pool_water_01_01"), None);
+        assert_eq!(inland_kind("ap_02f_am_e_water_scum_algae_gen_a_30_cln"), None);
+        assert_eq!(inland_kind("prop_am_water_raine_bottle_01a"), None);
+        assert_eq!(inland_kind("vk_04_water_treatment_pump_01"), None);
+    }
 
     const GRID: &str = "<GridAtlasInfo><clientSystemName>g</clientSystemName><tileTextureNamePrefix>g-</tileTextureNamePrefix><tileTextureNameSuffix>t</tileTextureNameSuffix><globalFallbackTextureName>t_gfb</globalFallbackTextureName><origin x=\"-5120.0\" y=\"7680.0\" z=\"0.0\" /><width value=\"16384\" /><height value=\"33792\" /><tileSize value=\"512\" /></GridAtlasInfo>";
 
