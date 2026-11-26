@@ -166,11 +166,12 @@ pub struct Look {
     pub wear_from_config: bool,
     /// The shown vehicle has wear levels (set by the model view).
     pub wear_levels: bool,
-    /// With `wear_from_config`: also draw the second wear layer (the
-    /// primer). Off by default: its per-part colour-range samples and the
-    /// per-vehicle amount are not decoded and taken as 1, which shows far
-    /// more primer than the game on some parts.
-    pub primer: bool,
+    /// With `wear_from_config`: the amount of the second wear layer (the
+    /// primer), 0 (off, the default) to 1. The game takes it per vehicle at
+    /// run time (spawn data, or a record of a file that is not shipped), so
+    /// it is the user's to set; it scales the primer's summed mask level
+    /// before its window.
+    pub primer_amount: f32,
     pub slot: u32,
     pub paint: [f32; 3],
     pub paint2nd: [f32; 3],
@@ -185,6 +186,9 @@ pub struct Look {
     pub sky_hor: [f32; 3],
     pub exposure: f32,
     pub ambient: f32,
+    /// Share of the sun light the lit ground and surroundings send back to
+    /// the model (the timecycle's `ambient_bounce_intensity`; sun_col.w).
+    pub bounce: f32,
     pub wet: f32,
     pub emissive: f32,
     pub fog: f32,
@@ -193,6 +197,10 @@ pub struct Look {
     pub tint: bool,
     pub clear: [f32; 3],
 }
+
+/// The timecycle's `ambient_bounce_intensity` where no weather is picked
+/// (its default in the map's scene too).
+pub const BOUNCE: f32 = 0.5;
 
 impl Default for Look {
     fn default() -> Self {
@@ -209,7 +217,7 @@ impl Default for Look {
             wear: 0.0,
             wear_from_config: true,
             wear_levels: false,
-            primer: false,
+            primer_amount: 0.0,
             slot: 0,
             paint: [0.55, 0.02, 0.02],
             paint2nd: [0.6, 0.6, 0.62],
@@ -223,6 +231,7 @@ impl Default for Look {
             sky_hor: [0.75, 0.82, 0.9],
             exposure: 1.0,
             ambient: 0.9,
+            bounce: BOUNCE,
             wet: 0.0,
             emissive: 2.0,
             fog: 0.0,
@@ -263,6 +272,7 @@ impl Look {
         let sky_l = (0.2126 * self.sky_hor[0] + 0.7152 * self.sky_hor[1] + 0.0722 * self.sky_hor[2])
             / (0.2126 * def.sky_hor[0] + 0.7152 * def.sky_hor[1] + 0.0722 * def.sky_hor[2]);
         self.ambient = (l.ambient * def.ambient / sky_l.max(0.05)).min(2.0);
+        self.bounce = l.bounce;
         self.emissive = 1.5 + 6.0 * (1.0 - l.day);
         // a viewer's stand-in for eye adaptation: brighten dark scenes by
         // part of their darkness, plus the timecycle's exposure offset
@@ -297,6 +307,7 @@ impl Look {
             dusk * 0.7,
         );
         self.ambient = 0.25 + 0.5 * day.sqrt();
+        self.bounce = BOUNCE;
         self.emissive = 1.5 + 6.0 * (1.0 - day);
         self.exposure = 1.0 + 1.5 * (1.0 - day.sqrt());
         if el < 0.0 {
@@ -449,6 +460,8 @@ struct Target {
     resolve_view: wgpu::TextureView,
     /// HDR frame (the 3D map): the tone-mapped image that is shown and read back.
     display: Option<(wgpu::Texture, wgpu::TextureView)>,
+    /// The running mean of still frames (when the renderer accumulates).
+    accum: Option<crate::accum::Targets>,
     egui_id: egui::TextureId,
 }
 
@@ -649,6 +662,16 @@ pub struct Renderer3D {
     /// that average several frames step it, as the game's dither changes
     /// every frame and its temporal filter averages it).
     pub dither_frame: f32,
+    /// Still-camera accumulation (the model viewer): while the view is
+    /// unchanged each frame steps the dither pattern and joins a running mean
+    /// (`crate::accum`), which is the image shown and read back.
+    pub accumulate: bool,
+    accum: Option<crate::accum::Accum>,
+    /// Frames in the running mean, and the key of the view they show.
+    accum_n: u32,
+    accum_key: u64,
+    /// Changes made outside `render` (joints, instances) since the last frame.
+    accum_bump: std::sync::atomic::AtomicU64,
     /// Map view: building glass drawn dark and mostly opaque (misc3.z).
     pub map_glass: bool,
     /// Draw calls of the coverage fallbacks in the last frame: models, cells.
@@ -905,16 +928,23 @@ fn tex_bc(
 
 impl Renderer3D {
     pub fn new(rs: &egui_wgpu::RenderState) -> Self {
-        Self::new_with(rs, false)
+        Self::new_with(rs, false, false)
+    }
+
+    /// The model viewer's renderer: as `new`, with the sun shadow map on
+    /// (SIXNG_SHADOWS=0 turns it off).
+    pub fn new_viewer(rs: &egui_wgpu::RenderState) -> Self {
+        Self::new_with(rs, false, true)
     }
 
     /// The 3D map's renderer: HDR frame with the game's sky, light and
     /// exposure (atmo.rs), tone mapped for display.
     pub fn new_map(rs: &egui_wgpu::RenderState) -> Self {
-        Self::new_with(rs, true)
+        Self::new_with(rs, true, false)
     }
 
-    fn new_with(rs: &egui_wgpu::RenderState, hdr: bool) -> Self {
+    /// `sun_default`: the sun shadow map is on unless SIXNG_SHADOWS says otherwise.
+    fn new_with(rs: &egui_wgpu::RenderState, hdr: bool, sun_default: bool) -> Self {
         let device = &rs.device;
         let color_fmt = if hdr { crate::atmo::HDR_FMT } else { COLOR_FMT };
         let shadow = crate::shadow::ShadowGpu::new(device, hdr, std::mem::size_of::<FrameU>() as u64);
@@ -1361,7 +1391,7 @@ impl Renderer3D {
             }),
         };
         let hair_luts = hair_blank(device, &rs.queue);
-        // The sun shadow map (SIXNG_SHADOWS=1, research: one map over the models, strands drawn into it as the
+        // The sun shadow map (on in the model viewer, elsewhere with SIXNG_SHADOWS=1; SIXNG_SHADOWS=0 turns it off; one map over the models, strands drawn into it as the
         // game draws its strands into its shadow maps; the game's own cascades, bias and filter are not read).
         let shadow_tex = |size: u32| {
             device
@@ -1384,7 +1414,7 @@ impl Renderer3D {
             compare: Some(wgpu::CompareFunction::LessEqual),
             ..Default::default()
         });
-        let sun_maps = std::env::var("SIXNG_SHADOWS").is_ok();
+        let sun_maps = std::env::var("SIXNG_SHADOWS").map_or(sun_default, |v| v != "0");
         let sun_map = (shadow_tex(if sun_maps { SHADOW_SIZE } else { 1 }), shadow_sampler.clone(), shadow_tex(if sun_maps { CAM_DEPTH_SIZE } else { 1 }));
         let shadow_ub = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("shadow frame ub"),
@@ -1632,6 +1662,11 @@ impl Renderer3D {
             cells: Vec::new(),
             lod_k: 1.0,
             dither_frame: 0.0,
+            accumulate: false,
+            accum: None,
+            accum_n: 0,
+            accum_key: 0,
+            accum_bump: std::sync::atomic::AtomicU64::new(0),
             map_glass: false,
             fb_draws: [0, 0],
             atmo,
@@ -2210,6 +2245,7 @@ impl Renderer3D {
         gm.n_instances = inst.len() as u32;
         gm.n_fb = n_fb as u32;
         gm.world = world_sphere(gm.bbox, inst.iter().filter(|i| !i.is_fallback()));
+        self.bump_accum(bytemuck::cast_slice(inst));
     }
 
     /// Give a model its stickers: the shader records (header first, see
@@ -2229,6 +2265,7 @@ impl Renderer3D {
         if n > 0 {
             rs.queue.write_buffer(buf, 0, bytemuck::cast_slice(&recs[..n]));
         }
+        self.bump_accum(bytemuck::cast_slice(&recs[..n]));
         gm.frame_bg = frame_bind_group(&rs.device, &self.bgl_frame, &self.frame_ub, &gm.joints_buf, &self.sampler, buf, pictures.unwrap_or(&self.stickers.view), &self.stickers.sampler, &self.atmo.binds, &self.hair_luts, &self.sun_map);
     }
 
@@ -2236,6 +2273,15 @@ impl Renderer3D {
         let v: Vec<f32> = mats.iter().flat_map(|m| m.to_cols_array()).collect();
         rs.queue
             .write_buffer(&gm.joints_buf, 0, bytemuck::cast_slice(&v));
+        self.bump_accum(bytemuck::cast_slice(&v));
+    }
+
+    /// Restart the still-camera mean when data it shows changed outside `render`.
+    fn bump_accum(&self, bytes: &[u8]) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut h);
+        self.accum_bump.fetch_add(h.finish() | 1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Change a material's base factor (e.g. after a paint override).
@@ -2250,6 +2296,7 @@ impl Renderer3D {
             u.base = base;
             rs.queue
                 .write_buffer(&gm.mat_ub, k as u64 * MAT_STRIDE, bytemuck::bytes_of(u));
+            self.bump_accum(bytemuck::bytes_of(u));
         }
     }
 
@@ -2269,6 +2316,7 @@ impl Renderer3D {
             };
             rs.queue
                 .write_buffer(&gm.mat_ub, k as u64 * MAT_STRIDE, bytemuck::bytes_of(u));
+            self.bump_accum(bytemuck::bytes_of(u));
         }
     }
 
@@ -2283,11 +2331,12 @@ impl Renderer3D {
         if self
             .target
             .as_ref()
-            .map(|t| t.size == size)
+            .map(|t| t.size == size && t.accum.is_some() == self.accumulate)
             .unwrap_or(false)
         {
             return;
         }
+        self.accum_n = 0;
         let device = &rs.device;
         let mk = |samples: u32, fmt: wgpu::TextureFormat, usage: wgpu::TextureUsages| {
             device.create_texture(&wgpu::TextureDescriptor {
@@ -2329,7 +2378,15 @@ impl Renderer3D {
             let v = t.create_view(&Default::default());
             (t, v)
         });
-        let shown = display.as_ref().map(|d| &d.1).unwrap_or(&resolve_view);
+        let frame = display.as_ref().map(|d| &d.1).unwrap_or(&resolve_view);
+        let accum = self.accumulate.then(|| {
+            let out_fmt = if self.hdr { crate::atmo::DISPLAY_FMT } else { color_fmt };
+            if self.accum.as_ref().is_some_and(|a| a.out_fmt != out_fmt) {
+                self.accum = None;
+            }
+            self.accum.get_or_insert_with(|| crate::accum::Accum::new(device, out_fmt)).targets(device, frame, size)
+        });
+        let shown = accum.as_ref().map(|a| &a.out_view).unwrap_or(frame);
         let mut r = rs.renderer.write();
         let egui_id = match &self.target {
             Some(t) => {
@@ -2350,6 +2407,7 @@ impl Renderer3D {
             resolve,
             resolve_view,
             display,
+            accum,
             egui_id,
         });
     }
@@ -2366,7 +2424,7 @@ impl Renderer3D {
             inv_view_proj: vp.inverse().to_cols_array_2d(),
             cam_pos: cam.eye().extend(1.0).to_array(),
             sun_dir: look.sun_dir.extend(look.sun_intensity).to_array(),
-            sun_col: lin(look.sun_col),
+            sun_col: [look.sun_col[0], look.sun_col[1], look.sun_col[2], look.bounce],
             sky_top,
             sky_hor: [
                 look.sky_hor[0],
@@ -2398,8 +2456,8 @@ impl Renderer3D {
             prev_view_proj: vp.to_cols_array_2d(),
             // xyz: the body paint's coat; w: vehicle wear (0 to 1)
             // w < 0: each part's own wear amount from the part ramp image
-            // -2: the same, and the primer layer too
-            jitter: [look.coat[0], look.coat[1], look.coat[2], if look.wear_from_config && look.wear_levels { if look.primer { -2.0 } else { -1.0 } } else { look.wear }],
+            // -1 - a (a > 0): the same, and the primer layer at amount a
+            jitter: [look.coat[0], look.coat[1], look.coat[2], if look.wear_from_config && look.wear_levels { -1.0 - look.primer_amount.clamp(0.0, 1.0) } else { look.wear }],
             frame: [self.dither_frame, self.target.as_ref().map_or(aspect * 1080.0, |t| t.size[0] as f32), self.target.as_ref().map_or(1080.0, |t| t.size[1] as f32), 0.0],
             light_view_proj: self.light_vp,
         }
@@ -2712,6 +2770,38 @@ impl Renderer3D {
         let device = &rs.device;
         let queue = &rs.queue;
         let aspect = size[0] as f32 / size[1] as f32;
+        // still-camera accumulation: the mean starts over when anything in the view changes, and each frame of it
+        // takes the next dither pattern
+        let base_dither = self.dither_frame;
+        if self.accumulate {
+            use std::hash::{Hash, Hasher};
+            let mut k = self.frame_uniform(cam, look, aspect, 0.0);
+            k.frame = [0.0; 4];
+            k.light_view_proj = [[0.0; 4]; 4];
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            bytemuck::bytes_of(&k).hash(&mut h);
+            size.hash(&mut h);
+            base_dither.to_bits().hash(&mut h);
+            self.decal_bias.hash(&mut h);
+            if let Some(g) = &self.ground {
+                bytemuck::bytes_of(&[g.centre.x, g.centre.y, g.centre.z, g.half[0], g.half[1], g.height]).hash(&mut h);
+            }
+            self.accum_bump.swap(0, std::sync::atomic::Ordering::Relaxed).hash(&mut h);
+            for gm in models {
+                (*gm as *const GpuModel as usize, gm.meshes.len(), gm.n_instances).hash(&mut h);
+                for me in &gm.meshes {
+                    (me.visible, me.n_idx).hash(&mut h);
+                }
+            }
+            bytemuck::cast_slice::<LineV, u8>(lines).hash(&mut h);
+            bytemuck::cast_slice::<LineV, u8>(lines_on_top).hash(&mut h);
+            let key = h.finish();
+            if key != self.accum_key {
+                self.accum_key = key;
+                self.accum_n = 0;
+            }
+            self.dither_frame = base_dither + self.accum_n as f32;
+        }
         // the sun shadow map: one orthographic view from the sun over the models
         let mut shadow_fu = None;
         self.light_vp = [[0.0; 4]; 4];
@@ -3075,6 +3165,9 @@ impl Renderer3D {
         if let (Some(_), Some(d)) = (&sky, &t.display) {
             self.atmo.post(device, &mut enc, &t.resolve_view, &d.1, size);
         }
+        if let (Some(a), Some(at)) = (&self.accum, &t.accum) {
+            a.run(&mut enc, at, self.accum_n);
+        }
         let t_e = std::time::Instant::now();
         let cb = enc.finish();
         RTIME[1].fetch_add(
@@ -3090,14 +3183,29 @@ impl Renderer3D {
         RTIME[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.draws = draws;
         let _ = &self.dummy_joints;
-        t.egui_id
+        let id = t.egui_id;
+        if self.accumulate {
+            self.accum_n = self.accum_n.saturating_add(1);
+            self.dither_frame = base_dither;
+        }
+        id
+    }
+
+    /// Frames in the still-camera mean so far (0 when not accumulating).
+    pub fn accum_frames(&self) -> u32 {
+        if self.accumulate { self.accum_n } else { 0 }
+    }
+
+    /// The still-camera mean is still settling: the caller keeps drawing.
+    pub fn accumulating(&self) -> bool {
+        self.accumulate && self.accum_n < crate::accum::CAP
     }
 
     /// Read the last rendered frame back as RGBA8 (sRGB-encoded).
     pub fn read_back(&self, rs: &egui_wgpu::RenderState) -> Option<(u32, u32, Vec<u8>)> {
         let t = self.target.as_ref()?;
         let [w, h] = t.size;
-        let src = t.display.as_ref().map(|d| &d.0).unwrap_or(&t.resolve);
+        let src = t.accum.as_ref().map(|a| &a.out).or(t.display.as_ref().map(|d| &d.0)).unwrap_or(&t.resolve);
         let row = (4 * w + 255) / 256 * 256;
         let buf = rs.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),

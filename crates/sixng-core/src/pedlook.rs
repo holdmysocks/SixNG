@@ -998,10 +998,38 @@ fn not_shown_reason(p: &Part, by_guid: &HashMap<u64, &String>) -> Option<&'stati
     // (2026-11-25) name by GUID `bodygenitalsgen_mr1_000_regular_ws00_full`,
     // its `_alt_00` and a hidden placeholder: drawables of a content pack
     // (core_restofworld), not of packs.rpf. Clothing covers them.
-    if p.category.as_deref() == Some("2a7a13a4") {
+    // The same layer is also stored under another category (`c8bc4e01`,
+    // `cs_raina`'s nude outfit: `bodygenitalsgen_fb1_008_regular_ws00_full`),
+    // so an item whose GUID names one of these drawables counts too.
+    let layer = p.guid.as_deref().and_then(|g| u64::from_str_radix(g, 16).ok()).is_some_and(|g| body_layer_ids().contains(&g));
+    if p.category.as_deref() == Some("2a7a13a4") || layer {
         return Some("anatomical body layer, always under clothing");
     }
     None
+}
+
+/// Asset ids of the anatomical body layer drawables
+/// (`bodygenitalsgen_<fit>_<nnn>_regular_ws00_full`, `_alt_00` to `_alt_02`;
+/// ten of them are in core_restofworld, of fits `fr1`, `fb1`, `fo1` and
+/// `mr1`), over every fit-shaped tag and numbers 000 to 031.
+fn body_layer_ids() -> &'static HashSet<u64> {
+    static T: OnceLock<HashSet<u64>> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut s = HashSet::new();
+        for sex in ['m', 'f'] {
+            for kind in 'a'..='z' {
+                for d in '0'..='9' {
+                    for n in 0..32 {
+                        let base = format!("bodygenitalsgen_{sex}{kind}{d}_{n:03}_regular_ws00_full");
+                        for suffix in ["", "_alt_00", "_alt_01", "_alt_02"] {
+                            s.insert(crate::meta7a::asset_id(&format!("{base}{suffix}")));
+                        }
+                    }
+                }
+            }
+        }
+        s
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1666,6 +1694,15 @@ mod tests {
         assert_eq!(model_hash("ped_0x7fd5440d"), 0x7fd5_440d);
         assert_eq!(model_hash("0x0007f78b"), 0x7f78b);
         assert_eq!(model_hash("cs_mandy"), joaat("cs_mandy"));
+    }
+
+    #[test]
+    fn body_layer_by_guid() {
+        // the GUID of `cs_raina`'s nude-outfit item, stored under a category
+        // other than the body layer's
+        assert!(body_layer_ids().contains(&0xf25c_e576_de83_479d));
+        assert!(body_layer_ids().contains(&crate::meta7a::asset_id("bodygenitalsgen_mr1_000_regular_ws00_full_alt_01")));
+        assert!(!body_layer_ids().contains(&crate::meta7a::asset_id("shortswork_mr1_001_regular_mw_long_full")));
     }
 
     #[test]
