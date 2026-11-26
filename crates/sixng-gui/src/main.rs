@@ -1124,7 +1124,7 @@ impl App {
                 }
                 ui.checkbox(&mut self.tex_png, "PNG");
                 ui.checkbox(&mut self.tex_dds, "DDS");
-                ui.label("Body shape:").on_hover_text("Ped clothing: pose the shared ped skeleton with the game's body-shape rig, e.g. gcweightbelly=0.5,gcmusclechest=1 (gcweight* -1..1, gcmuscle* 0..1, gcbutt, gcbreasts; allweight=v, allmuscle=v). Empty = neutral. Needs packs.rpf and anim.rpf indexed.");
+                ui.label("Body shape:").on_hover_text("Ped clothing: pose the shared ped skeleton with the game's body-shape rig, e.g. gcweightbelly=0.5,gcmusclechest=1 (gcweight* -1..1, gcmuscle* 0..1, gcbutt, gcbreasts, gcbreastheight, gcbreastspacing, gcchestheight, gccleavage, gchipheight, gchipwidth, gcbellyround, gcheadscale, gcmusclebiceps, gcmuscletriceps; allweight=v, allmuscle=v). Empty = neutral. Needs packs.rpf and anim.rpf indexed.");
                 ui.add(egui::TextEdit::singleline(&mut self.body_shape).hint_text("neutral").desired_width(160.0));
                 ui.label("Head skin:").on_hover_text("Ped heads: face variant (0 = first). A head gets the face the game links to it, or one of the faces of the same sex, body type and ethnicity. The model viewer has arrows to switch through them.");
                 ui.add(egui::DragValue::new(&mut self.head_skin).range(0..=999));
