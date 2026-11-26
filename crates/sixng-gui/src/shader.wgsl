@@ -1406,7 +1406,12 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     let kd = (1.0 - Fr) * (1.0 - metal);
     let direct = (kd * albedo / 3.14159 + spec) * sun_e(i.world) * ndl;
     let amb_d = ambient(n);
-    let fr_v = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
+    // The share of the surroundings a surface mirrors, as the game's standard lighting takes it: its
+    // environment table at (N.V, roughness), r (F90 - F0) + g F0 with F90 = 1, times the multi-scatter
+    // gain 1 + (1 / g - 1) F0. (A rough-Fresnel estimate stood here before; on rough surfaces seen edge-on,
+    // such as skin under the jaw, it gave about two and a half times the table's value: a pale rim.)
+    let et = env_tab(ndv, rough);
+    let fr_v = (et.x * (1.0 - f0) + et.y * f0) * (1.0 + (1.0 / max(et.y, 0.001) - 1.0) * f0);
     let r = reflect(-v, n);
     let env = environment(reflect(-v, n_env), rough) * F.misc.w;
     // a strand's ribbon faces the camera, so its derivatives are screen pixel steps; the game temporally
