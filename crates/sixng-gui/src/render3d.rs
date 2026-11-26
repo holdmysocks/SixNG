@@ -175,6 +175,9 @@ pub struct Look {
     /// it is the user's to set; it scales the primer's summed mask level
     /// before its window.
     pub primer_amount: f32,
+    /// The primer set a part takes first when its `primerSets` mask allows
+    /// several (0 to 2): the game takes it from a per-vehicle random order.
+    pub primer_set: u8,
     pub slot: u32,
     pub paint: [f32; 3],
     pub paint2nd: [f32; 3],
@@ -221,6 +224,7 @@ impl Default for Look {
             wear_from_config: true,
             wear_levels: false,
             primer_amount: 0.0,
+            primer_set: 0,
             slot: 0,
             paint: [0.55, 0.02, 0.02],
             paint2nd: [0.6, 0.6, 0.62],

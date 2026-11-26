@@ -194,9 +194,10 @@ pub fn coat_uvs(g: &Groom, c: &Coat) -> Vec<[f32; 2]> {
 /// guides when the groom stores nothing to grow), then the guides when
 /// `o.guides`. `extras` goes on every mesh; `colour` colours the grown
 /// strands (COLOR_0). With `hat` the strands are pressed under it as the
-/// viewer does (`Shell::press`, 3 mm under its lining): the guides before
-/// the strands are grown, the grown strands again after (noise, curl and
-/// clumps move them off the guides). Returns the pieces and a summary
+/// viewer does (`Shell::press_strands`, 3 mm under its lining, checked
+/// against the hat's triangles): the guides before the strands are grown,
+/// the grown strands again after (noise, curl and clumps move them off the
+/// guides). Returns the pieces and a summary
 /// (strands written, stored, guides, points pressed).
 pub fn piece(g: &Groom, name: &str, o: &Options, colour: Option<&HairColour>, hat: Option<&Shell>, extras: Value) -> (Vec<StrandPrim>, Value) {
     let k = g.points_per_strand;

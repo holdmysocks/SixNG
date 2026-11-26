@@ -264,6 +264,8 @@ exits with code 1.
 # A character with its strand hair (hair, brows, lashes, beard) in jason.hair.glb, then as Blender hair curves
 .\target\release\sixng.exe outfit player_story000_01 --look 0 --hair -o work\out\jason.glb
 blender --python scripts\blender_hair_curves.py -- work\out\jason.hair.glb --model work\out\jason.glb
+# A character made only of shared items (no parts named after it) exports its first outfit; ped-parts lists all its parts
+.\target\release\sixng.exe outfit cs_mandy --hair -o work\out\mandy.glb
 # Game text: all text tables to JSON, or one label's string in every language
 .\target\release\sixng.exe text data -o work\out
 .\target\release\sixng.exe text pack__shared_minigame000__shared_minigame000 --label AG_SUR_GEAR_FIRST1_01 --plain
@@ -435,11 +437,14 @@ restyle the hair:
 Under a hat in the outfit the scalp pieces are pressed in as the viewer
 does (a stand-in, not the game's method; see the model viewer below): the
 guides before the strands are grown and the grown strands after, every
-point beyond the hat's lining pulled to 3 mm under it. Their extras name
-the hat (`under_hat`) and the summary the points moved (`hat_pressed`).
-On Jason's look 1 (a cap worn backwards, over his long hair) 480,455 of
-1.19 M points move; a few tufts (about 0.1 % of the points, up to
-12 mm) still come through the side of the crown. Not in the export yet:
+point beyond the hat's lining pulled to 3 mm under it; then every strand
+is followed from its root against the hat's own triangles, and a point
+whose segment crosses the hat goes back under it (the coarse press alone
+let tufts through the side of a cap). Their extras name the hat
+(`under_hat`) and the summary the points moved (`hat_pressed`). On
+Jason's look 1 (a cap worn backwards, over his long hair) 411,913 of
+1.19 M points move, and 2 of 1.1 M strand segments still cross the cap
+(one strand at its lower edge; 69,923 with the press alone). Not in the export yet:
 the game's run-time strand count (it
 draws fewer strands at a distance; the export writes all it stores). To
 restyle in Blender, edit the hidden `_guides` objects and grow new strands
@@ -755,7 +760,13 @@ again**).
     two kinds). `sixng ped-look "^"` lists every character
     with what its default outfit has. `sixng outfit <name> --look N`
     exports outfit N as one rigged GLB (parts, the face, stored tints;
-    not the viewer's skin tone, colour words or hidden skin).
+    not the viewer's skin tone, colour words or hidden skin). A model with
+    no parts named after it (`cs_mandy`) exports outfit 0 without
+    `--look`. Some character prefixes are outside the outfit list, but
+    their own parts are worn by another model's wardrobe. Such a prefix
+    takes that model's outfits (`cs_roxy`: her clothes on
+    `cs_nastydimez_roxyrashad`). The link needs an outfit that wears the
+    prefix's head, or two of its parts for a set with no head.
   - **Full set.** The Character panel's *Full set* section lists every
     part a character uses. That covers each drawable of all its listed outfits,
     plus the variations of its wardrobe that no listed outfit reaches. Parts are grouped as
@@ -806,8 +817,10 @@ again**).
   swatches to click (`--hair-colour r,g,b`), and lists the character's
   other hair styles (its own placeholders that have grooms placed) to
   tick (`--hair-style TEXT`). Under a hat the scalp hair is pressed in: strand
-  points beyond the hat's lining are pulled to 3 mm under it, and an
-  opening the hat encloses (over a cap's strap) counts as closed. This
+  points beyond the hat's lining are pulled to 3 mm under it (then each
+  strand is checked against the hat's triangles, so none comes through
+  it), and an opening the hat encloses (over a cap's strap) counts as
+  closed. This
   is a stand-in, not the game's method: of the 6,886 outfits with a hat
   and hair, 6,840 ask for the plain hair state, and no stored rule
   says how the game keeps it under the hat. Hair items do have other
