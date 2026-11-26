@@ -1666,10 +1666,17 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                                     hidden.insert(p.drawable.clone(), (own, waist));
                                 }
                             }
-                            let by_name = sixng_core::outfit::dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
+                            let mut by_name = sixng_core::outfit::dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
                                 let n = e.name.as_ref()?.to_ascii_lowercase();
                                 ps.iter().any(|p| !p.strands && p.drawable == n).then_some((n, e))
                             }));
+                            // the parts in a content pack (the anatomical inserts, `packparts`)
+                            let packs = sixng_core::packparts::get(&ws.game);
+                            for p in ps.iter().filter(|p| !p.strands) {
+                                if let (false, Some(e)) = (by_name.contains_key(&p.drawable), packs.by_name(&p.drawable)) {
+                                    by_name.insert(p.drawable.clone(), e);
+                                }
+                            }
                             ps.into_iter().filter(|p| !p.strands).filter_map(|p| Some((by_name.get(&p.drawable)?.off, p))).collect()
                         }
                     },
@@ -1697,7 +1704,9 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                                 let n = e.name.as_ref()?.to_ascii_lowercase();
                                 re.is_match(&n).then_some((n, e))
                             }));
-                            any.values().next().map(|e| e.off).ok_or_else(|| anyhow!("no part of {prefix} and no drawable in {} matches {p:?} (see --list)", a.id))?
+                            // then the content packs' ped drawables (`packparts`)
+                            let pack = || sixng_core::packparts::get(&ws.game).entries.iter().find(|e| e.name.as_deref().is_some_and(|n| re.is_match(&n.to_ascii_lowercase())));
+                            any.values().next().copied().or_else(pack).map(|e| e.off).ok_or_else(|| anyhow!("no part of {prefix} and no drawable in {} or the content packs matches {p:?} (see --list)", a.id))?
                         }
                     };
                     v.push(off);
@@ -1716,7 +1725,13 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     offs.push(o);
                 }
             }
-            let sel: Vec<&sixng_core::scan::Entry> = offs.iter().filter_map(|o| ix.entries.iter().find(|e| e.off == *o)).collect();
+            let sel: Vec<&sixng_core::scan::Entry> = offs
+                .iter()
+                .filter_map(|o| match sixng_core::packparts::is_pack_key(*o) {
+                    true => sixng_core::packparts::loaded().and_then(|t| t.entries.iter().find(|e| e.off == *o)),
+                    false => ix.entries.iter().find(|e| e.off == *o),
+                })
+                .collect();
             let glb = glb.clone().unwrap_or_else(|| PathBuf::from(format!("{prefix}.glb")));
             let oa = OutArgs { out: glb.parent().map(|p| p.to_path_buf()).unwrap_or_default(), tex: tex.clone(), raw: false, force: true, no_embedded_textures: false, dry_run: false, body_shape: body_shape.clone(), head_skin: *head_skin, paint: None };
             if *anim_only && clip.is_empty() {
@@ -1795,7 +1810,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             for (_, p) in &look_parts {
                 // a head's face and a body item's painted skin, where stored
-                if matches!(p.slot.as_str(), "head" | "body upper" | "body lower") && !p.skins.is_empty() {
+                if (matches!(p.slot.as_str(), "head" | "body upper" | "body lower") || sixng_core::pedlook::is_skin_insert(&p.slot)) && !p.skins.is_empty() {
                     eo.part_skins.insert(p.drawable.clone(), p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect());
                 }
                 if p.colour.is_none() && p.preset_colours.iter().any(|c| c.is_some()) {
