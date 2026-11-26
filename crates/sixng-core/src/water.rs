@@ -1239,7 +1239,7 @@ pub fn export(ws: &crate::export::Workspace, out: Option<&std::path::Path>, o: &
     sr["check_against_placement_data"] = rep["shore_check"].clone();
     write_json(&dir.join("shore/cells.json"), &sr)?;
     if let (Some(t), Some(c)) = (&inland, &inland_check) {
-        rep["inland"] = write_inland(&dir.join("inland"), t, c)?;
+        rep["inland"] = write_inland(&dir.join("inland"), t, c, crate::ttpf::global(&ws.game))?;
     }
     rep["out"] = json!(dir);
     Ok(summary(&rep))
@@ -1294,6 +1294,13 @@ pub struct InlandTile {
     /// World-space vertices (RAGE, Z-up, metres) and triangles.
     pub positions: Vec<[f32; 3]>,
     pub indices: Vec<u32>,
+    /// UV0 per vertex (empty when the mesh has none).
+    pub uvs: Vec<[f32; 2]>,
+    /// The shader the LOD 0 mesh draws with (see [`shader_json`]).
+    pub shader: Value,
+    /// Store hashes of its flow texture and water height texture.
+    pub flow: Option<u64>,
+    pub height_tex: Option<u64>,
 }
 
 impl InlandTile {
@@ -1318,10 +1325,28 @@ impl InlandTile {
     }
 }
 
+/// A shader as JSON: effect name, textures (parameter, store hash, size,
+/// format) and constants (parameter, values).
+fn shader_json(s: &crate::drawable::Shader, set: &crate::ttpf::TtpfSet) -> Value {
+    let tex: Vec<Value> = s.textures.iter().map(|t| {
+        let h = u64::from_str_radix(&t.hash64, 16).unwrap_or(0);
+        let mut e = json!({"param": crate::names::param(&t.param_hash).unwrap_or_else(|| t.param_hash.clone()), "hash64": t.hash64});
+        if let Some((_, tx)) = set.get(h) {
+            e["width"] = tx.width.into();
+            e["height"] = tx.height.into();
+            e["dxgi_format"] = tx.dxgi_format.into();
+        }
+        e
+    }).collect();
+    let consts: serde_json::Map<String, Value> = s.constants.iter().map(|c| (crate::names::param(&c.hash).unwrap_or_else(|| c.hash.clone()), c.json().unwrap_or(Value::Null))).collect();
+    json!({"shader": crate::names::shader(&s.name_hash).unwrap_or_else(|| s.name_hash.clone()), "flags": s.flags, "textures": tex, "constants": consts})
+}
+
 /// Every inland water surface placed on the map: the drawables of
 /// levels.rpf whose name gives an [`inland_kind`], placed by the map files'
 /// entities (not interior or group-local ones). Each is a tile of at most
-/// 64 m; the install has 958, each placed once.
+/// 64 m; the install has 958, each placed once, with its own flow
+/// texture and water height texture.
 pub fn inland_tiles(ws: &crate::export::Workspace) -> Result<Vec<InlandTile>> {
     use rayon::prelude::*;
     let lv = ws.resolve("levels")?;
@@ -1334,6 +1359,7 @@ pub fn inland_tiles(ws: &crate::export::Workspace) -> Result<Vec<InlandTile>> {
             }
         }
     }
+    let set = crate::ttpf::global(&ws.game);
     let metas: Vec<&crate::scan::Entry> = ix.entries.iter().filter(|e| e.sub == "7a").collect();
     let scans = crate::export::scan_meta(&lv, &metas, false, std::sync::Arc::new(|_: &str, _: u64, _: u64| {}));
     let mut placed = Vec::new();
@@ -1351,19 +1377,26 @@ pub fn inland_tiles(ws: &crate::export::Workspace) -> Result<Vec<InlandTile>> {
             let r = crate::resource::Resource::load(&lv.path, e).ok()?;
             let bufs = crate::drawable::find_buffers(&r);
             let geoms = crate::drawable::find_geometries(&r, &bufs);
-            let lod0: std::collections::HashSet<usize> = crate::drawable::find_models(&r, &geoms).iter().filter(|m| m.lod == 0 && !m.part).flat_map(|m| m.geometries.clone()).collect();
+            // LOD 0 geometries and the shader each draws with
+            let lod0: std::collections::HashMap<usize, u16> = crate::drawable::find_models(&r, &geoms).iter().filter(|m| m.lod == 0 && !m.part).flat_map(|m| m.geometries.iter().copied().zip(m.shader_indices.iter().copied())).collect();
+            let mut used: std::collections::BTreeMap<u16, usize> = Default::default();
             let slice = |i: usize| {
                 let b = &bufs[i];
                 let end = (b.gfx_off + b.bytes).min(r.gfx.len() as u64) as usize;
                 &r.gfx[(b.gfx_off as usize).min(end)..end]
             };
-            let (mut positions, mut indices) = (Vec::new(), Vec::new());
+            let (mut positions, mut indices, mut uvs) = (Vec::new(), Vec::new(), Vec::new());
             for (gi, g) in geoms.iter().enumerate() {
-                if !lod0.is_empty() && !lod0.contains(&gi) {
+                if !lod0.is_empty() && !lod0.contains_key(&gi) {
                     continue;
                 }
                 let Some(h) = bufs[g.vertex_buffer].mesh_blob.as_ref() else { continue };
                 let m = crate::drawable::decode_mesh(slice(g.vertex_buffer), h, slice(g.index_buffer));
+                if let Some(&si) = lod0.get(&gi) {
+                    *used.entry(si).or_default() += m.indices.len();
+                }
+                let uv0 = m.uvs.iter().find(|(slot, _)| *slot == 3).map(|(_, u)| u.as_slice()).unwrap_or(&[]);
+                uvs.extend((0..m.positions.len()).map(|i| uv0.get(i).copied().unwrap_or([0.0, 0.0])));
                 let base = positions.len() as u32;
                 indices.extend(m.indices.iter().map(|i| i + base));
                 positions.extend(m.positions.iter().map(|v| {
@@ -1371,7 +1404,16 @@ pub fn inland_tiles(ws: &crate::export::Workspace) -> Result<Vec<InlandTile>> {
                     [w[0] + p[0], w[1] + p[1], w[2] + p[2]]
                 }));
             }
-            (!indices.is_empty()).then(|| InlandTile { name: name.clone(), kind, map_file: file, position: p, rotation: q, scale: sc, positions, indices })
+            let shaders = crate::drawable::find_shaders(&r);
+            // the shader drawing most triangles (the first one without a model table)
+            let si = used.iter().max_by_key(|(_, n)| **n).map_or(0, |(i, _)| *i as usize);
+            let sh = shaders.get(si);
+            let tex = |param: &str| sh.and_then(|s| s.textures.iter().find(|t| crate::names::param(&t.param_hash).as_deref() == Some(param))).and_then(|t| u64::from_str_radix(&t.hash64, 16).ok());
+            if uvs.iter().all(|u| *u == [0.0, 0.0]) {
+                uvs.clear();
+            }
+            (!indices.is_empty()).then(|| InlandTile { name: name.clone(), kind, map_file: file, position: p, rotation: q, scale: sc, positions, indices, uvs,
+                shader: sh.map_or(Value::Null, |s| shader_json(s, set)), flow: tex("flowtexture"), height_tex: tex("waterheighttexture") })
         })
         .collect();
     tiles.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1420,9 +1462,38 @@ pub fn check_inland(tiles: &[InlandTile], hgt: &Layer) -> Value {
 
 /// `inland/inland.json` and `inland/inland.glb` (one node per kind, one
 /// primitive per tile, world space).
-fn write_inland(dir: &std::path::Path, tiles: &[InlandTile], check: &Value) -> Result<Value> {
+fn write_inland(dir: &std::path::Path, tiles: &[InlandTile], check: &Value, set: &crate::ttpf::TtpfSet) -> Result<Value> {
     use crate::gltf::{Material, NodeGroup, TriPrim};
+    use rayon::prelude::*;
     std::fs::create_dir_all(dir)?;
+    // flow and water height textures as PNGs, one per store hash
+    let tdir = dir.join("textures");
+    std::fs::create_dir_all(&tdir)?;
+    let hashes: std::collections::BTreeSet<u64> = tiles.iter().flat_map(|t| [t.flow, t.height_tex]).flatten().collect();
+    let pngs: std::collections::HashMap<u64, Value> = hashes
+        .into_par_iter()
+        .map(|h| {
+            let v = match set.get(h) {
+                Some((store, tx)) => match crate::ttpf::write_png(store, tx, &tdir, false) {
+                    Ok((p, st)) => {
+                        let mut v = json!({"png": format!("textures/{}", p.file_name().unwrap_or_default().to_string_lossy()), "width": tx.width, "height": tx.height, "dxgi_format": tx.dxgi_format, "mip": st.mip});
+                        // float textures: the PNG clamps to 0..1, so give the stored range
+                        if let Ok((f, ..)) = store.data(tx).and_then(|d| crate::ttpf::decode_float_slice(tx, &d, 0, 0)) {
+                            let (lo, hi) = f.iter().filter(|x| x.is_finite()).fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+                            if lo <= hi {
+                                v["value_range"] = json!([lo, hi]);
+                            }
+                        }
+                        v
+                    }
+                    Err(e) => json!({"hash64": format!("{h:016x}"), "width": tx.width, "height": tx.height, "dxgi_format": tx.dxgi_format, "error": e.to_string()}),
+                },
+                None => json!({"hash64": format!("{h:016x}"), "error": "not in the texture stores"}),
+            };
+            (h, v)
+        })
+        .collect();
+    let tex_json = |h: Option<u64>| h.and_then(|h| pngs.get(&h)).cloned().unwrap_or(Value::Null);
     let kind_name = |k: &str| INLAND_KINDS.iter().find(|(c, _)| *c == k).map_or("unknown", |(_, n)| *n);
     let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
     for t in tiles {
@@ -1434,7 +1505,10 @@ fn write_inland(dir: &std::path::Path, tiles: &[InlandTile], check: &Value) -> R
             let z = t.z_percentiles();
             json!({"name": t.name, "kind": kind_name(t.kind), "kind_code": t.kind, "map_file": t.map_file,
                 "position": t.position, "rotation_world": t.rotation, "scale_xy_z": t.scale, "bbox": t.bbox(),
-                "surface_z": z[2], "z_percentiles_0_5_50_95_100": z, "triangles": t.indices.len() / 3, "vertices": t.positions.len()})
+                "surface_z": z[2], "z_percentiles_0_5_50_95_100": z, "triangles": t.indices.len() / 3, "vertices": t.positions.len(),
+                "shading": {"shader": t.shader["shader"], "flow_texture": tex_json(t.flow), "water_height_texture": tex_json(t.height_tex),
+                    "ripple_scale": t.shader["constants"]["ripplescale"], "ripple_bumpiness": t.shader["constants"]["ripplebumpiness"], "uv0": !t.uvs.is_empty()},
+                "shader": t.shader})
         })
         .collect();
     let mut mats = Vec::new();
@@ -1444,7 +1518,7 @@ fn write_inland(dir: &std::path::Path, tiles: &[InlandTile], check: &Value) -> R
             gltf: json!({"pbrMetallicRoughness": {"baseColorFactor": [0.1, 0.35, 0.6, 1.0], "metallicFactor": 0.0, "roughnessFactor": 0.1}}), extras: json!({"kind_code": k}) });
         let mi = mats.len() - 1;
         let prims = tiles.iter().filter(|t| t.kind == *k).map(|t| TriPrim {
-            name: t.name.clone(), positions: t.positions.clone(), normals: None, tangents: None, uvs: vec![],
+            name: t.name.clone(), positions: t.positions.clone(), normals: None, tangents: None, uvs: if t.uvs.is_empty() { vec![] } else { vec![t.uvs.clone()] },
             colors: None, colors1: None, regions: None, tint: None, indices: t.indices.clone(), material: Some(mi),
             joints: None, weights: None, joints1: None, weights1: None,
         }).collect();
@@ -1452,10 +1526,12 @@ fn write_inland(dir: &std::path::Path, tiles: &[InlandTile], check: &Value) -> R
     }
     crate::atomic::write(&dir.join("inland.glb"), crate::gltf::mesh_glb("inland_water", &groups, &mats, &[], json!({"coordinates": "world space"})))?;
     let kinds: serde_json::Map<String, Value> = counts.iter().map(|(k, n)| (kind_name(k).to_string(), json!(n))).collect();
-    let rep = json!({"tiles": tiles.len(), "kinds": kinds, "check_against_height_map": check});
+    let still = tiles.iter().filter(|t| t.flow.and_then(|h| pngs.get(&h)).is_some_and(|v| v["width"] == 4)).count();
+    let rep = json!({"tiles": tiles.len(), "kinds": kinds, "flow_textures": tiles.iter().filter_map(|t| t.flow).collect::<std::collections::HashSet<_>>().len(), "tiles_with_placeholder_flow": still, "check_against_height_map": check});
     write_json(&dir.join("inland.json"), &json!({
         "about": "Inland water surfaces (rivers, canals, creeks, reservoirs, ponds): the map's water drawables placed in world space, LOD 0. One tile per placement, at most 64 m across.",
         "coordinates": "RAGE world space, Z-up, metres; inland.glb is the same geometry in glTF Y-up (x, z, -y)",
+        "shading": "Every tile draws with the water_micro_geom shader. Its flow texture (BC3: flow direction in red and green around 128; 4 x 4 placeholder on still tiles) and water height texture (R16 float, 0 to 1) cover the tile's 64 m square: on the surface vertices UV0 is world x / 64 and -world y / 64 (u east, v south). Skirt vertices below the surface carry other UVs. `shader` lists every texture and constant of the shader; hex keys are parameter names not yet known.",
         "summary": rep, "tiles": rows}))?;
     Ok(rep)
 }
