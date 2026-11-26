@@ -2176,10 +2176,21 @@ fn ped_skin(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &crate::drawable::Dr
         if child && !o.body_shape.is_empty() && animal.is_none() {
             item.warnings.push("body shape: kid and infant bodies have no body-shape rig; neutral body exported".into());
         }
+        // Clothing helper bones posed by the garment surface rig (index into
+        // `skeleton`); the others follow their parent rigidly.
+        let mut garment: Vec<Option<[f32; 16]>> = Vec::new();
         if !o.body_shape.is_empty() && animal.is_none() && !child {
             match crate::bodyshape::get(&game_root(a), female) {
                 Ok(rig) => match crate::bodyshape::pose(&p.bones, rig, &crate::bodyshape::input_values(&o.body_shape)) {
-                    Some((posed, _)) => j.iter_mut().zip(posed).for_each(|(j, m)| j.pose = Some(m)),
+                    Some(posed) => {
+                        j.iter_mut().zip(&posed.matrices).for_each(|(j, m)| j.pose = Some(*m));
+                        if skeleton.iter().any(|b| b.parent.is_none() && b.parent_hash.is_some()) {
+                            match crate::bodyshape::get_garment(&game_root(a), female) {
+                                Ok(g) => garment = posed.garment(g, skeleton),
+                                Err(err) => item.warnings.push(format!("body shape: {err}; clothing helper bones follow the body rigidly")),
+                            }
+                        }
+                    }
                     None => item.warnings.push("body shape: shared skeleton has bones without a bind pose; neutral body exported".into()),
                 },
                 Err(err) => item.warnings.push(format!("body shape: {err}; neutral body exported")),
@@ -2211,7 +2222,9 @@ fn ped_skin(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &crate::drawable::Dr
             let jt = &mut j[ped_joints + k];
             let local = jt.bind;
             jt.bind = crate::gltf::mat_mul(&pb, &local);
-            if let Some(pp) = pp {
+            if let Some(gp) = garment.get(k).copied().flatten() {
+                jt.pose = Some(gp);
+            } else if let Some(pp) = pp {
                 jt.pose = Some(crate::gltf::mat_mul(&pp, &local));
             }
         }
