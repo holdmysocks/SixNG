@@ -745,6 +745,11 @@ enum Cmd {
         /// Also write each height tile at full resolution (height/tiles/).
         #[arg(long)]
         height_tiles: bool,
+        /// Also export the inland water surfaces (rivers, canals, creeks,
+        /// reservoirs, ponds) placed in world space: inland/inland.json and
+        /// inland/inland.glb. Scans every map file of levels.rpf.
+        #[arg(long)]
+        inland: bool,
         #[arg(long, short)]
         out: Option<PathBuf>,
     },
@@ -959,7 +964,9 @@ enum Cmd {
         /// Texture output: png, dds, or both.
         #[arg(long, default_value = "png")]
         tex: String,
-        /// Body shape, as for extract (e.g. "gcweightbelly=0.5").
+        /// Body shape, as for extract (e.g. "gcweightbelly=0.5"). Without it a
+        /// --look outfit is posed in its own body-shape preset (from
+        /// common.rpf's body-type XML; "gcweightback=0" for neutral).
         #[arg(long)]
         body_shape: Option<String>,
         /// Face variant for the head, as for extract.
@@ -1642,9 +1649,12 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             // items) exports its first outfit, as if --look 0 were given.
             let auto = look.is_none() && !animal && opts.is_empty() && parts.is_empty();
             let look: &Option<usize> = &look.or(auto.then_some(0));
-            // hide masks over each part of a --look outfit, by drawable name
-            let mut hidden: std::collections::HashMap<String, (Vec<String>, Vec<String>)> = Default::default();
-            let look_parts: Vec<(u64, sixng_core::pedlook::LookPart)> = match look {
+            // all parts of the --look outfit (strands and unresolved items too):
+            // the hide masks below are worked out over them
+            let mut look_outfit: Vec<sixng_core::pedlook::LookPart> = Vec::new();
+            // the outfit's body-shape preset (its tag), used unless --body-shape is given
+            let mut look_preset: Option<String> = None;
+            let mut look_parts: Vec<(u64, sixng_core::pedlook::LookPart)> = match look {
                 Some(k) => match sixng_core::pedlook::look(&ws.game, &a, &ix, &prefix) {
                     // not a listed model either: the error below names the part rule
                     Err(_) if auto => Vec::new(),
@@ -1653,24 +1663,14 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                         None if auto => Vec::new(),
                         None => bail!("{prefix} has {} outfits (--look 0..{})", l.outfits.len(), l.outfits.len().saturating_sub(1)),
                         Some(o) => {
-                            // a garment worn under another is drawn as its `_cull_00` twin
-                            let names: std::collections::HashSet<String> = ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| e.name.as_ref().map(|n| n.to_ascii_lowercase())).collect();
-                            let twins = sixng_core::pedlook::cull_twins(&o.parts, |n| names.contains(n));
-                            let mut ps: Vec<sixng_core::pedlook::LookPart> = o.parts.clone();
-                            for (i, p) in ps.iter_mut().enumerate() {
-                                let (own, waist) = sixng_core::pedlook::hidden_masks(&o.parts, i);
-                                if let Some(t) = twins.get(&p.drawable) {
-                                    p.drawable = t.clone();
-                                }
-                                if !own.is_empty() || !waist.is_empty() {
-                                    hidden.insert(p.drawable.clone(), (own, waist));
-                                }
-                            }
+                            look_outfit = o.parts.clone();
+                            look_preset = o.body_shape.clone();
+                            let ps = &o.parts;
                             let by_name = sixng_core::outfit::dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
                                 let n = e.name.as_ref()?.to_ascii_lowercase();
                                 ps.iter().any(|p| !p.strands && p.drawable == n).then_some((n, e))
                             }));
-                            ps.into_iter().filter(|p| !p.strands).filter_map(|p| Some((by_name.get(&p.drawable)?.off, p))).collect()
+                            ps.iter().filter(|p| !p.strands).filter_map(|p| Some((by_name.get(&p.drawable)?.off, p.clone()))).collect()
                         }
                     },
                 },
@@ -1716,42 +1716,63 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     offs.push(o);
                 }
             }
-            // --parts and the default parts: the hide masks of each picked
-            // garment come from its item in the character's wardrobe (the
-            // first outfit or variation that wears it), as for --look
-            if look_parts.is_empty() && !animal {
-                if let Ok(l) = sixng_core::pedlook::look(&ws.game, &a, &ix, &prefix) {
-                    let worn: Vec<&sixng_core::pedlook::LookPart> = l.outfits.iter().chain(&l.other_variations).flat_map(|o| &o.parts).filter(|p| !p.strands).collect();
-                    let name_of = |off: u64| ix.entries.iter().find(|e| e.off == off).and_then(|e| e.name.as_ref()).map(|n| n.to_ascii_lowercase());
-                    let (mut ps, mut at) = (Vec::new(), Vec::new());
-                    for (j, &off) in offs.iter().enumerate() {
-                        if let Some(p) = name_of(off).and_then(|n| worn.iter().find(|p| p.drawable == n)) {
-                            ps.push((*p).clone());
-                            at.push(j);
+            // Hide masks over the exported parts, by drawable name. A part's item
+            // is its --look outfit part, else the same drawable in the
+            // character's wardrobe (the first outfit or variation that wears
+            // it): --parts, --add and the default parts. A garment another
+            // part hides regions of is drawn as its `_cull_00` twin.
+            let mut hidden: std::collections::HashMap<String, (Vec<String>, Vec<String>)> = Default::default();
+            if !animal {
+                let name_of = |off: u64| ix.entries.iter().find(|e| e.off == off).and_then(|e| e.name.as_ref()).map(|n| n.to_ascii_lowercase());
+                let mut all = look_outfit.clone();
+                let extra: Vec<u64> = offs.iter().copied().filter(|o| !look_parts.iter().any(|p| p.0 == *o)).collect();
+                if !extra.is_empty() {
+                    if let Ok(l) = sixng_core::pedlook::look(&ws.game, &a, &ix, &prefix) {
+                        let worn: Vec<&sixng_core::pedlook::LookPart> = l.outfits.iter().chain(&l.other_variations).flat_map(|o| &o.parts).filter(|p| !p.strands).collect();
+                        for n in extra.iter().filter_map(|&o| name_of(o)) {
+                            if let Some(p) = worn.iter().find(|p| p.drawable == n) {
+                                all.push((*p).clone());
+                            }
                         }
                     }
-                    let names: std::collections::HashSet<String> = ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| e.name.as_ref().map(|n| n.to_ascii_lowercase())).collect();
-                    let twins = sixng_core::pedlook::cull_twins(&ps, |n| names.contains(n));
-                    let twin_of = sixng_core::outfit::dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
-                        let n = e.name.as_ref()?.to_ascii_lowercase();
-                        twins.values().any(|t| *t == n).then_some((n, e))
-                    }));
-                    for (i, p) in ps.iter().enumerate() {
-                        let (own, waist) = sixng_core::pedlook::hidden_masks(&ps, i);
-                        let mut name = p.drawable.clone();
-                        if let Some(e) = twins.get(&name).and_then(|t| twin_of.get(t)) {
-                            offs[at[i]] = e.off;
-                            name = twins[&p.drawable].clone();
-                        }
-                        if !own.is_empty() || !waist.is_empty() {
-                            hidden.insert(name, (own, waist));
-                        }
+                }
+                let names: std::collections::HashSet<String> = ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| e.name.as_ref().map(|n| n.to_ascii_lowercase())).collect();
+                let twins = sixng_core::pedlook::cull_twins(&all, |n| names.contains(n));
+                for (i, p) in all.iter().enumerate() {
+                    let (own, waist) = sixng_core::pedlook::hidden_masks(&all, i);
+                    if !own.is_empty() || !waist.is_empty() {
+                        hidden.insert(twins.get(&p.drawable).unwrap_or(&p.drawable).clone(), (own, waist));
                     }
+                }
+                let twin_of = sixng_core::outfit::dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
+                    let n = e.name.as_ref()?.to_ascii_lowercase();
+                    twins.values().any(|t| *t == n).then_some((n, e))
+                }));
+                for off in offs.iter_mut() {
+                    let Some(t) = name_of(*off).and_then(|n| twins.get(&n)) else { continue };
+                    let Some(e) = twin_of.get(t) else { continue };
+                    for lp in look_parts.iter_mut().filter(|lp| lp.0 == *off) {
+                        lp.0 = e.off;
+                        lp.1.drawable = t.clone();
+                    }
+                    *off = e.off;
                 }
             }
             let sel: Vec<&sixng_core::scan::Entry> = offs.iter().filter_map(|o| ix.entries.iter().find(|e| e.off == *o)).collect();
             let glb = glb.clone().unwrap_or_else(|| PathBuf::from(format!("{prefix}.glb")));
-            let oa = OutArgs { out: glb.parent().map(|p| p.to_path_buf()).unwrap_or_default(), tex: tex.clone(), raw: false, force: true, no_embedded_textures: false, dry_run: false, body_shape: body_shape.clone(), head_skin: *head_skin, paint: None };
+            // without --body-shape a --look outfit is posed in its own preset
+            let body_shape = match (body_shape, &look_preset) {
+                (Some(s), _) => Some(s.clone()),
+                (None, Some(tag)) => match sixng_core::bodyshape::preset_controls(&ws.game, tag) {
+                    Ok(c) => Some(c.iter().filter(|(_, v)| *v != 0.0).map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join(",")).filter(|s| !s.is_empty()),
+                    Err(e) => {
+                        eprintln!("body-shape preset {tag}: {e} (exported neutral)");
+                        None
+                    }
+                },
+                (None, None) => None,
+            };
+            let oa = OutArgs { out: glb.parent().map(|p| p.to_path_buf()).unwrap_or_default(), tex: tex.clone(), raw: false, force: true, no_embedded_textures: false, dry_run: false, body_shape, head_skin: *head_skin, paint: None };
             if *anim_only && clip.is_empty() {
                 bail!("--anim-only needs at least one --clip");
             }
@@ -2925,13 +2946,13 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             out.print(&json!({"ok": true, "result": res}));
         }
-        Cmd::Water { fog_px, height_px, shore_px, height_tiles, out: po } => {
+        Cmd::Water { fog_px, height_px, shore_px, height_tiles, inland, out: po } => {
             for (n, v, max) in [("--fog-px", *fog_px, 128), ("--height-px", *height_px, 512), ("--shore-px", *shore_px, 256)] {
                 if v == 0 || max % v != 0 {
                     anyhow::bail!("{n} {v}: must divide {max}");
                 }
             }
-            let o = sixng_core::water::Options { fog_px: *fog_px, height_px: *height_px, shore_px: *shore_px, height_tiles: *height_tiles };
+            let o = sixng_core::water::Options { fog_px: *fog_px, height_px: *height_px, shore_px: *shore_px, height_tiles: *height_tiles, inland: *inland };
             let r = sixng_core::water::export(&ws, po.as_deref(), &o)?;
             out.print(&json!({"ok": true, "result": r}));
         }

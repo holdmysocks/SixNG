@@ -1991,6 +1991,9 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
         let stored = |t: &crate::drawable::TexRef| u64::from_str_radix(&t.hash64, 16).is_ok_and(|h| set.get(h).is_some());
         let has_albedo = |s: &crate::drawable::Shader| s.textures.iter().any(|t| ALBEDO_PARAMS.contains(&t.param_hash.as_str()) && stored(t));
         if let (Some(&(alb, nrm)), true) = (list.iter().find(|s| set.get(s.0).is_some()), shaders.iter().any(|s| !has_albedo(s))) {
+            // Body items list their colour texture twice, the first time
+            // without a normal map: take the normal from the entry that has one.
+            let nrm = list.iter().find(|s| s.0 == alb && s.1 != 0 && set.get(s.1).is_some()).map_or(nrm, |s| s.1);
             let sh = shaders
                 .iter()
                 .map(|s| {
@@ -1998,7 +2001,9 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
                     if !has_albedo(&s) {
                         s.textures.retain(|t| !ALBEDO_PARAMS.contains(&t.param_hash.as_str()));
                         s.textures.push(tex(ALBEDO_PARAMS[0], alb));
-                        if nrm != 0 && set.get(nrm).is_some() && !s.textures.iter().any(|t| t.param_hash == "1e77bf4c" && stored(t)) {
+                        // the item's normal map over the mesh's: the mesh binds a smooth
+                        // generic body, the items the character's own (muscle, ribs, age)
+                        if nrm != 0 && set.get(nrm).is_some() {
                             s.textures.retain(|t| t.param_hash != "1e77bf4c");
                             s.textures.push(tex("1e77bf4c", nrm));
                         }
