@@ -625,6 +625,16 @@ again**).
     `mr1` parts on 10 characters, 9 child lower bodies `feet_mk1`, which
     only one body set wears); the face colour at the neck stays the
     fallback.
+    **Body normal maps** come from the body item since 2026-11-26. An item
+    lists its colour texture twice, the first time without a normal map,
+    and the export took that first entry, so the body kept the whole-body
+    mesh's own normal map: a smooth generic body, the same for every
+    character of a fit. The item's normal map is the character's own body
+    (an old woman's ribs, loose skin and knees, a muscular man's chest and
+    abdomen) and now replaces the mesh's. Of the 2,645
+    characters with a body skin, 1,042 change (1,798 body parts); 1,288
+    parts already had the same map, and 2,204 whose item names no stored
+    normal map keep the mesh's.
   - **Fabric shading.** The colour is shaded by the green channel of the
     garment's own packed map (`speculartex`: seams and folds, mid grey on
     plain cloth). From the clothing pixel shader (`ped_standard_muv`, read
