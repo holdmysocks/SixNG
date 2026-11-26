@@ -567,14 +567,34 @@ fn sky(d: vec3<f32>) -> vec3<f32> {
     return environment(d, 0.0) + F.sun_col.rgb * (disc * 40.0 * F.sun_dir.w);
 }
 
-// Diffuse light from the surroundings on a surface facing n: the sky,
-// mostly desaturated (its full colour tinted every shaded surface
-// blue-white), and on surfaces that face down the light the ground sends
-// back.
+// Share of the light on the ground that it sends back: the same ground as
+// the map's scene (atmo.rs GROUND_ALBEDO).
+const GROUND_ALBEDO: f32 = 0.15;
+
+// The sky's diffuse light on a surface facing n (irradiance / pi), mostly
+// desaturated (its full colour tinted every shaded surface blue-white).
+fn sky_light(n: vec3<f32>) -> vec3<f32> {
+    return mix(neutral(F.sky_hor.rgb, 0.8) * 0.6, neutral(F.sky_top.rgb, 0.8), n.y * 0.5 + 0.5) * F.misc.w;
+}
+
+// Diffuse light from the surroundings on a surface facing n (irradiance /
+// pi), built as the map's scene builds its ambient cube (atmo.wgsl
+// cs_ambient): the sky; a ground of GROUND_ALBEDO lit by the sun and the
+// sky, which fills (1 - n.y) / 2 of what the surface sees; and the sun light
+// bounced off lit surroundings that reaches it from every side, the
+// timecycle's ambient_bounce_intensity (sun_col.w) x the ground's albedo.
+// The ground keeps a model lit from behind by a low sun lit on its shaded
+// side, as the game does.
 fn ambient(n: vec3<f32>) -> vec3<f32> {
     if (hdr()) { return sky_ambient(n); }
-    let sky_d = mix(neutral(F.sky_hor.rgb, 0.8) * 0.6, neutral(F.sky_top.rgb, 0.8), n.y * 0.5 + 0.5);
-    return mix(sky_d, ground_col(), 0.8 * smoothstep(0.0, 1.0, -n.y)) * F.misc.w;
+    let l = normalize(F.sun_dir.xyz);
+    // the sun's light on the ground, / pi (sun_e's light on a level surface)
+    let e_sun = F.sun_col.rgb * (F.sun_dir.w * 3.0 * max(l.y, 0.0) / PI);
+    let ground = GROUND_ALBEDO * (e_sun + sky_light(vec3(0.0, 1.0, 0.0)));
+    let below = 0.5 - 0.5 * clamp(n.y, -1.0, 1.0);
+    // a surface facing down sees little sky
+    let sky = sky_light(n) * (1.0 - 0.8 * smoothstep(0.0, 1.0, -n.y));
+    return sky + ground * below + e_sun * (GROUND_ALBEDO * F.sun_col.w);
 }
 
 fn aces(x: vec3<f32>) -> vec3<f32> {

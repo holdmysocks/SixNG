@@ -6521,8 +6521,11 @@ impl Wrap {
     }
 
     /// Offset at a point: the inverse-square-distance mean of the six
-    /// nearest skin vertices (searched up to about 30 cm away).
-    fn at(&self, p: [f32; 3]) -> [f32; 3] {
+    /// nearest skin vertices (searched up to about 30 cm away). With the
+    /// point's normal, the offset along it is at least the largest of those
+    /// six, so where the skin swells unevenly (a belly at full weight) a
+    /// garment is not left inside it.
+    fn at(&self, p: [f32; 3], n: Option<[f32; 3]>) -> [f32; 3] {
         let k = Self::key(p);
         let mut best: Vec<(f32, u32)> = Vec::new();
         let mut r = 1;
@@ -6560,7 +6563,18 @@ impl Wrap {
             }
             wsum += w;
         }
-        o.map(|x| x / wsum)
+        let mut o = o.map(|x| x / wsum);
+        if let Some(n) = n.filter(|n| (n[0] * n[0] + n[1] * n[1] + n[2] * n[2] - 1.0).abs() < 0.1) {
+            let dot = |d: [f32; 3]| d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
+            let out = best.iter().take(6).map(|(_, i)| dot(self.pts[*i as usize].1)).fold(f32::MIN, f32::max);
+            let gap = out - dot(o);
+            if out > 0.0 && gap > 0.0 {
+                for c in 0..3 {
+                    o[c] += n[c] * gap;
+                }
+            }
+        }
+        o
     }
 
     /// Move a part with the skin. Small parts (a watch, glasses, a ring)
@@ -6569,12 +6583,12 @@ impl Wrap {
     fn apply(&self, m: &mut glb::Model) {
         use glam::Vec3;
         let size = (Vec3::from(m.bbox[1]) - Vec3::from(m.bbox[0])).length();
-        let rigid = (size < 0.3).then(|| self.at(((Vec3::from(m.bbox[0]) + Vec3::from(m.bbox[1])) * 0.5).to_array()));
+        let rigid = (size < 0.3).then(|| self.at(((Vec3::from(m.bbox[0]) + Vec3::from(m.bbox[1])) * 0.5).to_array(), None));
         let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
         for me in &mut m.meshes {
             let mut sum = Vec3::ZERO;
             for v in &mut me.verts {
-                let o = rigid.unwrap_or_else(|| self.at(v.pos));
+                let o = rigid.unwrap_or_else(|| self.at(v.pos, Some(v.nrm)));
                 for c in 0..3 {
                     v.pos[c] += o[c];
                 }
