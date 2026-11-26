@@ -260,6 +260,121 @@ pub struct Shell {
     r: Vec<f32>,
     /// Changes with the hat (cache key).
     pub id: u64,
+    /// The hat's own triangles, when known (`Shell::with_lining`).
+    lining: Option<Lining>,
+}
+
+/// A hat's triangles, binned by their direction from the shell's centre
+/// (`Lining::W` x `Lining::H` cells of one degree), for crossing tests.
+struct Lining {
+    tris: Vec<[[f32; 3]; 3]>,
+    cells: Vec<Vec<u32>>,
+}
+
+impl Lining {
+    const W: usize = 360;
+    const H: usize = 180;
+
+    /// Cell coordinates (fractional) of direction `d` from the centre.
+    fn at(d: [f32; 3]) -> (f32, f32) {
+        let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-9);
+        let x = (d[1].atan2(d[0]) / std::f32::consts::TAU + 0.5) * Self::W as f32;
+        let y = ((d[2] / l).clamp(-1.0, 1.0).asin() / std::f32::consts::PI + 0.5) * Self::H as f32;
+        (x, y)
+    }
+
+    /// Cell ranges (x may run past `W`: it wraps) covering the directions
+    /// `c`, with a margin of one cell; every longitude near the poles.
+    /// `c` should hold points inside the shape too (a segment or triangle
+    /// near a pole reaches higher than its corners).
+    fn span(c: &[(f32, f32)]) -> ((i64, i64), (usize, usize)) {
+        let w = Self::W as f32;
+        let (y0, y1) = c.iter().fold((f32::MAX, f32::MIN), |(a, b), q| (a.min(q.1), b.max(q.1)));
+        let (mut x0, mut x1) = c.iter().fold((f32::MAX, f32::MIN), |(a, b), q| (a.min(q.0), b.max(q.0)));
+        if x1 - x0 > w / 2.0 {
+            // across the longitude seam: count the western ones a turn on
+            let xs: Vec<f32> = c.iter().map(|q| if q.0 < w / 2.0 { q.0 + w } else { q.0 }).collect();
+            x0 = xs.iter().copied().fold(f32::MAX, f32::min);
+            x1 = xs.iter().copied().fold(f32::MIN, f32::max);
+        }
+        let ya = (y0.floor() as i64 - 1).max(0) as usize;
+        let yb = (y1.floor() as i64 + 1).min(Self::H as i64 - 1) as usize;
+        let all = ya < 6 || yb + 6 >= Self::H || x1 - x0 > w / 2.0;
+        let xs = if all { (0, Self::W as i64 - 1) } else { (x0.floor() as i64 - 1, x1.floor() as i64 + 1) };
+        (xs, (ya, yb))
+    }
+
+    fn new(centre: [f32; 3], tris: Vec<[[f32; 3]; 3]>) -> Lining {
+        let mut cells = vec![Vec::new(); Self::W * Self::H];
+        for (i, t) in tris.iter().enumerate() {
+            // corners, edge midpoints and centre
+            let mid = |p: [f32; 3], q: [f32; 3]| [(p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0, (p[2] + q[2]) / 2.0];
+            let g = [(t[0][0] + t[1][0] + t[2][0]) / 3.0, (t[0][1] + t[1][1] + t[2][1]) / 3.0, (t[0][2] + t[1][2] + t[2][2]) / 3.0];
+            let pts = [t[0], t[1], t[2], mid(t[0], t[1]), mid(t[1], t[2]), mid(t[2], t[0]), g];
+            let c: Vec<(f32, f32)> = pts.iter().map(|p| Self::at([p[0] - centre[0], p[1] - centre[1], p[2] - centre[2]])).collect();
+            let ((xa, xb), (ya, yb)) = Self::span(&c);
+            for y in ya..=yb {
+                for x in xa..=xb {
+                    cells[y * Self::W + x.rem_euclid(Self::W as i64) as usize].push(i as u32);
+                }
+            }
+        }
+        Lining { tris, cells }
+    }
+
+    /// The first crossing of segment `a`-`b` with the hat: its share of
+    /// the way from `a`. Only triangles binned in the cells the segment
+    /// spans (seen from `centre`) are tested (Moller-Trumbore).
+    fn first_hit(&self, centre: [f32; 3], a: [f32; 3], b: [f32; 3]) -> Option<f32> {
+        let sub = |p: [f32; 3], q: [f32; 3]| [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
+        let cross = |p: [f32; 3], q: [f32; 3]| [p[1] * q[2] - p[2] * q[1], p[2] * q[0] - p[0] * q[2], p[0] * q[1] - p[1] * q[0]];
+        let dot = |p: [f32; 3], q: [f32; 3]| p[0] * q[0] + p[1] * q[1] + p[2] * q[2];
+        // the directions along the segment (from the centre itself every
+        // direction is possible: those of the rest)
+        let ends: Vec<(f32, f32)> = (0..=8)
+            .map(|i| {
+                let f = i as f32 / 8.0;
+                [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f]
+            })
+            .filter(|p| dot(sub(*p, centre), sub(*p, centre)) > 1e-10)
+            .map(|p| Self::at(sub(p, centre)))
+            .collect();
+        let ((xa, xb), (ya, yb)) = Self::span(&ends);
+        let mut ids = Vec::new();
+        for y in ya..=yb {
+            for x in xa..=xb {
+                ids.extend_from_slice(&self.cells[y * Self::W + x.rem_euclid(Self::W as i64) as usize]);
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let d = sub(b, a);
+        let mut best: Option<f32> = None;
+        for i in ids {
+            let [v0, v1, v2] = self.tris[i as usize];
+            let (e1, e2) = (sub(v1, v0), sub(v2, v0));
+            let p = cross(d, e2);
+            let det = dot(e1, p);
+            if det.abs() < 1e-14 {
+                continue;
+            }
+            let s = sub(a, v0);
+            let u = dot(s, p) / det;
+            if !(0.0..=1.0).contains(&u) {
+                continue;
+            }
+            let q = cross(s, e1);
+            let v = dot(d, q) / det;
+            if v < 0.0 || u + v > 1.0 {
+                continue;
+            }
+            let t = dot(e2, q) / det;
+            if (0.0..=1.0).contains(&t) && best.is_none_or(|x| t < x) {
+                best = Some(t);
+            }
+        }
+        best
+    }
 }
 
 impl Shell {
@@ -353,7 +468,48 @@ impl Shell {
                 break;
             }
         }
-        Shell { centre, r, id }
+        Shell { centre, r, id, lining: None }
+    }
+
+    /// The same shell with the hat's own triangles (RAGE space), for
+    /// `press_strands`.
+    pub fn with_lining(mut self, tris: Vec<[[f32; 3]; 3]>) -> Shell {
+        self.lining = (!tris.is_empty()).then(|| Lining::new(self.centre, tris));
+        self
+    }
+
+    /// `press` for strands of `k` points each (strand-major), then, with
+    /// the hat's triangles (`with_lining`), a check of every strand from
+    /// its root: where a segment crosses the hat, its far point goes back
+    /// under the hat, `gap` inside it on the line from the centre (or,
+    /// where the segment would still cross, `gap` short of the crossing
+    /// along the segment). The shell alone is coarse (5 degree cells,
+    /// blended out toward the hat's edges) and lets a few points through.
+    /// Returns how many points moved.
+    pub fn press_strands(&self, points: &mut [[f32; 3]], k: usize, gap: f32) -> usize {
+        let before = points.to_vec();
+        self.press(points, gap);
+        if let (Some(l), true) = (&self.lining, k >= 2) {
+            let c = self.centre;
+            for s in points.chunks_exact_mut(k) {
+                for j in 1..k {
+                    let (a, b) = (s[j - 1], s[j]);
+                    let Some(t) = l.first_hit(c, a, b) else { continue };
+                    let under = l.first_hit(c, c, b).and_then(|h| {
+                        let len = ((b[0] - c[0]).powi(2) + (b[1] - c[1]).powi(2) + (b[2] - c[2]).powi(2)).sqrt().max(1e-9);
+                        let f = (h - gap / len).max(0.0);
+                        let q = [c[0] + (b[0] - c[0]) * f, c[1] + (b[1] - c[1]) * f, c[2] + (b[2] - c[2]) * f];
+                        l.first_hit(c, a, q).is_none().then_some(q)
+                    });
+                    s[j] = under.unwrap_or_else(|| {
+                        let len = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2) + (b[2] - a[2]).powi(2)).sqrt().max(1e-9);
+                        let f = (t - gap / len).max(0.0);
+                        [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f]
+                    });
+                }
+            }
+        }
+        before.iter().zip(points.iter()).filter(|(a, b)| a != b).count()
     }
 
     /// Pull the points that lie beyond the hat to `gap` under it. Returns
@@ -1306,7 +1462,7 @@ pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], o
                     let o = crate::hairexport::Options { density: full.unwrap_or(1.0), guides: false, ..Default::default() };
                     let mut ex = serde_json::json!({"source": e.id, "groom": format!("{:x}", e.off), "bones": info.bones});
                     crate::hairexport::tag_uv_set(&g, head, &mut ex);
-                    let (prims, _) = crate::hairexport::piece(&g, &name, &o, None, ex);
+                    let (prims, _) = crate::hairexport::piece(&g, &name, &o, None, None, ex);
                     crate::gltf::strands_glb(&name, &prims, extras)
                 }
                 (Some(hw), None) => g.ribbon_glb(&name, hw, [0.08, 0.05, 0.03], extras),
@@ -1409,6 +1565,54 @@ mod tests {
         let s = Shell::new([0.0, 0.0, 1.7], &holed, &[]);
         let mut through = [[0.14, 0.0, 1.75]];
         assert_eq!(s.press(&mut through, 0.003), 1);
+    }
+
+    #[test]
+    fn lining_keeps_strands_from_crossing_the_hat() {
+        // a dome of triangles, radius 10 cm, up to its pole
+        let at = |i: usize, j: usize| {
+            let (lat, lon) = ((i as f32 * 10.0).min(90.0).to_radians(), (j as f32 * 15.0).to_radians());
+            [0.1 * lat.cos() * lon.cos(), 0.1 * lat.cos() * lon.sin(), 1.7 + 0.1 * lat.sin()]
+        };
+        let mut tris = Vec::new();
+        for i in 0..9 {
+            for j in 0..24 {
+                tris.push([at(i, j), at(i, j + 1), at(i + 1, j + 1)]);
+                tris.push([at(i, j), at(i + 1, j + 1), at(i + 1, j)]);
+            }
+        }
+        let pts: Vec<[f32; 3]> = tris.iter().flatten().copied().collect();
+        let s = Shell::new([0.0, 0.0, 1.7], &pts, &[]).with_lining(tris.clone());
+        // strands of 4 points: out through the pole, through the side, and
+        // one that stays inside
+        let mut strands = vec![
+            [0.0, 0.0, 1.75], [0.003, 0.0, 1.79], [0.006, 0.001, 1.83], [0.01, 0.002, 1.9],
+            [0.05, 0.0, 1.72], [0.08, 0.01, 1.73], [0.12, 0.02, 1.74], [0.2, 0.03, 1.75],
+            [0.0, 0.03, 1.72], [0.0, 0.04, 1.73], [0.0, 0.05, 1.74], [0.0, 0.06, 1.75],
+        ];
+        let inside = strands[8..].to_vec();
+        assert!(s.press_strands(&mut strands, 4, 0.003) > 0);
+        assert_eq!(&strands[8..], &inside[..]);
+        // no segment crosses any triangle (brute force)
+        let sub = |p: [f32; 3], q: [f32; 3]| [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
+        let cross = |p: [f32; 3], q: [f32; 3]| [p[1] * q[2] - p[2] * q[1], p[2] * q[0] - p[0] * q[2], p[0] * q[1] - p[1] * q[0]];
+        let dot = |p: [f32; 3], q: [f32; 3]| p[0] * q[0] + p[1] * q[1] + p[2] * q[2];
+        for st in strands.chunks_exact(4) {
+            for w in st.windows(2) {
+                let (a, d) = (w[0], sub(w[1], w[0]));
+                for [v0, v1, v2] in &tris {
+                    let (e1, e2) = (sub(*v1, *v0), sub(*v2, *v0));
+                    let p = cross(d, e2);
+                    let det = dot(e1, p);
+                    if det.abs() < 1e-14 {
+                        continue;
+                    }
+                    let q = cross(sub(a, *v0), e1);
+                    let (u, v, t) = (dot(sub(a, *v0), p) / det, dot(d, q) / det, dot(e2, q) / det);
+                    assert!(!(u >= 0.0 && v >= 0.0 && u + v <= 1.0 && (0.0..=1.0).contains(&t)), "{w:?} crosses");
+                }
+            }
+        }
     }
 
     #[test]

@@ -434,8 +434,18 @@ restyle the hair:
    from root to tip. Variant: a random value against three per-guide
    thresholds gives each strand one of four colour ramps.
 
-Not in the export yet: how the hair is pressed under a hat (export the model without the
-hat and add the hat afterwards), and the game's run-time strand count (it
+Under a hat in the outfit the scalp pieces are pressed in as the viewer
+does (a stand-in, not the game's method; see the model viewer below): the
+guides before the strands are grown and the grown strands after, every
+point beyond the hat's lining pulled to 3 mm under it; then every strand
+is followed from its root against the hat's own triangles, and a point
+whose segment crosses the hat goes back under it (the coarse press alone
+let tufts through the side of a cap). Their extras name the hat
+(`under_hat`) and the summary the points moved (`hat_pressed`). On
+Jason's look 1 (a cap worn backwards, over his long hair) 411,913 of
+1.19 M points move, and 2 of 1.1 M strand segments still cross the cap
+(one strand at its lower edge; 69,923 with the press alone). Not in the export yet:
+the game's run-time strand count (it
 draws fewer strands at a distance; the export writes all it stores). To
 restyle in Blender, edit the hidden `_guides` objects and grow new strands
 from them with Blender's Interpolate Hair Curves node (it blends nearby
@@ -807,8 +817,10 @@ again**).
   swatches to click (`--hair-colour r,g,b`), and lists the character's
   other hair styles (its own placeholders that have grooms placed) to
   tick (`--hair-style TEXT`). Under a hat the scalp hair is pressed in: strand
-  points beyond the hat's lining are pulled to 3 mm under it, and an
-  opening the hat encloses (over a cap's strap) counts as closed. This
+  points beyond the hat's lining are pulled to 3 mm under it (then each
+  strand is checked against the hat's triangles, so none comes through
+  it), and an opening the hat encloses (over a cap's strap) counts as
+  closed. This
   is a stand-in, not the game's method: of the 6,886 outfits with a hat
   and hair, 6,840 ask for the plain hair state, and no stored rule
   says how the game keeps it under the hat. Hair items do have other
