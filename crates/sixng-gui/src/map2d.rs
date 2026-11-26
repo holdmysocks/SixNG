@@ -85,6 +85,20 @@ impl Grid {
     }
 }
 
+/// 32-bit fingerprint of a file's bytes (not cryptographic).
+fn fingerprint(b: &[u8]) -> u32 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ b.len() as u64;
+    let mut it = b.chunks_exact(8);
+    for c in &mut it {
+        let w = u64::from_le_bytes(c.try_into().unwrap());
+        h = (h ^ w).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(23);
+    }
+    for &x in it.remainder() {
+        h = (h ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (h ^ (h >> 32)) as u32
+}
+
 pub struct MapData {
     pub meta: Value,
     pub roads: Vec<Road>,
@@ -94,6 +108,9 @@ pub struct MapData {
     pub light_grid: Grid,
     pub ents: Vec<EntRec>,
     pub ent_grid: Grid,
+    /// Fingerprint of the bake's placements and strings: caches built from
+    /// the placements (map cells) are keyed by it.
+    pub bake_id: u32,
     pub strings: Vec<String>,
     pub files: Vec<String>,
     pub interiors: Vec<Value>,
@@ -186,10 +203,9 @@ impl MapData {
         for (i, e) in ents.iter().enumerate() {
             ent_grid.add(e.pos[0], e.pos[1], i as u32);
         }
-        let sj: Value = std::fs::read(dir.join("strings.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        let sb = std::fs::read(dir.join("strings.json")).unwrap_or_default();
+        let bake_id = fingerprint(&eb) ^ fingerprint(&sb).rotate_left(17);
+        let sj: Value = serde_json::from_slice(&sb).unwrap_or_default();
         let strings = sj["strings"]
             .as_array()
             .into_iter()
@@ -228,6 +244,7 @@ impl MapData {
             light_grid,
             ents,
             ent_grid,
+            bake_id,
             strings,
             files,
             interiors,
