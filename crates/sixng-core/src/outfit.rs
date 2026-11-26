@@ -203,6 +203,20 @@ fn options_from<'a>(p: &str, parts: impl Iterator<Item = (&'a str, u64, &'a str)
         chosen.remove("top");
         chosen.remove("bottom");
     }
+    // A suit jacket goes with dress trousers and a dress shirt (as in the
+    // outfit list's suit looks): with one as the default outer, the default
+    // bottom is the character's dress trousers when it has some, and a top
+    // that is not a dress shirt (a polo showing through a closed suit) is off.
+    let name_of = |off: u64| opts.iter().find(|o| o.off == off).map_or("", |o| o.name.as_str());
+    if chosen.get("outer").is_some_and(|&o| name_of(o)[p.len()..].starts_with("jacketsuit")) {
+        let dress = |o: &&PartOpt| o.group == "bottom" && o.name[p.len()..].starts_with("pantsdress") && !o.name.contains("_alt_");
+        if let Some(d) = opts.iter().find(dress) {
+            chosen.insert("bottom".into(), d.off);
+        }
+        if chosen.get("top").is_some_and(|&t| !name_of(t)[p.len()..].starts_with("shirtdress")) {
+            chosen.remove("top");
+        }
+    }
     // A character whose parts are all outside the outfit slots (one
     // `legacypedcs_…_fullbody` model) would show nothing: the first part of
     // each of its groups stands in.
@@ -694,6 +708,11 @@ mod tests {
         assert_eq!(opts(&["x_legacypedcs_mr1_000_fullbody_full"]), ["x_legacypedcs_mr1_000_fullbody_full"]);
         // with a slot part, accessories stay off
         assert_eq!(opts(&["x_hatflatcap_mr1_000_full", "x_head_mr1_000_full"]), ["x_head_mr1_000_full"]);
+        // a suit jacket takes the dress trousers and no polo under it
+        let suit = ["x_head_mr1_000_full", "x_jacketsuit_mr1_000_o_hl_long_full", "x_pantschinos_mr1_000_mw_long_full", "x_pantsdress_mr1_000_mw_long_full", "x_tshirtpolo_mr1_000_oc_tu_short_full"];
+        assert_eq!(opts(&suit), ["x_head_mr1_000_full", "x_jacketsuit_mr1_000_o_hl_long_full", "x_pantsdress_mr1_000_mw_long_full"]);
+        // with a dress shirt, the shirt stays
+        assert_eq!(opts(&["x_jacketsuit_mr1_000_o_hl_long_full", "x_shirtdress_mr1_000_oc_tu_long_full"]), ["x_jacketsuit_mr1_000_o_hl_long_full", "x_shirtdress_mr1_000_oc_tu_long_full"]);
     }
 
     /// Real data: a whole outfit with a walk clip, from a local install.
