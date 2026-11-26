@@ -11,7 +11,9 @@
 //! - `_WIDTH`: the strand's width (metres) at that point,
 //! - `_CLUMP`: the strand's clump (1-based; 0 = a scattered strand),
 //! - `_VARIANT`: the strand's colour variant 0-3 (which of the four colour
-//!   ramps of its colour set the game's strand shader takes).
+//!   ramps of its colour set the game's strand shader takes),
+//! - `COLOR_0` (when the piece's colours are known, `HairColour`): the
+//!   strand's colour at that point, linear RGB.
 //!
 //! Each mesh's extras give `points_per_strand`, `strands`, the piece's slot,
 //! placeholder, bone and groom offset, and in a character export
@@ -81,13 +83,63 @@ pub fn resample(pts: &[[f32; 3]], k: usize) -> Vec<[f32; 3]> {
     out
 }
 
+/// The colours of a piece's strands, as the viewer draws them: per colour
+/// variant, the colour along the strand.
+pub enum HairColour {
+    /// The game's colour set (`hairtone::StrandData`): four colour ramps,
+    /// the atlas colour (sRGB-encoded) along the strand.
+    Set(Box<[crate::hairtone::ColourRamp; 4]>),
+    /// Without the strand tables: the item's colour preset per variant, its
+    /// two colours from root to tip (`hairtone::ramp`, taken as linear).
+    Presets(Box<[crate::hairtone::Preset; 4]>),
+}
+
+impl HairColour {
+    /// Linear RGB of variant `variant` at `t` along the strand (0 root, 1 tip).
+    pub fn at(&self, variant: u8, t: f32) -> [f32; 3] {
+        let v = (variant & 3) as usize;
+        match self {
+            HairColour::Set(r) => r[v].at(t).map(|x| {
+                let x = x.clamp(0.0, 1.0);
+                if x < 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) }
+            }),
+            HairColour::Presets(p) => crate::hairtone::ramp(p[v].a, p[v].b, t),
+        }
+    }
+}
+
+/// Wardrobe item category of each strand slot, as the outfit's strand
+/// colour items name it (`pedlook::Outfit::strand_colours`).
+pub const SLOT_CATEGORY: [(&str, &str); 5] = [("hair", "864b03ae"), ("brows", "7c50ad43"), ("lashes", "83a664e7"), ("beard", "44d2709f"), ("body hair", "a228cc57")];
+
+/// The colours of a strand slot of an outfit, as the viewer picks them:
+/// the colour set the outfit's colour item gives the slot's category, else
+/// the one the slot's item names (its hair preset), looked up in the game's
+/// strand tables; without a set there, the item's own colour presets
+/// (unless their flag marks them as not a hair colour). Returns the
+/// colours and the set's name hash.
+pub fn slot_colour(outfit: &crate::pedlook::Outfit, slot: &str, tables: Option<&crate::hairtone::StrandData>, presets: Option<&crate::hairtone::Table>) -> Option<(HairColour, u32)> {
+    let hex = |h: &str| u32::from_str_radix(h, 16).ok();
+    let preset = outfit.parts.iter().find(|p| p.strands && p.slot == slot).and_then(|p| p.hair_preset.as_deref()).and_then(hex);
+    let cat = SLOT_CATEGORY.iter().find(|c| c.0 == slot).map(|c| c.1);
+    let set = cat.and_then(|c| outfit.strand_colours.iter().find(|x| x.0 == c)).and_then(|x| hex(&x.1)).or(preset)?;
+    if let Some(cs) = tables.and_then(|t| t.colour_set(set)) {
+        return Some((HairColour::Set(Box::new(cs.clone())), set));
+    }
+    let p = preset?;
+    let v = presets?.variants(p)?;
+    (!v[0].flag).then(|| (HairColour::Presets(Box::new(v)), p))
+}
+
 /// Strands of one piece as a `StrandPrim`: `points` are n strands of `k`
 /// points; `uv`, `clump` and `variant` one value per strand.
-fn prim(g: &Groom, name: String, k: usize, points: &[[f32; 3]], uv: &[[f32; 2]], clump: &[u32], variant: &[u8], o: &Options, extras: Value) -> StrandPrim {
+#[allow(clippy::too_many_arguments)]
+fn prim(g: &Groom, name: String, k: usize, points: &[[f32; 3]], uv: &[[f32; 2]], clump: &[u32], variant: &[u8], colour: Option<&HairColour>, o: &Options, extras: Value) -> StrandPrim {
     let n = if k == 0 { 0 } else { points.len() / k };
     let kk = if o.points >= 2 { o.points } else { k };
     let mut pos = Vec::with_capacity(n * kk);
     let (mut width, mut uvs, mut cl, mut var) = (Vec::with_capacity(n * kk), Vec::with_capacity(n * kk), Vec::with_capacity(n * kk), Vec::with_capacity(n * kk));
+    let mut col = Vec::with_capacity(if colour.is_some() { n * kk } else { 0 });
     for s in 0..n {
         let src = &points[s * k..s * k + k];
         if kk == k {
@@ -100,12 +152,16 @@ fn prim(g: &Groom, name: String, k: usize, points: &[[f32; 3]], uv: &[[f32; 2]],
             uvs.push(uv.get(s).copied().unwrap_or([0.0, 0.0]));
             cl.push(clump.get(s).copied().unwrap_or(0) as f32);
             var.push(variant.get(s).copied().unwrap_or(0) as f32);
+            if let Some(c) = colour {
+                let v = c.at(variant.get(s).copied().unwrap_or(0), j as f32 / (kk.max(2) - 1) as f32);
+                col.push([v[0], v[1], v[2], 1.0]);
+            }
         }
     }
     let mut extras = extras;
     extras["points_per_strand"] = json!(kk);
     extras["strands"] = json!(n);
-    StrandPrim { name, k: kk, positions: pos, uv: uvs, attrs: vec![("_WIDTH".into(), width), ("_CLUMP".into(), cl), ("_VARIANT".into(), var)], extras }
+    StrandPrim { name, k: kk, positions: pos, uv: uvs, colour: col, attrs: vec![("_WIDTH".into(), width), ("_CLUMP".into(), cl), ("_VARIANT".into(), var)], extras }
 }
 
 /// `extras` with `head_mesh`, `head_uv_set` and `head_uv_error` when the
@@ -136,9 +192,10 @@ pub fn coat_uvs(g: &Groom, c: &Coat) -> Vec<[f32; 2]> {
 
 /// The strands of one groom for `strands_glb`: the grown coat (or the
 /// guides when the groom stores nothing to grow), then the guides when
-/// `o.guides`. `extras` goes on every mesh. Returns the pieces and a
-/// summary (strands written, stored, guides).
-pub fn piece(g: &Groom, name: &str, o: &Options, extras: Value) -> (Vec<StrandPrim>, Value) {
+/// `o.guides`. `extras` goes on every mesh; `colour` colours the grown
+/// strands (COLOR_0). Returns the pieces and a summary (strands written,
+/// stored, guides).
+pub fn piece(g: &Groom, name: &str, o: &Options, colour: Option<&HairColour>, extras: Value) -> (Vec<StrandPrim>, Value) {
     let k = g.points_per_strand;
     let mut out = Vec::new();
     let sh = share(g, o);
@@ -148,15 +205,15 @@ pub fn piece(g: &Groom, name: &str, o: &Options, extras: Value) -> (Vec<StrandPr
     ex["grown"] = json!(grown);
     if grown {
         ex["share"] = json!(sh);
-        out.push(prim(g, name.to_string(), k, &coat.points, &coat_uvs(g, &coat), &coat.clumps, &coat.variants, o, ex));
+        out.push(prim(g, name.to_string(), k, &coat.points, &coat_uvs(g, &coat), &coat.clumps, &coat.variants, colour, o, ex));
     } else {
         // nothing stored to grow from: the guides are the hair
-        out.push(prim(g, name.to_string(), k, &g.points, &g.root_uv, &[], &[], o, ex));
+        out.push(prim(g, name.to_string(), k, &g.points, &g.root_uv, &[], &[], colour, o, ex));
     }
     if o.guides && grown {
         let mut ex = extras;
         ex["guides"] = json!(true);
-        out.push(prim(g, format!("{name}_guides"), k, &g.points, &g.root_uv, &[], &[], o, ex));
+        out.push(prim(g, format!("{name}_guides"), k, &g.points, &g.root_uv, &[], &[], None, o, ex));
     }
     let summary = json!({"name": name, "written": if grown { coat.guides.len() } else { g.strands }, "stored": g.stored_strands(), "guides": g.strands,
         "points_per_strand": if o.points >= 2 { o.points } else { k }, "grown": grown});
@@ -322,7 +379,7 @@ mod tests {
     fn piece_writes_grown_strands_with_their_attributes() {
         let pts = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.1], [1.0, 0.0, 0.0], [1.0, 0.0, 0.1], [0.0, 1.0, 0.0], [0.0, 1.0, 0.1]];
         let g = Groom { tint_weight: 1.0, strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![[40, 10, 2, 0]], width: 0.0003, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![], twist: vec![], curl: Default::default() };
-        let (p, s) = piece(&g, "t", &Options { points: 3, ..Default::default() }, json!({}));
+        let (p, s) = piece(&g, "t", &Options { points: 3, ..Default::default() }, None, json!({}));
         assert_eq!(p.len(), 2);
         assert_eq!((s["written"].as_u64(), s["guides"].as_u64()), (Some(50), Some(3)));
         let c = &p[0];
@@ -332,7 +389,18 @@ mod tests {
         assert!(clump[..120].iter().all(|&x| x == 0.0) && clump[120..].iter().all(|&x| x == 1.0 || x == 2.0));
         assert!(clump[120..].contains(&2.0));
         // the cap
-        let (p, s) = piece(&g, "t", &Options { max_strands: 10, guides: false, ..Default::default() }, json!({}));
+        let (p, s) = piece(&g, "t", &Options { max_strands: 10, guides: false, ..Default::default() }, None, json!({}));
+        assert!(p[0].colour.is_empty());
+        // with colours: one per point, root to tip of the strand's variant
+        let pr = |a: [u8; 3], b: [u8; 3]| crate::hairtone::Preset { a, b, texture: 0, flag: false, values: Default::default() };
+        let hc = HairColour::Presets(Box::new([pr([255, 0, 0], [0, 0, 255]), pr([0, 255, 0], [0, 255, 0]), pr([0, 255, 0], [0, 255, 0]), pr([0, 255, 0], [0, 255, 0])]));
+        let (p, _) = piece(&g, "t", &Options { points: 3, guides: false, ..Default::default() }, Some(&hc), json!({}));
+        let c = &p[0];
+        assert_eq!(c.colour.len(), c.positions.len());
+        let var = &c.attrs.iter().find(|a| a.0 == "_VARIANT").unwrap().1;
+        let s0 = (0..c.positions.len() / 3).find(|&s| var[s * 3] == 0.0).unwrap();
+        assert_eq!(c.colour[s0 * 3], [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(c.colour[s0 * 3 + 2], [0.0, 0.0, 1.0, 1.0]);
         assert_eq!(p.len(), 1);
         assert!(s["written"].as_u64().unwrap() <= 11);
         let glb = crate::gltf::strands_glb("t", &p, json!({}));
