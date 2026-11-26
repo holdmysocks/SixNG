@@ -1614,6 +1614,9 @@ impl App {
             if c.has("no-shadows") {
                 m3.no_shadows = true;
             }
+            if c.has("no-clouds") {
+                m3.clouds = false;
+            }
             if c.has("no-placed-lights") {
                 m3.placed_lights = false;
             }

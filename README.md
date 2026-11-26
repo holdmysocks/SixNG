@@ -1217,6 +1217,24 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   models smaller than three of their texels. Models and map cells cast (opaque and cut-out surfaces);
   skinned, see-through and decal surfaces do not. Only what the camera
   draws casts: a caster just outside the view leaves no shadow.
+- **Clouds** (HDR map): one cumulus layer between the timecycle's
+  `local_atmosphere_cloud_height` and `_height_top` (200 and 1500 m). Its
+  cover is a drifting noise field (drift from
+  `local_atmosphere_cloud_wind_velocity_scale`), thresholded by the
+  weather's cloud cover; the sky and every surface behind the layer are
+  seen through it, and its shadow moves over the ground. A cloud has a
+  dome-shaped top whose height follows its cover and a base that rises
+  where it thins, and is sampled along the whole ray through the layer
+  (8 to 48 samples for the sky, at most 10 for the ground behind the
+  layer), the step growing with the distance (120 m plus 4 % of the
+  distance, more where the samples would not reach the end) from a
+  start set per pixel by interleaved gradient noise with a little white
+  noise (no slices; less grain); a cloud thins out at its rim. A cloud is lit by
+  the sun or moon through the cloud above it (forward-peaked) and by the
+  sky. Our choices: the noise (2.5 km features), the extinction (0.004 per
+  m at full density) and the drift speed (12 m/s at scale 1); the game's
+  cloud map and noise textures are not used. `--no-clouds`, or the
+  **clouds** checkbox, turns them off.
 - **Terrain ground** (HDR map): the baked map tiles hold only a colour by
   height with their own hill shading (the bake's terrain layer), and cells
   the bake left out are filled flat green from the game's height map. The
@@ -1395,7 +1413,7 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   (they showed as floating black boxes); the model viewer still shows them.
 
 Map 3D screenshots: `--tab map3d --center X,Y --height H --yaw DEG --pitch
-DEG [--quality low|medium|high|ultra] [--detail 0-1] [--tod H] [--weather W] [--no-shadows] [--no-placed-lights] [--lights]
+DEG [--quality low|medium|high|ultra] [--detail 0-1] [--tod H] [--weather W] [--no-shadows] [--no-clouds] [--no-placed-lights] [--lights]
 [--roads] [--no-terrain] [--fog F] [--max-tex PX] [--no-textures]
 [--no-hd-fallback] [--kinds a,b] [--lods a,b] [--ram-cap GB]
 [--no-windows] [--no-decal-bias] [--show-proxies] [--fly X,Y,H,SECONDS]

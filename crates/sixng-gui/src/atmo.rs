@@ -42,8 +42,16 @@ const MOON_LUX: f32 = 0.25;
 /// Star and air-glow luminance (cd/m2) at a timecycle intensity of 1.
 const K_STAR: f32 = 100.0;
 const K_GLOW: f32 = 0.002;
-/// Share of the direct light that full cloud cover takes away (no clouds are drawn yet).
-const CLOUD_DIM: f32 = 0.85;
+/// Share of the direct light that full cloud cover takes away besides the
+/// drawn clouds' shadows (the haze under and between them).
+const CLOUD_DIM: f32 = 0.35;
+/// Cumulus extinction per m at full density (our choice: a 1 km deep core
+/// is opaque, its thin edges are not).
+const CLOUD_SIGMA: f32 = 0.004;
+/// Feature size of the cloud cover (m).
+const CLOUD_SCALE: f32 = 2500.0;
+/// Wind speed that moves the clouds at a wind velocity scale of 1 (m/s).
+const CLOUD_WIND: f32 = 12.0;
 /// Depth of the aerial-perspective volume (km) near the ground; from
 /// higher up it reaches the horizon (`ap_depth`).
 const AP_DEPTH: f32 = 40.0;
@@ -95,6 +103,11 @@ pub struct SceneU {
     pub water3: [f32; 4],
     /// Fresnel rescale, its min and max; w time (s) for the waves.
     pub water4: [f32; 4],
+    /// Clouds: cover (0 none to 1 overcast), base and top of the cumulus
+    /// layer (world y, m), extinction per m at full density.
+    pub cloud0: [f32; 4],
+    /// Clouds: drift (m/s, map x and world z), w feature size (m).
+    pub cloud1: [f32; 4],
 }
 
 /// Scale from the timecycle's `water_clip_*` scattering and extinction
@@ -196,6 +209,11 @@ impl Sky {
             g("local_atmosphere_fog_height", 0.0),
             g("local_atmosphere_haze_phase_anisotropy", 0.6).clamp(-0.95, 0.95),
         ];
+        let base = g("local_atmosphere_cloud_height", 200.0).max(0.0);
+        let top = g("local_atmosphere_cloud_height_top", 1500.0).max(base + 50.0);
+        u.cloud0 = [cloud, base, top, CLOUD_SIGMA];
+        let wind = CLOUD_WIND * g("local_atmosphere_cloud_wind_velocity_scale", 0.5);
+        u.cloud1 = [wind * 0.8, wind * 0.6, 0.0, CLOUD_SCALE];
         u.fog1 = [
             g("local_atmosphere_fog_density_layer_1", 0.0).max(0.0),
             g("local_atmosphere_fog_falloff_layer_1", 50.0),
@@ -957,7 +975,7 @@ mod tests {
     #[test]
     fn scene_layout() {
         // 20 vec4, flags, a matrix, the camera
-        assert_eq!(std::mem::size_of::<super::SceneU>(), 21 * 16 + 64 + 16 + 5 * 16);
+        assert_eq!(std::mem::size_of::<super::SceneU>(), 21 * 16 + 64 + 16 + 7 * 16);
     }
 
     #[test]
