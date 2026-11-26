@@ -1380,14 +1380,24 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   model yet (unresolved archetype hashes; about 88 % around downtown), so
   large HD models stay visible out to 1.75× the HD distance and the LOD
   level is skipped. SLOD placements mostly carry a placeholder unit-cube
-  bbox, so they are never culled by screen size.
+  bbox, so they are never culled by screen size. Water-plant tiles (`*_waterveg`) are left out
+  of this and keep the game's own LOD distance (130 m): kept out to about
+  1 km they drew as flat green squares and diamond patterns over the
+  fields (since 2026-11-26). The HD ground tiles beside them have the same
+  size and almost the same LOD distance, so they are told apart by name.
 - **Coverage fallbacks** (no holes near the camera): a SLOD placement (or
   a LOD with HD fallback off) with nothing finer to hand over to (no LOD
   link, or children that all lack a model) keeps drawing nearer than its
   own band, but only on pixels no real surface has covered. Real surfaces write a stencil
   mark as they draw; the fallbacks draw after them and only where the
   mark is missing (far-field terrain, ocean or sky), with back faces
-  culled so a coarse block the camera is inside stays invisible. Before,
+  culled so a coarse block the camera is inside stays invisible. Since
+  2026-11-26 an unlinked SLOD3 or SLOD4 tile fills in only one band
+  nearer than its own (SLOD4 from about 7.7 km, SLOD3 from about 4.4 km
+  at full detail): these tiles span kilometres, and nearer the camera
+  their flat ground patches and water pieces covered the terrain as
+  hard-edged green squares and diamond-tiled water. The finer levels
+  still fill in all the way to the camera. Before,
   such areas showed flat far-field terrain next to the camera while the
   same LODs farther away were drawn. Needs the 32-bit depth + stencil
   format (most desktop GPUs); without it the fallbacks draw plainly.

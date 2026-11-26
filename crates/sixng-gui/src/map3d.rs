@@ -164,6 +164,27 @@ impl Detail {
     }
 }
 
+/// Water-plant tiles (`*_waterveg`): flat beds of reed and lily cards
+/// that the game draws only out to their own LOD distance (130 m), with
+/// coarser water-plant SLODs beyond. Unlinked, they keep that distance
+/// instead of the HD fallback's longer one; kept out to about 1 km they
+/// drew as flat green squares and diamond patterns over the fields. (The
+/// HD ground tiles next to them have the same size and almost the same
+/// LOD distance, so only the name tells them apart.)
+pub fn own_lod_only(name: &str) -> bool {
+    name.ends_with("_waterveg")
+}
+
+/// Nearest distance an unlinked LOD of level `l` fills in at as a coverage
+/// fallback. SLOD3 and SLOD4 tiles (levels 4 and 5) cover kilometres with
+/// flat ground patches and water pieces that the terrain and the finer
+/// levels already draw near the camera, so they fill in only one band
+/// nearer than their own (from the inner edge of the band two levels
+/// finer); the finer levels fill in all the way to the camera.
+pub fn fb_floor(radii: &[f32; 6], l: usize) -> f32 {
+    if l >= 4 { radii[l - 2] * 0.92 } else { 0.0 }
+}
+
 pub struct Auto {
     pub screenshot: Option<PathBuf>,
     pub exit: bool,
@@ -1013,7 +1034,9 @@ impl Map3D {
         let band = |e: &EntRec, rad: f32| -> (f32, f32) {
             let l = e.lod.min(5) as usize;
             let lo_r = if l == 0 { 0.0 } else { d.radii[l - 1] * 0.92 };
-            let hi_r = if l == 0 && d.hd_fallback && rad >= 10.0 {
+            let hi_r = if l == 0 && e.lod_dist > 0.0 && own_lod_only(data.name(e.name)) {
+                (e.lod_dist * k).min(d.radii[0])
+            } else if l == 0 && d.hd_fallback && rad >= 10.0 {
                 d.radii[1].min(d.radii[0] * 1.75)
             } else {
                 d.radii[l]
@@ -1163,7 +1186,7 @@ impl Map3D {
                     return 2;
                 }
                 if dist < lo_r / hy {
-                    return if l >= 1 { 3 } else { 1 };
+                    return if l >= 1 && dist >= fb_floor(&d.radii, l) / hy { 3 } else { 1 };
                 }
                 0
             }
