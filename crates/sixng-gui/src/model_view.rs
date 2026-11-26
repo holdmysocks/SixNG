@@ -5188,6 +5188,25 @@ fn split_parts(q: &str) -> (&str, Option<Vec<u64>>) {
 /// Export and merge a set of parts; returns the model (None if none loaded),
 /// the first part's LOD files, the loaded names and the errors. A model
 /// passed in (an animal root) has its placeholder geometry replaced.
+/// The round pieces of a character's body bound (`fragphys::body_pieces`)
+/// placed on the model's bind pose, in RAGE model space (Z-up). The joints
+/// are the game's bone frames turned to Y-up (C M C^T), so the game frame
+/// is C^T W C.
+fn body_tapers(a: &sixng_core::game::ArchiveInfo, entries: &[sixng_core::scan::Entry], name: &str, joints: &[glb::Joint]) -> Vec<sixng_core::groom::Taper> {
+    let Some(e) = entries.iter().find(|e| e.rtype.as_deref() == Some("ft") && e.name.as_deref() == Some(name)) else { return Vec::new() };
+    let Ok(r) = sixng_core::resource::Resource::load(&a.path, e) else { return Vec::new() };
+    let c = Mat4::from_cols_array(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+    let bone: HashMap<u32, Mat4> = joints.iter().map(|j| (sixng_core::meta7a::joaat(&j.name), c.transpose() * Mat4::from_cols_array(&j.ibm).inverse() * c)).collect();
+    sixng_core::fragphys::body_pieces(&r)
+        .into_iter()
+        .filter_map(|p| {
+            let m = *bone.get(&p.bone_hash)? * Mat4::from_cols_array(&p.local);
+            let h = p.length / 2.0;
+            Some(sixng_core::groom::Taper { a: m.transform_point3(Vec3::new(0.0, h, 0.0)).into(), b: m.transform_point3(Vec3::new(0.0, -h, 0.0)).into(), ra: p.r_pos, rb: p.r_neg })
+        })
+        .collect()
+}
+
 fn load_parts(
     a: &sixng_core::game::ArchiveInfo,
     parts: &[&sixng_core::scan::Entry],
@@ -7143,14 +7162,28 @@ fn load_query_sel(
                 l.hat = Some(Arc::new(sixng_core::groom::Shell::new([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, top - 0.10], &hat, &head).with_lining(hat_tris)));
                 l.notes.push("Hat: the scalp hair is pressed under the hat's lining (strand points beyond it are pulled in to 3 mm under it), so the hair does not come through the hat; an opening the hat encloses (over a cap's strap) counts as closed. A stand-in, not the game's method: the outfit asks for the plain hair, and no stored rule says how the game keeps it under the hat.".to_string());
             }
-            // The style pass is damped near the head, body and garments
-            // (hats press the hair on their own; strand and card hair are
-            // not colliders).
+            // The style pass is damped near the body bound's pieces (head,
+            // neck, shoulders, chest), as the game does; without one, near
+            // the head, body and garments (hats press the hair on their
+            // own; strand and card hair are not colliders).
             if !l.hair.is_empty() {
-                let hairy = ["hair", "brows", "beard", "lashes", "body hair", "eyes", "eyecaps", "teeth", "teeth accessory"];
-                let pts: Vec<[f32; 3]> = skin.iter().filter(|(n, _)| !l.hats.contains(&n.to_ascii_lowercase()) && !hairy.contains(&sixng_core::pedlook::slot_of(&n.to_ascii_lowercase()).as_str())).flat_map(|(_, p)| p.iter().copied()).collect();
-                if !pts.is_empty() {
-                    l.collide = Some(Arc::new(sixng_core::groom::Colliders::new(&pts)));
+                let rig = |k: &str| parts.iter().any(|p| p.name.as_deref().is_some_and(|n| n.contains(k)));
+                let bound = if rig("_fr1_") { Some("defaultfemale_fr1_000_bounds") } else if rig("_mr1_") { Some("defaultmale_mr1_000_bounds") } else { None };
+                let shapes = bound.map(|b| body_tapers(&a, &ix.entries, b, &model.joints)).unwrap_or_default();
+                if std::env::var("SIXNG_DEBUG_HAIR").is_ok() {
+                    for t in &shapes {
+                        eprintln!("body piece {:?} {:?} r {:.3} {:.3}", t.a, t.b, t.ra, t.rb);
+                    }
+                }
+                if !shapes.is_empty() {
+                    l.notes.push(format!("Hair styling is damped near the {} pieces of the body bound ({}), as the game does. Garment bounds are not used.", shapes.len(), bound.unwrap_or_default()));
+                    l.collide = Some(Arc::new(sixng_core::groom::Colliders::shapes(shapes)));
+                } else {
+                    let hairy = ["hair", "brows", "beard", "lashes", "body hair", "eyes", "eyecaps", "teeth", "teeth accessory"];
+                    let pts: Vec<[f32; 3]> = skin.iter().filter(|(n, _)| !l.hats.contains(&n.to_ascii_lowercase()) && !hairy.contains(&sixng_core::pedlook::slot_of(&n.to_ascii_lowercase()).as_str())).flat_map(|(_, p)| p.iter().copied()).collect();
+                    if !pts.is_empty() {
+                        l.collide = Some(Arc::new(sixng_core::groom::Colliders::new(&pts)));
+                    }
                 }
             }
             // Strand roots of an inferred link must lie on this character:
