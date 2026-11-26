@@ -1227,8 +1227,165 @@ fn look_uncached(game_root: &Path, a: &ArchiveInfo, ix: &ArchiveIndex, model: &s
     if let Some(l) = look_by_head_shape(t, a, ix, model) {
         return Ok(l);
     }
-    // no outfit data at all (cutscene-only models): its own parts
-    own_look(a, ix, model).ok_or_else(|| last_err.unwrap_or_else(|| format!("{model} is not in the game's outfit list, and no wardrobe names its head")))
+    // no outfit data at all (cutscene-only models): its own parts, or for a
+    // head with nothing to wear, stand-in clothes
+    own_look(a, ix, model)
+        .or_else(|| look_stand_in(t, a, ix, model))
+        .ok_or_else(|| last_err.unwrap_or_else(|| format!("{model} is not in the game's outfit list, and no wardrobe names its head")))
+}
+
+/// Stand-in clothes for a character that is only a head (`cs_blair`,
+/// `cs_vern`): nothing in the files says what it wears, so it is shown in
+/// the outfits of the listed model whose head is nearest in shape, among
+/// the heads of the same fit and ethnicity code (and the same age letter,
+/// `_m` / `_o` / `_y` / `_k`, when there are enough), crowd heads included.
+/// The character keeps its own head, eyes, hair and other parts of its own
+/// (Connie's bandana, Mischa's piercing), each in place of the stand-in's
+/// part of the same slot. The note says it is a stand-in.
+fn look_stand_in(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Option<Look> {
+    let drs = crate::outfit::dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
+        let n = e.name.as_ref()?.to_ascii_lowercase();
+        (item_word(&n) == "head" && !n.contains("_eye") && !n.contains("_earring")).then_some((n, e))
+    }));
+    let own_p = format!("{model}_head_");
+    let Some((own_name, own_e)) = drs.iter().find(|(n, _)| n.starts_with(&own_p)) else {
+        return look_stand_in_hair(t, a, ix, model);
+    };
+    // "head_fr1_lat_" and the age letter after the number
+    let tail = &own_name[own_name.rfind("head_")?..];
+    let seg: Vec<&str> = tail.split('_').collect();
+    let code = format!("{}_{}_{}_", seg.first()?, seg.get(1)?, seg.get(2)?);
+    let age = seg.get(4).copied().unwrap_or("");
+    let age_of = |n: &str| n.rfind("head_").and_then(|i| n[i..].split('_').nth(4).map(str::to_string)).unwrap_or_default();
+    let listed = |n: &String| t.heads.contains_key(&joaat(n)) || t.heads.contains_key(&joaat(n.trim_end_matches("_full")));
+    let mut cands: Vec<(&String, &&crate::scan::Entry)> = drs.iter().filter(|(n, _)| n.contains(&code) && !n.starts_with(&own_p) && listed(n)).collect();
+    if cands.iter().filter(|(n, _)| age_of(n) == age).count() >= 5 {
+        cands.retain(|(n, _)| age_of(n) == age);
+    }
+    let own = mesh_points(a, own_e)?;
+    let own: Vec<[f32; 3]> = own.into_iter().step_by(5).collect();
+    let mut dist: Vec<(f32, &String)> = cands
+        .par_iter()
+        .filter_map(|(n, e)| {
+            let p: Vec<[f32; 3]> = mesh_points(a, e)?.into_iter().step_by(2).collect();
+            if p.len() < 1000 {
+                return None;
+            }
+            let sum: f32 = own.iter().map(|q| p.iter().map(|r| (q[0] - r[0]).powi(2) + (q[1] - r[1]).powi(2) + (q[2] - r[2]).powi(2)).fold(f32::MAX, f32::min).sqrt()).sum();
+            Some((sum / own.len() as f32, *n))
+        })
+        .collect();
+    dist.sort_by(|x, y| x.0.total_cmp(&y.0));
+    // the character's own parts besides the head: eyes, hair, accessories
+    let own_parts: Vec<String> = crate::outfit::outfit_options(ix, model).into_iter().map(|o| o.name).filter(|n| n != own_name && !n.contains("_eyecap")).collect();
+    let own_eyes = own_parts.iter().find(|n| n.starts_with(&own_p) && n.contains("_eyes")).cloned();
+    // one per slot, the first in name order (a hair has `_m` / `_p` forms)
+    let mut extras: Vec<&String> = Vec::new();
+    for n in own_parts.iter().filter(|n| !n.starts_with(&own_p)) {
+        if !extras.iter().any(|x| slot_of(x) == slot_of(n)) {
+            extras.push(n);
+        }
+    }
+    for (d, head) in &dist {
+        // the listed models whose wardrobe names this head
+        let res: Vec<u64> = [head.as_str(), head.trim_end_matches("_full")].iter().flat_map(|n| t.heads.get(&joaat(n)).cloned().unwrap_or_default()).collect();
+        // a model with everyday clothes (not only swimwear, diving gear or nothing)
+        let Some(mut l) = t.by_model.values().filter(|r| res.contains(&r.resource)).find_map(|row| look_row(t, a, ix, model, row, false).ok().filter(|l| l.outfits.iter().any(everyday))) else { continue };
+        // everyday outfits first, of those the ones that wear this head
+        l.outfits.sort_by_key(|o| (!everyday(o), !o.parts.iter().any(|p| &p.drawable == *head)));
+        for o in &mut l.outfits {
+            for p in &mut o.parts {
+                if p.slot == "head" {
+                    p.drawable = own_name.clone();
+                    p.skins.clear();
+                    p.found_by = "own";
+                } else if p.slot == "eyes" {
+                    if let Some(e) = &own_eyes {
+                        p.drawable = e.clone();
+                        p.skins.clear();
+                        p.found_by = "own";
+                    }
+                }
+            }
+            for x in &extras {
+                let slot = slot_of(x);
+                let strands = is_strand_word(item_word(x));
+                o.parts.retain(|p| p.slot != slot);
+                o.parts.push(LookPart { strands, slot, drawable: (*x).clone(), item: String::new(), guid: strands.then(|| format!("{:016x}", crate::meta7a::asset_id(x))), tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by: "own", category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, state_guids: vec![] });
+            }
+        }
+        l.other_variations.clear();
+        let other = crate::outfit::outfit_prefix(head).unwrap_or_else(|| head.to_string());
+        let who = t.by_model.iter().find(|(_, r)| r.resource == l_resource(&l)).map(|(h, _)| model_names(&crate::export::game_root(a)).ok().and_then(|m| m.names.get(h).cloned()).unwrap_or_else(|| format!("ped_0x{h:08x}")));
+        l.note = Some(format!(
+            "Stand-in clothes: the game files give {model} only a head, and nothing links it to an outfit. It is shown in the outfits of {} (whose head {other} is nearest in shape, {:.1} mm mean distance), with its own head{}. Not the character's real clothes.",
+            who.unwrap_or_else(|| "the model".into()),
+            d * 1000.0,
+            if extras.is_empty() { String::new() } else { format!(" and parts ({})", extras.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")) }
+        ));
+        l.model = model.to_string();
+        return Some(l);
+    }
+    None
+}
+
+/// Stand-in for a character that is only a hair (`cs_byron_dugal`: a
+/// mohawk): the first listed model of the hair's fit (in model hash order)
+/// with an everyday outfit that wears a hair of the same item word
+/// (`hairmohawk`), or failing that the first with an everyday outfit. That
+/// model's outfits and head, with this character's own hair in place of
+/// the model's.
+fn look_stand_in_hair(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Option<Look> {
+    let own: Vec<String> = crate::outfit::outfit_options(ix, model).into_iter().map(|o| o.name).collect();
+    let hair = own.iter().find(|n| slot_of(n) == "hair")?.clone();
+    let fit = hair.split('_').find(|x| crate::outfit::is_fit(x))?.to_string();
+    let word = item_word(&hair).to_string();
+    let wears = |o: &Outfit| o.parts.iter().any(|p| p.slot == "hair" && item_word(&p.drawable) == word);
+    let mut rows: Vec<(&u32, &ModelRow)> = t.by_model.iter().collect();
+    rows.sort_by_key(|(h, _)| **h);
+    let mut first: Option<(u32, Look)> = None;
+    let mut best: Option<(u32, Look)> = None;
+    for (h, row) in rows {
+        let Ok(l) = look_row(t, a, ix, model, row, false) else { continue };
+        if l.fit.as_deref() != Some(fit.as_str()) || !l.outfits.iter().any(everyday) {
+            continue;
+        }
+        if l.outfits.iter().any(|o| everyday(o) && wears(o)) {
+            best = Some((*h, l));
+            break;
+        }
+        if first.is_none() {
+            first = Some((*h, l));
+        }
+    }
+    let matched = best.is_some();
+    let (h, mut l) = best.or(first)?;
+    l.outfits.sort_by_key(|o| (!everyday(o), !wears(o)));
+    for o in &mut l.outfits {
+        o.parts.retain(|p| p.slot != "hair");
+        o.parts.push(LookPart { strands: true, slot: "hair".into(), drawable: hair.clone(), item: String::new(), guid: Some(format!("{:016x}", crate::meta7a::asset_id(&hair))), tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by: "own", category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, state_guids: vec![] });
+    }
+    l.other_variations.clear();
+    let who = model_names(&crate::export::game_root(a)).ok().and_then(|m| m.names.get(&h).cloned()).unwrap_or_else(|| format!("ped_0x{h:08x}"));
+    l.note = Some(format!(
+        "Stand-in: the game files give {model} only a hair ({hair}), no head, and nothing links it to an outfit. It is shown as {who}{}, with its own hair. Not the character's real head or clothes.",
+        if matched { format!(", a model that wears a {word} hair too") } else { String::new() }
+    ));
+    l.model = model.to_string();
+    Some(l)
+}
+
+/// An outfit of everyday clothes: a top (or outer layer) and a bottom, no
+/// mask, no swimwear (`undies swimming`, `bra bikini`).
+fn everyday(o: &Outfit) -> bool {
+    let has = |s: &str| o.parts.iter().any(|p| p.slot == s);
+    let swim = o.parts.iter().any(|p| ["undiesswimming", "brabikini", "undiesgstring", "shortsswim", "swimsuit"].contains(&item_word(&p.drawable)));
+    (has("top") || has("outer")) && has("bottom") && !has("mask") && !swim
+}
+
+/// The wardrobe resource offset of a look (`packs.rpf@<hex>`).
+fn l_resource(l: &Look) -> u64 {
+    l.resource.rsplit('@').next().and_then(|h| u64::from_str_radix(h.split_whitespace().next().unwrap_or(""), 16).ok()).unwrap_or(0)
 }
 
 /// Vertex positions of a drawable's largest mesh.
