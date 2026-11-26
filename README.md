@@ -1198,6 +1198,8 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   the surface, light down to the bed and back up through the water's
   extinction). Inland water meshes (lakes, marsh, canals) are measured from
   their own surface, the sea from 4 m below 0 (where the beaches end).
+  Inland water (a surface above the sea's) has short fetch: its waves are
+  0.15 times as long and a third as steep.
   Where the water is shallower than 1.6 m it foams: bands that roll in
   towards the shallower water, broken up by noise along the shore.
   Our choices: the bed's reflectance (sand and mud, 0.22 0.20 0.15), the

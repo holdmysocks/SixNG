@@ -339,8 +339,13 @@ fn water_shade(p: vec3<f32>, fp: f32, surf: f32) -> vec3<f32> {
     let o = F.cam_pos.xyz;
     let dist = length(o - p);
     let v = (o - p) / max(dist, 1e-3);
-    let sn = sea_normal(p, fp);
+    // inland water (lakes, marsh, canals: a surface above the sea's) has
+    // short fetch: its waves are shorter and flatter than the open sea's
+    let inland = surf > SEA_LEVEL + 0.5;
+    let wscale = select(1.0, INLAND_WAVES, inland);
+    let sn = sea_normal(p / wscale, fp / wscale);
     var n = sn.xyz;
+    if (inland) { n = normalize(mix(vec3(0.0, 1.0, 0.0), n, INLAND_SLOPE)); }
     if (dot(n, v) < 0.02) { n = normalize(n + v * (0.02 - dot(n, v))); }
     let var_micro = (1.0 - WAVE_SHARE) * max(S.water1.w, 0.003) + sn.w;
     let a = clamp(sqrt(2.0 * var_micro) + S.water3.w, SEA_MIN_ROUGH, 0.8);
@@ -397,6 +402,10 @@ fn water_shade(p: vec3<f32>, fp: f32, surf: f32) -> vec3<f32> {
     let water = fr * refl + glint + (1.0 - fr) * body;
     return mix(water, FOAM_ALBEDO * e_down / PI, foam * 0.85);
 }
+
+// Inland water's waves against the sea's: length and slope (our choice).
+const INLAND_WAVES: f32 = 0.15;
+const INLAND_SLOPE: f32 = 0.35;
 
 // Depth (m) under which the water foams, and the foam's reflectance (our
 // choices).
