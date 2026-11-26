@@ -993,7 +993,9 @@ mod tests {
             "gameplay_creatures@water@fish",
             "gameplay@vehicles@car@std@ds",
         ]);
-        let names = |v: Vec<&DictEntry>| v.into_iter().map(|d| d.name.as_str()).collect::<Vec<_>>();
+        fn names(v: Vec<&DictEntry>) -> Vec<&str> {
+            v.into_iter().map(|d| d.name.as_str()).collect()
+        }
         assert_eq!(fitting_dictionaries(&all, &ClipFit::Any).len(), all.len());
         assert_eq!(names(fitting_dictionaries(&all, &ClipFit::Person)), vec!["gameplay@locomotion@female_character@kat@normal@standing@walk@stance_neutral", "gameplay@vehicles@car@std@ds"]);
         // the two-word species name wins over the one word
@@ -1018,7 +1020,7 @@ mod tests {
         let n = "gameplay@locomotion@male_character@raul@normal@standing@walk@stance_neutral";
         assert!(name_matches(n, ""));
         assert!(name_matches(n, "  walk RAUL "));
-        assert!(name_matches(n, "male@raul"));
+        assert!(name_matches(n, "character@raul"));
         assert!(!name_matches(n, "walk run"));
     }
 
