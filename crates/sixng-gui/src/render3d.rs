@@ -918,16 +918,23 @@ fn tex_bc(
 
 impl Renderer3D {
     pub fn new(rs: &egui_wgpu::RenderState) -> Self {
-        Self::new_with(rs, false)
+        Self::new_with(rs, false, false)
+    }
+
+    /// The model viewer's renderer: as `new`, with the sun shadow map on
+    /// (SIXNG_SHADOWS=0 turns it off).
+    pub fn new_viewer(rs: &egui_wgpu::RenderState) -> Self {
+        Self::new_with(rs, false, true)
     }
 
     /// The 3D map's renderer: HDR frame with the game's sky, light and
     /// exposure (atmo.rs), tone mapped for display.
     pub fn new_map(rs: &egui_wgpu::RenderState) -> Self {
-        Self::new_with(rs, true)
+        Self::new_with(rs, true, false)
     }
 
-    fn new_with(rs: &egui_wgpu::RenderState, hdr: bool) -> Self {
+    /// `sun_default`: the sun shadow map is on unless SIXNG_SHADOWS says otherwise.
+    fn new_with(rs: &egui_wgpu::RenderState, hdr: bool, sun_default: bool) -> Self {
         let device = &rs.device;
         let color_fmt = if hdr { crate::atmo::HDR_FMT } else { COLOR_FMT };
         let shadow = crate::shadow::ShadowGpu::new(device, hdr, std::mem::size_of::<FrameU>() as u64);
@@ -1374,7 +1381,7 @@ impl Renderer3D {
             }),
         };
         let hair_luts = hair_blank(device, &rs.queue);
-        // The sun shadow map (SIXNG_SHADOWS=1, research: one map over the models, strands drawn into it as the
+        // The sun shadow map (on in the model viewer, elsewhere with SIXNG_SHADOWS=1; SIXNG_SHADOWS=0 turns it off; one map over the models, strands drawn into it as the
         // game draws its strands into its shadow maps; the game's own cascades, bias and filter are not read).
         let shadow_tex = |size: u32| {
             device
@@ -1397,7 +1404,7 @@ impl Renderer3D {
             compare: Some(wgpu::CompareFunction::LessEqual),
             ..Default::default()
         });
-        let sun_maps = std::env::var("SIXNG_SHADOWS").is_ok();
+        let sun_maps = std::env::var("SIXNG_SHADOWS").map_or(sun_default, |v| v != "0");
         let sun_map = (shadow_tex(if sun_maps { SHADOW_SIZE } else { 1 }), shadow_sampler.clone(), shadow_tex(if sun_maps { CAM_DEPTH_SIZE } else { 1 }));
         let shadow_ub = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("shadow frame ub"),

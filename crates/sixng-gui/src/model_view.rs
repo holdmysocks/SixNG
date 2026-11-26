@@ -1234,7 +1234,7 @@ impl ModelView {
             self.hair.loading = false;
             match r {
                 Ok(models) => {
-                    let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+                    let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
                     // strands are lit with the game's hair tables
                     if let Some(note) = ren.load_hair_luts(rs, std::path::Path::new(&self.game)) {
                         eprintln!("[hair] {note}");
@@ -2446,7 +2446,7 @@ impl ModelView {
                         .as_ref()
                         .map(|o| o.source == l.source)
                         .unwrap_or(false);
-                let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+                let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
                 let mut g = ren.upload(rs, &l.model, &[]);
                 ren.ensure_edges(rs, &mut g, &l.model);
                 if !keep_cam {
@@ -3002,7 +3002,7 @@ impl ModelView {
     fn update_brakes(&mut self, rs: &egui_wgpu::RenderState, ctx: &egui::Context) {
         if let Some(ls) = self.brake_pending.lock().unwrap().take() {
             self.brake_loading = false;
-            let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+            let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
             self.brakes = ls.iter().map(|(disc, on, l)| (*disc, *on, ren.upload(rs, &l.model, &[]))).collect();
         }
         let spots: Vec<(String, Vec3, f32)> = self
@@ -3276,7 +3276,7 @@ impl ModelView {
             }
         }
         self.part_look_done = Some((l.model.path.clone(), idx));
-        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
         let mut g = ren.upload(rs, &l.model, &[]);
         ren.ensure_edges(rs, &mut g, &l.model);
         self.gpu = Some(g);
@@ -3308,7 +3308,7 @@ impl ModelView {
             return;
         }
         let (Some(l), Some(g)) = (&self.loaded, self.gpu.as_mut()) else { return };
-        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
         let parts: Vec<String> = l.info["assembled_from"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
         let key = crate::livery::vehicle_key(&crate::vehicle_db::model_key(&l.source));
         self.livery.sync(rs, ren, g, &l.model, &key, &parts, Path::new(&self.game), Path::new(&self.work), &cache);
@@ -3434,7 +3434,7 @@ impl ModelView {
             }
             let c = self.rim_colour;
             self.rim_applied = c;
-            let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+            let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
             self.wheels = self
                 .wheel_src
                 .iter()
@@ -4218,14 +4218,14 @@ impl ModelView {
         });
         let (under, top) = self.lines(&globals);
         let settled = self.idle_for_shot();
-        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
         if let Some(g) = &self.gpu {
             if !skin.is_empty() {
                 ren.set_joints(rs, g, &skin);
             }
         }
         self.update_hair(rs, &ctx);
-        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
         // an animal's fur is bound to its skin and takes the same joint matrices
         if self.hair.rig.is_some() && !skin.is_empty() {
             for g in &self.hair.gpu {
