@@ -1228,6 +1228,27 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   models smaller than three of their texels. Models and map cells cast (opaque and cut-out surfaces);
   skinned, see-through and decal surfaces do not. Only what the camera
   draws casts: a caster just outside the view leaves no shadow.
+- **Clouds** (HDR map): one cumulus layer between the timecycle's
+  `local_atmosphere_cloud_height` and `_height_top` (200 and 1500 m). Its
+  cover is a drifting noise field (drift from
+  `local_atmosphere_cloud_wind_velocity_scale`), thresholded by the
+  weather's cloud cover; the sky and every surface behind the layer are
+  seen through it, and its shadow moves over the ground. A cloud has a
+  dome-shaped top whose height follows its cover and a base that rises
+  where it thins, and is sampled along the whole ray through the layer
+  (8 to 48 samples for the sky, at most 10 for the ground behind the
+  layer), the step growing with the distance (120 m plus 4 % of the
+  distance, more where the samples would not reach the end) from a
+  start set per pixel by interleaved gradient noise with a little white
+  noise (no slices; less grain); a cloud thins out at its rim. A cloud is lit by
+  the sun or moon through the cloud above it (forward-peaked) and by the
+  sky. Our choices: the noise (2.5 km features), the extinction (0.004 per
+  m at full density) and the drift speed (12 m/s at scale 1); the noise
+  (four octaves of value noise) is baked once into a 2048² texture that
+  repeats every 80 km, so each cloud sample, and the clouds' shadow on
+  every lit surface, is one texture read. The game's cloud map and noise
+  textures are not used. `--no-clouds`, or the
+  **clouds** checkbox, turns them off.
 - **Terrain ground** (HDR map): the baked map tiles hold only a colour by
   height with their own hill shading (the bake's terrain layer), and cells
   the bake left out are filled flat green from the game's height map. The
@@ -1270,16 +1291,47 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   (wet sand, beaches). A water plane under the terrain reaches the
   horizon. Our choices: the scale from the timecycle's water
   units to coefficients per metre (0.03), the wind direction, and the
-  share of the slope drawn as waves (60 %). Not yet: shallow water over
-  the seabed, foam, shore waves, refraction and underwater fog.
+  share of the slope drawn as waves (60 %).
+  Where the game's water maps are loaded (the fog atlas's and the water
+  height map's whole-map fallbacks, read once and cached in
+  `<work>/cache/water_view_v1.bin`; this needs current indexes of
+  `levels` and `textures`, and an index from an older version is reported
+  on the console and the water stays as before), each place takes its own water: the
+  body colour from the fog atlas's scattering over extinction there, and
+  the bed shows through shallow water (the water height map's ground under
+  the surface, light down to the bed and back up through the water's
+  extinction). Inland water meshes (lakes, marsh, canals) are measured from
+  their own surface, the sea from 4 m below 0 (where the beaches end).
+  Inland water (a surface above the sea's) has short fetch: its waves are
+  0.15 times as long and a third as steep.
+  Where the sea is shallower than 1.6 m past its visible edge it foams: bands that roll in
+  towards the shallower water, broken up by noise along the shore. The
+  sea drawn on the terrain takes its depth from the terrain's own 8 m
+  heights (finer than the water height map's 16 m); where the water height
+  map has no height (it leaves out many coasts), the map's 8 m heights
+  give the seabed, so those beaches get shallows and surf too. It surfs along the
+  terrain's coastline (where its cells turn from land to sea) whatever the
+  depth data says. The sea plane and the placed water also measure their
+  height over the surface seen through them from the scene's depth (the
+  opaque surfaces are drawn first, then the blended ones read that
+  depth), so a beach model running down into the sea gets a line of foam
+  at the visible waterline and broken bands where it is under 0.5 m deep
+  (a few metres out on a gentle beach). Inland water does not
+  foam.
+  Our choices: the bed's reflectance (sand and mud, 0.22 0.20 0.15), the
+  sea's level, and the foam (depth, bands, 0.75 reflectance). Not yet: the
+  shoreline grid's wave placement, refraction and underwater fog.
 - **Map cells** (far placements merged per area): a placement more than
-  0.6× the HD distance from the camera can be drawn from its cell instead
-  of one by one. A cell holds one LOD level's placements in one square of
+  0.3× the HD distance from the camera can be drawn from its cell instead
+  of one by one (`SIXNG_CELLS_NEAR` sets another fraction). The cells are
+  built for 0.6×; drawing them from 0.3× showed no visible change
+  downtown from 60 m and took the frame there from 25 to 44 fps (draws
+  6,859 to 3,706: the CPU cost of a frame follows its draw count). A cell holds one LOD level's placements in one square of
   the map (128 m for HD, 256 m for LOD, 512–2048 m for SLOD1–4), merged
   into a few batches with one draw each:
   - geometry is placed in the cell, from the low drawable LOD where a model
     has one, and simplified by vertex clustering to about two pixels at
-    the nearest distance the cell draws it;
+    0.6× the HD distance;
   - base-colour textures go in at 64 px, in BC3 texture arrays;
   - each vertex carries its placement's index. The vertex shader checks
     that placement's own LOD distance range, so LOD hand-offs stay per
@@ -1406,7 +1458,7 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   (they showed as floating black boxes); the model viewer still shows them.
 
 Map 3D screenshots: `--tab map3d --center X,Y --height H --yaw DEG --pitch
-DEG [--quality low|medium|high|ultra] [--detail 0-1] [--tod H] [--weather W] [--no-shadows] [--no-placed-lights] [--lights]
+DEG [--quality low|medium|high|ultra] [--detail 0-1] [--tod H] [--weather W] [--no-shadows] [--no-clouds] [--no-placed-lights] [--lights]
 [--roads] [--no-terrain] [--fog F] [--max-tex PX] [--no-textures]
 [--no-hd-fallback] [--kinds a,b] [--lods a,b] [--ram-cap GB]
 [--no-windows] [--no-decal-bias] [--show-proxies] [--fly X,Y,H,SECONDS]

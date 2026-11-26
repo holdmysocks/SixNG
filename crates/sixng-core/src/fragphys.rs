@@ -481,6 +481,70 @@ pub const ROOT_FLAGS: &[(u32, &str, bool)] = &[
 
 /// Names of the set bits of group flag words `w`, and the bits left
 /// unnamed (as [word, bit]).
+/// One round piece of a character's body bound: the fragments
+/// `defaultfemale_fr1_000_bounds` and `defaultmale_mr1_000_bounds` (and the
+/// per-garment `char_bipedbounds_*`) hold a composite whose children sit
+/// on the ragdoll bones, one group per bone (group name = joaat of the bone
+/// name). Kind 2 is a tapered capsule along its local y: +0x70 f32 radius
+/// at the +y end, +0x74 f32 radius at the -y end (= the margin), +0x78 f32
+/// length of the segment between the two centres; its bbox y half extent
+/// is length / 2 + the larger radius on every piece checked. Kind 0 is a
+/// sphere of the margin's radius. The larger radius is at the hip end of
+/// the thigh pieces, which is +y. Boxes (hands) and kind 13 (feet) are
+/// left out.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BodyPiece {
+    /// joaat of the bone name (`SKEL_Head`).
+    pub bone_hash: u32,
+    /// The piece's frame in its bone's frame (column-major).
+    pub local: [f32; 16],
+    pub kind: u8,
+    /// Radius at local +y (at length / 2) and at -y.
+    pub r_pos: f32,
+    pub r_neg: f32,
+    pub length: f32,
+}
+
+/// The round pieces of a body bound fragment (`BodyPiece`).
+pub fn body_pieces(r: &Resource) -> Vec<BodyPiece> {
+    let Ok(f) = try_decode(r) else { return Vec::new() };
+    let n = r.sys.len();
+    let Some(arch) = r.sys_off(r.u64(0x10)) else { return Vec::new() };
+    let Some(comp) = r.sys_off(r.u64(arch + 0x20)).filter(|&b| b + 0xA0 <= n && r.sys[b + 0x10] == 6) else { return Vec::new() };
+    let Some(t) = r.sys_off(r.u64(comp + 0x78)).filter(|&t| t + 64 * f.children.len() <= n) else { return Vec::new() };
+    let Some(cp) = r.sys_off(r.u64(0x28)) else { return Vec::new() };
+    let mut out = Vec::new();
+    for c in f.children.iter().filter(|c| c.in_use) {
+        let Some(g) = f.groups.get(c.group as usize) else { continue };
+        let Ok(bone_hash) = u32::from_str_radix(&g.name_hash, 16) else { continue };
+        let Some(b) = r.sys_off(r.u64(cp + CHILD_SIZE * c.index + 0x30)).filter(|&b| b + 0x80 <= n) else { continue };
+        let kind = r.sys[b + 0x10];
+        let margin = r.f32(b + 0x2C);
+        let (r_pos, r_neg, length) = match kind {
+            0 => (margin, margin, 0.0),
+            2 => (r.f32(b + 0x70), r.f32(b + 0x74), r.f32(b + 0x78)),
+            _ => continue,
+        };
+        if ![r_pos, r_neg, length].iter().all(|v| v.is_finite() && *v >= 0.0 && *v < 2.0) {
+            continue;
+        }
+        let mut local = [0f32; 16];
+        for (j, v) in local.iter_mut().enumerate() {
+            *v = r.f32(t + 64 * c.index + 4 * j);
+        }
+        // stored with w = 0 in the last row
+        local[3] = 0.0;
+        local[7] = 0.0;
+        local[11] = 0.0;
+        local[15] = 1.0;
+        if !finite(&local) {
+            continue;
+        }
+        out.push(BodyPiece { bone_hash, local, kind, r_pos, r_neg, length });
+    }
+    out
+}
+
 pub fn group_flag_names(w: [u32; 2]) -> (Vec<&'static str>, Vec<[u32; 2]>) {
     let mut names = Vec::new();
     let mut rest = Vec::new();

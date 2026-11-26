@@ -463,6 +463,9 @@ struct Target {
     size: [u32; 2],
     msaa: wgpu::TextureView,
     depth: wgpu::TextureView,
+    /// The depth as the blended draws read it (between the opaque and the
+    /// blended pass).
+    scene_bg: wgpu::BindGroup,
     resolve: wgpu::Texture,
     resolve_view: wgpu::TextureView,
     /// HDR frame (the 3D map): the tone-mapped image that is shown and read back.
@@ -611,6 +614,8 @@ pub fn class_id(c: &str) -> u32 {
 pub struct Renderer3D {
     pipe_opaque: wgpu::RenderPipeline,
     pipe_blend: wgpu::RenderPipeline,
+    /// The blended draws' view of the scene depth (group 2).
+    bgl_scene: wgpu::BindGroupLayout,
     /// Decal-bucket materials: depth-biased toward the camera so coplanar
     /// overlays win against the surface under them.
     pipe_decal: wgpu::RenderPipeline,
@@ -1093,6 +1098,26 @@ impl Renderer3D {
             bind_group_layouts: &[Some(&bgl_frame), Some(&bgl_mat)],
             immediate_size: 0,
         });
+        // the blended draws also read the scene's depth (the water's depth
+        // over what lies under it)
+        let bgl_scene = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("scene depth"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: true,
+                },
+                count: None,
+            }],
+        });
+        let layout_blend = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mesh blend"),
+            bind_group_layouts: &[Some(&bgl_frame), Some(&bgl_mat), Some(&bgl_scene)],
+            immediate_size: 0,
+        });
         let layout_frame = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("frame only"),
             bind_group_layouts: &[Some(&bgl_frame)],
@@ -1288,9 +1313,9 @@ impl Renderer3D {
         );
         let pipe_blend = mk(
             "blend",
-            &layout,
+            &layout_blend,
             "vs_mesh",
-            "fs_mesh",
+            "fs_mesh_blend",
             &vbufs,
             wgpu::PrimitiveTopology::TriangleList,
             Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -1657,6 +1682,7 @@ impl Renderer3D {
             depth_fmt,
             pipe_opaque,
             pipe_blend,
+            bgl_scene,
             pipe_decal,
             pipe_decal_blend,
             decal_bias: true,
@@ -2393,8 +2419,24 @@ impl Renderer3D {
         let color_fmt = if self.hdr { crate::atmo::HDR_FMT } else { COLOR_FMT };
         let msaa = mk(MSAA, color_fmt, wgpu::TextureUsages::RENDER_ATTACHMENT)
             .create_view(&Default::default());
-        let depth = mk(MSAA, self.depth_fmt, wgpu::TextureUsages::RENDER_ATTACHMENT)
-            .create_view(&Default::default());
+        let depth_tex = mk(
+            MSAA,
+            self.depth_fmt,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        let depth = depth_tex.create_view(&Default::default());
+        let depth_read = depth_tex.create_view(&wgpu::TextureViewDescriptor {
+            aspect: wgpu::TextureAspect::DepthOnly,
+            ..Default::default()
+        });
+        let scene_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene depth"),
+            layout: &self.bgl_scene,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&depth_read),
+            }],
+        });
         let resolve = mk(
             1,
             color_fmt,
@@ -2440,6 +2482,7 @@ impl Renderer3D {
             size,
             msaa,
             depth,
+            scene_bg,
             resolve,
             resolve_view,
             display,
@@ -2790,6 +2833,12 @@ impl Renderer3D {
         self.atmo.reset = 3;
     }
 
+    /// Uploads the water maps (fog atlas and water height map) for the
+    /// map's water.
+    pub fn set_water_maps(&mut self, queue: &wgpu::Queue, m: &sixng_core::water::ViewMaps, ground: Option<&dyn Fn(f32, f32) -> Option<f32>>) {
+        self.atmo.set_water_maps(queue, m, ground);
+    }
+
     /// Uploads the placed lights near the camera for the HDR shading
     /// (lights.rs `pack`; an empty grid turns them off).
     pub fn set_lights(&self, queue: &wgpu::Queue, lights: &[crate::lights::GpuLight], grid: &[u32]) {
@@ -3022,7 +3071,7 @@ impl Renderer3D {
                 label: Some("viewer pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &t.msaa,
-                    resolve_target: Some(&t.resolve_view),
+                    resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -3036,14 +3085,15 @@ impl Renderer3D {
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &t.depth,
+                    // kept for the blended pass, which reads it
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(0.0),
-                        store: wgpu::StoreOp::Discard,
+                        store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: (self.depth_fmt == DEPTH_STENCIL_FMT).then_some(
                         wgpu::Operations {
                             load: wgpu::LoadOp::Clear(0),
-                            store: wgpu::StoreOp::Discard,
+                            store: wgpu::StoreOp::Store,
                         },
                     ),
                 }),
@@ -3176,6 +3226,30 @@ impl Renderer3D {
                     draws += 1;
                 }
             }
+            drop(pass);
+            // the blended pass: the depth is read only, so the blended draws
+            // can read it as a texture too (the water's depth over the scene
+            // under it); nothing from here on writes depth
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("viewer blended pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &t.msaa,
+                    resolve_target: Some(&t.resolve_view),
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &t.depth,
+                    depth_ops: None,
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
             // blended, back to front by mesh centre
             if look.mode == 0 {
                 let eye = cam.eye();
@@ -3194,6 +3268,7 @@ impl Renderer3D {
                 }
                 bl.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
                 pass.set_pipeline(&self.pipe_blend);
+                pass.set_bind_group(2, &t.scene_bg, &[]);
                 for (_, gm, me) in bl {
                     pass.set_bind_group(0, &gm.frame_bg, &[]);
                     pass.set_vertex_buffer(1, gm.instances.slice(..));
