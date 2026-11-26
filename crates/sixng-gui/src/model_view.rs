@@ -295,7 +295,7 @@ pub struct LookInfo {
     /// That preset's control values (`None` when it could not be read).
     pub body_preset: Option<BodyShape>,
     /// The body shape the outfit was loaded with.
-    pub body_used: BodyShape,
+    pub body_used: Option<BodyShape>,
     /// Strand-hair assets of the outfit shown: (slot, placeholder name, asset GUID).
     pub strands: Vec<(String, String, String)>,
     /// Their stored tints by slot: palette name hash and row of tint 0.
@@ -623,12 +623,27 @@ pub static HEAD_SKIN: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 /// (12 `gcweight*` -1..1, 12 `gcmuscle*` 0..1, `gcbutt` 0..1, `gcbreasts`
 /// -1..1), for the game's body-shape rig on the shared skeleton
 /// (`ExportOptions::body_shape`).
-pub type BodyShape = [f32; 26];
+pub type BodyShape = [f32; sixng_core::bodyshape::CONTROLS.len()];
 /// The neutral body shape (every control 0).
-pub const NEUTRAL_BODY: BodyShape = [0.0; 26];
+pub const NEUTRAL_BODY: BodyShape = [0.0; sixng_core::bodyshape::CONTROLS.len()];
 /// Index of `gcbutt` and `gcbreasts` in a `BodyShape`.
 const BODY_BUTT: usize = 24;
 const BODY_BREASTS: usize = 25;
+/// First of the further shape controls (breast height and spacing, chest
+/// height, cleavage, hips, belly roundness, head scale, biceps, triceps),
+/// shown under "Shape details".
+const BODY_DETAILS: usize = 26;
+
+/// Slider label of a shape control (`gcbreastheight` -> `breast height`).
+fn detail_label(name: &str) -> String {
+    let n = name.trim_start_matches("gc").trim_start_matches('_');
+    for (a, b) in [("breastheight", "breast height"), ("breastspacing", "breast spacing"), ("chestheight", "chest height"), ("bellyround", "belly roundness"), ("hipwidth", "hip width"), ("hipheight", "hip height"), ("headscale", "head scale"), ("musclebiceps", "biceps"), ("muscletriceps", "triceps"), ("plasticbreasts", "plastic breasts")] {
+        if n == a {
+            return b.to_string();
+        }
+    }
+    n.to_string()
+}
 /// Body shape the viewer exports outfit parts with.
 pub static BODY_SHAPE: Mutex<BodyShape> = Mutex::new(NEUTRAL_BODY);
 /// Set by `--body`: outfits keep that shape instead of their preset.
@@ -2103,6 +2118,17 @@ impl ModelView {
                 }
             });
         });
+        egui::CollapsingHeader::new("Shape details").id_salt("body_details").show(ui, |ui| {
+            egui::Grid::new("body_detail_grid").num_columns(2).show(ui, |ui| {
+                for k in BODY_DETAILS..shape.len() {
+                    let (name, _, neg) = sixng_core::bodyshape::CONTROLS[k];
+                    let lo = if neg.is_some() { -1.0 } else { 0.0 };
+                    ui.label(detail_label(name)).on_hover_text(format!("The game's {name} control ({lo}..1)."));
+                    released |= ui.add(egui::Slider::new(&mut shape[k], lo..=1.0)).drag_stopped();
+                    ui.end_row();
+                }
+            });
+        });
         ui.horizontal(|ui| {
             let preset = look.body_preset;
             if ui.add_enabled(preset.is_some(), egui::Button::new("Reset")).on_hover_text("Back to the outfit's own body-shape preset.").clicked() {
@@ -2506,7 +2532,7 @@ impl ModelView {
             Ok(l) => {
                 // the shape the outfit opened in (its preset): no reload for it
                 if let Some(li) = &l.look {
-                    self.body_shape_shown = li.body_used;
+                    self.body_shape_shown = li.body_used.unwrap_or(NEUTRAL_BODY);
                 }
                 let keep_cam = std::mem::take(&mut self.keep_cam_once)
                     || self
@@ -7479,7 +7505,7 @@ fn load_query_sel(
                     }
                 }
                 drop(last);
-                info.body_used = *BODY_SHAPE.lock().unwrap();
+                info.body_used = Some(*BODY_SHAPE.lock().unwrap());
                 if !o.unresolved.is_empty() {
                     info.notes.push(format!("{} item(s) of this outfit have no model: {}", o.unresolved.len(), o.unresolved.join(", ")));
                 }
