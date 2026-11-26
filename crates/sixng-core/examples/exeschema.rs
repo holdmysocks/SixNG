@@ -48,8 +48,21 @@ const TYPES: &[&str] = &[
     "s64", "u64", "f64",
 ];
 
+/// Types after rage's list, named from the meta files' own schemas (all
+/// archives, 1,294 shared structs):
+/// * 0x22: 8 bytes, file type 0x08, the `id` of entity and archetype
+///   definitions and `Entity` references: a 64-bit object id.
+/// * 0x23: 8 bytes at 4-byte offsets, file type 0x30 (`Scale`, `Pos`, `Min`):
+///   a two-float vector without SIMD padding.
+/// * 0x24: 16 bytes, stored as the files' vec4 type 0x34, always `Rotation`:
+///   a quaternion.
+///
+/// 0x25..0x27 do not occur in any meta file.
 fn type_name(t: u8) -> String {
     match t {
+        0x22 => "id64".into(),
+        0x23 => "vec2_8".into(),
+        0x24 => "quatv".into(),
         0x28 => "vec3_12".into(),
         _ => TYPES
             .get(t as usize)
