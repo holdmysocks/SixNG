@@ -801,6 +801,25 @@ fn wear_gamma(l: f32, g: f32) -> f32 {
     return pow(l, 100.0 / max(0.001, 100.0 * g * g));
 }
 
+// RGB to hue, saturation, value and back, as the game's paint shader does
+// for its colour step (epsilon 1e-10).
+fn rgb_to_hsv(c: vec3<f32>) -> vec3<f32> {
+    let mx = max(c.r, max(c.g, c.b));
+    let mn = min(c.r, min(c.g, c.b));
+    let d = mx - mn;
+    var h = 0.0;
+    if (d > 0.0) {
+        if (mx == c.r) { h = (c.g - c.b) / d; } else if (mx == c.g) { h = 2.0 + (c.b - c.r) / d; } else { h = 4.0 + (c.r - c.g) / d; }
+        h = fract(h / 6.0 + 1.0);
+    }
+    return vec3(h, d / (mx + 1.0e-10), mx);
+}
+
+fn hsv_to_rgb(c: vec3<f32>) -> vec3<f32> {
+    let k = clamp(abs(fract(c.x + vec3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, vec3(0.0), vec3(1.0));
+    return c.z * mix(vec3(1.0), k, c.y);
+}
+
 // One window of the game's W2 weight (the first wear layer's palette
 // weight): sat((x - start) / width x 255 / divisor), start, width and the
 // divisor byte as 0 to 1. A zero width or divisor is the game's infinite
@@ -1765,6 +1784,10 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         var dust_k1 = 0.0;
         var dust_k3 = 0.0;
         var dust_g = vec3(0.0);
+        // the dust mask's bleach driver (-1 to 1) and whether the game's
+        // colour step runs (the part's own wear data)
+        var dust_sgn = 0.0;
+        var tone_on = false;
         let id = floor(i.col.a * 255.0 + 0.5);
         // the primer's weight (layer B) and its roughness and metalness
         var w3 = 0.0;
@@ -1898,7 +1921,12 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
                     dust_k1 = clamp(f32((lo >> 0u) & 1u) * dr + f32((lo >> 3u) & 1u) * db + dg, 0.0, 1.0) * 10.0 * textureLoad(t_em, vec2(83, row), 0).a;
                     dust_k3 = clamp(f32((lo >> 2u) & 1u) * dr + f32((lo >> 5u) & 1u) * db + f32((hi >> 2u) & 1u) * dg, 0.0, 1.0);
                     dust_g = vec3(textureLoad(t_em, vec2(80, row), 0).a, textureLoad(t_em, vec2(81, row), 0).a, textureLoad(t_em, vec2(82, row), 0).a);
+                    // the bleach driver: the scratch channels with signed
+                    // gains (columns 84, 86) and the dust, not saturated
+                    let ga = (textureLoad(t_em, vec2(76, row), 0).a * i.col.g + textureLoad(t_em, vec2(77, row), 0).a) * t.g;
+                    dust_sgn = clamp((2.0 * textureLoad(t_em, vec2(84, row), 0).a - 1.0) * dr + ga + (2.0 * textureLoad(t_em, vec2(86, row), 0).a - 1.0) * db, -1.0, 1.0);
                 }
+                tone_on = M.tile.w > 1.5;
             } else {
                 let t = wear_threshold(wear_amt);
                 k = smoothstep(t, t + 0.08, m.g);
@@ -1915,6 +1943,40 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         // and weight, clear coat taken off the base paint
         rough = clamp(rough + dust_k3 * dot(dust_g, vec3(w0, w3, k)), 0.04, 1.0);
         coat.x = clamp(coat.x - dust_k1 * w0 * dust_g.x, 0.0, 1.0);
+        // The game's colour step: where the colour does not come from a
+        // palette row (1 - its palette weight: the first wear layer's W2,
+        // the primer, the base when it has a row, column 95), the layer
+        // detail texture's green below 0.5 darkens it by the albedo
+        // multiply and above 0.5 lightens it by the albedo screen, in HSV;
+        // the dust mask's bleach driver then screens it toward white by
+        // the sun bleach screen. The amounts are the surface's first layer's
+        // (columns 89 to 91, for the base and the primer) and second layer's
+        // (92 to 94, for the first wear layer), by weight. The game adds a
+        // detail term to the green's offset; it is not added here.
+        if (tone_on) {
+            let row = 768 + i32(id);
+            let a0 = vec3(textureLoad(t_em, vec2(89, row), 0).a, textureLoad(t_em, vec2(90, row), 0).a, textureLoad(t_em, vec2(91, row), 0).a);
+            let a2 = vec3(textureLoad(t_em, vec2(92, row), 0).a, textureLoad(t_em, vec2(93, row), 0).a, textureLoad(t_em, vec2(94, row), 0).a);
+            let amt = a2 * k + a0 * (w3 + w0);
+            let pal_w = clamp(k * w2 + w3 + w0 * textureLoad(t_em, vec2(95, row), 0).a, 0.0, 1.0);
+            let gr = (1.0 - pal_w) * 2.0 * (dt.g - 0.5);
+            var hsv = rgb_to_hsv(max(albedo, vec3(0.0)));
+            if (gr < 0.0) {
+                let f = 1.0 + gr * amt.y;
+                hsv.z *= f;
+                hsv.y = 1.0 - f * (1.0 - hsv.y);
+            } else if (gr > 0.0) {
+                let f = 1.0 - gr * amt.z;
+                hsv.z = 1.0 - (1.0 - hsv.z) * f;
+                hsv.y *= f;
+            }
+            if (dust_sgn != 0.0) {
+                let q = dust_sgn * dot(dust_g, vec3(w0, w3, k)) * amt.x;
+                hsv.z = 1.0 - (1.0 - q) * (1.0 - hsv.z);
+                hsv.y *= 1.0 - q;
+            }
+            albedo = hsv_to_rgb(clamp(hsv, vec3(0.0), vec3(1.0)));
+        }
         metal = metal * w0 + m1 * k + p_metal * w3;
         pearl = pearl * w0;
     }
