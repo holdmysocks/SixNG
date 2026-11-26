@@ -313,6 +313,12 @@ enum Cmd {
         /// Only these groom offsets (hex, comma-separated).
         #[arg(long, value_delimiter = ',')]
         only: Vec<String>,
+        /// With --full: the model GLB the grooms sit on (`outfit` writes
+        /// one; or a head drawable exported on its own). Each grown groom's
+        /// mesh then names the head UV set (TEXCOORD_n) its root UVs are in
+        /// (head_uv_set), for scripts/blender_hair_curves.py --model.
+        #[arg(long)]
+        head: Option<PathBuf>,
         /// Only list the grooms (catalog with LOD chains and region) to <out>/grooms/<archive>/catalog.json.
         #[arg(long)]
         list: bool,
@@ -976,6 +982,8 @@ enum Cmd {
         /// its outfit item names, and parts with a stored tint their tint.
         /// Stored flat colours, colour tags, the body skin tone and strand
         /// hair are viewer features and are not in the export (see --hair).
+        /// A model with no parts of its own (`cs_mandy`) uses outfit 0 when
+        /// neither this nor --parts is given.
         #[arg(long)]
         look: Option<usize>,
         /// Also write the character's strand hair to <out>.hair.glb, in the
@@ -1630,16 +1638,27 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             // a name with no parts of its own is an ad-hoc character made of
             // --parts (generic world peds: head, hand, feet, clothing items)
             // --look: the parts of one outfit of the game's outfit list
+            // A model with no parts of its own (`cs_mandy`, made of shared
+            // items) exports its first outfit, as if --look 0 were given.
+            let auto = look.is_none() && !animal && opts.is_empty() && parts.is_empty();
+            let look: &Option<usize> = &look.or(auto.then_some(0));
             let look_parts: Vec<(u64, sixng_core::pedlook::LookPart)> = match look {
-                Some(k) => {
-                    let l = sixng_core::pedlook::look(&ws.game, &a, &ix, &prefix).map_err(|e| anyhow!(e))?;
-                    let o = l.outfits.get(*k).ok_or_else(|| anyhow!("{prefix} has {} outfits (--look 0..{})", l.outfits.len(), l.outfits.len().saturating_sub(1)))?;
-                    let by_name = sixng_core::outfit::dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
-                        let n = e.name.as_ref()?.to_ascii_lowercase();
-                        o.parts.iter().any(|p| !p.strands && p.drawable == n).then_some((n, e))
-                    }));
-                    o.parts.iter().filter(|p| !p.strands).filter_map(|p| Some((by_name.get(&p.drawable)?.off, p.clone()))).collect()
-                }
+                Some(k) => match sixng_core::pedlook::look(&ws.game, &a, &ix, &prefix) {
+                    // not a listed model either: the error below names the part rule
+                    Err(_) if auto => Vec::new(),
+                    Err(e) => bail!(e),
+                    Ok(l) => match l.outfits.get(*k) {
+                        None if auto => Vec::new(),
+                        None => bail!("{prefix} has {} outfits (--look 0..{})", l.outfits.len(), l.outfits.len().saturating_sub(1)),
+                        Some(o) => {
+                            let by_name = sixng_core::outfit::dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
+                                let n = e.name.as_ref()?.to_ascii_lowercase();
+                                o.parts.iter().any(|p| !p.strands && p.drawable == n).then_some((n, e))
+                            }));
+                            o.parts.iter().filter(|p| !p.strands).filter_map(|p| Some((by_name.get(&p.drawable)?.off, p.clone()))).collect()
+                        }
+                    },
+                },
                 None => Vec::new(),
             };
             if opts.is_empty() && parts.is_empty() && look_parts.is_empty() {
@@ -1779,11 +1798,16 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             if *hair && !*anim_only {
                 // the strand pieces of the outfit, then the extra styles
                 let slots: Vec<String> = if hair_slots.iter().any(|s| s == "all") { Vec::new() } else { hair_slots.clone() };
-                let mut pieces = match sixng_core::pedlook::look(&ws.game, &a, &ix, &prefix) {
-                    Ok(l) => sixng_core::hairexport::character_grooms(&ws.work, &a, &ix.entries, &l, look.unwrap_or(0), &slots).map_err(|e| anyhow!(e))?,
+                let ped = sixng_core::pedlook::look(&ws.game, &a, &ix, &prefix);
+                let mut pieces = match &ped {
+                    Ok(l) => sixng_core::hairexport::character_grooms(&ws.work, &a, &ix.entries, l, look.unwrap_or(0), &slots).map_err(|e| anyhow!(e))?,
                     Err(_) if !hair_style.is_empty() => Vec::new(),
                     Err(e) => bail!("--hair: no outfit list for {prefix}: {e}"),
                 };
+                // the colours the viewer gives each slot: the game's strand tables, else the items' presets
+                let outfit_of = ped.as_ref().ok().and_then(|l| l.outfits.get(look.unwrap_or(0)));
+                let tables = sixng_core::hairtables::load_or_build(&ws, &a).map_err(|e| eprintln!("--hair: strand tables not read: {e:#}")).ok().map(|v| sixng_core::hairtone::StrandData::from_json(&v));
+                let presets = sixng_core::hairtone::Table::load_or_build(&ws).ok();
                 for st in hair_style {
                     let re = regex::RegexBuilder::new(st).case_insensitive(true).build()?;
                     pieces.extend(sixng_core::hairexport::placeholder_grooms(&ws.work, &a, &ix.entries, &re).map_err(|e| anyhow!(e))?);
@@ -1799,14 +1823,15 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                         let bones = cat.iter().find(|c| c.off == *off).map(|c| c.bones.clone()).unwrap_or_default();
                         let name = format!("{}_{off:x}", slot.replace(' ', "_"));
                         let mut ex = json!({"slot": slot, "placeholder": placeholder, "groom": format!("{off:x}"), "bones": bones});
-                        let uv_set = head.as_ref().and_then(|h| Some((h, sixng_core::hairexport::root_uv_set(&g, h)?)));
-                        if let Some((h, (set, err))) = uv_set {
-                            ex["head_mesh"] = json!(h.name);
-                            ex["head_uv_set"] = json!(set);
-                            ex["head_uv_error"] = json!(err);
+                        let uv_set = sixng_core::hairexport::tag_uv_set(&g, head.as_ref(), &mut ex);
+                        let colour = outfit_of.and_then(|of| sixng_core::hairexport::slot_colour(of, slot, tables.as_ref(), presets.as_ref()));
+                        if let Some((c, set)) = &colour {
+                            ex["colour_set"] = json!(format!("{set:08x}"));
+                            ex["colour_source"] = json!(match c { sixng_core::hairexport::HairColour::Set(_) => "strand tables", sixng_core::hairexport::HairColour::Presets(_) => "item presets" });
                         }
-                        let (p, mut sum) = sixng_core::hairexport::piece(&g, &name, &o, ex);
-                        sum["head_uv_set"] = json!(uv_set.map(|u| u.1 .0));
+                        let (p, mut sum) = sixng_core::hairexport::piece(&g, &name, &o, colour.as_ref().map(|c| &c.0), ex);
+                        sum["head_uv_set"] = json!(uv_set);
+                        sum["colour_set"] = json!(colour.as_ref().map(|c| format!("{:08x}", c.1)));
                         sum["slot"] = json!(slot);
                         sum["placeholder"] = json!(placeholder);
                         sum["confidence"] = json!(confidence);
@@ -2129,7 +2154,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             out.print(&json!({"ok": true, "archive": a.id, "scanned": sel.len(), "tiles": n, "tiles_with_roads": roads,
                 "seconds": t.elapsed().as_secs_f64(), "index": po.join("navmesh").join(a.id.trim_end_matches(".rpf")).join("index.jsonl")}));
         }
-        Cmd::Grooms { archive, roots, ribbons, full, density, animal, only, list, out: po } => {
+        Cmd::Grooms { archive, roots, ribbons, full, density, animal, only, list, head, out: po } => {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
             let t = Instant::now();
@@ -2180,7 +2205,11 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     std::fs::create_dir_all(&dir)?;
                     sixng_core::atomic::write(dir.join(format!("{root}.fur.json")), serde_json::to_vec_pretty(&fur)?)?;
                 }
-                let (n, errors) = sixng_core::groom::export_grooms(&a, &ix.entries, &only, po, *roots, ribbons.map(|mm| mm / 1000.0), full.then_some(density.clamp(0.0, 1.0)), pr)?;
+                let head = match head {
+                    Some(p) => Some(sixng_core::hairexport::head_from_glb(&std::fs::read(p)?).ok_or_else(|| anyhow!("--head: no mesh in {}", p.display()))?),
+                    None => None,
+                };
+                let (n, errors) = sixng_core::groom::export_grooms(&a, &ix.entries, &only, po, *roots, ribbons.map(|mm| mm / 1000.0), full.then_some(density.clamp(0.0, 1.0)), head.as_ref(), pr)?;
                 out.print(&json!({"ok": true, "archive": a.id, "grooms": n, "errors": errors, "fur": fur,
                     "seconds": t.elapsed().as_secs_f64(), "index": po.join("grooms").join(a.id.trim_end_matches(".rpf")).join("index.jsonl")}));
             }

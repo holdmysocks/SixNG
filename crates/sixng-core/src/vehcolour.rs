@@ -92,12 +92,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// records they reach).
 /// 28: `wear_records.levels_by_config` and `levels_default` (each part id's
 /// wear level per configuration: the entry of its ladder).
-pub const EXPORT_VERSION: u32 = 28;
+/// 29: `primer` (each part id's primer palette rows per primer set).
+pub const EXPORT_VERSION: u32 = 29;
 /// Layout version of `<work>/index/vehicle_parts.json`.
 /// 21: a part's coat and the library's coat records.
 /// 22: the surfaces' wear ladders and detail sets, and the wear records.
 /// 23: each configuration's wear levels.
-pub const FORMAT: u32 = 23;
+/// 24: each part's primer palette rows.
+pub const FORMAT: u32 = 24;
 
 const PART_SET: u32 = 0xf142_44fd;
 const SET_COLOURS: u32 = 0x7847_6477;
@@ -110,8 +112,20 @@ const COLOUR_REC: u32 = 0xf137_9639;
 const COLOUR: u32 = 0x5bdc_13e3;
 const COLOUR_MODE: u32 = 0xadb5_2ec3;
 const COLOUR_ROW: u32 = 0xc831_3558;
+/// The primer's palette entries of a colour record: per primer type (the
+/// surface's `primerType`, 0 or 1) and primer set (0 to 2) the row and the
+/// slice fields. Type 0 set 0 is `COLOUR_ROW` / `COLOUR_MODE`. The game
+/// (getters at rva 0x10fb530 / 0x10fb590) takes set 0 of the same type for
+/// a set whose row is -1, its slice as well.
+const PRIMER_ENTRIES: [[(u32, u32); 3]; 2] = [
+    [(COLOUR_ROW, COLOUR_MODE), (0x6076_324c, 0x9dad_9c4d), (0x52b0_96c1, 0xabe8_38c2)],
+    [(0xaa45_174e, 0xbc3d_1f2b), (0x6123_1e48, 0xdb81_1fa6), (0x338b_c31a, 0x48d0_7a43)],
+];
 const SURFACE: u32 = 0x9e4d_e959;
 const SURFACE_ROUGH: u32 = 0x2cc7_2f7c;
+/// A surface's primer type (u8 at +0x3c): which half of its colour
+/// record's primer entries the primer reads.
+const SURFACE_PRIMER_TYPE: u32 = 0x78b5_45dd;
 /// A surface's second layer: its colour record and its `307f162c` record.
 const SURFACE_WEAR_COLOUR: u32 = 0x5cff_e5e0;
 const SURFACE_WEAR_ROUGH: u32 = 0x1747_70cc;
@@ -393,6 +407,11 @@ pub struct Part {
     /// when the part set names none.
     #[serde(default)]
     pub coat: u32,
+    /// The primer's palette rows for primer sets 0 to 2: the colour
+    /// record's entries of the surface's `primerType` (see
+    /// `PRIMER_ENTRIES`).
+    #[serde(default)]
+    pub primer: PrimerRows,
 }
 
 impl Part {
@@ -526,6 +545,12 @@ struct Library {
     wear_records: HashMap<String, HashMap<u32, Value>>,
     /// modifier name -> (wear channel, level, primer sets)
     levels: HashMap<u32, (u32, u8, u8)>,
+    /// colour record name -> its primer palette rows per primer type and
+    /// set (slice x 256 + row, after the game's fallback to set 0; 0xffff =
+    /// none)
+    primer: HashMap<u32, [[u16; 3]; 2]>,
+    /// surface name -> its primer type (0 or 1)
+    primer_type: HashMap<u32, u8>,
     /// binding modifiers with the wear flag
     wear_binds: std::collections::HashSet<u32>,
     id: Option<String>,
@@ -538,6 +563,41 @@ impl Library {
         let row = self.colours.get(&c).filter(|(mode, row, _)| (0..8).contains(mode) && *row >= 0).map(|(mode, row, _)| *mode as u16 * 256 + (*row as u16 & 255));
         (row, self.rough.get(&r).copied().unwrap_or([0.5, 0.5]), self.metal.get(&r).copied().unwrap_or([0.0, 0.0]))
     }
+
+    /// The primer's palette rows of a part, per primer set: its colour
+    /// record's entries of its surface's primer type.
+    fn primer_of(&self, colour: u32, surface: u32) -> PrimerRows {
+        let t = self.primer_type.get(&surface).copied().unwrap_or(0).min(1) as usize;
+        PrimerRows(self.primer.get(&colour).map_or([NO_ROW; 3], |p| p[t]))
+    }
+}
+
+const NO_ROW: u16 = 0xffff;
+
+/// A part's primer palette rows for primer sets 0 to 2 (slice x 256 + row;
+/// 0xffff = none).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(transparent)]
+pub struct PrimerRows(pub [u16; 3]);
+
+impl Default for PrimerRows {
+    fn default() -> Self {
+        PrimerRows([NO_ROW; 3])
+    }
+}
+
+/// A colour record's primer entries (see `PRIMER_ENTRIES`).
+fn primer_entries(c: &Value) -> [[u16; 3]; 2] {
+    std::array::from_fn(|t| {
+        let at = |s: usize| {
+            let (r, sl) = PRIMER_ENTRIES[t][s];
+            Some((num(c, r)?, num(c, sl)?)).filter(|(r, _)| *r != -1)
+        };
+        std::array::from_fn(|s| match at(s).or_else(|| at(0)) {
+            Some((row, slice)) if (0..8).contains(&slice) && row >= 0 => slice as u16 * 256 + (row as u16 & 255),
+            _ => NO_ROW,
+        })
+    })
 }
 
 fn library(game_root: &Path, work: &Path) -> Result<Library> {
@@ -552,7 +612,7 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
             }
             let m = &m;
             let dump = |h: u32| m.objects(h).into_iter().filter_map(|o| m.object(h, o, 0)).collect::<Vec<_>>();
-            let mut l = Library { colours: HashMap::new(), surfaces: HashMap::new(), wear: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), paint_types: HashMap::new(), coats: coats(m), options: HashMap::new(), refs: HashMap::new(), part_models: HashMap::new(), surface_wear: HashMap::new(), wear_records: HashMap::new(), levels: HashMap::new(), wear_binds: Default::default(), id: Some(e.id.clone()) };
+            let mut l = Library { colours: HashMap::new(), surfaces: HashMap::new(), wear: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), paint_types: HashMap::new(), coats: coats(m), options: HashMap::new(), refs: HashMap::new(), part_models: HashMap::new(), surface_wear: HashMap::new(), wear_records: HashMap::new(), levels: HashMap::new(), wear_binds: Default::default(), primer: HashMap::new(), primer_type: HashMap::new(), id: Some(e.id.clone()) };
             for (kind, h) in WEAR_KINDS {
                 let recs = dump(*h).into_iter().filter_map(|v| Some((num(&v, NAME)? as u32, wear_record(v)))).collect();
                 l.wear_records.insert(kind.to_string(), recs);
@@ -649,6 +709,7 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
                 let (Some(n), Some(col)) = (num(&c, NAME), num(&c, COLOUR)) else { continue };
                 let col = col as u32;
                 l.colours.insert(n as u32, (num(&c, COLOUR_MODE).unwrap_or(-1) as i8, num(&c, COLOUR_ROW).unwrap_or(-1) as i16, [col as u8, (col >> 8) as u8, (col >> 16) as u8]));
+                l.primer.insert(n as u32, primer_entries(&c));
             }
             for s in dump(SURFACE) {
                 if let (Some(n), Some(r)) = (num(&s, NAME), num(&s, SURFACE_ROUGH)) {
@@ -656,6 +717,9 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
                 }
                 if let (Some(n), Some(c), Some(r)) = (num(&s, NAME), num(&s, SURFACE_WEAR_COLOUR), num(&s, SURFACE_WEAR_ROUGH)) {
                     l.wear.insert(n as u32, (c as u32, r as u32));
+                }
+                if let (Some(n), Some(t)) = (num(&s, NAME), num(&s, SURFACE_PRIMER_TYPE)) {
+                    l.primer_type.insert(n as u32, t.clamp(0, 1) as u8);
                 }
                 if let Some(n) = num(&s, NAME) {
                     l.surface_wear.insert(n as u32, (num(&s, SURFACE_LADDER).unwrap_or(0) as u32, num(&s, SURFACE_DETAIL).unwrap_or(0) as u32));
@@ -711,7 +775,8 @@ pub fn build(game_root: &Path, work: &Path) -> Result<Tables> {
                         let metal = rec.and_then(|r| lib.metal.get(r)).copied().unwrap_or([0.0, 0.0]);
                         let (wear_row, wear_rough, wear_metal) = lib.wear_of(surface);
                         let coat = num(c, ENTRY_COAT).unwrap_or(0) as u32;
-                        Part { colour, surface, row, mode, rgb, rough, metal, wear_row, wear_rough, wear_metal, coat }
+                        let primer = lib.primer_of(colour, surface);
+                        Part { colour, surface, row, mode, rgb, rough, metal, wear_row, wear_rough, wear_metal, coat, primer }
                     })
                     .collect();
                 sets.push((name.to_string(), parts));
@@ -1007,6 +1072,7 @@ fn apply_config(lib: &Library, own: &HashMap<u32, Vec<u32>>, parts: &[u32], set:
             if let Some(k) = coats.get(&ch).filter(|k| coat && lib.coats.contains_key(k)) {
                 p.coat = *k;
             }
+            p.primer = lib.primer_of(p.colour, p.surface);
             changed[i as usize] |= *p != before;
         }
     }
@@ -1142,6 +1208,7 @@ impl Tables {
         let rows: Vec<Value> = names.iter().map(|n| self.sets.get(*n).map_or(Value::Null, |p| Value::String(row_table(p)))).collect();
         let wear: Vec<Value> = names.iter().map(|n| self.sets.get(*n).map_or(Value::Null, |p| Value::String(wear_table(p, mat)))).collect();
         let surfaces: Vec<Value> = names.iter().map(|n| self.sets.get(*n).map_or(Value::Null, |p| Value::String(surface_table(p)))).collect();
+        let primer: Vec<Value> = names.iter().map(|n| self.sets.get(*n).map_or(Value::Null, |p| Value::String(primer_table(p)))).collect();
         // the coat records the looks use, and per look the index of each part id's
         let mut used: Vec<u32> = names.iter().filter_map(|n| self.sets.get(*n)).flatten().map(|p| p.coat).filter(|c| self.coats.contains_key(&format!("{c:08x}"))).collect();
         used.sort();
@@ -1185,6 +1252,7 @@ impl Tables {
             "rows": rows,
             "wear": wear,
             "surfaces": surfaces,
+            "primer": primer,
             "coats": coats,
             "paint_coats": paint_coats,
             "coat_records": coat_records,
@@ -1335,6 +1403,13 @@ pub fn wear_table(parts: &[Part], mat: [f32; 2]) -> String {
         .collect()
 }
 
+/// The primer's palette rows of each of the 256 part ids, 12 hex digits
+/// each: per primer set 0 to 2 the row (4 digits: slice x 256 + row, `ffff`
+/// = none).
+pub fn primer_table(parts: &[Part]) -> String {
+    (0..256).map(|i| parts.get(i).map_or(PrimerRows::default(), |p| p.primer).0.iter().map(|r| format!("{r:04x}")).collect::<String>()).collect()
+}
+
 /// The colour of a row of a palette slice at position `u` (0 to 1): the
 /// mean of the 17 columns around it. In the paint shader the position is the green
 /// channel of the layer's detail texture (`lyr0diffusetex`), which is a
@@ -1359,6 +1434,31 @@ pub fn ramp(palette: &[[u8; 4]], slice: usize, row: usize, u: f32) -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn primer_entries_fall_back_to_set_0() {
+        let f = |h: u32| meta7a::field_name(h);
+        let mut c = serde_json::Map::new();
+        // type 0: set 0 row 232 slice 1, set 1 row 7 slice 5, set 2 empty
+        for (h, v) in [(COLOUR_ROW, 232), (COLOUR_MODE, 1), (0x6076_324c, 7), (0x9dad_9c4d, 5), (0x52b0_96c1, -1), (0xabe8_38c2, 5)] {
+            c.insert(f(h), v.into());
+        }
+        // type 1: set 0 row 232 slice 2, sets 1 and 2 without a row (their slice is not used)
+        for (h, v) in [(0xaa45_174e, 232), (0xbc3d_1f2b, 2), (0x6123_1e48, -1), (0xdb81_1fa6, 5), (0x338b_c31a, -1), (0x48d0_7a43, 5)] {
+            c.insert(f(h), v.into());
+        }
+        let e = primer_entries(&Value::Object(c));
+        assert_eq!(e[0], [256 + 232, 5 * 256 + 7, 256 + 232]);
+        assert_eq!(e[1], [512 + 232; 3]);
+        // no rows at all
+        assert_eq!(primer_entries(&serde_json::json!({})), [[NO_ROW; 3]; 2]);
+        // the table: 12 hex digits per part id
+        let p = Part { primer: PrimerRows([0x01e8, 0x0507, NO_ROW]), ..Default::default() };
+        let t = primer_table(&[p]);
+        assert_eq!(t.len(), 256 * 12);
+        assert_eq!(&t[..12], "01e80507ffff");
+        assert_eq!(&t[12..24], "ffffffffffff");
+    }
 
     #[test]
     fn colours_from_rows_and_paints() {
@@ -1578,7 +1678,7 @@ mod tests {
 
     #[test]
     fn wear_levels_follow_the_wear_bindings() {
-        let mut lib = Library { colours: HashMap::new(), surfaces: HashMap::new(), wear: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), paint_types: HashMap::new(), coats: HashMap::new(), options: HashMap::new(), refs: HashMap::new(), part_models: HashMap::new(), surface_wear: HashMap::new(), wear_records: HashMap::new(), levels: HashMap::new(), wear_binds: Default::default(), id: None };
+        let mut lib = Library { colours: HashMap::new(), surfaces: HashMap::new(), wear: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), paint_types: HashMap::new(), coats: HashMap::new(), options: HashMap::new(), refs: HashMap::new(), part_models: HashMap::new(), surface_wear: HashMap::new(), wear_records: HashMap::new(), levels: HashMap::new(), wear_binds: Default::default(), primer: HashMap::new(), primer_type: HashMap::new(), id: None };
         lib.groups.insert(0x10, vec![1, 2]);
         lib.groups.insert(0x11, vec![2, 3]);
         lib.groups.insert(0x12, vec![4]);
@@ -1606,7 +1706,7 @@ mod tests {
 
     #[test]
     fn coats_follow_the_paint_type_of_a_channel() {
-        let mut lib = Library { colours: HashMap::new(), surfaces: HashMap::new(), wear: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), paint_types: HashMap::new(), coats: HashMap::new(), options: HashMap::new(), refs: HashMap::new(), part_models: HashMap::new(), surface_wear: HashMap::new(), wear_records: HashMap::new(), levels: HashMap::new(), wear_binds: Default::default(), id: None };
+        let mut lib = Library { colours: HashMap::new(), surfaces: HashMap::new(), wear: HashMap::new(), rough: HashMap::new(), metal: HashMap::new(), rim_ratio: HashMap::new(), mods: HashMap::new(), groups: HashMap::new(), group_defs: HashMap::new(), binds: HashMap::new(), assigns: HashMap::new(), paint_types: HashMap::new(), coats: HashMap::new(), options: HashMap::new(), refs: HashMap::new(), part_models: HashMap::new(), surface_wear: HashMap::new(), wear_records: HashMap::new(), levels: HashMap::new(), wear_binds: Default::default(), primer: HashMap::new(), primer_type: HashMap::new(), id: None };
         for k in [0xa1, 0xa2, 0xa3] {
             lib.coats.insert(k, Coat::default());
         }
