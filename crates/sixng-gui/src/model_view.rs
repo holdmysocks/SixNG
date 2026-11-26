@@ -5320,6 +5320,8 @@ fn load_parts(
     // vertices are in hidden regions. Skin meshes without regions fall back
     // to hiding what lies right under a garment.
     let mut by_distance: Vec<std::ops::Range<usize>> = skin_meshes.clone();
+    // garments cut by the hide masks, which the distance test leaves alone
+    let mut masked: Vec<std::ops::Range<usize>> = Vec::new();
     if let Some(m) = &mut model {
         let (mut skin_hidden, mut cloth_hidden) = (0, 0);
         for (range, layer, off) in &region_parts {
@@ -5327,15 +5329,16 @@ fn load_parts(
             if !has_regions {
                 continue;
             }
-            // Clothes under clothes stay with the distance test below: the
-            // `_full` garment meshes carry no regions (their `_cull_00`
-            // twins do) and part of those masks sits in a second list whose
-            // key is not decoded.
+            // Clothes: the `_full` garment meshes carry no regions, so only a
+            // garment drawn as its `_cull_00` twin (one another item hides
+            // regions of) is cut here; the rest stay with the distance test
+            // below. Part of the masks sits in a second list whose key is not
+            // decoded (`hides_sub`), and is not applied.
             let is_skin = skin_meshes.contains(range);
-            if !is_skin {
-                continue;
-            }
             by_distance.retain(|r| r != range);
+            if !is_skin {
+                masked.push(range.clone());
+            }
             // only the items shown hide anything: a garment switched off
             // in the Parts panel leaves the skin under it whole
             let masks: Vec<&str> = fx.iter().filter(|(o, _)| *o != off && parts.iter().any(|e| e.off == **o)).flat_map(|(_, f)| f.hides.iter()).filter(|h| h.0 == *layer).map(|h| h.1.as_str()).collect();
@@ -5374,7 +5377,7 @@ fn load_parts(
         let mut hidden = 0;
         for &l in ls.iter().rev().skip(1).rev() {
             let pick = |f: &dyn Fn(u8) -> bool| layered.iter().filter(|x| f(x.1)).map(|x| x.0.clone()).collect::<Vec<_>>();
-            hidden += hide_covered_skin(m, &pick(&|x| x == l), &pick(&|x| x > l), 0.03);
+            hidden += hide_covered_skin(m, &pick(&|x| x == l).into_iter().filter(|r| !masked.contains(r)).collect::<Vec<_>>(), &pick(&|x| x > l), 0.03);
         }
         if hidden > 0 {
             notes.push(format!("Layers: {hidden} triangles of clothes worn under other clothes (under a jacket, or a t-shirt under an open shirt) are hidden where the clothes over them cover them, so they do not show through. Which is worn over which: a jacket over the rest, and an item whose hide masks name another item's layer over that item."));
@@ -6843,6 +6846,31 @@ fn load_query_sel(
                     let n = e.name.as_ref()?.to_ascii_lowercase();
                     look.outfits.iter().any(|o| o.parts.iter().any(|p| p.drawable == n)).then_some((n, e))
                 }));
+                // A garment another shown item hides regions of (a t-shirt under an open shirt) is drawn
+                // as its `_cull_00` twin: the same garment cut a little closer to the body, whose vertices
+                // carry the regions the hide masks name (the `_full` meshes carry none).
+                let swap: HashMap<String, String> = if std::env::var("SIXNG_NO_CULL").is_err() {
+                    let ps = &look.outfits[k].parts;
+                    ps.iter()
+                        .filter(|p| p.drawable.ends_with("_full") && p.layer.as_deref().is_some_and(|l| ps.iter().any(|q| !std::ptr::eq(q, *p) && q.hides.iter().any(|h| h.0 == l && h.1.chars().any(|c| c != '0')))))
+                        .filter_map(|p| {
+                            let twin = format!("{}_cull_00", p.drawable.trim_end_matches("_full"));
+                            ix.entries.iter().any(|e| e.rtype.as_deref() == Some("dr") && e.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(&twin))).then(|| (p.drawable.clone(), twin))
+                        })
+                        .collect()
+                } else {
+                    HashMap::new()
+                };
+                let by_name = {
+                    let mut b = by_name;
+                    if !swap.is_empty() {
+                        b.extend(sixng_core::outfit::dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
+                            let n = e.name.as_ref()?.to_ascii_lowercase();
+                            swap.values().any(|t| *t == n).then_some((n, e))
+                        })));
+                    }
+                    b
+                };
                 opts.iter_mut().for_each(|o| o.default = false);
                 let mut info = LookInfo { model: look.model.clone(), labels: look.outfits.iter().map(|o| o.label.clone()).collect(), current: k, ..Default::default() };
                 info.notes.extend(look.note.clone());
@@ -6863,13 +6891,14 @@ fn load_query_sel(
                             }
                             continue;
                         }
-                        let Some(e) = by_name.get(&p.drawable) else { continue };
+                        let drawable = if oi == k { swap.get(&p.drawable).unwrap_or(&p.drawable) } else { &p.drawable };
+                        let Some(e) = by_name.get(drawable) else { continue };
                         match opts.iter_mut().find(|x| x.off == e.off) {
                             Some(x) => {
                                 x.group = p.slot.clone();
                                 x.default |= oi == k;
                             }
-                            None => opts.push(crate::assemble::PartOpt { off: e.off, id: e.id.clone(), name: p.drawable.clone(), group: p.slot.clone(), label: p.drawable.trim_start_matches(&format!("{prefix}_")).to_string(), default: oi == k }),
+                            None => opts.push(crate::assemble::PartOpt { off: e.off, id: e.id.clone(), name: drawable.clone(), group: p.slot.clone(), label: drawable.trim_start_matches(&format!("{prefix}_")).to_string(), default: oi == k }),
                         }
                         if oi == k {
                             let body = p.slot == "body upper" || p.slot == "body lower";
