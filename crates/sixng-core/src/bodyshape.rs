@@ -561,6 +561,9 @@ pub fn outfit_preset(game_root: &Path, word: Option<&str>, items: &[String]) -> 
 }
 
 /// `preset_items` on a table of item hash -> (control hash, value).
+/// Controls not in `CONTROLS` are dropped, as the game's rig ignores them:
+/// six athletic presets set `gcweighbelly` (5443facc), a misspelling of
+/// `gcweightbelly` that no rig reads.
 pub fn preset_from_items(table: &HashMap<u32, Vec<(u32, f32)>>, items: &[String]) -> Result<Vec<(String, f32)>, String> {
     let mut vals: Vec<(&str, f32)> = Vec::new();
     let mut found = false;
@@ -1010,6 +1013,7 @@ mod tests {
     #[test]
     fn plastic_breasts_name_matches_preset_hash() {
         assert_eq!(crate::meta7a::joaat("gcplasticbreasts"), 0xb0eae798);
+        assert_eq!(crate::meta7a::joaat("gcweighbelly"), 0x5443facc);
     }
 
     #[test]
