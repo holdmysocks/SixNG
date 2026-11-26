@@ -375,49 +375,6 @@ impl Ttpf {
 /// All stores under `<game>/data/ttdb`, opened lazily.
 pub struct TtpfSet {
     pub stores: Vec<Ttpf>,
-    /// Game root for the de-duplication table ([`TtpfSet::dupes`]); None
-    /// for a set opened from a bare folder.
-    root: Option<PathBuf>,
-    dupes: std::sync::OnceLock<HashMap<u64, u64>>,
-}
-
-/// Magic of the texture de-duplication table: "EDUP" as stored.
-const DUPE_MAGIC: &[u8; 4] = b"EDUP";
-
-/// Parse the texture de-duplication table of textures.rpf: `"EDUP"`, u32
-/// count, then `count` pairs (u64 dropped hash, u64 kept hash) sorted by the
-/// dropped hash; the bytes after the pairs are filler. A texture whose
-/// pixels are the same as another's is stored once, under the kept hash, and
-/// shaders and wardrobe items that name the dropped hash find it through
-/// this table (on the install: 17,431 pairs, among them the painted body
-/// skins of most characters).
-pub fn parse_dupes(b: &[u8]) -> Option<HashMap<u64, u64>> {
-    if b.get(..4)? != DUPE_MAGIC {
-        return None;
-    }
-    let n = u32::from_le_bytes(b.get(4..8)?.try_into().ok()?) as usize;
-    let pairs = b.get(8..8 + n.checked_mul(16)?)?;
-    Some(
-        pairs
-            .chunks_exact(16)
-            .map(|c| (u64::from_le_bytes(c[..8].try_into().unwrap()), u64::from_le_bytes(c[8..].try_into().unwrap())))
-            .filter(|&(a, k)| a != 0 && k != 0 && a != k)
-            .collect(),
-    )
-}
-
-/// The de-duplication table from the textures.rpf index (its plain files
-/// are searched for the magic); empty when that archive is not indexed.
-fn load_dupes(game_root: &Path, work: &Path) -> HashMap<u64, u64> {
-    let Some(a) = crate::game::discover(game_root).into_iter().find(|a| a.id.eq_ignore_ascii_case("textures.rpf")) else { return HashMap::new() };
-    let Ok(ix) = crate::scan::load_index(&crate::scan::index_path(&work.join("index"), &a.id)) else { return HashMap::new() };
-    let mut out = HashMap::new();
-    for e in ix.entries.iter().filter(|e| e.kind == crate::classify::Kind::Bin && e.usize >= 8 && e.usize < 64 << 20) {
-        if let Some(t) = crate::scan::read_entry(&a.path, e).ok().and_then(|b| parse_dupes(&b)) {
-            out.extend(t);
-        }
-    }
-    out
 }
 
 impl TtpfSet {
@@ -437,35 +394,11 @@ impl TtpfSet {
         }
         walk(dir, &mut paths);
         paths.sort();
-        TtpfSet { stores: paths.iter().filter_map(|p| Ttpf::open(p).ok()).collect(), root: None, dupes: Default::default() }
+        TtpfSet { stores: paths.iter().filter_map(|p| Ttpf::open(p).ok()).collect() }
     }
 
-    /// A texture by hash. A hash that no store has is looked up again under
-    /// the hash the de-duplication table keeps for it, so the returned
-    /// texture's own `hash` can differ from the one asked for.
     pub fn get(&self, hash: u64) -> Option<(&Ttpf, &TtpfTex)> {
-        self.get_stored(hash).or_else(|| self.get_stored(self.kept(hash)?))
-    }
-
-    /// A texture stored under exactly this hash (no de-duplication).
-    pub fn get_stored(&self, hash: u64) -> Option<(&Ttpf, &TtpfTex)> {
         self.stores.iter().find_map(|s| s.get(hash).map(|t| (s, t)))
-    }
-
-    /// The hash a de-duplicated texture is stored under, if `hash` is one.
-    pub fn kept(&self, hash: u64) -> Option<u64> {
-        self.dupes()?.get(&hash).copied()
-    }
-
-    /// The de-duplication table (dropped hash -> kept hash), read on first
-    /// use once the work folder is known; None before that.
-    pub fn dupes(&self) -> Option<&HashMap<u64, u64>> {
-        if let Some(d) = self.dupes.get() {
-            return Some(d);
-        }
-        let root = self.root.as_deref()?;
-        let work = crate::names::work_dir()?;
-        Some(self.dupes.get_or_init(|| load_dupes(root, &work)))
     }
 }
 
@@ -628,7 +561,6 @@ pub fn global(game_root: &Path) -> &'static TtpfSet {
         for p in packs {
             set.stores.extend(TtpfSet::open_dir(&p).stores);
         }
-        set.root = Some(game_root.to_path_buf());
         set
     })
 }
@@ -741,23 +673,6 @@ pub fn write_png(store: &Ttpf, t: &TtpfTex, dir: &Path, force: bool) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn dupe_table() {
-        let mut b = b"EDUP".to_vec();
-        b.extend(2u32.to_le_bytes());
-        for (a, k) in [(0x10u64, 0x99u64), (0x20, 0x77)] {
-            b.extend(a.to_le_bytes());
-            b.extend(k.to_le_bytes());
-        }
-        b.extend([0xab; 24]); // filler after the pairs
-        let t = parse_dupes(&b).unwrap();
-        assert_eq!(t.len(), 2);
-        assert_eq!(t[&0x20], 0x77);
-        assert!(parse_dupes(b"EDTP    ").is_none());
-        b[4] = 9; // count past the end
-        assert!(parse_dupes(&b).is_none());
-    }
 
     fn tex(d0: u32, d1: u32, virt: u64) -> TtpfTex {
         let mut t = TtpfTex { hash: virt, width: (d0 & 0x3FFF) + 1, height: ((d0 >> 14) & 0x3FFF) + 1, dxgi_format: (d1 >> 3) & 0x7F, virt, size: 0, d0, d1, loc: 0, cube_base: None, mips_fixed: None };

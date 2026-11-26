@@ -788,10 +788,6 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                     continue;
                 };
                 e["store"] = store.label().into();
-                if tx.hash != h {
-                    // a de-duplicated texture: stored once under another hash
-                    e["stored_as"] = format!("{:016x}", tx.hash).into();
-                }
                 e["width"] = tx.width.into();
                 e["height"] = tx.height.into();
                 e["format"] = texture::dxgi_name(tx.dxgi_format).into();
