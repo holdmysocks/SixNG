@@ -878,8 +878,19 @@ again**).
   `eyes=left:up`) add to a preset for screenshots.
 - **Animation** (Character panel; `--anim <dictionary>/<clip>
   [--anim-pos 0..1]`): a clip of `anim.rpf` played on the character's
-  skeleton, with play / pause and a position slider. **Walk** loads a walk
-  clip of the game for the body type. Bone tracks are matched to the
+  skeleton, with play / pause and a position slider. Two dropdowns pick it:
+  first the clip dictionary, then a clip in it (or its default clip). Each
+  dropdown has a filter field (every typed word must be in the name), and
+  the dictionary list holds the dictionaries that fit the model: for a
+  character every one that is not for animals, for an animal those of its
+  species (**all dictionaries** lists every one). Clips whose animation
+  data is stored elsewhere are greyed out. The lists are read in the
+  background: the dictionary names once per run (the first time this reads
+  `anim.rpf` for about a minute and caches the list as
+  `index/anim.clipdicts.json`, as `sixng clips` does), a dictionary's clips
+  when it is picked. **✏** opens a text box for a typed or pasted
+  `<dictionary>[/<clip>]`, an entry id or a cutscene (`cin@<scene>`).
+  **Walk** loads a walk clip of the game for the body type. Bone tracks are matched to the
   shared skeleton by name hash, so the clip also drives the twist and
   muscle helper bones the Pose controls leave alone. The clip's own
   movement over the ground is applied: its mover tracks
@@ -889,9 +900,9 @@ again**).
   ground is seen to pass; **in place** leaves it out. On the female walk
   clip (6.65 m in 3.7 s) each planted foot stays within 1 cm on the
   ground while it is down. Float tracks (facial and other controls) are
-  not applied, and the Pose angles are added on top. `sixng clips --name <regex>` lists dictionaries. **Animals** have the same Animation section: it lists the clip
-  dictionaries of the animal's species (`gameplay@creatures@…@cat@normal@walk@slow`;
-  the list comes from `sixng clips`), and a dictionary alone plays its
+  not applied, and the Pose angles are added on top. `sixng clips --name <regex>` lists dictionaries. **Animals** have the same Animation section: its dictionary list holds the clip
+  dictionaries of the animal's species (`gameplay@creatures@…@cat@normal@walk@slow`,
+  or every animal dictionary when none has the species word), and a dictionary alone plays its
   `move` or `idle` clip. For this an animal's parts are bound to its
   skeleton by bone name, parts without bones (eyes, teeth, tongue) ride
   on the nearest bone, and each fur vertex takes the bone weights of the

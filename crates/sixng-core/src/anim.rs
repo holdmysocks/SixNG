@@ -892,9 +892,152 @@ pub fn dictionary_bytes(archive: &std::path::Path, e: &crate::scan::Entry) -> Re
     Ok(b)
 }
 
+/// Is this clip dictionary for animals? Their names have a `creatures` part
+/// (`gameplay@creatures@land@…`, `gameplay_creatures@air@…`,
+/// `ambient@ai_react@breakouts@creatures@…`, `face@face_creatures@…`).
+pub fn is_creature_dictionary(name: &str) -> bool {
+    name.split(['@', '_']).any(|p| p.eq_ignore_ascii_case("creatures"))
+}
+
+/// The words an animal model's species may go by in clip dictionary names.
+/// `crm_cat_feral_m_00` gives `feral_cat`, `cat_feral` and `cat`; some
+/// dictionaries use two words (`bengal_tiger`). `model` may be a path or
+/// carry `#` options; its last part is used.
+pub fn species_words(model: &str) -> Vec<String> {
+    let root = model.split_whitespace().next().unwrap_or("").rsplit([':', '#', '/', '\\']).find(|s| !s.is_empty()).unwrap_or("").to_ascii_lowercase();
+    let t: Vec<&str> = root.split('_').collect();
+    match t.as_slice() {
+        [_, a, b, ..] => vec![format!("{b}_{a}"), format!("{a}_{b}"), a.to_string()],
+        [_, a] => vec![a.to_string()],
+        _ => vec![],
+    }
+}
+
+/// Which clip dictionaries fit a model.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ClipFit {
+    /// Every dictionary.
+    Any,
+    /// A character: every dictionary that is not for animals.
+    Person,
+    /// An animal, by its model name: the animal dictionaries with its
+    /// species word as a part of the name (the first of `species_words`
+    /// that has any), else every animal dictionary.
+    Animal(String),
+}
+
+/// The dictionaries of `all` that fit, in the order of `all`.
+pub fn fitting_dictionaries<'a>(all: &'a [DictEntry], fit: &ClipFit) -> Vec<&'a DictEntry> {
+    match fit {
+        ClipFit::Any => all.iter().collect(),
+        ClipFit::Person => all.iter().filter(|d| !is_creature_dictionary(&d.name)).collect(),
+        ClipFit::Animal(model) => {
+            let creatures: Vec<&DictEntry> = all.iter().filter(|d| is_creature_dictionary(&d.name)).collect();
+            let species = species_words(model).iter().map(|w| creatures.iter().copied().filter(|d| d.name.split('@').any(|p| p.eq_ignore_ascii_case(w))).collect::<Vec<_>>()).find(|v| !v.is_empty());
+            species.unwrap_or(creatures)
+        }
+    }
+}
+
+/// Does `name` match a filter typed by a person: every word of `query`
+/// (split at white space) is in it, ignoring case. An empty query matches
+/// everything.
+pub fn name_matches(name: &str, query: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    query.split_whitespace().all(|w| name.contains(&w.to_ascii_lowercase()))
+}
+
+/// A clip of a dictionary as a picker lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClipInfo {
+    /// `short_name` (`move`, `idle_a`).
+    pub name: String,
+    pub duration: f32,
+    /// It binds decoded animation data, so it can be played.
+    pub playable: bool,
+}
+
+/// The named clips of a dictionary, sorted by name (clips of types other
+/// than animations have no name and are left out).
+pub fn clip_list(d: &ClipDictionary) -> Vec<ClipInfo> {
+    let mut v: Vec<ClipInfo> = d.clips.iter().filter(|c| !c.short_name().is_empty()).map(|c| ClipInfo { name: c.short_name().to_string(), duration: c.duration, playable: c.kind == 1 && !c.bindings.is_empty() }).collect();
+    v.sort_by(|a, b| a.name.cmp(&b.name));
+    v.dedup_by(|a, b| a.name == b.name);
+    v
+}
+
+/// The clip a dictionary alone plays: its `move` or `idle` clip, else the
+/// first one with decoded animation data.
+pub fn default_clip(d: &ClipDictionary) -> Option<&Clip> {
+    let bound: Vec<&Clip> = d.clips.iter().filter(|c| c.kind == 1 && !c.bindings.is_empty()).collect();
+    ["move", "idle"].iter().find_map(|n| bound.iter().find(|c| c.short_name() == *n).copied()).or(bound.first().copied())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entries(names: &[&str]) -> Vec<DictEntry> {
+        names.iter().enumerate().map(|(k, n)| DictEntry { name: n.to_string(), id: format!("anim.rpf@{k:x}") }).collect()
+    }
+
+    #[test]
+    fn dictionaries_fit_people_and_animals() {
+        let all = entries(&[
+            "ambient@ai_react@breakouts@creatures@air@bird@bat@standard@quick",
+            "face@face_creatures@cat",
+            "gameplay@creatures@land@mammal@cat@normal@walk@slow",
+            "gameplay@creatures@land@mammal@deer@normal@walk@slow",
+            "gameplay@creatures@land@mammal@feral_cat@normal@idle",
+            "gameplay@locomotion@female_character@kat@normal@standing@walk@stance_neutral",
+            "gameplay_creatures@water@fish",
+            "gameplay@vehicles@car@std@ds",
+        ]);
+        fn names(v: Vec<&DictEntry>) -> Vec<&str> {
+            v.into_iter().map(|d| d.name.as_str()).collect()
+        }
+        assert_eq!(fitting_dictionaries(&all, &ClipFit::Any).len(), all.len());
+        assert_eq!(names(fitting_dictionaries(&all, &ClipFit::Person)), vec!["gameplay@locomotion@female_character@kat@normal@standing@walk@stance_neutral", "gameplay@vehicles@car@std@ds"]);
+        // the two-word species name wins over the one word
+        assert_eq!(names(fitting_dictionaries(&all, &ClipFit::Animal("crm_cat_feral_m_00".into()))), vec!["gameplay@creatures@land@mammal@feral_cat@normal@idle"]);
+        assert_eq!(names(fitting_dictionaries(&all, &ClipFit::Animal("levels.rpf@12#outfit:crb_deer_whitetailed_m_00".into()))), vec!["gameplay@creatures@land@mammal@deer@normal@walk@slow"]);
+        assert_eq!(names(fitting_dictionaries(&all, &ClipFit::Animal("crb_bat_m_00".into()))), vec!["ambient@ai_react@breakouts@creatures@air@bird@bat@standard@quick"]);
+        // an unknown species: every animal dictionary
+        assert_eq!(fitting_dictionaries(&all, &ClipFit::Animal("crm_unicorn_m_00".into())).len(), 6);
+        assert!(is_creature_dictionary("Gameplay_Creatures@land"));
+        assert!(!is_creature_dictionary("gameplay@creaturesque"));
+    }
+
+    #[test]
+    fn species_words_from_model_names() {
+        assert_eq!(species_words("crm_cat_feral_m_00"), vec!["feral_cat", "cat_feral", "cat"]);
+        assert_eq!(species_words("x/y:CRB_Dog"), vec!["dog"]);
+        assert!(species_words("plain").is_empty());
+    }
+
+    #[test]
+    fn filter_words_all_match() {
+        let n = "gameplay@locomotion@male_character@raul@normal@standing@walk@stance_neutral";
+        assert!(name_matches(n, ""));
+        assert!(name_matches(n, "  walk RAUL "));
+        assert!(name_matches(n, "character@raul"));
+        assert!(!name_matches(n, "walk run"));
+    }
+
+    #[test]
+    fn clips_listed_and_default_picked() {
+        let bd = || vec![Binding { animation: 0, start: 0.0, end: 1.0, rate: 1.0, offset: 0.0 }];
+        let clip = |name: &str, kind: u32, bindings: Vec<Binding>| Clip { hash: 0, kind, name: name.into(), duration: 1.5, bindings, pending: Vec::new(), sections: 1 };
+        let mut d = ClipDictionary { name: "d".into(), clips: vec![clip("pack:/walk.clip", 1, bd()), clip("", 2, Vec::new()), clip("pack:/idle.clip", 1, bd()), clip("pack:/exit.clip", 1, Vec::new())], animations: Vec::new() };
+        let l = clip_list(&d);
+        assert_eq!(l.iter().map(|c| (c.name.as_str(), c.playable)).collect::<Vec<_>>(), vec![("exit", false), ("idle", true), ("walk", true)]);
+        assert_eq!(l[0].duration, 1.5);
+        assert_eq!(default_clip(&d).map(|c| c.short_name()), Some("idle"));
+        d.clips[2].bindings.clear();
+        assert_eq!(default_clip(&d).map(|c| c.short_name()), Some("walk"));
+        d.clips[0].bindings.clear();
+        assert!(default_clip(&d).is_none());
+    }
 
     #[test]
     fn mover_is_measured_from_the_clip_start() {
