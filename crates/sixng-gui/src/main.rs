@@ -1742,7 +1742,10 @@ impl App {
             m.look.wear_from_config = false;
         }
         if c.has("primer") {
-            m.look.primer = true;
+            m.look.primer_amount = 1.0;
+        }
+        if let Some(v) = c.f("primer-amount") {
+            m.look.primer_amount = (v as f32).clamp(0.0, 1.0);
         }
         if let Some(v) = c.get("fit-parts") {
             m.fit_parts_once = Some(v.to_string());
