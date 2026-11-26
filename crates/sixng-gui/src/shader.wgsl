@@ -207,6 +207,21 @@ fn cloud_density(xz: vec2<f32>) -> f32 {
     return smoothstep(t, t + 0.18, f);
 }
 
+// Cloud density (0 to 1) at world point p: the column's cover gives the
+// cloud's height, a flat base and a rounded top (cumulus), so a cloud is a
+// body and not a flat sheet seen edge on.
+fn cloud_density3(p: vec3<f32>) -> f32 {
+    let c = cloud_density(p.xz);
+    if (c <= 0.0) { return 0.0; }
+    let h = (p.y - S.cloud0.y) / max(S.cloud0.z - S.cloud0.y, 1.0);
+    let top = 0.15 + 0.85 * c;
+    return c * smoothstep(0.0, 0.06, h) * (1.0 - smoothstep(top * 0.55, top, h));
+}
+
+// Samples along a ray through the cloud layer (each pixel starts at its
+// own offset, so the steps do not show as slices).
+const CLOUD_STEPS: i32 = 14;
+
 // Light scattered towards the eye by the clouds along a ray from o in
 // direction d up to tmax (rgb), and the ray's transmittance through them (a).
 fn clouds_along(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> vec4<f32> {
@@ -223,32 +238,40 @@ fn clouds_along(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> vec4<f32> {
         t0 = max(min(ta, tb), 0.0);
         t1 = min(max(ta, tb), tmax);
     }
-    t1 = min(t1, 80000.0);
+    t1 = min(t1, 40000.0);
     if (t1 <= t0) { return vec4(0.0, 0.0, 0.0, 1.0); }
     let len = t1 - t0;
-    var dens = 0.0;
-    for (var k = 0; k < 4; k++) {
-        let p = o + d * (t0 + (f32(k) + 0.5) * 0.25 * len);
-        dens += cloud_density(p.xz);
-    }
-    dens *= 0.25;
-    let od = dens * S.cloud0.w * len;
-    let tr = exp(-od);
-    if (tr > 0.999) { return vec4(0.0, 0.0, 0.0, 1.0); }
-    // light in the cloud: the key light through the cloud above (half the
-    // layer, towards the light), forward-peaked, and the sky's light
-    let pm = o + d * (t0 + 0.5 * len);
+    let dt = len / f32(CLOUD_STEPS);
+    // the pixel's own start in the first step, from its view direction
+    let jit = cloud_hash(d.xz * 5113.0 + vec2(d.y * 2971.0, 0.0) + fract(S.water4.w * 7.0) * 13.0);
     let l = normalize(F.sun_dir.xyz);
-    let half_h = 0.5 * (y1 - y0);
-    let t_key = exp(-dens * S.cloud0.w * half_h / max(l.y, 0.08)) * smoothstep(-0.05, 0.05, l.y);
+    let lup = smoothstep(-0.05, 0.05, l.y);
     let c = dot(d, l);
     let g = 0.6;
     let ph = 0.7 * (1.0 - g * g) / (4.0 * PI * pow(1.0 + g * g - 2.0 * g * c, 1.5)) + 0.3 / (4.0 * PI);
-    // the dark base of a deep cloud: less of the light gets through
-    let powder = 1.0 - exp(-2.0 * od);
-    let lit = key_e(pm) * t_key * ph * (0.5 + 0.5 * powder) * 4.0
-        + sky_ambient(vec3(0.0, 1.0, 0.0)) * (0.55 + 0.45 * t_key);
-    return vec4(lit * (1.0 - tr), tr);
+    let amb = sky_ambient(vec3(0.0, 1.0, 0.0));
+    let sig = S.cloud0.w;
+    var tr = 1.0;
+    var lit = vec3(0.0);
+    for (var k = 0; k < CLOUD_STEPS; k++) {
+        let p = o + d * (t0 + (f32(k) + jit) * dt);
+        let dens = cloud_density3(p);
+        if (dens <= 0.0) { continue; }
+        let od = dens * sig * dt;
+        let st = exp(-od);
+        // the key light through the cloud above this point (towards the
+        // light, to the column's top), darker in a deep cloud's base
+        let h = clamp((p.y - y0) / max(y1 - y0, 1.0), 0.0, 1.0);
+        let above = cloud_density(p.xz + l.xz * ((y1 - p.y) * 0.5 / max(l.y, 0.08)));
+        let t_key = exp(-above * sig * (y1 - y0) * (1.0 - h) * 0.6 / max(l.y, 0.08)) * lup;
+        let powder = 1.0 - exp(-2.0 * od * 4.0);
+        let s_in = key_e(p) * t_key * ph * (0.5 + 0.5 * powder) * 4.0 + amb * (0.45 + 0.35 * h + 0.2 * t_key);
+        lit += tr * s_in * (1.0 - st);
+        tr *= st;
+        if (tr < 0.01) { break; }
+    }
+    if (tr > 0.999) { return vec4(0.0, 0.0, 0.0, 1.0); }
+    return vec4(lit, tr);
 }
 
 // Share of the key light reaching p past the clouds (their shadow).
