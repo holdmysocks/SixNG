@@ -988,7 +988,10 @@ again**).
   give the order of the missions in the story.
 - **Body sliders** (weight −1…1, muscle 0…1, breasts −1…1 and butt 0…1,
   the game's `gcbreasts` and `gcbutt` controls, and under **Regions** the
-  12 weight and 12 muscle regions; the overall weight and muscle set every
+  12 weight and 12 muscle regions, and under **Shape details** breast
+  height and spacing, chest height, cleavage, hip width and height, belly
+  roundness, head scale, biceps, triceps and one lower-chest control whose
+  name is not recovered; the overall weight and muscle set every
   region): an outfit opens in its own body-shape preset (since
   2026-11-26 read the way the game does it: the outfit's `BodyShapePreset`
   variation includes body-shape kits, and their tags name preset items of
