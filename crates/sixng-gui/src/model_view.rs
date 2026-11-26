@@ -646,8 +646,9 @@ pub fn body_spec(s: &BodyShape) -> String {
 pub fn body_from(controls: &[(String, f32)]) -> BodyShape {
     let mut s = NEUTRAL_BODY;
     for (n, v) in controls {
-        if let Some(k) = sixng_core::bodyshape::CONTROLS.iter().position(|c| c.0 == n) {
-            s[k] = *v;
+        // Controls past the slider set (CONTROLS may grow) have no slot here.
+        if let Some(slot) = sixng_core::bodyshape::CONTROLS.iter().position(|c| c.0 == n).and_then(|k| s.get_mut(k)) {
+            *slot = *v;
         }
     }
     s
