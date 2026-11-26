@@ -484,7 +484,6 @@ fn build_names(game_root: &Path, work: &Path, t: &Models, ix: &ArchiveIndex) -> 
     };
     grouped(&words, &mut names, true, false);
     grouped(&more_words, &mut names, true, false);
-    }
     // the text tables of data.rpf, when it is indexed
     let ixp = crate::scan::index_path(&work.join("index"), "data.rpf");
     if let Ok(dix) = crate::scan::load_index(&ixp) {
@@ -603,6 +602,7 @@ fn build_names(game_root: &Path, work: &Path, t: &Models, ix: &ArchiveIndex) -> 
                 names.insert(h, n);
             }
         }
+    }
     uncertain.retain(|h| names.contains_key(h));
     ModelNames { version: NAMES_VERSION, names, uncertain, display }
 }
@@ -1313,11 +1313,17 @@ fn look_by_parts(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) ->
     res.dedup();
     // of the models in those resources, the one with most outfits wearing these parts
     let wears = |o: &Outfit| o.parts.iter().filter(|x| own.contains(&x.drawable)).count();
+    // A model counts as wearing this set when an outfit wears the prefix's
+    // own head, or (for a head-less set such as cs_roxy) two of its parts.
+    // One shared accessory is not enough: a crowd ped wears
+    // cs_mischa_piercing with a generic head.
+    let heads: HashSet<&String> = own.iter().filter(|n| n.contains("_head_")).collect();
+    let is_set = |o: &Outfit| if heads.is_empty() { wears(o) >= 2 } else { o.parts.iter().any(|x| heads.contains(&x.drawable)) };
     let names = model_names(&crate::export::game_root(a)).ok();
     let mut best: Option<(usize, Look, String)> = None;
     for (h, row) in t.by_model.iter().filter(|(_, r)| res.contains(&r.resource)) {
         let Ok(l) = look_row(t, a, ix, model, row, false) else { continue };
-        let n = l.outfits.iter().filter(|o| wears(o) > 0).count();
+        let n = l.outfits.iter().filter(|o| is_set(o)).count();
         if n > 0 && best.as_ref().is_none_or(|b| n > b.0) {
             let name = names.and_then(|m| m.names.get(h).cloned()).unwrap_or_else(|| format!("ped_0x{h:08x}"));
             best = Some((n, l, name));

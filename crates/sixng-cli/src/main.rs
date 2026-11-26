@@ -976,6 +976,8 @@ enum Cmd {
         /// its outfit item names, and parts with a stored tint their tint.
         /// Stored flat colours, colour tags, the body skin tone and strand
         /// hair are viewer features and are not in the export (see --hair).
+        /// A model with no parts of its own (`cs_mandy`) uses outfit 0 when
+        /// neither this nor --parts is given.
         #[arg(long)]
         look: Option<usize>,
         /// Also write the character's strand hair to <out>.hair.glb, in the
@@ -1630,16 +1632,27 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             // a name with no parts of its own is an ad-hoc character made of
             // --parts (generic world peds: head, hand, feet, clothing items)
             // --look: the parts of one outfit of the game's outfit list
+            // A model with no parts of its own (`cs_mandy`, made of shared
+            // items) exports its first outfit, as if --look 0 were given.
+            let auto = look.is_none() && !animal && opts.is_empty() && parts.is_empty();
+            let look: &Option<usize> = &look.or(auto.then_some(0));
             let look_parts: Vec<(u64, sixng_core::pedlook::LookPart)> = match look {
-                Some(k) => {
-                    let l = sixng_core::pedlook::look(&ws.game, &a, &ix, &prefix).map_err(|e| anyhow!(e))?;
-                    let o = l.outfits.get(*k).ok_or_else(|| anyhow!("{prefix} has {} outfits (--look 0..{})", l.outfits.len(), l.outfits.len().saturating_sub(1)))?;
-                    let by_name = sixng_core::outfit::dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
-                        let n = e.name.as_ref()?.to_ascii_lowercase();
-                        o.parts.iter().any(|p| !p.strands && p.drawable == n).then_some((n, e))
-                    }));
-                    o.parts.iter().filter(|p| !p.strands).filter_map(|p| Some((by_name.get(&p.drawable)?.off, p.clone()))).collect()
-                }
+                Some(k) => match sixng_core::pedlook::look(&ws.game, &a, &ix, &prefix) {
+                    // not a listed model either: the error below names the part rule
+                    Err(_) if auto => Vec::new(),
+                    Err(e) => bail!(e),
+                    Ok(l) => match l.outfits.get(*k) {
+                        None if auto => Vec::new(),
+                        None => bail!("{prefix} has {} outfits (--look 0..{})", l.outfits.len(), l.outfits.len().saturating_sub(1)),
+                        Some(o) => {
+                            let by_name = sixng_core::outfit::dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
+                                let n = e.name.as_ref()?.to_ascii_lowercase();
+                                o.parts.iter().any(|p| !p.strands && p.drawable == n).then_some((n, e))
+                            }));
+                            o.parts.iter().filter(|p| !p.strands).filter_map(|p| Some((by_name.get(&p.drawable)?.off, p.clone()))).collect()
+                        }
+                    },
+                },
                 None => Vec::new(),
             };
             if opts.is_empty() && parts.is_empty() && look_parts.is_empty() {
