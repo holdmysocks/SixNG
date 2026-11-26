@@ -33,7 +33,7 @@ use std::sync::OnceLock;
 const PRESET: u32 = 0xf795_e8ba;
 const TAG_DRAWABLE: u32 = 0x4bfd_27dd;
 const PARAM_BASE: u32 = 0x44e2_1c90;
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
 
 /// Keys of the keyed texture list of a face preset, with what the texture
 /// is. The key names are not recovered; the descriptions are from the
@@ -68,7 +68,47 @@ pub struct HeadSkins {
     /// entries before the template's.
     #[serde(default)]
     pub extras: BTreeMap<u64, Vec<(u32, u64)>>,
+    /// joaat(head drawable name) -> the head whose faces it shares: a
+    /// `cs_<x>` head no preset lists takes the face of the head of the one
+    /// model the ped model table gives character name `<x>`
+    /// (`cs_lucia_head_fr1_lat_000_y_full` -> Lucia's player head), when both
+    /// heads have the same head code ([`same_person_codes`]).
+    #[serde(default)]
+    pub character: BTreeMap<u32, String>,
 }
+
+/// Whether two heads of one character can share a face: the same sex, body
+/// type and ethnicity code, and no step into or out of the old (`o`) or kid
+/// (`k`, `i`, `b`) ages. `y` and `m` mix: Lucia's player head is `m`, her
+/// cutscene head `y`.
+pub fn same_person_codes(a: &str, b: &str) -> bool {
+    let (Some((ca, aa)), Some((cb, ab))) = (head_code(a), head_code(b)) else { return false };
+    let adult = |c: char| matches!(c, 'y' | 'm');
+    ca == cb && (aa == ab || (adult(aa) && adult(ab)))
+}
+
+/// The `character` links: `cs_` heads with no preset of their own -> the
+/// head of the same character, by the ped model table's character names
+/// (`aliases`: joaat(character name) -> models). `heads` are the head
+/// drawable names; `has_preset` says whether a preset lists a head.
+fn character_links(heads: &[&str], aliases: &BTreeMap<u32, Vec<u32>>, has_preset: impl Fn(&str) -> bool) -> BTreeMap<u32, String> {
+    let mut out = BTreeMap::new();
+    for &h in heads.iter().filter(|h| h.starts_with("cs_") && !has_preset(h)) {
+        let Some((prefix, _)) = h.split_once("_head_") else { continue };
+        let short = &prefix[3..];
+        // exactly one model carries the character name, and it is another model
+        let Some(&[model]) = aliases.get(&joaat(short)).map(Vec::as_slice) else { continue };
+        if model == joaat(prefix) {
+            continue;
+        }
+        let donors: Vec<&str> = heads.iter().copied().filter(|d| d.split_once("_head_").is_some_and(|(p, _)| joaat(p) == model) && has_preset(d) && same_person_codes(h, d)).collect();
+        if let [d] = donors[..] {
+            out.insert(joaat(h), d.to_string());
+        }
+    }
+    out
+}
+
 
 /// A preset's own keyed textures with those of its template chain; a key
 /// keeps its first texture.
@@ -92,7 +132,8 @@ fn resolve_extras(own: &[(u32, u64)], template: u32, defs: &HashMap<u32, (u32, V
 #[derive(Debug, Clone, Serialize)]
 pub struct Choice {
     pub skin: Skin,
-    /// "linked" (a preset lists this head) or "auto".
+    /// "linked" (a preset lists this head), "character" (the face of the
+    /// same character's other head, named in `group`) or "auto".
     pub source: &'static str,
     /// Code the automatic choice matched (`fr1_lat`, `f`, or `any`).
     pub group: String,
@@ -202,8 +243,19 @@ fn build(packs: &Path, ix: &crate::scan::ArchiveIndex) -> HeadSkins {
             library.entry(code).or_default().extend(ss.iter().map(|s| (age, *s)));
         }
     }
+    let heads: Vec<&str> = {
+        let mut v: Vec<&str> = names.values().copied().filter(|n| is_head(n)).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    let character = match packs.parent().map(crate::pedlook::models) {
+        Some(Ok(m)) => character_links(&heads, &m.aliases, |n| by.contains_key(&joaat(n))),
+        _ => BTreeMap::new(),
+    };
     HeadSkins {
         version: CACHE_VERSION,
+        character,
         by_head: by.into_iter().map(|(h, s)| (h, s.into_iter().collect())).collect(),
         library: library.into_iter().map(|(c, s)| (c, s.into_iter().collect())).collect(),
         extras,
@@ -256,6 +308,14 @@ impl HeadSkins {
             let i = index % linked.len();
             return Some(Choice { skin: linked[i], source: "linked", group: String::new(), index: i, count: linked.len() });
         }
+        // the same character's other head
+        if let Some(d) = self.character.get(&joaat(&n)) {
+            let v: Vec<Skin> = self.by_head.get(&joaat(d)).into_iter().flatten().copied().filter(|s| exists(s.albedo)).collect();
+            if !v.is_empty() {
+                let i = index % v.len();
+                return Some(Choice { skin: v[i], source: "character", group: d.clone(), index: i, count: v.len() });
+            }
+        }
         let (code, age) = head_code(&n)?;
         let sex = &code[..1];
         let pick = |pred: &dyn Fn(&str, char) -> bool| -> Vec<Skin> {
@@ -284,6 +344,21 @@ impl HeadSkins {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn character_heads() {
+        assert!(same_person_codes("cs_lucia_head_fr1_lat_000_y_full", "player_story000_00_head_fr1_lat_000_m"));
+        assert!(!same_person_codes("cs_marv_carpenter_head_mr1_afr_000_o_full", "cs_marv_carpenter_head_mr1_afr_000_m_full"));
+        assert!(!same_person_codes("cs_kordell_head_mr1_afr_000_m_full", "cs_kordell_head_mb1_afr_000_m_full"));
+        let heads = ["cs_lucia_head_fr1_lat_000_y_full", "player_story000_00_head_fr1_lat_000_m", "cs_blair_head_fr1_cau_000_m_full", "cs_marv_head_mr1_afr_000_o_full", "marv_x_head_mr1_afr_000_m"];
+        let mut aliases = BTreeMap::new();
+        aliases.insert(joaat("lucia"), vec![joaat("player_story000_00")]);
+        aliases.insert(joaat("marv"), vec![joaat("marv_x")]);
+        let preset = |n: &str| n.starts_with("player_") || n.starts_with("marv_x");
+        let l = character_links(&heads, &aliases, preset);
+        assert_eq!(l.len(), 1, "old head and middle-aged face do not mix; blair has no character model");
+        assert_eq!(l[&joaat("cs_lucia_head_fr1_lat_000_y_full")], "player_story000_00_head_fr1_lat_000_m");
+    }
 
     #[test]
     fn codes() {

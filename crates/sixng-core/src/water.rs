@@ -1336,3 +1336,131 @@ mod tests {
         assert_eq!(im.shrink(2).px, vec![2.0, 6.0]);
     }
 }
+
+/// The water grids' global fallbacks for a viewer: the water height map
+/// (metres) and the fog atlas's scattering and extinction (raw values),
+/// each covering the whole grid, row 0 north.
+#[derive(Debug, Clone)]
+pub struct ViewMaps {
+    /// The grids' shared box: min x, min y, max x, max y.
+    pub world_box: [f32; 4],
+    /// Heights (m), one channel.
+    pub height: Image,
+    /// Scattering and extinction, three channels each.
+    pub scattering: Image,
+    pub extinction: Image,
+}
+
+const VIEW_MAGIC: &[u8; 8] = b"SXWVIEW1";
+
+impl ViewMaps {
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut b = VIEW_MAGIC.to_vec();
+        self.world_box.iter().for_each(|v| b.extend(v.to_le_bytes()));
+        for im in [&self.height, &self.scattering, &self.extinction] {
+            for v in [im.w, im.h, im.ch] {
+                b.extend((v as u32).to_le_bytes());
+            }
+            im.px.iter().for_each(|v| b.extend(v.to_le_bytes()));
+        }
+        b
+    }
+
+    fn from_bytes(b: &[u8]) -> Option<ViewMaps> {
+        let mut at = VIEW_MAGIC.len();
+        if b.get(..at)? != VIEW_MAGIC {
+            return None;
+        }
+        let f32_at = |at: &mut usize| -> Option<f32> {
+            let v = f32::from_le_bytes(b.get(*at..*at + 4)?.try_into().ok()?);
+            *at += 4;
+            Some(v)
+        };
+        let world_box = [f32_at(&mut at)?, f32_at(&mut at)?, f32_at(&mut at)?, f32_at(&mut at)?];
+        let mut ims = Vec::new();
+        for _ in 0..3 {
+            let mut u = || -> Option<usize> {
+                let v = u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?) as usize;
+                at += 4;
+                Some(v)
+            };
+            let (w, h, ch) = (u()?, u()?, u()?);
+            let n = w.checked_mul(h)?.checked_mul(ch)?;
+            let raw = b.get(at..at + n * 4)?;
+            at += n * 4;
+            ims.push(Image { w, h, ch, px: raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect() });
+        }
+        let extinction = ims.pop()?;
+        let scattering = ims.pop()?;
+        let height = ims.pop()?;
+        Some(ViewMaps { world_box, height, scattering, extinction })
+    }
+
+    /// Loads the maps, from the work folder's cache when it is there (the
+    /// fallback textures are found by name, else among the unnamed
+    /// dictionaries, which takes a while once).
+    pub fn load(ws: &crate::export::Workspace) -> Result<ViewMaps> {
+        let cache = ws.work.join("cache").join("water_view_v1.bin");
+        if let Some(m) = std::fs::read(&cache).ok().and_then(|b| ViewMaps::from_bytes(&b)) {
+            return Ok(m);
+        }
+        let common = ws.resolve("common")?;
+        let cix = ws.load_index(&common)?;
+        let docs = xml_docs(&common.path, &cix.entries);
+        let grids = grids(&docs);
+        let grid = |client: &str| grids.iter().map(|g| g.1.clone()).find(|g| g.client.eq_ignore_ascii_case(client)).ok_or_else(|| anyhow!("no GridAtlasInfo for {client} in common"));
+        let (fog1, fog2, hgt) = (grid("waterfogatlas")?, grid("waterfogatlas2")?, grid("WaterSystemHeightMap")?);
+        let fallback = |archive: &str, name: &str| -> Result<Image> {
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            // dictionaries named after the texture first, the unnamed ones only if needed
+            let named: Vec<crate::scan::Entry> = ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("txd") && e.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(name))).cloned().collect();
+            for e in &named {
+                if let Ok(r) = Resource::load_sys(&a.path, e) {
+                    if let Some(t) = texture::find_textures(&r).into_iter().find(|t| t.name.eq_ignore_ascii_case(name)) {
+                        return load_texture(&a.path, e, &t);
+                    }
+                }
+            }
+            let dicts = find_dicts(&a.path, &ix.entries, &[name]);
+            let (e, t) = find_tex(&dicts, name).ok_or_else(|| anyhow!("{name} not found in {archive}"))?;
+            load_texture(&a.path, e, t)
+        };
+        let mut height = fallback("levels", &hgt.fallback)?;
+        height.px.iter_mut().for_each(|v| *v = height_m(*v));
+        if height.ch > 1 {
+            height = Image { w: height.w, h: height.h, ch: 1, px: height.px.iter().step_by(height.ch).copied().collect() };
+        }
+        let rgb = |im: Image| -> Image {
+            if im.ch == 3 {
+                return im;
+            }
+            let px = im.px.chunks(im.ch).flat_map(|c| [c[0], *c.get(1).unwrap_or(&c[0]), *c.get(2).unwrap_or(&c[0])]).collect();
+            Image { w: im.w, h: im.h, ch: 3, px }
+        };
+        let scattering = rgb(fallback("textures", &fog1.fallback)?);
+        let extinction = rgb(fallback("textures", &fog2.fallback)?);
+        let m = ViewMaps { world_box: hgt.world_box(), height, scattering, extinction };
+        if let Some(d) = cache.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = crate::atomic::write(&cache, m.to_bytes());
+        Ok(m)
+    }
+}
+
+#[cfg(test)]
+mod view_maps_tests {
+    use super::*;
+
+    #[test]
+    fn view_maps_round_trip() {
+        let im = |ch: usize| Image { w: 2, h: 3, ch, px: (0..6 * ch).map(|v| v as f32 * 0.5).collect() };
+        let m = ViewMaps { world_box: [-1.0, -2.0, 3.0, 4.0], height: im(1), scattering: im(3), extinction: im(3) };
+        let back = ViewMaps::from_bytes(&m.to_bytes()).unwrap();
+        assert_eq!(back.world_box, m.world_box);
+        assert_eq!(back.height.px, m.height.px);
+        assert_eq!(back.extinction.px, m.extinction.px);
+        assert!(ViewMaps::from_bytes(b"nope").is_none());
+    }
+}

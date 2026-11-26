@@ -17,6 +17,7 @@ mod bc;
 mod cells;
 mod fabric;
 mod glb;
+mod gpu_time;
 mod lights;
 mod livery;
 mod livery_ui;
@@ -255,7 +256,7 @@ fn wgpu_options(no_vsync: bool, gpu: Option<String>) -> eframe::egui_wgpu::WgpuC
         c.device_descriptor = std::sync::Arc::new(move |adapter| {
             let mut d = base(adapter);
             d.required_features |= adapter.features()
-                & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::DEPTH32FLOAT_STENCIL8);
+                & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::DEPTH32FLOAT_STENCIL8 | crate::gpu_time::features());
             // the mesh shaders read more than wgpu's default 16 textures per stage (sky, shadow cascades, hair
             // lighting tables, materials); ask for what the adapter has, up to 32
             d.required_limits.max_sampled_textures_per_shader_stage =
@@ -799,7 +800,7 @@ Optional layers not exported yet (the map works without them): {}.", opt.join(",
             body_shape,
             head_skin: self.head_skin,
             paint: None,
-            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default(),
+            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default(), part_hidden: Default::default(),
         };
         self.start_task(
             &format!("Extracting {} entries", idxs.len()),
@@ -1612,6 +1613,9 @@ impl App {
             }
             if c.has("no-shadows") {
                 m3.no_shadows = true;
+            }
+            if c.has("no-clouds") {
+                m3.clouds = false;
             }
             if c.has("no-placed-lights") {
                 m3.placed_lights = false;

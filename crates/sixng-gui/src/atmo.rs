@@ -42,8 +42,65 @@ const MOON_LUX: f32 = 0.25;
 /// Star and air-glow luminance (cd/m2) at a timecycle intensity of 1.
 const K_STAR: f32 = 100.0;
 const K_GLOW: f32 = 0.002;
-/// Share of the direct light that full cloud cover takes away (no clouds are drawn yet).
-const CLOUD_DIM: f32 = 0.85;
+/// Share of the direct light that full cloud cover takes away besides the
+/// drawn clouds' shadows (the haze under and between them).
+const CLOUD_DIM: f32 = 0.35;
+/// Cumulus extinction per m at full density (our choice: a 1 km deep core
+/// is opaque, its thin edges are not).
+const CLOUD_SIGMA: f32 = 0.004;
+/// Feature size of the cloud cover (m).
+const CLOUD_SCALE: f32 = 2500.0;
+/// Wind speed that moves the clouds at a wind velocity scale of 1 (m/s).
+const CLOUD_WIND: f32 = 12.0;
+/// The clouds' cover noise is baked into a CLOUD_TEX square texture that
+/// repeats every CLOUD_PERIOD noise cells (80 km at CLOUD_SCALE: farther
+/// than the clouds are drawn), so a cloud sample is one texture read and
+/// not four octaves of noise (shader.wgsl reads it with the same period).
+const CLOUD_TEX: u32 = 2048;
+const CLOUD_PERIOD: u32 = 32;
+
+/// The value noise of shader.wgsl's clouds, its lattice wrapped every
+/// `period` cells (so the bake tiles).
+fn cloud_hash(x: f32, y: f32) -> f32 {
+    let fr = |v: f32| v - v.floor();
+    let (qx, qy) = (fr(x * 0.1031), fr(y * 0.1030));
+    let d = qx * (qy + 33.33) + qy * (qx + 33.33);
+    fr((qx + qy) * (qx + d))
+}
+
+fn cloud_vnoise(x: f32, y: f32, period: f32) -> f32 {
+    let (ix, iy) = (x.floor(), y.floor());
+    let (fx, fy) = (x - ix, y - iy);
+    let (ux, uy) = (fx * fx * (3.0 - 2.0 * fx), fy * fy * (3.0 - 2.0 * fy));
+    let w = |v: f32| v.rem_euclid(period);
+    let (x0, x1, y0, y1) = (w(ix), w(ix + 1.0), w(iy), w(iy + 1.0));
+    let a = cloud_hash(x0, y0) + (cloud_hash(x1, y0) - cloud_hash(x0, y0)) * ux;
+    let b = cloud_hash(x0, y1) + (cloud_hash(x1, y1) - cloud_hash(x0, y1)) * ux;
+    a + (b - a) * uy
+}
+
+/// Four octaves of the cloud noise over one period, as half floats (0 to 1).
+fn cloud_noise_texels() -> Vec<u16> {
+    use rayon::prelude::*;
+    let n = CLOUD_TEX as usize;
+    let per = CLOUD_PERIOD as f32;
+    (0..n * n)
+        .into_par_iter()
+        .map(|i| {
+            let mut qx = ((i % n) as f32 + 0.5) / n as f32 * per;
+            let mut qy = ((i / n) as f32 + 0.5) / n as f32 * per;
+            let (mut f, mut a, mut p) = (0.0, 0.5, per);
+            for _ in 0..4 {
+                f += a * cloud_vnoise(qx, qy, p);
+                qx = qx * 2.0 + 17.1;
+                qy = qy * 2.0 + 9.2;
+                a *= 0.5;
+                p *= 2.0;
+            }
+            f16_bits(f)
+        })
+        .collect()
+}
 /// Depth of the aerial-perspective volume (km) near the ground; from
 /// higher up it reaches the horizon (`ap_depth`).
 const AP_DEPTH: f32 = 40.0;
@@ -95,6 +152,14 @@ pub struct SceneU {
     pub water3: [f32; 4],
     /// Fresnel rescale, its min and max; w time (s) for the waves.
     pub water4: [f32; 4],
+    /// The water maps' world box (min x, min y, max x, max y, map
+    /// coordinates; all 0 until they are loaded).
+    pub water5: [f32; 4],
+    /// Clouds: cover (0 none to 1 overcast), base and top of the cumulus
+    /// layer (world y, m), extinction per m at full density.
+    pub cloud0: [f32; 4],
+    /// Clouds: drift (m/s, map x and world z), w feature size (m).
+    pub cloud1: [f32; 4],
 }
 
 /// Scale from the timecycle's `water_clip_*` scattering and extinction
@@ -196,6 +261,11 @@ impl Sky {
             g("local_atmosphere_fog_height", 0.0),
             g("local_atmosphere_haze_phase_anisotropy", 0.6).clamp(-0.95, 0.95),
         ];
+        let base = g("local_atmosphere_cloud_height", 200.0).max(0.0);
+        let top = g("local_atmosphere_cloud_height_top", 1500.0).max(base + 50.0);
+        u.cloud0 = [cloud, base, top, CLOUD_SIGMA];
+        let wind = CLOUD_WIND * g("local_atmosphere_cloud_wind_velocity_scale", 0.5);
+        u.cloud1 = [wind * 0.8, wind * 0.6, 0.0, CLOUD_SCALE];
         u.fog1 = [
             g("local_atmosphere_fog_density_layer_1", 0.0).max(0.0),
             g("local_atmosphere_fog_falloff_layer_1", 50.0),
@@ -326,9 +396,18 @@ pub struct SceneBinds {
     pub shadow_ub: wgpu::Buffer,
     pub shadow: wgpu::TextureView,
     pub shadow_cmp: wgpu::Sampler,
+    /// The water maps (`sixng_core::water::ViewMaps`): A = ground height
+    /// (m), scattering (rgb, timecycle units); B = extinction (rgb,
+    /// timecycle units), loaded (1) or not (0).
+    pub water_a: wgpu::TextureView,
+    pub water_b: wgpu::TextureView,
     /// The placed lights near the camera and their grid (lights.rs).
     pub lights: wgpu::Buffer,
     pub light_grid: wgpu::Buffer,
+    /// The clouds' cover noise, baked once (cloud_noise_texels), and the
+    /// repeating sampler it is read with.
+    pub cloud_noise: wgpu::TextureView,
+    pub repeat: wgpu::Sampler,
 }
 
 /// Bind group layout entries 6 to 14, 22 and 23 of the mesh shaders' group 0.
@@ -400,8 +479,17 @@ pub fn frame_layout_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
             count: None,
         },
+        tex(24, wgpu::TextureViewDimension::D2),
+        tex(25, wgpu::TextureViewDimension::D2),
         storage_fs(22),
         storage_fs(23),
+        tex(26, wgpu::TextureViewDimension::D2),
+        wgpu::BindGroupLayoutEntry {
+            binding: 27,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        },
     ]
 }
 
@@ -419,7 +507,7 @@ fn storage_fs(binding: u32) -> wgpu::BindGroupLayoutEntry {
 }
 
 impl SceneBinds {
-    pub fn entries(&self) -> [wgpu::BindGroupEntry<'_>; 11] {
+    pub fn entries(&self) -> [wgpu::BindGroupEntry<'_>; 15] {
         [
             wgpu::BindGroupEntry { binding: 6, resource: self.scene_ub.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&self.trans) },
@@ -430,8 +518,12 @@ impl SceneBinds {
             wgpu::BindGroupEntry { binding: 12, resource: self.shadow_ub.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(&self.shadow) },
             wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::Sampler(&self.shadow_cmp) },
+            wgpu::BindGroupEntry { binding: 24, resource: wgpu::BindingResource::TextureView(&self.water_a) },
+            wgpu::BindGroupEntry { binding: 25, resource: wgpu::BindingResource::TextureView(&self.water_b) },
             wgpu::BindGroupEntry { binding: 22, resource: self.lights.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 23, resource: self.light_grid.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 26, resource: wgpu::BindingResource::TextureView(&self.cloud_noise) },
+            wgpu::BindGroupEntry { binding: 27, resource: wgpu::BindingResource::Sampler(&self.repeat) },
         ]
     }
 }
@@ -451,6 +543,8 @@ struct Post {
 /// The GPU side: tables, state, passes.
 pub struct Atmosphere {
     pub binds: SceneBinds,
+    water_tex: [wgpu::Texture; 2],
+    water_box: [f32; 4],
     _ms: wgpu::TextureView,
     hist: wgpu::Buffer,
     bgl_post: wgpu::BindGroupLayout,
@@ -723,7 +817,23 @@ impl Atmosphere {
         let fs_down = rp("fs_down", HDR_FMT);
         let fs_up = rp("fs_up", HDR_FMT);
         let fs_tonemap = rp("fs_tonemap", DISPLAY_FMT);
+        // the water maps, zeroed (not loaded) until `set_water_maps`
+        let water_tex = [0, 1].map(|_| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("water maps"),
+                size: wgpu::Extent3d { width: WATER_W as u32, height: WATER_H as u32, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        });
+        let water_views = [0, 1].map(|k| water_tex[k].create_view(&Default::default()));
         Atmosphere {
+            water_tex,
+            water_box: [0.0; 4],
             t0: std::time::Instant::now(),
             binds: SceneBinds {
                 scene_ub,
@@ -735,6 +845,8 @@ impl Atmosphere {
                 shadow_ub: shadows.ub.clone(),
                 shadow: shadows.array.clone(),
                 shadow_cmp: shadows.cmp.clone(),
+                water_a: water_views[0].clone(),
+                water_b: water_views[1].clone(),
                 // zeroed: a grid of 0 cells, no lights
                 lights: device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("placed lights"),
@@ -747,6 +859,35 @@ impl Atmosphere {
                     size: (crate::lights::GRID_WORDS * 4) as u64,
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
+                }),
+                cloud_noise: {
+                    use wgpu::util::DeviceExt;
+                    let texels = cloud_noise_texels();
+                    device
+                        .create_texture_with_data(
+                            queue,
+                            &wgpu::TextureDescriptor {
+                                label: Some("cloud noise"),
+                                size: wgpu::Extent3d { width: CLOUD_TEX, height: CLOUD_TEX, depth_or_array_layers: 1 },
+                                mip_level_count: 1,
+                                sample_count: 1,
+                                dimension: wgpu::TextureDimension::D2,
+                                format: wgpu::TextureFormat::R16Float,
+                                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                                view_formats: &[],
+                            },
+                            wgpu::util::TextureDataOrder::LayerMajor,
+                            bytemuck::cast_slice(&texels),
+                        )
+                        .create_view(&Default::default())
+                },
+                repeat: device.create_sampler(&wgpu::SamplerDescriptor {
+                    label: Some("repeat"),
+                    address_mode_u: wgpu::AddressMode::Repeat,
+                    address_mode_v: wgpu::AddressMode::Repeat,
+                    mag_filter: wgpu::FilterMode::Linear,
+                    min_filter: wgpu::FilterMode::Linear,
+                    ..Default::default()
                 }),
             },
             _ms: ms,
@@ -779,7 +920,22 @@ impl Atmosphere {
         }
     }
 
-    /// Write the frame's scene values; `None` keeps the model viewer's own light.
+    /// Uploads the water maps (ground height, fog scattering and
+    /// extinction), resampled to the textures' size. `ground` (world x, y
+    /// to a height) fills the ground where the water height map has none.
+    pub fn set_water_maps(&mut self, queue: &wgpu::Queue, m: &sixng_core::water::ViewMaps, ground: Option<&dyn Fn(f32, f32) -> Option<f32>>) {
+        let (a, b) = water_texels(m, ground);
+        for (t, d) in self.water_tex.iter().zip([a, b]) {
+            queue.write_texture(
+                t.as_image_copy(),
+                bytemuck::cast_slice(&d),
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(WATER_W as u32 * 8), rows_per_image: None },
+                wgpu::Extent3d { width: WATER_W as u32, height: WATER_H as u32, depth_or_array_layers: 1 },
+            );
+        }
+        self.water_box = m.world_box;
+    }
+
     /// Uploads the placed lights near the camera (from `lights::pack`); an
     /// empty grid turns them off.
     pub fn set_lights(&self, queue: &wgpu::Queue, lights: &[crate::lights::GpuLight], grid: &[u32]) {
@@ -791,6 +947,7 @@ impl Atmosphere {
         queue.write_buffer(&self.binds.light_grid, 0, bytemuck::cast_slice(grid));
     }
 
+    /// Write the frame's scene values; `None` keeps the model viewer's own light.
     pub fn update(&mut self, queue: &wgpu::Queue, sky: Option<&Sky>, view_proj: Mat4, cam: Vec3, size: [u32; 2], dt: f32) {
         let Some(sky) = sky else {
             queue.write_buffer(&self.binds.scene_ub, 0, bytemuck::bytes_of(&SceneU::default()));
@@ -799,6 +956,7 @@ impl Atmosphere {
         let mut u = sky.u;
         u.radii[2] = (cam.y * 0.001).max(0.0);
         u.water4[3] = self.t0.elapsed().as_secs_f32();
+        u.water5 = self.water_box;
         u.radii[3] = ap_depth(u.radii[0], u.radii[2]);
         u.expo2[3] = dt.clamp(0.0, 0.25);
         u.post2[0] = if self.reset > 0 { 1.0 } else { 0.0 };
@@ -957,7 +1115,7 @@ mod tests {
     #[test]
     fn scene_layout() {
         // 20 vec4, flags, a matrix, the camera
-        assert_eq!(std::mem::size_of::<super::SceneU>(), 21 * 16 + 64 + 16 + 5 * 16);
+        assert_eq!(std::mem::size_of::<super::SceneU>(), 21 * 16 + 64 + 16 + 8 * 16);
     }
 
     #[test]
@@ -984,5 +1142,120 @@ mod tests {
         assert!(!noon.key_is_moon && noon.key_dir.y > 0.8);
         let night = super::Sky::fallback(1.0);
         assert!(night.key_is_moon && night.key_dir.y > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod cloud_noise_tests {
+    use super::*;
+
+    /// The baked noise repeats every period: an octave's lattice wraps, so
+    /// a point and the same point one period on give the same value.
+    #[test]
+    fn cloud_noise_tiles() {
+        let per = CLOUD_PERIOD as f32;
+        let fbm = |mut x: f32, mut y: f32| {
+            let (mut f, mut a, mut p) = (0.0, 0.5, per);
+            for _ in 0..4 {
+                f += a * cloud_vnoise(x, y, p);
+                x = x * 2.0 + 17.1;
+                y = y * 2.0 + 9.2;
+                a *= 0.5;
+                p *= 2.0;
+            }
+            f
+        };
+        for k in 0..50 {
+            let (x, y) = (k as f32 * 0.613, k as f32 * 0.371);
+            assert!((fbm(x, y) - fbm(x + per, y)).abs() < 1e-3);
+            assert!((fbm(x, y) - fbm(x, y + per)).abs() < 1e-3);
+        }
+        let t = cloud_noise_texels();
+        assert_eq!(t.len(), (CLOUD_TEX * CLOUD_TEX) as usize);
+        // the noise sum spreads over about 0.2 to 0.8 (the threshold's range)
+        let v: Vec<f32> = t.iter().step_by(997).map(|&h| f32::from_bits((((h as u32) >> 10) + 127 - 15) << 23 | ((h as u32) & 0x3ff) << 13)).collect();
+        let (lo, hi) = v.iter().fold((1.0f32, 0.0f32), |(a, b), &x| (a.min(x), b.max(x)));
+        assert!(lo < 0.3 && hi > 0.7 && lo > 0.0, "{lo} {hi}");
+    }
+}
+
+/// Size of the water map textures (the water height map's fallback: 16 m
+/// per texel over the 16 x 33 km grid).
+const WATER_W: usize = 1024;
+const WATER_H: usize = 2112;
+
+/// An f32 as IEEE half-float bits (round to nearest; overflow to inf).
+pub fn f16_bits(v: f32) -> u16 {
+    let b = v.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32;
+    let man = b & 0x7f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if man != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = (man | 0x80_0000) >> (1 - e);
+        return sign | ((m + 0x1000) >> 13) as u16;
+    }
+    let h = ((e as u32) << 10) | (man >> 13);
+    // round to nearest (carry may bump the exponent, which is right)
+    (sign as u32 | (h + ((man >> 12) & 1))) as u16
+}
+
+/// The two water textures' texels (RGBA half floats): A = height,
+/// scattering x 1000; B = extinction x 1000, 1.
+fn water_texels(m: &sixng_core::water::ViewMaps, ground: Option<&dyn Fn(f32, f32) -> Option<f32>>) -> (Vec<u16>, Vec<u16>) {
+    let [bx0, by0, bx1, by1] = m.world_box;
+    let at = |im: &sixng_core::water::Image, x: usize, y: usize, c: usize| {
+        let (ix, iy) = ((x * im.w / WATER_W).min(im.w - 1), (y * im.h / WATER_H).min(im.h - 1));
+        im.at(ix, iy, c.min(im.ch - 1))
+    };
+    let mut a = Vec::with_capacity(WATER_W * WATER_H * 4);
+    let mut b = Vec::with_capacity(WATER_W * WATER_H * 4);
+    for y in 0..WATER_H {
+        for x in 0..WATER_W {
+            // no height in the water height map (-300: the coasts the map
+            // leaves out, the open sea): the caller's ground where it has one
+            let mut h = at(&m.height, x, y, 0);
+            if h < -250.0 {
+                let wx = bx0 + (x as f32 + 0.5) / WATER_W as f32 * (bx1 - bx0);
+                let wy = by1 - (y as f32 + 0.5) / WATER_H as f32 * (by1 - by0);
+                if let Some(g) = ground.and_then(|f| f(wx, wy)) {
+                    h = g;
+                }
+            }
+            a.push(f16_bits(h));
+            for c in 0..3 {
+                a.push(f16_bits(at(&m.scattering, x, y, c) * 1000.0));
+            }
+            for c in 0..3 {
+                b.push(f16_bits(at(&m.extinction, x, y, c) * 1000.0));
+            }
+            b.push(f16_bits(1.0));
+        }
+    }
+    (a, b)
+}
+
+#[cfg(test)]
+mod water_map_tests {
+    #[test]
+    fn half_floats() {
+        use super::f16_bits;
+        assert_eq!(f16_bits(0.0), 0);
+        assert_eq!(f16_bits(1.0), 0x3c00);
+        assert_eq!(f16_bits(-2.0), 0xc000);
+        assert_eq!(f16_bits(65504.0), 0x7bff);
+        assert_eq!(f16_bits(1e6), 0x7c00);
+        assert_eq!(f16_bits(-300.0), 0xdcb0);
+        // smallest subnormal
+        assert_eq!(f16_bits(5.96e-8), 1);
     }
 }

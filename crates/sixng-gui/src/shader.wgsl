@@ -87,6 +87,11 @@ struct Shadow {
 @group(0) @binding(13) var t_shadow: texture_depth_2d_array;
 @group(0) @binding(14) var samp_shadow: sampler_comparison;
 
+// The water maps (atmo.rs `set_water_maps`): A = ground height (m) and the
+// water fog's scattering (rgb), B = its extinction (rgb) and 1 where
+// loaded; both in the timecycle's units, over the box S.water5.
+@group(0) @binding(24) var t_water_a: texture_2d<f32>;
+@group(0) @binding(25) var t_water_b: texture_2d<f32>;
 // The map's placed lights near the camera (lights.rs): the lights, and a
 // grid over them (header: origin x, z and cell size as f32 bits, cells per
 // side; per cell the first index and count; then the index list).
@@ -148,10 +153,69 @@ fn sun_shadow(p: vec3<f32>) -> f32 {
     return 1.0;
 }
 
-// share of a baked map tile's colour taken as the ground's reflectance
-const TILE_ALBEDO: f32 = 0.6;
+fn ground_hash(p: vec2<f32>) -> f32 {
+    let q = fract(p * vec2(0.1031, 0.1030));
+    let d = dot(q, q.yx + 33.33);
+    return fract((q.x + q.y) * (q.x + d));
+}
+
+fn ground_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(ground_hash(i), ground_hash(i + vec2(1.0, 0.0)), u.x),
+               mix(ground_hash(i + vec2(0.0, 1.0)), ground_hash(i + vec2(1.0, 1.0)), u.x), u.y);
+}
+
+// Reflectance of made-up ground at p (world, true height) with normal n:
+// sand near the sea, dry grass and scrub inland, darker woods in patches,
+// rock on steep slopes (our choice: the map tiles hold no ground types).
+fn filled_ground(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    let big = ground_noise(p.xz / 380.0);
+    let mid = ground_noise(p.xz / 60.0 + 7.3);
+    let fine = ground_noise(p.xz / 23.0 + 3.1);
+    let sand = vec3(0.42, 0.36, 0.25);
+    let grass = vec3(0.17, 0.19, 0.09);
+    let scrub = vec3(0.12, 0.13, 0.07);
+    let woods = vec3(0.06, 0.08, 0.04);
+    let rock = vec3(0.24, 0.22, 0.19);
+    var c = mix(grass, scrub, smoothstep(0.35, 0.65, mid));
+    c = mix(c, woods, smoothstep(0.55, 0.7, big) * 0.85);
+    // the beach band just above the sea
+    c = mix(sand, c, smoothstep(-2.5, 0.5, p.y + (mid - 0.5) * 2.0));
+    c = mix(c, rock, smoothstep(0.3, 0.5, 1.0 - n.y));
+    return c * (0.88 + 0.24 * fine);
+}
+
+// The map bake's colour by height (mapbake `hypso`, sRGB 0 to 1).
+fn tile_hypso(z: f32) -> vec3<f32> {
+    var zs = array<f32, 7>(-50.0, 0.0, 15.0, 60.0, 150.0, 350.0, 800.0);
+    var cs = array<vec3<f32>, 7>(
+        vec3(0.20, 0.35, 0.55), vec3(0.55, 0.60, 0.45), vec3(0.50, 0.62, 0.38),
+        vec3(0.62, 0.66, 0.42), vec3(0.70, 0.62, 0.45), vec3(0.62, 0.55, 0.48),
+        vec3(0.95, 0.95, 0.95));
+    for (var k = 0; k < 6; k++) {
+        if (z <= zs[k + 1]) {
+            return mix(cs[k], cs[k + 1], clamp((z - zs[k]) / (zs[k + 1] - zs[k]), 0.0, 1.0));
+        }
+    }
+    return cs[6];
+}
+
+// Relief factor (about 1 on flat ground) from a tile texel (linear) at
+// height z: the bake's hill shade (0.35 to 1.1, 0.85 on the flat).
+fn tile_relief(tile: vec3<f32>, z: f32) -> f32 {
+    let srgb = pow(max(tile, vec3(0.0)), vec3(1.0 / 2.2));
+    let h = tile_hypso(z);
+    let shade = dot(srgb, vec3(0.3, 0.6, 0.1)) / max(dot(h, vec3(0.3, 0.6, 0.1)), 0.05);
+    return mix(1.0, clamp(shade / 0.85, 0.4, 1.4), 0.5);
+}
+
 // how far the map's terrain is drawn under its real height (world3d SINK, m)
 const TILE_SINK: f32 = 1.5;
+// Terrain cells without a height stand at -2 m (world3d WATER_Z); a bed
+// height at or above this is that fill, not a height.
+const TILE_NO_HEIGHT: f32 = -2.5;
 
 // radius (km from the planet centre) of a world point (m, y up)
 fn point_r(p: vec3<f32>) -> f32 {
@@ -165,15 +229,157 @@ fn sun_e(p: vec3<f32>) -> vec3<f32> {
     return sun_e_shadowed(p, sun_shadow(p));
 }
 
-// The light of `sun_e` with the shadow `sh` already looked up.
+// The light of `sun_e` with the shadow `sh` already looked up; the
+// clouds' shadow is added here.
 fn sun_e_shadowed(p: vec3<f32>, sh: f32) -> vec3<f32> {
     if (!hdr()) { return F.sun_col.rgb * F.sun_dir.w * 3.0; }
+    let l = normalize(F.sun_dir.xyz);
+    return key_e(p) * sh * cloud_shadow(p, l);
+}
+
+// The key light (sun or moon) at p through the air, unshadowed.
+fn key_e(p: vec3<f32>) -> vec3<f32> {
     let r = point_r(p);
     let l = normalize(F.sun_dir.xyz);
     if (dot(l, S.moon.xyz) > 0.99) {
-        return S.moon_dir_e.rgb * transmittance(r, S.moon.y) * sh;
+        return S.moon_dir_e.rgb * transmittance(r, S.moon.y);
     }
-    return S.sun_dir_e.rgb * transmittance(r, S.sun.y) * sh;
+    return S.sun_dir_e.rgb * transmittance(r, S.sun.y);
+}
+
+// ---- clouds: one cumulus layer between S.cloud0.y and .z (world y), its
+// cover a drifting noise field thresholded by the weather's cloud cover;
+// optical depth along a ray from a few samples through the layer.
+
+fn cloud_hash(p: vec2<f32>) -> f32 {
+    let q = fract(p * vec2(0.1031, 0.1030));
+    let d = dot(q, q.yx + 33.33);
+    return fract((q.x + q.y) * (q.x + d));
+}
+
+// The cover noise: four octaves of value noise baked once (atmo.rs) into a
+// texture that repeats every CLOUD_PERIOD noise cells.
+@group(0) @binding(26) var t_cloud_noise: texture_2d<f32>;
+@group(0) @binding(27) var rep_lin: sampler;
+const CLOUD_PERIOD: f32 = 32.0;
+
+// Cloud density (0 to 1) of the column over world (x, z).
+fn cloud_density(xz: vec2<f32>) -> f32 {
+    let cover = S.cloud0.x;
+    if (cover <= 0.01) { return 0.0; }
+    let q = (xz - S.cloud1.xy * S.water4.w) / S.cloud1.w;
+    let f = textureSampleLevel(t_cloud_noise, rep_lin, q / CLOUD_PERIOD, 0.0).r;
+    // more cover lowers the threshold; the noise sum is about 0.2 to 0.8
+    let t = mix(0.74, 0.18, cover);
+    return smoothstep(t, t + 0.3, f);
+}
+
+// Cloud density (0 to 1) at world point p: the column's cover gives the
+// cloud's height, a flat base and a rounded top (cumulus), so a cloud is a
+// body and not a flat sheet seen edge on.
+fn cloud_density3(p: vec3<f32>) -> f32 {
+    let c = cloud_density(p.xz);
+    if (c <= 0.0) { return 0.0; }
+    let h = (p.y - S.cloud0.y) / max(S.cloud0.z - S.cloud0.y, 1.0);
+    // a dome: the top rises with the square root of the cover, so the
+    // sides are steep and the top round (not a cone)
+    let top = 0.25 + 0.75 * sqrt(c);
+    let dome = 1.0 - smoothstep(top * 0.7, top, h);
+    // the base rises where the cloud thins out, so its edges are lenses and
+    // not curtains down to the layer's floor
+    let base = 0.3 * (1.0 - c);
+    // thinning out to nothing at the cloud's rim (no hard edge)
+    return (0.4 + 0.6 * c) * smoothstep(0.0, 0.08, c) * smoothstep(base, base + 0.06, h) * dome;
+}
+
+// Samples along a ray through the cloud layer: one per CLOUD_STEP_M of
+// path, from 8 to CLOUD_STEPS (each pixel starts at its own offset, so the
+// steps do not show as slices).
+const CLOUD_STEPS: i32 = 48;
+// The same for the ground seen through the layer (every surface fragment).
+const CLOUD_STEPS_GROUND: i32 = 10;
+const CLOUD_STEP_M: f32 = 120.0;
+// farther out a step is this share of its distance from the eye (a far
+// cloud is small on screen)
+const CLOUD_DT_FAR: f32 = 0.04;
+
+// Light scattered towards the eye by the clouds along a ray from o in
+// direction d up to tmax (rgb), and the ray's transmittance through them (a).
+// `max_steps`: at most this many samples (fewer for the ground behind the
+// layer than for the sky); `px`: the pixel (target pixels), whose place in
+// a gradient pattern sets where in the first step the samples start.
+fn clouds_along(o: vec3<f32>, d: vec3<f32>, tmax: f32, max_steps: i32, px: vec2<f32>) -> vec4<f32> {
+    if (!hdr() || S.cloud0.x <= 0.01) { return vec4(0.0, 0.0, 0.0, 1.0); }
+    let y0 = S.cloud0.y;
+    let y1 = S.cloud0.z;
+    var t0 = 0.0;
+    var t1 = tmax;
+    if (abs(d.y) < 1e-4) {
+        if (o.y < y0 || o.y > y1) { return vec4(0.0, 0.0, 0.0, 1.0); }
+    } else {
+        let ta = (y0 - o.y) / d.y;
+        let tb = (y1 - o.y) / d.y;
+        t0 = max(min(ta, tb), 0.0);
+        t1 = min(max(ta, tb), tmax);
+    }
+    t1 = min(t1, 40000.0);
+    if (t1 <= t0) { return vec4(0.0, 0.0, 0.0, 1.0); }
+    let len = t1 - t0;
+    let steps = clamp(i32(ceil(len / CLOUD_STEP_M)), min(8, max_steps), max_steps);
+    // the pixel's start in the first step: interleaved gradient noise with
+    // a little white noise (each alone shows: one as grain, the other as a
+    // diagonal hatch)
+    let jit = fract(ign(px) + 0.35 * cloud_hash(px * 1.37));
+    let l = normalize(F.sun_dir.xyz);
+    let lup = smoothstep(-0.05, 0.05, l.y);
+    let c = dot(d, l);
+    let g = 0.6;
+    let ph = 0.7 * (1.0 - g * g) / (4.0 * PI * pow(1.0 + g * g - 2.0 * g * c, 1.5)) + 0.3 / (4.0 * PI);
+    let amb = sky_ambient(vec3(0.0, 1.0, 0.0));
+    let sig = S.cloud0.w;
+    var tr = 1.0;
+    var lit = vec3(0.0);
+    // the whole path is sampled, with steps growing with the distance from
+    // the eye: CLOUD_STEP_M plus a share of the distance, the share raised
+    // when the samples would not reach the path's end (a long grazing path
+    // still reaches the clouds near the horizon, and its near steps stay
+    // short)
+    let c0 = CLOUD_STEP_M / CLOUD_DT_FAR;
+    let grow = max(CLOUD_DT_FAR, pow((t1 + c0) / (t0 + c0), 1.0 / f32(steps)) - 1.0);
+    var t = t0;
+    for (var k = 0; k < steps; k++) {
+        let dt = (t + c0) * grow;
+        let tk = t + jit * dt;
+        t += dt;
+        if (tk > t1) { break; }
+        let p = o + d * tk;
+        let dens = cloud_density3(p);
+        if (dens <= 0.0) { continue; }
+        let od = dens * sig * dt;
+        let st = exp(-od);
+        // the key light through the cloud above this point (towards the
+        // light, to the column's top), darker in a deep cloud's base
+        let h = clamp((p.y - y0) / max(y1 - y0, 1.0), 0.0, 1.0);
+        let above = cloud_density(p.xz + l.xz * ((y1 - p.y) * 0.5 / max(l.y, 0.08)));
+        let t_key = exp(-above * sig * (y1 - y0) * (1.0 - h) * 0.6 / max(l.y, 0.08)) * lup;
+        let powder = 1.0 - exp(-2.0 * od * 4.0);
+        let s_in = key_e(p) * t_key * ph * (0.5 + 0.5 * powder) * 4.0 + amb * (0.45 + 0.35 * h + 0.2 * t_key);
+        lit += tr * s_in * (1.0 - st);
+        tr *= st;
+        if (tr < 0.01) { break; }
+    }
+    if (tr > 0.999) { return vec4(0.0, 0.0, 0.0, 1.0); }
+    return vec4(lit, tr);
+}
+
+// Share of the key light reaching p past the clouds (their shadow).
+fn cloud_shadow(p: vec3<f32>, l: vec3<f32>) -> f32 {
+    if (S.cloud0.x <= 0.01 || l.y < 0.02) { return 1.0; }
+    let mid = 0.5 * (S.cloud0.y + S.cloud0.z);
+    if (p.y > S.cloud0.z) { return 1.0; }
+    let t = (mid - p.y) / l.y;
+    let d = cloud_density(p.xz + l.xz * t);
+    return exp(-d * S.cloud0.w * (S.cloud0.z - S.cloud0.y) * 0.5 / max(l.y, 0.15));
 }
 
 // Sky irradiance / pi on a surface facing n (ambient cube from the sky-view LUT).
@@ -301,12 +507,66 @@ fn footprint(p: vec3<f32>) -> f32 {
 
 // Radiance leaving the water surface at p towards the camera; `fp` from
 // `footprint` (taken in uniform control flow by the caller).
-fn water_shade(p: vec3<f32>, fp: f32) -> vec3<f32> {
+// Scale from the timecycle's water units to coefficients per metre (atmo.rs
+// K_WATER).
+const K_WATER: f32 = 0.03;
+// The sea's surface height (world y, m) for the depth over the seabed: the
+// beaches and dunes reach down to about -4 m (world3d SEA_FLOOR); our
+// choice, not decoded.
+const SEA_LEVEL: f32 = -4.0;
+// Below this height a water surface is the sea plane (world3d, drawn under
+// the terrain), whose water stands at SEA_LEVEL.
+const SEA_PLANE_BELOW: f32 = -6.0;
+// Reflectance of the bed under shallow water (sand and mud; our choice).
+const BED_ALBEDO: vec3<f32> = vec3(0.22, 0.20, 0.15);
+
+struct WaterHere {
+    ground: f32,
+    scat: vec3<f32>,
+    ext: vec3<f32>,
+    ok: bool,
+};
+
+// The water maps at world point p (none outside them or before they load).
+fn water_here(p: vec3<f32>) -> WaterHere {
+    var w: WaterHere;
+    w.ok = false;
+    let b = S.water5;
+    if (b.z <= b.x || b.w <= b.y) { return w; }
+    // world (x, up, -y) to the map's x, y
+    let uv = vec2((p.x - b.x) / (b.z - b.x), (b.w + p.z) / (b.w - b.y));
+    if (any(uv < vec2(0.0)) || any(uv > vec2(1.0))) { return w; }
+    let a = textureSampleLevel(t_water_a, lin_clamp, uv, 0.0);
+    let e = textureSampleLevel(t_water_b, lin_clamp, uv, 0.0);
+    w.ground = a.x;
+    w.scat = a.yzw;
+    w.ext = e.rgb;
+    // no height (the open sea): the timecycle's water, as before the maps
+    w.ok = e.a > 0.5 && a.x > -250.0;
+    return w;
+}
+
+// `surf`: the water surface's height (world y) for the depth over the bed;
+// `bed`: the bed's height where the caller knows it (the terrain's 8 m
+// heights), else below NO_BED (the water height map's is taken).
+const NO_BED: f32 = -9000.0;
+// The water's own height over the opaque surface seen through it at this
+// pixel (m, from the scene's depth; below 0: not known). Set by the blended
+// draws' entry (fs_mesh_blend) for the map's water.
+var<private> scene_under: f32 = -1.0;
+// `edge`: 0 to 1 on the coastline the caller knows (the terrain's land to
+// sea cells), where the sea surfs whatever the depth data says.
+fn water_shade(p: vec3<f32>, fp: f32, surf: f32, bed: f32, edge: f32) -> vec3<f32> {
     let o = F.cam_pos.xyz;
     let dist = length(o - p);
     let v = (o - p) / max(dist, 1e-3);
-    let sn = sea_normal(p, fp);
+    // inland water (lakes, marsh, canals: a surface above the sea's) has
+    // short fetch: its waves are shorter and flatter than the open sea's
+    let inland = surf > SEA_LEVEL + 0.5;
+    let wscale = select(1.0, INLAND_WAVES, inland);
+    let sn = sea_normal(p / wscale, fp / wscale);
     var n = sn.xyz;
+    if (inland) { n = normalize(mix(vec3(0.0, 1.0, 0.0), n, INLAND_SLOPE)); }
     if (dot(n, v) < 0.02) { n = normalize(n + v * (0.02 - dot(n, v))); }
     let var_micro = (1.0 - WAVE_SHARE) * max(S.water1.w, 0.003) + sn.w;
     let a = clamp(sqrt(2.0 * var_micro) + S.water3.w, SEA_MIN_ROUGH, 0.8);
@@ -332,10 +592,91 @@ fn water_shade(p: vec3<f32>, fp: f32) -> vec3<f32> {
     let glint = D * G * fh / max(4.0 * ndl * ndv, 1e-3) * sun * ndl;
     // the water body: light going down, scattered back up (a third of
     // the single-scattering albedo, the usual ocean-colour rule)
-    let ssa = S.water1.rgb / max(S.water0.rgb, vec3(1e-5));
-    let e_down = sun * max(l.y, 0.0) * 0.98 + PI * sky_ambient(vec3(0.0, 1.0, 0.0));
-    let body = 0.33 * ssa * e_down / PI * S.water3.rgb;
-    return fr * refl + glint + (1.0 - fr) * body;
+    var ssa = S.water1.rgb / max(S.water0.rgb, vec3(1e-5));
+    let e_down = sun * max(l.y, 0.0) * 0.98 + PI * sky_ambient(vec3(0.0, 1.0, 0.0)) + local_e(p, vec3(0.0, 1.0, 0.0));
+    // the place's own water (the fog atlas) and the bed under it (the
+    // water height map): light reaching the bed and coming back through
+    // the water adds the bed's colour where the water is shallow
+    let wh = water_here(p);
+    var body = vec3(0.0);
+    var foam = 0.0;
+    if (wh.ok) {
+        ssa = clamp(wh.scat / max(wh.ext, vec3(1e-5)), vec3(0.0), vec3(1.0));
+        let depth = max(surf - select(wh.ground, bed, bed > NO_BED), 0.0);
+        // the view ray refracted into the water (n = 1.33)
+        let mu = sqrt(max(1.0 - (1.0 - ndv * ndv) / 1.7689, 0.04));
+        let t = exp(-wh.ext * K_WATER * depth * (1.0 + 1.0 / mu));
+        let deep = 0.33 * ssa * e_down / PI * S.water3.rgb;
+        body = mix(deep, BED_ALBEDO * e_down / PI, t);
+        // surf where the sea turns shallow: bands rolling in towards the
+        // shallower water, broken up along the shore (inland water has no surf)
+        // the sea's water shows only where the bed is over SURF_HIDDEN deep
+        // (shallower, the terrain stands above the sea plane): the surf
+        // starts at the water's visible edge
+        let shore = 1.0 - smoothstep(0.0, FOAM_DEPTH, max(depth - SURF_HIDDEN, 0.0));
+        if (shore > 0.0 && !inland) {
+            let tm = S.water4.w;
+            let brk = foam_noise(p.xz * 0.35 + vec2(tm * 0.05, 0.0)) * foam_noise(p.xz * 0.09 - vec2(0.0, tm * 0.02));
+            let band = pow(0.5 + 0.5 * sin(depth * 4.5 + tm * 1.3 + 6.0 * foam_noise(p.xz * 0.05)), 5.0);
+            foam = clamp(shore * (0.35 + 0.65 * band) * (0.5 + 1.0 * brk), 0.0, 1.0);
+        }
+    } else {
+        body = 0.33 * ssa * e_down / PI * S.water3.rgb;
+    }
+    if (edge > 0.0 && !inland) {
+        let tm = S.water4.w;
+        let brk = foam_noise(p.xz * 0.35 + vec2(tm * 0.05, 0.0)) * foam_noise(p.xz * 0.09 - vec2(0.0, tm * 0.02));
+        foam = max(foam, clamp(edge * (0.45 + 1.1 * brk), 0.0, 1.0));
+    }
+    // surf where the water is shallow over the surface drawn under it (a
+    // beach mesh running down into the sea plane): measured against the
+    // scene's depth, so it follows the visible waterline wherever the land
+    // comes from
+    if (scene_under >= 0.0 && !inland) {
+        let tm = S.water4.w;
+        let brk = foam_noise(p.xz * 0.35 + vec2(tm * 0.05, 0.0)) * foam_noise(p.xz * 0.09 - vec2(0.0, tm * 0.02));
+        // the sea plane lies just over a gently sloping bed along many
+        // beaches, so the foam keeps to the top SCENE_FOAM_DEPTH of water (a
+        // few metres from the waterline, not the whole shelf)
+        let band = pow(0.5 + 0.5 * sin(scene_under * 12.0 - tm * 1.3 + 6.0 * foam_noise(p.xz * 0.05)), 5.0);
+        let s = 1.0 - smoothstep(0.0, SCENE_FOAM_DEPTH, scene_under);
+        // a thin line of foam right at the waterline, broken bands farther out
+        let line = 1.0 - smoothstep(0.0, 0.08, scene_under);
+        foam = max(foam, clamp(0.6 * s * band * (0.4 + 1.0 * brk) + line * (0.3 + 0.5 * brk), 0.0, 1.0));
+    }
+    let water = fr * refl + glint + (1.0 - fr) * body;
+    return mix(water, FOAM_ALBEDO * e_down / PI, foam * 0.85);
+}
+
+// Inland water's waves against the sea's: length and slope (our choice).
+const INLAND_WAVES: f32 = 0.15;
+const INLAND_SLOPE: f32 = 0.35;
+
+// Depth (m) under which the water foams, and the foam's reflectance (our
+// choices).
+const FOAM_DEPTH: f32 = 1.6;
+// Depth of the sea's water where it first shows past the terrain (m): the
+// sea plane lies at SEA_LEVEL - 2.5 and the terrain 1.5 m under its height
+// (world3d), so the bed shows above it down to 1 m under the sea's level.
+const SURF_HIDDEN: f32 = 1.0;
+const FOAM_ALBEDO: f32 = 0.75;
+// Depth over the surface seen through the water (m) under which the
+// waterline's surf shows (our choice).
+const SCENE_FOAM_DEPTH: f32 = 0.5;
+
+fn foam_hash(p: vec2<f32>) -> f32 {
+    let q = fract(p * vec2(0.1031, 0.1030));
+    let d = dot(q, q.yx + 33.33);
+    return fract((q.x + q.y) * (q.x + d));
+}
+
+// Smooth value noise (0 to 1) for the foam.
+fn foam_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(foam_hash(i), foam_hash(i + vec2(1.0, 0.0)), u.x),
+               mix(foam_hash(i + vec2(0.0, 1.0)), foam_hash(i + vec2(1.0, 1.0)), u.x), u.y);
 }
 
 // The map's frame: aerial perspective (froxel volume), height fog, then
@@ -348,6 +689,9 @@ fn map_finish(col0: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
     let c = F.view_proj * vec4(p, 1.0);
     let ndc = c.xy / max(c.w, 1e-6);
     let uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    // clouds between the eye and the surface
+    let cl = clouds_along(o, v / max(length(v), 1e-3), length(v), CLOUD_STEPS_GROUND, uv * F.frame.yz);
+    col = col * cl.a + cl.rgb;
     let z = sqrt(clamp(d_km / max(S.radii.w, 0.001), 0.0, 1.0));
     var ap = textureSampleLevel(t_ap, lin_clamp, vec3(uv, max(z - 0.5 / AP_N, 0.5 / AP_N)), 0.0);
     // nearer than the first slice: fade in from nothing
@@ -472,6 +816,7 @@ struct VIn {
     @location(12) extra: vec4<f32>, // x skinned, y highlight, z tint code, w unused
     @location(13) tint: vec4<f32>,  // model tint palette colour (linear; white = none)
     @location(14) zone: vec4<u32>,  // x sticker zone, y model of an assembled vehicle
+    @builtin(vertex_index) vi: u32,
 };
 
 struct VOut {
@@ -488,6 +833,8 @@ struct VOut {
     @location(8) lamp: vec3<f32>,
     // sticker zone, model of an assembled vehicle
     @location(9) @interpolate(flat) zone: vec2<u32>,
+    // a strand ribbon's own dither seed (a hash of its point), so overlapping strands keep different samples
+    @location(10) @interpolate(flat) seed: u32,
 };
 
 fn skin_matrix(v: VIn) -> mat4x4<f32> {
@@ -524,6 +871,7 @@ fn mesh_vertex(v: VIn) -> VOut {
     let m = model * sk;
     let w = m * vec4(v.pos, 1.0);
     var o: VOut;
+    o.seed = (v.vi >> 1u) * 0x9e3779b9u;
     o.lamp = lamp;
     var wp = w.xyz;
     var edge = v.tan.w;
@@ -933,6 +1281,40 @@ fn strand_openness(clip: vec4<f32>) -> f32 {
 // the game's strength by roughness.
 // The game's diffuse ambient is darkened by its traced probe lighting, which
 // the viewer does not have.
+// Whether the mirror direction r from wp runs into the drawn scene within a short reach, by a march
+// through the camera depth pre-pass: 1 blocked, 0 open. The game's specular ambient is its traced
+// reflections, which see the body itself where a ray from the skin meets it (under the jaw, the neck);
+// the viewer's surroundings are a plain sky and ground with nothing of the model in them. The march
+// stands in for that trace on screen, with what lies behind the drawn surfaces taken as 2 to 8 cm
+// thick. The first step and the thickness are random per pixel and frame, so that the frame
+// accumulation turns the edges of what one march finds into gradual ones (a fixed march left
+// hard-edged patches, such as on the collarbone from rays reaching the chin).
+fn reflection_blocked(clip: vec4<f32>, wp: vec3<f32>, r: vec3<f32>) -> f32 {
+    if (F.light_vp[3][3] == 0.0) { return 0.0; }
+    let size = F.frame.yz;
+    let j0 = ign(clip.xy + vec2(F.frame.x * 5.23, F.frame.x * 1.91));
+    let j1 = ign(clip.xy * 0.73 + vec2(F.frame.x * 3.37, 29.0));
+    let thick = 0.02 + 0.06 * j1;
+    var t = 0.006 + 0.008 * j0;
+    for (var k = 0; k < 14; k++) {
+        let p = wp + r * t;
+        let c = F.view_proj * vec4(p, 1.0);
+        if (c.w <= 1.0e-4) { return 0.0; }
+        let ndc = c.xyz / c.w;
+        let q = vec2((ndc.x * 0.5 + 0.5) * size.x, (0.5 - ndc.y * 0.5) * size.y);
+        if (q.x < 0.0 || q.y < 0.0 || q.x >= size.x || q.y >= size.y) { return 0.0; }
+        let dep = eye_depth(vec2<i32>(q));
+        if (dep > 0.0) {
+            let w4 = F.inv_view_proj * vec4(ndc.xy, dep, 1.0);
+            let front = (F.view_proj * vec4(w4.xyz / w4.w, 1.0)).w;
+            let behind = c.w - front;
+            if (behind > 0.0 && behind < thick) { return 1.0; }
+        }
+        t = t * 1.3;
+    }
+    return 0.0;
+}
+
 fn screen_occlusion(clip: vec4<f32>, wp: vec3<f32>, n: vec3<f32>) -> f32 {
     if (F.light_vp[3][3] == 0.0) { return 1.0; }
     let size = F.frame.yz;
@@ -1038,8 +1420,38 @@ fn model_sun_shadow(wp: vec3<f32>, dx: vec3<f32>, dy: vec3<f32>) -> f32 {
     return s / 13.0;
 }
 
+// The scene's depth for the blended draws (the opaque pass's, multisampled).
+@group(2) @binding(0) var t_scene_depth: texture_depth_multisampled_2d;
+
+// The height of a water fragment over the opaque surface seen through it
+// (m), from the scene's depth at the pixel (its first sample); -1 where
+// nothing lies behind it, or where that sample holds something in front of
+// the water (an edge of a nearer object).
+fn scene_under_at(clip: vec4<f32>, wy: f32) -> f32 {
+    let sz = vec2<i32>(textureDimensions(t_scene_depth)) - 1;
+    let d = textureLoad(t_scene_depth, clamp(vec2<i32>(clip.xy), vec2(0), sz), 0);
+    if (d <= 0.0 || d > clip.z) { return -1.0; }
+    let uv = clip.xy / vec2<f32>(textureDimensions(t_scene_depth));
+    let q = F.inv_view_proj * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0);
+    return max(wy - q.y / q.w, 0.0);
+}
+
+// The blended draws: as fs_mesh, the map's water also knowing its depth
+// over the scene under it.
+@fragment
+fn fs_mesh_blend(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {
+    if (hdr() && M.flags.y == 8u && F.mode.x == 0u) {
+        scene_under = scene_under_at(i.clip, i.world.y);
+    }
+    return mesh_out(i, ff);
+}
+
 @fragment
 fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {
+    return mesh_out(i, ff);
+}
+
+fn mesh_out(i: VOut, ff: bool) -> MeshOut {
     var o: MeshOut;
     o.col = mesh_colour(i, ff);
     o.mask = 0xffffffffu;
@@ -1047,7 +1459,10 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {
     // covered share (a dither it averages over frames); here each sample of the pixel is kept or not
     let cov = select(clamp((i.uv1.y - 1.0) * 2.5, 0.0, 1.0), i.uv1.x, i.uv1.y > 1.5);
     if (M.flags.y == 12u && i.uv1.y > 0.5 && cov < 0.999) {
-        let j = fract(dot(i.tint.rgb, vec3(12.9898, 78.233, 37.719))) * 64.0 + F.frame.x * 5.588238;
+        // the game's offset: 5.58824 x ((strand id + frame + 37) & 63), its strand id from the strand's own bits;
+        // here a hash of the ribbon's point (one pattern for every strand would keep the same samples wherever
+        // strands overlap, so a crowd of thin strands never covered more than one of them does)
+        let j = 5.588238 * f32(((i.seed >> 26u) + u32(F.frame.x) + 37u) & 63u);
         var mk = 0u;
         for (var s = 0u; s < 4u; s++) {
             if (cov >= ign(i.clip.xy + vec2(j + f32(s) * 5.588, j + f32(s) * 9.123))) { mk |= 1u << s; }
@@ -1347,8 +1762,11 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
                 let gw = max(textureLoad(t_em, vec2(47, row), 0).a, 1.0 / 255.0);
                 let pu = clamp((clamp(lr + lg + lb, 0.0, 1.0) - gs) / gw, 0.004, 0.996);
                 p_col = textureSampleLevel(t_em, samp, vec2(pu, (id + 1025.5) / RAMP_ROWS), 0.0).rgb;
-                p_rough = textureLoad(t_em, vec2(32, row), 0).a;
-                p_metal = textureLoad(t_em, vec2(33, row), 0).a;
+                // its metalness and roughness, low and high (columns 32,
+                // 33 and 48, 49), blended by the material map as the
+                // first layer's are
+                p_metal = mix(textureLoad(t_em, vec2(32, row), 0).a, textureLoad(t_em, vec2(33, row), 0).a, mat_blend.x);
+                p_rough = mix(textureLoad(t_em, vec2(48, row), 0).a, textureLoad(t_em, vec2(49, row), 0).a, mat_blend.y);
             } else {
                 let t = wear_threshold(wear_amt);
                 k = smoothstep(t, t + 0.08, m.g);
@@ -1493,8 +1911,15 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     // roughness 0.5 upward, so next to none on skin
     let occ_k = max(0.0, 1.0 - 2.0 * rough);
     if (cls != 12u && occ_k > 0.0) { ao_s = ao * (1.0 + occ_k * (screen_occlusion(i.clip, i.world, n) - 1.0)); }
+    // From roughness 0.5 up the cone test is off and only the traced reflections keep the model's own
+    // body out of the mirrored surroundings: where the mirror ray meets the model, what it sees is that
+    // surface in the ambient light (taken with this pixel's colour) instead of the sky and ground.
+    var env_s = env;
+    if (cls != 12u && occ_k == 0.0) {
+        env_s = mix(env, albedo * amb_d, reflection_blocked(i.clip, i.world + n * 0.002, r));
+    }
     // the game applies its horizon occlusion to the specular ambient only (never to diffuse ambient, never to hair)
-    var col = direct * sh * ao_direct + kd * albedo * amb_d * ao + env * fr_v * ao_s + emissive;
+    var col = direct * sh * ao_direct + kd * albedo * amb_d * ao + env_s * fr_v * ao_s + emissive;
     // Sheen (velvet, suede): fibres standing on the surface catch light
     // towards the silhouette. The reflectance is the share seen head-on;
     // the fade sets how fast it grows towards the edge.
@@ -1611,7 +2036,18 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             // just under it don't blotch it at a low sun
             let lsh = normalize(F.sun_dir.xyz);
             let tsh = sun_shadow(i.world + vec3(0.0, TILE_SINK, 0.0) + lsh * 0.5);
-            col = albedo * TILE_ALBEDO * ((sun_e_shadowed(i.world, tsh) * (0.5 + 0.5 * ndl) + local_e(i.world, n)) / 3.14159 + amb_d);
+            // the baked tiles hold only a colour by height and their own hill
+            // shading (mapbake's terrain layer), and filled cells a flat
+            // green: the land is drawn as a ground made up from height, slope
+            // and noise instead, lit by the scene (the tiles' paint still
+            // marks the sea below)
+            let g = filled_ground(i.world + vec3(0.0, TILE_SINK, 0.0), n);
+            // the tiles' hill shading holds relief finer than the terrain
+            // mesh (embankments, pads): its share of the tile's brightness
+            // over the bake's colour for this height, at half strength
+            // (cells filled from the height map have no tile: none)
+            let rel = select(1.0, tile_relief(base.rgb, i.world.y + TILE_SINK), (M.flags.x & 1u) != 0u);
+            col = g * rel * ((sun_e_shadowed(i.world, tsh) * max(ndl, 0.0) + local_e(i.world, n)) / 3.14159 + amb_d);
             // the tiles' painted water (the map's water and no-data colour)
             // is shaded as the game's water on sea cells (no height, or deeper
             // than the beaches: vertex alpha 0, blending over a shore cell); on cells with a
@@ -1619,7 +2055,14 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             let painted = 1.0 - smoothstep(0.02, 0.07, length(base.rgb - TILE_SEA));
             let wet = painted * (1.0 - i.col.a);
             if (wet > 0.0) {
-                col = mix(col, water_shade(i.world, fp), wet);
+                // the bed from the terrain's own heights (finer than the water
+                // height map); cells without a height stand at the land's
+                // fill height, so there the water height map's is taken
+                let tbed = i.world.y + TILE_SINK;
+                // the coastline: the cells' land-to-sea blend (vertex alpha
+                // 1 on land, 0 on sea) surfs on its sea side
+                let edge = smoothstep(0.0, 0.35, i.col.a) * (1.0 - smoothstep(0.35, 0.85, i.col.a));
+                col = mix(col, water_shade(i.world, fp, SEA_LEVEL, select(NO_BED - 1.0, tbed, tbed < TILE_NO_HEIGHT), edge), wet);
             }
         } else {
             col = albedo * (0.55 * F.sun_col.rgb * F.sun_dir.w * (0.35 + 0.65 * ndl) + 0.7 * amb_d);
@@ -1628,7 +2071,7 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
 
     if (hdr() && cls == 8u && F.mode.x == 0u) {
         // the map's water (the sea plane is opaque)
-        col = water_shade(i.world, fp);
+        col = water_shade(i.world, fp, select(i.world.y, SEA_LEVEL, i.world.y < SEA_PLANE_BELOW), NO_BED - 1.0, 0.0);
         alpha = select(0.92, 1.0, M.flags.z == 0u);
     }
     let mode = F.mode.x;
@@ -1750,7 +2193,8 @@ fn fs_sky(i: SOut) -> @location(0) vec4<f32> {
     let d = normalize(b.xyz / b.w - a.xyz / a.w);
     if (hdr()) {
         // the sun disc can pass the HDR target's range
-        return vec4(min(sky(d) * SCN.v[0].x, vec3(30000.0)), 1.0);
+        let cl = clouds_along(F.cam_pos.xyz, d, 1e9, CLOUD_STEPS, i.clip.xy);
+        return vec4(min((sky(d) * cl.a + cl.rgb) * SCN.v[0].x, vec3(30000.0)), 1.0);
     }
     return vec4(aces(sky(d) * F.sky_hor.w), 1.0);
 }
@@ -1905,7 +2349,7 @@ fn fs_cell(i: COut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let env = environment(reflect(-v, n), rough) * F.misc.w;
     var col = direct + kd * albedo * amb_d + env * fr_v + emissive;
     if (hdr() && cls == 8u && F.mode.x == 0u) {
-        col = water_shade(i.world, fp);
+        col = water_shade(i.world, fp, select(i.world.y, SEA_LEVEL, i.world.y < SEA_PLANE_BELOW), NO_BED - 1.0, 0.0);
         alpha = select(0.92, 1.0, amode != 2u);
     }
     let mode = F.mode.x;
