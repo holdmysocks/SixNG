@@ -408,6 +408,10 @@ fn water_here(p: vec3<f32>) -> WaterHere {
 // `bed`: the bed's height where the caller knows it (the terrain's 8 m
 // heights), else below NO_BED (the water height map's is taken).
 const NO_BED: f32 = -9000.0;
+// The water's own height over the opaque surface seen through it at this
+// pixel (m, from the scene's depth; below 0: not known). Set by the blended
+// draws' entry (fs_mesh_blend) for the map's water.
+var<private> scene_under: f32 = -1.0;
 // `edge`: 0 to 1 on the coastline the caller knows (the terrain's land to
 // sea cells), where the sea surfs whatever the depth data says.
 fn water_shade(p: vec3<f32>, fp: f32, surf: f32, bed: f32, edge: f32) -> vec3<f32> {
@@ -481,6 +485,19 @@ fn water_shade(p: vec3<f32>, fp: f32, surf: f32, bed: f32, edge: f32) -> vec3<f3
         let tm = S.water4.w;
         let brk = foam_noise(p.xz * 0.35 + vec2(tm * 0.05, 0.0)) * foam_noise(p.xz * 0.09 - vec2(0.0, tm * 0.02));
         foam = max(foam, clamp(edge * (0.45 + 1.1 * brk), 0.0, 1.0));
+    }
+    // surf where the water is shallow over the surface drawn under it (a
+    // beach mesh running down into the sea plane): measured against the
+    // scene's depth, so it follows the visible waterline wherever the land
+    // comes from
+    if (scene_under >= 0.0 && !inland) {
+        let tm = S.water4.w;
+        let brk = foam_noise(p.xz * 0.35 + vec2(tm * 0.05, 0.0)) * foam_noise(p.xz * 0.09 - vec2(0.0, tm * 0.02));
+        let band = pow(0.5 + 0.5 * sin(scene_under * 4.5 - tm * 1.3 + 6.0 * foam_noise(p.xz * 0.05)), 5.0);
+        let s = 1.0 - smoothstep(0.0, FOAM_DEPTH, scene_under);
+        // a thin line of foam right at the waterline, broken bands farther out
+        let line = 1.0 - smoothstep(0.0, 0.25, scene_under);
+        foam = max(foam, clamp(s * (0.35 + 0.65 * band) * (0.5 + 1.0 * brk) + line * (0.4 + 0.6 * brk), 0.0, 1.0));
     }
     let water = fr * refl + glint + (1.0 - fr) * body;
     return mix(water, FOAM_ALBEDO * e_down / PI, foam * 0.85);
@@ -1218,8 +1235,38 @@ fn model_sun_shadow(wp: vec3<f32>, dx: vec3<f32>, dy: vec3<f32>) -> f32 {
     return s / 13.0;
 }
 
+// The scene's depth for the blended draws (the opaque pass's, multisampled).
+@group(2) @binding(0) var t_scene_depth: texture_depth_multisampled_2d;
+
+// The height of a water fragment over the opaque surface seen through it
+// (m), from the scene's depth at the pixel (its first sample); -1 where
+// nothing lies behind it, or where that sample holds something in front of
+// the water (an edge of a nearer object).
+fn scene_under_at(clip: vec4<f32>, wy: f32) -> f32 {
+    let sz = vec2<i32>(textureDimensions(t_scene_depth)) - 1;
+    let d = textureLoad(t_scene_depth, clamp(vec2<i32>(clip.xy), vec2(0), sz), 0);
+    if (d <= 0.0 || d > clip.z) { return -1.0; }
+    let uv = clip.xy / vec2<f32>(textureDimensions(t_scene_depth));
+    let q = F.inv_view_proj * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0);
+    return max(wy - q.y / q.w, 0.0);
+}
+
+// The blended draws: as fs_mesh, the map's water also knowing its depth
+// over the scene under it.
+@fragment
+fn fs_mesh_blend(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {
+    if (hdr() && M.flags.y == 8u && F.mode.x == 0u) {
+        scene_under = scene_under_at(i.clip, i.world.y);
+    }
+    return mesh_out(i, ff);
+}
+
 @fragment
 fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {
+    return mesh_out(i, ff);
+}
+
+fn mesh_out(i: VOut, ff: bool) -> MeshOut {
     var o: MeshOut;
     o.col = mesh_colour(i, ff);
     o.mask = 0xffffffffu;

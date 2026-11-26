@@ -1270,7 +1270,12 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   map has no height (it leaves out many coasts), the map's 8 m heights
   give the seabed, so those beaches get shallows and surf too. It surfs along the
   terrain's coastline (where its cells turn from land to sea) whatever the
-  depth data says. Inland water does not foam.
+  depth data says. The sea plane and the placed water also measure their
+  height over the surface seen through them from the scene's depth (the
+  opaque surfaces are drawn first, then the blended ones read that
+  depth), so a beach model running down into the sea gets a line of foam
+  at the visible waterline and bands out to 1.6 m. Inland water does not
+  foam.
   Our choices: the bed's reflectance (sand and mud, 0.22 0.20 0.15), the
   sea's level, and the foam (depth, bands, 0.75 reflectance). Not yet: the
   shoreline grid's wave placement, refraction and underwater fog.
