@@ -31,7 +31,7 @@ struct Mat {
 // rows of the part ramp image: 256 each of the first layer's palette rows,
 // the second layer's, the parts' surfaces and the parts' coats, and one row
 // with the body paint's coat
-const RAMP_ROWS: f32 = 1025.0;
+const RAMP_ROWS: f32 = 1281.0;
 
 @group(0) @binding(0) var<uniform> F: Frame;
 @group(0) @binding(1) var<storage, read> J: array<mat4x4<f32>>;
@@ -366,10 +366,6 @@ fn map_finish(col0: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
 // vehicle parts: the primer's mask (the wear mask when the model has none)
 @group(1) @binding(7) var t_primer: texture_2d<f32>;
 
-// The primer's colour: a stand-in grey (linear). The game takes a palette
-// gradient (column = the windowed mask) of a surface record the CPU builds
-// for the primer, which is not decoded.
-const PRIMER_COLOUR: vec3<f32> = vec3(0.2, 0.2, 0.2);
 
 // How often the wear mask repeats across a part's UV0 (the age records'
 // minTiling / maxTiling are about 4 to 6.5).
@@ -1228,6 +1224,10 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         let id = floor(i.col.a * 255.0 + 0.5);
         // the primer's weight (layer B) and its roughness and metalness
         var w3 = 0.0;
+        // the primer's colour: its palette row (rows 1025..1281 of the part
+        // ramp image) at the column of its summed mask through the preset's
+        // gradient window (columns 46, 47 of the coat row)
+        var p_col = vec3(0.2);
         var p_rough = 0.6;
         var p_metal = 0.0;
         if (wear_mask) {
@@ -1279,6 +1279,10 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
                 let ps = textureLoad(t_em, vec2(29, row), 0).a;
                 let pw = max(textureLoad(t_em, vec2(30, row), 0).a, 1.0 / 255.0);
                 w3 = select(0.0, (1.0 - k) * clamp((pb - ps) / pw, 0.0, 1.0), p_amt > 0.0);
+                let gs = textureLoad(t_em, vec2(46, row), 0).a;
+                let gw = max(textureLoad(t_em, vec2(47, row), 0).a, 1.0 / 255.0);
+                let pu = clamp((clamp(lr + lg + lb, 0.0, 1.0) - gs) / gw, 0.004, 0.996);
+                p_col = textureSampleLevel(t_em, samp, vec2(pu, (id + 1025.5) / RAMP_ROWS), 0.0).rgb;
                 p_rough = textureLoad(t_em, vec2(32, row), 0).a;
                 p_metal = textureLoad(t_em, vec2(33, row), 0).a;
             } else {
@@ -1289,7 +1293,7 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         let w1 = textureSampleLevel(t_em, samp, vec2(u, (id + 256.5) / RAMP_ROWS), 0.0);
         let m1 = textureSampleLevel(t_em, samp, vec2(u, (id + 0.5) / RAMP_ROWS), 0.0).a;
         let w0 = 1.0 - k - w3;
-        albedo = albedo * w0 + w1.rgb * k + PRIMER_COLOUR * w3;
+        albedo = albedo * w0 + w1.rgb * k + p_col * w3;
         rough = clamp(rough * w0 + w1.a * k + p_rough * w3, 0.04, 1.0);
         metal = metal * w0 + m1 * k + p_metal * w3;
         pearl = pearl * w0;
