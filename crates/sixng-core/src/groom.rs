@@ -194,15 +194,41 @@ impl Style {
 }
 
 /// What the style pass damps against: the game's colliders are capsules,
-/// spheres and boxes built on the CPU around the head, shoulders and hats
-/// (not stored with the groom); here the character's own surface points
-/// (head, body and garments) stand in for them. `damp` is the game's
-/// d = sat(1 - dist / falloff) with dist to the nearest point.
+/// spheres and boxes built on the CPU from the character's body bound (its
+/// ragdoll pieces on the head, neck, shoulders and chest) and hats, not
+/// stored with the groom. `Colliders::shapes` takes the body bound's round
+/// pieces (`Taper`); without a body bound, `Colliders::new` stands in with
+/// the character's own surface points (head, body and garments). `damp` is
+/// the game's d = sat(1 - dist / falloff), dist to the nearest surface.
 pub struct Colliders {
     cell: f32,
     grid: std::collections::HashMap<(i32, i32, i32), Vec<[f32; 3]>>,
-    /// Changes with the points (cache key).
+    shapes: Vec<Taper>,
+    /// Changes with the points or shapes (cache key).
     pub id: u64,
+}
+
+/// A tapered capsule (a sphere when `a == b`): radius `ra` at `a`, `rb`
+/// at `b`, model space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Taper {
+    pub a: [f32; 3],
+    pub b: [f32; 3],
+    pub ra: f32,
+    pub rb: f32,
+}
+
+impl Taper {
+    /// Distance from `p` to the surface (negative inside): to the nearest
+    /// point of the axis, less the radius there.
+    pub fn dist(&self, p: [f32; 3]) -> f32 {
+        let ab = [self.b[0] - self.a[0], self.b[1] - self.a[1], self.b[2] - self.a[2]];
+        let ap = [p[0] - self.a[0], p[1] - self.a[1], p[2] - self.a[2]];
+        let ll = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+        let t = if ll > 0.0 { ((ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / ll).clamp(0.0, 1.0) } else { 0.0 };
+        let d = [ap[0] - t * ab[0], ap[1] - t * ab[1], ap[2] - t * ab[2]];
+        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() - (self.ra + t * (self.rb - self.ra))
+    }
 }
 
 impl Colliders {
@@ -217,15 +243,31 @@ impl Colliders {
             grid.entry(Self::key(cell, *p)).or_default().push(*p);
             id = (id ^ (p[0].to_bits() as u64) << 1 ^ p[2].to_bits() as u64).wrapping_mul(0x100_0000_01b3);
         }
-        Colliders { cell, grid, id }
+        Colliders { cell, grid, shapes: Vec::new(), id }
+    }
+
+    /// Colliders from the body bound's round pieces.
+    pub fn shapes(shapes: Vec<Taper>) -> Colliders {
+        let mut id = 0x84222325_cbf29ce4u64;
+        for t in &shapes {
+            for v in [t.a[0], t.a[1], t.a[2], t.b[0], t.b[1], t.b[2], t.ra, t.rb] {
+                id = (id ^ v.to_bits() as u64).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        Colliders { cell: Self::FALLOFF, grid: Default::default(), shapes, id }
     }
 
     fn key(cell: f32, p: [f32; 3]) -> (i32, i32, i32) {
         ((p[0] / cell).floor() as i32, (p[1] / cell).floor() as i32, (p[2] / cell).floor() as i32)
     }
 
-    /// 0 at `FALLOFF` or more from every point, 1 on a point.
+    /// 0 at `FALLOFF` or more from every point (shape surface), 1 on a
+    /// point (on or inside a shape).
     pub fn damp(&self, p: [f32; 3]) -> f32 {
+        if !self.shapes.is_empty() {
+            let d = self.shapes.iter().map(|t| t.dist(p)).fold(f32::MAX, f32::min);
+            return (1.0 - d / Self::FALLOFF).clamp(0.0, 1.0);
+        }
         let (x, y, z) = Self::key(self.cell, p);
         let mut best = Self::FALLOFF * Self::FALLOFF;
         for dx in -1..=1 {
@@ -1633,6 +1675,21 @@ mod tests {
         let mut pts = src;
         st.apply(&mut pts, &|_| [1.0, 0.0, 0.0], false, &|p| c.weight(p, 1.0));
         assert!((pts[0][0] + 0.0008).abs() < 1e-5 && (pts[2][0] - 0.01).abs() < 1e-4, "{pts:?}");
+    }
+
+    #[test]
+    fn taper_colliders() {
+        // radius 0.1 at the origin, 0.05 at z = 1
+        let t = Taper { a: [0.0; 3], b: [0.0, 0.0, 1.0], ra: 0.1, rb: 0.05 };
+        assert!((t.dist([0.2, 0.0, 0.0]) - 0.1).abs() < 1e-6);
+        assert!((t.dist([0.2, 0.0, 0.5]) - 0.125).abs() < 1e-6);
+        assert!((t.dist([0.0, 0.0, 1.1]) - 0.05).abs() < 1e-6);
+        assert!(t.dist([0.0, 0.0, 0.5]) < 0.0);
+        let c = Colliders::shapes(vec![t]);
+        // on the surface: damped fully; 1.2 cm out: d = 0.6, rounded to 2/3 -> k = 1/3
+        assert_eq!(c.weight([0.1, 0.0, 0.0], 1.0), 0.0);
+        assert!((c.weight([0.112, 0.0, 0.0], 1.0) - 1.0 / 3.0).abs() < 1e-6);
+        assert_eq!(c.weight([0.2, 0.0, 0.0], 0.7), 0.7);
     }
 
     #[test]
