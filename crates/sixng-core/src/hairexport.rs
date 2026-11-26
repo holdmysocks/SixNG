@@ -20,7 +20,7 @@
 //! `head_mesh` and `head_uv_set`: the head mesh and which of its UV sets
 //! (`TEXCOORD_n`) the root UVs are coordinates in (`root_uv_set`).
 use crate::gltf::StrandPrim;
-use crate::groom::{Coat, Groom};
+use crate::groom::{Coat, Groom, Shell};
 use serde_json::{json, Value};
 
 /// How much of the hair to write.
@@ -193,13 +193,31 @@ pub fn coat_uvs(g: &Groom, c: &Coat) -> Vec<[f32; 2]> {
 /// The strands of one groom for `strands_glb`: the grown coat (or the
 /// guides when the groom stores nothing to grow), then the guides when
 /// `o.guides`. `extras` goes on every mesh; `colour` colours the grown
-/// strands (COLOR_0). Returns the pieces and a summary (strands written,
-/// stored, guides).
-pub fn piece(g: &Groom, name: &str, o: &Options, colour: Option<&HairColour>, extras: Value) -> (Vec<StrandPrim>, Value) {
+/// strands (COLOR_0). With `hat` the strands are pressed under it as the
+/// viewer does (`Shell::press_strands`, 3 mm under its lining, checked
+/// against the hat's triangles): the guides before the strands are grown,
+/// the grown strands again after (noise, curl and clumps move them off the
+/// guides). Returns the pieces and a summary
+/// (strands written, stored, guides, points pressed).
+pub fn piece(g: &Groom, name: &str, o: &Options, colour: Option<&HairColour>, hat: Option<&Shell>, extras: Value) -> (Vec<StrandPrim>, Value) {
     let k = g.points_per_strand;
     let mut out = Vec::new();
+    let mut pressed = 0;
+    let under;
+    let g = match hat {
+        Some(h) => {
+            let mut c = g.clone();
+            pressed += h.press_strands(&mut c.points, k, 0.003);
+            under = c;
+            &under
+        }
+        None => g,
+    };
     let sh = share(g, o);
-    let coat = g.coat(sh);
+    let mut coat = g.coat(sh);
+    if let Some(h) = hat {
+        pressed += h.press_strands(&mut coat.points, k, 0.003);
+    }
     let grown = !coat.guides.is_empty();
     let mut ex = extras.clone();
     ex["grown"] = json!(grown);
@@ -216,7 +234,7 @@ pub fn piece(g: &Groom, name: &str, o: &Options, colour: Option<&HairColour>, ex
         out.push(prim(g, format!("{name}_guides"), k, &g.points, &g.root_uv, &[], &[], None, o, ex));
     }
     let summary = json!({"name": name, "written": if grown { coat.guides.len() } else { g.strands }, "stored": g.stored_strands(), "guides": g.strands,
-        "points_per_strand": if o.points >= 2 { o.points } else { k }, "grown": grown});
+        "points_per_strand": if o.points >= 2 { o.points } else { k }, "grown": grown, "hat_pressed": hat.map(|_| pressed)});
     (out, summary)
 }
 
@@ -312,6 +330,80 @@ pub fn head_from_glb(b: &[u8]) -> Option<HeadUvs> {
     best
 }
 
+/// The hat of a model GLB the exporters wrote, as the viewer builds it for
+/// pressing the scalp hair (`groom::Shell`, with the hat's triangles as its
+/// lining): the meshes of the drawables `hats` (lower case; nodes are named
+/// `<drawable>/<geometry>`), seen from 10 cm under the crown, in the middle
+/// of the top 12 cm of the head. None without a hat or a head in the file.
+pub fn hat_shell(b: &[u8], hats: &[String]) -> Option<Shell> {
+    if hats.is_empty() || b.len() < 20 || &b[0..4] != b"glTF" {
+        return None;
+    }
+    let jl = u32::from_le_bytes(b[12..16].try_into().ok()?) as usize;
+    let doc: Value = serde_json::from_slice(b.get(20..20 + jl)?).ok()?;
+    let bo = 20 + jl;
+    let bl = u32::from_le_bytes(b.get(bo..bo + 4)?.try_into().ok()?) as usize;
+    let bin = b.get(bo + 8..bo + 8 + bl)?;
+    let is_head = |n: &str| n.contains("_head_") || n.starts_with("head_");
+    let (mut hat, mut head, mut tris) = (Vec::new(), Vec::new(), Vec::new());
+    for node in doc["nodes"].as_array()? {
+        let (Some(name), Some(mi)) = (node["name"].as_str(), node["mesh"].as_u64()) else { continue };
+        let drawable = name.split('/').next().unwrap_or(name).to_ascii_lowercase();
+        let is_hat = hats.contains(&drawable);
+        if !is_hat && !is_head(&drawable) {
+            continue;
+        }
+        let Some(prim) = doc["meshes"][mi as usize]["primitives"].get(0) else { continue };
+        let Some(i) = prim["attributes"]["POSITION"].as_u64() else { continue };
+        let a = &doc["accessors"][i as usize];
+        if a["componentType"].as_u64() != Some(5126) {
+            continue;
+        }
+        let v = &doc["bufferViews"][a["bufferView"].as_u64().unwrap_or(0) as usize];
+        let off = (v["byteOffset"].as_u64().unwrap_or(0) + a["byteOffset"].as_u64().unwrap_or(0)) as usize;
+        let n = a["count"].as_u64().unwrap_or(0) as usize;
+        let Some(raw) = bin.get(off..off + n * 12) else { continue };
+        // glTF Y-up back to RAGE Z-up: (x, y, z) -> (x, -z, y)
+        let pts: Vec<[f32; 3]> = raw
+            .chunks_exact(12)
+            .map(|c| {
+                let f = |j: usize| f32::from_le_bytes([c[j], c[j + 1], c[j + 2], c[j + 3]]);
+                [f(0), -f(8), f(4)]
+            })
+            .collect();
+        if !is_hat {
+            head.extend(pts);
+            continue;
+        }
+        // the hat's triangles (u16 or u32 indices)
+        if let Some(ia) = prim["indices"].as_u64().map(|i| &doc["accessors"][i as usize]) {
+            let iv = &doc["bufferViews"][ia["bufferView"].as_u64().unwrap_or(0) as usize];
+            let io = (iv["byteOffset"].as_u64().unwrap_or(0) + ia["byteOffset"].as_u64().unwrap_or(0)) as usize;
+            let n = ia["count"].as_u64().unwrap_or(0) as usize;
+            let idx: Vec<usize> = match ia["componentType"].as_u64() {
+                Some(5125) => bin.get(io..io + n * 4).map(|r| r.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize).collect()),
+                Some(5123) => bin.get(io..io + n * 2).map(|r| r.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]) as usize).collect()),
+                _ => None,
+            }
+            .unwrap_or_default();
+            tris.extend(idx.chunks_exact(3).filter_map(|t| Some([*pts.get(t[0])?, *pts.get(t[1])?, *pts.get(t[2])?])));
+        }
+        hat.extend(pts);
+    }
+    if hat.is_empty() || head.is_empty() {
+        return None;
+    }
+    let top = head.iter().map(|p| p[2]).fold(f32::MIN, f32::max);
+    let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+    for p in head.iter().filter(|p| p[2] > top - 0.12) {
+        for a in 0..2 {
+            lo[a] = lo[a].min(p[a]);
+            hi[a] = hi[a].max(p[a]);
+        }
+    }
+    Some(Shell::new([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, top - 0.10], &hat, &head).with_lining(tris))
+}
+
 /// Which of the head's UV sets a groom's root UVs belong to: at every guide
 /// root, the UV of the nearest head vertex in each set against the root's
 /// stored UV; the set with the smallest median distance wins when that is
@@ -379,7 +471,7 @@ mod tests {
     fn piece_writes_grown_strands_with_their_attributes() {
         let pts = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.1], [1.0, 0.0, 0.0], [1.0, 0.0, 0.1], [0.0, 1.0, 0.0], [0.0, 1.0, 0.1]];
         let g = Groom { tint_weight: 1.0, strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![[40, 10, 2, 0]], width: 0.0003, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![], twist: vec![], curl: Default::default() };
-        let (p, s) = piece(&g, "t", &Options { points: 3, ..Default::default() }, None, json!({}));
+        let (p, s) = piece(&g, "t", &Options { points: 3, ..Default::default() }, None, None, json!({}));
         assert_eq!(p.len(), 2);
         assert_eq!((s["written"].as_u64(), s["guides"].as_u64()), (Some(50), Some(3)));
         let c = &p[0];
@@ -389,12 +481,12 @@ mod tests {
         assert!(clump[..120].iter().all(|&x| x == 0.0) && clump[120..].iter().all(|&x| x == 1.0 || x == 2.0));
         assert!(clump[120..].contains(&2.0));
         // the cap
-        let (p, s) = piece(&g, "t", &Options { max_strands: 10, guides: false, ..Default::default() }, None, json!({}));
+        let (p, s) = piece(&g, "t", &Options { max_strands: 10, guides: false, ..Default::default() }, None, None, json!({}));
         assert!(p[0].colour.is_empty());
         // with colours: one per point, root to tip of the strand's variant
         let pr = |a: [u8; 3], b: [u8; 3]| crate::hairtone::Preset { a, b, texture: 0, flag: false, values: Default::default() };
         let hc = HairColour::Presets(Box::new([pr([255, 0, 0], [0, 0, 255]), pr([0, 255, 0], [0, 255, 0]), pr([0, 255, 0], [0, 255, 0]), pr([0, 255, 0], [0, 255, 0])]));
-        let (p, _) = piece(&g, "t", &Options { points: 3, guides: false, ..Default::default() }, Some(&hc), json!({}));
+        let (p, _) = piece(&g, "t", &Options { points: 3, guides: false, ..Default::default() }, Some(&hc), None, json!({}));
         let c = &p[0];
         assert_eq!(c.colour.len(), c.positions.len());
         let var = &c.attrs.iter().find(|a| a.0 == "_VARIANT").unwrap().1;
@@ -405,5 +497,23 @@ mod tests {
         assert!(s["written"].as_u64().unwrap() <= 11);
         let glb = crate::gltf::strands_glb("t", &p, json!({}));
         assert_eq!(&glb[0..4], b"glTF");
+        // under a hat (a dome of 5 cm): every point above its rim, guide or
+        // grown, ends up under its lining
+        let mut dome = Vec::new();
+        for i in 0..30 {
+            for j in 0..120 {
+                let (lat, lon) = ((i as f32 * 3.0).to_radians(), (j as f32 * 3.0).to_radians());
+                dome.push([0.5 + 0.05 * lat.cos() * lon.cos(), 0.5 + 0.05 * lat.cos() * lon.sin(), 0.05 * lat.sin()]);
+            }
+        }
+        let hat = Shell::new([0.5, 0.5, 0.0], &dome, &[]);
+        let (p, s) = piece(&g, "t", &Options { points: 3, ..Default::default() }, None, Some(&hat), json!({}));
+        assert!(s["hat_pressed"].as_u64().unwrap() > 0);
+        for c in &p {
+            for q in c.positions.iter().filter(|q| q[2] > 0.01) {
+                let r = ((q[0] - 0.5).powi(2) + (q[1] - 0.5).powi(2) + q[2].powi(2)).sqrt();
+                assert!(r < 0.05, "{} {q:?} {r}", c.name);
+            }
+        }
     }
 }

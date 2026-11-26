@@ -72,6 +72,10 @@ pub struct StrandLod {
     pub gi_cutoff: f32,
 }
 
+/// Lines of the reference view the game's strand count rule works in (H = 1440 in its LOD function, a global
+/// that is not the render target's height).
+pub const STRAND_RULE_LINES: f32 = 1440.0;
+
 impl StrandLod {
     /// Share of the stored strands drawn at distance `d` in a view `h` pixels high with tan(fov / 2) = `tan`.
     pub fn share(&self, d: f32, h: f32, tan: f32) -> f32 {
@@ -137,7 +141,8 @@ mod strand_lod_tests {
         for (d, want) in [(0.5, 0.883), (1.0, 0.442), (2.0, 0.221), (5.0, 0.088)] {
             assert!((l.share(d, 1440.0, 0.5) - want).abs() < 2e-3, "{d}: {}", l.share(d, 1440.0, 0.5));
         }
-        // very close: every strand; a narrower view or more pixels: more strands; beyond the cutoff: none
+        // very close: every strand; a narrower view: more strands; beyond the cutoff: none (the renderer passes
+        // the rule's fixed reference lines, STRAND_RULE_LINES, whatever its window)
         assert_eq!(l.share(0.1, 1440.0, 0.5), 1.0);
         assert!(l.share(2.0, 1440.0, 0.25) > l.share(2.0, 1440.0, 0.5) && l.share(2.0, 2160.0, 0.5) > l.share(2.0, 1440.0, 0.5));
         assert_eq!(l.share(120.0, 1440.0, 0.5), 0.0);
