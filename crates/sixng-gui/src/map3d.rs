@@ -432,6 +432,10 @@ impl VisAcc {
 }
 
 /// Quality presets: (name, detail, triangle budget (M), terrain error px, max texture px, draw-call budget).
+/// Coarsest LOD level (SLOD2) an unlinked placement is a coverage
+/// fallback at, nearer than its own band.
+const FB_MAX_LEVEL: usize = 3;
+
 pub const QUALITY: [(&str, f32, f32, f32, u32, usize); 4] = [
     ("low", 0.15, 6.0, 5.0, 128, 2500),
     ("medium", 0.4, 12.0, 3.0, 256, 5000),
@@ -1156,7 +1160,9 @@ impl Map3D {
                     return 2;
                 }
                 if dist < lo_r / hy {
-                    return if l >= 1 { 3 } else { 1 };
+                    // SLOD3 and SLOD4 are blocks kilometres across: nearer
+                    // than their band the terrain stands in better
+                    return if (1..=FB_MAX_LEVEL).contains(&l) { 3 } else { 1 };
                 }
                 0
             }

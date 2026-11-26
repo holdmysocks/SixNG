@@ -1278,7 +1278,10 @@ baked map (`entities.bin`; bake first with `--bake-map`):
 - **Coverage fallbacks** (no holes near the camera): a SLOD placement (or
   a LOD with HD fallback off) with nothing finer to hand over to (no LOD
   link, or children that all lack a model) keeps drawing nearer than its
-  own band, but only on pixels no real surface has covered. Real surfaces write a stencil
+  own band, but only on pixels no real surface has covered. Unlinked
+  SLOD3 and SLOD4 placements (blocks kilometres across) are not used this
+  way: nearer than their band the terrain stands in better (they showed
+  as flat squares and tiled water over the ground). Real surfaces write a stencil
   mark as they draw; the fallbacks draw after them and only where the
   mark is missing (far-field terrain, ocean or sky), with back faces
   culled so a coarse block the camera is inside stays invisible. Before,
