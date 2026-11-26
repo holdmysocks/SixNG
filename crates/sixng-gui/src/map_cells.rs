@@ -105,6 +105,8 @@ pub struct Cells {
     pub on: bool,
     index: Option<Arc<Index>>,
     building: Option<(String, mpsc::Receiver<Index>)>,
+    /// Bake whose stale cell directories (other bakes) were removed.
+    swept: Option<u32>,
     gen: u64,
     slots: HashMap<u32, Slot>,
     /// Per cell for this pass: USE_*.
@@ -238,11 +240,54 @@ fn static_range(
 }
 
 /// Cell format prefix of the cache directories (older ones are deleted).
-const TAG_FORMAT: &str = "v10_";
+const TAG_FORMAT: &str = "v11_";
 
-fn tag_of(d: &Detail) -> String {
+fn bake_prefix(bake: u32) -> String {
+    format!("{TAG_FORMAT}{bake:08x}")
+}
+
+/// Remove the cell directories of other bakes (never read again) on a
+/// thread, and take their size off the cache total.
+fn sweep_other_bakes(dir: PathBuf, bake: u32) {
+    let keep = bake_prefix(bake);
+    std::thread::spawn(move || {
+        fn size(p: &Path) -> u64 {
+            std::fs::read_dir(p).map_or(0, |rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| {
+                        let p = e.path();
+                        if p.is_dir() {
+                            size(&p)
+                        } else {
+                            e.metadata().map_or(0, |m| m.len())
+                        }
+                    })
+                    .sum()
+            })
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        for e in rd.filter_map(|e| e.ok()) {
+            let name = e.file_name().to_string_lossy().to_string();
+            if e.path().is_dir() && name.starts_with(TAG_FORMAT) && !name.starts_with(&keep) {
+                let n = size(&e.path());
+                if std::fs::remove_dir_all(e.path()).is_ok() {
+                    let _ = cells::CELL_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+                        Some(b.saturating_sub(n))
+                    });
+                }
+            }
+        }
+    });
+}
+
+/// Cache directory of an index: format, bake, then the detail settings
+/// (cells of another bake would merge the wrong placements).
+fn tag_of(d: &Detail, bake: u32) -> String {
     format!(
-        "{TAG_FORMAT}{:.0}_{:.4}_{:.2}_{:.2}_{}",
+        "{}_{:.0}_{:.4}_{:.2}_{:.2}_{}",
+        bake_prefix(bake),
         d.radii[0], d.min_size, d.prop_density, d.veg_density, d.hd_fallback as u8
     )
 }
@@ -348,6 +393,7 @@ impl Cells {
             on: false,
             index: None,
             building: None,
+            swept: None,
             gen: 0,
             slots: HashMap::new(),
             state: Vec::new(),
@@ -551,7 +597,7 @@ impl Cells {
         cs: &Arc<(Vec<u32>, Vec<u32>)>,
         d: &Detail,
     ) -> bool {
-        let tag = tag_of(d);
+        let tag = tag_of(d, data.bake_id);
         if let Some((t, rx)) = &self.building {
             if let Ok(ix) = rx.try_recv() {
                 let ok = *t == tag;
@@ -615,6 +661,10 @@ impl Cells {
             return;
         }
         let ix = self.index.clone().unwrap();
+        if self.swept != Some(data.bake_id) {
+            self.swept = Some(data.bake_id);
+            sweep_other_bakes(Self::dir(work), data.bake_id);
+        }
         let k = d.radii[0] / 330.0;
         let near = near_ring() * d.radii[0];
         let dir = Self::dir(work).join(&ix.tag);

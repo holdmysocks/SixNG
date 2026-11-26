@@ -1069,6 +1069,11 @@ pub struct Outfit {
     /// Body-shape preset name (`BodyShapePreset` variation), when included.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_shape: Option<String>,
+    /// The body-shape preset's items (hex; `bodyshape::preset_items`): the
+    /// `PRESET_ITEM_KEYS` tags of the body-shape kits its preset variations
+    /// include, in order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub body_preset_items: Vec<String>,
     pub parts: Vec<LookPart>,
     /// Strand colour sets the outfit's colour items give per item category (category hash, set name hash; hex).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1095,18 +1100,44 @@ fn not_shown_reason(p: &Part, by_guid: &HashMap<u64, &String>) -> Option<&'stati
     if named.is_some_and(|n| fp(n)) || (named.is_none() && !p.candidates.is_empty() && p.candidates.keys().all(|n| fp(n))) {
         return Some("first-person view only");
     }
-    // The four items of this category in the named characters' wardrobes
-    // (2026-11-25) name by GUID `bodygenitalsgen_mr1_000_regular_ws00_full`,
-    // its `_alt_00` and a hidden placeholder: drawables of a content pack
-    // (core_restofworld), not of packs.rpf. Clothing covers them.
-    // The same layer is also stored under another category (`c8bc4e01`,
-    // `cs_raina`'s nude outfit: `bodygenitalsgen_fb1_008_regular_ws00_full`),
-    // so an item whose GUID names one of these drawables counts too.
+    // The items of this category name by GUID
+    // `bodygenitalsgen_mr1_000_regular_ws00_full`, its `_alt_00` and a
+    // hidden placeholder: drawables of a content pack (core_restofworld,
+    // `packparts`). The same layer is also stored under another category
+    // (`c8bc4e01`, `cs_raina`'s nude outfit:
+    // `bodygenitalsgen_fb1_008_regular_ws00_full`). With that pack indexed
+    // they resolve and are drawn; they only get here when it is not.
     let layer = p.guid.as_deref().and_then(|g| u64::from_str_radix(g, 16).ok()).is_some_and(|g| body_layer_ids().contains(&g));
     if p.category.as_deref() == Some("2a7a13a4") || layer {
-        return Some("anatomical body layer, always under clothing");
+        return Some("anatomical body layer of the core_restofworld content pack, which is not indexed");
     }
     None
+}
+
+/// The drawable an item's asset GUID names, with how it was found: a
+/// drawable of the wardrobe's own archive (`main`) first, then one of the
+/// content packs (`pack`, see `packparts`). Not for heads (their GUID names
+/// the base head template) nor first-person meshes.
+fn guid_drawable(guid: &str, main: impl Fn(u64) -> Option<String>, pack: impl Fn(u64) -> Option<String>) -> Option<(String, &'static str)> {
+    let g = u64::from_str_radix(guid, 16).ok()?;
+    let (n, how) = match main(g) {
+        Some(n) => (n, "asset id (name)"),
+        None => (pack(g)?, "asset id (content pack)"),
+    };
+    (slot_of(&n) != "head" && !n.ends_with("_fp") && !n.contains("_fp_")).then_some((n, how))
+}
+
+/// Why a drawable is not drawn although an item names it: the content
+/// pack's invisible stand-ins (`invisible_brabalcony_fr1_000_…`, the bra of
+/// Lucia's body-detail set; the texture match finds the visible bra).
+fn invisible_reason(drawable: &str) -> Option<String> {
+    drawable.starts_with("invisible_").then(|| format!("invisible in the game: the item names {drawable}"))
+}
+
+/// Slots of the anatomical inserts (`packparts`): skin meshes drawn over the
+/// body, with the body's skin.
+pub fn is_skin_insert(slot: &str) -> bool {
+    matches!(slot, "nipples" | "genitals")
 }
 
 /// Asset ids of the anatomical body layer drawables
@@ -1212,7 +1243,7 @@ pub fn slot_of(name: &str) -> String {
         "feet" => return "body lower".into(),
         _ => {}
     }
-    for (p, s) in [("bracelet", "bracelet"), ("teethaccs", "teeth accessory"), ("teeth", "teeth"), ("eyecaps", "eyecaps"), ("bodyhair", "body hair"), ("hair", "hair"), ("wigs", "hair"), ("beard", "beard"), ("brows", "brows"), ("lashes", "lashes")] {
+    for (p, s) in [("bodynipples", "nipples"), ("bodygenitals", "genitals"), ("bracelet", "bracelet"), ("teethaccs", "teeth accessory"), ("teeth", "teeth"), ("eyecaps", "eyecaps"), ("bodyhair", "body hair"), ("hair", "hair"), ("wigs", "hair"), ("beard", "beard"), ("brows", "brows"), ("lashes", "lashes")] {
         if w.starts_with(p) {
             return s.to_string();
         }
@@ -1831,7 +1862,7 @@ fn own_look(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Option<Look> {
         }
     }
     let main: Vec<String> = parts.iter().filter(|p| ["full", "outer", "top", "bottom"].contains(&p.slot.as_str())).map(|p| pretty(item_word(&p.drawable))).collect();
-    Some(Look { model: model.to_string(), resource: format!("{} (own parts: the outfit data does not cover this model)", a.id), fit, outfits: vec![Outfit { id: String::new(), outfit_type: String::new(), scale: 0.0, label: format!("own parts: {}", main.join(", ")), body_shape: None, parts, strand_colours: vec![], unresolved: vec![], not_shown: vec![], variations: vec![] }], other_variations: vec![], note: Some("The outfit data does not cover this model: it is shown in its own parts.".into()) })
+    Some(Look { model: model.to_string(), resource: format!("{} (own parts: the outfit data does not cover this model)", a.id), fit, outfits: vec![Outfit { id: String::new(), outfit_type: String::new(), scale: 0.0, label: format!("own parts: {}", main.join(", ")), body_shape: None, body_preset_items: vec![], parts, strand_colours: vec![], unresolved: vec![], not_shown: vec![], variations: vec![] }], other_variations: vec![], note: Some("The outfit data does not cover this model: it is shown in its own parts.".into()) })
 }
 
 /// The outfits of one model row. `own_head`: keep only the outfits whose
@@ -1852,6 +1883,10 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
     // drawable, `_full` included (`shortswork_mr1_001_regular_mw_long_full`),
     // as for hair assets (`hairlink`).
     let by_guid: HashMap<u64, &String> = names.iter().map(|n| (crate::meta7a::asset_id(n), n)).collect();
+    // GUIDs that name a drawable of a content pack (the anatomical inserts,
+    // invisible underwear stand-ins …): `packparts`
+    let packs = crate::packparts::get(&crate::export::game_root(a));
+    let pack_name = |g: u64| packs.by_guid(g).and_then(|e| e.name.as_ref()).map(|n| n.to_ascii_lowercase());
     // an outfit with everything it includes (head set, body set, brows …)
     fn collect<'a>(v: &'a Variation, by_id: &HashMap<&str, &'a Variation>, seen: &mut HashSet<String>, out: &mut Vec<&'a Variation>) {
         if !seen.insert(v.id.clone()) {
@@ -1910,6 +1945,11 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
         let mut unresolved = Vec::new();
         let mut not_shown = Vec::new();
         let mut body_shape = None;
+        // the game applies the kits in include order (each kit's items
+        // gathered from its own parent chain in key order, fn 0x3e47f90)
+        // and sets each rig input to the item's value, so a later item wins
+        // (fn 0x4f95310)
+        let mut body_preset_items: Vec<String> = Vec::new();
         let mut strand_colours: Vec<(String, String)> = Vec::new();
         for v in &vs {
             for c in v.parts.iter().filter_map(|p| p.strand_colour.clone()) {
@@ -1924,6 +1964,14 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
                 if let Some(w) = v.tags.get("c2cfc00a").and_then(|w| w.first()) {
                     body_shape = Some(w.clone());
                 }
+                // the shape itself: the preset items its body-shape kits
+                // name (the word above is only a label: Lucia's and
+                // Jason's `Skinny` presets set weight -0.2 and -0.4)
+                for p in &v.parts {
+                    for k in crate::bodyshape::PRESET_ITEM_KEYS {
+                        body_preset_items.extend(p.tags.get(&format!("{k:08x}")).into_iter().flatten().cloned());
+                    }
+                }
             }
             for p in &v.parts {
                 let by_asset = || Some((assets?.pick(p.guid.as_deref()?, fit.as_deref(), &exists)?, "asset id"));
@@ -1933,10 +1981,7 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
                 // item in eight. Not for a head: its GUID names the base
                 // head template (`head_mr1_base_000_m_full`); the face is
                 // the head the item names.
-                let own = || {
-                    let n = by_guid.get(&u64::from_str_radix(p.guid.as_deref()?, 16).ok()?)?;
-                    (slot_of(n) != "head" && !n.ends_with("_fp") && !n.contains("_fp_")).then(|| ((*n).clone(), "asset id (name)"))
-                };
+                let own = || guid_drawable(p.guid.as_deref()?, |g| by_guid.get(&g).map(|n| (*n).clone()), &pack_name);
                 let Some((drawable, found_by)) = own().or_else(|| choose(p, fit.as_deref(), &exists)).or_else(by_asset) else {
                     // items without textures or names are settings, not parts;
                     // a garment that names a model by GUID is a part whose
@@ -1951,6 +1996,11 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
                     }
                     continue;
                 };
+                // an invisible stand-in draws nothing (Lucia's body-detail bra)
+                if let Some(why) = invisible_reason(&drawable) {
+                    not_shown.push(format!("{} ({why})", p.item));
+                    continue;
+                }
                 let mut drawable = drawable;
                 let slot = slot_of(&drawable);
                 // The skin meshes come cut to the garment (`hand_fr1_000_tshirt_a02`);
@@ -1976,7 +2026,7 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
             let main: Vec<String> = parts.iter().filter(|p| ["full", "outer", "top", "bottom"].contains(&p.slot.as_str())).map(|p| pretty(item_word(&p.drawable))).collect();
             let v = vs[0];
             if !parts.is_empty() || !unresolved.is_empty() || !not_shown.is_empty() {
-                other_variations.push(Outfit { id: v.id.clone(), outfit_type: String::new(), scale: 0.0, label: if main.is_empty() { format!("variation {}", v.id) } else { main.join(", ") }, body_shape, parts, strand_colours, unresolved, not_shown, variations: vec![v.id.clone()] });
+                other_variations.push(Outfit { id: v.id.clone(), outfit_type: String::new(), scale: 0.0, label: if main.is_empty() { format!("variation {}", v.id) } else { main.join(", ") }, body_shape, body_preset_items, parts, strand_colours, unresolved, not_shown, variations: vec![v.id.clone()] });
             }
             continue;
         }
@@ -2032,6 +2082,7 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
             scale: o.2,
             label: if main.is_empty() { format!("outfit {}", outfits.len() + 1) } else { main.join(", ") },
             body_shape,
+            body_preset_items,
             parts,
             strand_colours,
             unresolved,
@@ -2199,5 +2250,29 @@ mod tests {
         h.named = None;
         h.candidates = [("browsflat_mi1_000_short_n_full".to_string(), 2)].into_iter().collect();
         assert!(choose(&h, Some("fr1"), &all).is_none());
+    }
+
+    #[test]
+    fn guid_names_a_content_pack_insert_and_invisible_items_are_not_drawn() {
+        let nip = "bodynipplesgen_fr1_000_regular_ws00_full";
+        let g = crate::meta7a::asset_id(nip);
+        let hex = format!("{g:016x}");
+        let none = |_: u64| None::<String>;
+        let pack = |x: u64| (x == g).then(|| nip.to_string());
+        // not in the main archive: found in the pack
+        assert_eq!(guid_drawable(&hex, none, pack), Some((nip.to_string(), "asset id (content pack)")));
+        // the main archive comes first
+        let main = |x: u64| (x == g).then(|| "hand_fr1_000_nude_cull".to_string());
+        assert_eq!(guid_drawable(&hex, main, pack).unwrap().1, "asset id (name)");
+        // heads and first-person meshes are left to the other rules
+        assert!(guid_drawable(&hex, |_| Some("head_fr1_base_000_m_full".into()), none).is_none());
+        assert!(guid_drawable(&hex, none, |_| Some("tshirt_mr1_000_fp".into())).is_none());
+        assert!(guid_drawable("not hex", none, pack).is_none());
+        assert_eq!(slot_of(nip), "nipples");
+        assert_eq!(slot_of("bodygenitalsgen_mr1_000_regular_ws00_full_alt_00"), "genitals");
+        assert_eq!(slot_of("bodyhair_mr1_000_full"), "body hair");
+        assert!(is_skin_insert("nipples") && is_skin_insert("genitals") && !is_skin_insert("body upper"));
+        assert!(invisible_reason("invisible_brabalcony_fr1_000_regular_ws00_full").is_some());
+        assert!(invisible_reason("brabalcony_fr1_000_regular_ws00_full").is_none());
     }
 }

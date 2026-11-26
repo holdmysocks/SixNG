@@ -431,11 +431,25 @@ pub const CONTROLS: &[(&str, u32, Option<u32>)] = &[
     ("gcmuscleupperarm", 0x37657a6b, None),
     ("gcbutt", 0x5a502ae2, None),
     ("gcbreasts", 0x377b0101, Some(0x48f90678)),
+    // Shape controls found in the same preset PSO (2026-11-26); names by
+    // joaat of the control id, except the one whose name is not recovered.
+    ("gcbreastheight", 0xf9bc636e, Some(0x12b6dd5f)),
+    ("gcbreastspacing", 0xb3e7142f, Some(0x36c800c8)),
+    ("gcchestheight", 0xa064c82b, Some(0x9b89a2b0)),
+    ("gc_b0eae798", 0x8a7d0c78, Some(0xb2efcb7f)),
+    ("gccleavage", 0xf9dc7b4c, Some(0xc7717edf)),
+    ("gcbellyround", 0xa1aede2a, None),
+    ("gchipwidth", 0x6c83d62b, None),
+    ("gchipheight", 0xa64a2b22, Some(0xee16a69c)),
+    ("gcheadscale", 0x9c978205, None),
+    ("gcmusclebiceps", 0xc0fd5915, None),
+    ("gcmuscletriceps", 0xa981e727, None),
 ];
 
 /// Parse "gcweightbelly=1,gcmusclechest=0.5" into control values. Names are
 /// case-insensitive; `allweight=v` / `allmuscle=v` set every weight / muscle
-/// control. Values are clamped to -1..1 (muscle and butt to 0..1).
+/// control. Values are clamped to -1..1, or 0..1 for controls with no input
+/// for negative values (muscle, butt, belly roundness, hip width, head scale).
 pub fn parse_spec(spec: &str) -> Result<Vec<(String, f32)>, String> {
     let mut out: Vec<(String, f32)> = Vec::new();
     for kv in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -444,11 +458,12 @@ pub fn parse_spec(spec: &str) -> Result<Vec<(String, f32)>, String> {
         let v: f32 = v.trim().parse().map_err(|_| format!("body shape: bad value in `{kv}`"))?;
         let names: Vec<&str> = match k.as_str() {
             "allweight" => CONTROLS.iter().map(|c| c.0).filter(|n| n.starts_with("gcweight")).collect(),
-            "allmuscle" => CONTROLS.iter().map(|c| c.0).filter(|n| n.starts_with("gcmuscle")).collect(),
+            // the twelve regions; biceps and triceps are separate in the presets
+            "allmuscle" => CONTROLS.iter().map(|c| c.0).filter(|n| n.starts_with("gcmuscle") && !n.ends_with("ceps")).collect(),
             _ => vec![CONTROLS.iter().find(|c| c.0 == k).map(|c| c.0).ok_or_else(|| format!("body shape: unknown control `{k}` (known: {}, allweight, allmuscle)", CONTROLS.iter().map(|c| c.0).collect::<Vec<_>>().join(", ")))?],
         };
         for n in names {
-            let lo = if n.starts_with("gcmuscle") || n == "gcbutt" { 0.0 } else { -1.0 };
+            let lo = if CONTROLS.iter().any(|c| c.0 == n && c.2.is_none()) { 0.0 } else { -1.0 };
             out.retain(|x| x.0 != n);
             out.push((n.to_string(), v.clamp(lo, 1.0)));
         }
@@ -507,6 +522,110 @@ pub fn preset_from_xml(xml: &str, tag: &str) -> Result<Vec<(String, f32)>, Strin
         }
     }
     parse_spec(&spec.join(","))
+}
+
+/// Tag keys of a body-shape kit (wardrobe kits tagged `bodyshape`, included
+/// by an outfit's `BodyShapePreset` variation) whose values name preset
+/// items of the body-shape preset PSO in `anim.rpf`. The game reads these
+/// five keys together (static list at .rdata 0x651eab4, gathered by fn
+/// 0x3e47f90 along a kit's parent chain). The tag-key table in packs.rpf
+/// (the PSO with struct 91315b01) gives the first four mode 0 (the values
+/// of every record in the chain) and 63d3733d mode 1 (the first record that
+/// has it).
+pub const PRESET_ITEM_KEYS: [u32; 5] = [0x3631_3cc7, 0x0248_4ea6, 0x6b3f_b5a6, 0x179c_8d5c, 0x63d3_733d];
+
+/// Control values of an outfit's body-shape preset items (hex hashes from
+/// its body-shape kits' `PRESET_ITEM_KEYS` tags: kits in include order,
+/// each kit's in key order, as the game gathers them per kit in fn
+/// 0x3e47f90). Each item of the preset PSO
+/// (struct 890b5009) lists control values and the rig input values they
+/// give; the game stores each input's value over the old one (fn 0x4f95310),
+/// so a later item's value for a control replaces an earlier one (Mandy's
+/// preset sets every muscle region to 0.2, then thigh and calf back to 0).
+/// Controls without a slot in `CONTROLS` are left out. Needs `anim.rpf`
+/// indexed.
+pub fn preset_items(game_root: &Path, items: &[String]) -> Result<Vec<(String, f32)>, String> {
+    preset_from_items(preset_item_table(game_root)?, items)
+}
+
+/// An outfit's body-shape preset: its preset items (`Outfit::body_preset_items`)
+/// when it has any, else its profile word through the body-type XML
+/// (`preset_controls`); `None` when it has neither.
+pub fn outfit_preset(game_root: &Path, word: Option<&str>, items: &[String]) -> Option<Result<Vec<(String, f32)>, String>> {
+    if !items.is_empty() {
+        Some(preset_items(game_root, items))
+    } else {
+        word.map(|w| preset_controls(game_root, w))
+    }
+}
+
+/// `preset_items` on a table of item hash -> (control hash, value).
+pub fn preset_from_items(table: &HashMap<u32, Vec<(u32, f32)>>, items: &[String]) -> Result<Vec<(String, f32)>, String> {
+    let mut vals: Vec<(&str, f32)> = Vec::new();
+    let mut found = false;
+    for it in items {
+        let Some(list) = u32::from_str_radix(it, 16).ok().and_then(|h| table.get(&h)) else { continue };
+        found = true;
+        for (n, v) in list {
+            if let Some(c) = CONTROLS.iter().find(|c| crate::meta7a::joaat(c.0) == *n) {
+                vals.retain(|x| x.0 != c.0);
+                vals.push((c.0, *v));
+            }
+        }
+    }
+    if !found && !items.is_empty() {
+        return Err(format!("body-shape preset items {} are not in the preset PSO", items.join(", ")));
+    }
+    parse_spec(&vals.iter().map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join(","))
+}
+
+/// Preset items of the body-shape preset PSO in `anim.rpf` (the PSO holding
+/// struct 890b5009; read once): item hash -> (control hash, value).
+fn preset_item_table(game_root: &Path) -> Result<&'static HashMap<u32, Vec<(u32, f32)>>, String> {
+    static T: OnceLock<Result<HashMap<u32, Vec<(u32, f32)>>, String>> = OnceLock::new();
+    T.get_or_init(|| {
+        let work = crate::names::work_dir().ok_or("no work directory")?;
+        let ixp = crate::scan::index_path(&work.join("index"), "anim.rpf");
+        let ix = crate::scan::load_index(&ixp).map_err(|e| format!("anim.rpf index ({}): {e}; index anim.rpf first", ixp.display()))?;
+        let arch = game_root.join("anim.rpf");
+        // more than one PSO holds the struct (a small one comes first in the
+        // index): items of all of them
+        let tag = 0x890b_5009u32;
+        let mut t = HashMap::new();
+        for e in ix.entries.iter().filter(|e| e.kind == crate::classify::Kind::Pso) {
+            let Ok(b) = crate::scan::read_entry(&arch, e) else { continue };
+            if !b.windows(4).any(|w| w == tag.to_le_bytes() || w == tag.to_be_bytes()) {
+                continue;
+            }
+            if let Some(p) = crate::pso::parse(&b) {
+                preset_items_of(&p.to_json(), &mut t);
+            }
+        }
+        if t.is_empty() {
+            return Err("body-shape preset PSO (struct 890b5009) not found in anim.rpf".into());
+        }
+        Ok(t)
+    })
+    .as_ref()
+    .map_err(|e| e.clone())
+}
+
+/// Map entries (struct 00000100) whose item is a preset (struct 890b5009).
+fn preset_items_of(v: &serde_json::Value, out: &mut HashMap<u32, Vec<(u32, f32)>>) {
+    match v {
+        serde_json::Value::Object(o) => {
+            let it = &v["Item"];
+            if v["_struct"] == "00000100" && it["_struct"] == "890b5009" {
+                if let Some(k) = v["Key"].as_u64() {
+                    let vals = it["Values"].as_array().into_iter().flatten().filter_map(|x| Some((x["Name"].as_u64()? as u32, x["Value"].as_f64()? as f32))).collect();
+                    out.entry(k as u32).or_insert(vals);
+                }
+            }
+            o.values().for_each(|x| preset_items_of(x, out));
+        }
+        serde_json::Value::Array(a) => a.iter().for_each(|x| preset_items_of(x, out)),
+        _ => {}
+    }
 }
 
 /// The body-type XML of `common.rpf` (read once).
@@ -877,7 +996,31 @@ mod tests {
         assert_eq!(m.get(&0x74a5940e), Some(&0.5));
         assert_eq!(m.get(&0xf8ca1901), Some(&1.0));
         assert_eq!(parse_spec("allweight=1").unwrap().len(), 12);
+        assert_eq!(parse_spec("allmuscle=1").unwrap().len(), 12);
         assert!(parse_spec("nope=1").is_err());
+        // controls from the preset PSO: negative side by |v|, one-sided ones clamp at 0
+        let m = input_values(&parse_spec("gcbreastheight=-0.6,gccleavage=0.5,gcheadscale=-1,gchipwidth=0.9").unwrap());
+        assert_eq!(m.get(&0x12b6dd5f), Some(&0.6));
+        assert_eq!(m.get(&0xf9dc7b4c), Some(&0.5));
+        assert_eq!(m.get(&0x6c83d62b), Some(&0.9));
+        assert!(!m.contains_key(&0x9c978205) || m[&0x9c978205] == 0.0);
+    }
+
+    #[test]
+    fn preset_items_later_replace_earlier() {
+        let j = crate::meta7a::joaat;
+        let mut t = HashMap::new();
+        // every muscle region 0.2, then thigh back to 0, then an unknown control
+        t.insert(0x1d61_da02, CONTROLS.iter().filter(|c| c.0.starts_with("gcmuscle")).map(|c| (j(c.0), 0.2)).collect());
+        t.insert(0xa693_fe91, vec![(j("gcmusclethigh"), 0.0)]);
+        t.insert(0x5cd3_731a, vec![(0x1234_5678, 0.5), (j("GCBreasts"), 0.4)]);
+        let c = preset_from_items(&t, &["1d61da02".into(), "a693fe91".into(), "5cd3731a".into(), "00000001".into()]).unwrap();
+        let get = |n: &str| c.iter().find(|x| x.0 == n).map(|x| x.1);
+        assert_eq!(get("gcmuscleback"), Some(0.2));
+        assert_eq!(get("gcmusclethigh"), Some(0.0));
+        assert_eq!(get("gcbreasts"), Some(0.4));
+        assert!(preset_from_items(&t, &["00000001".into()]).is_err());
+        assert!(preset_from_items(&t, &[]).unwrap().is_empty());
     }
 
     #[test]
@@ -897,7 +1040,7 @@ mod tests {
     <Item key="BODYSHAPE_BEACHBELLIES"><BodyShapeVariations><Item><BodyShapePreset>PED_BODYSHAPE_BELLY</BodyShapePreset></Item></BodyShapeVariations></Item>
   </BodyShapeVariationProfiles>"#;
         assert_eq!(preset_from_xml(xml, "Average").unwrap(), vec![("gcweightback".to_string(), 0.0)]);
-        assert_eq!(preset_from_xml(xml, "BeachBellies").unwrap(), vec![("gcbutt".to_string(), 0.75), ("gcweightbelly".to_string(), 0.5)]);
+        assert_eq!(preset_from_xml(xml, "BeachBellies").unwrap(), vec![("gccleavage".to_string(), 0.5), ("gcbutt".to_string(), 0.75), ("gcweightbelly".to_string(), 0.5)]);
         assert!(preset_from_xml(xml, "Nope").is_err());
         // an unnamed profile word, as its joaat
         let h = format!("{:08x}", crate::meta7a::joaat("BeachBellies"));

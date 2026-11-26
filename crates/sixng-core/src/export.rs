@@ -754,7 +754,7 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                             e["width"] = et.width.into();
                             e["height"] = et.height.into();
                             e["format"] = et.format.clone().into();
-                            if let Some(sr) = crate::material::slot_role(&t.param_hash) {
+                            if let Some(sr) = crate::material::slot_role_in(&s.name_hash, &t.param_hash) {
                                 e["slot_role"] = sr.into();
                             }
                             match texture::embedded_rgba(r, et) {
@@ -784,7 +784,7 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                             e["status"] = "not in any ttpf store".into();
                             let role = unresolved_role(&t.param_hash);
                             e["role_guess"] = role.into();
-                            if let Some(sr) = crate::material::slot_role(&t.param_hash) {
+                            if let Some(sr) = crate::material::slot_role_in(&s.name_hash, &t.param_hash) {
                                 e["slot_role"] = sr.into();
                             }
                             e["texture_fallback"] = serde_json::json!({"reason": UNRESOLVED, "pending_role": role});
@@ -815,7 +815,7 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                     "data (linear)"
                 };
                 e["role_guess"] = role.into();
-                if let Some(r) = crate::material::slot_role(&t.param_hash) {
+                if let Some(r) = crate::material::slot_role_in(&s.name_hash, &t.param_hash) {
                     e["slot_role"] = r.into();
                 }
                 if !o.png {
@@ -1504,6 +1504,8 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                         v["wear_records"] = part_looks["wear_records"].clone();
                         v["wear_records_note"] = serde_json::Value::from("the game's wear records the parts reach (vehicle material library, as stored; links as 8 hex digits). Each part id's surface names a wear ladder and a detail set: ladder_by_look and detail_by_look give per look the index into ladders and details of each part id (256 x 2 hex digits, ff = none). A ladder lists six surfaces (materialPresets) and six wear presets (wearPresets, see presets: dustIntensity, rust, primer and control intensities). A preset names an age record (ageWearHash: in ages, or in age_ranges with minWear / maxWear), an edge record (7f1fe0a2, in edges) and two colour range records (879774bd, 02a27216, in colour_ranges). details: detailIndex0 / 1 are probably slices of the detail texture arrays (0cd27763, 7c0055b9), which no material binds. global: the library's shared dirt settings. levels_by_config (configuration key, as in configs) gives each part id's wear level and primer sets under that configuration (256 x 4 hex digits: level 0 to 5, then a bit mask; ffff = none); the level is the entry of its ladder's materialPresets and wearPresets. levels_default is the levels most configurations give. The configuration parts that set the levels sit in slots named wear, wear_interior, wear_engine, wear_wheels and six more. A dirt level and what the shader does with these values are not decoded; nothing here is applied to the GLB.");
                         v["primer"] = part_looks["primer"].clone();
+                        v["wear_tint"] = part_looks["wear_tint"].clone();
+                        v["wear_tint_note"] = serde_json::Value::from("per look, the colour of each part id's second layer (256 x 6 hex digits, sRGB red, green, blue): the colour of the colour record its surface names for the layer (5cffe5e0). The game packs it as that layer's tint (rva 0x37766a0, surface record +16, in linear); its paint shader shows the tint where the layer's palette weight is low and the palette row (wear) where it is high.");
                         v["primer_note"] = serde_json::Value::from("per look, the palette rows of each part id's primer (the game's second wear layer) for primer sets 0, 1 and 2 (256 x 12 hex digits: three rows as in rows, ffff = none). They are the part's colour record's primer entries of its surface's primerType; a set the record leaves empty takes set 0. A part's set is the first of a per-vehicle random order of 0, 1, 2 that its primerSets mask (levels_by_config) allows. The shader reads the row at the column the primer's summed mask gives through the wear preset's primerGradientStart / primerGradientEnd window. Not applied to the GLB.");
                         v["surfaces"] = part_looks["surfaces"].clone();
                         v["surfaces_note"] = serde_json::Value::from("per look, the first layer of each part id's surface (256 x 8 hex digits: metalness low, metalness high, roughness low, roughness high, 0 to 255). The paint shader blends low to high by the red (metalness) and green (roughness) channel of a material's lyr0materialatex (slot 2bb2ede8, sampled with the first UV set) at each pixel. The alpha of a look entry holds the same pair blended once, by the mean of that texture over the model's materials; a material whose map is not in the install has only that. A part patch has the same for its ids (surfaces).");
@@ -2483,6 +2485,9 @@ pub fn export_placements(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], ou
                     if let Some(p) = ps.and_then(|m| m.get(&(i as u64))) {
                         lod["parent"] = p.clone();
                     }
+                    if let Some(t) = arch_lod.get(&en.archetype).and_then(|al| crate::lodlinks::time_json(al.time_flags)) {
+                        j["time"] = t;
+                    }
                 }
             }
             doc["coordinate_system"] = serde_json::json!(match space {
@@ -2546,6 +2551,10 @@ pub struct BatchSummary {
 /// * `batch_props.bin`: 44 bytes per prop instance, little-endian:
 ///   position f32 x3, world rotation quaternion f32 x4 (x, y, z, w),
 ///   scale f32 x3, tint u8 x4 (RGBA);
+/// * `batch_props_layer.bin`: 2 bytes per prop instance, same order as
+///   `batch_props.bin`: `layer_blend` (the 2-layer shaders' per-instance
+///   value b = byte / 255) and `layer_aux` (read beside it), see
+///   `batches::PropInstance`; a separate file so the 44-byte records stay;
 /// * `batch_grass.bin`: 20 bytes per grass instance: position f32 x3,
 ///   normal x / y u8 (n = b / 255 * 2 - 1, z positive), colour u8 x3,
 ///   scale u8, ambient occlusion u8, one pad byte.
@@ -2560,6 +2569,7 @@ pub fn export_batches(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: 
     struct W {
         meta: crate::atomic::AtomicFile,
         props: crate::atomic::AtomicFile,
+        props_layer: crate::atomic::AtomicFile,
         grass: crate::atomic::AtomicFile,
         np: usize,
         ng: usize,
@@ -2568,6 +2578,7 @@ pub fn export_batches(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: 
     let w = std::sync::Mutex::new(W {
         meta: crate::atomic::AtomicFile::create(dir.join("batches.jsonl"))?,
         props: crate::atomic::AtomicFile::create(dir.join("batch_props.bin"))?,
+        props_layer: crate::atomic::AtomicFile::create(dir.join("batch_props_layer.bin"))?,
         grass: crate::atomic::AtomicFile::create(dir.join("batch_grass.bin"))?,
         np: 0,
         ng: 0,
@@ -2602,6 +2613,7 @@ pub fn export_batches(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: 
                 }
                 buf.extend_from_slice(&i.tint);
                 let _ = w.props.write_all(&buf);
+                let _ = w.props_layer.write_all(&[i.layer_blend, i.layer_aux]);
             }
             w.np += b.instances.len();
             w.s.prop_batches += 1;
@@ -2631,6 +2643,7 @@ pub fn export_batches(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: 
     let w = w.into_inner().unwrap();
     w.meta.commit()?;
     w.props.commit()?;
+    w.props_layer.commit()?;
     w.grass.commit()?;
     Ok(w.s)
 }

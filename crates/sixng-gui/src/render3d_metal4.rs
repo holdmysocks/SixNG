@@ -856,6 +856,46 @@ fn vertex4(vertex: &glb::Vertex) -> Vertex4 {
     }
 }
 
+/// 把 glb::Model 的网格组装成 GPU vertex/index 字节 + mesh 元数据。
+///
+/// 这是 vertex/index 字节的唯一来源：运行时上传（upload_shared）与离线缓存烘焙
+/// （bake_model_cache）都调用它，保证写入缓存的字节与运行时期望逐字节一致。
+pub fn build_vertex_index_bytes(
+    model: &glb::Model,
+) -> anyhow::Result<(Vec<u8>, Vec<u8>, Vec<GpuMesh4>)> {
+    let material_count = if model.materials.is_empty() {
+        1usize
+    } else {
+        model.materials.len()
+    };
+    let mut vertices: Vec<Vertex4> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    let mut meshes = Vec::with_capacity(model.meshes.len());
+    for mesh in &model.meshes {
+        if mesh.indices.len() % 3 != 0 {
+            bail!("MTL4 mesh {} has an incomplete triangle", mesh.name);
+        }
+        let vertex_offset = vertices.len() * std::mem::size_of::<Vertex4>();
+        let index_start = indices.len() * std::mem::size_of::<u32>();
+        vertices.extend(mesh.verts.iter().map(vertex4));
+        indices.extend_from_slice(&mesh.indices);
+        let index_end = indices.len() * std::mem::size_of::<u32>();
+        meshes.push(GpuMesh4 {
+            index_range: index_start..index_end,
+            vertex_offset,
+            n_idx: u32::try_from(mesh.indices.len())
+                .context("MTL4 mesh index count exceeds u32")?,
+            material: mesh.material.unwrap_or(0).min(material_count - 1),
+            skinned: mesh.skinned,
+            centre: Vec3::from(mesh.centre),
+            visible: true,
+        });
+    }
+    let vertex_bytes = bytemuck::cast_slice::<Vertex4, u8>(&vertices).to_vec();
+    let index_bytes = bytemuck::cast_slice::<u32, u8>(&indices).to_vec();
+    Ok((vertex_bytes, index_bytes, meshes))
+}
+
 fn material_image_indices(material: &glb::Material) -> [Option<usize>; 4] {
     [
         material.base,
@@ -1581,32 +1621,7 @@ impl Renderer3D4 {
             material_texture_indices.push(local_textures);
         }
 
-        let mut vertices = Vec::new();
-        let mut indices = Vec::new();
-        let mut meshes = Vec::with_capacity(model.meshes.len());
-        for mesh in &model.meshes {
-            if mesh.indices.len() % 3 != 0 {
-                bail!("MTL4 mesh {} has an incomplete triangle", mesh.name);
-            }
-            let vertex_offset = vertices.len() * std::mem::size_of::<Vertex4>();
-            let index_start = indices.len() * std::mem::size_of::<u32>();
-            vertices.extend(mesh.verts.iter().map(vertex4));
-            indices.extend_from_slice(&mesh.indices);
-            let index_end = indices.len() * std::mem::size_of::<u32>();
-            meshes.push(GpuMesh4 {
-                index_range: index_start..index_end,
-                vertex_offset,
-                n_idx: u32::try_from(mesh.indices.len())
-                    .context("MTL4 mesh index count exceeds u32")?,
-                material: mesh.material.unwrap_or(0).min(materials.len() - 1),
-                skinned: mesh.skinned,
-                centre: Vec3::from(mesh.centre),
-                visible: true,
-            });
-        }
-
-        let vertex_bytes = bytemuck::cast_slice::<Vertex4, u8>(&vertices);
-        let index_bytes = bytemuck::cast_slice::<u32, u8>(&indices);
+        let (vertex_bytes, index_bytes, meshes) = build_vertex_index_bytes(model)?;
         let vertex_buffer = self
             .device
             .new_buffer(vertex_bytes.len().max(4), ResourceOptions::PRIVATE)?;

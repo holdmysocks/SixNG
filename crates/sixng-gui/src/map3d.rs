@@ -3024,11 +3024,24 @@ impl Map3D {
         // out to here the far field lies flat under the streamed buildings
         // and their LODs (every level up to the last-but-one band is drawn,
         // with coverage fallbacks near the camera); beyond it shows them as
-        // blocks. Areas whose buildings are still loading keep the blocks.
+        // blocks. Areas whose buildings are still loading keep the blocks
+        // (not those the memory limits leave out: see update_building_readiness).
         self.detail.radii[4]
     }
 
+    /// Per 128 m area: visible buildings, and those not waiting on a load.
+    /// A building that is missing but not queued or loading (left out by
+    /// the memory limits) will not arrive, so it does not hold the area's
+    /// far-field blocks up: they would stand over the buildings that are
+    /// drawn.
     fn update_building_readiness(&mut self, data: &MapData) {
+        let pending: HashSet<u32> = {
+            let q = self.shared.queue.lock().unwrap();
+            let f = self.shared.inflight.lock().unwrap();
+            q.iter().map(|r| r.model).chain(f.iter().copied()).collect()
+        };
+        // more requests than the queue holds: the rest are still to come
+        let all_pending = self.stats.more_queued;
         let mut m: HashMap<(i32, i32), (u32, u32)> = HashMap::new();
         for &(i, model) in &self.visible {
             let e = &data.ents[i as usize];
@@ -3045,7 +3058,7 @@ impl Map3D {
             let loaded = self.cache.contains_key(&model);
             #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
             let loaded = loaded || self.cache4.contains_key(&model);
-            if loaded {
+            if loaded || !(all_pending || pending.contains(&model)) {
                 v.1 += 1;
             }
         }

@@ -95,7 +95,7 @@ pub const SLOTS: &[(&str, &str)] = &[
     ("58b6e707", "normal (BC5, DirectX green)"),
     ("4d56d7fe", "normal atlas (vehicle, BC1)"),
     ("2bb2ede8", "normal atlas (vehicle, BC1)"),
-    ("739e3d0d", "packed material data, linear (likely roughness/metal/AO; channel order unverified)"),
+    ("739e3d0d", "packed material data, linear (meaning depends on the shader; channel order unverified for most)"),
     ("c6f46e79", "packed material data, linear (G/B near 0.5: likely detail-normal or mask pair)"),
     ("0df47048", "secondary colour / detail albedo (sRGB)"),
     ("7485dafb", "colour with opacity in alpha (sRGB)"),
@@ -109,6 +109,20 @@ pub const SLOTS: &[(&str, &str)] = &[
     ("8e0d63ee", "emissive map (emissivetex: the lit parts of a lamp or panel)"),
     ("2c8d7182", "tint palette (embedded in the model: rows of RGBA8 colours, picked per instance by the placement tint row)"),
 ];
+
+/// Slots whose meaning depends on the shader: (shader hash, param hash, role).
+/// These are read from the shader programs, so they replace the generic role.
+pub const SHADER_SLOTS: &[(&str, &str, &str)] = &[
+    // weapon pixel program: R times a block strength is a wear amount (lerps the
+    // colour toward a wear ramp, scales metalness by 1 - wear, moves roughness
+    // toward a block value); G modulates gloss. Metalness comes from another map.
+    ("e68a4a98", "739e3d0d", "wear overlay amount (R) and gloss modulation (G), linear; not a metal mask"),
+];
+
+/// Slot role for a slot as one shader uses it, else the generic role.
+pub fn slot_role_in(shader_hash: &str, param_hash: &str) -> Option<&'static str> {
+    SHADER_SLOTS.iter().find(|s| s.0 == shader_hash && s.1 == param_hash).map(|s| s.2).or_else(|| slot_role(param_hash))
+}
 
 pub fn slot_role(param_hash: &str) -> Option<&'static str> {
     SLOTS.iter().find(|s| s.0 == param_hash).map(|s| s.1).or_else(|| u32::from_str_radix(param_hash, 16).ok().and_then(crate::headskin::extra_role))
@@ -523,7 +537,7 @@ fn two_layer_blend_text() -> Value {
         "inputs": {
             "c": "_COLOR1.r / 255 (the second vertex colour set)",
             "M": "the blend mask: slot 11 (extra_data), rgba, on TEXCOORD_0 when mask_uv_pair is 1, else TEXCOORD_1 (2 on 6 to 26 % of sampled materials; the mesh program packs mesh UV sets 0 and 1 into the pixel input TEXCOORD0)",
-            "b": "a per-instance value (byte 3 of the instance's record; batch props: an instance input). Not exported; 1 (byte 255) is assumed, which makes m = blendintensity",
+            "b": "a per-instance value / 255. Batch props (prop_2lyr_batch drawn instanced): the u8 at +0x3E of the 64-byte batch instance record (layer_blend in the decoded batches; 255 on 96 % of 2-layer rock instances, 0 on whole batches, which turns layer 2 off). Other placements: byte 3 of the first dword of the draw's 32-byte per-instance record, filled from the placement by code not read. Not exported; 1 (byte 255) is assumed, which makes m = blendintensity",
         },
         "steps": [
             "h = dot(M, mask_weights)                (mask_weights.z is replaced by b where instance_switch is 1 and b < 1)",
@@ -538,7 +552,7 @@ fn two_layer_blend_text() -> Value {
         ],
         "simple": "with b = 1 and the mask ignored (h = 0): w = saturate(sharpen(c) x blendintensity + blendoffset), sharpen(c) = c / (c + k (1 - c)); blendsoftness 1 gives sharpen(c) = c",
         "source": "shader code: the deferred pixel programs of standard_2lyr and prop_2lyr_batch read in full, the pxm and decal ground ones compared; the mesh programs' export of _COLOR1.r to the pixel input checked. Not compared with a rendered image",
-        "not_read": "where the per-instance value comes from in the placements; the normal and material-map blend (they use max(0, w - _COLOR1.g))",
+        "not_read": "which placement field fills b for ordinary entities (two u8 entity fields that default to 255, 0dc5f270 and 540ca436, are candidates but differ from each other on most entities); the normal and material-map blend (they use max(0, w - _COLOR1.g))",
     })
 }
 
@@ -1226,6 +1240,7 @@ mod paint_tests {
         let r = &b["resolved"];
         assert_eq!((r["h"].as_str(), r["k"].as_str(), r["w"].as_str()), (Some("1 - (M.b)"), Some("11.1111"), Some("saturate(s x 0.4 + 0.3)")));
         assert_eq!(r["mask_uv"], "TEXCOORD_1");
+        assert!(b["inputs"]["b"].as_str().unwrap().contains("+0x3E of the 64-byte batch instance record"));
         // softness 1: no sharpening; the layer-2 alpha switch multiplies in lyr1diffusetex.a
         let sh = crate::drawable::Shader { constants: vec![s1("cbc6c5b3", 1.0), s1("ba3b95db", 1.0), s1("29265d05", 0.0), s1("d6de9e14", 1.0)], ..sh };
         let r = &multilayer(&sh, &[], || Value::Null).unwrap()["blend"]["resolved"];
@@ -1348,5 +1363,13 @@ mod paint_tests {
         consts.last_mut().unwrap().values = Some([0.0; 4]);
         four_layer_tint(&mut l, &consts);
         assert_eq!(l["tint_formula"]["per_layer"][0]["texture_tint_amount"].as_f64(), Some(1.0));
+    }
+
+    #[test]
+    fn weapon_speculartex2_is_wear_not_metal() {
+        let w = slot_role_in("e68a4a98", "739e3d0d").unwrap();
+        assert!(w.contains("wear") && w.contains("not a metal mask"));
+        assert_eq!(slot_role_in("e3ba3129", "739e3d0d"), slot_role("739e3d0d"));
+        assert_eq!(slot_role_in("e68a4a98", "c8e8c282"), slot_role("c8e8c282"));
     }
 }
