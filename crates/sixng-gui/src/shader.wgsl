@@ -1937,6 +1937,8 @@ struct GlowOut {
     @location(2) world: vec3<f32>,
 };
 
+// brightest a corona's core gets (in exposed units; 1 is about white)
+const GLOW_PEAK: f32 = 0.9;
 // world radius of a corona's core (m)
 const GLOW_R: f32 = 0.08;
 
@@ -1974,5 +1976,11 @@ fn fs_glow(i: GlowOut) -> @location(0) vec4<f32> {
     let r2 = dot(i.uv, i.uv);
     if (r2 > 9.0) { discard; }
     let l = i.rad * exp(-0.5 * r2);
-    return vec4(map_finish_added(l, i.world), 0.0);
+    // each corona tone-mapped on its own (hue kept, brightest channel
+    // eased towards GLOW_PEAK times the exposure's white), so its core
+    // keeps the lamp's colour instead of clipping to white
+    let c = map_finish_added(l, i.world);
+    let m = max(max(c.r, c.g), max(c.b, 1e-6));
+    let k = GLOW_PEAK * (1.0 - exp(-m / GLOW_PEAK)) / m;
+    return vec4(c * k, 0.0);
 }
