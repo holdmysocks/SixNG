@@ -990,8 +990,7 @@ again**).
   the game's `gcbreasts` and `gcbutt` controls, and under **Regions** the
   12 weight and 12 muscle regions, and under **Shape details** breast
   height and spacing, chest height, cleavage, hip width and height, belly
-  roundness, head scale, biceps, triceps and one lower-chest control whose
-  name is not recovered; the overall weight and muscle set every
+  roundness, head scale, biceps, triceps and plastic breasts; the overall weight and muscle set every
   region): an outfit opens in its own body-shape preset (since
   2026-11-26 read the way the game does it: the outfit's `BodyShapePreset`
   variation includes body-shape kits, and their tags name preset items of
@@ -1031,8 +1030,9 @@ again**).
   (male rig only; the body-type XML's `GCCleavage`), `gchipheight` (-1..1,
   a negative value drives the other input by its size), `gcbellyround`,
   `gchipwidth`, `gcheadscale`, `gcmusclebiceps`, `gcmuscletriceps`
-  (0..1) and one whose name is not recovered, `gc_b0eae798` (-1..1, lower
-  chest and breast size). Every item that sets one control alone sets its
+  (0..1) and `gcplasticbreasts` (-1..1; at 1 the breasts are large, round
+  and set high). Its name was found by a word search for joaat
+  `b0eae798` and fits how it looks. Every item that sets one control alone sets its
   input to exactly the control's value (8 to 15 items each). The names
   are joaat of the control ids; the rig inputs themselves have other
   hashes. One input, `5ebebbe7` (head and neck), is set by no item; it is

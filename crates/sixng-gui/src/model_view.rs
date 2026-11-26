@@ -637,7 +637,7 @@ const BODY_DETAILS: usize = 26;
 /// Slider label of a shape control (`gcbreastheight` -> `breast height`).
 fn detail_label(name: &str) -> String {
     let n = name.trim_start_matches("gc").trim_start_matches('_');
-    for (a, b) in [("breastheight", "breast height"), ("breastspacing", "breast spacing"), ("chestheight", "chest height"), ("bellyround", "belly roundness"), ("hipwidth", "hip width"), ("hipheight", "hip height"), ("headscale", "head scale"), ("musclebiceps", "biceps"), ("muscletriceps", "triceps"), ("b0eae798", "lower chest (b0eae798)")] {
+    for (a, b) in [("breastheight", "breast height"), ("breastspacing", "breast spacing"), ("chestheight", "chest height"), ("bellyround", "belly roundness"), ("hipwidth", "hip width"), ("hipheight", "hip height"), ("headscale", "head scale"), ("musclebiceps", "biceps"), ("muscletriceps", "triceps"), ("plasticbreasts", "plastic breasts")] {
         if n == a {
             return b.to_string();
         }
