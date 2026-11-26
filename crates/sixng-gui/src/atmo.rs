@@ -811,11 +811,11 @@ impl Atmosphere {
         }
     }
 
-    /// Write the frame's scene values; `None` keeps the model viewer's own light.
     /// Uploads the water maps (ground height, fog scattering and
-    /// extinction), resampled to the textures' size.
-    pub fn set_water_maps(&mut self, queue: &wgpu::Queue, m: &sixng_core::water::ViewMaps) {
-        let (a, b) = water_texels(m);
+    /// extinction), resampled to the textures' size. `ground` (world x, y
+    /// to a height) fills the ground where the water height map has none.
+    pub fn set_water_maps(&mut self, queue: &wgpu::Queue, m: &sixng_core::water::ViewMaps, ground: Option<&dyn Fn(f32, f32) -> Option<f32>>) {
+        let (a, b) = water_texels(m, ground);
         for (t, d) in self.water_tex.iter().zip([a, b]) {
             queue.write_texture(
                 t.as_image_copy(),
@@ -838,6 +838,7 @@ impl Atmosphere {
         queue.write_buffer(&self.binds.light_grid, 0, bytemuck::cast_slice(grid));
     }
 
+    /// Write the frame's scene values; `None` keeps the model viewer's own light.
     pub fn update(&mut self, queue: &wgpu::Queue, sky: Option<&Sky>, view_proj: Mat4, cam: Vec3, size: [u32; 2], dt: f32) {
         let Some(sky) = sky else {
             queue.write_buffer(&self.binds.scene_ub, 0, bytemuck::bytes_of(&SceneU::default()));
@@ -1067,7 +1068,8 @@ pub fn f16_bits(v: f32) -> u16 {
 
 /// The two water textures' texels (RGBA half floats): A = height,
 /// scattering x 1000; B = extinction x 1000, 1.
-fn water_texels(m: &sixng_core::water::ViewMaps) -> (Vec<u16>, Vec<u16>) {
+fn water_texels(m: &sixng_core::water::ViewMaps, ground: Option<&dyn Fn(f32, f32) -> Option<f32>>) -> (Vec<u16>, Vec<u16>) {
+    let [bx0, by0, bx1, by1] = m.world_box;
     let at = |im: &sixng_core::water::Image, x: usize, y: usize, c: usize| {
         let (ix, iy) = ((x * im.w / WATER_W).min(im.w - 1), (y * im.h / WATER_H).min(im.h - 1));
         im.at(ix, iy, c.min(im.ch - 1))
@@ -1076,7 +1078,17 @@ fn water_texels(m: &sixng_core::water::ViewMaps) -> (Vec<u16>, Vec<u16>) {
     let mut b = Vec::with_capacity(WATER_W * WATER_H * 4);
     for y in 0..WATER_H {
         for x in 0..WATER_W {
-            a.push(f16_bits(at(&m.height, x, y, 0)));
+            // no height in the water height map (-300: the coasts the map
+            // leaves out, the open sea): the caller's ground where it has one
+            let mut h = at(&m.height, x, y, 0);
+            if h < -250.0 {
+                let wx = bx0 + (x as f32 + 0.5) / WATER_W as f32 * (bx1 - bx0);
+                let wy = by1 - (y as f32 + 0.5) / WATER_H as f32 * (by1 - by0);
+                if let Some(g) = ground.and_then(|f| f(wx, wy)) {
+                    h = g;
+                }
+            }
+            a.push(f16_bits(h));
             for c in 0..3 {
                 a.push(f16_bits(at(&m.scattering, x, y, c) * 1000.0));
             }

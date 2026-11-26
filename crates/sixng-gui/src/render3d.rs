@@ -2789,8 +2789,8 @@ impl Renderer3D {
 
     /// Uploads the water maps (fog atlas and water height map) for the
     /// map's water.
-    pub fn set_water_maps(&mut self, queue: &wgpu::Queue, m: &sixng_core::water::ViewMaps) {
-        self.atmo.set_water_maps(queue, m);
+    pub fn set_water_maps(&mut self, queue: &wgpu::Queue, m: &sixng_core::water::ViewMaps, ground: Option<&dyn Fn(f32, f32) -> Option<f32>>) {
+        self.atmo.set_water_maps(queue, m, ground);
     }
 
     /// Uploads the placed lights near the camera for the HDR shading

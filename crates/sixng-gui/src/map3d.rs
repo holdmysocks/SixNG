@@ -2722,7 +2722,13 @@ impl Map3D {
                 let got = slot.lock().unwrap().take();
                 if let Some(res) = got {
                     match res {
-                        Ok(m) => renderer.set_water_maps(&rs.queue, &m),
+                        Ok(m) => {
+                            // the map's 8 m heights fill the coasts the water
+                            // height map leaves out (the seabed off the beaches)
+                            let data = self.data.clone();
+                            let ground = |x: f32, y: f32| data.as_ref().and_then(|d| d.height(x, y));
+                            renderer.set_water_maps(&rs.queue, &m, Some(&ground));
+                        }
                         Err(e) => eprintln!("[map3d] water maps: {e:#}"),
                     }
                     self.water_maps = WaterMaps::Done;
