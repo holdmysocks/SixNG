@@ -456,6 +456,81 @@ pub fn parse_spec(spec: &str) -> Result<Vec<(String, f32)>, String> {
     Ok(out)
 }
 
+/// Control values of an outfit's body-shape preset tag (the variation's
+/// `BodyShapePreset` word, e.g. `Average`), from `common.rpf`'s body-type
+/// XML (`CPedVariationBodyTypeManager`): the profile `BODYSHAPE_<TAG>` lists
+/// presets the game picks from (the first is taken), and a preset
+/// `PED_BODYSHAPE_*` lists control values (the first of each value list).
+/// Controls without a known rig input (`GCCleavage`) are left out. Needs
+/// `common.rpf` indexed.
+pub fn preset_controls(game_root: &Path, tag: &str) -> Result<Vec<(String, f32)>, String> {
+    preset_from_xml(body_type_xml(game_root)?, tag)
+}
+
+/// `preset_controls` on the XML text.
+pub fn preset_from_xml(xml: &str, tag: &str) -> Result<Vec<(String, f32)>, String> {
+    let tag = tag.trim().to_ascii_uppercase();
+    let key = |k: &str| format!("<Item key=\"{k}\">");
+    // the item's text up to the next item key of the same kind
+    let block = |k: &str, next: &str| -> Option<&str> {
+        let at = xml.find(&key(k))? + key(k).len();
+        let rest = &xml[at..];
+        Some(&rest[..rest.find(next).unwrap_or(rest.len())])
+    };
+    // an unnamed profile word comes as its joaat (8 hex digits): name it
+    // from the profile keys of the XML
+    let tag = match u32::from_str_radix(&tag, 16) {
+        Ok(h) if tag.len() == 8 => xml
+            .split("<Item key=\"BODYSHAPE_")
+            .skip(1)
+            .filter_map(|r| r.split('"').next())
+            .find(|n| crate::meta7a::joaat(n) == h)
+            .map(str::to_string)
+            .ok_or_else(|| format!("body-shape profile word {tag} is not a profile of the body-type XML"))?,
+        _ => tag,
+    };
+    let preset = if tag.starts_with("PED_BODYSHAPE_") {
+        tag.clone()
+    } else {
+        let p = block(&format!("BODYSHAPE_{tag}"), "<Item key=\"BODYSHAPE_").ok_or_else(|| format!("body-shape profile BODYSHAPE_{tag} is not in the body-type XML"))?;
+        let a = p.find("<BodyShapePreset>").ok_or_else(|| format!("body-shape profile BODYSHAPE_{tag} names no preset"))? + "<BodyShapePreset>".len();
+        p[a..p[a..].find('<').map_or(p.len(), |e| a + e)].trim().to_string()
+    };
+    let b = block(&preset, "</Expressions>").ok_or_else(|| format!("body-shape preset {preset} is not in the body-type XML"))?;
+    let mut spec = Vec::new();
+    for item in b.split("<Id>").skip(1) {
+        let Some((id, rest)) = item.split_once("</Id>") else { continue };
+        let id = id.trim().to_ascii_lowercase();
+        let Some(v) = rest.split_once('>').and_then(|(_, r)| r.split('<').next()).and_then(|r| r.split_whitespace().next()).and_then(|x| x.parse::<f32>().ok()) else { continue };
+        if CONTROLS.iter().any(|c| c.0 == id) {
+            spec.push(format!("{id}={v}"));
+        }
+    }
+    parse_spec(&spec.join(","))
+}
+
+/// The body-type XML of `common.rpf` (read once).
+fn body_type_xml(game_root: &Path) -> Result<&'static str, String> {
+    static X: OnceLock<Result<String, String>> = OnceLock::new();
+    X.get_or_init(|| {
+        let work = crate::names::work_dir().ok_or("no work directory")?;
+        let ixp = crate::scan::index_path(&work.join("index"), "common.rpf");
+        let ix = crate::scan::load_index(&ixp).map_err(|e| format!("common.rpf index ({}): {e}; index common.rpf first", ixp.display()))?;
+        let arch = game_root.join("common.rpf");
+        for e in ix.entries.iter().filter(|e| e.kind == crate::classify::Kind::Xml) {
+            if let Ok(b) = crate::scan::read_entry(&arch, e) {
+                let s = String::from_utf8_lossy(&b);
+                if s.contains("<CPedVariationBodyTypeManager") {
+                    return Ok(s.into_owned());
+                }
+            }
+        }
+        Err("body-type XML (CPedVariationBodyTypeManager) not found in common.rpf".into())
+    })
+    .as_deref()
+    .map_err(|e| e.clone())
+}
+
 /// Rig input values (hash -> value) for control values.
 pub fn input_values(controls: &[(String, f32)]) -> HashMap<u32, f32> {
     let mut m = HashMap::new();
@@ -803,6 +878,31 @@ mod tests {
         assert_eq!(m.get(&0xf8ca1901), Some(&1.0));
         assert_eq!(parse_spec("allweight=1").unwrap().len(), 12);
         assert!(parse_spec("nope=1").is_err());
+    }
+
+    #[test]
+    fn preset_from_body_type_xml() {
+        let xml = r#"<BodyShapePresets>
+    <Item key="PED_BODYSHAPE_REGULAR"><Expressions><Item><Id>gcweightback</Id><Values content="float_array">0.0</Values></Item></Expressions></Item>
+    <Item key="PED_BODYSHAPE_BELLY">
+      <Expressions>
+        <Item><Id>GCCleavage</Id><Values content="float_array">0.5</Values></Item>
+        <Item><Id>GCButt</Id><Values content="float_array">0.75</Values></Item>
+        <Item><Id>gcweightbelly</Id><Values content="float_array">0.5 0.75 1.0</Values></Item>
+      </Expressions>
+    </Item>
+  </BodyShapePresets>
+  <BodyShapeVariationProfiles>
+    <Item key="BODYSHAPE_AVERAGE"><BodyShapeVariations><Item><BodyShapePreset>PED_BODYSHAPE_REGULAR</BodyShapePreset></Item></BodyShapeVariations></Item>
+    <Item key="BODYSHAPE_BEACHBELLIES"><BodyShapeVariations><Item><BodyShapePreset>PED_BODYSHAPE_BELLY</BodyShapePreset></Item></BodyShapeVariations></Item>
+  </BodyShapeVariationProfiles>"#;
+        assert_eq!(preset_from_xml(xml, "Average").unwrap(), vec![("gcweightback".to_string(), 0.0)]);
+        assert_eq!(preset_from_xml(xml, "BeachBellies").unwrap(), vec![("gcbutt".to_string(), 0.75), ("gcweightbelly".to_string(), 0.5)]);
+        assert!(preset_from_xml(xml, "Nope").is_err());
+        // an unnamed profile word, as its joaat
+        let h = format!("{:08x}", crate::meta7a::joaat("BeachBellies"));
+        assert_eq!(preset_from_xml(xml, &h).unwrap(), preset_from_xml(xml, "BeachBellies").unwrap());
+        assert!(preset_from_xml(xml, &format!("{:08x}", crate::meta7a::joaat("Skinny"))).is_err());
     }
 
     #[test]

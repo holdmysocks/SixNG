@@ -1893,11 +1893,27 @@ impl App {
             m.cam.pitch = v;
         }
         m.zoom_after_load = c.f("zoom");
-        // --body <weight>,<muscle>: body shape of characters (-1..1, 0..1)
+        // --body <weight>,<muscle>[,<breasts>,<butt>] (-1..1, 0..1, -1..1,
+        // 0..1; missing values are 0) or a --body-shape spec
+        // (gcweightbelly=0.5,gcbutt=1,...): body shape of characters, kept
+        // instead of the outfit's own preset
         if let Some(v) = c.get("body") {
-            let v: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-            if !v.is_empty() {
-                m.set_body_shape((v[0].clamp(-1.0, 1.0), v.get(1).copied().unwrap_or(0.0).clamp(0.0, 1.0)));
+            if v.contains('=') {
+                match sixng_core::bodyshape::parse_spec(v) {
+                    Ok(c) => m.set_body_shape(model_view::body_from(&c)),
+                    Err(e) => eprintln!("--body: {e}"),
+                }
+            } else {
+                let v: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                if !v.is_empty() {
+                    let at = |k: usize, lo: f32| v.get(k).copied().unwrap_or(0.0).clamp(lo, 1.0);
+                    let mut s = model_view::NEUTRAL_BODY;
+                    s[..12].fill(at(0, -1.0));
+                    s[12..24].fill(at(1, 0.0));
+                    s[25] = at(2, -1.0);
+                    s[24] = at(3, 0.0);
+                    m.set_body_shape(s);
+                }
             }
         }
         if let Some(q) = c.get("model") {
