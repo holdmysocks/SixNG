@@ -330,11 +330,11 @@ fn water_here(p: vec3<f32>) -> WaterHere {
     if (any(uv < vec2(0.0)) || any(uv > vec2(1.0))) { return w; }
     let a = textureSampleLevel(t_water_a, lin_clamp, uv, 0.0);
     let e = textureSampleLevel(t_water_b, lin_clamp, uv, 0.0);
-    // no height (the open sea): deep
-    w.ground = select(a.x, -1000.0, a.x < -250.0);
+    w.ground = a.x;
     w.scat = a.yzw;
     w.ext = e.rgb;
-    w.ok = e.a > 0.5;
+    // no height (the open sea): the timecycle's water, as before the maps
+    w.ok = e.a > 0.5 && a.x > -250.0;
     return w;
 }
 
@@ -342,7 +342,9 @@ fn water_here(p: vec3<f32>) -> WaterHere {
 // `bed`: the bed's height where the caller knows it (the terrain's 8 m
 // heights), else below NO_BED (the water height map's is taken).
 const NO_BED: f32 = -9000.0;
-fn water_shade(p: vec3<f32>, fp: f32, surf: f32, bed: f32) -> vec3<f32> {
+// `edge`: 0 to 1 on the coastline the caller knows (the terrain's land to
+// sea cells), where the sea surfs whatever the depth data says.
+fn water_shade(p: vec3<f32>, fp: f32, surf: f32, bed: f32, edge: f32) -> vec3<f32> {
     let o = F.cam_pos.xyz;
     let dist = length(o - p);
     let v = (o - p) / max(dist, 1e-3);
@@ -405,6 +407,11 @@ fn water_shade(p: vec3<f32>, fp: f32, surf: f32, bed: f32) -> vec3<f32> {
         }
     } else {
         body = 0.33 * ssa * e_down / PI * S.water3.rgb;
+    }
+    if (edge > 0.0 && !inland) {
+        let tm = S.water4.w;
+        let brk = foam_noise(p.xz * 0.35 + vec2(tm * 0.05, 0.0)) * foam_noise(p.xz * 0.09 - vec2(0.0, tm * 0.02));
+        foam = max(foam, clamp(edge * (0.45 + 1.1 * brk), 0.0, 1.0));
     }
     let water = fr * refl + glint + (1.0 - fr) * body;
     return mix(water, FOAM_ALBEDO * e_down / PI, foam * 0.85);
@@ -1657,7 +1664,10 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
                 // height map); cells without a height stand at the land's
                 // fill height, so there the water height map's is taken
                 let tbed = i.world.y + TILE_SINK;
-                col = mix(col, water_shade(i.world, fp, SEA_LEVEL, select(NO_BED - 1.0, tbed, tbed < TILE_NO_HEIGHT)), wet);
+                // the coastline: the cells' land-to-sea blend (vertex alpha
+                // 1 on land, 0 on sea) surfs on its sea side
+                let edge = smoothstep(0.0, 0.35, i.col.a) * (1.0 - smoothstep(0.35, 0.85, i.col.a));
+                col = mix(col, water_shade(i.world, fp, SEA_LEVEL, select(NO_BED - 1.0, tbed, tbed < TILE_NO_HEIGHT), edge), wet);
             }
         } else {
             col = albedo * (0.55 * F.sun_col.rgb * F.sun_dir.w * (0.35 + 0.65 * ndl) + 0.7 * amb_d);
@@ -1666,7 +1676,7 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
 
     if (hdr() && cls == 8u && F.mode.x == 0u) {
         // the map's water (the sea plane is opaque)
-        col = water_shade(i.world, fp, select(i.world.y, SEA_LEVEL, i.world.y < SEA_PLANE_BELOW), NO_BED - 1.0);
+        col = water_shade(i.world, fp, select(i.world.y, SEA_LEVEL, i.world.y < SEA_PLANE_BELOW), NO_BED - 1.0, 0.0);
         alpha = select(0.92, 1.0, M.flags.z == 0u);
     }
     let mode = F.mode.x;
@@ -1943,7 +1953,7 @@ fn fs_cell(i: COut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let env = environment(reflect(-v, n), rough) * F.misc.w;
     var col = direct + kd * albedo * amb_d + env * fr_v + emissive;
     if (hdr() && cls == 8u && F.mode.x == 0u) {
-        col = water_shade(i.world, fp, select(i.world.y, SEA_LEVEL, i.world.y < SEA_PLANE_BELOW), NO_BED - 1.0);
+        col = water_shade(i.world, fp, select(i.world.y, SEA_LEVEL, i.world.y < SEA_PLANE_BELOW), NO_BED - 1.0, 0.0);
         alpha = select(0.92, 1.0, amode != 2u);
     }
     let mode = F.mode.x;

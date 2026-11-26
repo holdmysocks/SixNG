@@ -1203,8 +1203,9 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   Where the sea is shallower than 1.6 m it foams: bands that roll in
   towards the shallower water, broken up by noise along the shore. The
   sea drawn on the terrain takes its depth from the terrain's own 8 m
-  heights (finer than the water height map's 16 m). Inland water does not
-  foam, and the open sea with no height in the water height map is deep.
+  heights (finer than the water height map's 16 m), and surfs along the
+  terrain's coastline (where its cells turn from land to sea) whatever the
+  depth data says. Inland water does not foam.
   Our choices: the bed's reflectance (sand and mud, 0.22 0.20 0.15), the
   sea's level, and the foam (depth, bands, 0.75 reflectance). Not yet: the
   shoreline grid's wave placement, refraction and underwater fog.
