@@ -5319,6 +5319,9 @@ fn load_parts(
     let mut named_parts: Vec<(std::ops::Range<usize>, Vec<(String, Option<usize>)>)> = Vec::new();
     // per garment: its meshes and how far out it is worn (`levels`)
     let mut layered: Vec<(std::ops::Range<usize>, u8)> = Vec::new();
+    // per merged mesh of a garment: its vertex positions before it followed
+    // the shaped skin (`keep_layer_order`)
+    let mut unshaped: HashMap<usize, Vec<[f32; 3]>> = HashMap::new();
     let levels = garment_levels(parts.iter().map(|e| e.off), fx);
     // Body shape: the skin and head are posed by the game's rig; clothes
     // and accessories follow the skin under them (`Wrap`).
@@ -5357,10 +5360,12 @@ fn load_parts(
                     first = lods;
                 }
                 let mut attached = None;
+                let mut pre: Option<Vec<Vec<[f32; 3]>>> = None;
                 if let Some(f) = f {
                     if !f.skeletal {
                         attached = place_attached(&mut m);
                         if let Some(w) = &wrap {
+                            pre = Some(m.meshes.iter().map(|me| me.verts.iter().map(|v| v.pos).collect()).collect());
                             w.apply(&mut m);
                         }
                     }
@@ -5421,6 +5426,9 @@ fn load_parts(
                 }
                 if let Some(&l) = levels.get(&e.off) {
                     layered.push((mesh0..mesh0 + m.meshes.len(), l));
+                    for (i, v) in pre.take().into_iter().flatten().enumerate() {
+                        unshaped.insert(mesh0 + i, v);
+                    }
                 }
                 if f.is_some_and(|f| f.heel) {
                     heel_meshes.push(mesh0..mesh0 + m.meshes.len());
@@ -5467,6 +5475,22 @@ fn load_parts(
     // lists per layer the regions it hides. A triangle goes when all its
     // vertices are in hidden regions. Skin meshes without regions fall back
     // to hiding what lies right under a garment.
+    // Body shape: each garment follows the skin on its own, so on a heavy or
+    // muscled body a garment worn under another can come out in front of it
+    // (a t-shirt through an open shirt's pocket). Put it back behind.
+    if let (Some(m), false) = (&mut model, unshaped.is_empty()) {
+        let mut ls: Vec<u8> = layered.iter().map(|x| x.1).collect();
+        ls.sort();
+        ls.dedup();
+        let mut moved = 0;
+        for &l in ls.iter().rev().skip(1) {
+            let pick = |f: &dyn Fn(u8) -> bool| layered.iter().filter(|x| f(x.1)).map(|x| x.0.clone()).collect::<Vec<_>>();
+            moved += keep_layer_order(m, &pick(&|x| x == l), &pick(&|x| x > l), &unshaped);
+        }
+        if moved > 0 {
+            notes.push(format!("Body shape and layers: {moved} vertices of clothes worn under other clothes are kept behind the clothes over them, as far behind as on the neutral body."));
+        }
+    }
     let mut by_distance: Vec<std::ops::Range<usize>> = skin_meshes.clone();
     if let Some(m) = &mut model {
         let (mut skin_hidden, mut cloth_hidden) = (0, 0);
@@ -6525,6 +6549,85 @@ fn garment_levels(shown: impl Iterator<Item = u64>, fx: &HashMap<u64, PartFx>) -
         }
     }
     level
+}
+
+/// Keeps the `inner` meshes behind the `outer` ones after both followed the
+/// shaped skin. An inner vertex that lay behind an outer garment's surface on
+/// the neutral body (an outer vertex within 6 cm, at most 2 cm to the side
+/// along that vertex's normal, turned to face the way the inner vertex does)
+/// is put back as far behind it; with several outer surfaces there (a
+/// jacket's shell over its pocket bag), the one that asks most; the nearest
+/// outer vertex counts however far to the side it is. Vertices only
+/// move inward. `unshaped` holds each mesh's positions before shaping.
+/// Returns how many vertices moved.
+fn keep_layer_order(m: &mut glb::Model, inner: &[std::ops::Range<usize>], outer: &[std::ops::Range<usize>], unshaped: &HashMap<usize, Vec<[f32; 3]>>) -> usize {
+    use glam::Vec3;
+    const REACH: f32 = 0.06;
+    const SIDE: f32 = 0.02;
+    let key = |p: Vec3| ((p.x / REACH).floor() as i32, (p.y / REACH).floor() as i32, (p.z / REACH).floor() as i32);
+    // outer vertices: neutral position, shaped position, normal
+    let mut grid: HashMap<(i32, i32, i32), Vec<(Vec3, Vec3, Vec3)>> = HashMap::new();
+    for i in outer.iter().cloned().flatten() {
+        let (Some(me), Some(pre)) = (m.meshes.get(i), unshaped.get(&i)) else { continue };
+        for (v, q) in me.verts.iter().zip(pre) {
+            let n = Vec3::from(v.nrm);
+            if (n.length() - 1.0).abs() < 0.1 {
+                grid.entry(key(Vec3::from(*q))).or_default().push((Vec3::from(*q), Vec3::from(v.pos), n));
+            }
+        }
+    }
+    if grid.is_empty() {
+        return 0;
+    }
+    let mut moved = 0;
+    for i in inner.iter().cloned().flatten() {
+        let (Some(me), Some(pre)) = (m.meshes.get_mut(i), unshaped.get(&i)) else { continue };
+        for (v, p) in me.verts.iter_mut().zip(pre) {
+            let (p, p2, vn) = (Vec3::from(*p), Vec3::from(v.pos), Vec3::from(v.nrm));
+            let k = key(p);
+            let mut push: Option<(f32, Vec3)> = None;
+            let mut nearest: Option<(f32, (Vec3, Vec3, Vec3))> = None;
+            // a two-sided garment's inner face points at the body: take the
+            // side facing the way the inner garment does (outward). Returns
+            // how far the vertex is to move back behind that surface.
+            let need = |(q, q2, n): (Vec3, Vec3, Vec3), side: f32| -> Option<(f32, Vec3)> {
+                let n = if n.dot(vn) < 0.0 { -n } else { n };
+                let d = p - q;
+                let s = d.dot(n);
+                if s >= 0.0 || (d - n * s).length() > side {
+                    return None;
+                }
+                Some(((p2 - q2).dot(n) - s, n)).filter(|x| x.0 > 0.0)
+            };
+            for x in -1..=1 {
+                for y in -1..=1 {
+                    for z in -1..=1 {
+                        for &o in grid.get(&(k.0 + x, k.1 + y, k.2 + z)).into_iter().flatten() {
+                            let d2 = (p - o.0).length_squared();
+                            if d2 >= REACH * REACH {
+                                continue;
+                            }
+                            if nearest.is_none_or(|b| d2 < b.0) {
+                                nearest = Some((d2, o));
+                            }
+                            if let Some(w) = need(o, SIDE).filter(|w| push.is_none_or(|b| w.0 > b.0)) {
+                                push = Some(w);
+                            }
+                        }
+                    }
+                }
+            }
+            // the nearest outer vertex counts however far to the side it is
+            if let Some(w) = nearest.and_then(|(_, o)| need(o, f32::MAX)).filter(|w| push.is_none_or(|b| w.0 > b.0)) {
+                push = Some(w);
+            }
+            if let Some((need, n)) = push {
+                v.pos = (p2 - n * need).to_array();
+                moved += 1;
+            }
+        }
+    }
+    moved
 }
 
 /// Hide the skin triangles that lie right under a garment: a skin vertex is
