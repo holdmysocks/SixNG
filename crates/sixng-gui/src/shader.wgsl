@@ -26,6 +26,7 @@ struct Mat {
     flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask, bit 12 = an emissive shader of another class (lit by its emissive map), bit 13 = the packed map is a vehicle material map, bit 14 = the emissive slot holds the part ramp image with the parts' surfaces
     tile: vec4<f32>,      // fabric detail tile: x UV scale, y rotation, z mean grey value, w bound
     emis: vec4<f32>,      // x emissive scale of the material (from the GLB's emissive strength), yzw the light's colour
+    strand: vec4<f32>,    // x a strand piece's width factor this frame (stored over drawn strands; 1 otherwise)
 };
 
 // rows of the part ramp image: 256 each of the first layer's palette rows,
@@ -537,7 +538,8 @@ fn mesh_vertex(v: VIn) -> VOut {
     if (abs(v.tan.w) >= 2.0) {
         let code = abs(v.tan.w) - 2.0;
         let ti = floor(code / 16.0);
-        let r = (code - 16.0 * ti) * 0.001;
+        // widened by the share of the piece's strands not drawn (sun shadow pass: its own factor below)
+        let r = (code - 16.0 * ti) * 0.001 * select(max(M.strand.x, 1.0), 1.0, F.frame.y > 1.0e8);
         // the game's minimum drawn width: 2 pixels at the strand's distance, capped at 10 mm (read from its
         // strand vertex program by the shader archive work); ti, the piece type, is kept for the strand count rule
         let npx = 2.0;

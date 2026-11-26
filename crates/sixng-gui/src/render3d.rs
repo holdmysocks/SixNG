@@ -59,6 +59,9 @@ struct MatU {
     /// emissive level (`glb::emissive_scale`); y, z, w: the light's colour
     /// (`glb::emissive_tint`).
     emis: [f32; 4],
+    /// x: strand width factor of a strand piece this frame (the stored strands over the drawn ones, as the
+    /// game's count rule draws fewer strands at its target thickness); 1 otherwise.
+    strand: [f32; 4],
 }
 
 #[repr(C)]
@@ -1062,7 +1065,7 @@ impl Renderer3D {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -2058,6 +2061,7 @@ impl Uploader {
                     _ => [0.0; 4],
                 },
                 emis: [mt.emissive_scale, mt.emissive_tint[0], mt.emissive_tint[1], mt.emissive_tint[2]],
+                strand: [1.0, 0.0, 0.0, 0.0],
             };
             let o = k * MAT_STRIDE as usize;
             mat_bytes[o..o + std::mem::size_of::<MatU>()].copy_from_slice(bytemuck::bytes_of(&u));
@@ -2866,6 +2870,19 @@ impl Renderer3D {
         }
         // strand count by distance (from the eye to the piece's centre; the model's own placement is taken as none)
         let eye = cam.eye();
+        // the drawn strands of a piece are as much wider as there are fewer of them (the game's count rule draws
+        // a share of the strands at its target thickness, so the piece keeps its cover)
+        for gm in models {
+            for me in &gm.meshes {
+                if let Some(l) = me.strand_lod {
+                    let f = l.share((eye - me.centre).length(), size[1] as f32, (cam.fov * 0.5).tan());
+                    let n = l.indices(me.n_idx, f).max(1);
+                    let k = (me.n_idx as f32 / n as f32).clamp(1.0, 50.0);
+                    let at = me.material as u64 * MAT_STRIDE + std::mem::offset_of!(MatU, strand) as u64;
+                    queue.write_buffer(&gm.mat_ub, at, bytemuck::bytes_of(&[k, 0.0f32, 0.0, 0.0]));
+                }
+            }
+        }
         let mut slots = 0u32;
         for me in models.iter().flat_map(|gm| gm.meshes.iter()) {
             if let Some(l) = me.strand_lod {
