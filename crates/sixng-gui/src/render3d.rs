@@ -669,6 +669,8 @@ pub struct Renderer3D {
     accum: Option<crate::accum::Accum>,
     /// Frames in the running mean, and the key of the view they show.
     accum_n: u32,
+    /// GPU time by part of the frame (automation tick lines)
+    gpu_timer: Option<crate::gpu_time::GpuTimer>,
     accum_key: u64,
     /// Changes made outside `render` (joints, instances) since the last frame.
     accum_bump: std::sync::atomic::AtomicU64,
@@ -1665,6 +1667,7 @@ impl Renderer3D {
             accumulate: false,
             accum: None,
             accum_n: 0,
+            gpu_timer: crate::gpu_time::GpuTimer::new(&rs.device, &rs.queue),
             accum_key: 0,
             accum_bump: std::sync::atomic::AtomicU64::new(0),
             map_glass: false,
@@ -2899,11 +2902,20 @@ impl Renderer3D {
         let dt = self.last_frame.map(|t| (now - t).as_secs_f32()).unwrap_or(0.016);
         self.last_frame = Some(now);
         let sky = if self.hdr { self.sky } else { None };
+        let gslot = self.gpu_timer.as_mut().and_then(|g| g.begin(device));
+        let gmark = |g: &Option<crate::gpu_time::GpuTimer>, enc: &mut wgpu::CommandEncoder, i: u32| {
+            if let (Some(g), Some(_)) = (g, gslot) {
+                g.mark(enc, i);
+            }
+        };
+        gmark(&self.gpu_timer, &mut enc, 0);
         self.atmo.update(queue, sky.as_ref(), cam.proj(aspect) * cam.view(), cam.eye(), size, dt);
         if let Some(sky) = &sky {
             self.atmo.compute(&mut enc, sky);
         }
+        gmark(&self.gpu_timer, &mut enc, 1);
         self.render_shadows(queue, &mut enc, cam, look, &fu, aspect, models);
+        gmark(&self.gpu_timer, &mut enc, 2);
         let t = self.target.as_ref().unwrap();
         let mut draws = 0u32;
         if shadow_fu.is_some() {
@@ -3162,11 +3174,16 @@ impl Renderer3D {
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
+        gmark(&self.gpu_timer, &mut enc, 3);
         if let (Some(_), Some(d)) = (&sky, &t.display) {
             self.atmo.post(device, &mut enc, &t.resolve_view, &d.1, size);
         }
         if let (Some(a), Some(at)) = (&self.accum, &t.accum) {
             a.run(&mut enc, at, self.accum_n);
+        }
+        gmark(&self.gpu_timer, &mut enc, 4);
+        if let (Some(g), Some(slot)) = (&self.gpu_timer, gslot) {
+            g.end(&mut enc, slot);
         }
         let t_e = std::time::Instant::now();
         let cb = enc.finish();
@@ -3176,6 +3193,9 @@ impl Renderer3D {
         );
         let t_s = std::time::Instant::now();
         queue.submit([cb]);
+        if let (Some(g), Some(slot)) = (&self.gpu_timer, gslot) {
+            g.after_submit(slot);
+        }
         RTIME[2].fetch_add(
             t_s.elapsed().as_micros() as u64,
             std::sync::atomic::Ordering::Relaxed,
