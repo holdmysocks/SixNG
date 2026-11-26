@@ -32,7 +32,9 @@ pub struct TriPrim {
     pub colors1: Option<Vec<[u8; 4]>>,
     /// Raw mesh stream 13, written as `_REGION`. On people its first byte is
     /// the region of the vertex (1 to 255) that the hide masks of clothes
-    /// address (`wardrobe::Part::hides`); the other bytes are 0 there.
+    /// address (`wardrobe::Part::hides`). On body skins the second byte is a
+    /// region in a second layer that both halves share (the waist strip);
+    /// the other bytes are 0.
     pub regions: Option<Vec<[u8; 4]>>,
     /// Per-vertex colour (linear RGBA8) written as COLOR_0, which glTF
     /// multiplies into the base colour: the model's tint palette entry.

@@ -175,6 +175,9 @@ pub struct Mesh {
     pub centre: [f32; 3],
     /// A strand hair piece that follows the game's strand count rule.
     pub strand_lod: Option<StrandLod>,
+    /// Per vertex, the second byte of the `_REGION` stream: a region in a second layer (on body skins,
+    /// the waist strip the upper and lower halves both carry). Empty when the mesh has none.
+    pub region2: Vec<u8>,
 }
 
 /// Close-up fabric weave of a clothing material (see `Material::detail`).
@@ -1156,6 +1159,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                     })
                     .count();
             }
+            let mut region2 = Vec::new();
             if let Some(a) = at["_COLOR0"].as_u64() {
                 let c = d.u8x4(a as usize)?;
                 for i in 0..n.min(c.len()) {
@@ -1172,6 +1176,10 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                 let c = d.u8x4(a as usize)?;
                 for i in 0..n.min(c.len()) {
                     v[i].zone[3] = c[i][0];
+                }
+                if c.iter().any(|r| r[1] != 0) {
+                    region2 = c.iter().take(n).map(|r| r[1]).collect();
+                    region2.resize(n, 0);
                 }
             }
             if let Some(a) = at["COLOR_0"].as_u64() {
@@ -1224,7 +1232,10 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                     };
                 }
             }
-            if has_tangents && uv_sets >= 1 {
+            // Also for meshes with no tangent stream: ped heads have none, yet the game's head
+            // programs build a tangent frame and apply the face's normal map with it. Without
+            // one the face was lit by its smooth vertex normals alone.
+            if uv_sets >= 1 {
                 uv0_tangents(&mut v, &indices);
             }
             tris += indices.len() / 3;
@@ -1235,7 +1246,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                     c[k] += x.pos[k] / n.max(1) as f32;
                 }
             }
-            meshes.push(Mesh { strand_lod: None,
+            meshes.push(Mesh { strand_lod: None, region2,
                 name: mesh["name"].as_str().unwrap_or("").into(),
                 verts: v,
                 indices,
