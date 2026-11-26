@@ -295,7 +295,7 @@ pub struct LookInfo {
     /// That preset's control values (`None` when it could not be read).
     pub body_preset: Option<BodyShape>,
     /// The body shape the outfit was loaded with.
-    pub body_used: BodyShape,
+    pub body_used: Option<BodyShape>,
     /// Strand-hair assets of the outfit shown: (slot, placeholder name, asset GUID).
     pub strands: Vec<(String, String, String)>,
     /// Their stored tints by slot: palette name hash and row of tint 0.
@@ -2532,7 +2532,7 @@ impl ModelView {
             Ok(l) => {
                 // the shape the outfit opened in (its preset): no reload for it
                 if let Some(li) = &l.look {
-                    self.body_shape_shown = li.body_used;
+                    self.body_shape_shown = li.body_used.unwrap_or(NEUTRAL_BODY);
                 }
                 let keep_cam = std::mem::take(&mut self.keep_cam_once)
                     || self
@@ -7226,7 +7226,7 @@ fn load_query_sel(
                     }
                 }
                 drop(last);
-                info.body_used = *BODY_SHAPE.lock().unwrap();
+                info.body_used = Some(*BODY_SHAPE.lock().unwrap());
                 if !o.unresolved.is_empty() {
                     info.notes.push(format!("{} item(s) of this outfit have no model: {}", o.unresolved.len(), o.unresolved.join(", ")));
                 }
