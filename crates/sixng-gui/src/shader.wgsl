@@ -87,6 +87,11 @@ struct Shadow {
 @group(0) @binding(13) var t_shadow: texture_depth_2d_array;
 @group(0) @binding(14) var samp_shadow: sampler_comparison;
 
+// The water maps (atmo.rs `set_water_maps`): A = ground height (m) and the
+// water fog's scattering (rgb), B = its extinction (rgb) and 1 where
+// loaded; both in the timecycle's units, over the box S.water5.
+@group(0) @binding(24) var t_water_a: texture_2d<f32>;
+@group(0) @binding(25) var t_water_b: texture_2d<f32>;
 // The map's placed lights near the camera (lights.rs): the lights, and a
 // grid over them (header: origin x, z and cell size as f32 bits, cells per
 // side; per cell the first index and count; then the index list).
@@ -208,6 +213,9 @@ fn tile_relief(tile: vec3<f32>, z: f32) -> f32 {
 
 // how far the map's terrain is drawn under its real height (world3d SINK, m)
 const TILE_SINK: f32 = 1.5;
+// Terrain cells without a height stand at -2 m (world3d WATER_Z); a bed
+// height at or above this is that fill, not a height.
+const TILE_NO_HEIGHT: f32 = -2.5;
 
 // radius (km from the planet centre) of a world point (m, y up)
 fn point_r(p: vec3<f32>) -> f32 {
@@ -507,12 +515,66 @@ fn footprint(p: vec3<f32>) -> f32 {
 
 // Radiance leaving the water surface at p towards the camera; `fp` from
 // `footprint` (taken in uniform control flow by the caller).
-fn water_shade(p: vec3<f32>, fp: f32) -> vec3<f32> {
+// Scale from the timecycle's water units to coefficients per metre (atmo.rs
+// K_WATER).
+const K_WATER: f32 = 0.03;
+// The sea's surface height (world y, m) for the depth over the seabed: the
+// beaches and dunes reach down to about -4 m (world3d SEA_FLOOR); our
+// choice, not decoded.
+const SEA_LEVEL: f32 = -4.0;
+// Below this height a water surface is the sea plane (world3d, drawn under
+// the terrain), whose water stands at SEA_LEVEL.
+const SEA_PLANE_BELOW: f32 = -6.0;
+// Reflectance of the bed under shallow water (sand and mud; our choice).
+const BED_ALBEDO: vec3<f32> = vec3(0.22, 0.20, 0.15);
+
+struct WaterHere {
+    ground: f32,
+    scat: vec3<f32>,
+    ext: vec3<f32>,
+    ok: bool,
+};
+
+// The water maps at world point p (none outside them or before they load).
+fn water_here(p: vec3<f32>) -> WaterHere {
+    var w: WaterHere;
+    w.ok = false;
+    let b = S.water5;
+    if (b.z <= b.x || b.w <= b.y) { return w; }
+    // world (x, up, -y) to the map's x, y
+    let uv = vec2((p.x - b.x) / (b.z - b.x), (b.w + p.z) / (b.w - b.y));
+    if (any(uv < vec2(0.0)) || any(uv > vec2(1.0))) { return w; }
+    let a = textureSampleLevel(t_water_a, lin_clamp, uv, 0.0);
+    let e = textureSampleLevel(t_water_b, lin_clamp, uv, 0.0);
+    w.ground = a.x;
+    w.scat = a.yzw;
+    w.ext = e.rgb;
+    // no height (the open sea): the timecycle's water, as before the maps
+    w.ok = e.a > 0.5 && a.x > -250.0;
+    return w;
+}
+
+// `surf`: the water surface's height (world y) for the depth over the bed;
+// `bed`: the bed's height where the caller knows it (the terrain's 8 m
+// heights), else below NO_BED (the water height map's is taken).
+const NO_BED: f32 = -9000.0;
+// The water's own height over the opaque surface seen through it at this
+// pixel (m, from the scene's depth; below 0: not known). Set by the blended
+// draws' entry (fs_mesh_blend) for the map's water.
+var<private> scene_under: f32 = -1.0;
+// `edge`: 0 to 1 on the coastline the caller knows (the terrain's land to
+// sea cells), where the sea surfs whatever the depth data says.
+fn water_shade(p: vec3<f32>, fp: f32, surf: f32, bed: f32, edge: f32) -> vec3<f32> {
     let o = F.cam_pos.xyz;
     let dist = length(o - p);
     let v = (o - p) / max(dist, 1e-3);
-    let sn = sea_normal(p, fp);
+    // inland water (lakes, marsh, canals: a surface above the sea's) has
+    // short fetch: its waves are shorter and flatter than the open sea's
+    let inland = surf > SEA_LEVEL + 0.5;
+    let wscale = select(1.0, INLAND_WAVES, inland);
+    let sn = sea_normal(p / wscale, fp / wscale);
     var n = sn.xyz;
+    if (inland) { n = normalize(mix(vec3(0.0, 1.0, 0.0), n, INLAND_SLOPE)); }
     if (dot(n, v) < 0.02) { n = normalize(n + v * (0.02 - dot(n, v))); }
     let var_micro = (1.0 - WAVE_SHARE) * max(S.water1.w, 0.003) + sn.w;
     let a = clamp(sqrt(2.0 * var_micro) + S.water3.w, SEA_MIN_ROUGH, 0.8);
@@ -538,10 +600,91 @@ fn water_shade(p: vec3<f32>, fp: f32) -> vec3<f32> {
     let glint = D * G * fh / max(4.0 * ndl * ndv, 1e-3) * sun * ndl;
     // the water body: light going down, scattered back up (a third of
     // the single-scattering albedo, the usual ocean-colour rule)
-    let ssa = S.water1.rgb / max(S.water0.rgb, vec3(1e-5));
-    let e_down = sun * max(l.y, 0.0) * 0.98 + PI * sky_ambient(vec3(0.0, 1.0, 0.0));
-    let body = 0.33 * ssa * e_down / PI * S.water3.rgb;
-    return fr * refl + glint + (1.0 - fr) * body;
+    var ssa = S.water1.rgb / max(S.water0.rgb, vec3(1e-5));
+    let e_down = sun * max(l.y, 0.0) * 0.98 + PI * sky_ambient(vec3(0.0, 1.0, 0.0)) + local_e(p, vec3(0.0, 1.0, 0.0));
+    // the place's own water (the fog atlas) and the bed under it (the
+    // water height map): light reaching the bed and coming back through
+    // the water adds the bed's colour where the water is shallow
+    let wh = water_here(p);
+    var body = vec3(0.0);
+    var foam = 0.0;
+    if (wh.ok) {
+        ssa = clamp(wh.scat / max(wh.ext, vec3(1e-5)), vec3(0.0), vec3(1.0));
+        let depth = max(surf - select(wh.ground, bed, bed > NO_BED), 0.0);
+        // the view ray refracted into the water (n = 1.33)
+        let mu = sqrt(max(1.0 - (1.0 - ndv * ndv) / 1.7689, 0.04));
+        let t = exp(-wh.ext * K_WATER * depth * (1.0 + 1.0 / mu));
+        let deep = 0.33 * ssa * e_down / PI * S.water3.rgb;
+        body = mix(deep, BED_ALBEDO * e_down / PI, t);
+        // surf where the sea turns shallow: bands rolling in towards the
+        // shallower water, broken up along the shore (inland water has no surf)
+        // the sea's water shows only where the bed is over SURF_HIDDEN deep
+        // (shallower, the terrain stands above the sea plane): the surf
+        // starts at the water's visible edge
+        let shore = 1.0 - smoothstep(0.0, FOAM_DEPTH, max(depth - SURF_HIDDEN, 0.0));
+        if (shore > 0.0 && !inland) {
+            let tm = S.water4.w;
+            let brk = foam_noise(p.xz * 0.35 + vec2(tm * 0.05, 0.0)) * foam_noise(p.xz * 0.09 - vec2(0.0, tm * 0.02));
+            let band = pow(0.5 + 0.5 * sin(depth * 4.5 + tm * 1.3 + 6.0 * foam_noise(p.xz * 0.05)), 5.0);
+            foam = clamp(shore * (0.35 + 0.65 * band) * (0.5 + 1.0 * brk), 0.0, 1.0);
+        }
+    } else {
+        body = 0.33 * ssa * e_down / PI * S.water3.rgb;
+    }
+    if (edge > 0.0 && !inland) {
+        let tm = S.water4.w;
+        let brk = foam_noise(p.xz * 0.35 + vec2(tm * 0.05, 0.0)) * foam_noise(p.xz * 0.09 - vec2(0.0, tm * 0.02));
+        foam = max(foam, clamp(edge * (0.45 + 1.1 * brk), 0.0, 1.0));
+    }
+    // surf where the water is shallow over the surface drawn under it (a
+    // beach mesh running down into the sea plane): measured against the
+    // scene's depth, so it follows the visible waterline wherever the land
+    // comes from
+    if (scene_under >= 0.0 && !inland) {
+        let tm = S.water4.w;
+        let brk = foam_noise(p.xz * 0.35 + vec2(tm * 0.05, 0.0)) * foam_noise(p.xz * 0.09 - vec2(0.0, tm * 0.02));
+        // the sea plane lies just over a gently sloping bed along many
+        // beaches, so the foam keeps to the top SCENE_FOAM_DEPTH of water (a
+        // few metres from the waterline, not the whole shelf)
+        let band = pow(0.5 + 0.5 * sin(scene_under * 12.0 - tm * 1.3 + 6.0 * foam_noise(p.xz * 0.05)), 5.0);
+        let s = 1.0 - smoothstep(0.0, SCENE_FOAM_DEPTH, scene_under);
+        // a thin line of foam right at the waterline, broken bands farther out
+        let line = 1.0 - smoothstep(0.0, 0.08, scene_under);
+        foam = max(foam, clamp(0.6 * s * band * (0.4 + 1.0 * brk) + line * (0.3 + 0.5 * brk), 0.0, 1.0));
+    }
+    let water = fr * refl + glint + (1.0 - fr) * body;
+    return mix(water, FOAM_ALBEDO * e_down / PI, foam * 0.85);
+}
+
+// Inland water's waves against the sea's: length and slope (our choice).
+const INLAND_WAVES: f32 = 0.15;
+const INLAND_SLOPE: f32 = 0.35;
+
+// Depth (m) under which the water foams, and the foam's reflectance (our
+// choices).
+const FOAM_DEPTH: f32 = 1.6;
+// Depth of the sea's water where it first shows past the terrain (m): the
+// sea plane lies at SEA_LEVEL - 2.5 and the terrain 1.5 m under its height
+// (world3d), so the bed shows above it down to 1 m under the sea's level.
+const SURF_HIDDEN: f32 = 1.0;
+const FOAM_ALBEDO: f32 = 0.75;
+// Depth over the surface seen through the water (m) under which the
+// waterline's surf shows (our choice).
+const SCENE_FOAM_DEPTH: f32 = 0.5;
+
+fn foam_hash(p: vec2<f32>) -> f32 {
+    let q = fract(p * vec2(0.1031, 0.1030));
+    let d = dot(q, q.yx + 33.33);
+    return fract((q.x + q.y) * (q.x + d));
+}
+
+// Smooth value noise (0 to 1) for the foam.
+fn foam_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(foam_hash(i), foam_hash(i + vec2(1.0, 0.0)), u.x),
+               mix(foam_hash(i + vec2(0.0, 1.0)), foam_hash(i + vec2(1.0, 1.0)), u.x), u.y);
 }
 
 // The map's frame: aerial perspective (froxel volume), height fog, then
@@ -1251,8 +1394,38 @@ fn model_sun_shadow(wp: vec3<f32>, dx: vec3<f32>, dy: vec3<f32>) -> f32 {
     return s / 13.0;
 }
 
+// The scene's depth for the blended draws (the opaque pass's, multisampled).
+@group(2) @binding(0) var t_scene_depth: texture_depth_multisampled_2d;
+
+// The height of a water fragment over the opaque surface seen through it
+// (m), from the scene's depth at the pixel (its first sample); -1 where
+// nothing lies behind it, or where that sample holds something in front of
+// the water (an edge of a nearer object).
+fn scene_under_at(clip: vec4<f32>, wy: f32) -> f32 {
+    let sz = vec2<i32>(textureDimensions(t_scene_depth)) - 1;
+    let d = textureLoad(t_scene_depth, clamp(vec2<i32>(clip.xy), vec2(0), sz), 0);
+    if (d <= 0.0 || d > clip.z) { return -1.0; }
+    let uv = clip.xy / vec2<f32>(textureDimensions(t_scene_depth));
+    let q = F.inv_view_proj * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0);
+    return max(wy - q.y / q.w, 0.0);
+}
+
+// The blended draws: as fs_mesh, the map's water also knowing its depth
+// over the scene under it.
+@fragment
+fn fs_mesh_blend(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {
+    if (hdr() && M.flags.y == 8u && F.mode.x == 0u) {
+        scene_under = scene_under_at(i.clip, i.world.y);
+    }
+    return mesh_out(i, ff);
+}
+
 @fragment
 fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {
+    return mesh_out(i, ff);
+}
+
+fn mesh_out(i: VOut, ff: bool) -> MeshOut {
     var o: MeshOut;
     o.col = mesh_colour(i, ff);
     o.mask = 0xffffffffu;
@@ -1846,7 +2019,14 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             let painted = 1.0 - smoothstep(0.02, 0.07, length(base.rgb - TILE_SEA));
             let wet = painted * (1.0 - i.col.a);
             if (wet > 0.0) {
-                col = mix(col, water_shade(i.world, fp), wet);
+                // the bed from the terrain's own heights (finer than the water
+                // height map); cells without a height stand at the land's
+                // fill height, so there the water height map's is taken
+                let tbed = i.world.y + TILE_SINK;
+                // the coastline: the cells' land-to-sea blend (vertex alpha
+                // 1 on land, 0 on sea) surfs on its sea side
+                let edge = smoothstep(0.0, 0.35, i.col.a) * (1.0 - smoothstep(0.35, 0.85, i.col.a));
+                col = mix(col, water_shade(i.world, fp, SEA_LEVEL, select(NO_BED - 1.0, tbed, tbed < TILE_NO_HEIGHT), edge), wet);
             }
         } else {
             col = albedo * (0.55 * F.sun_col.rgb * F.sun_dir.w * (0.35 + 0.65 * ndl) + 0.7 * amb_d);
@@ -1855,7 +2035,7 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
 
     if (hdr() && cls == 8u && F.mode.x == 0u) {
         // the map's water (the sea plane is opaque)
-        col = water_shade(i.world, fp);
+        col = water_shade(i.world, fp, select(i.world.y, SEA_LEVEL, i.world.y < SEA_PLANE_BELOW), NO_BED - 1.0, 0.0);
         alpha = select(0.92, 1.0, M.flags.z == 0u);
     }
     let mode = F.mode.x;
@@ -2133,7 +2313,7 @@ fn fs_cell(i: COut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let env = environment(reflect(-v, n), rough) * F.misc.w;
     var col = direct + kd * albedo * amb_d + env * fr_v + emissive;
     if (hdr() && cls == 8u && F.mode.x == 0u) {
-        col = water_shade(i.world, fp);
+        col = water_shade(i.world, fp, select(i.world.y, SEA_LEVEL, i.world.y < SEA_PLANE_BELOW), NO_BED - 1.0, 0.0);
         alpha = select(0.92, 1.0, amode != 2u);
     }
     let mode = F.mode.x;

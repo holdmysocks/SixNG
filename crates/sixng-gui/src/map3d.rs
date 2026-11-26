@@ -312,6 +312,9 @@ pub struct Map3D {
     stats: Stats,
     picked: Option<u32>,
     lines_cache: Option<(Vec3, f32, bool, bool, Vec<LineV>, Vec<LineV>)>,
+    /// The water maps (fog atlas and water height map), loaded once in the
+    /// background: none yet, loading, or ready to upload.
+    water_maps: WaterMaps,
     /// The placed lights' camera position, hour and switch at the last
     /// gathering, and a gathered set not yet uploaded.
     lights_key: Option<(Vec3, u32, bool)>,
@@ -589,6 +592,7 @@ impl Map3D {
             stats: Stats::default(),
             picked: None,
             lines_cache: None,
+            water_maps: WaterMaps::Idle,
             lights_key: None,
             lights_new: None,
             size: [16, 16],
@@ -2720,6 +2724,30 @@ impl Map3D {
                 }
             }
             let renderer = self.renderer.as_mut().unwrap();
+            if let WaterMaps::Loading(slot) = &self.water_maps {
+                let got = slot.lock().unwrap().take();
+                if let Some(res) = got {
+                    match res {
+                        Ok(m) => {
+                            // the map's 8 m heights fill the coasts the water
+                            // height map leaves out (the seabed off the beaches)
+                            let data = self.data.clone();
+                            let ground = |x: f32, y: f32| data.as_ref().and_then(|d| d.height(x, y));
+                            renderer.set_water_maps(&rs.queue, &m, Some(&ground));
+                        }
+                        Err(e) => eprintln!("[map3d] water maps: {e:#}"),
+                    }
+                    self.water_maps = WaterMaps::Done;
+                }
+            } else if matches!(self.water_maps, WaterMaps::Idle) && !self.game.is_empty() {
+                let slot = Arc::new(Mutex::new(None));
+                let (s2, ws) = (slot.clone(), sixng_core::export::Workspace::new(self.game.clone(), self.work.clone()));
+                std::thread::spawn(move || {
+                    let res = sixng_core::water::ViewMaps::load(&ws);
+                    *s2.lock().unwrap() = Some(res);
+                });
+                self.water_maps = WaterMaps::Loading(slot);
+            }
             if let Some((lights, grid, glows)) = self.lights_new.take() {
                 renderer.set_lights(&rs.queue, &lights, &grid);
                 renderer.glows = glows;
@@ -4213,4 +4241,11 @@ pub(crate) fn load_model(
     add(2, t2);
     LOAD_T[3].fetch_add(1, Ordering::Relaxed);
     r
+}
+
+/// The water maps' loading state (see `Map3D::water_maps`).
+enum WaterMaps {
+    Idle,
+    Loading(Arc<Mutex<Option<anyhow::Result<sixng_core::water::ViewMaps>>>>),
+    Done,
 }
