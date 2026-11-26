@@ -95,7 +95,7 @@ pub const SLOTS: &[(&str, &str)] = &[
     ("58b6e707", "normal (BC5, DirectX green)"),
     ("4d56d7fe", "normal atlas (vehicle, BC1)"),
     ("2bb2ede8", "normal atlas (vehicle, BC1)"),
-    ("739e3d0d", "packed material data, linear (likely roughness/metal/AO; channel order unverified)"),
+    ("739e3d0d", "packed material data, linear (meaning depends on the shader; channel order unverified for most)"),
     ("c6f46e79", "packed material data, linear (G/B near 0.5: likely detail-normal or mask pair)"),
     ("0df47048", "secondary colour / detail albedo (sRGB)"),
     ("7485dafb", "colour with opacity in alpha (sRGB)"),
@@ -109,6 +109,20 @@ pub const SLOTS: &[(&str, &str)] = &[
     ("8e0d63ee", "emissive map (emissivetex: the lit parts of a lamp or panel)"),
     ("2c8d7182", "tint palette (embedded in the model: rows of RGBA8 colours, picked per instance by the placement tint row)"),
 ];
+
+/// Slots whose meaning depends on the shader: (shader hash, param hash, role).
+/// These are read from the shader programs, so they replace the generic role.
+pub const SHADER_SLOTS: &[(&str, &str, &str)] = &[
+    // weapon pixel program: R times a block strength is a wear amount (lerps the
+    // colour toward a wear ramp, scales metalness by 1 - wear, moves roughness
+    // toward a block value); G modulates gloss. Metalness comes from another map.
+    ("e68a4a98", "739e3d0d", "wear overlay amount (R) and gloss modulation (G), linear; not a metal mask"),
+];
+
+/// Slot role for a slot as one shader uses it, else the generic role.
+pub fn slot_role_in(shader_hash: &str, param_hash: &str) -> Option<&'static str> {
+    SHADER_SLOTS.iter().find(|s| s.0 == shader_hash && s.1 == param_hash).map(|s| s.2).or_else(|| slot_role(param_hash))
+}
 
 pub fn slot_role(param_hash: &str) -> Option<&'static str> {
     SLOTS.iter().find(|s| s.0 == param_hash).map(|s| s.1).or_else(|| u32::from_str_radix(param_hash, 16).ok().and_then(crate::headskin::extra_role))
@@ -1348,5 +1362,13 @@ mod paint_tests {
         consts.last_mut().unwrap().values = Some([0.0; 4]);
         four_layer_tint(&mut l, &consts);
         assert_eq!(l["tint_formula"]["per_layer"][0]["texture_tint_amount"].as_f64(), Some(1.0));
+    }
+
+    #[test]
+    fn weapon_speculartex2_is_wear_not_metal() {
+        let w = slot_role_in("e68a4a98", "739e3d0d").unwrap();
+        assert!(w.contains("wear") && w.contains("not a metal mask"));
+        assert_eq!(slot_role_in("e3ba3129", "739e3d0d"), slot_role("739e3d0d"));
+        assert_eq!(slot_role_in("e68a4a98", "c8e8c282"), slot_role("c8e8c282"));
     }
 }
