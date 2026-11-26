@@ -1014,9 +1014,22 @@ again**).
   local matrix can carry shear, which TRS joint nodes cannot hold). The
   game's rig and its body-shape presets have no face controls, so the
   face does not change with the sliders. Each rig also reads 14 inputs
-  that no known control drives; they stay at 0. They act on the neck,
-  breasts and chest, hips and thighs, and upper arms, so they look like
-  extra shape controls. The game has two body-shape
+  that no control drove before 2026-11-26. They come from 11 more
+  controls in the same preset PSO (`anim.rpf@106153000`), each item of
+  which pairs control values with the rig input values they set:
+  `gcbreastheight`, `gcbreastspacing`, `gcchestheight`, `gccleavage`
+  (male rig only; the body-type XML's `GCCleavage`), `gchipheight` (-1..1,
+  a negative value drives the other input by its size), `gcbellyround`,
+  `gchipwidth`, `gcheadscale`, `gcmusclebiceps`, `gcmuscletriceps`
+  (0..1) and one whose name is not recovered, `gc_b0eae798` (-1..1, lower
+  chest and breast size). Every item that sets one control alone sets its
+  input to exactly the control's value (8 to 15 items each). The names
+  are joaat of the control ids; the rig inputs themselves have other
+  hashes. One input, `5ebebbe7` (head and neck), is set by no item; it is
+  probably the negative side of `gcheadscale` and stays at 0.
+  `gcheadscale` scales the head bone (1.5 at 0.5); the game also has
+  head-scale compensation rigs, which are not run here. `allmuscle` keeps
+  to the twelve regional muscle controls. The game has two body-shape
   rigs, female and male. The body type comes from the part's fit tag:
   every tag that starts with `m` (`mr1`, `mb1`, `mo1`, `mc1`, `msk1`) gets
   the male rig and skeleton. Before 2026-11-25, only `mr1` did, and the
