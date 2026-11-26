@@ -177,10 +177,49 @@ pub fn part_set(look: &Look, display: Option<String>) -> PartSet {
 
 /// The full set of a character model (`cs_mandy`), with the name the game
 /// shows for it.
+///
+/// A model the outfit data does not cover and that cannot stand in its own
+/// parts (a cutscene head, a hoodie and boots with no trousers) still has a
+/// set: its own drawables, with no outfits (`own_set`).
 pub fn of(game_root: &std::path::Path, a: &crate::game::ArchiveInfo, ix: &crate::scan::ArchiveIndex, model: &str) -> Result<PartSet, String> {
-    let look = crate::pedlook::look(game_root, a, ix, model)?;
     let display = crate::pedlook::model_names(game_root).ok().and_then(|n| n.display.get(&crate::pedlook::model_hash(&model.to_ascii_lowercase())).cloned());
-    Ok(part_set(&look, display))
+    match crate::pedlook::look(game_root, a, ix, model) {
+        Ok(look) => Ok(part_set(&look, display)),
+        Err(e) => {
+            let names: Vec<String> = crate::outfit::outfit_options(ix, model).into_iter().map(|o| o.name).collect();
+            own_set(model, display, &a.id, names).ok_or(e)
+        }
+    }
+}
+
+/// The set of a model with no outfit data: each of its own drawables once,
+/// worn by no outfit. Not `complete`: nothing says these parts make a whole
+/// character. None when the model has no drawable of its own.
+pub fn own_set(model: &str, display: Option<String>, archive: &str, names: Vec<String>) -> Option<PartSet> {
+    if names.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<SetPart> = names
+        .into_iter()
+        .map(|n| {
+            let slot = crate::pedlook::slot_of(&n);
+            let strands = crate::pedlook::is_strand_word(crate::pedlook::item_word(&n));
+            SetPart { kind: kind_of(&slot), slot, drawable: n, strands, found_by: "own", variants: vec![SetVariant { item: String::new(), guid: None, category: None, tint: None, colour: None, colour_tag: None, preset: None, preset_colours: vec![], hair_preset: None, tex_remap: vec![], outfits: vec![] }] }
+        })
+        .collect();
+    parts.sort_by(|a, b| (kind_rank(a.kind), &a.slot, &a.drawable).cmp(&(kind_rank(b.kind), &b.slot, &b.drawable)));
+    let fit = parts.iter().find(|p| p.slot == "head").and_then(|h| h.drawable.split('_').find(|t| crate::outfit::is_fit(t)).map(str::to_string));
+    Some(PartSet {
+        model: model.to_string(),
+        display,
+        resource: format!("{archive} (own parts: the outfit data does not cover this model)"),
+        fit,
+        outfits: vec![],
+        parts,
+        complete: false,
+        unresolved: 0,
+        note: Some("The outfit data does not cover this model, and its own parts are not a whole character: these are the drawables of its own, worn by no outfit.".into()),
+    })
 }
 
 #[cfg(test)]
@@ -218,5 +257,17 @@ mod tests {
         assert_eq!(jeans.variants[1].outfits, [1]);
         assert_eq!(s.parts[0].variants[0].outfits, [0, 1]);
         assert!(!s.complete && s.unresolved == 1);
+    }
+
+    #[test]
+    fn own_set_lists_the_models_own_drawables() {
+        let names = vec!["cs_roxy_hoodiezip_fr1_000_slim_h_hd_mid_full".to_string(), "cs_roxy_head_fr1_cau_000_m_full".to_string(), "cs_roxy_bootsankle_fr1_000_mid_hh_full".to_string()];
+        let s = own_set("cs_roxy", None, "packs", names).unwrap();
+        assert!(s.outfits.is_empty() && !s.complete && s.unresolved == 0);
+        assert_eq!(s.parts.len(), 3);
+        assert_eq!(s.parts[0].kind, "body");
+        assert_eq!(s.fit.as_deref(), Some("fr1"));
+        assert!(s.parts.iter().all(|p| p.variants.len() == 1 && p.variants[0].outfits.is_empty()));
+        assert!(own_set("cs_nobody", None, "packs", vec![]).is_none());
     }
 }
