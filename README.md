@@ -1194,13 +1194,16 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   share of the slope drawn as waves (60 %). Not yet: shallow water over
   the seabed, foam, shore waves, refraction and underwater fog.
 - **Map cells** (far placements merged per area): a placement more than
-  0.6× the HD distance from the camera can be drawn from its cell instead
-  of one by one. A cell holds one LOD level's placements in one square of
+  0.3× the HD distance from the camera can be drawn from its cell instead
+  of one by one (`SIXNG_CELLS_NEAR` sets another fraction). The cells are
+  built for 0.6×; drawing them from 0.3× showed no visible change
+  downtown from 60 m and took the frame there from 25 to 44 fps (draws
+  6,859 to 3,706: the CPU cost of a frame follows its draw count). A cell holds one LOD level's placements in one square of
   the map (128 m for HD, 256 m for LOD, 512–2048 m for SLOD1–4), merged
   into a few batches with one draw each:
   - geometry is placed in the cell, from the low drawable LOD where a model
     has one, and simplified by vertex clustering to about two pixels at
-    the nearest distance the cell draws it;
+    0.6× the HD distance;
   - base-colour textures go in at 64 px, in BC3 texture arrays;
   - each vertex carries its placement's index. The vertex shader checks
     that placement's own LOD distance range, so LOD hand-offs stay per
