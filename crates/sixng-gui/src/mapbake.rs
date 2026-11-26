@@ -499,6 +499,24 @@ fn glb_tris(j: &Value, bin: &[u8]) -> Vec<(Option<usize>, String, Vec<[f32; 3]>,
     out
 }
 
+/// The placements export to bake from: `<work>/placements_full` or the
+/// World-data export in `<work>/out`, whichever was written last (its
+/// `index.jsonl`). Before, a full export always won, so an old one kept
+/// models that newer decoding resolves out of the map (square holes in
+/// the ground where tiles had no model).
+fn newer_placements(full: PathBuf, out: PathBuf) -> PathBuf {
+    let when = |p: &Path| {
+        std::fs::metadata(p.join("index.jsonl"))
+            .and_then(|m| m.modified())
+            .ok()
+    };
+    match (when(&full), when(&out)) {
+        (Some(f), Some(o)) if o > f => out,
+        (Some(_), _) => full,
+        _ => out,
+    }
+}
+
 pub struct Baker {
     pub work: PathBuf,
     pub out: PathBuf,
@@ -510,13 +528,10 @@ impl Baker {
     pub fn new(game: &str, work: &str) -> Self {
         let w = PathBuf::from(work);
         let pf = w.join("placements_full").join("placements").join("levels");
+        let po = w.join("out").join("placements").join("levels");
         Baker {
             out: w.join("out"),
-            placements: if pf.exists() {
-                pf
-            } else {
-                w.join("out").join("placements").join("levels")
-            },
+            placements: newer_placements(pf, po),
             work: w,
             game: game.to_string(),
         }

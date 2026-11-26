@@ -1111,7 +1111,13 @@ the Archives page. Entries are exported on the fly into `<work>/gui_cache_v4`
 ### Map 2D
 
 First bake the map from the world exports (`sixng world all` output in
-`work/out`, plus full placements in `work/placements_full`).
+`work/out`, plus full placements in `work/placements_full`). When both
+`work/placements_full` and the World-data placements in `work/out` exist,
+the bake reads whichever was exported last (since 2026-11-26; before, the
+full export always won, so an old one left square holes where newer
+decoding finds the models). `map/bake.log` names the one it used. After
+updating SixNG, export the placements again and re-bake to pick up models
+the new version resolves.
 
 **🍞 Bake map** (or **🔄 Re-bake map**) at the top of the Map 2D and Map
 3D tabs does this in the app:
