@@ -4183,7 +4183,7 @@ pub(crate) fn load_model(
             body_shape: Vec::new(),
             head_skin: 0,
             paint: None,
-            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default(),
+            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default(), part_hidden: Default::default(),
         };
         let _ = sixng_core::export::export_entry(&a, e, &eo)?;
         add(1, t1);

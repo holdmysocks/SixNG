@@ -390,6 +390,12 @@ pub struct ExportOptions {
     /// `matlib`). Where a part has one it wins over `ped_tints`.
     #[serde(default)]
     pub part_colours: std::collections::HashMap<String, Vec<Option<[u8; 3]>>>,
+    /// Hide masks by lower-case drawable name (`pedlook::hidden_masks`):
+    /// the masks of the part's own layer and of the shared second skin
+    /// layer. `outfit` export drops the triangles whose vertices all lie in
+    /// hidden regions (the part's `_REGION` stream).
+    #[serde(default)]
+    pub part_hidden: std::collections::HashMap<String, (Vec<String>, Vec<String>)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3973,7 +3979,7 @@ mod dictionary_tests {
         let a = ArchiveInfo { id: "levels.rpf".into(), path: work.join("levels.rpf"), size: archive.len() as u64, container: "rpf9".into() };
         crate::atomic::write(&a.path, archive).unwrap();
         let o = ExportOptions { out: work.join("out"), png: false, dds: false, raw: false,
-            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default() };
+            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default(), part_hidden: Default::default() };
         let dir = o.out.join("models/levels").join(export_base_name(&e));
         fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("model.json");

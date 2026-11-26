@@ -1067,6 +1067,35 @@ pub fn item_word(name: &str) -> &str {
     }
 }
 
+/// The second region layer of body skins: the waist strip both halves carry.
+pub const SKIN_LAYER2: &str = "275822c4";
+
+/// Garments of one outfit to draw as their `_cull_00` twin: those another
+/// part of the outfit hides regions of (a t-shirt under an open shirt). The
+/// twin is the same garment cut a little closer to the body, whose vertices
+/// carry the regions the hide masks name; the `_full` meshes carry none.
+/// `exists` says whether a drawable name is in the archive. Returns
+/// `_full` name -> twin name.
+pub fn cull_twins(parts: &[LookPart], exists: impl Fn(&str) -> bool) -> HashMap<String, String> {
+    parts
+        .iter()
+        .enumerate()
+        .filter(|(i, p)| p.drawable.ends_with("_full") && p.layer.as_deref().is_some_and(|l| parts.iter().enumerate().any(|(j, q)| j != *i && q.hides.iter().any(|h| h.0 == l && h.1.chars().any(|c| c != '0')))))
+        .filter_map(|(_, p)| {
+            let twin = format!("{}_cull_00", p.drawable.trim_end_matches("_full"));
+            exists(&twin).then(|| (p.drawable.clone(), twin))
+        })
+        .collect()
+}
+
+/// The hide masks over part `i` of an outfit: the masks the other parts
+/// give the part's own layer, and those they give the second skin layer.
+pub fn hidden_masks(parts: &[LookPart], i: usize) -> (Vec<String>, Vec<String>) {
+    let Some(layer) = parts[i].layer.as_deref() else { return Default::default() };
+    let of = |l: &str| parts.iter().enumerate().filter(|(j, _)| *j != i).flat_map(|(_, q)| q.hides.iter()).filter(|h| h.0 == l).map(|h| h.1.clone()).collect::<Vec<_>>();
+    (of(layer), of(SKIN_LAYER2))
+}
+
 /// Outfit slot of a ped drawable name.
 pub fn slot_of(name: &str) -> String {
     let w = item_word(name);
@@ -1664,6 +1693,24 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cull_twins_and_masks_follow_the_hide_masks() {
+        let part = |d: &str, layer: &str, hides: Vec<(&str, &str)>| LookPart { slot: "top".into(), drawable: d.into(), item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by: "x", category: None, layer: Some(layer.into()), hides: hides.into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(), hides_sub: vec![], hair_state: None, state_guids: vec![] };
+        let parts = vec![
+            part("tshirt_mr1_000_full", "15793985", vec![]),
+            part("shirt_mr1_000_full", "752a6eba", vec![("15793985", "0a00"), ("275822c4", "0001")]),
+            part("pants_mr1_000_full", "a9e764eb", vec![("15793985", "0000")]),
+        ];
+        let twins = cull_twins(&parts, |n| n.ends_with("_cull_00"));
+        assert_eq!(twins.len(), 1);
+        assert_eq!(twins["tshirt_mr1_000_full"], "tshirt_mr1_000_cull_00");
+        assert!(cull_twins(&parts, |_| false).is_empty());
+        let (own, waist) = hidden_masks(&parts, 0);
+        assert_eq!(own, ["0a00", "0000"]);
+        assert!(waist.is_empty());
+        assert!(hidden_masks(&parts, 1).0.is_empty());
+    }
+
     use super::*;
 
     #[test]

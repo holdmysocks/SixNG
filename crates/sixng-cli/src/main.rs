@@ -158,7 +158,7 @@ impl OutArgs {
                     std::process::exit(2);
                 }
             }),
-            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default(),
+            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default(), part_hidden: Default::default(),
         }
     }
 }
@@ -1642,6 +1642,8 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             // items) exports its first outfit, as if --look 0 were given.
             let auto = look.is_none() && !animal && opts.is_empty() && parts.is_empty();
             let look: &Option<usize> = &look.or(auto.then_some(0));
+            // hide masks over each part of a --look outfit, by drawable name
+            let mut hidden: std::collections::HashMap<String, (Vec<String>, Vec<String>)> = Default::default();
             let look_parts: Vec<(u64, sixng_core::pedlook::LookPart)> = match look {
                 Some(k) => match sixng_core::pedlook::look(&ws.game, &a, &ix, &prefix) {
                     // not a listed model either: the error below names the part rule
@@ -1651,11 +1653,24 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                         None if auto => Vec::new(),
                         None => bail!("{prefix} has {} outfits (--look 0..{})", l.outfits.len(), l.outfits.len().saturating_sub(1)),
                         Some(o) => {
+                            // a garment worn under another is drawn as its `_cull_00` twin
+                            let names: std::collections::HashSet<String> = ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| e.name.as_ref().map(|n| n.to_ascii_lowercase())).collect();
+                            let twins = sixng_core::pedlook::cull_twins(&o.parts, |n| names.contains(n));
+                            let mut ps: Vec<sixng_core::pedlook::LookPart> = o.parts.clone();
+                            for (i, p) in ps.iter_mut().enumerate() {
+                                let (own, waist) = sixng_core::pedlook::hidden_masks(&o.parts, i);
+                                if let Some(t) = twins.get(&p.drawable) {
+                                    p.drawable = t.clone();
+                                }
+                                if !own.is_empty() || !waist.is_empty() {
+                                    hidden.insert(p.drawable.clone(), (own, waist));
+                                }
+                            }
                             let by_name = sixng_core::outfit::dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
                                 let n = e.name.as_ref()?.to_ascii_lowercase();
-                                o.parts.iter().any(|p| !p.strands && p.drawable == n).then_some((n, e))
+                                ps.iter().any(|p| !p.strands && p.drawable == n).then_some((n, e))
                             }));
-                            o.parts.iter().filter(|p| !p.strands).filter_map(|p| Some((by_name.get(&p.drawable)?.off, p.clone()))).collect()
+                            ps.into_iter().filter(|p| !p.strands).filter_map(|p| Some((by_name.get(&p.drawable)?.off, p))).collect()
                         }
                     },
                 },
@@ -1790,6 +1805,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     eo.ped_tints.insert(p.drawable.clone(), (pal, t.rows));
                 }
             }
+            eo.part_hidden = hidden;
             for t in tint {
                 let (name, pal, rows) = sixng_core::pedtint::parse_spec(t).map_err(|e| anyhow!(e))?;
                 eo.ped_tints.insert(name, (pal, rows));
