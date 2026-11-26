@@ -244,6 +244,8 @@ pub struct Map3D {
     pub show_terrain: bool,
     pub show_roads: bool,
     pub show_lights: bool,
+    /// Light the HDR view with the placed lights (and their coronas).
+    pub placed_lights: bool,
     pub show_minimap: bool,
     pub show_stats: bool,
     pub decal_bias: bool,
@@ -308,6 +310,10 @@ pub struct Map3D {
     stats: Stats,
     picked: Option<u32>,
     lines_cache: Option<(Vec3, f32, bool, bool, Vec<LineV>, Vec<LineV>)>,
+    /// The placed lights' camera position, hour and switch at the last
+    /// gathering, and a gathered set not yet uploaded.
+    lights_key: Option<(Vec3, u32, bool)>,
+    lights_new: Option<(Vec<crate::lights::GpuLight>, Vec<u32>, Vec<crate::lights::Glow>)>,
     size: [u32; 2],
     load_opts_lod: usize,
     perf: Perf,
@@ -499,6 +505,7 @@ impl Map3D {
             show_terrain: true,
             show_roads: false,
             show_lights: false,
+            placed_lights: true,
             show_minimap: true,
             show_stats: true,
             decal_bias: true,
@@ -579,6 +586,8 @@ impl Map3D {
             stats: Stats::default(),
             picked: None,
             lines_cache: None,
+            lights_key: None,
+            lights_new: None,
             size: [16, 16],
             load_opts_lod: 0,
             perf: Perf::default(),
@@ -2081,6 +2090,59 @@ impl Map3D {
         (under, top)
     }
 
+    /// Gathers the placed exterior lights that are on at this hour: those
+    /// near the camera for the shading (lights.rs grid), and coronas for
+    /// those within a few kilometres. Again only when the camera has moved
+    /// some metres or the hour changes.
+    fn gather_lights(&mut self, data: &MapData) {
+        let eye = self.cam.eye();
+        let hour = (self.tod.floor() as u32).min(23);
+        let on = self.placed_lights;
+        if let Some((e, h, o)) = self.lights_key {
+            if h == hour && o == on && (e - eye).length() < 8.0 {
+                return;
+            }
+        }
+        self.lights_key = Some((eye, hour, on));
+        if !on {
+            self.lights_new = Some((Vec::new(), Vec::new(), Vec::new()));
+            return;
+        }
+        // shaded within the grid, coronas of bright lights to GLOW_FAR
+        const GLOW_FAR: f32 = 3000.0;
+        const GLOW_NEAR: f32 = 600.0;
+        let shade_r = crate::lights::N as f32 * crate::lights::CELL * 0.75;
+        let er = rage(eye);
+        let lin = |b: u8| (b as f32 / 255.0).powf(2.2);
+        let mut shade = Vec::new();
+        let mut glows = Vec::new();
+        data.light_grid.query(er[0] - GLOW_FAR, er[1] - GLOW_FAR, er[0] + GLOW_FAR, er[1] + GLOW_FAR, |i| {
+            let l = &data.lights[i as usize];
+            if l.flags & 1 != 0 || l.mask & (1 << hour) == 0 || (l.flags & 2 != 0 && (7..19).contains(&hour)) {
+                return;
+            }
+            if !(l.intensity > 0.0) || !(l.range > 0.0) {
+                return;
+            }
+            let (dx, dy) = (l.pos[0] - er[0], l.pos[1] - er[1]);
+            let d = (dx * dx + dy * dy).sqrt();
+            let p = gl(l.pos);
+            let col = [lin(l.rgb_type[0]), lin(l.rgb_type[1]), lin(l.rgb_type[2])];
+            if d < shade_r && l.range >= 1.0 {
+                shade.push(crate::lights::GpuLight {
+                    pos_range: [p.x, p.y, p.z, l.range.min(60.0)],
+                    col_fe: [col[0] * l.intensity, col[1] * l.intensity, col[2] * l.intensity, l.falloff_exp],
+                });
+            }
+            // small decorative lights (range under 3 m) glow only near
+            if d < GLOW_FAR && (d < GLOW_NEAR || l.intensity >= 50.0) && (d < 150.0 || l.range >= 3.0) {
+                glows.push(crate::lights::Glow { pos: [p.x, p.y, p.z, l.intensity], col: [col[0], col[1], col[2], 0.0] });
+            }
+        });
+        let (lights, grid) = crate::lights::pack(eye, &shade);
+        self.lights_new = Some((lights, grid, glows));
+    }
+
     /// Ray pick against the visible entities' bboxes.
     fn pick(&self, data: &MapData, ray_o: Vec3, ray_d: Vec3) -> Option<u32> {
         let o = rage(ray_o);
@@ -2553,6 +2615,7 @@ impl Map3D {
             }
         }
         let (mut under, top) = self.overlay_lines(&data);
+        self.gather_lights(&data);
         if self.sectors.on {
             let e = rage(self.cam.eye());
             under.extend(self.sectors.lines3d(&data, [e[0], e[1]]));
@@ -2651,6 +2714,10 @@ impl Map3D {
                 }
             }
             let renderer = self.renderer.as_mut().unwrap();
+            if let Some((lights, grid, glows)) = self.lights_new.take() {
+                renderer.set_lights(&rs.queue, &lights, &grid);
+                renderer.glows = glows;
+            }
             renderer.decal_bias = self.decal_bias;
             let texture_id = renderer.render(rs, px, &self.cam, &look, &models, &under, &top);
             self.stats.draws = renderer.draws;
@@ -3106,6 +3173,7 @@ impl Map3D {
         );
         ui.checkbox(&mut self.show_roads, "roads (by speed)");
         ui.checkbox(&mut self.show_lights, "lights (exterior, by hour)");
+        ui.checkbox(&mut self.placed_lights, "placed lights shine (HDR)").on_hover_text("The map's exterior lights light the scene and glow, by their hours");
         self.sectors.ui(ui);
         ui.checkbox(&mut self.show_proxies, "show proxies / placeholders").on_hover_text("Debug: also draw interior-shell, shadow, light and VFX proxies, placements without a model and degenerate models");
         ui.checkbox(&mut self.decal_bias, "decal depth bias").on_hover_text("Markings, grime, signage and terrain blend layers drawn after opaque surfaces with a depth bias, by layer order");
@@ -3828,8 +3896,12 @@ impl Map3D {
 
     fn frames_ok(&self) -> bool {
         // under memory pressure not every wanted model will load: an empty
-        // queue is as good as it gets
-        self.sectors.idle()
+        // queue is as good as it gets. The map data and the terrain's
+        // height pyramid must be in first: before them nothing is queued,
+        // and an empty queue would pass for a loaded view.
+        self.data.is_some()
+            && (!self.show_terrain || self.world.ready())
+            && self.sectors.idle()
             && (!self.show_terrain || self.world.idle())
             && (self.pressure > 0
                 || self.keep.iter().all(|model| {

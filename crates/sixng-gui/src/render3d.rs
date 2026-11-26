@@ -59,6 +59,9 @@ struct MatU {
     /// emissive level (`glb::emissive_scale`); y, z, w: the light's colour
     /// (`glb::emissive_tint`).
     emis: [f32; 4],
+    /// x: strand width factor of a strand piece this frame (the stored strands over the drawn ones, as the
+    /// game's count rule draws fewer strands at its target thickness); 1 otherwise.
+    strand: [f32; 4],
 }
 
 #[repr(C)]
@@ -172,6 +175,9 @@ pub struct Look {
     /// it is the user's to set; it scales the primer's summed mask level
     /// before its window.
     pub primer_amount: f32,
+    /// The primer set a part takes first when its `primerSets` mask allows
+    /// several (0 to 2): the game takes it from a per-vehicle random order.
+    pub primer_set: u8,
     pub slot: u32,
     pub paint: [f32; 3],
     pub paint2nd: [f32; 3],
@@ -218,6 +224,7 @@ impl Default for Look {
             wear_from_config: true,
             wear_levels: false,
             primer_amount: 0.0,
+            primer_set: 0,
             slot: 0,
             paint: [0.55, 0.02, 0.02],
             paint2nd: [0.6, 0.6, 0.62],
@@ -612,6 +619,10 @@ pub struct Renderer3D {
     pipe_wire: wgpu::RenderPipeline,
     pipe_lines: wgpu::RenderPipeline,
     pipe_lines_top: wgpu::RenderPipeline,
+    /// Coronas of the map's placed lights (lights.rs), added in HDR.
+    pipe_glow: wgpu::RenderPipeline,
+    /// The coronas to draw this frame (Map 3D; empty elsewhere).
+    pub glows: Vec<crate::lights::Glow>,
     pipe_sky: wgpu::RenderPipeline,
     pipe_ground: wgpu::RenderPipeline,
     /// Shadow to draw on the ground under the model (shaded mode only).
@@ -1060,7 +1071,7 @@ impl Renderer3D {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -1314,6 +1325,25 @@ impl Renderer3D {
             wgpu::PrimitiveTopology::LineList,
             Some(wgpu::BlendState::ALPHA_BLENDING),
             depth(false, wgpu::CompareFunction::Always),
+        );
+        let gattrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
+        let gbufs = [Some(wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<crate::lights::Glow>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &gattrs,
+        })];
+        let pipe_glow = mk(
+            "glow",
+            &layout_frame,
+            "vs_glow",
+            "fs_glow",
+            &gbufs,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            Some(wgpu::BlendState {
+                color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+                alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+            }),
+            depth(false, wgpu::CompareFunction::GreaterEqual),
         );
         let pipe_sky = mk(
             "sky",
@@ -1633,6 +1663,8 @@ impl Renderer3D {
             pipe_wire,
             pipe_lines,
             pipe_lines_top,
+            pipe_glow,
+            glows: Vec::new(),
             pipe_sky,
             pipe_ground,
             ground: None,
@@ -2036,6 +2068,7 @@ impl Uploader {
                     _ => [0.0; 4],
                 },
                 emis: [mt.emissive_scale, mt.emissive_tint[0], mt.emissive_tint[1], mt.emissive_tint[2]],
+                strand: [1.0, 0.0, 0.0, 0.0],
             };
             let o = k * MAT_STRIDE as usize;
             mat_bytes[o..o + std::mem::size_of::<MatU>()].copy_from_slice(bytemuck::bytes_of(&u));
@@ -2757,6 +2790,12 @@ impl Renderer3D {
         self.atmo.reset = 3;
     }
 
+    /// Uploads the placed lights near the camera for the HDR shading
+    /// (lights.rs `pack`; an empty grid turns them off).
+    pub fn set_lights(&self, queue: &wgpu::Queue, lights: &[crate::lights::GpuLight], grid: &[u32]) {
+        self.atmo.set_lights(queue, lights, grid);
+    }
+
     pub fn render(
         &mut self,
         rs: &egui_wgpu::RenderState,
@@ -2838,6 +2877,19 @@ impl Renderer3D {
         }
         // strand count by distance (from the eye to the piece's centre; the model's own placement is taken as none)
         let eye = cam.eye();
+        // the drawn strands of a piece are as much wider as there are fewer of them (the game's count rule draws
+        // a share of the strands at its target thickness, so the piece keeps its cover)
+        for gm in models {
+            for me in &gm.meshes {
+                if let Some(l) = me.strand_lod {
+                    let f = l.share((eye - me.centre).length(), size[1] as f32, (cam.fov * 0.5).tan());
+                    let n = l.indices(me.n_idx, f).max(1);
+                    let k = (me.n_idx as f32 / n as f32).clamp(1.0, 50.0);
+                    let at = me.material as u64 * MAT_STRIDE + std::mem::offset_of!(MatU, strand) as u64;
+                    queue.write_buffer(&gm.mat_ub, at, bytemuck::bytes_of(&[k, 0.0f32, 0.0, 0.0]));
+                }
+            }
+        }
         let mut slots = 0u32;
         for me in models.iter().flat_map(|gm| gm.meshes.iter()) {
             if let Some(l) = me.strand_lod {
@@ -2872,6 +2924,13 @@ impl Renderer3D {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("lines"),
                 contents: bytemuck::cast_slice(lines),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        });
+        let glow_b = (self.hdr && !self.glows.is_empty()).then(|| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("glows"),
+                contents: bytemuck::cast_slice(&self.glows),
                 usage: wgpu::BufferUsages::VERTEX,
             })
         });
@@ -3156,6 +3215,12 @@ impl Renderer3D {
                         }
                     }
                 }
+            }
+            if let Some(gb) = &glow_b {
+                pass.set_pipeline(&self.pipe_glow);
+                pass.set_bind_group(0, &self.default_frame_bg, &[]);
+                pass.set_vertex_buffer(0, gb.slice(..));
+                pass.draw(0..4, 0..self.glows.len() as u32);
             }
             if let Some(lb) = &lb {
                 pass.set_pipeline(&self.pipe_lines);
