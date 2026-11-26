@@ -732,12 +732,14 @@ again**).
     the drawable names; the wardrobe stores none. Run
     `sixng ped-parts cs_mandy --out <dir>` to write `<dir>/cs_mandy/parts.json`, and
     `sixng ped-parts "^" --out <dir>` to write one for every character, with a
-    summary. That covers the 292 characters with parts of their own and the 457 other
+    summary. That covers the 292 characters with parts of their own and the 461 other
     named models of the outfit list (Mandy is one: all her parts are
-    shared items). Of these 749, 747 have every item resolved; Raina
-    (under both her model names) misses one. Items left out on purpose
+    shared items). All 753 have every item resolved. Items left out on purpose
     (first-person arms, the anatomical body layer) are listed apart and
-    do not count as missing. Mandy (9 outfits, 40 parts, 47 variants),
+    do not count as missing. The body layer is found by its category
+    (`2a7a13a4`) or by an asset GUID that names a
+    `bodygenitalsgen_<fit>_<nnn>_regular_ws00_full` drawable, which Raina's
+    nude outfit stores under another category. Mandy (9 outfits, 40 parts, 47 variants),
     Vicki (15, 48, 53) and Viper (3, 18, 18) are complete. 30
     characters have a wardrobe variation that no outfit uses; in each case it
     is a spare head set (head, eyes, teeth).
