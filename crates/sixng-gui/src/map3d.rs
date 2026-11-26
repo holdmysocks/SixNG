@@ -164,6 +164,15 @@ impl Detail {
     }
 }
 
+/// A placement whose box is flat for its size (ground patches, water
+/// plants, ground cards): unlinked, it keeps the game's own LOD distance
+/// instead of the HD fallback's longer one. The terrain covers the ground
+/// it lies on, and from afar such pieces drew as flat squares of colour.
+pub fn flat_piece(e: &crate::mapbake::EntRec) -> bool {
+    let (dx, dy, dz) = (e.hi[0] - e.lo[0], e.hi[1] - e.lo[1], e.hi[2] - e.lo[2]);
+    e.rflags & RF_BBOX_UNKNOWN == 0 && dz >= 0.0 && dz < (0.1 * dx.max(dy)).max(4.0)
+}
+
 /// Nearest distance an unlinked LOD of level `l` fills in at as a coverage
 /// fallback. SLOD3 and SLOD4 tiles (levels 4 and 5) cover kilometres with
 /// flat ground patches and water pieces that the terrain and the finer
@@ -1023,7 +1032,9 @@ impl Map3D {
         let band = |e: &EntRec, rad: f32| -> (f32, f32) {
             let l = e.lod.min(5) as usize;
             let lo_r = if l == 0 { 0.0 } else { d.radii[l - 1] * 0.92 };
-            let hi_r = if l == 0 && d.hd_fallback && rad >= 10.0 {
+            let hi_r = if l == 0 && e.lod_dist > 0.0 && flat_piece(e) {
+                (e.lod_dist * k).min(d.radii[0])
+            } else if l == 0 && d.hd_fallback && rad >= 10.0 {
                 d.radii[1].min(d.radii[0] * 1.75)
             } else {
                 d.radii[l]
