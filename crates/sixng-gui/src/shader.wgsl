@@ -232,7 +232,8 @@ fn cloud_density3(p: vec3<f32>) -> f32 {
     // the base rises where the cloud thins out, so its edges are lenses and
     // not curtains down to the layer's floor
     let base = 0.3 * (1.0 - c);
-    return (0.4 + 0.6 * c) * smoothstep(base, base + 0.06, h) * dome * step(1e-3, c);
+    // thinning out to nothing at the cloud's rim (no hard edge)
+    return (0.4 + 0.6 * c) * smoothstep(0.0, 0.25, c) * smoothstep(base, base + 0.06, h) * dome;
 }
 
 // Samples along a ray through the cloud layer: one per CLOUD_STEP_M of
@@ -242,12 +243,14 @@ const CLOUD_STEPS: i32 = 32;
 // The same for the ground seen through the layer (every surface fragment).
 const CLOUD_STEPS_GROUND: i32 = 10;
 const CLOUD_STEP_M: f32 = 120.0;
+const CLOUD_DT_MAX: f32 = 250.0;
 
 // Light scattered towards the eye by the clouds along a ray from o in
 // direction d up to tmax (rgb), and the ray's transmittance through them (a).
 // `max_steps`: at most this many samples (fewer for the ground behind the
-// layer than for the sky).
-fn clouds_along(o: vec3<f32>, d: vec3<f32>, tmax: f32, max_steps: i32) -> vec4<f32> {
+// layer than for the sky); `px`: the pixel (target pixels), whose place in
+// a gradient pattern sets where in the first step the samples start.
+fn clouds_along(o: vec3<f32>, d: vec3<f32>, tmax: f32, max_steps: i32, px: vec2<f32>) -> vec4<f32> {
     if (!hdr() || S.cloud0.x <= 0.01) { return vec4(0.0, 0.0, 0.0, 1.0); }
     let y0 = S.cloud0.y;
     let y1 = S.cloud0.z;
@@ -265,9 +268,14 @@ fn clouds_along(o: vec3<f32>, d: vec3<f32>, tmax: f32, max_steps: i32) -> vec4<f
     if (t1 <= t0) { return vec4(0.0, 0.0, 0.0, 1.0); }
     let len = t1 - t0;
     let steps = clamp(i32(ceil(len / CLOUD_STEP_M)), min(8, max_steps), max_steps);
-    let dt = len / f32(steps);
-    // the pixel's own start in the first step, from its view direction
-    let jit = cloud_hash(d.xz * 5113.0 + vec2(d.y * 2971.0, 0.0));
+    // samples at most CLOUD_DT_MAX apart: a long grazing path (towards the
+    // horizon) is sampled over its first part only, where a cloud in the
+    // way is thick enough to hide what lies behind it; spread thinner, a
+    // thin cloud would be hit by one pixel and missed by the next (grain)
+    let dt = min(len / f32(steps), CLOUD_DT_MAX);
+    // the pixel's start in the first step: interleaved gradient noise, an
+    // even, fine pattern (white noise per pixel shows as grain)
+    let jit = ign(px);
     let l = normalize(F.sun_dir.xyz);
     let lup = smoothstep(-0.05, 0.05, l.y);
     let c = dot(d, l);
@@ -476,13 +484,13 @@ fn map_finish(col0: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
     var col = col0;
     let o = F.cam_pos.xyz;
     let v = p - o;
-    // clouds between the eye and the surface
-    let cl = clouds_along(o, v / max(length(v), 1e-3), length(v), CLOUD_STEPS_GROUND);
-    col = col * cl.a + cl.rgb;
     let d_km = length(v) * 0.001;
     let c = F.view_proj * vec4(p, 1.0);
     let ndc = c.xy / max(c.w, 1e-6);
     let uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    // clouds between the eye and the surface
+    let cl = clouds_along(o, v / max(length(v), 1e-3), length(v), CLOUD_STEPS_GROUND, uv * F.frame.yz);
+    col = col * cl.a + cl.rgb;
     let z = sqrt(clamp(d_km / max(S.radii.w, 0.001), 0.0, 1.0));
     var ap = textureSampleLevel(t_ap, lin_clamp, vec3(uv, max(z - 0.5 / AP_N, 0.5 / AP_N)), 0.0);
     // nearer than the first slice: fade in from nothing
@@ -1885,7 +1893,7 @@ fn fs_sky(i: SOut) -> @location(0) vec4<f32> {
     let d = normalize(b.xyz / b.w - a.xyz / a.w);
     if (hdr()) {
         // the sun disc can pass the HDR target's range
-        let cl = clouds_along(F.cam_pos.xyz, d, 1e9, CLOUD_STEPS);
+        let cl = clouds_along(F.cam_pos.xyz, d, 1e9, CLOUD_STEPS, i.clip.xy);
         return vec4(min((sky(d) * cl.a + cl.rgb) * SCN.v[0].x, vec3(30000.0)), 1.0);
     }
     return vec4(aces(sky(d) * F.sky_hor.w), 1.0);
