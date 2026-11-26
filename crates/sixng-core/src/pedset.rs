@@ -227,7 +227,7 @@ mod tests {
     use super::*;
 
     fn part(slot: &str, drawable: &str, item: &str) -> LookPart {
-        LookPart { slot: slot.into(), drawable: drawable.into(), item: item.into(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by: "asset id (name)", category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, state_guids: vec![] }
+        LookPart { slot: slot.into(), drawable: drawable.into(), item: item.into(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by: "asset id (name)", skin_from: None, category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, state_guids: vec![] }
     }
 
     fn outfit(id: &str, parts: Vec<LookPart>, unresolved: Vec<String>) -> Outfit {
