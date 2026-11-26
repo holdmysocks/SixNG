@@ -809,6 +809,30 @@ fn w2_term(x: f32, st: f32, wd: f32, dv: f32) -> f32 {
     return clamp(y / (wd * dv), 0.0, 1.0);
 }
 
+// The first wear layer's levels summed (the game's M_R + M_G + M_B): each
+// mask channel times the vertex colour's, scaled and biased and raised to
+// the gamma, as in the shader's first layer (columns 16 + c, 34 + c, 37 + c
+// of the part's coat row `row`).
+fn wear_level_sum(m: vec3<f32>, col: vec3<f32>, row: i32) -> f32 {
+    var s = 0.0;
+    for (var c = 0; c < 3; c++) {
+        let sc = textureLoad(t_em, vec2(16 + c, row), 0).a;
+        let bi = textureLoad(t_em, vec2(34 + c, row), 0).a;
+        s += wear_gamma(clamp(col[c] * (m[c] * sc + bi), 0.0, 1.0), textureLoad(t_em, vec2(37 + c, row), 0).a);
+    }
+    return s;
+}
+
+// The game's edge window on the summed wear level (edgeStart and edgeEnd
+// of the part's edge record, columns 70 and 71): sat((x - start) / (end -
+// start)); an empty window is a step at its start.
+fn wear_edge(x: f32, row: i32) -> f32 {
+    let es = textureLoad(t_em, vec2(70, row), 0).a;
+    let d = textureLoad(t_em, vec2(71, row), 0).a - es;
+    if (d <= 0.0) { return select(0.0, 1.0, x > es); }
+    return clamp((x - es) / d, 0.0, 1.0);
+}
+
 fn wear_threshold(a: f32) -> f32 {
     let c = 0.45 * a * a;
     if (c < 0.05) { return mix(1.01, 0.98, c / 0.05); }
@@ -1705,6 +1729,11 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     // With the game's wear mask bound, the second layer shows where the
     // mask's green is above the part's threshold (`wear_threshold`), in
     // patches; the detail texture then only gives the palette column.
+    // the wear mask's UV and its screen derivatives (taken here, in uniform
+    // control flow), for the edge bump's extra samples
+    let wear_uv = i.uv0 * WEAR_TILING;
+    let wear_dx = dpdx(wear_uv);
+    let wear_dy = dpdy(wear_uv);
     var wear_amt = F.jitter.w;
     let wear_mask = (M.flags.w & 0x8000u) != 0u;
     let wear_on = M.tile.w > 1.5 || wear_mask;
@@ -1776,6 +1805,26 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
                 }
                 let w2d = w2_term(d4, textureLoad(t_em, vec2(53, row), 0).a, textureLoad(t_em, vec2(57, row), 0).a, textureLoad(t_em, vec2(61, row), 0).a);
                 w2 = select(0.0, max(clamp(w2s, 0.0, 1.0), w2d), textureLoad(t_em, vec2(68, row), 0).a > 0.5);
+                // The game's edge term (its part flag bit 17 is never set,
+                // so always the bump): where the levels sum above 0, the
+                // mask is sampled again one screen footprint L along each
+                // wear UV axis, the edge window of each summed level taken,
+                // and 0.01 x (edge there - edge here) / (L + 1e-4) x the
+                // edge intensity (column 69) added to the tangent-space
+                // normal: the worn patches sit lower than the paint.
+                let ei = textureLoad(t_em, vec2(69, row), 0).a;
+                if (ei > 0.0 && ml.x + ml.y + ml.z > 0.0 && tl > 0.1) {
+                    let fl = max(length(wear_dx), length(wear_dy));
+                    let mx = textureSampleGrad(t_wear, samp, wear_uv + vec2(fl, 0.0), wear_dx, wear_dy).rgb;
+                    let my = textureSampleGrad(t_wear, samp, wear_uv + vec2(0.0, fl), wear_dx, wear_dy).rgb;
+                    let e0 = wear_edge(clamp(ml.x + ml.y + ml.z, 0.0, 1.0), row);
+                    let ex = wear_edge(clamp(wear_level_sum(mx, i.col.rgb, row), 0.0, 1.0), row);
+                    let ey = wear_edge(clamp(wear_level_sum(my, i.col.rgb, row), 0.0, 1.0), row);
+                    let g = 0.01 * vec2(ex - e0, ey - e0) / (fl + 1.0e-4) * ei;
+                    let et = normalize(i.tan.xyz - n * dot(n, i.tan.xyz));
+                    let eb = cross(n, et) * select(1.0, -1.0, i.tan.w < 0.0);
+                    n = normalize(n + et * g.x + eb * g.y);
+                }
                 tint = vec3(textureLoad(t_em, vec2(65, row), 0).a, textureLoad(t_em, vec2(66, row), 0).a, textureLoad(t_em, vec2(67, row), 0).a);
                 // The game's second wear layer, the primer (columns 25 to
                 // 33): its mask (or the wear mask, column 31) per channel
@@ -1813,6 +1862,10 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
                 // first layer's are
                 p_metal = mix(textureLoad(t_em, vec2(32, row), 0).a, textureLoad(t_em, vec2(33, row), 0).a, mat_blend.x);
                 p_rough = mix(textureLoad(t_em, vec2(48, row), 0).a, textureLoad(t_em, vec2(49, row), 0).a, mat_blend.y);
+                // the clear coat worn off with the paint: each wear layer
+                // takes 10 x byte / 255 of it per unit of weight (column
+                // 72: the age record's aa7d4fbd x 25.5, truncated)
+                coat.x = max(coat.x - (k + w3) * 10.0 * textureLoad(t_em, vec2(72, row), 0).a, 0.0);
             } else {
                 let t = wear_threshold(wear_amt);
                 k = smoothstep(t, t + 0.08, m.g);
