@@ -390,6 +390,12 @@ pub struct ExportOptions {
     /// `matlib`). Where a part has one it wins over `ped_tints`.
     #[serde(default)]
     pub part_colours: std::collections::HashMap<String, Vec<Option<[u8; 3]>>>,
+    /// Hide masks by lower-case drawable name (`pedlook::hidden_masks`):
+    /// the masks of the part's own layer and of the shared second skin
+    /// layer. `outfit` export drops the triangles whose vertices all lie in
+    /// hidden regions (the part's `_REGION` stream).
+    #[serde(default)]
+    pub part_hidden: std::collections::HashMap<String, (Vec<String>, Vec<String>)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2178,10 +2184,21 @@ fn ped_skin(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &crate::drawable::Dr
         if child && !o.body_shape.is_empty() && animal.is_none() {
             item.warnings.push("body shape: kid and infant bodies have no body-shape rig; neutral body exported".into());
         }
+        // Clothing helper bones posed by the garment surface rig (index into
+        // `skeleton`); the others follow their parent rigidly.
+        let mut garment: Vec<Option<[f32; 16]>> = Vec::new();
         if !o.body_shape.is_empty() && animal.is_none() && !child {
             match crate::bodyshape::get(&game_root(a), female) {
                 Ok(rig) => match crate::bodyshape::pose(&p.bones, rig, &crate::bodyshape::input_values(&o.body_shape)) {
-                    Some((posed, _)) => j.iter_mut().zip(posed).for_each(|(j, m)| j.pose = Some(m)),
+                    Some(posed) => {
+                        j.iter_mut().zip(&posed.matrices).for_each(|(j, m)| j.pose = Some(*m));
+                        if skeleton.iter().any(|b| b.parent.is_none() && b.parent_hash.is_some()) {
+                            match crate::bodyshape::get_garment(&game_root(a), female) {
+                                Ok(g) => garment = posed.garment(g, skeleton),
+                                Err(err) => item.warnings.push(format!("body shape: {err}; clothing helper bones follow the body rigidly")),
+                            }
+                        }
+                    }
                     None => item.warnings.push("body shape: shared skeleton has bones without a bind pose; neutral body exported".into()),
                 },
                 Err(err) => item.warnings.push(format!("body shape: {err}; neutral body exported")),
@@ -2213,7 +2230,9 @@ fn ped_skin(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &crate::drawable::Dr
             let jt = &mut j[ped_joints + k];
             let local = jt.bind;
             jt.bind = crate::gltf::mat_mul(&pb, &local);
-            if let Some(pp) = pp {
+            if let Some(gp) = garment.get(k).copied().flatten() {
+                jt.pose = Some(gp);
+            } else if let Some(pp) = pp {
                 jt.pose = Some(crate::gltf::mat_mul(&pp, &local));
             }
         }
@@ -3973,7 +3992,7 @@ mod dictionary_tests {
         let a = ArchiveInfo { id: "levels.rpf".into(), path: work.join("levels.rpf"), size: archive.len() as u64, container: "rpf9".into() };
         crate::atomic::write(&a.path, archive).unwrap();
         let o = ExportOptions { out: work.join("out"), png: false, dds: false, raw: false,
-            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default() };
+            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default(), part_hidden: Default::default() };
         let dir = o.out.join("models/levels").join(export_base_name(&e));
         fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("model.json");

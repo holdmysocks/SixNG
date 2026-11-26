@@ -800,7 +800,7 @@ Optional layers not exported yet (the map works without them): {}.", opt.join(",
             body_shape,
             head_skin: self.head_skin,
             paint: None,
-            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default(),
+            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default(), part_hidden: Default::default(),
         };
         self.start_task(
             &format!("Extracting {} entries", idxs.len()),
@@ -1613,6 +1613,9 @@ impl App {
             }
             if c.has("no-shadows") {
                 m3.no_shadows = true;
+            }
+            if c.has("no-clouds") {
+                m3.clouds = false;
             }
             if c.has("no-placed-lights") {
                 m3.placed_lights = false;

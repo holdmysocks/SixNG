@@ -244,6 +244,8 @@ pub struct Map3D {
     pub show_terrain: bool,
     pub show_roads: bool,
     pub show_lights: bool,
+    /// Draw the weather's clouds (and their shadows) in the HDR view.
+    pub clouds: bool,
     /// Light the HDR view with the placed lights (and their coronas).
     pub placed_lights: bool,
     pub show_minimap: bool,
@@ -508,6 +510,7 @@ impl Map3D {
             show_terrain: true,
             show_roads: false,
             show_lights: false,
+            clouds: true,
             placed_lights: true,
             show_minimap: true,
             show_stats: true,
@@ -2690,7 +2693,10 @@ impl Map3D {
             Vec::new()
         };
         // the game's sky and light for the weather and hour (timecycle)
-        let sky = self.game_sky();
+        let mut sky = self.game_sky();
+        if !self.clouds {
+            sky.u.cloud0[0] = 0.0;
+        }
         look.sun_dir = sky.key_dir;
         look.sun_intensity = 1.0;
         look.sun_col = [1.0; 3];
@@ -3201,6 +3207,7 @@ impl Map3D {
         );
         ui.checkbox(&mut self.show_roads, "roads (by speed)");
         ui.checkbox(&mut self.show_lights, "lights (exterior, by hour)");
+        ui.checkbox(&mut self.clouds, "clouds (HDR)").on_hover_text("The weather's cumulus layer and its shadows");
         ui.checkbox(&mut self.placed_lights, "placed lights shine (HDR)").on_hover_text("The map's exterior lights light the scene and glow, by their hours");
         self.sectors.ui(ui);
         ui.checkbox(&mut self.show_proxies, "show proxies / placeholders").on_hover_text("Debug: also draw interior-shell, shadow, light and VFX proxies, placements without a model and degenerate models");
@@ -3425,6 +3432,10 @@ impl Map3D {
         // stays open)
         static KEEP_TICKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let keep_ticks = *KEEP_TICKS.get_or_init(|| std::env::var("SIXNG_MAP_TICKS").is_ok_and(|v| v != "0"));
+        if keep_ticks {
+            // keep drawing frames (an idle window draws none, so it would log no ticks)
+            ctx.request_repaint();
+        }
         if (self.auto.screenshot.is_some() || keep_ticks)
             && self
                 .perf
@@ -4215,7 +4226,7 @@ pub(crate) fn load_model(
             body_shape: Vec::new(),
             head_skin: 0,
             paint: None,
-            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default(),
+            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default(), part_hidden: Default::default(),
         };
         let _ = sixng_core::export::export_entry(&a, e, &eo)?;
         add(1, t1);

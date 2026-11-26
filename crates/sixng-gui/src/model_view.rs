@@ -4560,6 +4560,8 @@ impl ModelView {
             });
             ui.label(if src == "linked" {
                 "faces the game links to this head"
+            } else if src == "character" {
+                "the face of this character's other head"
             } else {
                 "automatic: faces of the same sex, body type and ethnicity"
             });
@@ -6920,14 +6922,8 @@ fn load_query_sel(
                 // as its `_cull_00` twin: the same garment cut a little closer to the body, whose vertices
                 // carry the regions the hide masks name (the `_full` meshes carry none).
                 let swap: HashMap<String, String> = if std::env::var("SIXNG_NO_CULL").is_err() {
-                    let ps = &look.outfits[k].parts;
-                    ps.iter()
-                        .filter(|p| p.drawable.ends_with("_full") && p.layer.as_deref().is_some_and(|l| ps.iter().any(|q| !std::ptr::eq(q, *p) && q.hides.iter().any(|h| h.0 == l && h.1.chars().any(|c| c != '0')))))
-                        .filter_map(|p| {
-                            let twin = format!("{}_cull_00", p.drawable.trim_end_matches("_full"));
-                            ix.entries.iter().any(|e| e.rtype.as_deref() == Some("dr") && e.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(&twin))).then(|| (p.drawable.clone(), twin))
-                        })
-                        .collect()
+                    let names: std::collections::HashSet<String> = ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| e.name.as_ref().map(|n| n.to_ascii_lowercase())).collect();
+                    sixng_core::pedlook::cull_twins(&look.outfits[k].parts, |n| names.contains(n))
                 } else {
                     HashMap::new()
                 };
@@ -8810,6 +8806,7 @@ fn export_load_shaped(
         tex_remap: Default::default(), ped_tints: Default::default(),
         part_skins: e.name.as_ref().filter(|_| !skins.is_empty()).map(|n| (n.to_ascii_lowercase(), skins.to_vec())).into_iter().collect(),
         part_colours: Default::default(),
+        part_hidden: Default::default(),
     };
     let item = export::export_entry(a, e, &opts)?;
     let lods = lods_in(&dir);

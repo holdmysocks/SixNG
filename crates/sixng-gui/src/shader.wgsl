@@ -229,15 +229,165 @@ fn sun_e(p: vec3<f32>) -> vec3<f32> {
     return sun_e_shadowed(p, sun_shadow(p));
 }
 
-// The light of `sun_e` with the shadow `sh` already looked up.
+// The light of `sun_e` with the shadow `sh` already looked up; the
+// clouds' shadow is added here.
 fn sun_e_shadowed(p: vec3<f32>, sh: f32) -> vec3<f32> {
     if (!hdr()) { return F.sun_col.rgb * F.sun_dir.w * 3.0; }
+    let l = normalize(F.sun_dir.xyz);
+    return key_e(p) * sh * cloud_shadow(p, l);
+}
+
+// The key light (sun or moon) at p through the air, unshadowed.
+fn key_e(p: vec3<f32>) -> vec3<f32> {
     let r = point_r(p);
     let l = normalize(F.sun_dir.xyz);
     if (dot(l, S.moon.xyz) > 0.99) {
-        return S.moon_dir_e.rgb * transmittance(r, S.moon.y) * sh;
+        return S.moon_dir_e.rgb * transmittance(r, S.moon.y);
     }
-    return S.sun_dir_e.rgb * transmittance(r, S.sun.y) * sh;
+    return S.sun_dir_e.rgb * transmittance(r, S.sun.y);
+}
+
+// ---- clouds: one cumulus layer between S.cloud0.y and .z (world y), its
+// cover a drifting noise field thresholded by the weather's cloud cover;
+// optical depth along a ray from a few samples through the layer.
+
+fn cloud_hash(p: vec2<f32>) -> f32 {
+    let q = fract(p * vec2(0.1031, 0.1030));
+    let d = dot(q, q.yx + 33.33);
+    return fract((q.x + q.y) * (q.x + d));
+}
+
+fn cloud_vnoise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(cloud_hash(i), cloud_hash(i + vec2(1.0, 0.0)), u.x),
+               mix(cloud_hash(i + vec2(0.0, 1.0)), cloud_hash(i + vec2(1.0, 1.0)), u.x), u.y);
+}
+
+// Cloud density (0 to 1) of the column over world (x, z).
+fn cloud_density(xz: vec2<f32>) -> f32 {
+    let cover = S.cloud0.x;
+    if (cover <= 0.01) { return 0.0; }
+    var q = (xz - S.cloud1.xy * S.water4.w) / S.cloud1.w;
+    var f = 0.0;
+    var a = 0.5;
+    for (var k = 0; k < 4; k++) {
+        f += a * cloud_vnoise(q);
+        q = q * 2.03 + vec2(17.1, 9.2);
+        a *= 0.5;
+    }
+    // more cover lowers the threshold; the noise sum is about 0.2 to 0.8
+    let t = mix(0.74, 0.18, cover);
+    return smoothstep(t, t + 0.3, f);
+}
+
+// Cloud density (0 to 1) at world point p: the column's cover gives the
+// cloud's height, a flat base and a rounded top (cumulus), so a cloud is a
+// body and not a flat sheet seen edge on.
+fn cloud_density3(p: vec3<f32>) -> f32 {
+    let c = cloud_density(p.xz);
+    if (c <= 0.0) { return 0.0; }
+    let h = (p.y - S.cloud0.y) / max(S.cloud0.z - S.cloud0.y, 1.0);
+    // a dome: the top rises with the square root of the cover, so the
+    // sides are steep and the top round (not a cone)
+    let top = 0.25 + 0.75 * sqrt(c);
+    let dome = 1.0 - smoothstep(top * 0.7, top, h);
+    // the base rises where the cloud thins out, so its edges are lenses and
+    // not curtains down to the layer's floor
+    let base = 0.3 * (1.0 - c);
+    // thinning out to nothing at the cloud's rim (no hard edge)
+    return (0.4 + 0.6 * c) * smoothstep(0.0, 0.08, c) * smoothstep(base, base + 0.06, h) * dome;
+}
+
+// Samples along a ray through the cloud layer: one per CLOUD_STEP_M of
+// path, from 8 to CLOUD_STEPS (each pixel starts at its own offset, so the
+// steps do not show as slices).
+const CLOUD_STEPS: i32 = 48;
+// The same for the ground seen through the layer (every surface fragment).
+const CLOUD_STEPS_GROUND: i32 = 10;
+const CLOUD_STEP_M: f32 = 120.0;
+// farther out a step is this share of its distance from the eye (a far
+// cloud is small on screen)
+const CLOUD_DT_FAR: f32 = 0.04;
+
+// Light scattered towards the eye by the clouds along a ray from o in
+// direction d up to tmax (rgb), and the ray's transmittance through them (a).
+// `max_steps`: at most this many samples (fewer for the ground behind the
+// layer than for the sky); `px`: the pixel (target pixels), whose place in
+// a gradient pattern sets where in the first step the samples start.
+fn clouds_along(o: vec3<f32>, d: vec3<f32>, tmax: f32, max_steps: i32, px: vec2<f32>) -> vec4<f32> {
+    if (!hdr() || S.cloud0.x <= 0.01) { return vec4(0.0, 0.0, 0.0, 1.0); }
+    let y0 = S.cloud0.y;
+    let y1 = S.cloud0.z;
+    var t0 = 0.0;
+    var t1 = tmax;
+    if (abs(d.y) < 1e-4) {
+        if (o.y < y0 || o.y > y1) { return vec4(0.0, 0.0, 0.0, 1.0); }
+    } else {
+        let ta = (y0 - o.y) / d.y;
+        let tb = (y1 - o.y) / d.y;
+        t0 = max(min(ta, tb), 0.0);
+        t1 = min(max(ta, tb), tmax);
+    }
+    t1 = min(t1, 40000.0);
+    if (t1 <= t0) { return vec4(0.0, 0.0, 0.0, 1.0); }
+    let len = t1 - t0;
+    let steps = clamp(i32(ceil(len / CLOUD_STEP_M)), min(8, max_steps), max_steps);
+    // the pixel's start in the first step: interleaved gradient noise with
+    // a little white noise (each alone shows: one as grain, the other as a
+    // diagonal hatch)
+    let jit = fract(ign(px) + 0.35 * cloud_hash(px * 1.37));
+    let l = normalize(F.sun_dir.xyz);
+    let lup = smoothstep(-0.05, 0.05, l.y);
+    let c = dot(d, l);
+    let g = 0.6;
+    let ph = 0.7 * (1.0 - g * g) / (4.0 * PI * pow(1.0 + g * g - 2.0 * g * c, 1.5)) + 0.3 / (4.0 * PI);
+    let amb = sky_ambient(vec3(0.0, 1.0, 0.0));
+    let sig = S.cloud0.w;
+    var tr = 1.0;
+    var lit = vec3(0.0);
+    // the whole path is sampled, with steps growing with the distance from
+    // the eye: CLOUD_STEP_M plus a share of the distance, the share raised
+    // when the samples would not reach the path's end (a long grazing path
+    // still reaches the clouds near the horizon, and its near steps stay
+    // short)
+    let c0 = CLOUD_STEP_M / CLOUD_DT_FAR;
+    let grow = max(CLOUD_DT_FAR, pow((t1 + c0) / (t0 + c0), 1.0 / f32(steps)) - 1.0);
+    var t = t0;
+    for (var k = 0; k < steps; k++) {
+        let dt = (t + c0) * grow;
+        let tk = t + jit * dt;
+        t += dt;
+        if (tk > t1) { break; }
+        let p = o + d * tk;
+        let dens = cloud_density3(p);
+        if (dens <= 0.0) { continue; }
+        let od = dens * sig * dt;
+        let st = exp(-od);
+        // the key light through the cloud above this point (towards the
+        // light, to the column's top), darker in a deep cloud's base
+        let h = clamp((p.y - y0) / max(y1 - y0, 1.0), 0.0, 1.0);
+        let above = cloud_density(p.xz + l.xz * ((y1 - p.y) * 0.5 / max(l.y, 0.08)));
+        let t_key = exp(-above * sig * (y1 - y0) * (1.0 - h) * 0.6 / max(l.y, 0.08)) * lup;
+        let powder = 1.0 - exp(-2.0 * od * 4.0);
+        let s_in = key_e(p) * t_key * ph * (0.5 + 0.5 * powder) * 4.0 + amb * (0.45 + 0.35 * h + 0.2 * t_key);
+        lit += tr * s_in * (1.0 - st);
+        tr *= st;
+        if (tr < 0.01) { break; }
+    }
+    if (tr > 0.999) { return vec4(0.0, 0.0, 0.0, 1.0); }
+    return vec4(lit, tr);
+}
+
+// Share of the key light reaching p past the clouds (their shadow).
+fn cloud_shadow(p: vec3<f32>, l: vec3<f32>) -> f32 {
+    if (S.cloud0.x <= 0.01 || l.y < 0.02) { return 1.0; }
+    let mid = 0.5 * (S.cloud0.y + S.cloud0.z);
+    if (p.y > S.cloud0.z) { return 1.0; }
+    let t = (mid - p.y) / l.y;
+    let d = cloud_density(p.xz + l.xz * t);
+    return exp(-d * S.cloud0.w * (S.cloud0.z - S.cloud0.y) * 0.5 / max(l.y, 0.15));
 }
 
 // Sky irradiance / pi on a surface facing n (ambient cube from the sky-view LUT).
@@ -547,6 +697,9 @@ fn map_finish(col0: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
     let c = F.view_proj * vec4(p, 1.0);
     let ndc = c.xy / max(c.w, 1e-6);
     let uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    // clouds between the eye and the surface
+    let cl = clouds_along(o, v / max(length(v), 1e-3), length(v), CLOUD_STEPS_GROUND, uv * F.frame.yz);
+    col = col * cl.a + cl.rgb;
     let z = sqrt(clamp(d_km / max(S.radii.w, 0.001), 0.0, 1.0));
     var ap = textureSampleLevel(t_ap, lin_clamp, vec3(uv, max(z - 0.5 / AP_N, 0.5 / AP_N)), 0.0);
     // nearer than the first slice: fade in from nothing
@@ -2004,7 +2157,8 @@ fn fs_sky(i: SOut) -> @location(0) vec4<f32> {
     let d = normalize(b.xyz / b.w - a.xyz / a.w);
     if (hdr()) {
         // the sun disc can pass the HDR target's range
-        return vec4(min(sky(d) * SCN.v[0].x, vec3(30000.0)), 1.0);
+        let cl = clouds_along(F.cam_pos.xyz, d, 1e9, CLOUD_STEPS, i.clip.xy);
+        return vec4(min((sky(d) * cl.a + cl.rgb) * SCN.v[0].x, vec3(30000.0)), 1.0);
     }
     return vec4(aces(sky(d) * F.sky_hor.w), 1.0);
 }
