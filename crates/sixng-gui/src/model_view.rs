@@ -4311,9 +4311,12 @@ impl ModelView {
         }
         self.update_hair(rs, &ctx);
         let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
-        // an animal's fur is bound to its skin and takes the same joint matrices
+        // an animal's fur is bound to its skin and takes the same joint
+        // matrices; right after a switch from a character, `hair.gpu` still
+        // holds the character's hair (one-matrix buffers) until the fur has
+        // loaded, so only models built for this skeleton take them
         if self.hair.rig.is_some() && !skin.is_empty() {
-            for g in &self.hair.gpu {
+            for g in self.hair.gpu.iter().filter(|g| crate::render3d::joints_fit(g.joints_buf.size(), skin.len())) {
                 ren.set_joints(rs, g, &skin);
             }
         }
@@ -5698,10 +5701,13 @@ fn part_wear(w: &serde_json::Value, look: usize, config: Option<&str>) -> Option
         if v0 <= 0.1 {
             continue;
         }
-        let b = |h: u32| field(p, h).unwrap_or(0.0) as f32 / 255.0;
-        let byte = |x: f32| (x.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        // a preset byte as the game reads it: times the float nearest 1 / 255
+        let b = |h: u32| field(p, h).unwrap_or(0.0) as f32 * f32::from_bits(0x3b80_8081);
         // the game's B(): truncated
         let trunc = |x: f32| (x.clamp(0.0, 1.0) * 255.0) as u8;
+        // a window width without a floor: truncated, a negative one wrapping
+        // round as the game's low byte of the integer does
+        let wrap = |x: f32| (x * 255.0) as i32 as u8;
         let [ra, rb] = RANGE_LINKS.map(|l| range_mid(p[sixng_core::meta7a::field_name(l)].as_str().map_or(&serde_json::Value::Null, |k| &w["colour_ranges"][k])));
         for c in 0..3 {
             let [i, s, e] = PRIMER_CONTROL[c].map(b);
@@ -5712,11 +5718,11 @@ fn part_wear(w: &serde_json::Value, look: usize, config: Option<&str>) -> Option
             o.primer_gamma[c] = trunc(rb[2][c]);
         }
         let [ps, pe] = PRIMER_WINDOW.map(b);
-        (o.primer_start, o.primer_width) = (byte(ps), byte(pe - ps));
-        o.primer_cross = byte(b(PRIMER_CROSS));
+        (o.primer_start, o.primer_width) = (trunc(ps), wrap(pe - ps));
+        o.primer_cross = trunc(b(PRIMER_CROSS));
         o.primer_on_wear_mask = p[sixng_core::meta7a::field_name(PRIMER_ON_WEAR_MASK)].as_bool() == Some(true);
-        let g = |k: &str| p[k].as_f64().unwrap_or(0.0).clamp(0.0, 255.0) as u8;
-        (o.primer_gradient_start, o.primer_gradient_width) = (g("primerGradientStart"), g("primerGradientEnd").saturating_sub(g("primerGradientStart")));
+        let g = |k: &str| p[k].as_f64().unwrap_or(0.0) as f32 * f32::from_bits(0x3b80_8081);
+        (o.primer_gradient_start, o.primer_gradient_width) = (trunc(g("primerGradientStart")), wrap(g("primerGradientEnd") - g("primerGradientStart")));
         for c in 0..3 {
             let [i, s, e] = WEAR_CONTROL[c].map(b);
             let act = ((v0 - s) / (e - s).max(1.0e-4)).clamp(0.0, 1.0);
@@ -5725,8 +5731,11 @@ fn part_wear(w: &serde_json::Value, look: usize, config: Option<&str>) -> Option
             o.bias[c] = trunc(ra[1][c] * k);
             o.gamma[c] = trunc(ra[2][c]);
             let [ws, we] = WEAR_WINDOW[c].map(b);
-            o.start[c] = (ws * 255.0 + 0.5) as u8;
-            o.width[c] = (((we - ws).max(0.0)) * 255.0 + 0.5) as u8;
+            // the game's width (rva 0x173f430, in f32): 255 x max(1e-4,
+            // end - start), truncated, so often one less than the bytes'
+            // difference
+            o.start[c] = trunc(ws);
+            o.width[c] = trunc((we - ws).max(1.0e-4));
         }
     }
     Some(out)
@@ -9140,6 +9149,7 @@ mod tests {
             "ladder_by_look": [ladder],
             "ladders": [{"wearPresets": ["p0", "p1", "p1", "p1", "p4", "p4"]}],
             "presets": {"p1": {"ageWearHash": "r1"}, "p4": {"ageWearHash": "a4", "controlIntensityA": 255, "b18a6db5": 127.5, "1b6a3e09": 255, "rustStart": 51, "rustEnd": 102,
+                "rustStartB": 12, "rustEndB": 44, "primerGradientStart": 19, "primerGradientEnd": 255,
                 "primerIntensityB": 102, "4eb87881": 0, "26007b2d": 255, "primerStart": 10, "primerEnd": 127, "8ed71149": 51, "eff390bd": true,
                 "879774bd": "cr"}},
             "colour_ranges": {"cr": {"minGreen": 102, "maxGreen": 153, "fb2b7f54": 0, "c5801a83": 102, "7e3dffd5": 255, "c82d2173": 255}},
@@ -9156,6 +9166,10 @@ mod tests {
         assert_eq!((a[1].primer, a[1].primer_bias, a[1].primer_gamma[1]), ([0, 32, 0], [0, 13, 0], 255));
         assert_eq!((a[1].primer_start, a[1].primer_width, a[1].primer_cross, a[1].primer_on_wear_mask), (10, 117, 51, true));
         assert_eq!((a[1].bias, a[1].gamma), ([0; 3], [255; 3]));
+        // the game's float widths (rva 0x173f430): 12..44 gives one less
+        // than the bytes' difference, 19..255 the difference itself
+        assert_eq!((a[1].start[1], a[1].width[1]), (12, 31));
+        assert_eq!((a[1].primer_gradient_start, a[1].primer_gradient_width), (19, 236));
         assert_eq!(super::primer_surface(&serde_json::json!({"primerPalette": {"roughnessLow": 0.45, "roughnessHigh": 0.78, "metallicLow": 0.0, "metallicHigh": 0.0}})), [0, 0, 114, 198]);
         assert_eq!(super::primer_surface(&serde_json::json!({})), [0, 0, 153, 153]);
         assert_eq!(part_wear(&w, 0, None).unwrap()[0].amount, 150);
