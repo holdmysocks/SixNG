@@ -2483,6 +2483,9 @@ pub fn export_placements(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], ou
                     if let Some(p) = ps.and_then(|m| m.get(&(i as u64))) {
                         lod["parent"] = p.clone();
                     }
+                    if let Some(t) = arch_lod.get(&en.archetype).and_then(|al| crate::lodlinks::time_json(al.time_flags)) {
+                        j["time"] = t;
+                    }
                 }
             }
             doc["coordinate_system"] = serde_json::json!(match space {
