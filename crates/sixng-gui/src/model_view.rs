@@ -1337,7 +1337,7 @@ impl ModelView {
                 for (off, mut g) in grooms {
                     // scalp hair stays under the hat (3 mm inside its lining)
                     if let Some(h) = hat.as_ref().filter(|_| under_hat.contains(&off)) {
-                        h.press(&mut g.points, 0.003);
+                        h.press_strands(&mut g.points, g.points_per_strand, 0.003);
                     }
                     // linear colour from the sRGB picker value
                     let lin = rgb.map(|c| c.powf(2.2));
@@ -1363,7 +1363,7 @@ impl ModelView {
                         // noise, curl and clumping move grown strands off the
                         // pressed guides: press them again
                         if let Some(h) = hat.as_ref().filter(|_| under_hat.contains(&off)) {
-                            h.press(&mut coat.points, 0.003);
+                            h.press_strands(&mut coat.points, k, 0.003);
                         }
                         drawn += coat.guides.len();
                         // fewer strands than stored: wider ones, for the same cover
@@ -5171,8 +5171,11 @@ fn load_parts(
     mut model: Option<glb::Model>,
     fx: &HashMap<u64, PartFx>,
     game: &Path,
-) -> (Option<glb::Model>, Vec<PathBuf>, Vec<String>, Vec<String>, Vec<(String, Vec<[f32; 3]>)>, Vec<([f32; 3], [u8; 3])>, Vec<bool>, Vec<String>) {
+    hats: &[String],
+) -> (Option<glb::Model>, Vec<PathBuf>, Vec<String>, Vec<String>, Vec<(String, Vec<[f32; 3]>)>, Vec<([f32; 3], [u8; 3])>, Vec<bool>, Vec<String>, Vec<[[f32; 3]; 3]>) {
     let mut first = Vec::new();
+    // the triangles of the parts named in `hats` (RAGE model space), for pressing hair under them
+    let mut hat_tris = Vec::new();
     let mut names = Vec::new();
     let mut errs = Vec::new();
     let mut skin = Vec::new();
@@ -5263,6 +5266,12 @@ fn load_parts(
                     })
                     .collect();
                 let step = (pts.len() / 60_000).max(1);
+                if hats.contains(&e.name.clone().unwrap_or_default().to_ascii_lowercase()) {
+                    for me in &m.meshes {
+                        let v = |i: u32| me.verts.get(i as usize).map(|v| [v.pos[0], -v.pos[2], v.pos[1]]);
+                        hat_tris.extend(me.indices.chunks_exact(3).filter_map(|t| Some([v(t[0])?, v(t[1])?, v(t[2])?])));
+                    }
+                }
                 skin.push((e.name.clone().unwrap_or_default(), pts.into_iter().step_by(step).collect()));
                 // skin colour at the vertices of the body and head (not eyes or teeth)
                 if e.name.as_deref().is_some_and(|n| n.contains("_body_") || n.contains("_head_")) {
@@ -5413,7 +5422,7 @@ fn load_parts(
     if coloured > 0 {
         notes.push(format!("Clothing colours: {coloured} part(s) coloured from the outfit data: the item's garment preset with its fabric (weave under the colour gradient, then the trim and wash layers, baked into the garment's texture; one per sub-material, picked by the garment's materialid texture, or by the part number in its vertex colour where it has none), else the item's stored colour, else row tint 0 of its tint palette (for the generic palette only when it agrees with the item's colour tag), else the colour tag itself (one of 18 words such as navy or khaki, shown in a plain shade of ours). Second and third tints are not applied."));
     }
-    (model, first, names, errs, skin, colours, mask, notes)
+    (model, first, names, errs, skin, colours, mask, notes, hat_tris)
 }
 
 /// Colour a ped clothing part of an outfit: its grey shade maps become the
@@ -7029,7 +7038,8 @@ fn load_query_sel(
         if parts.is_empty() {
             return Err(anyhow::anyhow!("no parts of {prefix} selected"));
         }
-        let (model, first, names, errs, skin, _, _, notes) = load_parts(&a, &parts, cache, lod, None, &fx, &ws.game);
+        let hats = look_info.as_ref().map(|l| l.hats.clone()).unwrap_or_default();
+        let (model, first, names, errs, skin, _, _, notes, hat_tris) = load_parts(&a, &parts, cache, lod, None, &fx, &ws.game, &hats);
         let model = model
             .ok_or_else(|| anyhow::anyhow!("no part of {prefix} loaded: {}", errs.join("; ")))?;
         if let Some(l) = &mut look_info {
@@ -7048,7 +7058,7 @@ fn load_query_sel(
                     }
                 }
                 let head: Vec<[f32; 3]> = skin.iter().filter(|(n, _)| is_head(n)).flat_map(|(_, p)| p.iter().copied()).collect();
-                l.hat = Some(Arc::new(sixng_core::groom::Shell::new([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, top - 0.10], &hat, &head)));
+                l.hat = Some(Arc::new(sixng_core::groom::Shell::new([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, top - 0.10], &hat, &head).with_lining(hat_tris)));
                 l.notes.push("Hat: the scalp hair is pressed under the hat's lining (strand points beyond it are pulled in to 3 mm under it), so the hair does not come through the hat; an opening the hat encloses (over a cap's strap) counts as closed. A stand-in, not the game's method: the outfit asks for the plain hair, and no stored rule says how the game keeps it under the hat.".to_string());
             }
             // The style pass is damped near the head, body and garments
@@ -7151,7 +7161,7 @@ fn load_query_sel(
     if crate::assemble::is_animal(name) && e.rtype.as_deref() == Some("ft") {
         let opts = crate::assemble::animal_options(&ix, name);
         let (selected, parts) = pick(&ix, &opts, &sel);
-        let (m, _, names, _, skin, mut colours, mask, _) = load_parts(&a, &parts, cache, level, Some(model), &HashMap::new(), &ws.game);
+        let (m, _, names, _, skin, mut colours, mask, _, _) = load_parts(&a, &parts, cache, level, Some(model), &HashMap::new(), &ws.game, &[]);
         let mut model = m.expect("root model passed in");
         let borrowed = tint_masks_from_painted(&mut model, &mut colours, &mask);
         // fur: the grooms of this animal's fur variants (cached per animal)

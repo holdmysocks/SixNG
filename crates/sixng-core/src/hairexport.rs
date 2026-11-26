@@ -206,7 +206,7 @@ pub fn piece(g: &Groom, name: &str, o: &Options, colour: Option<&HairColour>, ha
     let g = match hat {
         Some(h) => {
             let mut c = g.clone();
-            pressed += h.press(&mut c.points, 0.003);
+            pressed += h.press_strands(&mut c.points, k, 0.003);
             under = c;
             &under
         }
@@ -215,7 +215,7 @@ pub fn piece(g: &Groom, name: &str, o: &Options, colour: Option<&HairColour>, ha
     let sh = share(g, o);
     let mut coat = g.coat(sh);
     if let Some(h) = hat {
-        pressed += h.press(&mut coat.points, 0.003);
+        pressed += h.press_strands(&mut coat.points, k, 0.003);
     }
     let grown = !coat.guides.is_empty();
     let mut ex = extras.clone();
@@ -330,10 +330,10 @@ pub fn head_from_glb(b: &[u8]) -> Option<HeadUvs> {
 }
 
 /// The hat of a model GLB the exporters wrote, as the viewer builds it for
-/// pressing the scalp hair (`groom::Shell`): the meshes of the drawables
-/// `hats` (lower case; nodes are named `<drawable>/<geometry>`), seen from
-/// 10 cm under the crown, in the middle of the top 12 cm of the head. None
-/// without a hat or a head in the file.
+/// pressing the scalp hair (`groom::Shell`, with the hat's triangles as its
+/// lining): the meshes of the drawables `hats` (lower case; nodes are named
+/// `<drawable>/<geometry>`), seen from 10 cm under the crown, in the middle
+/// of the top 12 cm of the head. None without a hat or a head in the file.
 pub fn hat_shell(b: &[u8], hats: &[String]) -> Option<Shell> {
     if hats.is_empty() || b.len() < 20 || &b[0..4] != b"glTF" {
         return None;
@@ -344,18 +344,16 @@ pub fn hat_shell(b: &[u8], hats: &[String]) -> Option<Shell> {
     let bl = u32::from_le_bytes(b.get(bo..bo + 4)?.try_into().ok()?) as usize;
     let bin = b.get(bo + 8..bo + 8 + bl)?;
     let is_head = |n: &str| n.contains("_head_") || n.starts_with("head_");
-    let (mut hat, mut head) = (Vec::new(), Vec::new());
+    let (mut hat, mut head, mut tris) = (Vec::new(), Vec::new(), Vec::new());
     for node in doc["nodes"].as_array()? {
         let (Some(name), Some(mi)) = (node["name"].as_str(), node["mesh"].as_u64()) else { continue };
         let drawable = name.split('/').next().unwrap_or(name).to_ascii_lowercase();
-        let to = if hats.contains(&drawable) {
-            &mut hat
-        } else if is_head(&drawable) {
-            &mut head
-        } else {
+        let is_hat = hats.contains(&drawable);
+        if !is_hat && !is_head(&drawable) {
             continue;
-        };
-        let Some(i) = doc["meshes"][mi as usize]["primitives"].get(0).and_then(|p| p["attributes"]["POSITION"].as_u64()) else { continue };
+        }
+        let Some(prim) = doc["meshes"][mi as usize]["primitives"].get(0) else { continue };
+        let Some(i) = prim["attributes"]["POSITION"].as_u64() else { continue };
         let a = &doc["accessors"][i as usize];
         if a["componentType"].as_u64() != Some(5126) {
             continue;
@@ -365,10 +363,31 @@ pub fn hat_shell(b: &[u8], hats: &[String]) -> Option<Shell> {
         let n = a["count"].as_u64().unwrap_or(0) as usize;
         let Some(raw) = bin.get(off..off + n * 12) else { continue };
         // glTF Y-up back to RAGE Z-up: (x, y, z) -> (x, -z, y)
-        to.extend(raw.chunks_exact(12).map(|c| {
-            let f = |j: usize| f32::from_le_bytes([c[j], c[j + 1], c[j + 2], c[j + 3]]);
-            [f(0), -f(8), f(4)]
-        }));
+        let pts: Vec<[f32; 3]> = raw
+            .chunks_exact(12)
+            .map(|c| {
+                let f = |j: usize| f32::from_le_bytes([c[j], c[j + 1], c[j + 2], c[j + 3]]);
+                [f(0), -f(8), f(4)]
+            })
+            .collect();
+        if !is_hat {
+            head.extend(pts);
+            continue;
+        }
+        // the hat's triangles (u16 or u32 indices)
+        if let Some(ia) = prim["indices"].as_u64().map(|i| &doc["accessors"][i as usize]) {
+            let iv = &doc["bufferViews"][ia["bufferView"].as_u64().unwrap_or(0) as usize];
+            let io = (iv["byteOffset"].as_u64().unwrap_or(0) + ia["byteOffset"].as_u64().unwrap_or(0)) as usize;
+            let n = ia["count"].as_u64().unwrap_or(0) as usize;
+            let idx: Vec<usize> = match ia["componentType"].as_u64() {
+                Some(5125) => bin.get(io..io + n * 4).map(|r| r.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize).collect()),
+                Some(5123) => bin.get(io..io + n * 2).map(|r| r.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]) as usize).collect()),
+                _ => None,
+            }
+            .unwrap_or_default();
+            tris.extend(idx.chunks_exact(3).filter_map(|t| Some([*pts.get(t[0])?, *pts.get(t[1])?, *pts.get(t[2])?])));
+        }
+        hat.extend(pts);
     }
     if hat.is_empty() || head.is_empty() {
         return None;
@@ -381,7 +400,7 @@ pub fn hat_shell(b: &[u8], hats: &[String]) -> Option<Shell> {
             hi[a] = hi[a].max(p[a]);
         }
     }
-    Some(Shell::new([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, top - 0.10], &hat, &head))
+    Some(Shell::new([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, top - 0.10], &hat, &head).with_lining(tris))
 }
 
 /// Which of the head's UV sets a groom's root UVs belong to: at every guide
