@@ -1,16 +1,24 @@
-//! Ped body shape: the game's body-shape rigs, applied to the shared ped
-//! skeleton.
+//! Ped body shape: the game's body-shape and garment rigs, applied to the
+//! shared ped skeleton and to clothing helper bones.
 //!
 //! Body shape (the `gcweight*` / `gcmuscle*` controls of the body-shape
 //! presets) moves helper bones (`BM_*`, `MH_*`, `SEC_*`, `RB_*`) of the
 //! shared ped skeleton; the clothing is skinned to them. The moves come from
-//! a RIG0 program in the rig dictionary of `anim.rpf`
+//! RIG0 programs in the rig dictionary of `anim.rpf`
 //! (`anim/rig/generated/source/ped/human/<female|male>/body/LOD0_Body_Shapes_*`).
-//! The program is a sparse additive pose rig over a float register file:
-//! passes of (track register, weight register, delta) entries, each doing
-//! track += weight × delta (translation, scale) or q = q · delta^weight
-//! (rotation). Deltas are in the game's Z-up bone frames, i.e. the frames of
-//! the bind matrices here. See FORMATS.md §3.20.
+//! Clothing with its own helper bones (`GM_U01_*`) is then posed by the
+//! garment surface rig (`.../garment/GarmentSurface<Female|Male>`), which
+//! reads the shaped body bones and writes the helper bones' local
+//! translation and rotation.
+//!
+//! A rig program runs over a float register file. The input list loads
+//! float controls and bone local (translation, rotation, scale) channels
+//! into registers, the blocks compute (vector and quaternion arithmetic,
+//! curves, cone readers, blend skinning, additive pose passes), and the
+//! output list writes bone channels back. Rotations and translations are in
+//! the game's Z-up bone frames, i.e. the frames of the bind matrices here.
+//! The block semantics are those of the game's evaluator (rva 0x5141100);
+//! see FORMATS.md §3.20.
 use crate::drawable::{affine_inverse, Bone};
 use crate::meta7a::joaat;
 use crate::resource::Resource;
@@ -18,33 +26,16 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
+/// A bone channel of a rig's input or output list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
-    Translation,
-    Rotation,
-    Scale,
-}
-
-#[derive(Clone, Debug)]
-pub struct Op {
-    /// Track register (first of 3 or 4).
-    pub track: u16,
-    /// Weight register.
-    pub weight: u16,
-    pub kind: Kind,
-    /// xyz (translation, scale) or xyzw (rotation).
-    pub delta: [f32; 4],
-}
-
-#[derive(Clone, Debug)]
-enum Block {
-    /// Constants: first register and values.
-    Consts(u16, Vec<f32>),
-    /// dst = a × b (assumed; only drives a minor corrective).
-    Product(u16, u16, u16),
-    /// dst = clamp(src, 0, 1) (assumed).
-    Clamp(u16, u16),
-    Pass(Vec<Op>),
+pub struct Channel {
+    /// 0 translation (3 floats), 1 rotation (x, y, z, w), 2 scale (3 floats),
+    /// 3 a scalar channel.
+    pub t: u8,
+    /// First register.
+    pub reg: u16,
+    /// joaat(bone name).
+    pub hash: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -52,9 +43,13 @@ pub struct Rig {
     pub registers: usize,
     /// Float input name hash -> register.
     pub inputs: HashMap<u32, u16>,
-    /// Track register -> joaat(bone name).
-    pub tracks: HashMap<u16, u32>,
-    blocks: Vec<Block>,
+    /// Bone channels loaded into registers before the program runs.
+    pub bone_in: Vec<Channel>,
+    /// Bone channels written from registers after it.
+    pub bone_out: Vec<Channel>,
+    /// Program bytes and its blocks: (type, start, end) in `prog`.
+    prog: Vec<u8>,
+    blocks: Vec<(u8, usize, usize)>,
 }
 
 fn u16_at(b: &[u8], o: usize) -> Option<u16> {
@@ -69,7 +64,14 @@ fn f32_at(b: &[u8], o: usize) -> Option<f32> {
 
 const SEC_BLOCKS: u32 = 0xe636c3e9;
 const SEC_INPUTS: u32 = 0x2316833f;
+const SEC_OUTPUTS: u32 = 0x7224f987;
 const SEC_PROGRAM: u32 = 0xb00f0959;
+
+/// Block types the evaluator here runs. Others (24, 25, 57, 80) occur only
+/// in cull-volume and accessory rigs and are not decoded.
+const KNOWN_BLOCKS: &[u8] = &[
+    0x20, 0x21, 0x22, 0x40, 0x41, 0x42, 0x43, 0x45, 0x46, 0x48, 0x4b, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x60, 0x61, 0x62, 0x70, 0x71, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86,
+];
 
 /// Parse a RIG0 blob (starts with "RIG0").
 pub fn parse_rig(b: &[u8]) -> Option<Rig> {
@@ -80,68 +82,322 @@ pub fn parse_rig(b: &[u8]) -> Option<Rig> {
     let offs: Vec<usize> = (0..n).map(|i| u32_at(b, 0x14 + 4 * i).map(|x| x as usize)).collect::<Option<_>>()?;
     let sec = |t: u32| offs.iter().copied().find(|&o| u32_at(b, o) == Some(t));
     let (bt, inp, prog) = (sec(SEC_BLOCKS)?, sec(SEC_INPUTS)?, sec(SEC_PROGRAM)?);
-    // inputs: (u8 type, u8 kind, u16 register, u32 hash); kind 1 = float, 3 = bone track
+    // lists: (u8 channel, u8 kind, u16 register, u32 hash); kind 1 = float,
+    // 3 = bone channel
+    let list = |at: usize| -> Option<Vec<(u8, u8, u16, u32)>> { (0..u32_at(b, at + 8)? as usize).map(|i| { let o = at + 12 + 8 * i; Some((*b.get(o)?, *b.get(o + 1)?, u16_at(b, o + 2)?, u32_at(b, o + 4)?)) }).collect() };
     let mut inputs = HashMap::new();
-    let mut tracks = HashMap::new();
-    for i in 0..u32_at(b, inp + 8)? as usize {
-        let o = inp + 12 + 8 * i;
-        let (kind, reg, h) = (*b.get(o + 1)?, u16_at(b, o + 2)?, u32_at(b, o + 4)?);
+    let mut bone_in = Vec::new();
+    for (t, kind, reg, hash) in list(inp)? {
         match kind {
             1 => {
-                inputs.insert(h, reg);
+                inputs.insert(hash, reg);
             }
-            3 => {
-                tracks.insert(reg, h);
-            }
+            3 => bone_in.push(Channel { t, reg, hash }),
             _ => {}
         }
     }
+    let bone_out = match sec(SEC_OUTPUTS) {
+        Some(o) => list(o)?.into_iter().filter(|e| e.1 == 3).map(|(t, _, reg, hash)| Channel { t, reg, hash }).collect(),
+        None => Vec::new(),
+    };
     // block table: count, register count, then u32 (type << 24 | offset), 0xff ends
     let count = u32_at(b, bt + 8)? as usize;
     let registers = u32_at(b, bt + 12)? as usize;
     let body = prog + 8;
-    let body_end = prog + u32_at(b, prog + 4)? as usize;
-    let mut ents: Vec<(u8, usize)> = Vec::new();
+    let body_end = (prog + u32_at(b, prog + 4)? as usize).min(b.len());
+    let code = b.get(body..body_end)?.to_vec();
+    let mut starts: Vec<(u8, usize)> = Vec::new();
     for i in 0..count {
         let e = u32_at(b, bt + 16 + 4 * i)?;
         if e >> 24 == 0xff {
             break;
         }
-        ents.push(((e >> 24) as u8, body + (e & 0xff_ffff) as usize));
+        let t = (e >> 24) as u8;
+        if !KNOWN_BLOCKS.contains(&t) {
+            return None;
+        }
+        starts.push((t, (e & 0xff_ffff) as usize));
     }
-    let mut blocks = Vec::new();
-    for (k, &(t, o)) in ents.iter().enumerate() {
-        let end = ents.get(k + 1).map_or(body_end, |x| x.1).min(b.len());
-        let blk = b.get(o..end)?;
-        match t {
-            0x85 => {
-                let (first, n) = (u16_at(blk, 0)?, u16_at(blk, 2)? as usize);
-                blocks.push(Block::Consts(first, (0..n).map(|i| f32_at(blk, 4 + 4 * i)).collect::<Option<_>>()?));
+    let blocks = starts.iter().enumerate().map(|(k, &(t, o))| (t, o, starts.get(k + 1).map_or(code.len(), |x| x.1).max(o))).collect();
+    Some(Rig { registers, inputs, bone_in, bone_out, prog: code, blocks })
+}
+
+type Trs = ([f32; 3], Quat, [f32; 3]);
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+fn normed<const N: usize>(v: [f32; N]) -> [f32; N] {
+    let l = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if l > 0.0 {
+        v.map(|x| x / l)
+    } else {
+        v
+    }
+}
+fn conj(q: Quat) -> Quat {
+    [-q[0], -q[1], -q[2], q[3]]
+}
+fn dot4(a: Quat, b: Quat) -> f32 {
+    a.iter().zip(&b).map(|(x, y)| x * y).sum()
+}
+
+struct Regs(Vec<f32>);
+impl Regs {
+    fn s(&self, r: u16) -> f32 {
+        self.0.get(r as usize).copied().unwrap_or(0.0)
+    }
+    fn g<const N: usize>(&self, r: u16) -> [f32; N] {
+        std::array::from_fn(|i| self.0.get(r as usize + i).copied().unwrap_or(0.0))
+    }
+    fn p(&mut self, r: u16, v: &[f32]) {
+        for (i, x) in v.iter().enumerate() {
+            if let Some(d) = self.0.get_mut(r as usize + i) {
+                *d = *x;
             }
-            0x46 => blocks.push(Block::Product(u16_at(blk, 0)?, u16_at(blk, 2)?, u16_at(blk, 4)?)),
-            0x81 => blocks.push(Block::Clamp(u16_at(blk, 0)?, u16_at(blk, 2)?)),
-            0x86 => {
-                let (nt, ns, nq) = (u16_at(blk, 0)? as usize, u16_at(blk, 2)? as usize, u16_at(blk, 4)? as usize);
-                let n = nt + ns + nq;
-                let mut f = 8 + 6 * n;
-                let mut ops = Vec::with_capacity(n);
-                for i in 0..n {
-                    let (track, weight) = (u16_at(blk, 8 + 6 * i)?, u16_at(blk, 8 + 6 * i + 2)?);
-                    let kind = if i < nt { Kind::Translation } else if i < nt + ns { Kind::Scale } else { Kind::Rotation };
-                    let m = if kind == Kind::Rotation { 4 } else { 3 };
-                    let mut delta = [0f32; 4];
-                    for (j, d) in delta.iter_mut().enumerate().take(m) {
-                        *d = f32_at(blk, f + 4 * j)?;
-                    }
-                    f += 4 * m;
-                    ops.push(Op { track, weight, kind, delta });
-                }
-                blocks.push(Block::Pass(ops));
-            }
-            _ => return None,
         }
     }
-    Some(Rig { registers, inputs, tracks, blocks })
+}
+
+impl Rig {
+    /// Run the program. Bone channels of the input list are loaded from
+    /// `locals` (bone hash -> local translation, rotation, scale; missing
+    /// bones read zero), float inputs from `floats` (missing ones read zero).
+    /// Returns the output list's channels with their values (rotation x, y,
+    /// z, w; translation and scale in the first three).
+    pub fn run(&self, locals: &HashMap<u32, Trs>, floats: &HashMap<u32, f32>) -> Vec<(Channel, [f32; 4])> {
+        let mut r = Regs(vec![0f32; self.registers + 8]);
+        for (h, &reg) in &self.inputs {
+            r.p(reg, &[floats.get(h).copied().unwrap_or(0.0)]);
+        }
+        for c in &self.bone_in {
+            if let Some((t, q, s)) = locals.get(&c.hash) {
+                match c.t {
+                    0 => r.p(c.reg, t),
+                    1 => r.p(c.reg, q),
+                    2 => r.p(c.reg, s),
+                    _ => {}
+                }
+            }
+        }
+        let p = &self.prog;
+        let h = |o: usize| u16_at(p, o).unwrap_or(0);
+        let w = |o: usize| u32_at(p, o).unwrap_or(0) as usize;
+        let f = |o: usize| f32_at(p, o).unwrap_or(0.0);
+        for &(t, o, _end) in &self.blocks {
+            match t {
+                0x20 => r.p(h(o), &[f(o + 2)]),
+                0x21 => r.p(h(o), &[f(o + 2), f(o + 6), f(o + 10)]),
+                0x22 => r.p(h(o), &[f(o + 2), f(o + 6), f(o + 10), f(o + 14)]),
+                0x85 => {
+                    let (first, n) = (h(o), h(o + 2) as usize);
+                    let v: Vec<f32> = (0..n).map(|i| f(o + 4 + 4 * i)).collect();
+                    r.p(first, &v);
+                }
+                0x40 => r.p(h(o + 4), &[r.s(h(o)) + r.s(h(o + 2))]),
+                0x46 => r.p(h(o + 4), &[r.s(h(o)) * r.s(h(o + 2))]),
+                0x42 => r.p(h(o + 6), &[r.s(h(o)) + r.s(h(o + 2)) * r.s(h(o + 4))]),
+                0x41 | 0x45 | 0x48 | 0x4b => {
+                    let (a, b): ([f32; 3], [f32; 3]) = (r.g(h(o)), r.g(h(o + 2)));
+                    let v: [f32; 3] = std::array::from_fn(|i| match t {
+                        0x41 => a[i] + b[i],
+                        0x45 => a[i] - b[i],
+                        0x48 => a[i] * b[i],
+                        _ if b[i] != 0.0 => a[i] / b[i],
+                        _ => 0.0,
+                    });
+                    r.p(h(o + 4), &v);
+                }
+                0x43 => {
+                    let (a, b, k): ([f32; 3], [f32; 3], f32) = (r.g(h(o)), r.g(h(o + 2)), r.s(h(o + 4)));
+                    r.p(h(o + 6), &std::array::from_fn::<f32, 3, _>(|i| a[i] + b[i] * k));
+                }
+                0x55 => {
+                    let (a, b, k): ([f32; 3], [f32; 3], f32) = (r.g(h(o)), r.g(h(o + 2)), r.s(h(o + 4)));
+                    r.p(h(o + 6), &std::array::from_fn::<f32, 3, _>(|i| a[i] + (b[i] - a[i]) * k));
+                }
+                0x50 | 0x53 => {
+                    let (q, v): (Quat, [f32; 3]) = (r.g(h(o)), r.g(h(o + 2)));
+                    r.p(h(o + 4), &qrot(if t == 0x53 { conj(q) } else { q }, v));
+                }
+                0x51 | 0x54 => {
+                    let (a, b): (Quat, Quat) = (r.g(h(o)), r.g(h(o + 2)));
+                    r.p(h(o + 4), &qmul(if t == 0x54 { conj(a) } else { a }, b));
+                }
+                0x52 => {
+                    // a * nlerp(identity, b, k), b in the w >= 0 hemisphere
+                    let (a, mut b, k): (Quat, Quat, f32) = (r.g(h(o)), r.g(h(o + 2)), r.s(h(o + 4)));
+                    if b[3] < 0.0 {
+                        b = b.map(|x| -x);
+                    }
+                    r.p(h(o + 6), &qmul(a, normed([k * b[0], k * b[1], k * b[2], k * (b[3] - 1.0) + 1.0])));
+                }
+                0x56 => {
+                    let (a, mut b, k): (Quat, Quat, f32) = (r.g(h(o)), r.g(h(o + 2)), r.s(h(o + 4)));
+                    if dot4(a, b) < 0.0 {
+                        b = b.map(|x| -x);
+                    }
+                    r.p(h(o + 6), &normed(std::array::from_fn::<f32, 4, _>(|i| a[i] + k * (b[i] - a[i]))));
+                }
+                0x60 => {
+                    let (a, b): ([f32; 3], [f32; 3]) = (r.g(h(o)), r.g(h(o + 2)));
+                    let v = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                    r.p(h(o + 4), &if dot3(v, v) > 1e-12 { normed(v) } else { [1.0, 0.0, 0.0] });
+                }
+                0x61 => {
+                    // shortest arc from a to b
+                    let (a, b): ([f32; 3], [f32; 3]) = (r.g(h(o)), r.g(h(o + 2)));
+                    let (a, b) = (normed(a), normed(b));
+                    let d = dot3(a, b);
+                    let q = if (d + 1.0).abs() < 1e-6 {
+                        let ax = if a[0].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [0.0, 1.0, 0.0] };
+                        let c = normed(cross(a, ax));
+                        [c[0], c[1], c[2], 0.0]
+                    } else {
+                        let c = cross(a, b);
+                        normed([c[0], c[1], c[2], 1.0 + d])
+                    };
+                    r.p(h(o + 4), &q);
+                }
+                0x62 => {
+                    // frame from three points: x along b - a, y towards c
+                    let (a, b, c): ([f32; 3], [f32; 3], [f32; 3]) = (r.g(h(o)), r.g(h(o + 2)), r.g(h(o + 4)));
+                    let x = normed([b[0] - a[0], b[1] - a[1], b[2] - a[2]]);
+                    let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+                    let d = dot3(x, v);
+                    let y = normed([v[0] - d * x[0], v[1] - d * x[1], v[2] - d * x[2]]);
+                    let z = cross(x, y);
+                    r.p(h(o + 6), &normed(m2q([[x[0], y[0], z[0]], [x[1], y[1], z[1]], [x[2], y[2], z[2]]])));
+                }
+                0x70 | 0x71 => {
+                    // cone readers: u16 input direction, entries of
+                    // (u16 dst, direction, k) from +0x16, 0x12 apart
+                    let v: [f32; 3] = r.g(h(o));
+                    for i in 0..w(o + 0x12) {
+                        let e = o + 0x16 + 0x12 * i;
+                        let d = dot3(v, [f(e + 2), f(e + 6), f(e + 10)]);
+                        let k = f(e + 14);
+                        let x = if t == 0x70 {
+                            (1.0 - d) * k + 1.0
+                        } else {
+                            let s = (2.0 * d + 2.0).abs();
+                            let s = if s > f32::MIN_POSITIVE { 2.0 - s.sqrt() } else { 2.0 };
+                            let y = s.abs();
+                            1.0 - k * if y > f32::MIN_POSITIVE { y.sqrt() } else { 0.0 }
+                        };
+                        r.p(h(e), &[x.max(0.0)]);
+                    }
+                }
+                0x81..=0x83 => {
+                    // piecewise-linear curve: u16 dst, u16 input, u8 flags
+                    // (bit 0: wrap to the fraction), u32 n at +8, n knots,
+                    // n value registers
+                    let n = w(o + 8);
+                    if n == 0 {
+                        continue;
+                    }
+                    let mut x = r.s(h(o + 2));
+                    if p.get(o + 4).is_some_and(|fl| fl & 1 != 0) {
+                        x -= x.floor();
+                    }
+                    let kn = |i: usize| f(o + 12 + 4 * i);
+                    let vr = |i: usize| h(o + 12 + 4 * n + 2 * i);
+                    let (j, s) = if n == 1 {
+                        (0, 0.0)
+                    } else {
+                        let mut j = 0;
+                        while j + 2 < n && kn(j + 1) < x {
+                            j += 1;
+                        }
+                        (j, ((x - kn(j)) / (kn(j + 1) - kn(j)).max(1e-10)).clamp(0.0, 1.0))
+                    };
+                    let j1 = (j + 1).min(n - 1);
+                    match t {
+                        0x81 => r.p(h(o), &[r.s(vr(j)) + s * (r.s(vr(j1)) - r.s(vr(j)))]),
+                        0x82 => {
+                            let (a, b): ([f32; 3], [f32; 3]) = (r.g(vr(j)), r.g(vr(j1)));
+                            r.p(h(o), &std::array::from_fn::<f32, 3, _>(|i| a[i] + s * (b[i] - a[i])));
+                        }
+                        _ => {
+                            let (a, mut b): (Quat, Quat) = (r.g(vr(j)), r.g(vr(j1)));
+                            if dot4(a, b) < 0.0 {
+                                b = b.map(|x| -x);
+                            }
+                            r.p(h(o), &normed(std::array::from_fn::<f32, 4, _>(|i| a[i] + s * (b[i] - a[i]))));
+                        }
+                    }
+                }
+                0x84 => {
+                    // blend skinning: u32 n; register triples (T, Q, S) for 8
+                    // influences per item; weights; offsets and rotations
+                    // (structure of arrays); destination (position, rotation)
+                    let n = w(o);
+                    let (ix, wt) = (o + 4, o + 4 + 48 * n);
+                    let (of, qq) = (wt + 32 * n, wt + 32 * n + 96 * n);
+                    let ds = qq + 128 * n;
+                    for i in 0..n {
+                        let mut pos = [0f32; 3];
+                        let mut acc: Option<Quat> = None;
+                        for k in 0..8 {
+                            let reg = |j: usize| h(ix + 2 * (24 * i + 3 * k + j));
+                            let wk = f(wt + 4 * (8 * i + k));
+                            let off: [f32; 3] = std::array::from_fn(|c| f(of + 4 * (24 * i + 8 * c + k)));
+                            let lq: Quat = std::array::from_fn(|c| f(qq + 4 * (32 * i + 8 * c + k)));
+                            let (tt, q, sc): ([f32; 3], Quat, [f32; 3]) = (r.g(reg(0)), r.g(reg(1)), r.g(reg(2)));
+                            let rv = qrot(q, [sc[0] * off[0], sc[1] * off[1], sc[2] * off[2]]);
+                            (0..3).for_each(|c| pos[c] += wk * (tt[c] + rv[c]));
+                            let rk = qmul(q, lq).map(|x| wk * x);
+                            acc = Some(match acc {
+                                None => rk,
+                                Some(a) => {
+                                    let sg = if dot4(a, rk) < 0.0 { -1.0 } else { 1.0 };
+                                    std::array::from_fn(|c| a[c] + sg * rk[c])
+                                }
+                            });
+                        }
+                        r.p(h(ds + 4 * i), &pos);
+                        let a = acc.unwrap_or([0.0; 4]);
+                        let l2 = dot4(a, a);
+                        r.p(h(ds + 4 * i + 2), &if l2 > 1e-5 { a.map(|x| x / l2.sqrt()) } else { [0.0; 4] });
+                    }
+                }
+                0x86 => {
+                    // additive pass: (track register, weight register) entries,
+                    // translations, then scales (track += weight * delta), then
+                    // rotations (q = q * delta^weight)
+                    let (nt, ns, nq) = (h(o) as usize, h(o + 2) as usize, h(o + 4) as usize);
+                    let n = nt + ns + nq;
+                    let mut d = o + 8 + 6 * n;
+                    for i in 0..n {
+                        let (tr, wr) = (h(o + 8 + 6 * i), h(o + 8 + 6 * i + 2));
+                        let rot = i >= nt + ns;
+                        let wv = r.s(wr);
+                        if wv != 0.0 {
+                            if rot {
+                                let q: Quat = r.g(tr);
+                                r.p(tr, &qmul(q, qpow([f(d), f(d + 4), f(d + 8), f(d + 12)], wv)));
+                            } else {
+                                let v: [f32; 3] = r.g(tr);
+                                r.p(tr, &std::array::from_fn::<f32, 3, _>(|j| v[j] + wv * f(d + 4 * j)));
+                            }
+                        }
+                        d += if rot { 16 } else { 12 };
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.bone_out
+            .iter()
+            .map(|c| {
+                let v: [f32; 4] = r.g(c.reg);
+                (*c, if c.t == 1 { v } else { [v[0], v[1], v[2], 0.0] })
+            })
+            .collect()
+    }
 }
 
 /// A body control and the rig inputs it drives: (name, input for positive
@@ -303,20 +559,55 @@ fn mul(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
     o
 }
 
-/// Shaped pose of a skeleton: bone -> model matrices (same space as
-/// `Bone::bind_matrix`), plus how many rig entries moved a bone. Bones the rig
-/// does not touch keep their bind pose relative to their parent. `None` if a
-/// bone has no bind matrix.
-pub fn pose(bones: &[Bone], rig: &Rig, inputs: &HashMap<u32, f32>) -> Option<(Vec<[f32; 16]>, usize)> {
+/// A shaped skeleton.
+#[derive(Clone, Debug)]
+pub struct Posed {
+    /// Bone -> model matrices (same space as `Bone::bind_matrix`). Bones the
+    /// rig does not move keep their bind pose relative to their parent.
+    pub matrices: Vec<[f32; 16]>,
+    /// Bone channels the rig changed.
+    pub moved: usize,
+    /// Each bone's local (translation, rotation, scale) after the rig.
+    locals: Vec<Trs>,
+    /// Each bone's model (translation, rotation, scale).
+    model: Vec<Trs>,
+    by_hash: HashMap<u32, usize>,
+}
+
+fn changed(a: &[f32], b: &[f32]) -> bool {
+    a.iter().zip(b).any(|(x, y)| (x - y).abs() > 1e-6)
+}
+
+/// Compose a model transform from the parent's and a local one, as the
+/// game's skeleton update does: rotation = parent rotation * local rotation,
+/// translation = parent translation + parent rotation applied to (parent
+/// scale * local translation, per axis), scale = parent scale * local scale
+/// (per axis). So a helper bone's scale reaches the bones under it, in each
+/// bone's own axes, without the shear a matrix product would add. A vertex
+/// is then rotation * (scale * (inverse bind * vertex)) + translation.
+fn compose((pt, pq, ps): Trs, (lt, lq, ls): Trs) -> Trs {
+    let r = qrot(pq, [ps[0] * lt[0], ps[1] * lt[1], ps[2] * lt[2]]);
+    ([pt[0] + r[0], pt[1] + r[1], pt[2] + r[2]], qmul(pq, lq), [ps[0] * ls[0], ps[1] * ls[1], ps[2] * ls[2]])
+}
+
+fn apply(trs: &mut Trs, c: &Channel, v: &[f32; 4]) -> bool {
+    let (old, new): (&mut [f32], &[f32]) = match c.t {
+        0 => (&mut trs.0, &v[..3]),
+        1 => (&mut trs.1, &v[..4]),
+        2 => (&mut trs.2, &v[..3]),
+        _ => return false,
+    };
+    let moved = changed(old, new);
+    old.copy_from_slice(new);
+    moved
+}
+
+/// Shaped pose of a skeleton by a body-shape rig. `None` if a bone has no
+/// bind matrix.
+pub fn pose(bones: &[Bone], rig: &Rig, inputs: &HashMap<u32, f32>) -> Option<Posed> {
     let binds: Vec<[f32; 16]> = bones.iter().map(|b| b.bind_matrix).collect::<Option<_>>()?;
-    let mut regs = vec![0f32; rig.registers.max(1)];
-    for (h, &r) in &rig.inputs {
-        if let (Some(v), Some(x)) = (inputs.get(h), regs.get_mut(r as usize)) {
-            *x = *v;
-        }
-    }
     let by_hash: HashMap<u32, usize> = bones.iter().enumerate().map(|(i, b)| (joaat(&b.name), i)).collect();
-    let mut trs: Vec<_> = bones
+    let mut locals: Vec<Trs> = bones
         .iter()
         .enumerate()
         .map(|(i, b)| {
@@ -327,75 +618,64 @@ pub fn pose(bones: &[Bone], rig: &Rig, inputs: &HashMap<u32, f32>) -> Option<(Ve
             to_trs(&local)
         })
         .collect();
+    let input: HashMap<u32, Trs> = by_hash.iter().map(|(&h, &i)| (h, locals[i])).collect();
     let mut touched = vec![false; bones.len()];
-    let mut applied = 0;
-    for blk in &rig.blocks {
-        match blk {
-            Block::Consts(first, v) => {
-                for (k, x) in v.iter().enumerate() {
-                    if let Some(r) = regs.get_mut(*first as usize + k) {
-                        *r = *x;
-                    }
-                }
-            }
-            Block::Product(a, b, d) => {
-                let v = regs.get(*a as usize).copied().unwrap_or(0.0) * regs.get(*b as usize).copied().unwrap_or(0.0);
-                if let Some(r) = regs.get_mut(*d as usize) {
-                    *r = v;
-                }
-            }
-            Block::Clamp(d, s) => {
-                let v = regs.get(*s as usize).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                if let Some(r) = regs.get_mut(*d as usize) {
-                    *r = v;
-                }
-            }
-            Block::Pass(ops) => {
-                for op in ops {
-                    let w = regs.get(op.weight as usize).copied().unwrap_or(0.0);
-                    if w == 0.0 {
-                        continue;
-                    }
-                    let Some(&bi) = rig.tracks.get(&op.track).and_then(|h| by_hash.get(h)) else { continue };
-                    let (t, q, s) = &mut trs[bi];
-                    match op.kind {
-                        Kind::Translation => (0..3).for_each(|k| t[k] += w * op.delta[k]),
-                        Kind::Scale => (0..3).for_each(|k| s[k] += w * op.delta[k]),
-                        Kind::Rotation => *q = qmul(*q, qpow(op.delta, w)),
-                    }
-                    touched[bi] = true;
-                    applied += 1;
-                }
-            }
+    let mut moved = 0;
+    for (c, v) in rig.run(&input, inputs) {
+        let Some(&bi) = by_hash.get(&c.hash) else { continue };
+        if apply(&mut locals[bi], &c, &v) {
+            touched[bi] = true;
+            moved += 1;
         }
     }
-    // Model transforms as the game's skeleton update builds them: each bone
-    // keeps (rotation, translation, scale) in model space, composed from its
-    // parent's as rotation = parent rotation * local rotation, translation =
-    // parent translation + parent rotation applied to (parent scale * local
-    // translation, per axis), scale = parent scale * local scale (per axis).
-    // So a helper bone's scale reaches the bones under it, in each bone's own
-    // axes, without the shear a matrix product would add. A vertex is then
-    // rotation * (scale * (inverse bind * vertex)) + translation.
     let mut out = binds.clone();
-    let mut model: Vec<([f32; 3], Quat, [f32; 3])> = binds.iter().map(to_trs).collect();
+    let mut model: Vec<Trs> = binds.iter().map(to_trs).collect();
     for i in 0..bones.len() {
-        let (lt, lq, ls) = trs[i];
         model[i] = match bones[i].parent {
             // parents come before children in RAGE skeletons; fall back to bind
-            Some(p) if (p as usize) < i => {
-                let (pt, pq, ps) = model[p as usize];
-                let r = qrot(pq, [ps[0] * lt[0], ps[1] * lt[1], ps[2] * lt[2]]);
-                ([pt[0] + r[0], pt[1] + r[1], pt[2] + r[2]], qmul(pq, lq), [ps[0] * ls[0], ps[1] * ls[1], ps[2] * ls[2]])
-            }
+            Some(p) if (p as usize) < i => compose(model[p as usize], locals[i]),
             Some(_) => continue,
-            None => (lt, lq, ls),
+            None => locals[i],
         };
         if touched[i] || bones[i].parent.is_some_and(|p| (p as usize) < i && out[p as usize] != binds[p as usize]) {
             out[i] = from_trs(model[i].0, model[i].1, model[i].2);
         }
     }
-    Some((out, applied))
+    Some(Posed { matrices: out, moved, locals, model, by_hash })
+}
+
+impl Posed {
+    /// Pose clothing helper bones with a garment surface rig: the rig reads
+    /// the shaped body bones' locals and the helper bones' stored locals and
+    /// writes the helper bones' new locals. Returns, per bone of `own` (the
+    /// clothing drawable's own skeleton), its model matrix when the rig
+    /// moved it; `None` for bones it leaves (they follow their parent
+    /// rigidly). Only root bones that name their parent in the shared
+    /// skeleton (`Bone::parent_hash`) are posed, which is how helper bones
+    /// are stored.
+    pub fn garment(&self, rig: &Rig, own: &[Bone]) -> Vec<Option<[f32; 16]>> {
+        let stored = |b: &Bone| -> Trs { (b.translation, b.rotation, b.scale) };
+        let mut input: HashMap<u32, Trs> = self.by_hash.iter().map(|(&h, &i)| (h, self.locals[i])).collect();
+        for b in own {
+            input.entry(joaat(&b.name)).or_insert_with(|| stored(b));
+        }
+        let mut outs: HashMap<u32, Vec<(Channel, [f32; 4])>> = HashMap::new();
+        for (c, v) in rig.run(&input, &HashMap::new()) {
+            outs.entry(c.hash).or_default().push((c, v));
+        }
+        own.iter()
+            .map(|b| {
+                let pi = *b.parent_hash.filter(|_| b.parent.is_none()).and_then(|h| self.by_hash.get(&h))?;
+                let o = outs.get(&joaat(&b.name))?;
+                let mut local = stored(b);
+                for (c, v) in o {
+                    apply(&mut local, c, v);
+                }
+                let (t, q, s) = compose(self.model[pi], local);
+                Some(from_trs(t, q, s))
+            })
+            .collect()
+    }
 }
 
 /// Rig path of the LOD0 body-shape rig.
@@ -478,18 +758,36 @@ fn rig_dict(game_root: &Path) -> Result<&'static Resource, String> {
     .map_err(|e| e.clone())
 }
 
+/// Rig path of the garment surface rig, which poses clothing helper bones
+/// (`GM_U01_*`) from the body bones.
+pub fn garment_rig_path(female: bool) -> &'static str {
+    if female {
+        "anim/rig/generated/source/ped/human/female/garment/GarmentSurfaceFemale"
+    } else {
+        "anim/rig/generated/source/ped/human/male/garment/GarmentSurfaceMale"
+    }
+}
+
+fn load(game_root: &Path, path: &str) -> Result<Rig, String> {
+    let d = rig_dict(game_root)?;
+    let blob = dict_rig(d, path).ok_or_else(|| format!("{path} not in the rig dictionary"))?;
+    parse_rig(blob).ok_or_else(|| format!("{path}: unexpected RIG0 layout"))
+}
+
 /// The LOD0 body-shape rig for a body (cached).
 pub fn get(game_root: &Path, female: bool) -> Result<&'static Rig, String> {
     static F: OnceLock<Result<Rig, String>> = OnceLock::new();
     static M: OnceLock<Result<Rig, String>> = OnceLock::new();
     let cell = if female { &F } else { &M };
-    cell.get_or_init(|| {
-        let d = rig_dict(game_root)?;
-        let blob = dict_rig(d, rig_path(female)).ok_or_else(|| format!("{} not in the rig dictionary", rig_path(female)))?;
-        parse_rig(blob).ok_or_else(|| format!("{}: unexpected RIG0 layout", rig_path(female)))
-    })
-    .as_ref()
-    .map_err(|e| e.clone())
+    cell.get_or_init(|| load(game_root, rig_path(female))).as_ref().map_err(|e| e.clone())
+}
+
+/// The garment surface rig for a body (cached).
+pub fn get_garment(game_root: &Path, female: bool) -> Result<&'static Rig, String> {
+    static F: OnceLock<Result<Rig, String>> = OnceLock::new();
+    static M: OnceLock<Result<Rig, String>> = OnceLock::new();
+    let cell = if female { &F } else { &M };
+    cell.get_or_init(|| load(game_root, garment_rig_path(female))).as_ref().map_err(|e| e.clone())
 }
 
 #[cfg(test)]
@@ -527,14 +825,19 @@ mod tests {
         let h = std::f32::consts::FRAC_1_SQRT_2;
         // root at 0, parent at 1 m, child 0.1 m above the parent and turned 90 degrees about x
         let bones = vec![bone(0, "root", None, 0.0, id), bone(1, "parent", Some(0), 1.0, id), bone(2, "child", Some(1), 1.1, [h, 0.0, 0.0, h])];
-        let rig = Rig {
-            registers: 4,
-            inputs: HashMap::from([(7, 0)]),
-            tracks: HashMap::from([(1, joaat("parent"))]),
-            blocks: vec![Block::Pass(vec![Op { track: 1, weight: 0, kind: Kind::Scale, delta: [0.0, 0.0, 2.0, 0.0] }])],
-        };
-        let (m, applied) = pose(&bones, &rig, &HashMap::from([(7, 1.0)])).unwrap();
-        assert_eq!(applied, 1);
+        // one additive pass: scale of "parent" (registers 1..3) += weight (register 0) * (0, 0, 2)
+        let mut prog = Vec::new();
+        for x in [0u16, 1, 0, 0, 1, 0, 0] {
+            prog.extend(x.to_le_bytes());
+        }
+        for x in [0f32, 0.0, 2.0] {
+            prog.extend(x.to_le_bytes());
+        }
+        let ch = Channel { t: 2, reg: 1, hash: joaat("parent") };
+        let rig = Rig { registers: 4, inputs: HashMap::from([(7, 0)]), bone_in: vec![ch], bone_out: vec![ch], blocks: vec![(0x86, 0, prog.len())], prog };
+        let posed = pose(&bones, &rig, &HashMap::from([(7, 1.0)])).unwrap();
+        assert_eq!(posed.moved, 1);
+        let m = &posed.matrices;
         // the parent is scaled 3x along z
         assert!((m[1][10] - 3.0).abs() < 1e-5);
         // the child's offset is scaled with it: 1 + 3 * 0.1
