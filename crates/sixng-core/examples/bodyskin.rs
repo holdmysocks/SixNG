@@ -1,5 +1,7 @@
 //! Research: body skin textures of characters.
 //! bodyskin item <game> <work> <wardrobe offset hex> <item hex>...   the items (and their parent chain) as JSON
+//! bodyskin missing <game> <work>                                     referenced textures in no store and no de-duplication table (TSV)
+//! bodyskin heads <game> <work>                                       head preset faces: stored, through the table, missing
 //! bodyskin dupes <game> <work>                                       referenced textures found through the de-duplication table
 //! bodyskin survey <game> <work> [model regex]                       one JSON line per character: its body skin parts,
 //!                                                                    the textures the items name and the drawable binds,
@@ -101,7 +103,61 @@ fn main() -> anyhow::Result<()> {
             top.truncate(25);
             println!("{}", serde_json::json!({"table_pairs": d, "referenced": n, "stored": stored, "found_through_table": via, "still_missing": n - stored - via, "by_shader": top}));
         }
-        _ => anyhow::bail!("item | survey | dupes"),
+        "missing" => {
+            // referenced textures in no store and not in the de-duplication table, one TSV row each:
+            // hash, materials, models, top slot, top shader, first model archive id and name
+            let set = sixng_core::ttpf::global(&ws.game);
+            let tu = sixng_core::texusers::TexUsers::load(&sixng_core::texusers::path(&ws))?;
+            let mut rows = Vec::new();
+            for (h, mats) in &tu.by_texture {
+                if set.get(*h).is_some() {
+                    continue;
+                }
+                let mut slots: std::collections::HashMap<&str, usize> = Default::default();
+                let mut shaders: std::collections::HashMap<&str, usize> = Default::default();
+                let mut models = std::collections::BTreeSet::new();
+                for &m in mats {
+                    let mt = &tu.materials[m as usize];
+                    for (sl, x) in &mt.slots {
+                        if x == h {
+                            *slots.entry(sl.as_str()).or_default() += 1;
+                        }
+                    }
+                    *shaders.entry(mt.shader.as_str()).or_default() += 1;
+                    models.extend(tu.material_models[m as usize].iter().copied());
+                }
+                let top = |m: &std::collections::HashMap<&str, usize>| m.iter().max_by_key(|x| x.1).map(|x| x.0.to_string()).unwrap_or_default();
+                let first = models.iter().next().map(|&i| tu.models[i as usize].clone()).unwrap_or_default();
+                rows.push((mats.len(), models.len(), *h, top(&slots), top(&shaders), first));
+            }
+            rows.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
+            for (nm, nmod, h, sl, sh, (id, name)) in rows {
+                println!("{h:016x}	{nm}	{nmod}	{sl}	{sh}	{id}	{name}");
+            }
+        }
+        "heads" => {
+            // head preset faces (by_head and library): stored, found through the table, missing;
+            // then the missing head-drawable textures (hashes on stdin) whose head has a preset face
+            let set = sixng_core::ttpf::global(&ws.game);
+            let t: serde_json::Value = serde_json::from_slice(&std::fs::read(ws.work.join("index").join("head_skins.json"))?)?;
+            let mut c: std::collections::BTreeMap<&str, usize> = Default::default();
+            let mut all = Vec::new();
+            for v in t["by_head"].as_object().unwrap().values() {
+                all.extend(v.as_array().unwrap().iter().cloned());
+            }
+            for v in t["library"].as_object().unwrap().values() {
+                all.extend(v.as_array().unwrap().iter().map(|x| x[1].clone()));
+            }
+            for f in &all {
+                for k in ["albedo", "normal"] {
+                    let h = f[k].as_u64().unwrap_or(0);
+                    let st = if h == 0 { "none" } else if set.get_stored(h).is_some() { "stored" } else if set.get(h).is_some() { "via table" } else { "missing" };
+                    *c.entry(if k == "albedo" { ["albedo stored", "albedo via table", "albedo missing", "albedo none"][["stored", "via table", "missing", "none"].iter().position(|x| *x == st).unwrap()] } else { ["normal stored", "normal via table", "normal missing", "normal none"][["stored", "via table", "missing", "none"].iter().position(|x| *x == st).unwrap()] }).or_default() += 1;
+                }
+            }
+            println!("{}", serde_json::json!({"faces": all.len(), "counts": c}));
+        }
+        _ => anyhow::bail!("item | survey | dupes | missing | heads"),
     }
     Ok(())
 }
