@@ -431,11 +431,25 @@ pub const CONTROLS: &[(&str, u32, Option<u32>)] = &[
     ("gcmuscleupperarm", 0x37657a6b, None),
     ("gcbutt", 0x5a502ae2, None),
     ("gcbreasts", 0x377b0101, Some(0x48f90678)),
+    // Shape controls found in the same preset PSO (2026-11-26); names by
+    // joaat of the control id, except the one whose name is not recovered.
+    ("gcbreastheight", 0xf9bc636e, Some(0x12b6dd5f)),
+    ("gcbreastspacing", 0xb3e7142f, Some(0x36c800c8)),
+    ("gcchestheight", 0xa064c82b, Some(0x9b89a2b0)),
+    ("gc_b0eae798", 0x8a7d0c78, Some(0xb2efcb7f)),
+    ("gccleavage", 0xf9dc7b4c, Some(0xc7717edf)),
+    ("gcbellyround", 0xa1aede2a, None),
+    ("gchipwidth", 0x6c83d62b, None),
+    ("gchipheight", 0xa64a2b22, Some(0xee16a69c)),
+    ("gcheadscale", 0x9c978205, None),
+    ("gcmusclebiceps", 0xc0fd5915, None),
+    ("gcmuscletriceps", 0xa981e727, None),
 ];
 
 /// Parse "gcweightbelly=1,gcmusclechest=0.5" into control values. Names are
 /// case-insensitive; `allweight=v` / `allmuscle=v` set every weight / muscle
-/// control. Values are clamped to -1..1 (muscle and butt to 0..1).
+/// control. Values are clamped to -1..1, or 0..1 for controls with no input
+/// for negative values (muscle, butt, belly roundness, hip width, head scale).
 pub fn parse_spec(spec: &str) -> Result<Vec<(String, f32)>, String> {
     let mut out: Vec<(String, f32)> = Vec::new();
     for kv in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -444,11 +458,12 @@ pub fn parse_spec(spec: &str) -> Result<Vec<(String, f32)>, String> {
         let v: f32 = v.trim().parse().map_err(|_| format!("body shape: bad value in `{kv}`"))?;
         let names: Vec<&str> = match k.as_str() {
             "allweight" => CONTROLS.iter().map(|c| c.0).filter(|n| n.starts_with("gcweight")).collect(),
-            "allmuscle" => CONTROLS.iter().map(|c| c.0).filter(|n| n.starts_with("gcmuscle")).collect(),
+            // the twelve regions; biceps and triceps are separate in the presets
+            "allmuscle" => CONTROLS.iter().map(|c| c.0).filter(|n| n.starts_with("gcmuscle") && !n.ends_with("ceps")).collect(),
             _ => vec![CONTROLS.iter().find(|c| c.0 == k).map(|c| c.0).ok_or_else(|| format!("body shape: unknown control `{k}` (known: {}, allweight, allmuscle)", CONTROLS.iter().map(|c| c.0).collect::<Vec<_>>().join(", ")))?],
         };
         for n in names {
-            let lo = if n.starts_with("gcmuscle") || n == "gcbutt" { 0.0 } else { -1.0 };
+            let lo = if CONTROLS.iter().any(|c| c.0 == n && c.2.is_none()) { 0.0 } else { -1.0 };
             out.retain(|x| x.0 != n);
             out.push((n.to_string(), v.clamp(lo, 1.0)));
         }
@@ -877,7 +892,14 @@ mod tests {
         assert_eq!(m.get(&0x74a5940e), Some(&0.5));
         assert_eq!(m.get(&0xf8ca1901), Some(&1.0));
         assert_eq!(parse_spec("allweight=1").unwrap().len(), 12);
+        assert_eq!(parse_spec("allmuscle=1").unwrap().len(), 12);
         assert!(parse_spec("nope=1").is_err());
+        // controls from the preset PSO: negative side by |v|, one-sided ones clamp at 0
+        let m = input_values(&parse_spec("gcbreastheight=-0.6,gccleavage=0.5,gcheadscale=-1,gchipwidth=0.9").unwrap());
+        assert_eq!(m.get(&0x12b6dd5f), Some(&0.6));
+        assert_eq!(m.get(&0xf9dc7b4c), Some(&0.5));
+        assert_eq!(m.get(&0x6c83d62b), Some(&0.9));
+        assert!(!m.contains_key(&0x9c978205) || m[&0x9c978205] == 0.0);
     }
 
     #[test]
@@ -897,7 +919,7 @@ mod tests {
     <Item key="BODYSHAPE_BEACHBELLIES"><BodyShapeVariations><Item><BodyShapePreset>PED_BODYSHAPE_BELLY</BodyShapePreset></Item></BodyShapeVariations></Item>
   </BodyShapeVariationProfiles>"#;
         assert_eq!(preset_from_xml(xml, "Average").unwrap(), vec![("gcweightback".to_string(), 0.0)]);
-        assert_eq!(preset_from_xml(xml, "BeachBellies").unwrap(), vec![("gcbutt".to_string(), 0.75), ("gcweightbelly".to_string(), 0.5)]);
+        assert_eq!(preset_from_xml(xml, "BeachBellies").unwrap(), vec![("gccleavage".to_string(), 0.5), ("gcbutt".to_string(), 0.75), ("gcweightbelly".to_string(), 0.5)]);
         assert!(preset_from_xml(xml, "Nope").is_err());
         // an unnamed profile word, as its joaat
         let h = format!("{:08x}", crate::meta7a::joaat("BeachBellies"));
