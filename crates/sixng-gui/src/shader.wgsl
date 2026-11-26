@@ -472,6 +472,7 @@ struct VIn {
     @location(12) extra: vec4<f32>, // x skinned, y highlight, z tint code, w unused
     @location(13) tint: vec4<f32>,  // model tint palette colour (linear; white = none)
     @location(14) zone: vec4<u32>,  // x sticker zone, y model of an assembled vehicle
+    @builtin(vertex_index) vi: u32,
 };
 
 struct VOut {
@@ -488,6 +489,8 @@ struct VOut {
     @location(8) lamp: vec3<f32>,
     // sticker zone, model of an assembled vehicle
     @location(9) @interpolate(flat) zone: vec2<u32>,
+    // a strand ribbon's own dither seed (a hash of its point), so overlapping strands keep different samples
+    @location(10) @interpolate(flat) seed: u32,
 };
 
 fn skin_matrix(v: VIn) -> mat4x4<f32> {
@@ -524,6 +527,7 @@ fn mesh_vertex(v: VIn) -> VOut {
     let m = model * sk;
     let w = m * vec4(v.pos, 1.0);
     var o: VOut;
+    o.seed = (v.vi >> 1u) * 0x9e3779b9u;
     o.lamp = lamp;
     var wp = w.xyz;
     var edge = v.tan.w;
@@ -1047,7 +1051,10 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {
     // covered share (a dither it averages over frames); here each sample of the pixel is kept or not
     let cov = select(clamp((i.uv1.y - 1.0) * 2.5, 0.0, 1.0), i.uv1.x, i.uv1.y > 1.5);
     if (M.flags.y == 12u && i.uv1.y > 0.5 && cov < 0.999) {
-        let j = fract(dot(i.tint.rgb, vec3(12.9898, 78.233, 37.719))) * 64.0 + F.frame.x * 5.588238;
+        // the game's offset: 5.58824 x ((strand id + frame + 37) & 63), its strand id from the strand's own bits;
+        // here a hash of the ribbon's point (one pattern for every strand would keep the same samples wherever
+        // strands overlap, so a crowd of thin strands never covered more than one of them does)
+        let j = 5.588238 * f32(((i.seed >> 26u) + u32(F.frame.x) + 37u) & 63u);
         var mk = 0u;
         for (var s = 0u; s < 4u; s++) {
             if (cov >= ign(i.clip.xy + vec2(j + f32(s) * 5.588, j + f32(s) * 9.123))) { mk |= 1u << s; }
