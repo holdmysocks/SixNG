@@ -523,7 +523,7 @@ fn two_layer_blend_text() -> Value {
         "inputs": {
             "c": "_COLOR1.r / 255 (the second vertex colour set)",
             "M": "the blend mask: slot 11 (extra_data), rgba, on TEXCOORD_0 when mask_uv_pair is 1, else TEXCOORD_1 (2 on 6 to 26 % of sampled materials; the mesh program packs mesh UV sets 0 and 1 into the pixel input TEXCOORD0)",
-            "b": "a per-instance value (byte 3 of the instance's record; batch props: an instance input). Not exported; 1 (byte 255) is assumed, which makes m = blendintensity",
+            "b": "a per-instance value / 255. Batch props (prop_2lyr_batch drawn instanced): the u8 at +0x3E of the 64-byte batch instance record (layer_blend in the decoded batches; 255 on 96 % of 2-layer rock instances, 0 on whole batches, which turns layer 2 off). Other placements: byte 3 of the first dword of the draw's 32-byte per-instance record, filled from the placement by code not read. Not exported; 1 (byte 255) is assumed, which makes m = blendintensity",
         },
         "steps": [
             "h = dot(M, mask_weights)                (mask_weights.z is replaced by b where instance_switch is 1 and b < 1)",
@@ -538,7 +538,7 @@ fn two_layer_blend_text() -> Value {
         ],
         "simple": "with b = 1 and the mask ignored (h = 0): w = saturate(sharpen(c) x blendintensity + blendoffset), sharpen(c) = c / (c + k (1 - c)); blendsoftness 1 gives sharpen(c) = c",
         "source": "shader code: the deferred pixel programs of standard_2lyr and prop_2lyr_batch read in full, the pxm and decal ground ones compared; the mesh programs' export of _COLOR1.r to the pixel input checked. Not compared with a rendered image",
-        "not_read": "where the per-instance value comes from in the placements; the normal and material-map blend (they use max(0, w - _COLOR1.g))",
+        "not_read": "which placement field fills b for ordinary entities (two u8 entity fields that default to 255, 0dc5f270 and 540ca436, are candidates but differ from each other on most entities); the normal and material-map blend (they use max(0, w - _COLOR1.g))",
     })
 }
 
@@ -1226,6 +1226,7 @@ mod paint_tests {
         let r = &b["resolved"];
         assert_eq!((r["h"].as_str(), r["k"].as_str(), r["w"].as_str()), (Some("1 - (M.b)"), Some("11.1111"), Some("saturate(s x 0.4 + 0.3)")));
         assert_eq!(r["mask_uv"], "TEXCOORD_1");
+        assert!(b["inputs"]["b"].as_str().unwrap().contains("+0x3E of the 64-byte batch instance record"));
         // softness 1: no sharpening; the layer-2 alpha switch multiplies in lyr1diffusetex.a
         let sh = crate::drawable::Shader { constants: vec![s1("cbc6c5b3", 1.0), s1("ba3b95db", 1.0), s1("29265d05", 0.0), s1("d6de9e14", 1.0)], ..sh };
         let r = &multilayer(&sh, &[], || Value::Null).unwrap()["blend"]["resolved"];
