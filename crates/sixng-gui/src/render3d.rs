@@ -517,6 +517,12 @@ pub struct GpuModel {
     pub stencil: u32,
     /// Material names and shaders (inspection).
     pub mat_names: Vec<String>,
+    /// The instances last written to `instances` (an unchanged set is not
+    /// written again).
+    pub last_inst: Vec<Instance>,
+    /// Recorded draws of this model per pass (see `BUNDLE_*`): the key of
+    /// what they were recorded for, their draw count and the bundle.
+    pub bundles: std::sync::Mutex<Vec<Option<(u64, u32, wgpu::RenderBundle)>>>,
 }
 
 impl GpuModel {
@@ -542,6 +548,162 @@ impl GpuModel {
     pub fn n_normal(&self) -> u32 {
         self.n_instances - self.n_fb.min(self.n_instances)
     }
+}
+
+/// Bundle slots of a model ([`GpuModel::bundles`]): its opaque draws, its
+/// coverage-fallback draws, then one per shadow cascade.
+pub const BUNDLE_OPAQUE: usize = 0;
+pub const BUNDLE_FB: usize = 1;
+pub const BUNDLE_SHADOW: usize = 2;
+
+/// The pass a model's recorded draws are replayed in: its device and
+/// attachment formats.
+pub struct BundleCtx<'d> {
+    pub device: &'d wgpu::Device,
+    pub color: Option<wgpu::TextureFormat>,
+    pub depth: wgpu::TextureFormat,
+    pub samples: u32,
+}
+
+/// Static models' draws are recorded once as render bundles and replayed
+/// each frame (wgpu validates and encodes a recorded draw once instead of
+/// every frame); `SIXNG_NO_BUNDLES=1` records every draw every frame.
+fn bundles_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("SIXNG_NO_BUNDLES").is_ok_and(|v| v != "0"))
+}
+
+/// Whether a model's draws stay the same from frame to frame (no joints,
+/// no strand hair with a per-frame count).
+fn bundle_ok(gm: &GpuModel) -> bool {
+    !gm.meshes.iter().any(|m| m.skinned || m.strand_lod.is_some())
+}
+
+/// Key of a model's recorded draws: what they were recorded with.
+fn bundle_key(gm: &GpuModel, pipe: &wgpu::RenderPipeline, bg: &wgpu::BindGroup, range: &std::ops::Range<u32>, extra: u64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    pipe.hash(&mut h);
+    bg.hash(&mut h);
+    gm.instances.hash(&mut h);
+    range.hash(&mut h);
+    extra.hash(&mut h);
+    for me in &gm.meshes {
+        (me.visible, me.n_idx).hash(&mut h);
+    }
+    h.finish()
+}
+
+/// The model's bundle in `slot` recorded for `key` and its draw count
+/// (`rec` records it when it is missing or was recorded for something else).
+fn model_bundle<'a>(
+    ctx: &BundleCtx<'_>,
+    gm: &GpuModel,
+    slot: usize,
+    key: u64,
+    rec: impl FnOnce(&mut wgpu::RenderBundleEncoder<'a>) -> u32,
+) -> (wgpu::RenderBundle, u32) {
+    let mut b = gm.bundles.lock().unwrap();
+    if b.len() <= slot {
+        b.resize_with(slot + 1, || None);
+    }
+    if let Some((k, n, rb)) = &b[slot] {
+        if *k == key {
+            return (rb.clone(), *n);
+        }
+    }
+    let fmts = [ctx.color];
+    let mut enc = ctx.device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
+        label: Some("model draws"),
+        color_formats: if ctx.color.is_some() { &fmts } else { &[] },
+        depth_stencil: Some(wgpu::RenderBundleDepthStencil {
+            format: ctx.depth,
+            depth_read_only: false,
+            stencil_read_only: false,
+        }),
+        sample_count: ctx.samples,
+        multiview: None,
+    });
+    let n = rec(&mut enc);
+    let rb = enc.finish(&wgpu::RenderBundleDescriptor { label: Some("model draws") });
+    b[slot] = Some((key, n, rb.clone()));
+    (rb, n)
+}
+
+/// A model's opaque (or coverage-fallback) draws into a bundle, as the
+/// direct path in `record_opaque` draws them.
+fn bundle_opaque<'a>(
+    be: &mut wgpu::RenderBundleEncoder<'a>,
+    pipe: &'a wgpu::RenderPipeline,
+    bg0: &'a wgpu::BindGroup,
+    gm: &'a GpuModel,
+    decal_bias: bool,
+    mode: u32,
+    range: std::ops::Range<u32>,
+) -> u32 {
+    let mut n = 0;
+    be.set_pipeline(pipe);
+    be.set_bind_group(0, bg0, &[]);
+    be.set_vertex_buffer(1, gm.instances.slice(..));
+    let mut bound: Option<&wgpu::Buffer> = None;
+    let mut mat = usize::MAX;
+    for me in gm.meshes.iter().filter(|m| m.visible && m.n_idx > 0) {
+        let blend = gm.mat_alpha[me.material] == 2 || matches!(gm.mat_class[me.material], 5 | 6 | 8);
+        if (blend && mode == 0) || (decal_bias && gm.mat_decal[me.material].is_some()) {
+            continue;
+        }
+        if mat != me.material {
+            be.set_bind_group(1, &gm.mat_bg[me.material], &[]);
+            mat = me.material;
+        }
+        if bound != Some(&me.vb) {
+            be.set_vertex_buffer(0, me.vb.slice(..));
+            be.set_index_buffer(me.ib.slice(..), wgpu::IndexFormat::Uint32);
+            bound = Some(&me.vb);
+        }
+        let first = (me.ib_range.start / 4) as u32;
+        let base = (me.vb_range.start / std::mem::size_of::<glb::Vertex>() as u64) as i32;
+        be.draw_indexed(first..first + me.n_idx, base, range.clone());
+        n += 1;
+    }
+    n
+}
+
+/// A model's shadow-caster draws into a bundle, as the direct path in
+/// `record_shadow` draws them.
+fn bundle_shadow<'a>(
+    be: &mut wgpu::RenderBundleEncoder<'a>,
+    pipe: &'a wgpu::RenderPipeline,
+    bg0: &'a wgpu::BindGroup,
+    gm: &'a GpuModel,
+    range: std::ops::Range<u32>,
+) -> u32 {
+    let mut n = 0;
+    be.set_pipeline(pipe);
+    be.set_bind_group(0, bg0, &[]);
+    be.set_vertex_buffer(1, gm.instances.slice(..));
+    let mut bound: Option<&wgpu::Buffer> = None;
+    let mut mat = usize::MAX;
+    for me in gm.meshes.iter().filter(|m| m.visible && m.n_idx > 0) {
+        let see_through = gm.mat_alpha[me.material] == 2 || matches!(gm.mat_class[me.material], 5 | 6 | 8);
+        if see_through || gm.mat_decal[me.material].is_some() {
+            continue;
+        }
+        if mat != me.material {
+            be.set_bind_group(1, &gm.mat_bg[me.material], &[]);
+            mat = me.material;
+        }
+        if bound != Some(&me.vb) {
+            be.set_vertex_buffer(0, me.vb.slice(..));
+            be.set_index_buffer(me.ib.slice(..), wgpu::IndexFormat::Uint32);
+            bound = Some(&me.vb);
+        }
+        let first = (me.ib_range.start / 4) as u32;
+        let base = (me.vb_range.start / std::mem::size_of::<glb::Vertex>() as u64) as i32;
+        be.draw_indexed(first..first + me.n_idx, base, range.clone());
+        n += 1;
+    }
+    n
 }
 
 /// World bounding sphere of a model's instances from its local box.
@@ -2188,6 +2350,8 @@ impl Uploader {
             bbox: [Vec3::from(m.bbox[0]), Vec3::from(m.bbox[1])],
             world: None,
             stencil: 1,
+            last_inst: Vec::new(),
+            bundles: std::sync::Mutex::new(Vec::new()),
             mat_names: mats
                 .iter()
                 .map(|mt| format!("{} [{}] {}", mt.name, mt.shader_hash, mt.class))
@@ -2220,6 +2384,14 @@ impl Renderer3D {
     }
 
     pub fn set_instances(&self, rs: &egui_wgpu::RenderState, gm: &mut GpuModel, inst: &[Instance]) {
+        // most frames most models keep their instances: nothing to write
+        if gm.n_instances as usize == inst.len()
+            && bytemuck::cast_slice::<Instance, u8>(&gm.last_inst) == bytemuck::cast_slice::<Instance, u8>(inst)
+        {
+            return;
+        }
+        gm.last_inst.clear();
+        gm.last_inst.extend_from_slice(inst);
         if inst.len() as u32 > gm.instance_cap {
             let cap = inst.len();
             gm.instances = rs.device.create_buffer(&wgpu::BufferDescriptor {
@@ -2519,13 +2691,17 @@ impl Renderer3D {
         models: &[&GpuModel],
         mode: u32,
         fb: bool,
+        bctx: Option<&BundleCtx<'_>>,
     ) -> u32 {
         let mut n = 0u32;
-        be.set_pipeline(pipe);
+        let mut pipe_set = false;
         let mut sref = u32::MAX;
         // static models share the default frame bind group (their joints
         // buffer is never read), so it is bound once
         let mut shared_bound = false;
+        // recorded static models waiting to be replayed (in one call, until
+        // the stencil value changes or a model is drawn directly)
+        let mut pending: Vec<wgpu::RenderBundle> = Vec::new();
         for gm in models {
             let range = if fb {
                 gm.n_normal()..gm.n_instances
@@ -2536,9 +2712,31 @@ impl Renderer3D {
                 continue;
             }
             let want = if fb { 0 } else { gm.stencil };
+            let bundled = bctx.filter(|_| bundles_on() && bundle_ok(gm));
+            if (sref != want || bundled.is_none()) && !pending.is_empty() {
+                be.execute_bundles(pending.iter());
+                pending.clear();
+                // replaying bundles leaves no pipeline or groups bound
+                pipe_set = false;
+                shared_bound = false;
+            }
             if sref != want {
                 be.set_stencil_reference(want);
                 sref = want;
+            }
+            if let Some(ctx) = bundled {
+                let extra = ((mode as u64) << 1) | decal_bias as u64;
+                let key = bundle_key(gm, pipe, default_frame_bg, &range, extra);
+                let (rb, k) = model_bundle(ctx, gm, if fb { BUNDLE_FB } else { BUNDLE_OPAQUE }, key, |e| {
+                    bundle_opaque(e, pipe, default_frame_bg, gm, decal_bias, mode, range.clone())
+                });
+                pending.push(rb);
+                n += k;
+                continue;
+            }
+            if !pipe_set {
+                be.set_pipeline(pipe);
+                pipe_set = true;
             }
             if gm.meshes.iter().any(|m| m.skinned) {
                 be.set_bind_group(0, Some(&gm.frame_bg), &[]);
@@ -2583,6 +2781,9 @@ impl Renderer3D {
                 n += 1;
             }
         }
+        if !pending.is_empty() {
+            be.execute_bundles(pending.iter());
+        }
         n
     }
 
@@ -2595,10 +2796,11 @@ impl Renderer3D {
         be: &mut wgpu::RenderPass<'_>,
         models: &[&GpuModel],
         c: &crate::shadow::Cascade,
+        bctx: Option<(&BundleCtx<'_>, usize)>,
     ) -> u32 {
         let mut n = 0u32;
-        be.set_pipeline(pipe);
-        be.set_bind_group(0, Some(bg), &[]);
+        let mut bound_pipe = false;
+        let mut pending: Vec<wgpu::RenderBundle> = Vec::new();
         for gm in models {
             let range = 0..gm.n_normal();
             if range.is_empty() || gm.meshes.iter().any(|m| m.skinned) {
@@ -2611,6 +2813,23 @@ impl Renderer3D {
                 if !crate::shadow::in_cascade(c, wc, wr) {
                     continue;
                 }
+            }
+            if let Some((ctx, cascade)) = bctx.filter(|_| bundles_on() && bundle_ok(gm)) {
+                let key = bundle_key(gm, pipe, bg, &range, 0);
+                let (rb, k) = model_bundle(ctx, gm, BUNDLE_SHADOW + cascade, key, |e| bundle_shadow(e, pipe, bg, gm, range.clone()));
+                pending.push(rb);
+                n += k;
+                continue;
+            }
+            if !pending.is_empty() {
+                be.execute_bundles(pending.iter());
+                pending.clear();
+                bound_pipe = false;
+            }
+            if !bound_pipe {
+                be.set_pipeline(pipe);
+                be.set_bind_group(0, Some(bg), &[]);
+                bound_pipe = true;
             }
             be.set_vertex_buffer(1, Some(gm.instances.slice(..)));
             let mut bound: Option<&wgpu::Buffer> = None;
@@ -2636,6 +2855,9 @@ impl Renderer3D {
                 n += 1;
             }
         }
+        if !pending.is_empty() {
+            be.execute_bundles(pending.iter());
+        }
         n
     }
 
@@ -2644,6 +2866,7 @@ impl Renderer3D {
     #[allow(clippy::too_many_arguments)]
     fn render_shadows(
         &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         enc: &mut wgpu::CommandEncoder,
         cam: &Camera,
@@ -2688,7 +2911,8 @@ impl Renderer3D {
                 multiview_mask: None,
             });
             let bg = &self.shadow_bgs[i];
-            self.shadow_draws += Self::record_shadow(&self.pipe_shadow, bg, &mut pass, models, &c);
+            let bctx = BundleCtx { device, color: None, depth: crate::shadow::FMT, samples: 1 };
+            self.shadow_draws += Self::record_shadow(&self.pipe_shadow, bg, &mut pass, models, &c, Some((&bctx, i)));
             // map cells stand in for placements far from the camera: none
             // in the nearest cascade
             if i > 0 {
@@ -2914,7 +3138,7 @@ impl Renderer3D {
             self.atmo.compute(&mut enc, sky);
         }
         gmark(&self.gpu_timer, &mut enc, 1);
-        self.render_shadows(queue, &mut enc, cam, look, &fu, aspect, models);
+        self.render_shadows(device, queue, &mut enc, cam, look, &fu, aspect, models);
         gmark(&self.gpu_timer, &mut enc, 2);
         let t = self.target.as_ref().unwrap();
         let mut draws = 0u32;
@@ -2954,6 +3178,12 @@ impl Renderer3D {
                 Self::record_sun_map(&self.pipe_cam_depth, &self.depth_frame_bg, &[], &mut dp, models, true);
             }
         }
+        let bctx = BundleCtx {
+            device,
+            color: Some(if self.hdr { crate::atmo::HDR_FMT } else { COLOR_FMT }),
+            depth: self.depth_fmt,
+            samples: MSAA,
+        };
         {
             let c = if self.hdr { [0.0; 3] } else { look.clear };
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3005,6 +3235,7 @@ impl Renderer3D {
                 models,
                 look.mode,
                 false,
+                Some(&bctx),
             );
             pass.set_stencil_reference(1);
             draws += Self::draw_cells(
@@ -3025,6 +3256,7 @@ impl Renderer3D {
                 models,
                 0,
                 true,
+                Some(&bctx),
             );
             pass.set_stencil_reference(0);
             let fc = Self::draw_cells(

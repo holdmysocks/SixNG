@@ -1309,9 +1309,14 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   driver starts moving the map into shared (system) memory (more than
   384 MB), the streamer takes 85 % of what was in use at that point as the
   GPU budget and sheds models above it, like the RAM caps. Freed models
-  give their GPU memory back: the renderer records no render bundles,
-  because the graphics library version in use never frees a bundle, nor
-  anything it draws.
+  give their GPU memory back, with their recorded draws.
+- **Recorded draws**: a static model's opaque, coverage-fallback and
+  shadow-caster draws are recorded once as render bundles and replayed
+  each frame, so the graphics library validates and encodes them once
+  instead of every frame; a model is recorded again when its instances,
+  shown meshes or pass change. Skinned models and strand hair are drawn
+  directly. `SIXNG_NO_BUNDLES=1` draws everything directly (for
+  comparison). Instances are written to the GPU only when they change.
 
 - **Lighting**: ambient light comes from a mostly desaturated sky, and the
   fog fades towards a half-desaturated sky, so surfaces keep their texture
