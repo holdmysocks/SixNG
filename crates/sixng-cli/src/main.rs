@@ -964,7 +964,9 @@ enum Cmd {
         /// Texture output: png, dds, or both.
         #[arg(long, default_value = "png")]
         tex: String,
-        /// Body shape, as for extract (e.g. "gcweightbelly=0.5").
+        /// Body shape, as for extract (e.g. "gcweightbelly=0.5"). Without it a
+        /// --look outfit is posed in its own body-shape preset (from
+        /// common.rpf's body-type XML; "gcweightback=0" for neutral).
         #[arg(long)]
         body_shape: Option<String>,
         /// Face variant for the head, as for extract.
@@ -1650,6 +1652,8 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             // all parts of the --look outfit (strands and unresolved items too):
             // the hide masks below are worked out over them
             let mut look_outfit: Vec<sixng_core::pedlook::LookPart> = Vec::new();
+            // the outfit's body-shape preset (its tag), used unless --body-shape is given
+            let mut look_preset: Option<String> = None;
             let mut look_parts: Vec<(u64, sixng_core::pedlook::LookPart)> = match look {
                 Some(k) => match sixng_core::pedlook::look(&ws.game, &a, &ix, &prefix) {
                     // not a listed model either: the error below names the part rule
@@ -1660,6 +1664,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                         None => bail!("{prefix} has {} outfits (--look 0..{})", l.outfits.len(), l.outfits.len().saturating_sub(1)),
                         Some(o) => {
                             look_outfit = o.parts.clone();
+                            look_preset = o.body_shape.clone();
                             let ps = &o.parts;
                             let by_name = sixng_core::outfit::dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
                                 let n = e.name.as_ref()?.to_ascii_lowercase();
@@ -1755,7 +1760,19 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             let sel: Vec<&sixng_core::scan::Entry> = offs.iter().filter_map(|o| ix.entries.iter().find(|e| e.off == *o)).collect();
             let glb = glb.clone().unwrap_or_else(|| PathBuf::from(format!("{prefix}.glb")));
-            let oa = OutArgs { out: glb.parent().map(|p| p.to_path_buf()).unwrap_or_default(), tex: tex.clone(), raw: false, force: true, no_embedded_textures: false, dry_run: false, body_shape: body_shape.clone(), head_skin: *head_skin, paint: None };
+            // without --body-shape a --look outfit is posed in its own preset
+            let body_shape = match (body_shape, &look_preset) {
+                (Some(s), _) => Some(s.clone()),
+                (None, Some(tag)) => match sixng_core::bodyshape::preset_controls(&ws.game, tag) {
+                    Ok(c) => Some(c.iter().filter(|(_, v)| *v != 0.0).map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join(",")).filter(|s| !s.is_empty()),
+                    Err(e) => {
+                        eprintln!("body-shape preset {tag}: {e} (exported neutral)");
+                        None
+                    }
+                },
+                (None, None) => None,
+            };
+            let oa = OutArgs { out: glb.parent().map(|p| p.to_path_buf()).unwrap_or_default(), tex: tex.clone(), raw: false, force: true, no_embedded_textures: false, dry_run: false, body_shape, head_skin: *head_skin, paint: None };
             if *anim_only && clip.is_empty() {
                 bail!("--anim-only needs at least one --clip");
             }

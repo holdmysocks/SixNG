@@ -980,8 +980,18 @@ again**).
   `<work>/index/story_flow_tags.json`. The Scenes tab shows the names as
   the scene's **Story** and its name search finds them. The tags do not
   give the order of the missions in the story.
-- **Body sliders** (weight −1…1, muscle 0…1; `--body <w>,<m>` for
-  screenshots): the skin and head are posed with the game's body-shape rig
+- **Body sliders** (weight −1…1, muscle 0…1, breasts −1…1 and butt 0…1,
+  the game's `gcbreasts` and `gcbutt` controls, and under **Regions** the
+  12 weight and 12 muscle regions; the overall weight and muscle set every
+  region): an outfit opens in its own body-shape preset, read from
+  `common.rpf`'s body-type XML (the outfit's `BodyShapePreset` tag, e.g.
+  `Average`, names a profile `BODYSHAPE_<tag>`; its first preset gives the
+  control values; an outfit whose word names no profile, such as
+  Lucia's and Jason's `Skinny`, opens neutral), **Reset** goes back to it
+  and **Neutral** sets every control to 0. `outfit --look` exports use the preset too unless
+  `--body-shape` is given. `--body <w>,<m>[,<b>,<t>]` or `--body` with a
+  `--body-shape` spec sets the shape for screenshots instead of the
+  preset. The skin and head are posed with the game's body-shape rig
   on the shared skeleton. Clothes and accessories follow the skin under
   them (each point moves with the nearest skin vertices), because the
   data the game shapes clothes with is not decoded. Small accessories
