@@ -1232,8 +1232,11 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   noise (no slices; less grain); a cloud thins out at its rim. A cloud is lit by
   the sun or moon through the cloud above it (forward-peaked) and by the
   sky. Our choices: the noise (2.5 km features), the extinction (0.004 per
-  m at full density) and the drift speed (12 m/s at scale 1); the game's
-  cloud map and noise textures are not used. `--no-clouds`, or the
+  m at full density) and the drift speed (12 m/s at scale 1); the noise
+  (four octaves of value noise) is baked once into a 2048² texture that
+  repeats every 80 km, so each cloud sample, and the clouds' shadow on
+  every lit surface, is one texture read. The game's cloud map and noise
+  textures are not used. `--no-clouds`, or the
   **clouds** checkbox, turns them off.
 - **Terrain ground** (HDR map): the baked map tiles hold only a colour by
   height with their own hill shading (the bake's terrain layer), and cells

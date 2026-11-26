@@ -52,6 +52,61 @@ const CLOUD_SIGMA: f32 = 0.004;
 const CLOUD_SCALE: f32 = 2500.0;
 /// Wind speed that moves the clouds at a wind velocity scale of 1 (m/s).
 const CLOUD_WIND: f32 = 12.0;
+/// The clouds' cover noise is baked into a CLOUD_TEX square texture that
+/// repeats every CLOUD_PERIOD noise cells (80 km at CLOUD_SCALE: farther
+/// than the clouds are drawn), so a cloud sample is one texture read and
+/// not four octaves of noise (shader.wgsl reads it with the same period).
+const CLOUD_TEX: u32 = 2048;
+const CLOUD_PERIOD: u32 = 32;
+
+/// The value noise of shader.wgsl's clouds, its lattice wrapped every
+/// `period` cells (so the bake tiles).
+fn cloud_hash(x: f32, y: f32) -> f32 {
+    let fr = |v: f32| v - v.floor();
+    let (qx, qy) = (fr(x * 0.1031), fr(y * 0.1030));
+    let d = qx * (qy + 33.33) + qy * (qx + 33.33);
+    fr((qx + qy) * (qx + d))
+}
+
+fn cloud_vnoise(x: f32, y: f32, period: f32) -> f32 {
+    let (ix, iy) = (x.floor(), y.floor());
+    let (fx, fy) = (x - ix, y - iy);
+    let (ux, uy) = (fx * fx * (3.0 - 2.0 * fx), fy * fy * (3.0 - 2.0 * fy));
+    let w = |v: f32| v.rem_euclid(period);
+    let (x0, x1, y0, y1) = (w(ix), w(ix + 1.0), w(iy), w(iy + 1.0));
+    let a = cloud_hash(x0, y0) + (cloud_hash(x1, y0) - cloud_hash(x0, y0)) * ux;
+    let b = cloud_hash(x0, y1) + (cloud_hash(x1, y1) - cloud_hash(x0, y1)) * ux;
+    a + (b - a) * uy
+}
+
+/// Four octaves of the cloud noise over one period, as half floats (0 to 1).
+fn cloud_noise_texels() -> Vec<u16> {
+    use rayon::prelude::*;
+    let n = CLOUD_TEX as usize;
+    let per = CLOUD_PERIOD as f32;
+    let half = |v: f32| -> u16 {
+        // 0 to 1 only: normal half floats, smaller values flushed to 0
+        let b = v.clamp(0.0, 1.0).to_bits();
+        let e = ((b >> 23) & 0xff) as i32 - 127 + 15;
+        if e <= 0 { 0 } else { ((e as u32) << 10 | ((b >> 13) & 0x3ff)) as u16 }
+    };
+    (0..n * n)
+        .into_par_iter()
+        .map(|i| {
+            let mut qx = ((i % n) as f32 + 0.5) / n as f32 * per;
+            let mut qy = ((i / n) as f32 + 0.5) / n as f32 * per;
+            let (mut f, mut a, mut p) = (0.0, 0.5, per);
+            for _ in 0..4 {
+                f += a * cloud_vnoise(qx, qy, p);
+                qx = qx * 2.0 + 17.1;
+                qy = qy * 2.0 + 9.2;
+                a *= 0.5;
+                p *= 2.0;
+            }
+            half(f)
+        })
+        .collect()
+}
 /// Depth of the aerial-perspective volume (km) near the ground; from
 /// higher up it reaches the horizon (`ap_depth`).
 const AP_DEPTH: f32 = 40.0;
@@ -347,6 +402,10 @@ pub struct SceneBinds {
     /// The placed lights near the camera and their grid (lights.rs).
     pub lights: wgpu::Buffer,
     pub light_grid: wgpu::Buffer,
+    /// The clouds' cover noise, baked once (cloud_noise_texels), and the
+    /// repeating sampler it is read with.
+    pub cloud_noise: wgpu::TextureView,
+    pub repeat: wgpu::Sampler,
 }
 
 /// Bind group layout entries 6 to 14, 22 and 23 of the mesh shaders' group 0.
@@ -420,6 +479,13 @@ pub fn frame_layout_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
         },
         storage_fs(22),
         storage_fs(23),
+        tex(26, wgpu::TextureViewDimension::D2),
+        wgpu::BindGroupLayoutEntry {
+            binding: 27,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        },
     ]
 }
 
@@ -437,7 +503,7 @@ fn storage_fs(binding: u32) -> wgpu::BindGroupLayoutEntry {
 }
 
 impl SceneBinds {
-    pub fn entries(&self) -> [wgpu::BindGroupEntry<'_>; 11] {
+    pub fn entries(&self) -> [wgpu::BindGroupEntry<'_>; 13] {
         [
             wgpu::BindGroupEntry { binding: 6, resource: self.scene_ub.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&self.trans) },
@@ -450,6 +516,8 @@ impl SceneBinds {
             wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::Sampler(&self.shadow_cmp) },
             wgpu::BindGroupEntry { binding: 22, resource: self.lights.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 23, resource: self.light_grid.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 26, resource: wgpu::BindingResource::TextureView(&self.cloud_noise) },
+            wgpu::BindGroupEntry { binding: 27, resource: wgpu::BindingResource::Sampler(&self.repeat) },
         ]
     }
 }
@@ -766,6 +834,35 @@ impl Atmosphere {
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 }),
+                cloud_noise: {
+                    use wgpu::util::DeviceExt;
+                    let texels = cloud_noise_texels();
+                    device
+                        .create_texture_with_data(
+                            queue,
+                            &wgpu::TextureDescriptor {
+                                label: Some("cloud noise"),
+                                size: wgpu::Extent3d { width: CLOUD_TEX, height: CLOUD_TEX, depth_or_array_layers: 1 },
+                                mip_level_count: 1,
+                                sample_count: 1,
+                                dimension: wgpu::TextureDimension::D2,
+                                format: wgpu::TextureFormat::R16Float,
+                                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                                view_formats: &[],
+                            },
+                            wgpu::util::TextureDataOrder::LayerMajor,
+                            bytemuck::cast_slice(&texels),
+                        )
+                        .create_view(&Default::default())
+                },
+                repeat: device.create_sampler(&wgpu::SamplerDescriptor {
+                    label: Some("repeat"),
+                    address_mode_u: wgpu::AddressMode::Repeat,
+                    address_mode_v: wgpu::AddressMode::Repeat,
+                    mag_filter: wgpu::FilterMode::Linear,
+                    min_filter: wgpu::FilterMode::Linear,
+                    ..Default::default()
+                }),
             },
             _ms: ms,
             hist,
@@ -1002,5 +1099,39 @@ mod tests {
         assert!(!noon.key_is_moon && noon.key_dir.y > 0.8);
         let night = super::Sky::fallback(1.0);
         assert!(night.key_is_moon && night.key_dir.y > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod cloud_noise_tests {
+    use super::*;
+
+    /// The baked noise repeats every period: an octave's lattice wraps, so
+    /// a point and the same point one period on give the same value.
+    #[test]
+    fn cloud_noise_tiles() {
+        let per = CLOUD_PERIOD as f32;
+        let fbm = |mut x: f32, mut y: f32| {
+            let (mut f, mut a, mut p) = (0.0, 0.5, per);
+            for _ in 0..4 {
+                f += a * cloud_vnoise(x, y, p);
+                x = x * 2.0 + 17.1;
+                y = y * 2.0 + 9.2;
+                a *= 0.5;
+                p *= 2.0;
+            }
+            f
+        };
+        for k in 0..50 {
+            let (x, y) = (k as f32 * 0.613, k as f32 * 0.371);
+            assert!((fbm(x, y) - fbm(x + per, y)).abs() < 1e-3);
+            assert!((fbm(x, y) - fbm(x, y + per)).abs() < 1e-3);
+        }
+        let t = cloud_noise_texels();
+        assert_eq!(t.len(), (CLOUD_TEX * CLOUD_TEX) as usize);
+        // the noise sum spreads over about 0.2 to 0.8 (the threshold's range)
+        let v: Vec<f32> = t.iter().step_by(997).map(|&h| f32::from_bits((((h as u32) >> 10) + 127 - 15) << 23 | ((h as u32) & 0x3ff) << 13)).collect();
+        let (lo, hi) = v.iter().fold((1.0f32, 0.0f32), |(a, b), &x| (a.min(x), b.max(x)));
+        assert!(lo < 0.3 && hi > 0.7 && lo > 0.0, "{lo} {hi}");
     }
 }
