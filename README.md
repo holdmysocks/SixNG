@@ -1203,9 +1203,10 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   weather's cloud cover; the sky and every surface behind the layer are
   seen through it, and its shadow moves over the ground. A cloud has a
   dome-shaped top whose height follows its cover and a base that rises
-  where it thins, and is sampled every 120 m along each ray (8 to 48
-  samples for the sky, at most 10 for the ground behind the layer; near
-  the eye at most 150 m apart, farther out 3 % of the distance) from a
+  where it thins, and is sampled along the whole ray through the layer
+  (8 to 48 samples for the sky, at most 10 for the ground behind the
+  layer), the step growing with the distance (120 m plus 4 % of the
+  distance, more where the samples would not reach the end) from a
   start set per pixel by interleaved gradient noise with a little white
   noise (no slices; less grain); a cloud thins out at its rim. A cloud is lit by
   the sun or moon through the cloud above it (forward-peaked) and by the

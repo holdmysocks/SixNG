@@ -299,8 +299,9 @@ const CLOUD_STEPS: i32 = 48;
 // The same for the ground seen through the layer (every surface fragment).
 const CLOUD_STEPS_GROUND: i32 = 10;
 const CLOUD_STEP_M: f32 = 120.0;
-const CLOUD_DT_MAX: f32 = 150.0;
-const CLOUD_DT_FAR: f32 = 0.03;
+// farther out a step is this share of its distance from the eye (a far
+// cloud is small on screen)
+const CLOUD_DT_FAR: f32 = 0.04;
 
 // Light scattered towards the eye by the clouds along a ray from o in
 // direction d up to tmax (rgb), and the ray's transmittance through them (a).
@@ -325,10 +326,6 @@ fn clouds_along(o: vec3<f32>, d: vec3<f32>, tmax: f32, max_steps: i32, px: vec2<
     if (t1 <= t0) { return vec4(0.0, 0.0, 0.0, 1.0); }
     let len = t1 - t0;
     let steps = clamp(i32(ceil(len / CLOUD_STEP_M)), min(8, max_steps), max_steps);
-    // samples at most CLOUD_DT_MAX apart near the eye, and a fixed share
-    // of the distance farther out (a far cloud is small on screen, and a
-    // long grazing path still reaches the clouds near the horizon)
-    let dt = min(len / f32(steps), max(CLOUD_DT_MAX, t0 * CLOUD_DT_FAR));
     // the pixel's start in the first step: interleaved gradient noise with
     // a little white noise (each alone shows: one as grain, the other as a
     // diagonal hatch)
@@ -342,8 +339,20 @@ fn clouds_along(o: vec3<f32>, d: vec3<f32>, tmax: f32, max_steps: i32, px: vec2<
     let sig = S.cloud0.w;
     var tr = 1.0;
     var lit = vec3(0.0);
+    // the whole path is sampled, with steps growing with the distance from
+    // the eye: CLOUD_STEP_M plus a share of the distance, the share raised
+    // when the samples would not reach the path's end (a long grazing path
+    // still reaches the clouds near the horizon, and its near steps stay
+    // short)
+    let c0 = CLOUD_STEP_M / CLOUD_DT_FAR;
+    let grow = max(CLOUD_DT_FAR, pow((t1 + c0) / (t0 + c0), 1.0 / f32(steps)) - 1.0);
+    var t = t0;
     for (var k = 0; k < steps; k++) {
-        let p = o + d * (t0 + (f32(k) + jit) * dt);
+        let dt = (t + c0) * grow;
+        let tk = t + jit * dt;
+        t += dt;
+        if (tk > t1) { break; }
+        let p = o + d * tk;
         let dens = cloud_density3(p);
         if (dens <= 0.0) { continue; }
         let od = dens * sig * dt;
