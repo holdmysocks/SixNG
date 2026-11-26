@@ -3228,8 +3228,11 @@ impl ModelView {
                         }
                         // columns 25 to 33: the primer's scale per channel,
                         // cross byte, window start and width, mask switch,
-                        // and the library's primer roughness and metalness
+                        // and the library's primer metalness low and high
+                        // (roughness low and high in columns 48, 49)
                         let primer = [pw.primer[0], pw.primer[1], pw.primer[2], pw.primer_cross, pw.primer_start, pw.primer_width, if pw.primer_on_wear_mask { 255 } else { 0 }, primer_surface[0], primer_surface[1]];
+                        px[(768 + id) * 512 + 48 * 4 + 3] = primer_surface[2];
+                        px[(768 + id) * 512 + 49 * 4 + 3] = primer_surface[3];
                         for (c, v) in primer.iter().enumerate() {
                             px[(768 + id) * 512 + (25 + c) * 4 + 3] = *v;
                         }
@@ -5677,16 +5680,17 @@ fn primer_set(mask: u8, first: u8) -> usize {
     (0..3).map(|k| (first as usize + k) % 3).find(|s| mask & (1 << s) != 0).unwrap_or(0)
 }
 
-/// The roughness and metalness (0 to 255 each) of the library's primer
-/// (`primerPalette` of the global record: the middle of `roughnessLow` and
-/// `roughnessHigh`, of `metallicLow` and `metallicHigh`; the game blends
-/// each pair by the material map, which the viewer does not read for the
-/// primer). Without the record: roughness 0.6, metalness 0.
-fn primer_surface(global: &serde_json::Value) -> [u8; 2] {
+/// The primer's metalness and roughness, low and high (0 to 255 each:
+/// metalness low, high, roughness low, high): the library's `primerPalette`
+/// (global record), which the game packs once into its global object
+/// (rva 0x5b4cce0, each value x 255 truncated) and copies into every
+/// part's primer surface record; its paint shader blends each pair by the
+/// material map's red (metalness) and green (roughness), as for the first
+/// layer. Without the record: roughness 0.6, metalness 0.
+fn primer_surface(global: &serde_json::Value) -> [u8; 4] {
     let p = &global["primerPalette"];
-    let mid = |a: &str, b: &str| Some(((p[a].as_f64()? + p[b].as_f64()?) * 0.5).clamp(0.0, 1.0) as f32);
-    let byte = |x: f32| (x * 255.0 + 0.5) as u8;
-    [byte(mid("roughnessLow", "roughnessHigh").unwrap_or(0.6)), byte(mid("metallicLow", "metallicHigh").unwrap_or(0.0))]
+    let byte = |k: &str, d: f64| (p[k].as_f64().unwrap_or(d).clamp(0.0, 1.0) * 255.0) as u8;
+    [byte("metallicLow", 0.0), byte("metallicHigh", 0.0), byte("roughnessLow", 0.6), byte("roughnessHigh", 0.6)]
 }
 
 /// Four bytes from 8 hex digits.
@@ -9028,7 +9032,8 @@ mod tests {
         assert_eq!((a[1].primer, a[1].primer_bias, a[1].primer_gamma[1]), ([0, 32, 0], [0, 13, 0], 255));
         assert_eq!((a[1].primer_start, a[1].primer_width, a[1].primer_cross, a[1].primer_on_wear_mask), (10, 117, 51, true));
         assert_eq!((a[1].bias, a[1].gamma), ([0; 3], [255; 3]));
-        assert_eq!(super::primer_surface(&serde_json::json!({"primerPalette": {"roughnessLow": 0.45, "roughnessHigh": 0.78, "metallicLow": 0.0, "metallicHigh": 0.0}})), [157, 0]);
+        assert_eq!(super::primer_surface(&serde_json::json!({"primerPalette": {"roughnessLow": 0.45, "roughnessHigh": 0.78, "metallicLow": 0.0, "metallicHigh": 0.0}})), [0, 0, 114, 198]);
+        assert_eq!(super::primer_surface(&serde_json::json!({})), [0, 0, 153, 153]);
         assert_eq!(part_wear(&w, 0, None).unwrap()[0].amount, 150);
         // a configuration without levels: no wear; level 0 without a ladder: the level's value
         assert_eq!(part_wear(&w, 0, Some("nope")).unwrap()[0], PartWear::default());
