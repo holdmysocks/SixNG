@@ -4546,6 +4546,8 @@ impl ModelView {
             });
             ui.label(if src == "linked" {
                 "faces the game links to this head"
+            } else if src == "character" {
+                "the face of this character's other head"
             } else {
                 "automatic: faces of the same sex, body type and ethnicity"
             });

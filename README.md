@@ -962,10 +962,19 @@ again**).
   `head_*` faces) the game's material data names the head, and that face
   is used. Other heads (`a_head_base_*`, crowd `hc_*` heads, characters
   whose materials are in archives not indexed yet) get a face of the same
-  sex, body type and ethnicity from that library. The viewer shows
+  sex, body type and ethnicity from that library. Since 2026-11-25 a
+  `cs_` head that no preset lists takes the face of the same character's
+  other head first: the ped model table gives each model a character name,
+  and when exactly one model carries the head's name without `cs_`, its
+  head with the same sex, body type and ethnicity code is used (ages may
+  differ between young and middle-aged, not into old or child). Of the 29
+  such `cs_` heads this links one, `cs_lucia`, which now shows Lucia's
+  player face instead of another woman's; the rest have no character
+  model, or only a head of another age, body type or ethnicity. The viewer shows
   **Head skin ◀ n / N ▶** to switch through the faces; exports take the
   **Head skin** number next to Body shape, or `extract --head-skin N`.
-  `model.json` records the choice (`head_skin`: linked or auto, index,
+  `model.json` records the choice (`head_skin`: linked, character (with
+  the donor head as `group`) or auto, index,
   count, texture hashes). The table is built from the `packs` index on
   first use (about 5 s) and kept in `<work>/index/head_skins.json`.
   **Other head maps** (2026-11-24): a face's material data holds colour
