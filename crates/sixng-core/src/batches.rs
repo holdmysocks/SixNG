@@ -14,7 +14,13 @@
 //! Prop batch: +0x60 f32 LOD distance, +0x80 u16 array, +0x90 instances
 //! `ea6b3a96` (64 B): +0x00 3 x vec4 rows of a 3x4 matrix (rotation and
 //! scale in xyz, world translation in w), +0x30 f32, +0x34 u32 tint
-//! (RGBA bytes), +0x38 f32, +0x3C u16, +0x3E u8 x2; +0xA0 bbox.
+//! (RGBA bytes), +0x38 f32, +0x3C u16, +0x3E u8 layer blend, +0x3F u8;
+//! +0xA0 bbox. The 2-layer prop shaders read the record as it is: the
+//! mesh program loads the 3x4 matrix, the tint and the dword at +0x3C, and
+//! passes +0x3E / 255 as the per-instance value b of the layer-2 blend
+//! (see `material::two_layer_blend_text`) and +0x3F / 255 beside it (the
+//! pixel program feeds it into a desaturation of the blended colour).
+//! Mostly 255 / 255; whole batches have 0 / 0, which turns layer 2 off.
 //!
 //! Grass batch: +0x80 bbox (min vec4, max vec4), +0xA0 vec3 scale range,
 //! +0xB8 f32 LOD distance, +0x178 instances `ed86f522` (16 B): +0 u16 x3
@@ -39,8 +45,15 @@ pub struct PropInstance {
     pub s: [f32; 3],
     /// Tint, RGBA bytes (u32 at +0x34).
     pub tint: [u8; 4],
-    /// f32 at +0x30 and +0x38, u16 at +0x3C, u8 x2 at +0x3E (unknown).
-    pub raw: (f32, f32, u16, [u8; 2]),
+    /// u8 at +0x3E: the per-instance value b of the 2-layer prop shaders
+    /// (b = layer_blend / 255; shader code). 255 on most instances.
+    pub layer_blend: u8,
+    /// u8 at +0x3F: read by the same shaders next to `layer_blend` (a
+    /// desaturation amount, not traced further). Equal to it on 96 % of
+    /// instances.
+    pub layer_aux: u8,
+    /// f32 at +0x30 and +0x38, u16 at +0x3C (unknown).
+    pub raw: (f32, f32, u16),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -139,7 +152,9 @@ pub fn prop_batches(r: &Resource, m: &Meta) -> Vec<PropBatch> {
                         q: mat_to_quat(mm),
                         s,
                         tint: t,
-                        raw: (r.f32(q + 0x30), r.f32(q + 0x38), r.u16(q + 0x3C), [r.sys.get(q + 0x3E).copied().unwrap_or(0), r.sys.get(q + 0x3F).copied().unwrap_or(0)]),
+                        layer_blend: r.sys[q + 0x3E],
+                        layer_aux: r.sys[q + 0x3F],
+                        raw: (r.f32(q + 0x30), r.f32(q + 0x38), r.u16(q + 0x3C)),
                     });
                 }
             }
@@ -207,6 +222,8 @@ mod tests {
             put_f32(&mut sys, q + 16 + 12, 200.0);
             put_f32(&mut sys, q + 32 + 8, 2.0);
             put_f32(&mut sys, q + 32 + 12, 30.0);
+            sys[q + 0x3E] = 255 - k as u8;
+            sys[q + 0x3F] = 7;
         }
         let blocks = vec![(0x1111, 0x10, 0x100), (PROP_BATCH, 368, batch), (PROP_INSTANCE, 0x700, 0x800)];
         (Resource { sys, gfx: Vec::new(), gfx_base: 0 }, blocks)
@@ -240,6 +257,7 @@ mod tests {
             assert_eq!(i.p, [100.0 + k as f32, 200.0, 30.0]);
             assert_eq!(i.s, [2.0, 2.0, 2.0]);
             assert!((i.q[3] - 1.0).abs() < 1e-6);
+            assert_eq!((i.layer_blend, i.layer_aux), (255 - k as u8, 7));
         }
     }
 }
