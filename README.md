@@ -1173,6 +1173,17 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   models smaller than three of their texels. Models and map cells cast (opaque and cut-out surfaces);
   skinned, see-through and decal surfaces do not. Only what the camera
   draws casts: a caster just outside the view leaves no shadow.
+- **Clouds** (HDR map): one cumulus layer between the timecycle's
+  `local_atmosphere_cloud_height` and `_height_top` (200 and 1500 m). Its
+  cover is a drifting noise field (drift from
+  `local_atmosphere_cloud_wind_velocity_scale`), thresholded by the
+  weather's cloud cover; the sky and every surface behind the layer are
+  seen through it, and its shadow moves over the ground. A cloud is lit by
+  the sun or moon through the cloud above it (forward-peaked) and by the
+  sky. Our choices: the noise (2.5 km features), the extinction (0.004 per
+  m at full density) and the drift speed (12 m/s at scale 1); the game's
+  cloud map and noise textures are not used. `--no-clouds`, or the
+  **clouds** checkbox, turns them off.
 - **Water** (HDR map): the sea and the game's water meshes are shaded
   from the timecycle's `water_*` values. Wind waves set the normal: the
   peak wavelength comes from `water_ocean_beaufort_scale` and
@@ -1327,7 +1338,7 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   (they showed as floating black boxes); the model viewer still shows them.
 
 Map 3D screenshots: `--tab map3d --center X,Y --height H --yaw DEG --pitch
-DEG [--quality low|medium|high|ultra] [--detail 0-1] [--tod H] [--weather W] [--no-shadows] [--lights]
+DEG [--quality low|medium|high|ultra] [--detail 0-1] [--tod H] [--weather W] [--no-shadows] [--no-clouds] [--lights]
 [--roads] [--no-terrain] [--fog F] [--max-tex PX] [--no-textures]
 [--no-hd-fallback] [--kinds a,b] [--lods a,b] [--ram-cap GB]
 [--no-windows] [--no-decal-bias] [--show-proxies] [--fly X,Y,H,SECONDS]

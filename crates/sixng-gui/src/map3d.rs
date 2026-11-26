@@ -244,6 +244,8 @@ pub struct Map3D {
     pub show_terrain: bool,
     pub show_roads: bool,
     pub show_lights: bool,
+    /// Draw the weather's clouds (and their shadows) in the HDR view.
+    pub clouds: bool,
     pub show_minimap: bool,
     pub show_stats: bool,
     pub decal_bias: bool,
@@ -499,6 +501,7 @@ impl Map3D {
             show_terrain: true,
             show_roads: false,
             show_lights: false,
+            clouds: true,
             show_minimap: true,
             show_stats: true,
             decal_bias: true,
@@ -2623,7 +2626,10 @@ impl Map3D {
             Vec::new()
         };
         // the game's sky and light for the weather and hour (timecycle)
-        let sky = self.game_sky();
+        let mut sky = self.game_sky();
+        if !self.clouds {
+            sky.u.cloud0[0] = 0.0;
+        }
         look.sun_dir = sky.key_dir;
         look.sun_intensity = 1.0;
         look.sun_col = [1.0; 3];
@@ -3106,6 +3112,7 @@ impl Map3D {
         );
         ui.checkbox(&mut self.show_roads, "roads (by speed)");
         ui.checkbox(&mut self.show_lights, "lights (exterior, by hour)");
+        ui.checkbox(&mut self.clouds, "clouds (HDR)").on_hover_text("The weather's cumulus layer and its shadows");
         self.sectors.ui(ui);
         ui.checkbox(&mut self.show_proxies, "show proxies / placeholders").on_hover_text("Debug: also draw interior-shell, shadow, light and VFX proxies, placements without a model and degenerate models");
         ui.checkbox(&mut self.decal_bias, "decal depth bias").on_hover_text("Markings, grime, signage and terrain blend layers drawn after opaque surfaces with a depth bias, by layer order");

@@ -1612,6 +1612,9 @@ impl App {
             if c.has("no-shadows") {
                 m3.no_shadows = true;
             }
+            if c.has("no-clouds") {
+                m3.clouds = false;
+            }
             if let Some(v) = c.f("fog") {
                 m3.look.fog = v;
             }
