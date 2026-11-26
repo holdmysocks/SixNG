@@ -1190,7 +1190,9 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   share of the slope drawn as waves (60 %).
   Where the game's water maps are loaded (the fog atlas's and the water
   height map's whole-map fallbacks, read once and cached in
-  `<work>/cache/water_view_v1.bin`), each place takes its own water: the
+  `<work>/cache/water_view_v1.bin`; this needs current indexes of
+  `levels` and `textures`, and an index from an older version is reported
+  on the console and the water stays as before), each place takes its own water: the
   body colour from the fog atlas's scattering over extinction there, and
   the bed shows through shallow water (the water height map's ground under
   the surface, light down to the bed and back up through the water's
@@ -1198,7 +1200,7 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   their own surface, the sea from 4 m below 0 (where the beaches end).
   Where the water is shallower than 1.6 m it foams: bands that roll in
   towards the shallower water, broken up by noise along the shore.
-  Our choices: the bed's reflectance (sand and mud, 0.30 0.26 0.19), the
+  Our choices: the bed's reflectance (sand and mud, 0.22 0.20 0.15), the
   sea's level, and the foam (depth, bands, 0.75 reflectance). Not yet: the
   shoreline grid's wave placement, refraction and underwater fog.
 - **Map cells** (far placements merged per area): a placement more than
