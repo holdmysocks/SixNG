@@ -51,9 +51,9 @@ fn listed_elsewhere(dict: &str) -> bool {
 /// below of the rows `shown` (each drawn by `row`, which returns whether it
 /// was picked). Returns the picked row. The popup stays open while the
 /// filter is typed in and closes on a pick.
-fn filtered_combo(ui: &mut egui::Ui, id: &str, selected: egui::WidgetText, width: f32, filter: &mut String, note: &str, shown: &[usize], mut row: impl FnMut(&mut egui::Ui, usize) -> bool) -> Option<usize> {
+fn filtered_combo(ui: &mut egui::Ui, id: &str, selected: egui::WidgetText, hover: &str, width: f32, filter: &mut String, note: &str, shown: &[usize], mut row: impl FnMut(&mut egui::Ui, usize) -> bool) -> Option<usize> {
     let mut picked = None;
-    egui::ComboBox::from_id_salt(id).selected_text(selected).width(width).truncate().height(440.0).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show_ui(ui, |ui| {
+    let r = egui::ComboBox::from_id_salt(id).selected_text(selected).width(width).height(440.0).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show_ui(ui, |ui| {
         let r = ui.add(egui::TextEdit::singleline(filter).hint_text("filter: words of the name").desired_width(f32::INFINITY));
         if ui.memory(|m| m.focused().is_none()) {
             r.request_focus();
@@ -71,10 +71,28 @@ fn filtered_combo(ui: &mut egui::Ui, id: &str, selected: egui::WidgetText, width
             ui.close();
         }
     });
+    if !hover.is_empty() {
+        let _ = r.response.on_hover_text(hover);
+    }
     picked
 }
 
+/// The end of a long name, so the button keeps its width (a dictionary
+/// name runs to 90 characters; the panel would grow to fit it).
+fn tail(name: &str, max: usize) -> String {
+    let n = name.chars().count();
+    if n <= max {
+        return name.to_string();
+    }
+    format!("…{}", name.chars().skip(n + 1 - max).collect::<String>())
+}
+
 impl ClipPicker {
+    /// A list is being read (screenshot automation waits for it).
+    pub fn busy(&self) -> bool {
+        self.all_loading || self.clips_loading.is_some()
+    }
+
     /// Take in what the worker threads have read, and start reading what
     /// is missing.
     fn poll(&mut self, ctx: &egui::Context, game: &str, work: &str, dict: &str) {
@@ -132,10 +150,10 @@ impl ClipPicker {
         ui.horizontal(|ui| {
             match &self.all {
                 Some(Ok(_)) => {
-                    let selected: egui::WidgetText = if dict.is_empty() { egui::RichText::new(format!("pick one of {} dictionaries", self.fit.len())).weak().into() } else { dict.clone().into() };
+                    let selected: egui::WidgetText = if dict.is_empty() { egui::RichText::new(format!("pick one of {} dictionaries", self.fit.len())).weak().into() } else { tail(&dict, 40).into() };
                     let note = format!("{} of {} {}", self.shown.len(), self.fit.len(), if self.show_all { "dictionaries" } else { "dictionaries that fit this model" });
                     let (fit_names, shown) = (&self.fit, &self.shown);
-                    if let Some(k) = filtered_combo(ui, "clip_dictionary", selected, 300.0, &mut self.filter, &note, shown, |ui, k| ui.selectable_label(fit_names[k].eq_ignore_ascii_case(&dict), &fit_names[k]).clicked()) {
+                    if let Some(k) = filtered_combo(ui, "clip_dictionary", selected, &dict, 300.0, &mut self.filter, &note, shown, |ui, k| ui.selectable_label(fit_names[k].eq_ignore_ascii_case(&dict), &fit_names[k]).clicked()) {
                         *want = self.fit[k].clone();
                         picked = true;
                     }
@@ -161,9 +179,9 @@ impl ClipPicker {
                 Some(Ok(clips)) => {
                     let current = clips.iter().position(|c| c.name.eq_ignore_ascii_case(&clip));
                     let selected: egui::WidgetText = match current {
-                        Some(k) => clips[k].name.clone().into(),
+                        Some(k) => tail(&clips[k].name, 40).into(),
                         None if clip.is_empty() => egui::RichText::new("default clip (move or idle)").weak().into(),
-                        None => clip.clone().into(),
+                        None => tail(&clip, 40).into(),
                     };
                     // row 0 is the default; clip k is row k + 1
                     let shown: Vec<usize> = std::iter::once(0).chain(clips.iter().enumerate().filter(|(_, c)| anim::name_matches(&c.name, &self.clip_filter)).map(|(k, _)| k + 1)).collect();
@@ -180,7 +198,7 @@ impl ClipPicker {
                         let r = if c.playable { r } else { r.on_hover_text("Its animation data is stored elsewhere and not decoded: it does not play") };
                         r.clicked()
                     };
-                    if let Some(k) = filtered_combo(ui, "clip_in_dictionary", selected, 300.0, &mut self.clip_filter, &note, &shown, row) {
+                    if let Some(k) = filtered_combo(ui, "clip_in_dictionary", selected, &clip, 300.0, &mut self.clip_filter, &note, &shown, row) {
                         *want = if k == 0 { dict.clone() } else { format!("{dict}/{}", clips[k - 1].name) };
                         picked = true;
                     }
@@ -220,5 +238,8 @@ mod tests {
         assert_eq!(split("a@b"), ("a@b", ""));
         assert!(listed_elsewhere("anim.rpf@1a2b"));
         assert!(!listed_elsewhere("gameplay@locomotion@x"));
+        assert_eq!(tail("abc", 5), "abc");
+        assert_eq!(tail("abcdefgh", 5), "…efgh");
+        assert_eq!(tail("abcdefgh", 5).chars().count(), 5);
     }
 }
