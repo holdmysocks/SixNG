@@ -1173,12 +1173,14 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   models smaller than three of their texels. Models and map cells cast (opaque and cut-out surfaces);
   skinned, see-through and decal surfaces do not. Only what the camera
   draws casts: a caster just outside the view leaves no shadow.
-- **Land without a map tile** (HDR map): cells the map bake left out,
-  filled from the game's height map, are no longer flat green. Their
-  ground is made up from height, slope and noise: sand just above the sea,
-  dry grass and scrub inland, darker woods in patches, rock on steep
-  slopes. It's lit with its own normals, since no hill shading is baked
-  in (our choice; no map tile shows these cells).
+- **Terrain ground** (HDR map): the baked map tiles hold only a colour by
+  height with their own hill shading (the bake's terrain layer), and cells
+  the bake left out are filled flat green from the game's height map. The
+  land is drawn as a ground made up from height, slope and noise instead:
+  sand just above the sea, dry grass and scrub inland, darker woods in
+  patches, rock on steep slopes, lit by the scene with the terrain's own
+  normals. The tiles' water paint still marks the sea (our choice; the
+  game's terrain materials are not decoded).
 - **Water** (HDR map): the sea and the game's water meshes are shaded
   from the timecycle's `water_*` values. Wind waves set the normal: the
   peak wavelength comes from `water_ocean_beaufort_scale` and

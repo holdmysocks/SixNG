@@ -137,9 +137,6 @@ fn sun_shadow(p: vec3<f32>) -> f32 {
     return 1.0;
 }
 
-// The colour of land filled from the height map (world3d FILLED_LAND), linear.
-const TILE_FILLED: vec3<f32> = vec3(0.155, 0.262, 0.102);
-
 fn ground_hash(p: vec2<f32>) -> f32 {
     let q = fract(p * vec2(0.1031, 0.1030));
     let d = dot(q, q.yx + 33.33);
@@ -156,7 +153,7 @@ fn ground_noise(p: vec2<f32>) -> f32 {
 
 // Reflectance of made-up ground at p (world, true height) with normal n:
 // sand near the sea, dry grass and scrub inland, darker woods in patches,
-// rock on steep slopes (our choice: no map tile shows these cells).
+// rock on steep slopes (our choice: the map tiles hold no ground types).
 fn filled_ground(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     let big = ground_noise(p.xz / 380.0);
     let mid = ground_noise(p.xz / 60.0 + 7.3);
@@ -174,8 +171,6 @@ fn filled_ground(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     return c * (0.8 + 0.4 * fine);
 }
 
-// share of a baked map tile's colour taken as the ground's reflectance
-const TILE_ALBEDO: f32 = 0.6;
 // how far the map's terrain is drawn under its real height (world3d SINK, m)
 const TILE_SINK: f32 = 1.5;
 
@@ -1580,14 +1575,13 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             // just under it don't blotch it at a low sun
             let lsh = normalize(F.sun_dir.xyz);
             let tsh = sun_shadow(i.world + vec3(0.0, TILE_SINK, 0.0) + lsh * 0.5);
-            col = albedo * TILE_ALBEDO * (sun_e_shadowed(i.world, tsh) * (0.5 + 0.5 * ndl) / 3.14159 + amb_d);
-            // land filled from the game's height map where no map tile was
-            // baked (flat TILE_FILLED): a ground made up from height, slope
-            // and noise, lit without the tiles' baked hill shading
-            if ((M.flags.x & 1u) == 0u && length(M.base.rgb - TILE_FILLED) < 0.01) {
-                let g = filled_ground(i.world + vec3(0.0, TILE_SINK, 0.0), n);
-                col = g * (sun_e_shadowed(i.world, tsh) * max(ndl, 0.0) / 3.14159 + amb_d);
-            }
+            // the baked tiles hold only a colour by height and their own hill
+            // shading (mapbake's terrain layer), and filled cells a flat
+            // green: the land is drawn as a ground made up from height, slope
+            // and noise instead, lit by the scene (the tiles' paint still
+            // marks the sea below)
+            let g = filled_ground(i.world + vec3(0.0, TILE_SINK, 0.0), n);
+            col = g * (sun_e_shadowed(i.world, tsh) * max(ndl, 0.0) / 3.14159 + amb_d);
             // the tiles' painted water (the map's water and no-data colour)
             // is shaded as the game's water on sea cells (no height, or deeper
             // than the beaches: vertex alpha 0, blending over a shore cell); on cells with a
