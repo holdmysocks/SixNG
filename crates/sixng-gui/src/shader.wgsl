@@ -1347,8 +1347,11 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
                 let gw = max(textureLoad(t_em, vec2(47, row), 0).a, 1.0 / 255.0);
                 let pu = clamp((clamp(lr + lg + lb, 0.0, 1.0) - gs) / gw, 0.004, 0.996);
                 p_col = textureSampleLevel(t_em, samp, vec2(pu, (id + 1025.5) / RAMP_ROWS), 0.0).rgb;
-                p_rough = textureLoad(t_em, vec2(32, row), 0).a;
-                p_metal = textureLoad(t_em, vec2(33, row), 0).a;
+                // its metalness and roughness, low and high (columns 32,
+                // 33 and 48, 49), blended by the material map as the
+                // first layer's are
+                p_metal = mix(textureLoad(t_em, vec2(32, row), 0).a, textureLoad(t_em, vec2(33, row), 0).a, mat_blend.x);
+                p_rough = mix(textureLoad(t_em, vec2(48, row), 0).a, textureLoad(t_em, vec2(49, row), 0).a, mat_blend.y);
             } else {
                 let t = wear_threshold(wear_amt);
                 k = smoothstep(t, t + 0.08, m.g);
