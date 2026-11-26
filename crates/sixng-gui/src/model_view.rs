@@ -5382,7 +5382,7 @@ fn load_parts(
             // two halves: the strip round the waist that both carry. Each half hides it there, so
             // the upper half's copy goes when the lower half is worn and the two do not fight.
             let masks2: Vec<&str> = fx.iter().filter(|(o, _)| *o != off && parts.iter().any(|e| e.off == **o)).flat_map(|(_, f)| f.hides.iter()).filter(|h| h.0 == SKIN_LAYER2).map(|h| h.1.as_str()).collect();
-            let hide2: Vec<bool> = (0..256u32).map(|n| n != 0 && masks2.iter().any(|k| sixng_core::wardrobe::mask_has(k, n))).collect();
+            let hide2: Vec<bool> = (0..256u32).map(|n| n != 0 && is_skin && masks2.iter().any(|k| sixng_core::wardrobe::mask_has(k, n))).collect();
             for i in range.clone() {
                 let Some(me) = m.meshes.get_mut(i) else { continue };
                 let before = me.indices.len() / 3;
@@ -6910,14 +6910,8 @@ fn load_query_sel(
                 // as its `_cull_00` twin: the same garment cut a little closer to the body, whose vertices
                 // carry the regions the hide masks name (the `_full` meshes carry none).
                 let swap: HashMap<String, String> = if std::env::var("SIXNG_NO_CULL").is_err() {
-                    let ps = &look.outfits[k].parts;
-                    ps.iter()
-                        .filter(|p| p.drawable.ends_with("_full") && p.layer.as_deref().is_some_and(|l| ps.iter().any(|q| !std::ptr::eq(q, *p) && q.hides.iter().any(|h| h.0 == l && h.1.chars().any(|c| c != '0')))))
-                        .filter_map(|p| {
-                            let twin = format!("{}_cull_00", p.drawable.trim_end_matches("_full"));
-                            ix.entries.iter().any(|e| e.rtype.as_deref() == Some("dr") && e.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(&twin))).then(|| (p.drawable.clone(), twin))
-                        })
-                        .collect()
+                    let names: std::collections::HashSet<String> = ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| e.name.as_ref().map(|n| n.to_ascii_lowercase())).collect();
+                    sixng_core::pedlook::cull_twins(&look.outfits[k].parts, |n| names.contains(n))
                 } else {
                     HashMap::new()
                 };

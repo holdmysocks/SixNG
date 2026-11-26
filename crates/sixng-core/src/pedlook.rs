@@ -1089,11 +1089,15 @@ pub fn cull_twins(parts: &[LookPart], exists: impl Fn(&str) -> bool) -> HashMap<
 }
 
 /// The hide masks over part `i` of an outfit: the masks the other parts
-/// give the part's own layer, and those they give the second skin layer.
+/// give the part's own layer, and, for the two body-skin halves, those they
+/// give the second skin layer (the second region byte is that layer only on
+/// body skin: a shoe's second byte is something else, and a waist mask would
+/// take the shoe away).
 pub fn hidden_masks(parts: &[LookPart], i: usize) -> (Vec<String>, Vec<String>) {
     let Some(layer) = parts[i].layer.as_deref() else { return Default::default() };
     let of = |l: &str| parts.iter().enumerate().filter(|(j, _)| *j != i).flat_map(|(_, q)| q.hides.iter()).filter(|h| h.0 == l).map(|h| h.1.clone()).collect::<Vec<_>>();
-    (of(layer), of(SKIN_LAYER2))
+    let body = matches!(parts[i].slot.as_str(), "body upper" | "body lower");
+    (of(layer), if body { of(SKIN_LAYER2) } else { Vec::new() })
 }
 
 /// Outfit slot of a ped drawable name.
@@ -1707,7 +1711,11 @@ mod tests {
         assert!(cull_twins(&parts, |_| false).is_empty());
         let (own, waist) = hidden_masks(&parts, 0);
         assert_eq!(own, ["0a00", "0000"]);
+        // the waist layer is a body-skin layer only
         assert!(waist.is_empty());
+        let mut body = parts.clone();
+        body[0].slot = "body upper".into();
+        assert_eq!(hidden_masks(&body, 0).1, ["0001"]);
         assert!(hidden_masks(&parts, 1).0.is_empty());
     }
 
