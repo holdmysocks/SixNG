@@ -3820,8 +3820,12 @@ impl Map3D {
 
     fn frames_ok(&self) -> bool {
         // under memory pressure not every wanted model will load: an empty
-        // queue is as good as it gets
-        self.sectors.idle()
+        // queue is as good as it gets. The map data and the terrain's
+        // height pyramid must be in first: before them nothing is queued,
+        // and an empty queue would pass for a loaded view.
+        self.data.is_some()
+            && (!self.show_terrain || self.world.ready())
+            && self.sectors.idle()
             && (!self.show_terrain || self.world.idle())
             && (self.pressure > 0
                 || self.keep.iter().all(|model| {
