@@ -892,6 +892,9 @@ pub struct LookPart {
     /// of `hairtone`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hair_preset: Option<String>,
+    /// Painted hair layer set of a strand item (tag `023e5a2f`, hex): the key of the head skin's hair layers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_set: Option<String>,
     /// Base colour (sRGB) per sub-material from the item's garment preset
     /// (`matlib`); empty when the item names none or it is not in the
     /// library.
@@ -1456,7 +1459,7 @@ fn own_look(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Option<Look> {
     let names: HashSet<String> = ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| e.name.as_ref().map(|n| n.to_ascii_lowercase())).collect();
     let exists = |n: &str| names.contains(n);
     let mut parts: Vec<LookPart> = Vec::new();
-    let plain = |slot: String, drawable: String, found_by: &'static str| LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: String::new(), guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by, category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, state_guids: vec![] };
+    let plain = |slot: String, drawable: String, found_by: &'static str| LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: String::new(), guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, layer_set: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by, category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, state_guids: vec![] };
     for o in opts.iter().filter(|o| o.default || is_strand_word(item_word(&o.name))) {
         let slot = slot_of(&o.name);
         // one hair, one beard …: the first of each
@@ -1612,10 +1615,10 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
                     continue;
                 }
                 let slot_is_hair = slot == "hair";
-                parts.push(LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: p.item.clone(), guid: p.guid.clone(), tint: p.tint.clone(), colour: p.colour, colour_tag: p.colour_tag, hair_preset: p.hair_preset.clone(), preset: p.preset.clone(), preset_colours: p.preset.as_deref().and_then(|h| presets?.colours(h)).map(|v| v.into_iter().map(|c| c.map(|c| [c[0], c[1], c[2]])).collect()).unwrap_or_default(), tex_remap: p.tex_remap.clone(), skins: p.skins.clone(), found_by, category: p.category.clone(), layer: p.layer.clone(), hides: p.hides.clone(), hides_sub: p.hides_sub.clone(), hair_state: None, state_guids: if slot_is_hair { p.state_guids.clone() } else { vec![] } });
+                parts.push(LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: p.item.clone(), guid: p.guid.clone(), tint: p.tint.clone(), colour: p.colour, colour_tag: p.colour_tag, hair_preset: p.hair_preset.clone(), layer_set: p.layer_set.clone(), preset: p.preset.clone(), preset_colours: p.preset.as_deref().and_then(|h| presets?.colours(h)).map(|v| v.into_iter().map(|c| c.map(|c| [c[0], c[1], c[2]])).collect()).unwrap_or_default(), tex_remap: p.tex_remap.clone(), skins: p.skins.clone(), found_by, category: p.category.clone(), layer: p.layer.clone(), hides: p.hides.clone(), hides_sub: p.hides_sub.clone(), hair_state: None, state_guids: if slot_is_hair { p.state_guids.clone() } else { vec![] } });
             }
         }
-        let plain = |slot: &str, drawable: String, found_by: &'static str| LookPart { slot: slot.into(), drawable, item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by, category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, state_guids: vec![] };
+        let plain = |slot: &str, drawable: String, found_by: &'static str| LookPart { slot: slot.into(), drawable, item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, layer_set: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by, category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, state_guids: vec![] };
         // another variation of the wardrobe: only what it holds itself
         if !listed {
             let main: Vec<String> = parts.iter().filter(|p| ["full", "outer", "top", "bottom"].contains(&p.slot.as_str())).map(|p| pretty(item_word(&p.drawable))).collect();
@@ -1699,7 +1702,7 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
 mod tests {
     #[test]
     fn cull_twins_and_masks_follow_the_hide_masks() {
-        let part = |d: &str, layer: &str, hides: Vec<(&str, &str)>| LookPart { slot: "top".into(), drawable: d.into(), item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by: "x", category: None, layer: Some(layer.into()), hides: hides.into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(), hides_sub: vec![], hair_state: None, state_guids: vec![] };
+        let part = |d: &str, layer: &str, hides: Vec<(&str, &str)>| LookPart { slot: "top".into(), drawable: d.into(), item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by: "x", category: None, layer: Some(layer.into()), hides: hides.into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(), hides_sub: vec![], hair_state: None, state_guids: vec![], layer_set: None };
         let parts = vec![
             part("tshirt_mr1_000_full", "15793985", vec![]),
             part("shirt_mr1_000_full", "752a6eba", vec![("15793985", "0a00"), ("275822c4", "0001")]),
@@ -1807,7 +1810,7 @@ mod tests {
 
     #[test]
     fn choose_prefers_name_then_fit() {
-        let mut p = Part { item: "1".into(), category: None, name: None, drawable: None, tex_remap: vec![], tags: Default::default(), tint: None, named: None, guid: None, colour: None, colour_tag: None, hair_preset: None, strand_colour: None, preset: None, state: String::new(), skins: vec![], candidates: Default::default(), layer: None, hides: vec![], hides_sub: vec![], state_guids: vec![] };
+        let mut p = Part { item: "1".into(), category: None, name: None, drawable: None, tex_remap: vec![], tags: Default::default(), tint: None, named: None, guid: None, colour: None, colour_tag: None, hair_preset: None, layer_set: None, strand_colour: None, preset: None, state: String::new(), skins: vec![], candidates: Default::default(), layer: None, hides: vec![], hides_sub: vec![], state_guids: vec![] };
         p.candidates.insert("hand_fc1_000_full".into(), 3);
         p.candidates.insert("hand_fr1_000_full".into(), 3);
         p.candidates.insert("hand_fr1_000_nude_cull".into(), 3);

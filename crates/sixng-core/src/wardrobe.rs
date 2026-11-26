@@ -72,6 +72,11 @@ pub struct Part {
     /// key of `hairtone` for a hair, brow, lash or beard item.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hair_preset: Option<String>,
+    /// Painted hair layer set (tag `023e5a2f`, hex), first along the chain: the key of the head skin's hair
+    /// layers (`hairtone::Table::under_layers`). Often the hash of the drawable name without `_full`, but an
+    /// item can inherit another one from its parent (one story character's default ponytail does).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_set: Option<String>,
     /// A colour item (tag `b28c2b3f`): the strand colour set it gives every strand piece of one item category
     /// of the outfit (category hash, colour set name hash; hex). A story character's outfit carries one per
     /// category (hair, brows, lashes); it stands before the colour the hair item itself names. Read from the
@@ -395,6 +400,7 @@ pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers,
             let colour_tag = chain.iter().find_map(|c| tags(c, 0xe606_17ae).into_iter().find_map(crate::pedtint::colour_word)).map(|x| x.0);
             let colour = chain.iter().filter_map(|c| state(c)).find_map(|s| s[f(0x46d2_6d93)].as_u64().filter(|&x| x != 0)).map(|x| (x as u32).to_be_bytes());
             let hair_preset = chain.iter().find_map(|c| tags(c, crate::hairtone::TAG).into_iter().next()).map(|x| format!("{x:08x}"));
+            let layer_set = chain.iter().find_map(|c| tags(c, 0x023e_5a2f).into_iter().next()).map(|x| format!("{x:08x}"));
             let mut tex_remap = Vec::new();
             if let Some(mats) = drawable.as_deref().and_then(|d| model_mats.get(d)) {
                 for (slot, new) in set_textures(&chain) {
@@ -436,7 +442,7 @@ pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers,
                     }
                 }
             }
-            parts.push(Part { layer, hides, hides_sub, state_guids, item: format!("{:08x}", it[f(0x6512_1749)].as_u64().unwrap_or(0)), category, name: name.map(|p| p.0.clone()), drawable, tex_remap, tags: tg, tint, named, guid, colour, colour_tag, hair_preset, strand_colour, preset, state: format!("{want_state:08x}"), skins, candidates: counts });
+            parts.push(Part { layer, hides, hides_sub, state_guids, item: format!("{:08x}", it[f(0x6512_1749)].as_u64().unwrap_or(0)), category, name: name.map(|p| p.0.clone()), drawable, tex_remap, tags: tg, tint, named, guid, colour, colour_tag, hair_preset, layer_set, strand_colour, preset, state: format!("{want_state:08x}"), skins, candidates: counts });
         }
         let mut tags = BTreeMap::new();
         tag_words(&v, pre, &mut tags);
