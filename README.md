@@ -1390,7 +1390,11 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   view settings (every kind and LOD level, no proxies);
   `SIXNG_MAP_NO_CELLS=1` turns them off, and `SIXNG_MAP_CELL_LEVELS=2,3`
   merges only those levels (0 HD to 5 SLOD4); the rest draw per placement,
-  where they can be picked.
+  where they can be picked. `SIXNG_MAP_CELL_ONLY=<text>` merges only models
+  whose name contains the text, `SIXNG_MAP_CELL_LOG=<text>` prints each
+  mesh of matching models as it is merged, and
+  `SIXNG_MAP_CELL_NO_SIMPLIFY=1` keeps every vertex. With any of these
+  three set, cells are built fresh and not saved.
 - **Texture streaming**: a model first loads with 64 px base-colour
   textures only (normal and data maps come with the sharper reload), read
   from block-compressed 64 px copies in `<work>/gui_cache_v4/bc64` (a few

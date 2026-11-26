@@ -271,6 +271,11 @@ fn build_index(data: &MapData, cs: &[u32], cl: &[u32], d: &Detail, tag: String) 
         if levels.as_ref().is_some_and(|l| !l.contains(&e.lod.min(5))) {
             continue;
         }
+        if let Some(only) = &cells::debug().only {
+            if !data.name(e.model).contains(only.as_str()) {
+                continue;
+            }
+        }
         let key = CellKey::of(e.lod.min(5), e.pos[0], e.pos[1]);
         let c = by_cell.entry(key).or_insert((Vec::new(), f32::MAX, 0.0));
         c.0.push(i as u32);
@@ -492,7 +497,9 @@ impl Cells {
                             q = sh.cv.wait(q).unwrap();
                         }
                     };
-                    let c = match cells::read(&job.path) {
+                    // debug runs build every cell fresh and keep none
+                    let dbg = cells::debug().any();
+                    let c = match (!dbg).then(|| cells::read(&job.path)).flatten() {
                         Some(c) => {
                             sh.read.fetch_add(1, Ordering::Relaxed);
                             Some(c)
@@ -524,7 +531,7 @@ impl Cells {
                             sh.build_us
                                 .fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
                             sh.built.fetch_add(1, Ordering::Relaxed);
-                            if cells::CELL_BYTES.load(Ordering::Relaxed) < cells::CELL_CAP {
+                            if !dbg && cells::CELL_BYTES.load(Ordering::Relaxed) < cells::CELL_CAP {
                                 if cells::write(&job.path, &c).is_ok() {
                                     sh.present
                                         .lock()

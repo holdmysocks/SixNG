@@ -287,6 +287,38 @@ fn simplify(verts: &mut Vec<CellV>, idx: &mut Vec<u32>, grid: f32) {
     *idx = ni;
 }
 
+/// Debug switches for map cells (read once from the environment). Any of
+/// them builds every cell fresh and writes none to disk.
+/// - `SIXNG_MAP_CELL_ONLY=<text>`: only models whose name contains it go
+///   into cells; the rest draw per placement.
+/// - `SIXNG_MAP_CELL_LOG=<text>`: print each mesh of matching models as a
+///   cell merges it (material, alpha, vertices before and after
+///   simplification, bounds).
+/// - `SIXNG_MAP_CELL_NO_SIMPLIFY=1`: keep every vertex.
+pub struct CellDebug {
+    pub only: Option<String>,
+    pub log: Option<String>,
+    pub no_simplify: bool,
+}
+
+impl CellDebug {
+    pub fn any(&self) -> bool {
+        self.only.is_some() || self.log.is_some() || self.no_simplify
+    }
+}
+
+pub fn debug() -> &'static CellDebug {
+    static D: std::sync::OnceLock<CellDebug> = std::sync::OnceLock::new();
+    D.get_or_init(|| {
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        CellDebug {
+            only: var("SIXNG_MAP_CELL_ONLY"),
+            log: var("SIXNG_MAP_CELL_LOG"),
+            no_simplify: var("SIXNG_MAP_CELL_NO_SIMPLIFY").is_some(),
+        }
+    })
+}
+
 /// Merge the placements of a cell. `load` gives a model (64 px textures)
 /// at a drawable LOD, or None when it cannot be loaded; `max_layers` is the
 /// device's array layer limit.
@@ -430,7 +462,43 @@ pub fn build(
                 });
             }
             let mut mi = me.indices.clone();
-            simplify(&mut mv, &mut mi, e.grid);
+            let (nv0, nt0) = (mv.len(), mi.len() / 3);
+            if !debug().no_simplify {
+                simplify(&mut mv, &mut mi, e.grid);
+            }
+            if debug().log.as_ref().is_some_and(|t| e.model.contains(t.as_str())) {
+                let mut bb = [[f32::MAX; 3], [f32::MIN; 3]];
+                for v in &mv {
+                    for a in 0..3 {
+                        bb[0][a] = bb[0][a].min(v.pos[a] + origin[a]);
+                        bb[1][a] = bb[1][a].max(v.pos[a] + origin[a]);
+                    }
+                }
+                let bad = mi.iter().filter(|&&i| i as usize >= mv.len()).count();
+                eprintln!(
+                    "[cells] {:?} {} lod {} mesh mat {:?} alpha {} class {} base {:?} pass {} verts {}->{} tris {}->{} grid {:.2} bad idx {} pos {:?} yaw {:.2} range {:.0}-{:.0} fb {:?} world bounds (gl) {:?}",
+                    key,
+                    e.model,
+                    drawable_lod(key.level),
+                    mat.map(|m| m.name.as_str()),
+                    amode,
+                    cls,
+                    factor,
+                    pass,
+                    nv0,
+                    mv.len(),
+                    nt0,
+                    mi.len() / 3,
+                    e.grid,
+                    bad,
+                    e.pos,
+                    e.yaw,
+                    e.lo,
+                    e.hi,
+                    e.fb,
+                    bb
+                );
+            }
             part.0.extend(mv);
             part.1.extend(mi.iter().map(|i| i + base));
         }
