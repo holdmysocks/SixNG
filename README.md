@@ -368,11 +368,18 @@ Size:
 per piece) and `--hair-points N` (points per strand, resampled along the
 strand). Jason's default look (`player_story000_01 --look 0`): 11 pieces,
 146,441 strands, 23 MB, about 15 s. `sixng grooms --full` writes the same
-attributes per groom.
+attributes per groom; with `--head <model.glb>` (a model `outfit` wrote, or
+a head drawable exported on its own) each groom also names its head UV
+set, and so does the viewer's "Export shown grooms" button, matched
+against the shown character's head. The set cannot be told from the kind
+of piece: on five characters most scalp pieces are in set 3 and the face
+pieces in set 2, but some scalp pieces (ponytails, long hair) are in set 0,
+and a few match no set of the head they are shown on.
 
 `scripts/blender_hair_curves.py` turns the file into hair curves objects
-(`blender --python scripts/blender_hair_curves.py -- <hair.glb> --model
-<model.glb> [--save <file.blend>]`): one per piece, with `radius`, `clump`,
+(`blender --python scripts/blender_hair_curves.py -- <hair.glb> [<hair.glb>
+…] --model <model.glb> [--save <file.blend>]`; several files for the
+per-groom files of `grooms --full`): one per piece, with `radius`, `clump`,
 `variant` and `root_uv`. With `--model` each object is parented to the head
 bone of the armature and gets the head mesh as its surface: its surface
 UV map is the head's UV set `head_uv_set` (the importer names `TEXCOORD_n`
