@@ -1952,13 +1952,16 @@ fn vs_glow(g: GlowIn, @builtin(vertex_index) vi: u32) -> GlowOut {
     let b = F.inv_view_proj * vec4(0.0, 2.0 / h, 1.0, 1.0);
     let pix = length(normalize(b.xyz / b.w - F.cam_pos.xyz) - normalize(a.xyz / a.w - F.cam_pos.xyz));
     // sigma of the Gaussian in pixels; the sprite reaches 3 sigma
-    let sig_px = max(GLOW_R / d / max(pix, 1e-6), 0.6);
+    // at least a pixel wide: a narrower core would clip to white in the
+    // tone map and lose the lamp's colour
+    let sig_px = max(GLOW_R / d / max(pix, 1e-6), 1.0);
     let half_px = 3.0 * sig_px;
     let w = max(F.frame.y, 1.0);
     o.clip = c + vec4(corner.x * half_px * 2.0 / w, corner.y * half_px * 2.0 / h, 0.0, 0.0) * c.w;
     o.uv = corner * 3.0;
     // radiance at the centre: the irradiance at the eye over the Gaussian's solid angle
-    let e_eye = g.col.rgb * (LIGHT_K * GLOW_K) * g.pos.w / (d * d);
+    // floodlights capped, so one does not outshine a district
+    let e_eye = g.col.rgb * (LIGHT_K * GLOW_K) * min(g.pos.w, 2500.0) / (d * d);
     let sig_rad = sig_px * pix;
     o.rad = e_eye / (2.0 * PI * sig_rad * sig_rad);
     o.world = g.pos.xyz;
