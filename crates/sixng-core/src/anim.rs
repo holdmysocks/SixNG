@@ -901,16 +901,21 @@ pub fn is_creature_dictionary(name: &str) -> bool {
 
 /// The words an animal model's species may go by in clip dictionary names.
 /// `crm_cat_feral_m_00` gives `feral_cat`, `cat_feral` and `cat`; some
-/// dictionaries use two words (`bengal_tiger`). `model` may be a path or
-/// carry `#` options; its last part is used.
+/// dictionaries use two words (`bengal_tiger`). `model` may be a path, carry
+/// `#` options, or be a viewer source line (`packs.rpf@45904010
+/// crm_deer_whitetailed_m_00 (+6 parts)`): the first word whose last part is
+/// a model name is used.
 pub fn species_words(model: &str) -> Vec<String> {
-    let root = model.split_whitespace().next().unwrap_or("").rsplit([':', '#', '/', '\\']).find(|s| !s.is_empty()).unwrap_or("").to_ascii_lowercase();
-    let t: Vec<&str> = root.split('_').collect();
-    match t.as_slice() {
-        [_, a, b, ..] => vec![format!("{b}_{a}"), format!("{a}_{b}"), a.to_string()],
-        [_, a] => vec![a.to_string()],
-        _ => vec![],
+    for word in model.split_whitespace() {
+        let root = word.rsplit([':', '#', '/', '\\']).find(|s| !s.is_empty()).unwrap_or("").to_ascii_lowercase();
+        let t: Vec<&str> = root.split('_').collect();
+        match t.as_slice() {
+            [_, a, b, ..] => return vec![format!("{b}_{a}"), format!("{a}_{b}"), a.to_string()],
+            [_, a] => return vec![a.to_string()],
+            _ => {}
+        }
     }
+    Vec::new()
 }
 
 /// Which clip dictionaries fit a model.
@@ -1013,6 +1018,8 @@ mod tests {
         assert_eq!(species_words("crm_cat_feral_m_00"), vec!["feral_cat", "cat_feral", "cat"]);
         assert_eq!(species_words("x/y:CRB_Dog"), vec!["dog"]);
         assert!(species_words("plain").is_empty());
+        // the viewer's source line: the entry id first, then the model name
+        assert_eq!(species_words("packs.rpf@45904010 crm_deer_whitetailed_m_00 (+6 parts)"), vec!["whitetailed_deer", "deer_whitetailed", "deer"]);
     }
 
     #[test]

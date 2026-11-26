@@ -292,6 +292,10 @@ pub struct LookInfo {
     pub current: usize,
     /// Body-shape preset of the outfit shown.
     pub body_shape: Option<String>,
+    /// That preset's control values (`None` when it could not be read).
+    pub body_preset: Option<BodyShape>,
+    /// The body shape the outfit was loaded with.
+    pub body_used: BodyShape,
     /// Strand-hair assets of the outfit shown: (slot, placeholder name, asset GUID).
     pub strands: Vec<(String, String, String)>,
     /// Their stored tints by slot: palette name hash and row of tint 0.
@@ -615,10 +619,49 @@ type Pending = Arc<Mutex<Option<(u64, Result<Loaded, String>)>>>;
 
 /// Face variant the viewer exports ped heads with (`ExportOptions::head_skin`).
 pub static HEAD_SKIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// Body shape the viewer exports outfit parts with: (weight -1..1, muscle
-/// 0..1), the game's body-shape rig on the shared skeleton
-/// (`ExportOptions::body_shape`, `allweight` / `allmuscle`).
-pub static BODY_SHAPE: Mutex<(f32, f32)> = Mutex::new((0.0, 0.0));
+/// Body shape: one value per control of `bodyshape::CONTROLS`, in its order
+/// (12 `gcweight*` -1..1, 12 `gcmuscle*` 0..1, `gcbutt` 0..1, `gcbreasts`
+/// -1..1), for the game's body-shape rig on the shared skeleton
+/// (`ExportOptions::body_shape`).
+pub type BodyShape = [f32; 26];
+/// The neutral body shape (every control 0).
+pub const NEUTRAL_BODY: BodyShape = [0.0; 26];
+/// Index of `gcbutt` and `gcbreasts` in a `BodyShape`.
+const BODY_BUTT: usize = 24;
+const BODY_BREASTS: usize = 25;
+/// Body shape the viewer exports outfit parts with.
+pub static BODY_SHAPE: Mutex<BodyShape> = Mutex::new(NEUTRAL_BODY);
+/// Set by `--body`: outfits keep that shape instead of their preset.
+static BODY_PINNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The outfit whose preset was applied last (query up to the look), so a
+/// reload of the same outfit keeps the sliders.
+static BODY_PRESET_FOR: Mutex<String> = Mutex::new(String::new());
+
+/// The `--body-shape` spec of a shape (non-zero controls only).
+pub fn body_spec(s: &BodyShape) -> String {
+    sixng_core::bodyshape::CONTROLS.iter().zip(s).filter(|(_, v)| **v != 0.0).map(|(c, v)| format!("{}={v}", c.0)).collect::<Vec<_>>().join(",")
+}
+
+/// A shape from control values (`bodyshape::parse_spec`, `preset_controls`).
+pub fn body_from(controls: &[(String, f32)]) -> BodyShape {
+    let mut s = NEUTRAL_BODY;
+    for (n, v) in controls {
+        // Controls past the slider set (CONTROLS may grow) have no slot here.
+        if let Some(slot) = sixng_core::bodyshape::CONTROLS.iter().position(|c| c.0 == n).and_then(|k| s.get_mut(k)) {
+            *slot = *v;
+        }
+    }
+    s
+}
+
+/// The game's shape for an outfit's body-shape preset tag (neutral when the
+/// outfit has none; `None` when the preset cannot be read).
+fn preset_shape(game: &Path, tag: Option<&str>) -> Option<BodyShape> {
+    match tag {
+        None => Some(NEUTRAL_BODY),
+        Some(t) => sixng_core::bodyshape::preset_controls(game, t).ok().map(|c| body_from(&c)),
+    }
+}
 /// Last head exported for the viewer: (variant, variant count, source).
 static HEAD_SKIN_SEEN: Mutex<Option<(usize, usize, String)>> = Mutex::new(None);
 
@@ -824,7 +867,7 @@ pub struct ModelView {
     /// Pose of the character shown (degrees), see `PedPose`.
     pub ped_pose: PedPose,
     /// Body shape of the character shown (`BODY_SHAPE` when it was loaded).
-    body_shape_shown: (f32, f32),
+    body_shape_shown: BodyShape,
     pub wheels_on: bool,
     pub wheel_rim: String,
     /// Rim colour (linear). The game sets it per vehicle at runtime and no
@@ -1152,7 +1195,7 @@ impl ModelView {
             ped_clip: PedClip::default(),
             clip_picker: Default::default(),
             ped_pose: PedPose::default(),
-            body_shape_shown: (0.0, 0.0),
+            body_shape_shown: NEUTRAL_BODY,
             wheels_on: true,
             wheel_rim: "rim_muscle_001_hi".into(),
             rim_colour: RIM_ALLOY,
@@ -1767,7 +1810,7 @@ impl ModelView {
 
     /// The loaded model is complete (a vehicle has its data, parts and wheels).
     fn idle_for_model(&self) -> bool {
-        if self.parts_request.is_some() || self.fit_parts_once.is_some() || self.random_parts_once || !self.hair.settled() || self.auto.then.is_some() || self.auto.find_hair || self.auto.export_hair || self.hair.fitting || self.ped_clip.loading || (!self.ped_clip.want.trim().is_empty() && self.ped_clip.anim.is_none() && self.ped_clip.status.starts_with("loading")) {
+        if self.parts_request.is_some() || self.fit_parts_once.is_some() || self.random_parts_once || !self.hair.settled() || self.auto.then.is_some() || self.auto.find_hair || self.auto.export_hair || self.hair.fitting || self.ped_clip.loading || self.clip_picker.busy() || (!self.ped_clip.want.trim().is_empty() && self.ped_clip.anim.is_none() && self.ped_clip.status.starts_with("loading")) {
             return false;
         }
         let Some(l) = self
@@ -1911,8 +1954,10 @@ impl ModelView {
         }
     }
 
-    /// Body shape for characters (weight, muscle), before a model is opened.
-    pub fn set_body_shape(&mut self, shape: (f32, f32)) {
+    /// Body shape for characters, before a model is opened (`--body`:
+    /// outfits keep it instead of their own preset).
+    pub fn set_body_shape(&mut self, shape: BodyShape) {
+        BODY_PINNED.store(true, std::sync::atomic::Ordering::Relaxed);
         *BODY_SHAPE.lock().unwrap() = shape;
         self.body_shape_shown = shape;
     }
@@ -2021,20 +2066,56 @@ impl ModelView {
         let mut shape = *BODY_SHAPE.lock().unwrap();
         let before = shape;
         let mut released = false;
+        // the overall sliders show the mean and set every region
+        let mean = |s: &[f32]| s.iter().sum::<f32>() / s.len() as f32;
+        let (mut weight, mut muscle) = (mean(&shape[..12]), mean(&shape[12..24]));
+        let (w0, m0) = (weight, muscle);
         ui.horizontal(|ui| {
             ui.label("Body");
-            released |= ui.add(egui::Slider::new(&mut shape.0, -1.0..=1.0).text("weight")).on_hover_text("The game's body-shape rig on the shared skeleton (all weight controls). Body and clothes follow the same bones, so the clothes change with the body.").drag_stopped();
+            released |= ui.add(egui::Slider::new(&mut weight, -1.0..=1.0).text("weight")).on_hover_text("The game's body-shape rig on the shared skeleton (sets all 12 weight regions). Body and clothes follow the same bones, so the clothes change with the body.").drag_stopped();
         });
         ui.horizontal(|ui| {
             ui.label("        ");
-            released |= ui.add(egui::Slider::new(&mut shape.1, 0.0..=1.0).text("muscle")).drag_stopped();
-            if ui.button("Reset").clicked() {
-                shape = (0.0, 0.0);
+            released |= ui.add(egui::Slider::new(&mut muscle, 0.0..=1.0).text("muscle")).on_hover_text("Sets all 12 muscle regions.").drag_stopped();
+        });
+        if weight != w0 {
+            shape[..12].fill(weight);
+        }
+        if muscle != m0 {
+            shape[12..24].fill(muscle);
+        }
+        ui.horizontal(|ui| {
+            ui.label("        ");
+            released |= ui.add(egui::Slider::new(&mut shape[BODY_BREASTS], -1.0..=1.0).text("breasts")).on_hover_text("The game's gcbreasts control: -1 smaller, 1 larger (breast and pectoral bones).").drag_stopped();
+        });
+        ui.horizontal(|ui| {
+            ui.label("        ");
+            released |= ui.add(egui::Slider::new(&mut shape[BODY_BUTT], 0.0..=1.0).text("butt")).on_hover_text("The game's gcbutt control: 0 neutral, 1 fuller.").drag_stopped();
+        });
+        egui::CollapsingHeader::new("Regions").id_salt("body_regions").show(ui, |ui| {
+            egui::Grid::new("body_region_grid").num_columns(3).show(ui, |ui| {
+                for k in 0..12 {
+                    ui.label(sixng_core::bodyshape::CONTROLS[k].0.trim_start_matches("gcweight"));
+                    released |= ui.add(egui::Slider::new(&mut shape[k], -1.0..=1.0).text("weight")).drag_stopped();
+                    released |= ui.add(egui::Slider::new(&mut shape[12 + k], 0.0..=1.0).text("muscle")).drag_stopped();
+                    ui.end_row();
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            let preset = look.body_preset;
+            if ui.add_enabled(preset.is_some(), egui::Button::new("Reset")).on_hover_text("Back to the outfit's own body-shape preset.").clicked() {
+                shape = preset.unwrap_or(NEUTRAL_BODY);
+                released = true;
+            }
+            if ui.button("Neutral").on_hover_text("Every control 0 (the game's REGULAR shape).").clicked() {
+                shape = NEUTRAL_BODY;
                 released = true;
             }
         });
         if let Some(p) = &look.body_shape {
-            ui.label(egui::RichText::new(format!("Body-shape preset of this outfit: {p} (its control values are not applied; the sliders start neutral).")).weak().small());
+            let how = if look.body_preset.is_some() { "the sliders open in its values" } else { "not a profile of the body-type XML in common.rpf (or common.rpf is not indexed); the sliders open neutral" };
+            ui.label(egui::RichText::new(format!("Body-shape preset of this outfit: {p} ({how}).")).weak().small());
         }
         if shape != before {
             *BODY_SHAPE.lock().unwrap() = shape;
@@ -2422,6 +2503,10 @@ impl ModelView {
         self.loading = false;
         match r {
             Ok(l) => {
+                // the shape the outfit opened in (its preset): no reload for it
+                if let Some(li) = &l.look {
+                    self.body_shape_shown = li.body_used;
+                }
                 let keep_cam = std::mem::take(&mut self.keep_cam_once)
                     || self
                         .loaded
@@ -5206,10 +5291,10 @@ fn load_parts(
     let levels = garment_levels(parts.iter().map(|e| e.off), fx);
     // Body shape: the skin and head are posed by the game's rig; clothes
     // and accessories follow the skin under them (`Wrap`).
-    let shape = if fx.is_empty() { (0.0, 0.0) } else { *BODY_SHAPE.lock().unwrap() };
+    let shape = if fx.is_empty() { NEUTRAL_BODY } else { *BODY_SHAPE.lock().unwrap() };
     let mut posed: HashMap<u64, anyhow::Result<(glb::Model, Vec<PathBuf>, serde_json::Value)>> = HashMap::new();
     let mut field: Vec<([f32; 3], [f32; 3])> = Vec::new();
-    if shape != (0.0, 0.0) {
+    if shape != NEUTRAL_BODY {
         for e in parts {
             let Some(f) = fx.get(&e.off).filter(|f| f.skeletal) else { continue };
             let mut r = export_load_shaped(a, e, cache, lod, &f.skins, shape);
@@ -7074,6 +7159,19 @@ fn load_query_sel(
                 }
                 let o = &look.outfits[k];
                 info.body_shape = o.body_shape.clone();
+                // the outfit's own body shape, when it is opened (a reload of
+                // the same outfit keeps the sliders; `--body` keeps its shape)
+                info.body_preset = preset_shape(&ws.game, o.body_shape.as_deref());
+                let key = format!("{archive}#outfit:{prefix}#look={k}");
+                let mut last = BODY_PRESET_FOR.lock().unwrap();
+                if *last != key {
+                    *last = key;
+                    if !BODY_PINNED.load(std::sync::atomic::Ordering::Relaxed) {
+                        *BODY_SHAPE.lock().unwrap() = info.body_preset.unwrap_or(NEUTRAL_BODY);
+                    }
+                }
+                drop(last);
+                info.body_used = *BODY_SHAPE.lock().unwrap();
                 if !o.unresolved.is_empty() {
                     info.notes.push(format!("{} item(s) of this outfit have no model: {}", o.unresolved.len(), o.unresolved.join(", ")));
                 }
@@ -7169,7 +7267,7 @@ fn load_query_sel(
             // pieces that do not (another head shape, a neighbour's piece)
             // are left out. Only in the neutral body shape, where the skin is
             // where the grooms expect it. A link read from the game is kept whole.
-            if *BODY_SHAPE.lock().unwrap() == (0.0, 0.0) && !l.hair.is_empty() {
+            if *BODY_SHAPE.lock().unwrap() == NEUTRAL_BODY && !l.hair.is_empty() {
                 const CELL: f32 = 0.012;
                 let key = |p: &[f32; 3]| ((p[0] / CELL).floor() as i32, (p[1] / CELL).floor() as i32, (p[2] / CELL).floor() as i32);
                 // hair, brows, beards and lashes must root on the head; body
@@ -8752,10 +8850,10 @@ fn export_load_skin(
     lod: usize,
     skins: &[(u64, u64)],
 ) -> anyhow::Result<(glb::Model, Vec<PathBuf>, serde_json::Value)> {
-    export_load_shaped(a, e, cache, lod, skins, (0.0, 0.0))
+    export_load_shaped(a, e, cache, lod, skins, NEUTRAL_BODY)
 }
 
-/// `export_load_skin` with a body shape (weight, muscle). Shaped exports go
+/// `export_load_skin` with a body shape (`BodyShape`). Shaped exports go
 /// to their own folder, so the cached neutral models stay neutral.
 fn export_load_shaped(
     a: &sixng_core::game::ArchiveInfo,
@@ -8763,12 +8861,12 @@ fn export_load_shaped(
     cache: &Path,
     lod: usize,
     skins: &[(u64, u64)],
-    shape: (f32, f32),
+    shape: BodyShape,
 ) -> anyhow::Result<(glb::Model, Vec<PathBuf>, serde_json::Value)> {
-    let shaped = shape != (0.0, 0.0);
+    let shaped = shape != NEUTRAL_BODY;
     let shaped_dir = cache.join("shaped");
     let cache = if shaped { shaped_dir.as_path() } else { cache };
-    let body_shape = if shaped { sixng_core::bodyshape::parse_spec(&format!("allweight={},allmuscle={}", shape.0, shape.1)).unwrap_or_default() } else { Vec::new() };
+    let body_shape = if shaped { sixng_core::bodyshape::parse_spec(&body_spec(&shape)).unwrap_or_default() } else { Vec::new() };
     // Heads are exported again each time (small), so the chosen face variant applies.
     let head = sixng_core::headskin::is_head(e.name.as_deref().unwrap_or(""));
     let dir = cache
