@@ -1545,6 +1545,11 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   give their GPU memory back: the renderer records no render bundles,
   because the graphics library version in use never frees a bundle, nor
   anything it draws.
+- **GPU device loss**: when the driver loses the GPU device (a driver
+  reset, or out of GPU memory), the viewer cannot draw any more. It logs
+  the reason, shows a message box asking for a restart (not with
+  `--exit`), and exits with code 3 instead of crashing.
+  `SIXNG_TEST_GPU_LOSS=N` destroys the device after N frames, to test this.
 
 - **Lighting**: ambient light comes from a mostly desaturated sky, and the
   fog fades towards a half-desaturated sky, so surfaces keep their texture

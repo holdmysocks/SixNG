@@ -483,6 +483,10 @@ impl Cells {
         let sh = self.shared.clone();
         std::thread::spawn(move || {
             for (gen, cell, c) in up_rx {
+                // nothing more to the device once it is lost (the app exits)
+                if crate::gpu_lost() {
+                    return;
+                }
                 let g = c.map(|c| up.upload_cell(&device, &queue, &c));
                 let r = main_tx.send((gen, cell, g));
                 sh.taken.lock().unwrap().remove(&cell);
