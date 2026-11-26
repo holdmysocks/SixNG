@@ -1390,7 +1390,13 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   own band, but only on pixels no real surface has covered. Real surfaces write a stencil
   mark as they draw; the fallbacks draw after them and only where the
   mark is missing (far-field terrain, ocean or sky), with back faces
-  culled so a coarse block the camera is inside stays invisible. Before,
+  culled so a coarse block the camera is inside stays invisible. Since
+  2026-11-26 an unlinked SLOD3 or SLOD4 tile fills in only one band
+  nearer than its own (SLOD4 from about 7.7 km, SLOD3 from about 4.4 km
+  at full detail): these tiles span kilometres, and nearer the camera
+  their flat ground patches and water pieces covered the terrain as
+  hard-edged green squares and diamond-tiled water. The finer levels
+  still fill in all the way to the camera. Before,
   such areas showed flat far-field terrain next to the camera while the
   same LODs farther away were drawn. Needs the 32-bit depth + stencil
   format (most desktop GPUs); without it the fallbacks draw plainly.

@@ -140,7 +140,7 @@ fn static_range(
 ) -> Option<(f32, f32, Option<f32>)> {
     let n = data.ents.len();
     let k = d.radii[0] / 330.0;
-    let rn: Vec<f32> = d.radii.iter().map(|r| r / k).collect();
+    let rn: [f32; 6] = d.radii.map(|r| r / k);
     let drawable =
         |e: &crate::mapbake::EntRec| !data.name(e.model).is_empty() && e.rflags & RF_HIDE == 0;
     let rad_of = |e: &crate::mapbake::EntRec| -> f32 {
@@ -211,7 +211,8 @@ fn static_range(
             return None;
         }
         if e.lod >= 1 {
-            fb = Some(0.0);
+            // as the per-placement path (map3d::fb_floor), in these units
+            fb = Some(map3d::fb_floor(&rn, e.lod.min(5) as usize));
         }
         (lo, hi)
     };
@@ -235,7 +236,7 @@ fn static_range(
 }
 
 /// Cell format prefix of the cache directories (older ones are deleted).
-const TAG_FORMAT: &str = "v7_";
+const TAG_FORMAT: &str = "v8_";
 
 fn tag_of(d: &Detail) -> String {
     format!(

@@ -164,6 +164,16 @@ impl Detail {
     }
 }
 
+/// Nearest distance an unlinked LOD of level `l` fills in at as a coverage
+/// fallback. SLOD3 and SLOD4 tiles (levels 4 and 5) cover kilometres with
+/// flat ground patches and water pieces that the terrain and the finer
+/// levels already draw near the camera, so they fill in only one band
+/// nearer than their own (from the inner edge of the band two levels
+/// finer); the finer levels fill in all the way to the camera.
+pub fn fb_floor(radii: &[f32; 6], l: usize) -> f32 {
+    if l >= 4 { radii[l - 2] * 0.92 } else { 0.0 }
+}
+
 pub struct Auto {
     pub screenshot: Option<PathBuf>,
     pub exit: bool,
@@ -1163,7 +1173,7 @@ impl Map3D {
                     return 2;
                 }
                 if dist < lo_r / hy {
-                    return if l >= 1 { 3 } else { 1 };
+                    return if l >= 1 && dist >= fb_floor(&d.radii, l) / hy { 3 } else { 1 };
                 }
                 0
             }
