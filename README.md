@@ -264,6 +264,8 @@ exits with code 1.
 # A character with its strand hair (hair, brows, lashes, beard) in jason.hair.glb, then as Blender hair curves
 .\target\release\sixng.exe outfit player_story000_01 --look 0 --hair -o work\out\jason.glb
 blender --python scripts\blender_hair_curves.py -- work\out\jason.hair.glb --model work\out\jason.glb
+# A character made only of shared items (no parts named after it) exports its first outfit; ped-parts lists all its parts
+.\target\release\sixng.exe outfit cs_mandy --hair -o work\out\mandy.glb
 # Game text: all text tables to JSON, or one label's string in every language
 .\target\release\sixng.exe text data -o work\out
 .\target\release\sixng.exe text pack__shared_minigame000__shared_minigame000 --label AG_SUR_GEAR_FIRST1_01 --plain
@@ -748,7 +750,13 @@ again**).
     two kinds). `sixng ped-look "^"` lists every character
     with what its default outfit has. `sixng outfit <name> --look N`
     exports outfit N as one rigged GLB (parts, the face, stored tints;
-    not the viewer's skin tone, colour words or hidden skin).
+    not the viewer's skin tone, colour words or hidden skin). A model with
+    no parts named after it (`cs_mandy`) exports outfit 0 without
+    `--look`. Some character prefixes are outside the outfit list, but
+    their own parts are worn by another model's wardrobe. Such a prefix
+    takes that model's outfits (`cs_roxy`: her clothes on
+    `cs_nastydimez_roxyrashad`). The link needs an outfit that wears the
+    prefix's head, or two of its parts for a set with no head.
   - **Full set.** The Character panel's *Full set* section lists every
     part a character uses. That covers each drawable of all its listed outfits,
     plus the variations of its wardrobe that no listed outfit reaches. Parts are grouped as
