@@ -1069,6 +1069,11 @@ pub struct Outfit {
     /// Body-shape preset name (`BodyShapePreset` variation), when included.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_shape: Option<String>,
+    /// The body-shape preset's items (hex; `bodyshape::preset_items`): the
+    /// `PRESET_ITEM_KEYS` tags of the body-shape kits its preset variations
+    /// include, in order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub body_preset_items: Vec<String>,
     pub parts: Vec<LookPart>,
     /// Strand colour sets the outfit's colour items give per item category (category hash, set name hash; hex).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1857,7 +1862,7 @@ fn own_look(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Option<Look> {
         }
     }
     let main: Vec<String> = parts.iter().filter(|p| ["full", "outer", "top", "bottom"].contains(&p.slot.as_str())).map(|p| pretty(item_word(&p.drawable))).collect();
-    Some(Look { model: model.to_string(), resource: format!("{} (own parts: the outfit data does not cover this model)", a.id), fit, outfits: vec![Outfit { id: String::new(), outfit_type: String::new(), scale: 0.0, label: format!("own parts: {}", main.join(", ")), body_shape: None, parts, strand_colours: vec![], unresolved: vec![], not_shown: vec![], variations: vec![] }], other_variations: vec![], note: Some("The outfit data does not cover this model: it is shown in its own parts.".into()) })
+    Some(Look { model: model.to_string(), resource: format!("{} (own parts: the outfit data does not cover this model)", a.id), fit, outfits: vec![Outfit { id: String::new(), outfit_type: String::new(), scale: 0.0, label: format!("own parts: {}", main.join(", ")), body_shape: None, body_preset_items: vec![], parts, strand_colours: vec![], unresolved: vec![], not_shown: vec![], variations: vec![] }], other_variations: vec![], note: Some("The outfit data does not cover this model: it is shown in its own parts.".into()) })
 }
 
 /// The outfits of one model row. `own_head`: keep only the outfits whose
@@ -1940,6 +1945,11 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
         let mut unresolved = Vec::new();
         let mut not_shown = Vec::new();
         let mut body_shape = None;
+        // the game applies the kits in include order (each kit's items
+        // gathered from its own parent chain in key order, fn 0x3e47f90)
+        // and sets each rig input to the item's value, so a later item wins
+        // (fn 0x4f95310)
+        let mut body_preset_items: Vec<String> = Vec::new();
         let mut strand_colours: Vec<(String, String)> = Vec::new();
         for v in &vs {
             for c in v.parts.iter().filter_map(|p| p.strand_colour.clone()) {
@@ -1953,6 +1963,14 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
             if v.tags.values().flatten().any(|w| w == "BodyShapePreset") {
                 if let Some(w) = v.tags.get("c2cfc00a").and_then(|w| w.first()) {
                     body_shape = Some(w.clone());
+                }
+                // the shape itself: the preset items its body-shape kits
+                // name (the word above is only a label: Lucia's and
+                // Jason's `Skinny` presets set weight -0.2 and -0.4)
+                for p in &v.parts {
+                    for k in crate::bodyshape::PRESET_ITEM_KEYS {
+                        body_preset_items.extend(p.tags.get(&format!("{k:08x}")).into_iter().flatten().cloned());
+                    }
                 }
             }
             for p in &v.parts {
@@ -2008,7 +2026,7 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
             let main: Vec<String> = parts.iter().filter(|p| ["full", "outer", "top", "bottom"].contains(&p.slot.as_str())).map(|p| pretty(item_word(&p.drawable))).collect();
             let v = vs[0];
             if !parts.is_empty() || !unresolved.is_empty() || !not_shown.is_empty() {
-                other_variations.push(Outfit { id: v.id.clone(), outfit_type: String::new(), scale: 0.0, label: if main.is_empty() { format!("variation {}", v.id) } else { main.join(", ") }, body_shape, parts, strand_colours, unresolved, not_shown, variations: vec![v.id.clone()] });
+                other_variations.push(Outfit { id: v.id.clone(), outfit_type: String::new(), scale: 0.0, label: if main.is_empty() { format!("variation {}", v.id) } else { main.join(", ") }, body_shape, body_preset_items, parts, strand_colours, unresolved, not_shown, variations: vec![v.id.clone()] });
             }
             continue;
         }
@@ -2064,6 +2082,7 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
             scale: o.2,
             label: if main.is_empty() { format!("outfit {}", outfits.len() + 1) } else { main.join(", ") },
             body_shape,
+            body_preset_items,
             parts,
             strand_colours,
             unresolved,
