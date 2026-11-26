@@ -561,7 +561,15 @@ fn fld<'a>(v: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value
 /// Asset registries: GUID -> (type, name-word hashes), from every PSO file
 /// with registry records.
 fn registry(archive: &Path, all: &[crate::scan::Entry]) -> HashMap<u64, Vec<u32>> {
-    let found: Vec<Vec<(u64, Vec<u32>)>> = all
+    registry_props(archive, all, &[PROP_WORDS]).into_iter().map(|(g, mut p)| (g, p.remove(&PROP_WORDS).unwrap_or_default())).collect()
+}
+
+/// Of every hair / fur asset in the registries (PSO files, record struct
+/// `20e0f6ed`, type 30): the values of the asked properties (a property is
+/// a key with a list of name hashes). An asset lacking a property has no
+/// entry for it.
+pub(crate) fn registry_props(archive: &Path, all: &[crate::scan::Entry], keys: &[u32]) -> HashMap<u64, HashMap<u32, Vec<u32>>> {
+    let found: Vec<Vec<(u64, HashMap<u32, Vec<u32>>)>> = all
         .par_iter()
         .filter(|e| e.kind == Kind::Pso)
         .filter_map(|e| {
@@ -579,15 +587,12 @@ fn registry(archive: &Path, all: &[crate::scan::Entry]) -> HashMap<u64, Vec<u32>
                             continue;
                         }
                         let Ok(guid) = u64::from_str_radix(key, 16) else { continue };
-                        let words = fld(item, "properties")
-                            .and_then(|p| p.as_array())
-                            .into_iter()
-                            .flatten()
-                            .filter(|p| fld(p, "Key").and_then(|k| k.as_u64()) == Some(PROP_WORDS as u64))
-                            .flat_map(|p| fld(p, "Item").and_then(|i| i.as_array()).into_iter().flatten())
-                            .filter_map(|x| x.as_u64().map(|x| x as u32))
-                            .collect();
-                        out.push((guid, words));
+                        let mut props: HashMap<u32, Vec<u32>> = HashMap::new();
+                        for p in fld(item, "properties").and_then(|p| p.as_array()).into_iter().flatten() {
+                            let Some(k) = fld(p, "Key").and_then(|k| k.as_u64()).map(|k| k as u32).filter(|k| keys.contains(k)) else { continue };
+                            props.entry(k).or_default().extend(fld(p, "Item").and_then(|i| i.as_array()).into_iter().flatten().filter_map(|x| x.as_u64().map(|x| x as u32)));
+                        }
+                        out.push((guid, props));
                     }
                 }
             }

@@ -28,6 +28,7 @@ pub mod hairexport;
 pub mod hairgen;
 pub mod hairlight;
 pub mod hairlink;
+pub mod hairsets;
 pub mod hairtables;
 pub mod hairtone;
 pub mod game;

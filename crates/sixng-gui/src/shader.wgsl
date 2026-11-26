@@ -26,12 +26,13 @@ struct Mat {
     flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask, bit 12 = an emissive shader of another class (lit by its emissive map), bit 13 = the packed map is a vehicle material map, bit 14 = the emissive slot holds the part ramp image with the parts' surfaces
     tile: vec4<f32>,      // fabric detail tile: x UV scale, y rotation, z mean grey value, w bound
     emis: vec4<f32>,      // x emissive scale of the material (from the GLB's emissive strength), yzw the light's colour
+    strand: vec4<f32>,    // x a strand piece's width factor this frame (stored over drawn strands; 1 otherwise)
 };
 
 // rows of the part ramp image: 256 each of the first layer's palette rows,
 // the second layer's, the parts' surfaces and the parts' coats, and one row
 // with the body paint's coat
-const RAMP_ROWS: f32 = 1025.0;
+const RAMP_ROWS: f32 = 1281.0;
 
 @group(0) @binding(0) var<uniform> F: Frame;
 @group(0) @binding(1) var<storage, read> J: array<mat4x4<f32>>;
@@ -85,6 +86,16 @@ struct Shadow {
 @group(0) @binding(12) var<uniform> SH: Shadow;
 @group(0) @binding(13) var t_shadow: texture_depth_2d_array;
 @group(0) @binding(14) var samp_shadow: sampler_comparison;
+
+// The map's placed lights near the camera (lights.rs): the lights, and a
+// grid over them (header: origin x, z and cell size as f32 bits, cells per
+// side; per cell the first index and count; then the index list).
+struct Light {
+    pos_range: vec4<f32>,
+    col_fe: vec4<f32>,
+};
+@group(0) @binding(22) var<storage, read> LT: array<Light>;
+@group(0) @binding(23) var<storage, read> LG: array<u32>;
 
 fn hdr() -> bool { return S.flags.x == 1u; }
 
@@ -483,6 +494,58 @@ fn map_finish(col0: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
     return min(col * SCN.v[0].x, vec3(30000.0));
 }
 
+// Illuminance (lux) of a placed light of intensity 1 at 1 m: our choice,
+// tuned by eye against the night timecycle (not decoded).
+const LIGHT_K: f32 = 0.65;
+// Share of a light's intensity its corona shows towards the camera: a
+// street lamp sends most of its light down, and the sprite stands for the
+// lamp's glass only (our choice).
+const GLOW_K: f32 = 0.12;
+// a light's sphere: nothing nearer than this (m)
+const LIGHT_NEAR: f32 = 0.25;
+
+// Illuminance on a surface at p facing n from the placed lights whose
+// range reaches p: inverse square, windowed to zero at the range.
+fn local_e(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    if (!hdr()) { return vec3(0.0); }
+    let cells = LG[3];
+    if (cells == 0u) { return vec3(0.0); }
+    let o = vec2(bitcast<f32>(LG[0]), bitcast<f32>(LG[1]));
+    let cs = bitcast<f32>(LG[2]);
+    let g = (p.xz - o) / cs;
+    if (any(g < vec2(0.0)) || any(g >= vec2(f32(cells)))) { return vec3(0.0); }
+    let c = u32(g.y) * cells + u32(g.x);
+    let first = LG[4u + c * 2u];
+    let count = LG[4u + c * 2u + 1u];
+    let base = 4u + cells * cells * 2u;
+    var e = vec3(0.0);
+    for (var k = 0u; k < count; k++) {
+        let l = LT[LG[base + first + k]];
+        let d = l.pos_range.xyz - p;
+        let d2 = max(dot(d, d), LIGHT_NEAR * LIGHT_NEAR);
+        let q = d2 / (l.pos_range.w * l.pos_range.w);
+        let win = clamp(1.0 - q * q, 0.0, 1.0);
+        let ndl = max(dot(n, d * inverseSqrt(d2)), 0.0);
+        e += l.col_fe.rgb * (LIGHT_K * win * win * ndl / d2);
+    }
+    return e;
+}
+
+// The map's frame for light added over a surface (the coronas): its
+// transmittance through the haze and fog, then the exposure.
+fn map_finish_added(col0: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
+    let v = p - F.cam_pos.xyz;
+    let d_km = length(v) * 0.001;
+    let c = F.view_proj * vec4(p, 1.0);
+    let ndc = c.xy / max(c.w, 1e-6);
+    let uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    let z = sqrt(clamp(d_km / max(S.radii.w, 0.001), 0.0, 1.0));
+    let ap = textureSampleLevel(t_ap, lin_clamp, vec3(uv, max(z - 0.5 / AP_N, 0.5 / AP_N)), 0.0);
+    let k = clamp(d_km / ap_depth(0.0), 0.0, 1.0);
+    let t = mix(1.0, ap.a, k) * height_fog(p);
+    return min(col0 * t * SCN.v[0].x, vec3(30000.0));
+}
+
 @group(1) @binding(0) var<uniform> M: Mat;
 @group(1) @binding(1) var t_base: texture_2d<f32>;
 @group(1) @binding(2) var t_nrm: texture_2d<f32>;
@@ -494,10 +557,6 @@ fn map_finish(col0: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
 // vehicle parts: the primer's mask (the wear mask when the model has none)
 @group(1) @binding(7) var t_primer: texture_2d<f32>;
 
-// The primer's colour: a stand-in grey (linear). The game takes a palette
-// gradient (column = the windowed mask) of a surface record the CPU builds
-// for the primer, which is not decoded.
-const PRIMER_COLOUR: vec3<f32> = vec3(0.2, 0.2, 0.2);
 
 // How often the wear mask repeats across a part's UV0 (the age records'
 // minTiling / maxTiling are about 4 to 6.5).
@@ -603,7 +662,8 @@ fn mesh_vertex(v: VIn) -> VOut {
     if (abs(v.tan.w) >= 2.0) {
         let code = abs(v.tan.w) - 2.0;
         let ti = floor(code / 16.0);
-        let r = (code - 16.0 * ti) * 0.001;
+        // widened by the share of the piece's strands not drawn (sun shadow pass: its own factor below)
+        let r = (code - 16.0 * ti) * 0.001 * select(max(M.strand.x, 1.0), 1.0, F.frame.y > 1.0e8);
         // the game's minimum drawn width: 2 pixels at the strand's distance, capped at 10 mm (read from its
         // strand vertex program by the shader archive work); ti, the piece type, is kept for the strand count rule
         let npx = 2.0;
@@ -1356,6 +1416,10 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         let id = floor(i.col.a * 255.0 + 0.5);
         // the primer's weight (layer B) and its roughness and metalness
         var w3 = 0.0;
+        // the primer's colour: its palette row (rows 1025..1281 of the part
+        // ramp image) at the column of its summed mask through the preset's
+        // gradient window (columns 46, 47 of the coat row)
+        var p_col = vec3(0.2);
         var p_rough = 0.6;
         var p_metal = 0.0;
         if (wear_mask) {
@@ -1407,6 +1471,10 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
                 let ps = textureLoad(t_em, vec2(29, row), 0).a;
                 let pw = max(textureLoad(t_em, vec2(30, row), 0).a, 1.0 / 255.0);
                 w3 = select(0.0, (1.0 - k) * clamp((pb - ps) / pw, 0.0, 1.0), p_amt > 0.0);
+                let gs = textureLoad(t_em, vec2(46, row), 0).a;
+                let gw = max(textureLoad(t_em, vec2(47, row), 0).a, 1.0 / 255.0);
+                let pu = clamp((clamp(lr + lg + lb, 0.0, 1.0) - gs) / gw, 0.004, 0.996);
+                p_col = textureSampleLevel(t_em, samp, vec2(pu, (id + 1025.5) / RAMP_ROWS), 0.0).rgb;
                 p_rough = textureLoad(t_em, vec2(32, row), 0).a;
                 p_metal = textureLoad(t_em, vec2(33, row), 0).a;
             } else {
@@ -1417,7 +1485,7 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         let w1 = textureSampleLevel(t_em, samp, vec2(u, (id + 256.5) / RAMP_ROWS), 0.0);
         let m1 = textureSampleLevel(t_em, samp, vec2(u, (id + 0.5) / RAMP_ROWS), 0.0).a;
         let w0 = 1.0 - k - w3;
-        albedo = albedo * w0 + w1.rgb * k + PRIMER_COLOUR * w3;
+        albedo = albedo * w0 + w1.rgb * k + p_col * w3;
         rough = clamp(rough * w0 + w1.a * k + p_rough * w3, 0.04, 1.0);
         metal = metal * w0 + m1 * k + p_metal * w3;
         pearl = pearl * w0;
@@ -1532,9 +1600,14 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     let Fr = f0 + (1.0 - f0) * pow(1.0 - max(dot(h, v), 0.0), 5.0);
     let spec = D * G * Fr / max(4.0 * ndl * ndv, 0.001);
     let kd = (1.0 - Fr) * (1.0 - metal);
-    let direct = (kd * albedo / 3.14159 + spec) * sun_e(i.world) * ndl;
+    let direct = (kd * albedo / 3.14159 + spec) * sun_e(i.world) * ndl + kd * albedo / 3.14159 * local_e(i.world, n);
     let amb_d = ambient(n);
-    let fr_v = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
+    // The share of the surroundings a surface mirrors, as the game's standard lighting takes it: its
+    // environment table at (N.V, roughness), r (F90 - F0) + g F0 with F90 = 1, times the multi-scatter
+    // gain 1 + (1 / g - 1) F0. (A rough-Fresnel estimate stood here before; on rough surfaces seen edge-on,
+    // such as skin under the jaw, it gave about two and a half times the table's value: a pale rim.)
+    let et = env_tab(ndv, rough);
+    let fr_v = (et.x * (1.0 - f0) + et.y * f0) * (1.0 + (1.0 / max(et.y, 0.001) - 1.0) * f0);
     let r = reflect(-v, n);
     let env = environment(reflect(-v, n_env), rough) * F.misc.w;
     // a strand's ribbon faces the camera, so its derivatives are screen pixel steps; the game temporally
@@ -1666,7 +1739,7 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             // just under it don't blotch it at a low sun
             let lsh = normalize(F.sun_dir.xyz);
             let tsh = sun_shadow(i.world + vec3(0.0, TILE_SINK, 0.0) + lsh * 0.5);
-            col = albedo * TILE_ALBEDO * (sun_e_shadowed(i.world, tsh) * (0.5 + 0.5 * ndl) / 3.14159 + amb_d);
+            col = albedo * TILE_ALBEDO * ((sun_e_shadowed(i.world, tsh) * (0.5 + 0.5 * ndl) + local_e(i.world, n)) / 3.14159 + amb_d);
             // the tiles' painted water (the map's water and no-data colour)
             // is shaded as the game's water on sea cells (no height, or deeper
             // than the beaches: vertex alpha 0, blending over a shore cell); on cells with a
@@ -1955,7 +2028,7 @@ fn fs_cell(i: COut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let Fr = f0 + (1.0 - f0) * pow(1.0 - max(dot(h, v), 0.0), 5.0);
     let spec = D * G * Fr / max(4.0 * ndl * ndv, 0.001);
     let kd = 1.0 - Fr;
-    let direct = (kd * albedo / 3.14159 + spec) * sun_e(i.world) * ndl;
+    let direct = (kd * albedo / 3.14159 + spec) * sun_e(i.world) * ndl + kd * albedo / 3.14159 * local_e(i.world, n);
     let amb_d = ambient(n);
     let fr_v = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
     let env = environment(reflect(-v, n), rough) * F.misc.w;
@@ -1987,4 +2060,67 @@ fn fs_shadow_cell(i: COut) {
     if ((i.lf.y & 3u) == 1u && a < 0.5) {
         discard;
     }
+}
+
+// Coronas of the map's placed lights (lights.rs `Glow`): a camera-facing
+// sprite per light, added to the HDR target. The light's irradiance at the
+// eye (intensity / d^2) is spread over a Gaussian of at least a pixel, so a
+// far light shrinks to a dim point instead of flickering.
+struct GlowIn {
+    @location(0) pos: vec4<f32>,
+    @location(1) col: vec4<f32>,
+};
+struct GlowOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) rad: vec3<f32>,
+    @location(2) world: vec3<f32>,
+};
+
+// brightest a corona's core gets (in exposed units; 1 is about white)
+const GLOW_PEAK: f32 = 0.9;
+// world radius of a corona's core (m)
+const GLOW_R: f32 = 0.08;
+
+@vertex
+fn vs_glow(g: GlowIn, @builtin(vertex_index) vi: u32) -> GlowOut {
+    var o: GlowOut;
+    let corner = vec2(f32(vi & 1u), f32((vi >> 1u) & 1u)) * 2.0 - 1.0;
+    let c = F.view_proj * vec4(g.pos.xyz, 1.0);
+    let d = max(length(g.pos.xyz - F.cam_pos.xyz), 0.5);
+    // angle of one pixel (rad), from the inverse view-projection
+    let h = max(F.frame.z, 1.0);
+    let a = F.inv_view_proj * vec4(0.0, 0.0, 1.0, 1.0);
+    let b = F.inv_view_proj * vec4(0.0, 2.0 / h, 1.0, 1.0);
+    let pix = length(normalize(b.xyz / b.w - F.cam_pos.xyz) - normalize(a.xyz / a.w - F.cam_pos.xyz));
+    // sigma of the Gaussian in pixels; the sprite reaches 3 sigma
+    // at least a pixel wide: a narrower core would clip to white in the
+    // tone map and lose the lamp's colour
+    let sig_px = max(GLOW_R / d / max(pix, 1e-6), 1.0);
+    let half_px = 3.0 * sig_px;
+    let w = max(F.frame.y, 1.0);
+    o.clip = c + vec4(corner.x * half_px * 2.0 / w, corner.y * half_px * 2.0 / h, 0.0, 0.0) * c.w;
+    o.uv = corner * 3.0;
+    // radiance at the centre: the irradiance at the eye over the Gaussian's solid angle
+    // floodlights capped, so one does not outshine a district
+    let e_eye = g.col.rgb * (LIGHT_K * GLOW_K) * min(g.pos.w, 2500.0) / (d * d);
+    let sig_rad = sig_px * pix;
+    o.rad = e_eye / (2.0 * PI * sig_rad * sig_rad);
+    o.world = g.pos.xyz;
+    if (c.w <= 0.0) { o.clip = vec4(0.0, 0.0, -1.0, 1.0); }
+    return o;
+}
+
+@fragment
+fn fs_glow(i: GlowOut) -> @location(0) vec4<f32> {
+    let r2 = dot(i.uv, i.uv);
+    if (r2 > 9.0) { discard; }
+    let l = i.rad * exp(-0.5 * r2);
+    // each corona tone-mapped on its own (hue kept, brightest channel
+    // eased towards GLOW_PEAK times the exposure's white), so its core
+    // keeps the lamp's colour instead of clipping to white
+    let c = map_finish_added(l, i.world);
+    let m = max(max(c.r, c.g), max(c.b, 1e-6));
+    let k = GLOW_PEAK * (1.0 - exp(-m / GLOW_PEAK)) / m;
+    return vec4(c * k, 0.0);
 }
