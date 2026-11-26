@@ -1213,6 +1213,17 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   m at full density) and the drift speed (12 m/s at scale 1); the game's
   cloud map and noise textures are not used. `--no-clouds`, or the
   **clouds** checkbox, turns them off.
+- **Terrain ground** (HDR map): the baked map tiles hold only a colour by
+  height with their own hill shading (the bake's terrain layer), and cells
+  the bake left out are filled flat green from the game's height map. The
+  land is drawn as a ground made up from height, slope and noise instead:
+  sand just above the sea, dry grass and scrub inland, darker woods in
+  patches, rock on steep slopes, lit by the scene with the terrain's own
+  normals. The tiles' hill shading, which holds relief finer than the
+  terrain mesh (embankments, building pads), is kept at half strength: the
+  tile's brightness over the bake's colour for that height. The tiles'
+  water paint still marks the sea (our choice; the game's terrain
+  materials are not decoded).
 - **Placed lights** (HDR map): the map's exterior lights that are on at
   the hour (their hour mask and night flag) light the scene and glow. Those
   within about 500 m of the camera are shaded on every surface: inverse
