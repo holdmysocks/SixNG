@@ -781,6 +781,17 @@ again**).
     takes that model's outfits (`cs_roxy`: her clothes on
     `cs_nastydimez_roxyrashad`). The link needs an outfit that wears the
     prefix's head, or two of its parts for a set with no head.
+  - **Stand-in clothes.** Eight cutscene characters are only a head or a
+    hair, and nothing in the files links them to an outfit: `cs_blair`,
+    `cs_byron_dugal`, `cs_connie`, `cs_cousin_02`, `cs_gator_trainer`,
+    `cs_ilarus`, `cs_mischa` and `cs_vern`. They are shown in stand-in
+    clothes, and the note says so. The stand-in is the listed model whose
+    head is nearest in shape, of the same fit, ethnicity and age code
+    (crowd heads included), with everyday clothes, which come first.
+    The character keeps its own head, eyes, hair and accessories
+    (Connie's bandana, Mischa's piercing). For a hair with no head
+    (`cs_byron_dugal`), the stand-in is a model that wears the same kind
+    of hair, with the character's own hair in its place.
   - **Full set.** The Character panel's *Full set* section lists every
     part a character uses. That covers each drawable of all its listed outfits,
     plus the variations of its wardrobe that no listed outfit reaches. Parts are grouped as
