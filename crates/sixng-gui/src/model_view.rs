@@ -874,6 +874,11 @@ type GroomList = Result<Vec<sixng_core::groom::GroomInfo>, String>;
 /// Most strands an animal's interpolated coat is drawn with (a cat's short
 /// body coat stores about 365,000). Fewer strands are drawn wider.
 const COAT_STRANDS: usize = 90_000;
+
+/// Parameter set (fibre widths, roughness, translucency) per hair slot when
+/// none is given: the sets checked against the game frames of one character (asset catalogue
+/// property 2259149558 is not read per asset yet).
+const DEFAULT_PARAMSETS: [(&str, &str); 3] = [("hair", "Long_HighGloss_000"), ("brows", "Eyebrows_MidGloss_000"), ("lashes", "Eyelashes_MidGloss_000")];
 /// Skin samples: position (RAGE model space) and linear colour.
 pub type SkinColours = Arc<Vec<([f32; 3], [u8; 3])>>;
 
@@ -1229,7 +1234,7 @@ impl ModelView {
             self.hair.loading = false;
             match r {
                 Ok(models) => {
-                    let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+                    let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
                     // strands are lit with the game's hair tables
                     if let Some(note) = ren.load_hair_luts(rs, std::path::Path::new(&self.game)) {
                         eprintln!("[hair] {note}");
@@ -1280,31 +1285,38 @@ impl ModelView {
         let collide = self.hair.collide.clone();
         let rig = self.hair.rig.clone();
         let tones = if self.hair.stored_colours { self.hair.tones.clone() } else { HashMap::new() };
-        // research, until the game's ramp files are read by SixNG itself: SIXNG_HAIR_DATA=<json of the four
-        // parsed tables> makes every hair piece of a character take the colour set its wardrobe item names.
+        // The game's strand tables (colour and parameter ramps and sets, hair LOD presets) are read from the
+        // game's own files (`hairtables`, cached in the index folder) when the hair is built. Overrides for
+        // research: SIXNG_HAIR_DATA=<json> and SIXNG_HAIR_LOD=<json> take parsed tables from files;
         // SIXNG_HAIR_COLOURSET=<name> forces one colour set; SIXNG_HAIR_PARAMSETS=hair=<set>,brows=<set>
-        // names the parameter set per slot (the asset property that names it is not read here yet);
-        // SIXNG_FUR_SETS=<colour set>,<parameter set> gives an animal's strands those sets.
+        // names the parameter set per slot (default: `DEFAULT_PARAMSETS`; the asset property that names it
+        // is not read yet); SIXNG_FUR_SETS=<colour set>,<parameter set> gives an animal's strands those sets.
         let joaat = sixng_core::meta7a::joaat;
-        let strand_data: Option<Arc<sixng_core::hairtone::StrandData>> = std::env::var("SIXNG_HAIR_DATA").ok().and_then(|f| {
-            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(f).ok()?).ok()?;
-            Some(Arc::new(sixng_core::hairtone::StrandData::from_json(&v)))
-        });
+        let env_data: Option<serde_json::Value> = std::env::var("SIXNG_HAIR_DATA").ok().and_then(|f| serde_json::from_slice(&std::fs::read(f).ok()?).ok());
         // SIXNG_HAIR_SUM=1 lights every strand by the hair lighting, whatever its set's UseStandardBsdf says
         let force_hair_sum = std::env::var("SIXNG_HAIR_SUM").is_ok();
-        if std::env::var("SIXNG_DEBUG_HAIR").is_ok() { eprintln!("strand tables: {:?}", strand_data.as_ref().map(|d| d.counts())); }
         let force_colour: Option<u32> = std::env::var("SIXNG_HAIR_COLOURSET").ok().map(|n| joaat(&n.to_ascii_lowercase()));
-        let slot_params: HashMap<String, u32> = std::env::var("SIXNG_HAIR_PARAMSETS").ok().map(|s| s.split(',').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_string(), joaat(&v.to_ascii_lowercase()))).collect()).unwrap_or_default();
+        let slot_params: HashMap<String, u32> = std::env::var("SIXNG_HAIR_PARAMSETS").ok().map(|s| s.split(',').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_string(), joaat(&v.to_ascii_lowercase()))).collect()).unwrap_or_else(|| DEFAULT_PARAMSETS.iter().map(|(k, v)| (k.to_string(), joaat(&v.to_ascii_lowercase()))).collect());
         // SIXNG_HAIR_LOD=<json of the parsed hair LOD presets> applies the game's strand count rule to a character's pieces
         // (head hair by the preset Default: whether its items name another one is not traced; brows, lashes, beard and
         // body hair by the presets of those names) and to an animal's fur given with SIXNG_FUR_SETS (the preset Animal)
-        let lod_presets: Option<serde_json::Value> = std::env::var("SIXNG_HAIR_LOD").ok().and_then(|f| serde_json::from_slice(&std::fs::read(f).ok()?).ok());
+        let env_lod: Option<serde_json::Value> = std::env::var("SIXNG_HAIR_LOD").ok().and_then(|f| serde_json::from_slice(&std::fs::read(f).ok()?).ok());
         let fur_sets: Option<(u32, u32)> = std::env::var("SIXNG_FUR_SETS").ok().and_then(|s| s.split_once(',').map(|(c, p)| (joaat(&c.to_ascii_lowercase()), joaat(&p.to_ascii_lowercase()))));
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<Vec<glb::Model>> {
                 let (a, ix) = index_for(&ws, "packs", &idx)?;
                 std::fs::create_dir_all(&dir)?;
+                // the game's tables (unless given by file); without them the hair keeps its stored preset colours
+                let game_tables = if env_data.is_some() && env_lod.is_some() { None } else {
+                    match sixng_core::hairtables::load_or_build(&ws, &a) {
+                        Ok(v) => Some(v),
+                        Err(e) => { eprintln!("[hair] strand tables not read: {e:#}"); None }
+                    }
+                };
+                let strand_data: Option<Arc<sixng_core::hairtone::StrandData>> = env_data.as_ref().or(game_tables.as_ref()).map(|v| Arc::new(sixng_core::hairtone::StrandData::from_json(v)));
+                let lod_presets: Option<serde_json::Value> = env_lod.clone().or_else(|| game_tables.as_ref().map(|v| v["lod_presets"].clone()));
+                if std::env::var("SIXNG_DEBUG_HAIR").is_ok() { eprintln!("strand tables: {:?}, LOD presets {}", strand_data.as_ref().map(|d| d.counts()), lod_presets.as_ref().and_then(|v| v.as_object()).map_or(0, |m| m.len())); }
                 // research: SIXNG_NO_STRANDS=1 draws no strand pieces (to see the skin under them)
                 let grooms: Vec<(u64, sixng_core::groom::Groom)> = sel.iter().filter(|_| std::env::var("SIXNG_NO_STRANDS").is_err()).map(|&off| sixng_core::groom::load(&a, &ix.entries, off).map(|g| (off, g))).collect::<anyhow::Result<_>>()?;
                 let stored: usize = grooms.iter().map(|g| g.1.stored_strands()).sum();
@@ -2434,7 +2446,7 @@ impl ModelView {
                         .as_ref()
                         .map(|o| o.source == l.source)
                         .unwrap_or(false);
-                let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+                let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
                 let mut g = ren.upload(rs, &l.model, &[]);
                 ren.ensure_edges(rs, &mut g, &l.model);
                 if !keep_cam {
@@ -2990,7 +3002,7 @@ impl ModelView {
     fn update_brakes(&mut self, rs: &egui_wgpu::RenderState, ctx: &egui::Context) {
         if let Some(ls) = self.brake_pending.lock().unwrap().take() {
             self.brake_loading = false;
-            let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+            let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
             self.brakes = ls.iter().map(|(disc, on, l)| (*disc, *on, ren.upload(rs, &l.model, &[]))).collect();
         }
         let spots: Vec<(String, Vec3, f32)> = self
@@ -3264,7 +3276,7 @@ impl ModelView {
             }
         }
         self.part_look_done = Some((l.model.path.clone(), idx));
-        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
         let mut g = ren.upload(rs, &l.model, &[]);
         ren.ensure_edges(rs, &mut g, &l.model);
         self.gpu = Some(g);
@@ -3296,7 +3308,7 @@ impl ModelView {
             return;
         }
         let (Some(l), Some(g)) = (&self.loaded, self.gpu.as_mut()) else { return };
-        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
         let parts: Vec<String> = l.info["assembled_from"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
         let key = crate::livery::vehicle_key(&crate::vehicle_db::model_key(&l.source));
         self.livery.sync(rs, ren, g, &l.model, &key, &parts, Path::new(&self.game), Path::new(&self.work), &cache);
@@ -3422,7 +3434,7 @@ impl ModelView {
             }
             let c = self.rim_colour;
             self.rim_applied = c;
-            let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+            let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
             self.wheels = self
                 .wheel_src
                 .iter()
@@ -4206,14 +4218,14 @@ impl ModelView {
         });
         let (under, top) = self.lines(&globals);
         let settled = self.idle_for_shot();
-        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
         if let Some(g) = &self.gpu {
             if !skin.is_empty() {
                 ren.set_joints(rs, g, &skin);
             }
         }
         self.update_hair(rs, &ctx);
-        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
         // an animal's fur is bound to its skin and takes the same joint matrices
         if self.hair.rig.is_some() && !skin.is_empty() {
             for g in &self.hair.gpu {
@@ -4241,7 +4253,12 @@ impl ModelView {
         }
         ren.decal_bias = self.decal_bias;
         ren.ground = ground;
+        // a still view settles into the mean of many dither patterns (SIXNG_ACCUM=0: each frame on its own)
+        ren.accumulate = std::env::var("SIXNG_ACCUM").map_or(true, |v| v != "0");
         let tid = ren.render(rs, px, &self.cam, &self.look, &models, &under, &top);
+        if ren.accumulating() {
+            ctx.request_repaint();
+        }
         ui.painter().image(
             tid,
             rect,
@@ -4342,6 +4359,8 @@ impl ModelView {
             // dither pattern (the game averages its per-frame dither over time)
             let frames = std::env::var("SIXNG_SHOT_FRAMES").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1).clamp(1, 64);
             let mut averaged = None;
+            // a plain shot waits for the still-camera mean to settle
+            let ready = ready && (frames > 1 || !ren.accumulating());
             let ready = ready && (frames == 1 || match ren.read_back(rs) {
                 Some((w, h, px)) => {
                     if self.shot_acc.1.len() != px.len() {

@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+mod accum;
 mod assemble;
 mod atmo;
 mod bc;

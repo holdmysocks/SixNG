@@ -460,6 +460,8 @@ struct Target {
     resolve_view: wgpu::TextureView,
     /// HDR frame (the 3D map): the tone-mapped image that is shown and read back.
     display: Option<(wgpu::Texture, wgpu::TextureView)>,
+    /// The running mean of still frames (when the renderer accumulates).
+    accum: Option<crate::accum::Targets>,
     egui_id: egui::TextureId,
 }
 
@@ -660,6 +662,16 @@ pub struct Renderer3D {
     /// that average several frames step it, as the game's dither changes
     /// every frame and its temporal filter averages it).
     pub dither_frame: f32,
+    /// Still-camera accumulation (the model viewer): while the view is
+    /// unchanged each frame steps the dither pattern and joins a running mean
+    /// (`crate::accum`), which is the image shown and read back.
+    pub accumulate: bool,
+    accum: Option<crate::accum::Accum>,
+    /// Frames in the running mean, and the key of the view they show.
+    accum_n: u32,
+    accum_key: u64,
+    /// Changes made outside `render` (joints, instances) since the last frame.
+    accum_bump: std::sync::atomic::AtomicU64,
     /// Map view: building glass drawn dark and mostly opaque (misc3.z).
     pub map_glass: bool,
     /// Draw calls of the coverage fallbacks in the last frame: models, cells.
@@ -916,16 +928,23 @@ fn tex_bc(
 
 impl Renderer3D {
     pub fn new(rs: &egui_wgpu::RenderState) -> Self {
-        Self::new_with(rs, false)
+        Self::new_with(rs, false, false)
+    }
+
+    /// The model viewer's renderer: as `new`, with the sun shadow map on
+    /// (SIXNG_SHADOWS=0 turns it off).
+    pub fn new_viewer(rs: &egui_wgpu::RenderState) -> Self {
+        Self::new_with(rs, false, true)
     }
 
     /// The 3D map's renderer: HDR frame with the game's sky, light and
     /// exposure (atmo.rs), tone mapped for display.
     pub fn new_map(rs: &egui_wgpu::RenderState) -> Self {
-        Self::new_with(rs, true)
+        Self::new_with(rs, true, false)
     }
 
-    fn new_with(rs: &egui_wgpu::RenderState, hdr: bool) -> Self {
+    /// `sun_default`: the sun shadow map is on unless SIXNG_SHADOWS says otherwise.
+    fn new_with(rs: &egui_wgpu::RenderState, hdr: bool, sun_default: bool) -> Self {
         let device = &rs.device;
         let color_fmt = if hdr { crate::atmo::HDR_FMT } else { COLOR_FMT };
         let shadow = crate::shadow::ShadowGpu::new(device, hdr, std::mem::size_of::<FrameU>() as u64);
@@ -1372,7 +1391,7 @@ impl Renderer3D {
             }),
         };
         let hair_luts = hair_blank(device, &rs.queue);
-        // The sun shadow map (SIXNG_SHADOWS=1, research: one map over the models, strands drawn into it as the
+        // The sun shadow map (on in the model viewer, elsewhere with SIXNG_SHADOWS=1; SIXNG_SHADOWS=0 turns it off; one map over the models, strands drawn into it as the
         // game draws its strands into its shadow maps; the game's own cascades, bias and filter are not read).
         let shadow_tex = |size: u32| {
             device
@@ -1395,7 +1414,7 @@ impl Renderer3D {
             compare: Some(wgpu::CompareFunction::LessEqual),
             ..Default::default()
         });
-        let sun_maps = std::env::var("SIXNG_SHADOWS").is_ok();
+        let sun_maps = std::env::var("SIXNG_SHADOWS").map_or(sun_default, |v| v != "0");
         let sun_map = (shadow_tex(if sun_maps { SHADOW_SIZE } else { 1 }), shadow_sampler.clone(), shadow_tex(if sun_maps { CAM_DEPTH_SIZE } else { 1 }));
         let shadow_ub = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("shadow frame ub"),
@@ -1643,6 +1662,11 @@ impl Renderer3D {
             cells: Vec::new(),
             lod_k: 1.0,
             dither_frame: 0.0,
+            accumulate: false,
+            accum: None,
+            accum_n: 0,
+            accum_key: 0,
+            accum_bump: std::sync::atomic::AtomicU64::new(0),
             map_glass: false,
             fb_draws: [0, 0],
             atmo,
@@ -2221,6 +2245,7 @@ impl Renderer3D {
         gm.n_instances = inst.len() as u32;
         gm.n_fb = n_fb as u32;
         gm.world = world_sphere(gm.bbox, inst.iter().filter(|i| !i.is_fallback()));
+        self.bump_accum(bytemuck::cast_slice(inst));
     }
 
     /// Give a model its stickers: the shader records (header first, see
@@ -2240,6 +2265,7 @@ impl Renderer3D {
         if n > 0 {
             rs.queue.write_buffer(buf, 0, bytemuck::cast_slice(&recs[..n]));
         }
+        self.bump_accum(bytemuck::cast_slice(&recs[..n]));
         gm.frame_bg = frame_bind_group(&rs.device, &self.bgl_frame, &self.frame_ub, &gm.joints_buf, &self.sampler, buf, pictures.unwrap_or(&self.stickers.view), &self.stickers.sampler, &self.atmo.binds, &self.hair_luts, &self.sun_map);
     }
 
@@ -2247,6 +2273,15 @@ impl Renderer3D {
         let v: Vec<f32> = mats.iter().flat_map(|m| m.to_cols_array()).collect();
         rs.queue
             .write_buffer(&gm.joints_buf, 0, bytemuck::cast_slice(&v));
+        self.bump_accum(bytemuck::cast_slice(&v));
+    }
+
+    /// Restart the still-camera mean when data it shows changed outside `render`.
+    fn bump_accum(&self, bytes: &[u8]) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut h);
+        self.accum_bump.fetch_add(h.finish() | 1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Change a material's base factor (e.g. after a paint override).
@@ -2261,6 +2296,7 @@ impl Renderer3D {
             u.base = base;
             rs.queue
                 .write_buffer(&gm.mat_ub, k as u64 * MAT_STRIDE, bytemuck::bytes_of(u));
+            self.bump_accum(bytemuck::bytes_of(u));
         }
     }
 
@@ -2280,6 +2316,7 @@ impl Renderer3D {
             };
             rs.queue
                 .write_buffer(&gm.mat_ub, k as u64 * MAT_STRIDE, bytemuck::bytes_of(u));
+            self.bump_accum(bytemuck::bytes_of(u));
         }
     }
 
@@ -2294,11 +2331,12 @@ impl Renderer3D {
         if self
             .target
             .as_ref()
-            .map(|t| t.size == size)
+            .map(|t| t.size == size && t.accum.is_some() == self.accumulate)
             .unwrap_or(false)
         {
             return;
         }
+        self.accum_n = 0;
         let device = &rs.device;
         let mk = |samples: u32, fmt: wgpu::TextureFormat, usage: wgpu::TextureUsages| {
             device.create_texture(&wgpu::TextureDescriptor {
@@ -2340,7 +2378,15 @@ impl Renderer3D {
             let v = t.create_view(&Default::default());
             (t, v)
         });
-        let shown = display.as_ref().map(|d| &d.1).unwrap_or(&resolve_view);
+        let frame = display.as_ref().map(|d| &d.1).unwrap_or(&resolve_view);
+        let accum = self.accumulate.then(|| {
+            let out_fmt = if self.hdr { crate::atmo::DISPLAY_FMT } else { color_fmt };
+            if self.accum.as_ref().is_some_and(|a| a.out_fmt != out_fmt) {
+                self.accum = None;
+            }
+            self.accum.get_or_insert_with(|| crate::accum::Accum::new(device, out_fmt)).targets(device, frame, size)
+        });
+        let shown = accum.as_ref().map(|a| &a.out_view).unwrap_or(frame);
         let mut r = rs.renderer.write();
         let egui_id = match &self.target {
             Some(t) => {
@@ -2361,6 +2407,7 @@ impl Renderer3D {
             resolve,
             resolve_view,
             display,
+            accum,
             egui_id,
         });
     }
@@ -2723,6 +2770,38 @@ impl Renderer3D {
         let device = &rs.device;
         let queue = &rs.queue;
         let aspect = size[0] as f32 / size[1] as f32;
+        // still-camera accumulation: the mean starts over when anything in the view changes, and each frame of it
+        // takes the next dither pattern
+        let base_dither = self.dither_frame;
+        if self.accumulate {
+            use std::hash::{Hash, Hasher};
+            let mut k = self.frame_uniform(cam, look, aspect, 0.0);
+            k.frame = [0.0; 4];
+            k.light_view_proj = [[0.0; 4]; 4];
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            bytemuck::bytes_of(&k).hash(&mut h);
+            size.hash(&mut h);
+            base_dither.to_bits().hash(&mut h);
+            self.decal_bias.hash(&mut h);
+            if let Some(g) = &self.ground {
+                bytemuck::bytes_of(&[g.centre.x, g.centre.y, g.centre.z, g.half[0], g.half[1], g.height]).hash(&mut h);
+            }
+            self.accum_bump.swap(0, std::sync::atomic::Ordering::Relaxed).hash(&mut h);
+            for gm in models {
+                (*gm as *const GpuModel as usize, gm.meshes.len(), gm.n_instances).hash(&mut h);
+                for me in &gm.meshes {
+                    (me.visible, me.n_idx).hash(&mut h);
+                }
+            }
+            bytemuck::cast_slice::<LineV, u8>(lines).hash(&mut h);
+            bytemuck::cast_slice::<LineV, u8>(lines_on_top).hash(&mut h);
+            let key = h.finish();
+            if key != self.accum_key {
+                self.accum_key = key;
+                self.accum_n = 0;
+            }
+            self.dither_frame = base_dither + self.accum_n as f32;
+        }
         // the sun shadow map: one orthographic view from the sun over the models
         let mut shadow_fu = None;
         self.light_vp = [[0.0; 4]; 4];
@@ -3086,6 +3165,9 @@ impl Renderer3D {
         if let (Some(_), Some(d)) = (&sky, &t.display) {
             self.atmo.post(device, &mut enc, &t.resolve_view, &d.1, size);
         }
+        if let (Some(a), Some(at)) = (&self.accum, &t.accum) {
+            a.run(&mut enc, at, self.accum_n);
+        }
         let t_e = std::time::Instant::now();
         let cb = enc.finish();
         RTIME[1].fetch_add(
@@ -3101,14 +3183,29 @@ impl Renderer3D {
         RTIME[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.draws = draws;
         let _ = &self.dummy_joints;
-        t.egui_id
+        let id = t.egui_id;
+        if self.accumulate {
+            self.accum_n = self.accum_n.saturating_add(1);
+            self.dither_frame = base_dither;
+        }
+        id
+    }
+
+    /// Frames in the still-camera mean so far (0 when not accumulating).
+    pub fn accum_frames(&self) -> u32 {
+        if self.accumulate { self.accum_n } else { 0 }
+    }
+
+    /// The still-camera mean is still settling: the caller keeps drawing.
+    pub fn accumulating(&self) -> bool {
+        self.accumulate && self.accum_n < crate::accum::CAP
     }
 
     /// Read the last rendered frame back as RGBA8 (sRGB-encoded).
     pub fn read_back(&self, rs: &egui_wgpu::RenderState) -> Option<(u32, u32, Vec<u8>)> {
         let t = self.target.as_ref()?;
         let [w, h] = t.size;
-        let src = t.display.as_ref().map(|d| &d.0).unwrap_or(&t.resolve);
+        let src = t.accum.as_ref().map(|a| &a.out).or(t.display.as_ref().map(|d| &d.0)).unwrap_or(&t.resolve);
         let row = (4 * w + 255) / 256 * 256;
         let buf = rs.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
