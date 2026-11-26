@@ -1594,13 +1594,22 @@ impl ModelView {
         let ws = Workspace::new(&self.game, &self.work);
         let (idx, sel, slot, ctx) = (self.indexes.clone(), self.hair.selected.clone(), self.hair.export_done.clone(), ctx.clone());
         let full = self.hair.export_full.then_some(self.hair.density.clamp(0.05, 1.0));
+        let (shown, cache): (Vec<u64>, PathBuf) = (self.loaded.as_ref().map_or_else(Vec::new, |l| l.selected.clone()), self.cache_dir());
         // a folder per model, so an earlier `sixng grooms` export and its index stay as they are
         let model: String = self.loaded.as_ref().map_or("grooms", |l| l.source.split_whitespace().next().unwrap_or("").rsplit([':', '#', '/']).find(|s| !s.is_empty() && !s.starts_with("look=")).unwrap_or("grooms")).chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
         let out = Path::new(&self.work).join("out").join("hair").join(model);
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<String> {
                 let (a, ix) = index_for(&ws, "packs", &idx)?;
-                let (written, errors) = sixng_core::groom::export_grooms(&a, &ix.entries, &sel, &out, false, None, full, sixng_core::export::no_progress())?;
+                // the shown character's head as the viewer exported it, to name the
+                // head UV set the root UVs are in (`hairexport::tag_uv_set`)
+                let head = shown
+                    .iter()
+                    .filter_map(|o| ix.entries.iter().find(|e| e.off == *o))
+                    .filter(|e| e.name.as_deref().is_some_and(sixng_core::headskin::is_head))
+                    .find_map(|e| std::fs::read(cache.join("models").join(sixng_core::game::index_stem(&a.id)).join(export::export_base_name(e)).join("model.glb")).ok())
+                    .and_then(|b| sixng_core::hairexport::head_from_glb(&b));
+                let (written, errors) = sixng_core::groom::export_grooms(&a, &ix.entries, &sel, &out, false, None, full, head.as_ref(), sixng_core::export::no_progress())?;
                 let dir = out.join("grooms").join("packs");
                 Ok(format!("{written} groom(s) written to {}{}{}", dir.display(), if full.is_some() { " with the full strand set and a growth.json each" } else { " (guide strands)" }, if errors > 0 { format!("; {errors} failed") } else { String::new() }))
             })()
@@ -1656,7 +1665,7 @@ impl ModelView {
                         let ctx = ui.ctx().clone();
                         self.start_hair_export(&ctx);
                     }
-                    ui.checkbox(&mut self.hair.export_full, "full strands").on_hover_text("Write the strands the groom stores per root triangle, grown between its guides, instead of the guide strands alone (same as `sixng grooms --full`; the density slider below sets the share). The game's own clumping, curl and noise are not decoded, so the result is smoother than in game.");
+                    ui.checkbox(&mut self.hair.export_full, "full strands").on_hover_text("Write the strands the groom stores per root triangle, grown between its guides, instead of the guide strands alone, with clumping, curl and noise as the viewer draws them (same as `sixng grooms --full`; the density slider below sets the share). Each groom names the head UV set its root UVs are in, for scripts/blender_hair_curves.py.");
                     if self.hair.exporting {
                         ui.spinner();
                         ui.label("exporting (the first run reads the groom list, about a minute) …");

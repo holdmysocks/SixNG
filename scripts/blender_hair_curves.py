@@ -1,7 +1,7 @@
-"""Make Blender hair curves of a strand GLB written by `sixng outfit --hair`
-(or `sixng grooms --full`).
+"""Make Blender hair curves of strand GLBs written by `sixng outfit --hair`
+(or `sixng grooms --full`, one file per groom).
 
-    blender --python scripts/blender_hair_curves.py -- <hair.glb> [--model <model.glb>] [--save <file.blend>]
+    blender --python scripts/blender_hair_curves.py -- <hair.glb> [<hair.glb> ...] [--model <model.glb>] [--save <file.blend>]
 
 Each strand piece of the GLB becomes one hair curves object with these
 attributes:
@@ -226,15 +226,19 @@ def attach(made):
 
 def main(argv):
     if not argv:
-        raise SystemExit("usage: blender --python blender_hair_curves.py -- <hair.glb> [--model <model.glb>] [--save <file.blend>]")
-    hair, model, save = argv[0], None, None
-    if "--model" in argv:
-        model = argv[argv.index("--model") + 1]
-    if "--save" in argv:
-        save = argv[argv.index("--save") + 1]
+        raise SystemExit("usage: blender --python blender_hair_curves.py -- <hair.glb> [<hair.glb> ...] [--model <model.glb>] [--save <file.blend>]")
+    model, save, hair = None, None, []
+    it = iter(argv)
+    for a in it:
+        if a == "--model":
+            model = next(it)
+        elif a == "--save":
+            save = next(it)
+        else:
+            hair.append(a)
     if model:
         bpy.ops.import_scene.gltf(filepath=model)
-    made = build(hair)
+    made = [m for h in hair for m in build(h)]
     coll = bpy.data.collections.new("hair")
     guides = bpy.data.collections.new("hair guides")
     bpy.context.scene.collection.children.link(coll)
