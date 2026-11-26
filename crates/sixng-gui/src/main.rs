@@ -236,9 +236,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eframe::run_native(
         "SixNG Extractor",
         opts,
-        Box::new(move |_cc| Ok(Box::new(App::new(cli)))),
+        Box::new(move |cc| {
+            if let Some(rs) = cc.wgpu_render_state.as_ref() {
+                watch_gpu_loss(&rs.device);
+            }
+            Ok(Box::new(App::new(cli)))
+        }),
     )?;
     Ok(())
+}
+
+/// Set once the GPU device is lost (a driver reset, or out of memory).
+static GPU_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// When the device is lost, wgpu destroys every buffer and texture, and the
+/// next call on one fails validation (such as unmapping a frame-timer
+/// read-back buffer) far from the cause; the default error handler then
+/// panics. Say why the device was lost, and after that log the errors it
+/// causes instead of panicking, so the window can ask for a restart.
+fn watch_gpu_loss(device: &eframe::egui_wgpu::wgpu::Device) {
+    device.set_device_lost_callback(|reason, msg| {
+        eprintln!("[gpu] device lost ({reason:?}): {msg}");
+        GPU_LOST.store(true, std::sync::atomic::Ordering::Release);
+    });
+    device.on_uncaptured_error(Arc::new(gpu_error));
+}
+
+/// The uncaptured-error handler: as wgpu's default (a panic) while the
+/// device works, the first error logged and the rest dropped once it is lost.
+fn gpu_error(e: eframe::egui_wgpu::wgpu::Error) {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !GPU_LOST.load(std::sync::atomic::Ordering::Acquire) {
+        panic!("wgpu error: {e}
+");
+    }
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[gpu] after the device loss: {e} (further errors not shown)");
+    }
 }
 
 /// Default wgpu setup plus BC texture compression where the adapter has it
@@ -871,6 +905,11 @@ impl App {
         if !self.cli_started {
             self.cli_started = true;
             self.apply_cli(&ctx);
+        }
+        if GPU_LOST.load(std::sync::atomic::Ordering::Acquire) {
+            egui::Panel::top("gpu_lost").show(ui, |ui| {
+                ui.colored_label(egui::Color32::from_rgb(230, 80, 70), "The GPU device was lost (a driver reset, or out of GPU memory): the 3D views no longer draw. Restart the viewer.");
+            });
         }
         egui::Panel::top("tabs").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -2020,3 +2059,22 @@ fn human(n: u64) -> String {
 
 #[allow(dead_code)]
 fn unused(_: Filter) {}
+
+#[cfg(test)]
+mod gpu_loss_tests {
+    use super::*;
+    use eframe::egui_wgpu::wgpu;
+
+    fn err() -> wgpu::Error {
+        wgpu::Error::Validation { source: "buffer has been destroyed".into(), description: "unmap".into() }
+    }
+
+    #[test]
+    fn gpu_errors_panic_until_the_device_is_lost() {
+        // one test: GPU_LOST is process-wide
+        assert!(std::panic::catch_unwind(|| gpu_error(err())).is_err());
+        GPU_LOST.store(true, std::sync::atomic::Ordering::Release);
+        gpu_error(err());
+        gpu_error(err());
+    }
+}
