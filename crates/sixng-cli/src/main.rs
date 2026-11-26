@@ -1803,7 +1803,11 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 let o = sixng_core::hairexport::Options { density: *hair_density, max_strands: *hair_max, points: *hair_points, guides: !*hair_no_guides };
                 let (mut prims, mut rows) = (Vec::new(), Vec::new());
                 // the head as written, to find which of its UV sets the root UVs are in
-                let head = std::fs::read(&glb).ok().and_then(|b| sixng_core::hairexport::head_from_glb(&b));
+                let model = std::fs::read(&glb).ok();
+                let head = model.as_deref().and_then(sixng_core::hairexport::head_from_glb);
+                // a hat of the outfit: the scalp hair is pressed under it, as in the viewer
+                let hats: Vec<String> = outfit_of.map(|of| of.parts.iter().filter(|p| p.slot == "hat").map(|p| p.drawable.to_ascii_lowercase()).collect()).unwrap_or_default();
+                let hat = model.as_deref().and_then(|b| sixng_core::hairexport::hat_shell(b, &hats));
                 for (slot, placeholder, grooms, confidence) in &pieces {
                     for off in grooms {
                         let g = sixng_core::groom::load(&a, &ix.entries, *off)?;
@@ -1812,11 +1816,14 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                         let mut ex = json!({"slot": slot, "placeholder": placeholder, "groom": format!("{off:x}"), "bones": bones});
                         let uv_set = sixng_core::hairexport::tag_uv_set(&g, head.as_ref(), &mut ex);
                         let colour = outfit_of.and_then(|of| sixng_core::hairexport::slot_colour(of, slot, tables.as_ref(), presets.as_ref()));
+                        if hat.is_some() && slot == "hair" {
+                            ex["under_hat"] = json!(hats);
+                        }
                         if let Some((c, set)) = &colour {
                             ex["colour_set"] = json!(format!("{set:08x}"));
                             ex["colour_source"] = json!(match c { sixng_core::hairexport::HairColour::Set(_) => "strand tables", sixng_core::hairexport::HairColour::Presets(_) => "item presets" });
                         }
-                        let (p, mut sum) = sixng_core::hairexport::piece(&g, &name, &o, colour.as_ref().map(|c| &c.0), ex);
+                        let (p, mut sum) = sixng_core::hairexport::piece(&g, &name, &o, colour.as_ref().map(|c| &c.0), hat.as_ref().filter(|_| slot == "hair"), ex);
                         sum["head_uv_set"] = json!(uv_set);
                         sum["colour_set"] = json!(colour.as_ref().map(|c| format!("{:08x}", c.1)));
                         sum["slot"] = json!(slot);

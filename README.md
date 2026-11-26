@@ -432,8 +432,15 @@ restyle the hair:
    from root to tip. Variant: a random value against three per-guide
    thresholds gives each strand one of four colour ramps.
 
-Not in the export yet: how the hair is pressed under a hat (export the model without the
-hat and add the hat afterwards), and the game's run-time strand count (it
+Under a hat in the outfit the scalp pieces are pressed in as the viewer
+does (a stand-in, not the game's method; see the model viewer below): the
+guides before the strands are grown and the grown strands after, every
+point beyond the hat's lining pulled to 3 mm under it. Their extras name
+the hat (`under_hat`) and the summary the points moved (`hat_pressed`).
+On Jason's look 1 (a cap worn backwards, over his long hair) 480,455 of
+1.19 M points move; a few tufts (about 0.1 % of the points, up to
+12 mm) still come through the side of the crown. Not in the export yet:
+the game's run-time strand count (it
 draws fewer strands at a distance; the export writes all it stores). To
 restyle in Blender, edit the hidden `_guides` objects and grow new strands
 from them with Blender's Interpolate Hair Curves node (it blends nearby
