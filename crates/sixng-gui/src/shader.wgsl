@@ -367,7 +367,11 @@ fn map_finish(col0: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
 
 // Illuminance (lux) of a placed light of intensity 1 at 1 m: our choice,
 // tuned by eye against the night timecycle (not decoded).
-const LIGHT_K: f32 = 1.0;
+const LIGHT_K: f32 = 0.65;
+// Share of a light's intensity its corona shows towards the camera: a
+// street lamp sends most of its light down, and the sprite stands for the
+// lamp's glass only (our choice).
+const GLOW_K: f32 = 0.12;
 // a light's sphere: nothing nearer than this (m)
 const LIGHT_NEAR: f32 = 0.25;
 
@@ -1934,7 +1938,7 @@ struct GlowOut {
 };
 
 // world radius of a corona's core (m)
-const GLOW_R: f32 = 0.12;
+const GLOW_R: f32 = 0.08;
 
 @vertex
 fn vs_glow(g: GlowIn, @builtin(vertex_index) vi: u32) -> GlowOut {
@@ -1948,13 +1952,13 @@ fn vs_glow(g: GlowIn, @builtin(vertex_index) vi: u32) -> GlowOut {
     let b = F.inv_view_proj * vec4(0.0, 2.0 / h, 1.0, 1.0);
     let pix = length(normalize(b.xyz / b.w - F.cam_pos.xyz) - normalize(a.xyz / a.w - F.cam_pos.xyz));
     // sigma of the Gaussian in pixels; the sprite reaches 3 sigma
-    let sig_px = max(GLOW_R / d / max(pix, 1e-6), 0.7);
+    let sig_px = max(GLOW_R / d / max(pix, 1e-6), 0.6);
     let half_px = 3.0 * sig_px;
     let w = max(F.frame.y, 1.0);
     o.clip = c + vec4(corner.x * half_px * 2.0 / w, corner.y * half_px * 2.0 / h, 0.0, 0.0) * c.w;
     o.uv = corner * 3.0;
     // radiance at the centre: the irradiance at the eye over the Gaussian's solid angle
-    let e_eye = g.col.rgb * LIGHT_K * g.pos.w / (d * d);
+    let e_eye = g.col.rgb * (LIGHT_K * GLOW_K) * g.pos.w / (d * d);
     let sig_rad = sig_px * pix;
     o.rad = e_eye / (2.0 * PI * sig_rad * sig_rad);
     o.world = g.pos.xyz;

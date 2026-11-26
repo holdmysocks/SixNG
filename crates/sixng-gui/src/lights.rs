@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn grid_lists_lights_in_reach() {
-        let (kept, grid) = pack(Vec3::ZERO, &[light(1.0, 1.0, 5.0, 10.0), light(5000.0, 0.0, 5.0, 10.0), light(-30.0, 2.0, 20.0, 1.0)]);
+        let (kept, grid) = pack(Vec3::ZERO, &[light(1.0, 1.0, 5.0, 10.0), light(5000.0, 0.0, 5.0, 10.0), light(-20.0, 2.0, 30.0, 1.0)]);
         assert_eq!(kept.len(), 2, "the far light is left out");
         let ox = f32::from_bits(grid[0]);
         let oz = f32::from_bits(grid[1]);

@@ -1175,9 +1175,11 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   square, windowed to zero at the light's range, at most 32 lights per
   12 m cell of a grid around the camera, brightest first. Every lit light
   within 600 m, and the brighter ones (intensity 50 or more) to 3 km, draw
-  a corona: the light's irradiance at the eye spread over a small Gaussian
-  of at least a pixel, dimmed by the haze. Our choices: one intensity unit
-  gives 1 lux at 1 m, all lights shine as points (spot cones and the
+  a corona (small decorative lights only within 150 m): the share of the
+  light's irradiance at the eye that its glass shows, spread over a small
+  Gaussian of at least a pixel, dimmed by the haze. Our choices: one
+  intensity unit gives 0.65 lux at 1 m, a corona shows 12 % of the light,
+  all lights shine as points (spot cones and the
   falloff exponent are not used yet). `--no-placed-lights`, or the
   **placed lights shine** checkbox, turns them off.
 - **Water** (HDR map): the sea and the game's water meshes are shaded

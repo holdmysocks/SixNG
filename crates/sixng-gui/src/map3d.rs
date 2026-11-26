@@ -2134,7 +2134,8 @@ impl Map3D {
                     col_fe: [col[0] * l.intensity, col[1] * l.intensity, col[2] * l.intensity, l.falloff_exp],
                 });
             }
-            if d < GLOW_FAR && (d < GLOW_NEAR || l.intensity >= 50.0) {
+            // small decorative lights (range under 3 m) glow only near
+            if d < GLOW_FAR && (d < GLOW_NEAR || l.intensity >= 50.0) && (d < 150.0 || l.range >= 3.0) {
                 glows.push(crate::lights::Glow { pos: [p.x, p.y, p.z, l.intensity], col: [col[0], col[1], col[2], 0.0] });
             }
         });
