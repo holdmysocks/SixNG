@@ -1274,7 +1274,8 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   height over the surface seen through them from the scene's depth (the
   opaque surfaces are drawn first, then the blended ones read that
   depth), so a beach model running down into the sea gets a line of foam
-  at the visible waterline and bands out to 1.6 m. Inland water does not
+  at the visible waterline and broken bands where it is under 0.5 m deep
+  (a few metres out on a gentle beach). Inland water does not
   foam.
   Our choices: the bed's reflectance (sand and mud, 0.22 0.20 0.15), the
   sea's level, and the foam (depth, bands, 0.75 reflectance). Not yet: the

@@ -493,11 +493,14 @@ fn water_shade(p: vec3<f32>, fp: f32, surf: f32, bed: f32, edge: f32) -> vec3<f3
     if (scene_under >= 0.0 && !inland) {
         let tm = S.water4.w;
         let brk = foam_noise(p.xz * 0.35 + vec2(tm * 0.05, 0.0)) * foam_noise(p.xz * 0.09 - vec2(0.0, tm * 0.02));
-        let band = pow(0.5 + 0.5 * sin(scene_under * 4.5 - tm * 1.3 + 6.0 * foam_noise(p.xz * 0.05)), 5.0);
-        let s = 1.0 - smoothstep(0.0, FOAM_DEPTH, scene_under);
+        // the sea plane lies just over a gently sloping bed along many
+        // beaches, so the foam keeps to the top SCENE_FOAM_DEPTH of water (a
+        // few metres from the waterline, not the whole shelf)
+        let band = pow(0.5 + 0.5 * sin(scene_under * 12.0 - tm * 1.3 + 6.0 * foam_noise(p.xz * 0.05)), 5.0);
+        let s = 1.0 - smoothstep(0.0, SCENE_FOAM_DEPTH, scene_under);
         // a thin line of foam right at the waterline, broken bands farther out
-        let line = 1.0 - smoothstep(0.0, 0.25, scene_under);
-        foam = max(foam, clamp(s * (0.35 + 0.65 * band) * (0.5 + 1.0 * brk) + line * (0.4 + 0.6 * brk), 0.0, 1.0));
+        let line = 1.0 - smoothstep(0.0, 0.08, scene_under);
+        foam = max(foam, clamp(0.6 * s * band * (0.4 + 1.0 * brk) + line * (0.3 + 0.5 * brk), 0.0, 1.0));
     }
     let water = fr * refl + glint + (1.0 - fr) * body;
     return mix(water, FOAM_ALBEDO * e_down / PI, foam * 0.85);
@@ -515,6 +518,9 @@ const FOAM_DEPTH: f32 = 1.6;
 // (world3d), so the bed shows above it down to 1 m under the sea's level.
 const SURF_HIDDEN: f32 = 1.0;
 const FOAM_ALBEDO: f32 = 0.75;
+// Depth over the surface seen through the water (m) under which the
+// waterline's surf shows (our choice).
+const SCENE_FOAM_DEPTH: f32 = 0.5;
 
 fn foam_hash(p: vec2<f32>) -> f32 {
     let q = fract(p * vec2(0.1031, 0.1030));
