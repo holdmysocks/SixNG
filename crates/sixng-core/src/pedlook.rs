@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-const CACHE_VERSION: u32 = 4;
+const CACHE_VERSION: u32 = 5;
 const VARIATION: u32 = 0xa9d5_7751;
 const LIST_ITEM: u32 = 0xa5ea_6310;
 
@@ -67,6 +67,12 @@ pub struct Models {
     /// without `cs_`.
     #[serde(default)]
     pub aliases: BTreeMap<u32, Vec<u32>>,
+    /// Name id (`meta7a::asset_id`) of a drawable of a character prefix the
+    /// list does not have (`cs_roxy_jacketfur_…`) -> the wardrobe resources
+    /// with an item naming it. Such a prefix can be a clothing set that
+    /// another model wears (`cs_nastydimez_roxyrashad`).
+    #[serde(default)]
+    pub parts: BTreeMap<u64, Vec<u64>>,
 }
 
 fn build(packs: &Path, ix: &ArchiveIndex) -> Models {
@@ -121,6 +127,16 @@ fn build(packs: &Path, ix: &ArchiveIndex) -> Models {
             }
         }
     }
+    // the drawables of character prefixes the list does not have, by name id
+    let targets: HashSet<u64> = ix
+        .entries
+        .iter()
+        .filter(|e| e.rtype.as_deref() == Some("dr"))
+        .filter_map(|e| e.name.as_ref().map(|n| n.to_ascii_lowercase()))
+        .filter(|n| crate::outfit::outfit_prefix(n).is_some_and(|p| !lists.contains_key(&joaat(&p))))
+        .map(|n| crate::meta7a::asset_id(&n))
+        .collect();
+    let parts_found: std::sync::Mutex<Vec<(u64, u64)>> = Default::default();
     // variation id -> wardrobe resources that define it (false), and head
     // drawable hash -> resources whose items name it (true)
     let found: Vec<(bool, u32, u64)> = ix
@@ -134,6 +150,15 @@ fn build(packs: &Path, ix: &ArchiveIndex) -> Models {
             let f = crate::meta7a::field_name;
             let k = f(0x6512_1749);
             let vars = m.objects(VARIATION);
+            if !vars.is_empty() && !targets.is_empty() {
+                // item names: the 64-bit name ids anywhere in the resource
+                let mut hit: Vec<(u64, u64)> = r.sys.chunks_exact(8).chain(r.gfx.chunks_exact(8)).map(|c| u64::from_le_bytes(c.try_into().unwrap())).filter(|h| targets.contains(h)).map(|h| (h, e.off)).collect();
+                hit.sort();
+                hit.dedup();
+                if !hit.is_empty() {
+                    parts_found.lock().unwrap().extend(hit);
+                }
+            }
             for &o in &vars {
                 if let Some(id) = m.scalars(VARIATION, o, &[]).get(&k).and_then(|x| x.as_u64()) {
                     v.push((false, id as u32, e.off));
@@ -175,7 +200,11 @@ fn build(packs: &Path, ix: &ArchiveIndex) -> Models {
             by_model.insert(model, ModelRow { resource, outfits });
         }
     }
-    Models { version: CACHE_VERSION, by_model, heads, aliases }
+    let mut parts: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for (h, off) in parts_found.into_inner().unwrap() {
+        parts.entry(h).or_default().push(off);
+    }
+    Models { version: CACHE_VERSION, by_model, heads, aliases, parts }
 }
 
 /// The model table (built from the packs.rpf index on first use, about ten
@@ -240,7 +269,7 @@ pub struct ModelNames {
     pub display: BTreeMap<u32, String>,
 }
 
-const NAMES_VERSION: u32 = 4;
+const NAMES_VERSION: u32 = 5;
 
 /// The cached story cutscene catalog (`sixng cutscenes` or the Scenes tab
 /// builds it), when there is one.
@@ -258,8 +287,21 @@ fn catalog_path(work: &Path) -> std::path::PathBuf {
 /// without `cs_`, names a listed model (`listed(joaat)`) that has no name yet.
 /// A name whose 64-bit id is also a scene file's ped model is certain; the
 /// others go to `uncertain`.
+/// The 64-bit model ids of a catalog's scene-file peds.
+fn scene_peds(c: &crate::cutscene::Catalog) -> HashSet<u64> {
+    c.files.iter().flat_map(|f| &f.objects).filter(|o| o.kind == "ped").filter_map(|o| o.model).collect()
+}
+
+/// The words of a name for candidate model names: lower case, at least three
+/// letters, digits cut off the end (`afinal_goon3` -> `afinal`, `goon`).
+fn name_words(n: &str) -> impl Iterator<Item = String> + '_ {
+    n.split(|c: char| !c.is_ascii_alphanumeric())
+        .map(|w| w.trim_end_matches(|c: char| c.is_ascii_digit()).to_ascii_lowercase())
+        .filter(|w| w.len() >= 3 && w.len() <= 20 && w.bytes().all(|c| c.is_ascii_lowercase()))
+}
+
 fn names_from_scenes(c: &crate::cutscene::Catalog, listed: impl Fn(u32) -> bool, names: &mut BTreeMap<u32, String>, uncertain: &mut std::collections::BTreeSet<u32>) {
-    let peds: HashSet<u64> = c.files.iter().flat_map(|f| &f.objects).filter(|o| o.kind == "ped").filter_map(|o| o.model).collect();
+    let peds = scene_peds(c);
     let mut handles: Vec<String> = c.dicts.iter().flat_map(|d| &d.clips).map(|cl| crate::cutscene::split_clip_name(cl).0.to_ascii_lowercase()).collect();
     handles.sort();
     handles.dedup();
@@ -352,9 +394,26 @@ fn build_names(game_root: &Path, work: &Path, t: &Models, ix: &ArchiveIndex) -> 
         }
     }
     let mut uncertain = std::collections::BTreeSet::new();
+    // the 64-bit model ids of the scene files' peds, and the words of the
+    // scenes' clip handles (`afinal_goon3` -> `afinal`, `goon`)
+    let mut peds: HashSet<u64> = HashSet::new();
+    let mut more_words: HashSet<String> = HashSet::new();
     if let Some(c) = cutscene_catalog(work) {
         names_from_scenes(&c, |h| keys.contains_key(&h), &mut names, &mut uncertain);
+        peds = scene_peds(&c);
+        for d in &c.dicts {
+            for cl in &d.clips {
+                more_words.extend(name_words(crate::cutscene::split_clip_name(cl).0));
+            }
+        }
     }
+    // the words of the name dictionary's names
+    if let Ok(d) = std::fs::read(crate::names::dict_path(work)).map_err(|_| ()).and_then(|b| serde_json::from_slice::<crate::names::Dict>(&b).map_err(|_| ())) {
+        for (n, _) in d.names.values().flatten() {
+            more_words.extend(name_words(n));
+        }
+    }
+    more_words.retain(|w| !words.contains(w));
     // the name dictionary
     for &h in keys.keys() {
         if !names.contains_key(&h) {
@@ -424,6 +483,8 @@ fn build_names(game_root: &Path, work: &Path, t: &Models, ix: &ArchiveIndex) -> 
         }
     };
     grouped(&words, &mut names, true, false);
+    grouped(&more_words, &mut names, true, false);
+    }
     // the text tables of data.rpf, when it is indexed
     let ixp = crate::scan::index_path(&work.join("index"), "data.rpf");
     if let Ok(dix) = crate::scan::load_index(&ixp) {
@@ -514,6 +575,34 @@ fn build_names(game_root: &Path, work: &Path, t: &Models, ix: &ArchiveIndex) -> 
             }
         }
     }
+    // A candidate whose 64-bit id is also a scene file's ped model is that
+    // model, whatever its form (`cs_felixtheten`, `g_m_m_cashcity_00`).
+    if !peds.is_empty() {
+        let prefixes: Vec<String> = ambient.iter().cloned().chain(["cs_", "csb_", "ig_", "hc_cs_", "hc_"].map(String::from)).collect();
+        let suffixes: Vec<String> = std::iter::once(String::new()).chain((0..13).map(|n| format!("_{n:02}"))).collect();
+        let found: Vec<(u32, String)> = words
+            .par_iter()
+            .chain(more_words.par_iter())
+            .flat_map_iter(|stem| {
+                let mut v = Vec::new();
+                for p in &prefixes {
+                    for x in &suffixes {
+                        let cand = format!("{p}{stem}{x}");
+                        let h = joaat(&cand);
+                        if keys.contains_key(&h) && peds.contains(&crate::meta7a::asset_id(&cand)) {
+                            v.push((h, cand));
+                        }
+                    }
+                }
+                v
+            })
+            .collect();
+        for (h, n) in found {
+            if !names.contains_key(&h) || uncertain.contains(&h) {
+                uncertain.remove(&h);
+                names.insert(h, n);
+            }
+        }
     uncertain.retain(|h| names.contains_key(h));
     ModelNames { version: NAMES_VERSION, names, uncertain, display }
 }
@@ -1095,6 +1184,11 @@ fn look_uncached(game_root: &Path, a: &ArchiveInfo, ix: &ArchiveIndex, model: &s
     if let Some(l) = out {
         return Ok(l);
     }
+    // A clothing set that another model's wardrobe wears (`cs_roxy` ->
+    // `cs_nastydimez_roxyrashad`)
+    if let Some(l) = look_by_parts(t, a, ix, model) {
+        return Ok(l);
+    }
     // The ped model table names a model after this character: `cs_lucia`
     // -> the one model whose character name is joaat("lucia"). That model's
     // outfits, with this character's own head when it has one.
@@ -1170,6 +1264,42 @@ fn look_by_alias(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) ->
         Some(_) => format!("{model} is not in the outfit list under its own name. The outfits of the model named after \"{short}\" ({was}) are shown with this character's own head."),
         None => format!("{model} has no head of its own and is not in the outfit list. The outfits and head of the model named after \"{short}\" ({was}) are shown."),
     });
+    Some(l)
+}
+
+/// For a character prefix the outfit list does not have, whose own parts
+/// a listed model's wardrobe names (`Models::parts`): that model's outfits,
+/// those that wear this prefix's parts first. `cs_roxy` is a head-less set
+/// of clothes; `cs_nastydimez_roxyrashad` wears them.
+fn look_by_parts(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Option<Look> {
+    let p = format!("{model}_");
+    let own: HashSet<String> = ix
+        .entries
+        .iter()
+        .filter(|e| e.rtype.as_deref() == Some("dr"))
+        .filter_map(|e| e.name.as_ref().map(|n| n.to_ascii_lowercase()))
+        .filter(|n| n.starts_with(&p) && crate::outfit::outfit_prefix(n).as_deref() == Some(model))
+        .collect();
+    let mut res: Vec<u64> = own.iter().flat_map(|n| t.parts.get(&crate::meta7a::asset_id(n)).cloned().unwrap_or_default()).collect();
+    res.sort();
+    res.dedup();
+    // of the models in those resources, the one with most outfits wearing these parts
+    let wears = |o: &Outfit| o.parts.iter().filter(|x| own.contains(&x.drawable)).count();
+    let names = model_names(&crate::export::game_root(a)).ok();
+    let mut best: Option<(usize, Look, String)> = None;
+    for (h, row) in t.by_model.iter().filter(|(_, r)| res.contains(&r.resource)) {
+        let Ok(l) = look_row(t, a, ix, model, row, false) else { continue };
+        let n = l.outfits.iter().filter(|o| wears(o) > 0).count();
+        if n > 0 && best.as_ref().is_none_or(|b| n > b.0) {
+            let name = names.and_then(|m| m.names.get(h).cloned()).unwrap_or_else(|| format!("ped_0x{h:08x}"));
+            best = Some((n, l, name));
+        }
+    }
+    let (_, mut l, other) = best?;
+    // stable: the outfits that wear most of this prefix's parts first
+    l.outfits.sort_by_key(|o| std::cmp::Reverse(wears(o)));
+    l.model = model.to_string();
+    l.note = Some(format!("{model} is not in the outfit list. Its parts are worn by the outfits of {other}, so that model's outfits are shown, those with these parts first."));
     Some(l)
 }
 
