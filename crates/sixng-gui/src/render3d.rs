@@ -166,11 +166,12 @@ pub struct Look {
     pub wear_from_config: bool,
     /// The shown vehicle has wear levels (set by the model view).
     pub wear_levels: bool,
-    /// With `wear_from_config`: also draw the second wear layer (the
-    /// primer). Off by default: its per-part colour-range samples and the
-    /// per-vehicle amount are not decoded and taken as 1, which shows far
-    /// more primer than the game on some parts.
-    pub primer: bool,
+    /// With `wear_from_config`: the amount of the second wear layer (the
+    /// primer), 0 (off, the default) to 1. The game takes it per vehicle at
+    /// run time (spawn data, or a record of a file that is not shipped), so
+    /// it is the user's to set; it scales the primer's summed mask level
+    /// before its window.
+    pub primer_amount: f32,
     pub slot: u32,
     pub paint: [f32; 3],
     pub paint2nd: [f32; 3],
@@ -209,7 +210,7 @@ impl Default for Look {
             wear: 0.0,
             wear_from_config: true,
             wear_levels: false,
-            primer: false,
+            primer_amount: 0.0,
             slot: 0,
             paint: [0.55, 0.02, 0.02],
             paint2nd: [0.6, 0.6, 0.62],
@@ -2438,8 +2439,8 @@ impl Renderer3D {
             prev_view_proj: vp.to_cols_array_2d(),
             // xyz: the body paint's coat; w: vehicle wear (0 to 1)
             // w < 0: each part's own wear amount from the part ramp image
-            // -2: the same, and the primer layer too
-            jitter: [look.coat[0], look.coat[1], look.coat[2], if look.wear_from_config && look.wear_levels { if look.primer { -2.0 } else { -1.0 } } else { look.wear }],
+            // -1 - a (a > 0): the same, and the primer layer at amount a
+            jitter: [look.coat[0], look.coat[1], look.coat[2], if look.wear_from_config && look.wear_levels { -1.0 - look.primer_amount.clamp(0.0, 1.0) } else { look.wear }],
             frame: [self.dither_frame, self.target.as_ref().map_or(aspect * 1080.0, |t| t.size[0] as f32), self.target.as_ref().map_or(1080.0, |t| t.size[1] as f32), 0.0],
             light_view_proj: self.light_vp,
         }

@@ -14,7 +14,9 @@
 //!   ramps of its colour set the game's strand shader takes).
 //!
 //! Each mesh's extras give `points_per_strand`, `strands`, the piece's slot,
-//! placeholder, bone and groom offset.
+//! placeholder, bone and groom offset, and in a character export
+//! `head_mesh` and `head_uv_set`: the head mesh and which of its UV sets
+//! (`TEXCOORD_n`) the root UVs are coordinates in (`root_uv_set`).
 use crate::gltf::StrandPrim;
 use crate::groom::{Coat, Groom};
 use serde_json::{json, Value};
@@ -180,9 +182,114 @@ pub fn placeholder_grooms(work: &std::path::Path, a: &crate::game::ArchiveInfo, 
     Ok(seen.into_values().map(|l| (crate::pedlook::slot_of(&l.placeholder), l.placeholder.clone(), t.uncontested(l), l.confidence)).collect())
 }
 
+/// A character's head mesh read back from its model GLB: the vertex
+/// positions (glTF space) and every UV set (`TEXCOORD_n`).
+pub struct HeadUvs {
+    /// The head's node name (the Blender object name after import).
+    pub name: String,
+    pub pos: Vec<[f32; 3]>,
+    pub sets: Vec<Vec<[f32; 2]>>,
+}
+
+/// The head mesh of a model GLB: the largest mesh named like a head
+/// drawable (`…_head_…` or `head_…`, not its eyes). None when there is
+/// none.
+pub fn head_from_glb(b: &[u8]) -> Option<HeadUvs> {
+    if b.len() < 20 || &b[0..4] != b"glTF" {
+        return None;
+    }
+    let jl = u32::from_le_bytes(b[12..16].try_into().ok()?) as usize;
+    let doc: Value = serde_json::from_slice(b.get(20..20 + jl)?).ok()?;
+    let bo = 20 + jl;
+    let bl = u32::from_le_bytes(b.get(bo..bo + 4)?.try_into().ok()?) as usize;
+    let bin = b.get(bo + 8..bo + 8 + bl)?;
+    // float accessor `i` as rows of `w` values
+    let floats = |i: &Value, w: usize| -> Option<Vec<f32>> {
+        let a = &doc["accessors"][i.as_u64()? as usize];
+        if a["componentType"].as_u64()? != 5126 {
+            return None;
+        }
+        let v = &doc["bufferViews"][a["bufferView"].as_u64()? as usize];
+        let off = (v["byteOffset"].as_u64().unwrap_or(0) + a["byteOffset"].as_u64().unwrap_or(0)) as usize;
+        let n = a["count"].as_u64()? as usize * w;
+        let raw = bin.get(off..off + n * 4)?;
+        Some(raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    };
+    let is_head = |n: &str| (n.contains("_head_") || n.starts_with("head_")) && !n.contains("eyes");
+    let mut best: Option<HeadUvs> = None;
+    for node in doc["nodes"].as_array()? {
+        let (Some(name), Some(mi)) = (node["name"].as_str(), node["mesh"].as_u64()) else { continue };
+        if !is_head(name) {
+            continue;
+        }
+        let Some(prim) = doc["meshes"][mi as usize]["primitives"].get(0) else { continue };
+        let at = &prim["attributes"];
+        let Some(p) = floats(&at["POSITION"], 3) else { continue };
+        let pos: Vec<[f32; 3]> = p.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+        let mut sets = Vec::new();
+        while let Some(u) = at.get(format!("TEXCOORD_{}", sets.len())).and_then(|i| floats(i, 2)) {
+            sets.push(u.chunks_exact(2).map(|c| [c[0], c[1]]).collect::<Vec<[f32; 2]>>());
+        }
+        if best.as_ref().is_none_or(|h| pos.len() > h.pos.len()) {
+            best = Some(HeadUvs { name: name.to_string(), pos, sets });
+        }
+    }
+    best
+}
+
+/// Which of the head's UV sets a groom's root UVs belong to: at every guide
+/// root, the UV of the nearest head vertex in each set against the root's
+/// stored UV; the set with the smallest median distance wins when that is
+/// under 0.05 (UV units) and under half the next set's. Returns (set,
+/// median distance). On the player
+/// heads checked, scalp hair matched set 3 and brows, lashes and beards set
+/// 2, to within 0.01; which set a groom uses is not found in the groom
+/// itself, hence the match.
+pub fn root_uv_set(g: &Groom, head: &HeadUvs) -> Option<(usize, f32)> {
+    let k = g.points_per_strand.max(1);
+    if g.root_uv.len() != g.strands || head.pos.is_empty() || head.sets.is_empty() {
+        return None;
+    }
+    // the nearest head vertex to each guide root (glTF space, as the head)
+    let near: Vec<usize> = (0..g.strands)
+        .map(|s| {
+            let r = g.points[s * k];
+            let q = [r[0], r[2], -r[1]];
+            let d = |p: &[f32; 3]| (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2);
+            (0..head.pos.len()).min_by(|&a, &b| d(&head.pos[a]).total_cmp(&d(&head.pos[b]))).unwrap_or(0)
+        })
+        .collect();
+    let mut med: Vec<(usize, f32)> = head
+        .sets
+        .iter()
+        .enumerate()
+        .map(|(si, set)| {
+            let mut e: Vec<f32> = near.iter().zip(&g.root_uv).map(|(&v, uv)| ((set[v][0] - uv[0]).powi(2) + (set[v][1] - uv[1]).powi(2)).sqrt()).collect();
+            e.sort_by(f32::total_cmp);
+            (si, e[e.len() / 2])
+        })
+        .collect();
+    med.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let next = med.get(1).map_or(f32::MAX, |m| m.1);
+    med.first().copied().filter(|b| b.1 < 0.05 && b.1 < next * 0.5)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_uvs_find_their_head_uv_set() {
+        // a head of three vertices whose UV set 1 is the groom's root UV
+        let head = HeadUvs { name: "h".into(), pos: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], sets: vec![vec![[0.9, 0.9], [0.1, 0.5], [0.5, 0.1]], vec![[0.2, 0.3], [0.4, 0.3], [0.2, 0.6]]] };
+        // guide roots in RAGE space: glTF (x, y, z) is RAGE (x, -z, y)
+        let pts = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.1], [1.0, 0.0, 0.0], [1.0, 0.0, 0.1], [0.0, 0.0, 1.0], [0.0, 0.0, 1.1]];
+        let g = Groom { tint_weight: 1.0, strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![[0.2, 0.3], [0.4, 0.3], [0.2, 0.6]], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0003, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![], twist: vec![], curl: Default::default() };
+        assert_eq!(root_uv_set(&g, &head), Some((1, 0.0)));
+        // no set close enough
+        let far = Groom { root_uv: vec![[0.7, 0.7]; 3], ..g.clone() };
+        assert_eq!(root_uv_set(&far, &head), None);
+    }
 
     #[test]
     fn resampled_strand_keeps_its_ends_and_spacing() {
