@@ -88,6 +88,27 @@ mod asset_id_tests {
     }
 }
 
+/// Named values of the executable's enums (`enum_values.txt`): enum hash
+/// -> value -> name.
+pub fn enum_values() -> &'static HashMap<u32, BTreeMap<i64, &'static str>> {
+    static M: std::sync::OnceLock<HashMap<u32, BTreeMap<i64, &'static str>>> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let mut m: HashMap<u32, BTreeMap<i64, &'static str>> = HashMap::new();
+        for l in include_str!("enum_values.txt").lines().filter(|l| !l.starts_with('#')) {
+            let mut it = l.split_whitespace();
+            let (Some(h), Some(v), Some(n)) = (it.next().and_then(|h| u32::from_str_radix(h, 16).ok()), it.next().and_then(|v| v.parse().ok()), it.next()) else { continue };
+            m.entry(h).or_default().insert(v, n);
+        }
+        m
+    })
+}
+
+/// Name of one enum value (`enum_hash` is the member's `extra`), if the
+/// executable's tables name it.
+pub fn enum_value_name(enum_hash: u32, value: i64) -> Option<&'static str> {
+    enum_values().get(&enum_hash)?.get(&value).copied()
+}
+
 /// A half float (member type 0x20) as f32. Infinity and NaN read as f32::MAX.
 pub fn half(h: u16) -> f32 {
     let (s, e, f) = (if h & 0x8000 != 0 { -1.0f32 } else { 1.0 }, (h >> 10) & 0x1f, (h & 0x3ff) as f32);
@@ -464,7 +485,33 @@ impl<'a> Meta<'a> {
     /// followed through pool references.
     pub fn dump(&self) -> serde_json::Value {
         let roots: Vec<_> = self.root_block().and_then(|(h, o)| self.object(h, o, 0)).into_iter().collect();
-        serde_json::json!({"schema": self.schema(), "roots": roots})
+        let mut v = serde_json::json!({"schema": self.schema(), "roots": roots});
+        let en = self.enum_names();
+        if !en.is_empty() {
+            v["enum_names"] = serde_json::json!(en);
+        }
+        v
+    }
+
+    /// Value names of the enum members (types 0x60-0x62, and arrays of
+    /// them) of this resource's structs, by field name: value -> name.
+    /// Only values named in the executable's enum tables are listed, so a
+    /// value missing here is unknown, not invalid.
+    pub fn enum_names(&self) -> BTreeMap<String, BTreeMap<i64, &'static str>> {
+        let mut out: BTreeMap<String, BTreeMap<i64, &'static str>> = BTreeMap::new();
+        for sd in self.structs.values() {
+            for m in &sd.members {
+                if m.hash == 0x100 {
+                    continue;
+                }
+                // an array's element is the member its `reference` points at
+                let el = if matches!(m.ty, 0x50..=0x5f) { sd.members.get(m.reference as usize) } else { Some(m) };
+                let Some(el) = el.filter(|e| matches!(e.ty, 0x60..=0x62)) else { continue };
+                let Some(vals) = enum_values().get(&el.extra) else { continue };
+                out.entry(field_name(m.hash)).or_default().extend(vals.iter().map(|(&v, &n)| (v, n)));
+            }
+        }
+        out
     }
 
     /// Every instance of every struct (hash 0x100 and up), decoded in full,
@@ -782,6 +829,22 @@ pub fn mlo_instances(m: &Meta) -> Vec<MloInstance> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enum_value_table() {
+        // rage__eLodType and the entity priority enum
+        assert_eq!(enum_value_name(0x4b5a_cc2f, 5), Some("LODTYPES_DEPTH_ORPHANHD"));
+        assert_eq!(enum_value_name(0x4b5a_cc2f, 6), Some("LODTYPES_DEPTH_SLOD4"));
+        assert_eq!(enum_value_name(0x0701_af5f, 0), Some("PRI_REQUIRED"));
+        assert_eq!(enum_value_name(0x0701_af5f, 99), None);
+        assert!(enum_values().values().map(|v| v.len()).sum::<usize>() > 3000);
+        for (h, vals) in enum_values() {
+            assert_ne!(*h, 0);
+            for n in vals.values() {
+                assert!(!n.is_empty() && !n.contains(char::is_whitespace));
+            }
+        }
+    }
 
     #[test]
     fn struct_names() {
