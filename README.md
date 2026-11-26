@@ -644,7 +644,13 @@ again**).
     abdomen) and now replaces the mesh's. Of the 2,645
     characters with a body skin, 1,042 change (1,798 body parts); 1,288
     parts already had the same map, and 2,204 whose item names no stored
-    normal map keep the mesh's.
+    normal map keep the mesh's. The same change applies to heads whose
+    outfit item names their face: 1,138 heads now take the face's own
+    normal map (wrinkles, brow and age detail) over the head mesh's,
+    which is generic, and on some heads (`cs_benedict_halifax`) is not a
+    normal map at all. Heads that borrow a face from another character
+    through the head skin table keep their mesh's normal map when it is
+    stored (22 heads), so they don't take another person's wrinkles.
   - **Fabric shading.** The colour is shaded by the green channel of the
     garment's own packed map (`speculartex`: seams and folds, mid grey on
     plain cloth). From the clothing pixel shader (`ped_standard_muv`, read
