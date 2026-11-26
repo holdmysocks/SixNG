@@ -1179,8 +1179,9 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   `local_atmosphere_cloud_wind_velocity_scale`), thresholded by the
   weather's cloud cover; the sky and every surface behind the layer are
   seen through it, and its shadow moves over the ground. A cloud has a flat
-  base and a rounded top whose height follows its cover, and is sampled
-  14 times along each ray from a per-pixel start (no slices). A cloud is lit by
+  base and a dome-shaped top whose height follows its cover, and is sampled
+  every 120 m along each ray (8 to 40 samples) from a per-pixel start (no
+  slices). A cloud is lit by
   the sun or moon through the cloud above it (forward-peaked) and by the
   sky. Our choices: the noise (2.5 km features), the extinction (0.004 per
   m at full density) and the drift speed (12 m/s at scale 1); the game's

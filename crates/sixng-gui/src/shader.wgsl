@@ -214,13 +214,18 @@ fn cloud_density3(p: vec3<f32>) -> f32 {
     let c = cloud_density(p.xz);
     if (c <= 0.0) { return 0.0; }
     let h = (p.y - S.cloud0.y) / max(S.cloud0.z - S.cloud0.y, 1.0);
-    let top = 0.15 + 0.85 * c;
-    return c * smoothstep(0.0, 0.06, h) * (1.0 - smoothstep(top * 0.55, top, h));
+    // a dome: the top rises with the square root of the cover, so the
+    // sides are steep and the top round (not a cone)
+    let top = 0.25 + 0.75 * sqrt(c);
+    let dome = 1.0 - smoothstep(top * 0.7, top, h);
+    return (0.4 + 0.6 * c) * smoothstep(0.0, 0.05, h) * dome * step(1e-3, c);
 }
 
-// Samples along a ray through the cloud layer (each pixel starts at its
-// own offset, so the steps do not show as slices).
-const CLOUD_STEPS: i32 = 14;
+// Samples along a ray through the cloud layer: one per CLOUD_STEP_M of
+// path, from 8 to CLOUD_STEPS (each pixel starts at its own offset, so the
+// steps do not show as slices).
+const CLOUD_STEPS: i32 = 40;
+const CLOUD_STEP_M: f32 = 120.0;
 
 // Light scattered towards the eye by the clouds along a ray from o in
 // direction d up to tmax (rgb), and the ray's transmittance through them (a).
@@ -241,9 +246,10 @@ fn clouds_along(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> vec4<f32> {
     t1 = min(t1, 40000.0);
     if (t1 <= t0) { return vec4(0.0, 0.0, 0.0, 1.0); }
     let len = t1 - t0;
-    let dt = len / f32(CLOUD_STEPS);
+    let steps = clamp(i32(ceil(len / CLOUD_STEP_M)), 8, CLOUD_STEPS);
+    let dt = len / f32(steps);
     // the pixel's own start in the first step, from its view direction
-    let jit = cloud_hash(d.xz * 5113.0 + vec2(d.y * 2971.0, 0.0) + fract(S.water4.w * 7.0) * 13.0);
+    let jit = cloud_hash(d.xz * 5113.0 + vec2(d.y * 2971.0, 0.0));
     let l = normalize(F.sun_dir.xyz);
     let lup = smoothstep(-0.05, 0.05, l.y);
     let c = dot(d, l);
@@ -253,7 +259,7 @@ fn clouds_along(o: vec3<f32>, d: vec3<f32>, tmax: f32) -> vec4<f32> {
     let sig = S.cloud0.w;
     var tr = 1.0;
     var lit = vec3(0.0);
-    for (var k = 0; k < CLOUD_STEPS; k++) {
+    for (var k = 0; k < steps; k++) {
         let p = o + d * (t0 + (f32(k) + jit) * dt);
         let dens = cloud_density3(p);
         if (dens <= 0.0) { continue; }
