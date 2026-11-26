@@ -413,6 +413,8 @@ pub struct PartFx {
     pub region_layer: u32,
     /// The item's hide masks: layer -> 256-bit region set (hex).
     pub hides: Vec<(u32, String)>,
+    /// The item's second mask list (`hides_sub`): layer, key (1 to 3), mask.
+    pub hides_sub: Vec<(u32, u32, String)>,
 }
 
 /// The strand count rule of a piece from its hair LOD preset (a record of the parsed presets) and the first
@@ -5369,8 +5371,6 @@ fn load_parts(
     // vertices are in hidden regions. Skin meshes without regions fall back
     // to hiding what lies right under a garment.
     let mut by_distance: Vec<std::ops::Range<usize>> = skin_meshes.clone();
-    // garments cut by the hide masks, which the distance test leaves alone
-    let mut masked: Vec<std::ops::Range<usize>> = Vec::new();
     if let Some(m) = &mut model {
         let (mut skin_hidden, mut cloth_hidden) = (0, 0);
         for (range, layer, off) in &region_parts {
@@ -5380,17 +5380,21 @@ fn load_parts(
             }
             // Clothes: the `_full` garment meshes carry no regions, so only a
             // garment drawn as its `_cull_00` twin (one another item hides
-            // regions of) is cut here; the rest stay with the distance test
-            // below. Part of the masks sits in a second list whose key is not
-            // decoded (`hides_sub`), and is not applied.
+            // regions of) is cut here. Every garment under another still goes
+            // through the distance test below as well: the masks leave some
+            // of an under-layer that pokes through (Pretzel's tank top under
+            // his open shirt).
             let is_skin = skin_meshes.contains(range);
             by_distance.retain(|r| r != range);
-            if !is_skin {
-                masked.push(range.clone());
-            }
             // only the items shown hide anything: a garment switched off
             // in the Parts panel leaves the skin under it whole
-            let masks: Vec<&str> = fx.iter().filter(|(o, _)| *o != off && parts.iter().any(|e| e.off == **o)).flat_map(|(_, f)| f.hides.iter()).filter(|h| h.0 == *layer).map(|h| h.1.as_str()).collect();
+            let mut masks: Vec<&str> = fx.iter().filter(|(o, _)| *o != off && parts.iter().any(|e| e.off == **o)).flat_map(|(_, f)| f.hides.iter()).filter(|h| h.0 == *layer).map(|h| h.1.as_str()).collect();
+            // The second mask list (`hides_sub`, keys 1 to 3, nested sets that add the belly band, the torso sides
+            // and, for key 3, the upper arms) is left out: when the game applies a key is not decoded (applying
+            // key 2 on a heavy body, the body-shape guess, removes only a few of the patches). Research:
+            // SIXNG_SUB=1,2 applies those keys.
+            let keys: Vec<u32> = std::env::var("SIXNG_SUB").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default();
+            masks.extend(fx.iter().filter(|(o, _)| *o != off && parts.iter().any(|e| e.off == **o)).flat_map(|(_, f)| f.hides_sub.iter()).filter(|h| h.0 == *layer && keys.contains(&h.1)).map(|h| h.2.as_str()));
             let hide: Vec<bool> = (0..256u32).map(|n| masks.iter().any(|k| sixng_core::wardrobe::mask_has(k, n))).collect();
             // The second byte of a body skin's regions is a region in a second layer, shared by the
             // two halves: the strip round the waist that both carry. Each half hides it there, so
@@ -5427,7 +5431,7 @@ fn load_parts(
         let mut hidden = 0;
         for &l in ls.iter().rev().skip(1).rev() {
             let pick = |f: &dyn Fn(u8) -> bool| layered.iter().filter(|x| f(x.1)).map(|x| x.0.clone()).collect::<Vec<_>>();
-            hidden += hide_covered_skin(m, &pick(&|x| x == l).into_iter().filter(|r| !masked.contains(r)).collect::<Vec<_>>(), &pick(&|x| x > l), 0.03);
+            hidden += hide_covered_skin(m, &pick(&|x| x == l), &pick(&|x| x > l), 0.03);
         }
         if hidden > 0 {
             notes.push(format!("Layers: {hidden} triangles of clothes worn under other clothes (under a jacket, or a t-shirt under an open shirt) are hidden where the clothes over them cover them, so they do not show through. Which is worn over which: a jacket over the rest, and an item whose hide masks name another item's layer over that item."));
@@ -6972,7 +6976,7 @@ fn load_query_sel(
                         }
                         if oi == k {
                             let body = p.slot == "body upper" || p.slot == "body lower";
-                            fx.insert(e.off, PartFx { tint: p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t.rows[0]))).filter(|t| t.1 != 255), colour: p.colour.map(|c| [c[1], c[2], c[3]]), tag: p.colour_tag, subs: p.preset_colours.clone(), preset: p.preset.as_deref().and_then(|h| u32::from_str_radix(h, 16).ok()), head: p.slot == "head", body, skeletal: body || matches!(p.slot.as_str(), "head" | "eyes" | "teeth" | "teeth accessory"), covers: matches!(p.slot.as_str(), "top" | "outer" | "bottom" | "full" | "feet" | "gloves"), layer: match p.slot.as_str() { "outer" => 2, "top" | "bottom" | "full" => 1, _ => 0 }, heel: p.slot == "feet" && p.drawable.split('_').any(|t| matches!(t, "sh" | "mh" | "hh")), region_layer: p.layer.as_deref().and_then(|l| u32::from_str_radix(l, 16).ok()).unwrap_or(match p.slot.as_str() { "body upper" => 0xb4d9_d470, "body lower" => 0xe062_2b84, _ => 0 }), hides: p.hides.iter().filter_map(|(l, m)| Some((u32::from_str_radix(l, 16).ok()?, m.clone()))).collect(), under: Vec::new(), skins: if p.slot == "head" || body { p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect() } else { Vec::new() } });
+                            fx.insert(e.off, PartFx { tint: p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t.rows[0]))).filter(|t| t.1 != 255), colour: p.colour.map(|c| [c[1], c[2], c[3]]), tag: p.colour_tag, subs: p.preset_colours.clone(), preset: p.preset.as_deref().and_then(|h| u32::from_str_radix(h, 16).ok()), head: p.slot == "head", body, skeletal: body || matches!(p.slot.as_str(), "head" | "eyes" | "teeth" | "teeth accessory"), covers: matches!(p.slot.as_str(), "top" | "outer" | "bottom" | "full" | "feet" | "gloves"), layer: match p.slot.as_str() { "outer" => 2, "top" | "bottom" | "full" => 1, _ => 0 }, heel: p.slot == "feet" && p.drawable.split('_').any(|t| matches!(t, "sh" | "mh" | "hh")), region_layer: p.layer.as_deref().and_then(|l| u32::from_str_radix(l, 16).ok()).unwrap_or(match p.slot.as_str() { "body upper" => 0xb4d9_d470, "body lower" => 0xe062_2b84, _ => 0 }), hides: p.hides.iter().filter_map(|(l, m)| Some((u32::from_str_radix(l, 16).ok()?, m.clone()))).collect(), hides_sub: p.hides_sub.iter().filter_map(|(l, k, m)| Some((u32::from_str_radix(l, 16).ok()?, *k, m.clone()))).collect(), under: Vec::new(), skins: if p.slot == "head" || body { p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect() } else { Vec::new() } });
                         }
                     }
                 }
