@@ -703,12 +703,15 @@ again**).
     39 on people) and the strengths (`6022028b` xy, 1 and 1). The game
     darkens the colour by `saturate(1 + x * mask * (2c - 1))` (c = control,
     mask = `speculartex2` R) and adds `y * mask` times the detail normal
-    to the tangent-space normal; the viewer does the same. Two per-ped
-    engine values also scale these terms (record `3b316b01`, +0x74 and
-    +0x30). The engine's default record sets both to 0, which turns the
-    detail normal and colour off. What a ped writes there is not traced, so
-    the viewer takes 1. A per-tile roughness term is not traced either
-    (taken as 0). **Occlusion**
+    to the tangent-space normal; the viewer does the same. Two values of
+    the ped's instance record (`3b316b01`) also scale these terms. Each
+    ped's record is a copy of its own data, which the ped's update keeps:
+    +0x74 fades the detail with the ped's distance from the camera (1 up to
+    6 m, 0 from 9 m; 20 to 21 m for some peds), and +0x30 is 1 in the
+    normal state. Up close both are 1, as the viewer takes them; the rules
+    are in `extras.skin_spec.detail.per_ped`. (The engine's default record,
+    0 and 0, is only for entities without a record of their own.) A
+    per-tile roughness term is not traced (taken as 0). **Occlusion**
     (`speculartex` B) enters the G-buffer as `lerp(1, B, strength)`, the
     strength being material constant `4d1ecedd`. The lighting multiplies
     the diffuse ambient by it and the specular ambient by its fourth root,

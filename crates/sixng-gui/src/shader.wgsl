@@ -1661,8 +1661,9 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     var n = normalize(i.nrm);
     if (ff == (i.extra.w < 0.0)) { n = -n; }
     let tl = length(i.tan.xyz);
-    // ped skin's engine detail (both skin programs; the two per-ped engine
-    // scales on it taken as 1, the per-tile roughness term as 0)
+    // ped skin's engine detail (both skin programs; the two per-ped scales
+    // on it are 1 up close, which the viewer takes: the strength fades out
+    // from 6 to 9 m from the camera; the per-tile roughness term as 0)
     let skin_det_on = (M.flags.w & 64u) != 0u && (M.flags.w & 256u) == 0u;
     let det_gx = dpdx(i.uv0 * M.strand.yz);
     let det_gy = dpdy(i.uv0 * M.strand.yz);

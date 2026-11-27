@@ -65,8 +65,15 @@
 //! with `c` = control R and `mask` = `speculartex2` R,
 //! `colour *= saturate(1 + strength.x * mask * (2c - 1))`, tangent normal
 //! `xy += strength.y * mask * detail.xy`, at UV0 x `uv_scale`. Two values
-//! of a per-ped engine record scale the normal and colour terms (taken as
-//! 1); a per-tile engine value scales a roughness term (taken as 0).
+//! of the ped's instance record (`3b316b01`, `per_ped_detail_json`) scale these
+//! terms; each ped's record is a copy of its owner object's data (owner +
+//! 0x20), which the ped's update keeps: +0x74 scales both terms and fades
+//! with the ped's distance from the camera, `1 - saturate((dist - 6) /
+//! 3)` (6 to 9 m; 20 to 21 m when the owner's flag byte +0x22b has bit 0),
+//! +0x30 scales the normal term's tiling blend and is 1 unless bit 1 or 2
+//! of that byte is set (then `1 - c` with a per-ped byte `c`). Up close
+//! both are 1, as the viewer takes them. A per-tile engine value scales a
+//! roughness term (taken as 0).
 //!
 //! Occlusion (`speculartex` B) enters the G-buffer as
 //! `lerp(1, B, strength)` with the material's constant `4d1ecedd`; the
@@ -424,6 +431,16 @@ pub fn write_translucency_png(out: &Path, spec: &str, bias: f32, prof: &SssProfi
     Some(rel)
 }
 
+/// The per-ped scales on the skin detail, as `extras.skin_spec.detail.per_ped`.
+pub fn per_ped_detail_json() -> Value {
+    serde_json::json!({
+        "record": "3b316b01",
+        "strength": {"offset": "0x74", "rule": "1 - saturate((camera distance - near) / (far - near)), near 6 m, far 9 m (20 and 21 m when the owner's flag byte +0x22b has bit 0); scales both detail terms", "close_up": 1.0},
+        "normal_blend": {"offset": "0x30", "rule": "1; 1 - c (c = owner byte +0x22a / 255) when bit 1 or 2 of the owner's flag byte +0x22b is set", "close_up": 1.0},
+        "engine_default": "the record for entities with none of their own has both at 0 (detail off)"
+    })
+}
+
 /// The tile of the detail atlases a skin region (0-15) uses.
 pub fn detail_slice(table: [u32; 3], region: u32) -> u32 {
     let f = |w: u32| (w >> (2 * region)) & 3;
@@ -499,7 +516,8 @@ pub fn detail_json(shader_hash: &str, consts: &[crate::drawable::ShaderConst], g
         "forced_slice": force,
         "atlases": {"normal": format!("{DETAIL_NORMAL_ATLAS:016x}"), "control": format!("{DETAIL_CONTROL_ATLAS:016x}"), "store": "data/ttdb/graphics/ttdb_graphics.ttpf"},
         "layout": "4 x 4 sheets of 256 x 256 tiles, region r (speculartex2 G: u32(16 G + 0.5)) at column r % 4, row r / 4",
-        "rule": "uv = UV0 * uv_scale; c = control sheet R, d = normal sheet RG * 2 - 1, mask = speculartex2 R; colour *= saturate(1 + strength.x * mask * (2c - 1)); tangent-space normal xy += strength.y * mask * d (before z is rebuilt). Where speculartex2 G straddles two regions the game samples both and averages."
+        "rule": "uv = UV0 * uv_scale; c = control sheet R, d = normal sheet RG * 2 - 1, mask = speculartex2 R; colour *= saturate(1 + strength.x * mask * (2c - 1)); tangent-space normal xy += strength.y * mask * d (before z is rebuilt). Where speculartex2 G straddles two regions the game samples both and averages.",
+        "per_ped": per_ped_detail_json()
     });
     match write_detail_sheets(game_root, tdir, &slices) {
         Ok([n, c]) => {
@@ -672,6 +690,14 @@ mod tests {
         apply_gltf(&mut g2, &mut x2, "210fbc6a", &entries[1..], &SkinConsts { fresnel: None, ..Default::default() }, None, None, None);
         assert_eq!(g2, json!({}));
         assert_eq!(x2, json!({}));
+    }
+
+    #[test]
+    fn per_ped_detail_is_one_up_close() {
+        let j = per_ped_detail_json();
+        assert_eq!(j["record"], "3b316b01");
+        assert_eq!(j["strength"]["close_up"], 1.0);
+        assert_eq!(j["normal_blend"]["close_up"], 1.0);
     }
 
     #[test]
