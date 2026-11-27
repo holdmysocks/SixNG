@@ -598,6 +598,11 @@ pub fn render_hint(name: Option<&str>, has_model: bool) -> Option<&'static str> 
 /// parentIndex, `e74c3c23` parentInstance, `a687ac89` numChildren,
 /// `bf74dfa7` lodDist (-1 = the archetype's lodDist), `ca974bcd`
 /// childLodDist, `2691f019` priorityLevel.
+/// The level and priority value names come from the executable's enum
+/// tables (`examples/exeschema.rs`): rage__eLodType (`4b5acc2f`, HD 0,
+/// LOD 1, SLOD1-3 2-4, ORPHANHD 5, SLOD4 6) and the priority enum
+/// (`0701af5f`, PRI_REQUIRED 0, PRI_OPTIONAL_HIGH 1, PRI_OPTIONAL_MEDIUM 2,
+/// PRI_OPTIONAL_LOW 3).
 /// With `parentInstance` = -1, `parentIndex` indexes the entities of the
 /// parent map file (named by `parent_hash` when set). With
 /// `parentInstance` >= 0 the parent is that instance of a prop batch in
@@ -629,6 +634,13 @@ pub fn entity_lod(f: &BTreeMap<String, serde_json::Value>) -> serde_json::Value 
         "lod_dist": g(0xbf74_dfa7),
         "child_lod_dist": g(0xca97_4bcd),
         "priority": i(0x2691_f019),
+        "priority_name": i(0x2691_f019).map(|p| match p {
+            0 => "REQUIRED",
+            1 => "OPTIONAL_HIGH",
+            2 => "OPTIONAL_MEDIUM",
+            3 => "OPTIONAL_LOW",
+            _ => "unknown",
+        }),
     })
 }
 
@@ -840,6 +852,18 @@ mod tests {
         assert_eq!(v[&6], serde_json::json!("ab"));
         assert_eq!(v[&7], serde_json::json!(u64::MAX));
         assert!(is_scalar_type(0x01) && !is_scalar_type(0x05) && !is_scalar_type(0x52));
+    }
+
+    #[test]
+    fn entity_lod_names() {
+        let mut f = BTreeMap::new();
+        f.insert("6c8f1715".to_string(), serde_json::json!(5));
+        f.insert("2691f019".to_string(), serde_json::json!(2));
+        let l = entity_lod(&f);
+        assert_eq!(l["level"], "ORPHAN_HD");
+        assert_eq!(l["priority"], 2);
+        assert_eq!(l["priority_name"], "OPTIONAL_MEDIUM");
+        assert!(entity_lod(&BTreeMap::new())["priority_name"].is_null());
     }
 
     #[test]
