@@ -1775,7 +1775,7 @@ fn write_pools(dir: &std::path::Path, pools: &[PoolSurface], unplaced: &Unplaced
         let prims = ix.iter().map(|&i| &pools[i]).map(|p| TriPrim {
             name: p.name.clone(), positions: p.positions.clone(), normals: None, tangents: None, uvs: if p.uvs.is_empty() { vec![] } else { vec![p.uvs.clone()] },
             colors: None, colors1: None, regions: None, tint: None, indices: p.indices.clone(), material: Some(mi),
-            joints: None, weights: None, joints1: None, weights1: None,
+            joints: None, weights: None, joints1: None, weights1: None, morphs: Vec::new(),
         }).collect();
         groups.push(NodeGroup { name: k.to_string(), prims });
     }
