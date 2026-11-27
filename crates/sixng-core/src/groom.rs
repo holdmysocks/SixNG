@@ -107,6 +107,30 @@ pub struct Groom {
     /// strand (graphics header +0x24, a byte offset; 0 = none). Read from
     /// the game's strand generator.
     pub twist: Vec<[u8; 4]>,
+    /// The game's strand simulation inputs (`SimData`), None when the
+    /// groom stores none.
+    pub sim: Option<SimData>,
+}
+
+/// What the game's strand simulation (`smh_sim`) reads from a groom, per
+/// guide point (strand-major, like `Groom::points`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SimData {
+    /// Graphics header +0x34 (B1), low half float: the compliance c of the
+    /// pull toward the posed guide (0 at the root, rising to the tip).
+    pub c: Vec<f32>,
+    /// B1's high half float: the compliance of the bend constraint that
+    /// keeps each segment's angle to the one before (high at the root,
+    /// low at the tip).
+    pub bend: Vec<f32>,
+    /// Graphics header +0x50 bit 7: the bend constraint is on.
+    pub bend_on: bool,
+    /// Graphics header +0x38 (B2): the rest length of the segment ending at
+    /// each point; at the root the strand's whole length.
+    pub rest: Vec<f32>,
+    /// System +0xF6 (half float): the velocity damping rate per second; the
+    /// game damps by clamp(1 - dt x rate, 1e-6, 1) per step.
+    pub damping: f32,
 }
 
 /// One strand style record: 2D offsets across the strand along its length.
@@ -310,6 +334,35 @@ impl Colliders {
             }
         }
         (1.0 - best.sqrt() / Self::FALLOFF).clamp(0.0, 1.0)
+    }
+
+    /// The point pushed out of the body bound's shapes and boxes onto their
+    /// surface (unchanged outside them, or with only surface points).
+    pub fn push_out(&self, mut p: [f32; 3]) -> [f32; 3] {
+        if self.shapes.is_empty() && self.boxes.is_empty() {
+            return p;
+        }
+        let dist = |q: [f32; 3]| self.shapes.iter().map(|t| t.dist(q)).chain(self.boxes.iter().map(|b| b.dist(q))).fold(f32::MAX, f32::min);
+        // a few rounds: a point pushed out of one shape can end in another
+        for _ in 0..4 {
+            let d = dist(p);
+            if d >= 0.0 {
+                break;
+            }
+            let e = 1.0e-4;
+            let n = [0, 1, 2].map(|i| {
+                let (mut a, mut b) = (p, p);
+                a[i] += e;
+                b[i] -= e;
+                (dist(a) - dist(b)) / (2.0 * e)
+            });
+            let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            if l < 1.0e-6 {
+                break;
+            }
+            p = [0, 1, 2].map(|i| p[i] - d * n[i] / l);
+        }
+        p
     }
 
     /// The style weight at `p` for the instance strength `strength`: the
@@ -803,10 +856,149 @@ pub fn parse(r: &Resource) -> Result<Groom> {
         crate::hairgen::Style { bend: v(0), fade: v(1), noise: v(2), curl: v(3), noise_freq: v(4), curl_freq: v(5) }
     };
     let style = if r.sys.len() >= 0x110 { [style_at(0xF8), style_at(0x104)] } else { Default::default() };
-    Ok(Groom { tint_weight: r.sys.get(0x12C).map_or(1.0, |b| *b as f32 / 255.0), strands: s, points_per_strand: k, points, w, roots, lengths, root_uv, bones, root_box, group_box, tri_counts, width, taper, pick_steps, seed: gu32(0x7C), length_var: [f16(gu16(0x60)), f16(gu16(0x62))], head: g.get(..0xC0).map_or(Vec::new(), |h| h.to_vec()), corners, clump_scale: [0x12A, 0x12B].map(|o| r.sys.get(o).map_or(1.0, |b| *b as f32 / 255.0)), styles, clump_type: r.sys.get(0x12D).copied().unwrap_or(0), guide_tri, twist, curl: style })
+    // the strand simulation's inputs: B1 (4 bytes per point, the low half float is c) and B2 (a half
+    // float per point, the rest length); a groom without them is not simulated
+    let (b1, b2) = (b(1), b(2));
+    let sim = match (g.get(b1..b1 + s * k * 4), g.get(b2..b2 + s * k * 2)) {
+        (Some(cb), Some(lb)) if b1 > 0 && b2 > 0 => {
+            let c: Vec<f32> = cb.chunks_exact(4).map(|q| f16(u16::from_le_bytes([q[0], q[1]]))).collect();
+            let bend: Vec<f32> = cb.chunks_exact(4).map(|q| f16(u16::from_le_bytes([q[2], q[3]]))).collect();
+            let rest: Vec<f32> = lb.chunks_exact(2).map(|q| f16(u16::from_le_bytes([q[0], q[1]]))).collect();
+            let ok = c.iter().chain(&rest).all(|x| x.is_finite() && *x >= 0.0 && *x < 1.0e4) && bend.iter().all(|x| x.is_finite());
+            ok.then(|| SimData { c, bend, bend_on: gu32(0x50) & 0x80 != 0, rest, damping: Some(f16(r.u16(0xF6))).filter(|x| x.is_finite() && *x >= 0.0).unwrap_or(0.0) })
+        }
+        _ => None,
+    };
+    Ok(Groom { tint_weight: r.sys.get(0x12C).map_or(1.0, |b| *b as f32 / 255.0), strands: s, points_per_strand: k, points, w, roots, lengths, root_uv, bones, root_box, group_box, tri_counts, width, taper, pick_steps, seed: gu32(0x7C), length_var: [f16(gu16(0x60)), f16(gu16(0x62))], head: g.get(..0xC0).map_or(Vec::new(), |h| h.to_vec()), corners, clump_scale: [0x12A, 0x12B].map(|o| r.sys.get(o).map_or(1.0, |b| *b as f32 / 255.0)), styles, clump_type: r.sys.get(0x12D).copied().unwrap_or(0), guide_tri, twist, curl: style, sim })
 }
 
 impl Groom {
+    /// The guides as the game's strand simulation leaves them on a still
+    /// character, as its close-up variant does (`smh_sim_1`, which the
+    /// game runs within the hair LOD presets' SimFeatureCutoff, 15 m on
+    /// most; read from its programs by the shader archive work): each guide
+    /// hangs from its root under gravity, held to its rest lengths, bent
+    /// back toward its stored segment angles and pulled back toward its
+    /// stored shape, and is pushed out of the body's colliders. The stored
+    /// guides stand in for the game's poses A and B (the guides skinned to
+    /// the current pose); the viewer draws the bind pose, so they are the
+    /// same.
+    ///
+    /// Per point k (stored point B, c and rest length L from `SimData`,
+    /// a = the point's w, which the groom stores as L / 10; g = (0, 0, -9.8)
+    /// m/s^2 as the game's code sets it):
+    /// - start: x_k = x_(k-1) + L_k normalize((B_k - B_(k-1)) + c a g)
+    ///   (the game's start estimate), then out of the colliders;
+    /// - each step (dt = 1/30 s, the rate the program's constants are tuned
+    ///   to): v = damp (v + g dt / 2), x += dt v; x += f (B - x) with
+    ///   f = 1 / (1 + a c / dt^2); out of the colliders; then from the root,
+    ///   x_k = x_(k-1) + L_k normalize((x_k - x_(k-1)) + s (x_(k+1) - x_k))
+    ///   with s the program's look-ahead when the next segment is
+    ///   stretched; then, from the third point on when the bend constraint
+    ///   is on, the segment is turned toward its stored angle to the one
+    ///   before: the shortest turn q from the stored previous segment to the
+    ///   current one, target = q (B_k - B_(k-1)), and
+    ///   D = h (target - (x_k - x_(k-1))) goes on x_k and off x_(k-1), with
+    ///   h = 0.5 / (1 + a c_b / dt^2) and c_b = B1's high half + 0.3937 x
+    ///   127 d^8 (d the collider damping at the point), at least 0.001;
+    ///   v from the change of position.
+    ///
+    /// The roots stay. Runs until no point moves 0.05 mm in a step, or 300
+    /// steps, at dt = 0.05 s (the game's substeps run from 1.8 to 1 times
+    /// the frame time; the settled shape does not depend on dt). Left out:
+    /// the extra velocity damping of the follow-the-leader step and the
+    /// point radius against the colliders (both set per instance at run
+    /// time), wind, and sim_1's distance-dependent scale on the pull's
+    /// compliance (medium confidence in its reading, and it needs per-node
+    /// pose data the viewer does not build). Returns false
+    /// (guides unchanged) when the groom stores no simulation data.
+    pub fn settle(&mut self, colliders: Option<&Colliders>) -> bool {
+        let Some(sim) = self.sim.as_ref() else { return false };
+        let k = self.points_per_strand;
+        if k < 2 || sim.c.len() != self.points.len() || sim.rest.len() != self.points.len() || self.w.len() != self.points.len() {
+            return false;
+        }
+        const DT: f32 = 0.05;
+        const G: [f32; 3] = [0.0, 0.0, -9.8];
+        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let cross = |a: [f32; 3], b: [f32; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+        let damp = (1.0 - DT * sim.damping).clamp(1.0e-6, 1.0);
+        let add = |a: [f32; 3], b: [f32; 3]| [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+        let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+        let scale = |a: [f32; 3], f: f32| [a[0] * f, a[1] * f, a[2] * f];
+        let len = |a: [f32; 3]| (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+        let unit = |a: [f32; 3], or: [f32; 3]| {
+            let l = len(a);
+            if l > 1.0e-9 { scale(a, 1.0 / l) } else { or }
+        };
+        let out = |p: [f32; 3]| colliders.map_or(p, |c| c.push_out(p));
+        let pose = self.points.clone();
+        for s in 0..self.strands {
+            let at = s * k;
+            let b = &pose[at..at + k];
+            let a = |j: usize| self.w[at + j].max(0.0);
+            let c = |j: usize| sim.c[at + j];
+            let l = |j: usize| sim.rest[at + j].max(1.0e-6);
+            let f = |j: usize| 1.0 / (1.0 + a(j) * c(j) / (DT * DT));
+            // the start estimate
+            let mut x = b.to_vec();
+            for j in 1..k {
+                let dir = unit(add(sub(b[j], b[j - 1]), scale(G, c(j) * a(j))), [0.0, 0.0, -1.0]);
+                x[j] = out(add(x[j - 1], scale(dir, l(j))));
+            }
+            let mut v = vec![[0.0f32; 3]; k];
+            // the root's entry is the whole strand: the look-ahead fades as the remaining length runs out
+            let total = l(0);
+            for _ in 0..300 {
+                let start = x.clone();
+                for j in 1..k {
+                    v[j] = scale(add(v[j], scale(G, DT * 0.5)), damp);
+                    let p = add(start[j], scale(v[j], DT));
+                    let p = add(p, scale(sub(b[j], p), f(j)));
+                    x[j] = out(p);
+                }
+                let mut remaining = total;
+                for j in 1..k {
+                    let lj = l(j);
+                    let ahead = if j + 1 < k {
+                        let stretch = len(sub(x[j + 1], x[j])) / l(j + 1) - 1.0;
+                        (stretch * 2.0 * (1.0 - lj / remaining.max(1.0e-6)).clamp(0.0, 1.0)).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    remaining -= lj;
+                    let toward = if j + 1 < k { add(sub(x[j], x[j - 1]), scale(sub(x[j + 1], x[j]), ahead)) } else { sub(x[j], x[j - 1]) };
+                    x[j] = add(x[j - 1], scale(unit(toward, sub(b[j], b[j - 1])), lj));
+                    if sim.bend_on && j >= 2 {
+                        // the shortest turn from the stored previous segment to the current one, applied to the stored segment
+                        let u = unit(sub(b[j - 2], b[j - 1]), [0.0, 0.0, 1.0]);
+                        let w = unit(sub(x[j - 2], x[j - 1]), u);
+                        let (cq, axis) = (dot(u, w), cross(u, w));
+                        let rest = sub(b[j], b[j - 1]);
+                        let target = if cq > -0.999 { add(add(scale(rest, cq), cross(axis, rest)), scale(axis, dot(axis, rest) / (1.0 + cq))) } else { rest };
+                        let d = colliders.map_or(0.0, |c| c.damp(x[j]));
+                        let cb = (sim.bend[at + j].max(0.0) + 0.3937 * (127.0 * d.powi(8)).floor()).max(0.001 * (1.0 / (360.0 * DT)).min(1.0));
+                        let h = 0.5 / (1.0 + a(j) * cb / (DT * DT));
+                        let delta = scale(sub(target, sub(x[j], x[j - 1])), h);
+                        x[j] = add(x[j], delta);
+                        x[j - 1] = sub(x[j - 1], delta);
+                    }
+                }
+                let mut moved = 0.0f32;
+                for j in 1..k {
+                    let d = sub(x[j], start[j]);
+                    v[j] = scale(d, 1.0 / DT);
+                    moved = moved.max(len(d));
+                }
+                if moved < 5.0e-5 {
+                    break;
+                }
+            }
+            self.points[at..at + k].copy_from_slice(&x);
+        }
+        true
+    }
+
     /// Line-segment indices (pairs) along every strand.
     pub fn segments(&self) -> Vec<u32> {
         let k = self.points_per_strand as u32;
@@ -1613,6 +1805,82 @@ pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], o
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One horizontal guide of `k` points, 2 cm apart along +x, with the
+    /// simulation data the game stores (a = L / 10 in w).
+    fn hanging(k: usize, c: f32, bend: f32, bend_on: bool) -> Groom {
+        let l = 0.02f32;
+        let points: Vec<[f32; 3]> = (0..k).map(|j| [j as f32 * l, 0.0, 0.0]).collect();
+        let rest: Vec<f32> = (0..k).map(|j| if j == 0 { l * (k - 1) as f32 } else { l }).collect();
+        let w: Vec<f32> = rest.iter().map(|r| r / 10.0).collect();
+        let cs: Vec<f32> = (0..k).map(|j| if j == 0 { 0.0 } else { c }).collect();
+        Groom { tint_weight: 1.0, strands: 1, points_per_strand: k, points, w, roots: vec![], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![], twist: vec![], curl: Default::default(), sim: Some(SimData { c: cs, bend: vec![bend; k], bend_on, rest, damping: 0.0 }) }
+    }
+
+    fn seg(g: &Groom, j: usize) -> f32 {
+        let (a, b) = (g.points[j - 1], g.points[j]);
+        ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2) + (b[2] - a[2]).powi(2)).sqrt()
+    }
+
+    #[test]
+    fn a_soft_guide_hangs_and_keeps_its_lengths() {
+        let mut g = hanging(6, 100.0, 10.0, false);
+        assert!(g.settle(None));
+        assert_eq!(g.points[0], [0.0; 3]);
+        // gravity pulls the free end well down; the segments keep their rest length
+        assert!(g.points[5][2] < -0.05, "tip {:?}", g.points[5]);
+        for j in 1..6 {
+            assert!((seg(&g, j) - 0.02).abs() < 1.0e-4, "segment {j}: {}", seg(&g, j));
+        }
+    }
+
+    #[test]
+    fn a_guide_without_compliance_keeps_its_shape() {
+        let mut g = hanging(6, 0.0, 0.0, true);
+        let before = g.points.clone();
+        assert!(g.settle(None));
+        for (p, q) in g.points.iter().zip(&before) {
+            assert!((0..3).all(|i| (p[i] - q[i]).abs() < 1.0e-4), "{p:?} against {q:?}");
+        }
+    }
+
+    #[test]
+    fn the_bend_constraint_holds_the_shape_against_gravity() {
+        // a guide with a stored corner: four points out along +x, then four up along +z
+        let cornered = |bend_on: bool| {
+            let mut g = hanging(8, 100.0, 1.0, bend_on);
+            for j in 4..8 {
+                g.points[j] = [0.06, 0.0, (j - 3) as f32 * 0.02];
+            }
+            g.settle(None);
+            g
+        };
+        // the angle in degrees between the segments before and after point 3
+        let turn = |g: &Groom| {
+            let (a, b, c) = (g.points[2], g.points[3], g.points[4]);
+            let (u, v) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - b[0], c[1] - b[1], c[2] - b[2]]);
+            let d = (u[0] * v[0] + u[1] * v[1] + u[2] * v[2]) / (seg(g, 3) * seg(g, 4));
+            d.clamp(-1.0, 1.0).acos().to_degrees()
+        };
+        let (free, bent) = (cornered(false), cornered(true));
+        // gravity straightens the free guide; the bend constraint keeps the corner
+        assert!(turn(&bent) > turn(&free) + 20.0, "bent {} free {}", turn(&bent), turn(&free));
+    }
+
+    #[test]
+    fn a_guide_without_simulation_data_is_left_alone() {
+        let mut g = hanging(4, 100.0, 1.0, false);
+        g.sim = None;
+        assert!(!g.settle(None));
+    }
+
+    #[test]
+    fn push_out_puts_a_point_on_the_shape() {
+        let c = Colliders::shapes(vec![Taper { a: [0.0; 3], b: [0.0; 3], ra: 0.1, rb: 0.1 }]);
+        let p = c.push_out([0.05, 0.0, 0.0]);
+        assert!((p[0] - 0.1).abs() < 1.0e-3 && p[1].abs() < 1.0e-3 && p[2].abs() < 1.0e-3, "{p:?}");
+        assert_eq!(c.push_out([0.2, 0.0, 0.0]), [0.2, 0.0, 0.0]);
+    }
     #[test]
     fn full_strand_set_follows_the_stored_counts() {
         // three guides of two points each, one root triangle that stores 5 + 2 strands
@@ -1641,6 +1909,7 @@ mod tests {
             clump_type: 0,
             guide_tri: vec![],
             twist: vec![],
+            sim: None,
         };
         let c = g.coat(1.0);
         assert_eq!(c.guides.len(), 7);
@@ -1819,7 +2088,7 @@ mod tests {
     }
     #[test]
     fn segments() {
-        let g = Groom { tint_weight: 1.0, strands: 2, points_per_strand: 3, points: vec![[0.0; 3]; 6], w: vec![0.0; 6], roots: vec![[0, 1, 1]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![], twist: vec![], curl: Default::default() };
+        let g = Groom { tint_weight: 1.0, strands: 2, points_per_strand: 3, points: vec![[0.0; 3]; 6], w: vec![0.0; 6], roots: vec![[0, 1, 1]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![], twist: vec![], curl: Default::default(), sim: None };
         assert_eq!(g.segments(), vec![0, 1, 1, 2, 3, 4, 4, 5]);
         assert_eq!(g.root_indices(), vec![0, 3, 3]);
     }
@@ -1827,7 +2096,7 @@ mod tests {
     fn coat_from_strand_counts() {
         // one root triangle of three 2-point guides, 40 + 10 stored strands
         let pts = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.1], [1.0, 0.0, 0.0], [1.0, 0.0, 0.1], [0.0, 1.0, 0.0], [0.0, 1.0, 0.1]];
-        let g = Groom { tint_weight: 1.0, strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![[40, 10, 1, 0]], width: 0.0003, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![], twist: vec![], curl: Default::default() };
+        let g = Groom { tint_weight: 1.0, strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![[40, 10, 1, 0]], width: 0.0003, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![], twist: vec![], curl: Default::default(), sim: None };
         assert_eq!(g.stored_strands(), 50);
         let c = g.coat(1.0);
         assert_eq!((c.guides.len(), c.points.len(), c.stored), (50, 100, 50));
