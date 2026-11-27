@@ -1882,7 +1882,7 @@ impl Renderer3D4 {
         } else {
             Some(
                 self.device
-                    .new_buffer_with_bytes(vertex_bytes, ResourceOptions::SHARED)?,
+                    .new_buffer_with_bytes(&vertex_bytes, ResourceOptions::SHARED)?,
             )
         };
         let index_staging = if loaded_from_cache || index_bytes.is_empty() {
@@ -1890,7 +1890,7 @@ impl Renderer3D4 {
         } else {
             Some(
                 self.device
-                    .new_buffer_with_bytes(index_bytes, ResourceOptions::SHARED)?,
+                    .new_buffer_with_bytes(&index_bytes, ResourceOptions::SHARED)?,
             )
         };
 
