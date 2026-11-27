@@ -2336,6 +2336,60 @@ impl Uploader {
     }
 }
 
+/// Draws in a fixed order (decals by layer, blended back to front): binds
+/// only what changed since the last draw, and joins a mesh to the pending
+/// draw when it is the same model and material and its indices follow on
+/// (the order is unchanged).
+#[derive(Default)]
+struct SortedDraws<'a> {
+    model: Option<&'a GpuModel>,
+    mat: usize,
+    buf: Option<&'a wgpu::Buffer>,
+    run: Option<(std::ops::Range<u32>, u32)>,
+}
+
+impl<'a> SortedDraws<'a> {
+    fn draw(&mut self, pass: &mut wgpu::RenderPass<'_>, gm: &'a GpuModel, me: &'a GpuMesh) -> u32 {
+        let first = me.first();
+        let same_model = self.model.is_some_and(|m| std::ptr::eq(m, gm));
+        let same = same_model && self.mat == me.material && self.buf == Some(&me.vb);
+        if let Some((r, _)) = &mut self.run {
+            if same && r.end == first {
+                r.end = first + me.n_idx;
+                return 0;
+            }
+        }
+        let n = self.flush(pass);
+        if !same_model {
+            pass.set_bind_group(0, &gm.frame_bg, &[]);
+            pass.set_vertex_buffer(1, gm.instances.slice(..));
+            self.model = Some(gm);
+            self.mat = usize::MAX;
+        }
+        if self.mat != me.material {
+            pass.set_bind_group(1, &gm.mat_bg[me.material], &[]);
+            self.mat = me.material;
+        }
+        if self.buf != Some(&me.vb) {
+            pass.set_vertex_buffer(0, me.vb.slice(..));
+            pass.set_index_buffer(me.ib.slice(..), wgpu::IndexFormat::Uint32);
+            self.buf = Some(&me.vb);
+        }
+        self.run = Some((first..first + me.n_idx, gm.n_normal()));
+        n
+    }
+
+    fn flush(&mut self, pass: &mut wgpu::RenderPass<'_>) -> u32 {
+        match self.run.take() {
+            Some((r, inst)) => {
+                pass.draw_indexed(r, 0, 0..inst);
+                1
+            }
+            None => 0,
+        }
+    }
+}
+
 impl Renderer3D {
     /// Build wireframe edge buffers (on first use).
     pub fn ensure_edges(&self, rs: &egui_wgpu::RenderState, gm: &mut GpuModel, m: &glb::Model) {
@@ -3378,8 +3432,8 @@ impl Renderer3D {
             if self.decal_bias {
                 let eye = cam.eye();
                 let mut dl: Vec<(u8, bool, f32, &GpuModel, &GpuMesh)> = Vec::new();
-                for gm in models {
-                    for me in gm.meshes.iter().filter(|m| m.visible) {
+                for gm in models.iter().filter(|gm| gm.n_normal() > 0) {
+                    for me in gm.meshes.iter().filter(|m| m.visible && m.n_idx > 0) {
                         if let Some(o) = gm.mat_decal[me.material] {
                             let blend = look.mode == 0
                                 && (gm.mat_alpha[me.material] == 2
@@ -3396,23 +3450,22 @@ impl Renderer3D {
                         .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
                 });
                 let mut cur: Option<bool> = None;
+                let mut st = SortedDraws::default();
                 for (_, blend, _, gm, me) in dl {
                     if cur != Some(blend) {
+                        draws += st.flush(&mut pass);
                         pass.set_pipeline(if blend {
                             &self.pipe_decal_blend
                         } else {
                             &self.pipe_decal
                         });
                         cur = Some(blend);
+                        // a new pipeline: bind everything again
+                        st = SortedDraws::default();
                     }
-                    pass.set_bind_group(0, &gm.frame_bg, &[]);
-                    pass.set_vertex_buffer(1, gm.instances.slice(..));
-                    pass.set_bind_group(1, &gm.mat_bg[me.material], &[]);
-                    pass.set_vertex_buffer(0, me.vb.slice(..));
-                    pass.set_index_buffer(me.islice(), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..me.n_idx, 0, 0..gm.n_normal());
-                    draws += 1;
+                    draws += st.draw(&mut pass, gm, me);
                 }
+                draws += st.flush(&mut pass);
             }
             drop(pass);
             // the blended pass: the depth is read only, so the blended draws
@@ -3442,8 +3495,8 @@ impl Renderer3D {
             if look.mode == 0 {
                 let eye = cam.eye();
                 let mut bl: Vec<(f32, &GpuModel, &GpuMesh)> = Vec::new();
-                for gm in models {
-                    for me in gm.meshes.iter().filter(|m| m.visible) {
+                for gm in models.iter().filter(|gm| gm.n_normal() > 0) {
+                    for me in gm.meshes.iter().filter(|m| m.visible && m.n_idx > 0) {
                         if self.decal_bias && gm.mat_decal[me.material].is_some() {
                             continue;
                         }
@@ -3457,15 +3510,11 @@ impl Renderer3D {
                 bl.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
                 pass.set_pipeline(&self.pipe_blend);
                 pass.set_bind_group(2, &t.scene_bg, &[]);
+                let mut st = SortedDraws::default();
                 for (_, gm, me) in bl {
-                    pass.set_bind_group(0, &gm.frame_bg, &[]);
-                    pass.set_vertex_buffer(1, gm.instances.slice(..));
-                    pass.set_bind_group(1, &gm.mat_bg[me.material], &[]);
-                    pass.set_vertex_buffer(0, me.vb.slice(..));
-                    pass.set_index_buffer(me.islice(), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..me.n_idx, 0, 0..gm.n_normal());
-                    draws += 1;
+                    draws += st.draw(&mut pass, gm, me);
                 }
+                draws += st.flush(&mut pass);
             }
             if look.wire {
                 pass.set_pipeline(&self.pipe_wire);
