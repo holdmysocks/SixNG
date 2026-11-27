@@ -162,6 +162,111 @@ pub fn save(path: &Path, l: &Livery) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The undo history of a vehicle's livery.
+///
+/// A step is what changed between two moments of rest: a drag, a turn of
+/// the wheel or a run of typing is one step, taken when the pointer is up
+/// and nothing has changed for `History::REST` seconds.
+#[derive(Default)]
+pub struct History {
+    /// The vehicle the history belongs to; another vehicle starts anew.
+    tag: String,
+    /// The livery at the last moment of rest.
+    base: Livery,
+    /// As it was a frame ago, and when it last changed.
+    seen: Livery,
+    changed_at: f64,
+    undo: Vec<Livery>,
+    redo: Vec<Livery>,
+}
+
+impl History {
+    /// Seconds without a change before a step is taken.
+    pub const REST: f64 = 0.35;
+    /// Steps kept.
+    pub const STEPS: usize = 200;
+
+    /// What counts as the livery: not the numbers the viewer writes back
+    /// for reference (`shader_uv` changes a frame after the placement).
+    fn plain(l: &Livery) -> Livery {
+        let mut l = l.clone();
+        for s in &mut l.stickers {
+            s.shader_uv = None;
+        }
+        l
+    }
+
+    /// Forget everything; `now` is the start.
+    pub fn reset(&mut self, tag: &str, now: &Livery) {
+        *self = History { tag: tag.to_string(), base: Self::plain(now), seen: Self::plain(now), ..Default::default() };
+    }
+
+    /// Call every frame. `t`: the time, seconds; `held`: a pointer button
+    /// is down (a drag is not over). True while a change waits to become
+    /// a step (call again within `REST`).
+    pub fn track(&mut self, tag: &str, now: &Livery, t: f64, held: bool) -> bool {
+        if self.tag != tag {
+            self.reset(tag, now);
+            return false;
+        }
+        let now = Self::plain(now);
+        if now != self.seen {
+            self.seen = now;
+            self.changed_at = t;
+        }
+        if self.seen == self.base {
+            return false;
+        }
+        if held || t - self.changed_at < Self::REST {
+            return true;
+        }
+        self.step();
+        false
+    }
+
+    /// Take the pending change as a step now.
+    fn step(&mut self) {
+        if self.seen != self.base {
+            self.undo.push(std::mem::replace(&mut self.base, self.seen.clone()));
+            if self.undo.len() > Self::STEPS {
+                self.undo.remove(0);
+            }
+            self.redo.clear();
+        }
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty() || self.seen != self.base
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty() && self.seen == self.base
+    }
+
+    /// Go back one step. True when `now` changed.
+    pub fn undo(&mut self, now: &mut Livery) -> bool {
+        self.seen = Self::plain(now);
+        self.step();
+        let Some(back) = self.undo.pop() else { return false };
+        self.redo.push(std::mem::replace(&mut self.base, back));
+        self.seen = self.base.clone();
+        *now = self.base.clone();
+        true
+    }
+
+    /// Go forward one step again. Nothing after a new change.
+    pub fn redo(&mut self, now: &mut Livery) -> bool {
+        if Self::plain(now) != self.base {
+            return false;
+        }
+        let Some(on) = self.redo.pop() else { return false };
+        self.undo.push(std::mem::replace(&mut self.base, on));
+        self.seen = self.base.clone();
+        *now = self.base.clone();
+        true
+    }
+}
+
 /// One sticker zone of a loaded model.
 #[derive(Clone, Debug, Default)]
 pub struct Zone {
@@ -861,6 +966,54 @@ mod tests {
         assert!((c[0] - 0.5).abs() < 1e-4 && (c[1] - 0.5).abs() < 1e-4);
         // 80 % of 4 m wide is 3.2 m; at 4:1 that is 0.8 m high, which fits 2 m
         assert!((size[0] - 3.2).abs() < 1e-3 && (size[1] - 0.8).abs() < 1e-3, "{size:?}");
+    }
+
+    #[test]
+    fn undo_goes_back_a_step_and_redo_forward() {
+        let sticker = |x: f32| {
+            let mut s = Sticker::new(Picture::Game("0".into()));
+            s.centre = [x, 0.5];
+            s
+        };
+        let mut l = Livery::default();
+        let mut h = History::default();
+        assert!(!h.track("car", &l, 0.0, false));
+        assert!(!h.can_undo() && !h.can_redo());
+        // a sticker is added, then dragged over several frames: two steps
+        l.stickers.push(sticker(0.1));
+        assert!(h.track("car", &l, 1.0, false));
+        assert!(!h.track("car", &l, 1.5, false));
+        for (k, t) in [2.0, 2.1, 2.2].into_iter().enumerate() {
+            l.stickers[0].centre[0] = 0.2 + k as f32 * 0.1;
+            assert!(h.track("car", &l, t, true));
+        }
+        // still held: no step however long it rests
+        assert!(h.track("car", &l, 9.0, true));
+        // what the viewer writes back is not a change
+        l.stickers[0].shader_uv = Some([1.0; 6]);
+        assert!(!h.track("car", &l, 9.5, false));
+        assert!(h.can_undo() && !h.can_redo());
+        assert!(h.undo(&mut l));
+        assert_eq!(l.stickers[0].centre[0], 0.1);
+        assert!(h.undo(&mut l));
+        assert!(l.stickers.is_empty());
+        assert!(!h.undo(&mut l) && !h.can_undo());
+        assert!(h.redo(&mut l) && h.redo(&mut l) && !h.redo(&mut l));
+        assert_eq!(l.stickers[0].centre[0], 0.4);
+        // undo right after a change takes the change back, without waiting
+        l.stickers[0].rotation = 90.0;
+        assert!(h.track("car", &l, 10.0, false));
+        assert!(h.undo(&mut l));
+        assert_eq!(l.stickers[0].rotation, 0.0);
+        // a new change after an undo drops what could be redone
+        assert!(h.can_redo());
+        l.stickers[0].mirror = true;
+        h.track("car", &l, 11.0, false);
+        h.track("car", &l, 12.0, false);
+        assert!(!h.can_redo() && !h.redo(&mut l));
+        // another vehicle starts anew
+        assert!(!h.track("truck", &l, 13.0, false));
+        assert!(!h.can_undo());
     }
 
     #[test]

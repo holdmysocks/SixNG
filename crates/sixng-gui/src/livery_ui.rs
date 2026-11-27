@@ -103,6 +103,14 @@ pub struct Editor {
     pub ready: bool,
     pub auto_click: Vec<[f32; 2]>,
     pub auto_drag: Option<[f32; 2]>,
+    /// `--livery-undo N`, `--livery-redo N`: after the other scripted steps,
+    /// undo N steps, then redo N (before a scripted save).
+    pub auto_undo: usize,
+    pub auto_redo: usize,
+    /// When the scripted steps were done (the undo steps wait for the
+    /// change to come to rest).
+    auto_rest: Option<f64>,
+    history: livery::History,
     /// `--livery-save`: save once the scripted steps are done.
     pub auto_save: bool,
     /// `--livery-brand NAME`: put on the vehicle's game livery of this name
@@ -142,6 +150,10 @@ impl Default for Editor {
             auto_click: Vec::new(),
             auto_drag: None,
             auto_save: false,
+            auto_undo: 0,
+            auto_redo: 0,
+            auto_rest: None,
+            history: Default::default(),
             auto_brand: None,
             brands: Default::default(),
             brands_started: false,
@@ -274,7 +286,7 @@ impl Editor {
 
     /// Scripted steps are still to run.
     fn scripting(&self) -> bool {
-        self.auto_select.is_some() || !self.auto_add.is_empty() || !self.auto_click.is_empty() || self.auto_drag.is_some() || self.auto_save || self.auto_brand.is_some()
+        self.auto_select.is_some() || !self.auto_add.is_empty() || !self.auto_click.is_empty() || self.auto_drag.is_some() || self.auto_save || self.auto_brand.is_some() || self.auto_undo > 0 || self.auto_redo > 0
     }
 
     fn start_brands(&mut self, env: &Env, ctx: &egui::Context) {
@@ -478,6 +490,16 @@ impl State {
         self.changed();
     }
 
+    /// Undo (`back`) or redo one step.
+    fn step(&mut self, back: bool) {
+        let done = if back { self.ed.history.undo(&mut self.livery) } else { self.ed.history.redo(&mut self.livery) };
+        if done {
+            self.ed.selected = self.ed.selected.filter(|i| *i < self.livery.stickers.len());
+            self.status = if back { "undone".into() } else { "redone".into() };
+            self.changed();
+        }
+    }
+
     fn save_to(&mut self, file: &Path) {
         match livery::save(file, &self.livery) {
             Ok(()) => {
@@ -490,6 +512,22 @@ impl State {
 
     /// The Liveries window and, when asked for, the sticker picker.
     pub fn panel(&mut self, ctx: &egui::Context, within: egui::Rect, env: &Env) {
+        // the undo history follows the livery whether the panel is open or not
+        let (t, held) = ctx.input(|i| (i.time, i.pointer.any_down()));
+        let vehicle = self.vehicle.clone();
+        if self.ed.history.track(&vehicle, &self.livery, t, held) {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(livery::History::REST));
+        }
+        // Ctrl+Z, Ctrl+Y or Ctrl+Shift+Z, while no text is being typed
+        if self.ed.open && !ctx.egui_wants_keyboard_input() {
+            let (undo, redo) = ctx.input_mut(|i| {
+                let redo = i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z) || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y);
+                (!redo && i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z), redo)
+            });
+            if undo || redo {
+                self.step(undo);
+            }
+        }
         let selected = if self.ed.open { self.ed.selected.filter(|i| *i < self.livery.stickers.len()) } else { None };
         self.ed.selected = self.ed.selected.filter(|i| *i < self.livery.stickers.len());
         let tint = selected.is_some() && self.ed.tool == Tool::Zones;
@@ -568,6 +606,12 @@ impl State {
                 self.livery.stickers.clear();
                 self.ed.selected = None;
                 self.changed();
+            }
+            if ui.add_enabled(self.ed.history.can_undo(), egui::Button::new("Undo")).on_hover_text("Undo the last change to the stickers (Ctrl+Z). A drag or a run of typing is one step.").clicked() {
+                self.step(true);
+            }
+            if ui.add_enabled(self.ed.history.can_redo(), egui::Button::new("Redo")).on_hover_text("Redo what was undone (Ctrl+Y or Ctrl+Shift+Z)").clicked() {
+                self.step(false);
             }
             ui.menu_button("File", |ui| {
                 if ui.button("Save a copy…").clicked() {
@@ -1101,6 +1145,23 @@ impl State {
         }
         self.ed.auto_click.clear();
         self.ed.auto_drag = None;
+        if self.ed.auto_undo > 0 || self.ed.auto_redo > 0 {
+            // once the scripted changes have come to rest and are a step
+            let t = ui.input(|i| i.time);
+            let since = *self.ed.auto_rest.get_or_insert(t);
+            if t - since < livery::History::REST * 2.0 {
+                ui.ctx().request_repaint();
+                return false;
+            }
+            if self.ed.auto_undo > 0 {
+                self.ed.auto_undo -= 1;
+                self.step(true);
+            } else {
+                self.ed.auto_redo -= 1;
+                self.step(false);
+            }
+            return false;
+        }
         if self.ed.auto_save {
             self.ed.auto_save = false;
             let file = self.file(Path::new(env.work));
