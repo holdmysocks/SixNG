@@ -5905,6 +5905,9 @@ fn load_parts(
     if let (Some(m), false) = (&mut model, rig_parts.is_empty()) {
         if rig_character(m, &rig_parts, &skin_meshes) {
             notes.push("Rig: every part is bound to the shared skeleton, so the Pose controls move the body with its clothes. A part's own helper bones follow the body bone they hang from (the game drives them with data that is not decoded), and the first four of a vertex's eight bone weights are used, so joints bend more simply than in the game.".to_string());
+            if let Some(n) = teeth_follow_jaw(m).filter(|&n| n > 0) {
+                notes.push(format!("Jaw: the teeth, tongue and inner mouth take {n} of the head's shape keys that move the jaw (open, forward, back, sideways), fitted on the chin as a turn about the jaw bone or a shift, so they open with the mouth in the Expression panel. The game turns the jaw in code; the angle here is fitted from the skin."));
+            }
         }
     }
     if let (Some(m), Some(s)) = (&mut model, head_shape) {
@@ -6899,6 +6902,61 @@ fn rig_character(m: &mut glb::Model, parts: &[(std::ops::Range<usize>, Vec<glb::
     }
     m.joints = joints;
     true
+}
+
+/// The head's jaw shape keys on the teeth, tongue and inner mouth (see
+/// `sixng_core::jawkeys`): the vertices skinned under `FB_Jaw` get a key of
+/// the same name that moves them with the chin. The model is Y up, Z forward;
+/// the fit works Z up, -Y forward. Returns the number of keys, or `None`
+/// when the model has no jaw bone, head keys or teeth.
+fn teeth_follow_jaw(m: &mut glb::Model) -> Option<usize> {
+    use sixng_core::jawkeys;
+    let jaw = m.joints.iter().position(|j| j.name.eq_ignore_ascii_case("FB_Jaw"))?;
+    let under: Vec<bool> = (0..m.joints.len())
+        .map(|i| std::iter::successors(Some(i), |&x| m.joints[x].parent.filter(|&p| p != x)).take(256).any(|x| x == jaw))
+        .collect();
+    let zup = |p: [f32; 3]| [p[0], -p[2], p[1]];
+    let yup = |p: [f32; 3]| [p[0], p[2], -p[1]];
+    let pivot = zup(glam::Mat4::from_cols_array(&m.joints[jaw].ibm).inverse().w_axis.truncate().to_array());
+    let weight = |v: &glb::Vertex| -> f32 {
+        let all: u32 = v.weights.iter().map(|&w| w as u32).sum();
+        let on: u32 = (0..4).filter(|&k| under.get(v.joints[k] as usize).copied().unwrap_or(false)).map(|k| v.weights[k] as u32).sum();
+        if all > 0 { on as f32 / all as f32 } else { 0.0 }
+    };
+    let jaw_w: Vec<Option<Vec<f32>>> = m.meshes.iter().map(|me| me.skinned.then(|| me.verts.iter().map(weight).collect::<Vec<f32>>()).filter(|w| w.iter().any(|&x| x > 0.0))).collect();
+    let head = m.meshes.iter().position(|me| me.morphs.iter().any(|x| x.0.starts_with("face_")))?;
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for (mi, me) in m.meshes.iter().enumerate().filter(|x| x.0 != head) {
+        let Some(w) = &jaw_w[mi] else { continue };
+        for (v, &x) in me.verts.iter().zip(w) {
+            if x > 0.5 {
+                let p = zup(v.pos);
+                for a in 0..3 {
+                    lo[a] = lo[a].min(p[a]);
+                    hi[a] = hi[a].max(p[a]);
+                }
+            }
+        }
+    }
+    if lo[0] > hi[0] {
+        return None;
+    }
+    let hm = &m.meshes[head];
+    let hpos: Vec<[f32; 3]> = hm.verts.iter().map(|v| zup(v.pos)).collect();
+    let hmorphs: Vec<(String, Vec<[f32; 3]>)> = hm.morphs.iter().map(|(n, d)| (n.clone(), d.iter().map(|&x| zup(x)).collect())).collect();
+    let hw = jaw_w[head].clone().unwrap_or_else(|| vec![0.0; hpos.len()]);
+    let (_, keys) = jawkeys::fit_keys(pivot, &hpos, &hw, &hmorphs, lo, hi).ok()?;
+    if keys.is_empty() {
+        return Some(0);
+    }
+    for (mi, me) in m.meshes.iter_mut().enumerate() {
+        let Some(w) = &jaw_w[mi] else { continue };
+        let pos: Vec<[f32; 3]> = me.verts.iter().map(|v| zup(v.pos)).collect();
+        let mut morphs: Vec<(String, Vec<[f32; 3]>)> = me.morphs.iter().map(|(n, d)| (n.clone(), d.iter().map(|&x| zup(x)).collect())).collect();
+        jawkeys::add_keys(&mut morphs, &keys, pivot, &pos, w);
+        me.morphs = morphs.into_iter().map(|(n, d)| (n, d.into_iter().map(yup).collect())).collect();
+    }
+    Some(keys.len())
 }
 
 /// How far out each shown garment is worn, for hiding what is under it:
