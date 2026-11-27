@@ -3677,8 +3677,10 @@ impl ModelView {
         }
         let cache = self.cache_dir();
         self.livery.ed.ready = !self.loading && self.idle_for_model() && self.frames_since_load >= 3;
+        // clicks land on the vehicle as it is drawn: doors open, a roof down
+        let skin = if self.livery.ed.open { self.joint_mats().1 } else { Vec::new() };
         let Some(l) = &self.loaded else { return false };
-        let env = crate::livery_ui::Env { game: &self.game, work: &self.work, cache: &cache, config: self.veh_cfg };
+        let env = crate::livery_ui::Env { game: &self.game, work: &self.work, cache: &cache, config: self.veh_cfg, skin: &skin };
         self.livery.pointer(ui, resp, rect, &self.cam, &l.model, &env)
     }
 
@@ -4515,7 +4517,7 @@ impl ModelView {
         // the Liveries panel floats over the view
         if self.is_vehicle() {
             let cache = self.cache_dir();
-            let env = crate::livery_ui::Env { game: &self.game, work: &self.work, cache: &cache, config: self.veh_cfg };
+            let env = crate::livery_ui::Env { game: &self.game, work: &self.work, cache: &cache, config: self.veh_cfg, skin: &[] };
             self.livery.panel(&ctx, rect, &env);
         }
         self.sync_livery(rs);
