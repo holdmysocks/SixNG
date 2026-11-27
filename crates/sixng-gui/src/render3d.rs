@@ -62,6 +62,10 @@ struct MatU {
     /// x: strand width factor of a strand piece this frame (the stored strands over the drawn ones, as the
     /// game's count rule draws fewer strands at its target thickness); 1 otherwise.
     strand: [f32; 4],
+    /// Ped glass (`glb::Material::glass`, the material library's transmission
+    /// record): [σA rgb, wA], [σB rgb, wB], [d_base, d_max, p, h0],
+    /// [k, t, d_mask, 1 = glass]; all zero otherwise.
+    glass: [[f32; 4]; 4],
 }
 
 #[repr(C)]
@@ -517,6 +521,9 @@ pub struct GpuModel {
     pub mat_class: Vec<u32>,
     /// Decal layer order per material (None = not a decal).
     pub mat_decal: Vec<Option<u8>>,
+    /// Ped glass per material: drawn with the tinted-glass blend when the
+    /// device has dual-source blending.
+    pub mat_glass: Vec<bool>,
     /// All material uniforms in one buffer, MAT_STRIDE bytes apart.
     mat_ub: wgpu::Buffer,
     mat_cpu: Vec<MatU>,
@@ -717,6 +724,9 @@ pub fn class_id(c: &str) -> u32 {
 pub struct Renderer3D {
     pipe_opaque: wgpu::RenderPipeline,
     pipe_blend: wgpu::RenderPipeline,
+    /// Ped glass's dual-source blend (None: the device has no dual-source
+    /// blending, or a map renderer); glass is then drawn with `pipe_blend`.
+    pipe_glass: Option<wgpu::RenderPipeline>,
     /// The blended draws' view of the scene depth (group 2).
     bgl_scene: wgpu::BindGroupLayout,
     /// Decal-bucket materials: depth-biased toward the camera so coplanar
@@ -1431,6 +1441,55 @@ impl Renderer3D {
             Some(wgpu::BlendState::ALPHA_BLENDING),
             depth(false, wgpu::CompareFunction::Greater),
         );
+        // ped glass: the game's dual-source blend, dst' = src0 + dst x src1
+        // (glass.wgsl), in a shader module of its own so that devices without
+        // dual-source blending still build the rest; only the model viewer
+        // sets glass records, so only its renderer builds it
+        let pipe_glass = (!hdr && device.features().contains(wgpu::Features::DUAL_SOURCE_BLENDING)).then(|| {
+            let src = format!("enable dual_source_blending;\n{}\n{}\n{}", include_str!("atmo_common.wgsl"), include_str!("shader.wgsl"), include_str!("glass.wgsl"));
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("sixng glass shader"),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            });
+            let blend = wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::Src1,
+                operation: wgpu::BlendOperation::Add,
+            };
+            let blend_a = wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::Src1Alpha,
+                operation: wgpu::BlendOperation::Add,
+            };
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("glass"),
+                layout: Some(&layout_blend),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_mesh"),
+                    compilation_options: Default::default(),
+                    buffers: &vbufs,
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: depth(false, wgpu::CompareFunction::Greater),
+                multisample: ms,
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_mesh_glass"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: color_fmt,
+                        blend: Some(wgpu::BlendState { color: blend, alpha: blend_a }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        });
         let pipe_wire = mk(
             "wire",
             &layout,
@@ -1820,6 +1879,7 @@ impl Renderer3D {
             depth_fmt,
             pipe_opaque,
             pipe_blend,
+            pipe_glass,
             bgl_scene,
             pipe_decal,
             pipe_decal_blend,
@@ -2140,6 +2200,7 @@ impl Uploader {
         let mut mat_bg = Vec::new();
         let mut mat_cpu = Vec::new();
         let mut mat_alpha = Vec::new();
+        let mut mat_glass = Vec::new();
         let mut mat_class = Vec::new();
         let mut mat_decal = Vec::new();
         let default = glb::Material {
@@ -2165,6 +2226,7 @@ impl Uploader {
             occlusion_only: false,
             skin_spec: None,
             skin_detail: None,
+            glass: None,
             emissive_scale: 1.0,
             lit: false,
             emissive_tint: [1.0; 3],
@@ -2269,6 +2331,14 @@ impl Uploader {
                     Some(s) => [1.0, s.uv_scale[0], s.uv_scale[1], s.strength[0]],
                     None => [1.0, 0.0, 0.0, 0.0],
                 },
+                glass: mt.glass.map_or([[0.0; 4]; 4], |g| {
+                    [
+                        [g.absorption[0], g.absorption[1], g.absorption[2], g.absorption_albedo],
+                        [g.scattering[0], g.scattering[1], g.scattering[2], g.scattering_albedo],
+                        [g.thickness, g.path_cap, g.anisotropy, g.back_front],
+                        [g.alpha_divisor, g.opaque_from, g.thickness_mask, 1.0],
+                    ]
+                }),
             };
             let o = k * MAT_STRIDE as usize;
             mat_bytes[o..o + std::mem::size_of::<MatU>()].copy_from_slice(bytemuck::bytes_of(&u));
@@ -2323,6 +2393,7 @@ impl Uploader {
             mat_alpha.push(alpha);
             mat_class.push(class_id(&mt.class));
             mat_decal.push(mt.decal);
+            mat_glass.push(mt.glass.is_some());
         }
         queue.write_buffer(&mat_ub, 0, &mat_bytes);
         // one vertex and one index buffer for all meshes (fewer GPU objects:
@@ -2426,6 +2497,7 @@ impl Uploader {
             order,
             mat_bg,
             mat_alpha,
+            mat_glass,
             mat_class,
             mat_decal,
             mat_ub,
@@ -3726,7 +3798,7 @@ impl Renderer3D {
                 });
                 pass.set_bind_group(2, &t.scene_bg, &[]);
                 late_culled += bl.iter().filter(|e| !e.5).count() as u32;
-                late += Self::record_joined(&mut pass, bl.iter().map(|e| (&self.pipe_blend, e.1, e.3, e.4, e.5)));
+                late += Self::record_joined(&mut pass, bl.iter().map(|e| (if e.3.mat_glass[e.4.material] { self.pipe_glass.as_ref().unwrap_or(&self.pipe_blend) } else { &self.pipe_blend }, e.1, e.3, e.4, e.5)));
             }
             MESH_CULLED[3].fetch_add(late_culled, std::sync::atomic::Ordering::Relaxed);
             draws += late;
