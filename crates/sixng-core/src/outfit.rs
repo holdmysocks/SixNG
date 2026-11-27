@@ -708,7 +708,7 @@ mod tests {
         assert_eq!(m[0].parent, None);
         let mut p = TriPrim {
             name: "p".into(), positions: vec![[0.0; 3]; 2], normals: None, tangents: None, uvs: vec![], colors: None, colors1: None, regions: None, tint: None, indices: vec![], material: None,
-            joints: Some(vec![[0, 3, 2, 7], [1, 1, 1, 1]]), weights: Some(vec![[100, 100, 55, 0], [255, 0, 0, 0]]), joints1: None, weights1: None,
+            joints: Some(vec![[0, 3, 2, 7], [1, 1, 1, 1]]), weights: Some(vec![[100, 100, 55, 0], [255, 0, 0, 0]]), joints1: None, weights1: None, morphs: Vec::new(),
         };
         remap_joints(&mut p, &maps[1]);
         assert_eq!(p.joints.unwrap(), [[4, 3, 1, u16::MAX], [0, 0, 0, 0]]);

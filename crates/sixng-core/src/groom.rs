@@ -846,7 +846,7 @@ impl Groom {
     /// Ribbon GLB with one plain material of colour `rgb` (linear).
     pub fn ribbon_glb(&self, name: &str, half_width: f32, rgb: [f32; 3], extras: serde_json::Value) -> Vec<u8> {
         let (positions, normals, uv, indices) = self.ribbons(half_width);
-        let prim = crate::gltf::TriPrim { name: name.to_string(), positions, normals: Some(normals), tangents: None, uvs: vec![uv], colors: None, colors1: None, regions: None, tint: None, indices, material: Some(0), joints: None, weights: None, joints1: None, weights1: None };
+        let prim = crate::gltf::TriPrim { name: name.to_string(), positions, normals: Some(normals), tangents: None, uvs: vec![uv], colors: None, colors1: None, regions: None, tint: None, indices, material: Some(0), joints: None, weights: None, joints1: None, weights1: None, morphs: Vec::new() };
         let mat = crate::gltf::Material {
             name: "hair".into(),
             base_color_uri: None,
@@ -1276,7 +1276,7 @@ impl Groom {
                 idx.extend_from_slice(&[v0, v0 + 1, v0 + 3, v0, v0 + 3, v0 + 2]);
             }
         }
-        let prim = crate::gltf::TriPrim { name: name.to_string(), positions: pos, normals: Some(nrm), tangents: Some(tan), uvs: if uv0.is_empty() { vec![] } else { vec![uv0, uv1] }, colors: None, colors1: None, regions: None, tint: Some(tint), indices: idx, material: Some(0), joints: None, weights: None, joints1: None, weights1: None };
+        let prim = crate::gltf::TriPrim { name: name.to_string(), positions: pos, normals: Some(nrm), tangents: Some(tan), uvs: if uv0.is_empty() { vec![] } else { vec![uv0, uv1] }, colors: None, colors1: None, regions: None, tint: Some(tint), indices: idx, material: Some(0), joints: None, weights: None, joints1: None, weights1: None, morphs: Vec::new() };
         let mat = crate::gltf::Material {
             name: "fur".into(),
             base_color_uri: None,
@@ -1294,7 +1294,7 @@ impl Groom {
         let (positions, normals, uv, indices) = self.ribbons(half_width);
         let per = self.points_per_strand * 4;
         let tint: Vec<[u8; 4]> = (0..positions.len()).map(|i| strand_rgb.get(i / per.max(1)).map_or([255; 4], |c| [c[0], c[1], c[2], 255])).collect();
-        let prim = crate::gltf::TriPrim { name: name.to_string(), positions, normals: Some(normals), tangents: None, uvs: vec![uv], colors: None, colors1: None, regions: None, tint: Some(tint), indices, material: Some(0), joints: None, weights: None, joints1: None, weights1: None };
+        let prim = crate::gltf::TriPrim { name: name.to_string(), positions, normals: Some(normals), tangents: None, uvs: vec![uv], colors: None, colors1: None, regions: None, tint: Some(tint), indices, material: Some(0), joints: None, weights: None, joints1: None, weights1: None, morphs: Vec::new() };
         let mat = crate::gltf::Material {
             name: "fur".into(),
             base_color_uri: None,

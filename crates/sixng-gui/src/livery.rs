@@ -808,7 +808,7 @@ mod tests {
             let u = (x + 2.0) / 4.0;
             glb::Vertex { pos: [x, y, 0.0], nrm: [0.0, 0.0, 1.0], uv0: [u, 1.0 - y / 2.0], uv1: [if flip_u { 1.0 - u } else { u }, 1.0 - y / 2.0], zone: [zone, 0, 1, 0], ..Default::default() }
         };
-        let mesh = glb::Mesh { strand_lod: None, region2: Vec::new(), name: String::new(), verts: vec![v(-2.0, 0.0), v(2.0, 0.0), v(2.0, 2.0), v(-2.0, 2.0)], indices: vec![0, 1, 2, 0, 2, 3], material: None, skinned: false, has_tangents: false, uv_sets: 2, centre: [0.0; 3] };
+        let mesh = glb::Mesh { strand_lod: None, region2: Vec::new(), morphs: Vec::new(), name: String::new(), verts: vec![v(-2.0, 0.0), v(2.0, 0.0), v(2.0, 2.0), v(-2.0, 2.0)], indices: vec![0, 1, 2, 0, 2, 3], material: None, skinned: false, has_tangents: false, uv_sets: 2, centre: [0.0; 3] };
         glb::Model { path: PathBuf::new(), meshes: vec![mesh], materials: Vec::new(), joints: Vec::new(), images: Vec::new(), bbox: [[0.0; 3]; 2], triangles: 2, vertices: 4, extras: serde_json::Value::Null }
     }
 

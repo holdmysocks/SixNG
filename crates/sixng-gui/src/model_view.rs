@@ -884,6 +884,14 @@ pub struct ModelView {
     pub ped_pose: PedPose,
     /// Body shape of the character shown (`BODY_SHAPE` when it was loaded).
     body_shape_shown: BodyShape,
+    /// Face expression: the shape keys (morph targets) of the meshes shown,
+    /// by name, with the weight set in the panel; and the weights the GPU
+    /// vertices were last built with.
+    expr: Vec<(String, f32)>,
+    expr_shown: Vec<f32>,
+    expr_filter: String,
+    /// Weights to set on the next model that has them (`--expr`).
+    pub expr_auto: Vec<(String, f32)>,
     pub wheels_on: bool,
     pub wheel_rim: String,
     /// Rim colour (linear). The game sets it per vehicle at runtime and no
@@ -1212,6 +1220,10 @@ impl ModelView {
             clip_picker: Default::default(),
             ped_pose: PedPose::default(),
             body_shape_shown: NEUTRAL_BODY,
+            expr: Vec::new(),
+            expr_shown: Vec::new(),
+            expr_filter: String::new(),
+            expr_auto: Vec::new(),
             wheels_on: true,
             wheel_rim: "rim_muscle_001_hi".into(),
             rim_colour: RIM_ALLOY,
@@ -2619,6 +2631,21 @@ impl ModelView {
                     self.hair.collide = None;
                     if self.hair.fur.is_none() {
                         self.hair.selected.clear();
+                    }
+                }
+                // the morph targets of the new meshes, all at 0 (as uploaded)
+                self.expr.clear();
+                for me in &l.model.meshes {
+                    for (n, _) in &me.morphs {
+                        if !self.expr.iter().any(|e| &e.0 == n) {
+                            self.expr.push((n.clone(), 0.0));
+                        }
+                    }
+                }
+                self.expr_shown = vec![0.0; self.expr.len()];
+                for (n, w) in &self.expr_auto {
+                    if let Some(e) = self.expr.iter_mut().find(|e| &e.0 == n) {
+                        e.1 = *w;
                     }
                 }
                 self.loaded = Some(l);
@@ -4363,6 +4390,16 @@ impl ModelView {
                 ren.set_joints(rs, g, &skin);
             }
         }
+        // face expression: rebuild the morphed meshes when a weight changed
+        let weights: Vec<f32> = self.expr.iter().map(|e| e.1).collect();
+        if weights != self.expr_shown {
+            if let (Some(l), Some(g)) = (&self.loaded, &self.gpu) {
+                for (k, me) in l.model.meshes.iter().enumerate().filter(|m| !m.1.morphs.is_empty()) {
+                    ren.write_vertices(rs, g, k, &morph_vertices(me, &self.expr));
+                }
+            }
+            self.expr_shown = weights;
+        }
         self.update_hair(rs, &ctx);
         let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
         // an animal's fur is bound to its skin and takes the same joint
@@ -4683,6 +4720,25 @@ impl ModelView {
                 self.keep_cam_once = true;
                 self.open(&q, lod, ui.ctx());
             }
+            ui.separator();
+        }
+        if !self.expr.is_empty() {
+            egui::CollapsingHeader::new("Expression").id_salt("face_expr").show(ui, |ui| {
+                ui.label(egui::RichText::new("The face's expression controls: shape keys of the game's face network (exported as glTF morph targets).").weak().small());
+                ui.horizontal(|ui| {
+                    ui.label("filter");
+                    ui.text_edit_singleline(&mut self.expr_filter);
+                    if ui.button("Reset").on_hover_text("Every control back to 0 (the neutral face).").clicked() {
+                        self.expr.iter_mut().for_each(|e| e.1 = 0.0);
+                    }
+                });
+                let f = self.expr_filter.to_ascii_lowercase();
+                egui::ScrollArea::vertical().max_height(320.0).id_salt("face_expr_list").show(ui, |ui| {
+                    for e in self.expr.iter_mut().filter(|e| e.0.to_ascii_lowercase().contains(&f)) {
+                        ui.add(egui::Slider::new(&mut e.1, 0.0..=1.0).text(e.0.as_str()));
+                    }
+                });
+            });
             ui.separator();
         }
         ui.heading("View");
@@ -9603,4 +9659,47 @@ fn finish_load(slot: &Pending, latest: &std::sync::atomic::AtomicU64, gen: u64, 
     if latest.load(std::sync::atomic::Ordering::SeqCst) == gen {
         *s = Some((gen, r));
     }
+}
+
+/// A mesh's vertices with its morph targets applied at the given weights
+/// (by target name). Normals turn with the faces: each vertex's normal
+/// gets the change of its face-averaged normal.
+fn morph_vertices(me: &glb::Mesh, weights: &[(String, f32)]) -> Vec<glb::Vertex> {
+    let mut v = me.verts.clone();
+    let mut any = false;
+    for (name, d) in &me.morphs {
+        let Some(w) = weights.iter().find(|e| &e.0 == name).map(|e| e.1).filter(|w| *w != 0.0) else { continue };
+        any = true;
+        for (x, d) in v.iter_mut().zip(d) {
+            for k in 0..3 {
+                x.pos[k] += w * d[k];
+            }
+        }
+    }
+    if !any {
+        return v;
+    }
+    let normals = |vs: &[glb::Vertex]| -> Vec<Vec3> {
+        let mut acc = vec![Vec3::ZERO; vs.len()];
+        for t in me.indices.chunks_exact(3) {
+            let [a, b, c] = [t[0] as usize, t[1] as usize, t[2] as usize];
+            if a.max(b).max(c) >= vs.len() {
+                continue;
+            }
+            let (pa, pb, pc) = (Vec3::from(vs[a].pos), Vec3::from(vs[b].pos), Vec3::from(vs[c].pos));
+            let n = (pb - pa).cross(pc - pa);
+            for i in [a, b, c] {
+                acc[i] += n;
+            }
+        }
+        acc.into_iter().map(|n| n.normalize_or_zero()).collect()
+    };
+    let (n0, n1) = (normals(&me.verts), normals(&v));
+    for ((x, a), b) in v.iter_mut().zip(n0).zip(n1) {
+        let n = (Vec3::from(x.nrm) + b - a).normalize_or_zero();
+        if n != Vec3::ZERO {
+            x.nrm = n.into();
+        }
+    }
+    v
 }

@@ -517,7 +517,7 @@ fn node_model(
     let nv = verts.len();
     let mut meshes = Vec::new();
     if !idx_hm.is_empty() {
-        meshes.push(glb::Mesh { strand_lod: None, region2: Vec::new(),
+        meshes.push(glb::Mesh { strand_lod: None, region2: Vec::new(), morphs: Vec::new(),
             name: format!("world {}/{}/{} heightmap", k.l, k.x, k.y),
             verts: verts.clone(),
             indices: idx_hm,
@@ -533,7 +533,7 @@ fn node_model(
     if !idx.is_empty() || meshes.is_empty() {
         meshes.insert(
             0,
-            glb::Mesh { strand_lod: None, region2: Vec::new(),
+            glb::Mesh { strand_lod: None, region2: Vec::new(), morphs: Vec::new(),
                 name: format!("world {}/{}/{}", k.l, k.x, k.y),
                 verts,
                 indices: idx,
@@ -1251,7 +1251,7 @@ fn ocean_model() -> glb::Model {
         v(cx - e, cy + e),
         v(cx + e, cy + e),
     ];
-    let mesh = glb::Mesh { strand_lod: None, region2: Vec::new(),
+    let mesh = glb::Mesh { strand_lod: None, region2: Vec::new(), morphs: Vec::new(),
         name: "sea".into(),
         verts,
         indices: vec![0, 2, 1, 1, 2, 3],

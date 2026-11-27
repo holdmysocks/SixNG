@@ -141,6 +141,7 @@ impl NavMesh {
                 weights: None,
                 joints1: None,
                 weights1: None,
+                morphs: Vec::new(),
             });
         }
         Some(mesh_glb(name, &[NodeGroup { name: name.to_string(), prims }], &mats, &[], extras))
