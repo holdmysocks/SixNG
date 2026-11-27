@@ -707,10 +707,11 @@ impl AudioView {
                                 match self.dialogue.get(&(b.off, i)) {
                                     Some(lines) => {
                                         let first = lines[0].label();
+                                        let first = if first.chars().count() > 60 { format!("{}…", first.chars().take(59).collect::<String>()) } else { first };
                                         let shown = if lines.len() > 1 { format!("{first} (+{})", lines.len() - 1) } else { first };
                                         let hover = lines.iter().map(|l| format!("{:08x}  {}", l.subtitle_key, l.label())).collect::<Vec<_>>().join("
 ");
-                                        ui.add(egui::Label::new(shown).truncate()).on_hover_text(format!("Subtitle key and line (dialogue_links.json):
+                                        ui.label(shown).on_hover_text(format!("Subtitle key and line (dialogue_links.json):
 {hover}"));
                                     }
                                     None => {
