@@ -792,10 +792,17 @@ fn map_finish_added(col0: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
 // them: the region from the min and max of the four nearest G texels (two
 // regions are averaged), at UV0 x the material's tiling (strand.yz).
 struct SkinDet { n: vec2<f32>, c: f32, mask: f32 };
+// The game samples a texture array, so a tile never sees its neighbours. In
+// the sheet the filter must stay inside the tile: one isotropic mip level
+// (the anisotropic footprint would reach across the edge) and the position
+// held half a texel of the coarser of the two blended levels from the edge,
+// or every tile repeat draws a line of the neighbouring tile.
 fn skin_tile(t: texture_2d<f32>, r: u32, p: vec2<f32>, gx: vec2<f32>, gy: vec2<f32>) -> vec4<f32> {
     let cell = vec2(f32(r & 3u), f32(r >> 2u));
-    let q = (cell + fract(p) * (254.0 / 256.0) + 1.0 / 256.0) * 0.25;
-    return textureSampleGrad(t, samp, q, gx * 0.25, gy * 0.25);
+    let lod = clamp(log2(max(max(length(gx), length(gy)) * 256.0, 1e-6)), 0.0, 8.0);
+    let h = 0.5 * exp2(ceil(lod)) / 256.0;
+    let q = (cell + clamp(fract(p), vec2(h), vec2(1.0 - h))) * 0.25;
+    return textureSampleLevel(t, samp, q, lod);
 }
 fn skin_detail(uv: vec2<f32>, gx: vec2<f32>, gy: vec2<f32>) -> SkinDet {
     let p = uv * M.strand.yz;
