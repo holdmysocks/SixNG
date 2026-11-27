@@ -1522,7 +1522,12 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   - base-colour textures go in at 64 px, in BC3 texture arrays;
   - each vertex carries its placement's index. The vertex shader checks
     that placement's own LOD distance range, so LOD hand-offs stay per
-    placement.
+    placement;
+  - since 2026-11-27 a cell's batches go to the GPU ordered by pass,
+    texture array, then distance range. Neighbouring batches in range draw
+    as one call, also across a batch out of range when that adds at most
+    half the call's triangles (its placements are dropped in the vertex
+    shader), and a texture array is bound only when it changes.
 
   Built cells are cached in `<work>/gui_cache_v4/cells` (capped at 4 GB),
   so a revisited area loads with one file read per cell. The cache is

@@ -168,6 +168,33 @@ pub struct CellCpu {
 }
 
 impl CellCpu {
+    /// The index buffer and batches in drawing order: by pass, texture
+    /// chunk, then the group's distance range, so the batches in range at
+    /// one distance sit next to each other and draw as one range (the
+    /// vertex program drops every placement outside its own range).
+    pub fn draw_order(&self) -> (Vec<u32>, Vec<Batch>) {
+        let mut order: Vec<usize> = (0..self.batches.len()).collect();
+        let range = |b: &Batch| self.groups.get(b.group as usize).map_or((0.0, 0.0), |g| (g.lo, g.hi));
+        order.sort_by(|&a, &b| {
+            let (x, y) = (&self.batches[a], &self.batches[b]);
+            let ((xl, xh), (yl, yh)) = (range(x), range(y));
+            (x.pass, x.chunk)
+                .cmp(&(y.pass, y.chunk))
+                .then(xl.total_cmp(&yl))
+                .then(xh.total_cmp(&yh))
+                .then(x.group.cmp(&y.group))
+        });
+        let mut idx = Vec::with_capacity(self.indices.len());
+        let mut out = Vec::with_capacity(order.len());
+        for k in order {
+            let b = self.batches[k];
+            let src = self.indices.get(b.first as usize..(b.first + b.count) as usize).unwrap_or(&[]);
+            out.push(Batch { first: idx.len() as u32, count: src.len() as u32, ..b });
+            idx.extend_from_slice(src);
+        }
+        (idx, out)
+    }
+
     pub fn bytes(&self) -> usize {
         self.verts.len() * std::mem::size_of::<CellV>()
             + self.indices.len() * 4
@@ -616,6 +643,27 @@ pub fn read(path: &Path) -> Option<CellCpu> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draw_order_puts_neighbouring_ranges_together() {
+        let g = |lo: f32, hi: f32| Group { lo, hi, bb: [[0.0; 3], [1.0; 3]] };
+        let b = |group: u16, chunk: u16, pass: u8, first: u32, count: u32| Batch { group, chunk, pass, first, count };
+        // groups out of distance order, batches by group as the baker writes them
+        let c = CellCpu {
+            origin: [0.0; 3],
+            groups: vec![g(200.0, 400.0), g(0.0, 100.0), g(100.0, 200.0)],
+            batches: vec![b(0, 0, PASS_OPAQUE, 0, 3), b(0, 0, PASS_BLEND, 3, 3), b(1, 0, PASS_OPAQUE, 6, 3), b(2, 0, PASS_OPAQUE, 9, 3)],
+            chunks: vec![],
+            verts: vec![],
+            indices: (0..12).collect(),
+            ents: vec![],
+        };
+        let (idx, bs) = c.draw_order();
+        // opaque by range (groups 1, 2, 0), then the blended one
+        assert_eq!(bs.iter().map(|b| (b.group, b.pass)).collect::<Vec<_>>(), vec![(1, 0), (2, 0), (0, 0), (0, PASS_BLEND)]);
+        assert_eq!(bs.iter().map(|b| (b.first, b.count)).collect::<Vec<_>>(), vec![(0, 3), (3, 3), (6, 3), (9, 3)]);
+        assert_eq!(idx, vec![6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4, 5]);
+    }
 
     #[test]
     fn classes_and_keys() {
