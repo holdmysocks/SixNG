@@ -125,7 +125,7 @@ struct Gpu {
 }
 
 /// Texture cache (key -> texture, shared between models and with the workers).
-type TexCache = Arc<Mutex<HashMap<String, wgpu::Texture>>>;
+type TexCache = Arc<Mutex<HashMap<String, crate::render3d::Tex>>>;
 
 /// Detail settings (the "detail" slider sets them all; each can be tuned).
 #[derive(Clone, PartialEq)]
@@ -717,7 +717,7 @@ impl Map3D {
                                     if !crate::render3d::has_pixels(i) {
                                         return None;
                                     }
-                                    let t = crate::render3d::tex_rgba(&gpu.device, &gpu.queue, i);
+                                    let t = gpu.up.tex(&gpu.device, &gpu.queue, i);
                                     Some(
                                         tex_cache
                                             .lock()
@@ -1814,7 +1814,7 @@ impl Map3D {
     /// Drop one reference to each texture key; free textures nobody uses.
     fn release_keys(
         refs: &mut HashMap<String, (u32, usize)>,
-        cache: &mut HashMap<String, wgpu::Texture>,
+        cache: &mut HashMap<String, crate::render3d::Tex>,
         keys_set: &mut HashSet<String>,
         bytes: &mut usize,
         keys: Vec<String>,
@@ -3573,7 +3573,7 @@ impl Map3D {
                 }
             );
             let line = format!("{line} | gpu ms/frame sky|shadows|main|post {}", crate::gpu_time::take_line());
-            let line = format!("{line} | draws {} (shadow {}, decal/see-through {}, meshes culled [main, fb, shadow, late] {:?}) | {} ({} placements) | {} fallbacks ({:?} draws, by level unlinked/linked {:?}) | wait: terrain idle {}, keep missing {}{}, inflight {}", self.stats.draws, self.renderer.as_ref().map_or(0, |r| r.shadow_draws), self.renderer.as_ref().map_or(0, |r| r.late_draws), crate::render3d::MESH_CULLED.each_ref().map(|a| a.load(std::sync::atomic::Ordering::Relaxed)), self.cells.summary(), self.stats.in_cells, self.stats.n_fb, self.renderer.as_ref().map_or([0, 0], |r| r.fb_draws), self.stats.fb_lvl, self.world.idle(), self.keep.iter().filter(|m| !self.cache.contains_key(m)).count(), if self.stats.capped { " (model cap full)" } else { "" }, self.stats.inflight);
+            let line = format!("{line} | draws {} (shadow {}, decal/see-through {}, meshes culled [main, fb, shadow, late] {:?}){} | {} ({} placements) | {} fallbacks ({:?} draws, by level unlinked/linked {:?}) | wait: terrain idle {}, keep missing {}{}, inflight {}", self.stats.draws, self.renderer.as_ref().map_or(0, |r| r.shadow_draws), self.renderer.as_ref().map_or(0, |r| r.late_draws), crate::render3d::MESH_CULLED.each_ref().map(|a| a.load(std::sync::atomic::Ordering::Relaxed)), self.renderer.as_ref().map_or(String::new(), |r| r.gd_summary()), self.cells.summary(), self.stats.in_cells, self.stats.n_fb, self.renderer.as_ref().map_or([0, 0], |r| r.fb_draws), self.stats.fb_lvl, self.world.idle(), self.keep.iter().filter(|m| !self.cache.contains_key(m)).count(), if self.stats.capped { " (model cap full)" } else { "" }, self.stats.inflight);
             eprintln!("{line}");
             self.draw_log();
         }
