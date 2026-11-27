@@ -4935,7 +4935,7 @@ impl ModelView {
         }
         if !self.expr.is_empty() {
             egui::CollapsingHeader::new("Expression").id_salt("face_expr").show(ui, |ui| {
-                ui.label(egui::RichText::new("The face's expression controls: shape keys of the game's face network (exported as glTF morph targets).").weak().small());
+                ui.label(egui::RichText::new("Shape keys (exported as glTF morph targets): face_* are the face network's expression controls, pose_* the pose correctives garments take from the character's body network (driven by the pose in the game; what drives each one is not decoded).").weak().small());
                 ui.horizontal(|ui| {
                     ui.label("filter");
                     ui.text_edit_singleline(&mut self.expr_filter);
@@ -4946,7 +4946,9 @@ impl ModelView {
                 let f = self.expr_filter.to_ascii_lowercase();
                 egui::ScrollArea::vertical().max_height(320.0).id_salt("face_expr_list").show(ui, |ui| {
                     for e in self.expr.iter_mut().filter(|e| e.0.to_ascii_lowercase().contains(&f)) {
-                        ui.add(egui::Slider::new(&mut e.1, 0.0..=1.0).text(e.0.as_str()));
+                        // pose inputs come from joint rotations and go both ways
+                        let lo = if e.0.starts_with("pose_") { -1.0 } else { 0.0 };
+                        ui.add(egui::Slider::new(&mut e.1, lo..=1.0).text(e.0.as_str()));
                     }
                 });
             });

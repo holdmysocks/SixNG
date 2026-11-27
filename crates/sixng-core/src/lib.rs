@@ -41,6 +41,7 @@ pub mod cloth;
 pub mod text;
 pub mod gamenames;
 pub mod texusers;
+pub mod facecontrols;
 pub mod facegraph;
 pub mod headdelta;
 pub mod meta7a;

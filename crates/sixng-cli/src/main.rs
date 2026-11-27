@@ -2068,7 +2068,9 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                         .map(|c| {
                             let tr = sixng_core::anim::all_tracks(&d, c);
                             json!({"name": c.short_name(), "hash": format!("{:08x}", c.hash), "type": c.kind, "duration": c.duration, "bindings": c.bindings.len(), "sections": c.sections, "missing_windows": c.pending.len(),
-                                "tracks": tr.len(), "bones": tr.iter().filter(|t| t.0 != 0).map(|t| t.0).collect::<std::collections::BTreeSet<_>>().len()})
+                                "tracks": tr.len(), "bones": tr.iter().filter(|t| t.0 != 0).map(|t| t.0).collect::<std::collections::BTreeSet<_>>().len(),
+                                // facial clips: the face controls they animate, by name (hex when unknown)
+                                "facial_controls": tr.iter().filter(|t| t.1 == sixng_core::facecontrols::FACIAL_TRANSLATION).map(|t| sixng_core::facecontrols::label(t.0)).collect::<Vec<_>>()})
                         })
                         .collect();
                     out.print(&json!({"ok": true, "dictionary": de.name, "id": de.id, "clip_count": d.clips.len(), "animations": d.animations.len(), "clips": clips}));

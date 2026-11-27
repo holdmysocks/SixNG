@@ -1779,22 +1779,24 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         Some(n) if n.to_ascii_lowercase().contains("head") => crate::facegraph::nets_for_head(a, n),
         _ => Vec::new(),
     };
+    // Other ped parts: shape keys from the character's pose network, named
+    // after the ped model (`facegraph::surface_map`); only parts whose
+    // stream 8 is a surface map use it.
+    let pose_nets = std::cell::OnceCell::new();
+    let pose_nets_of = || pose_nets.get_or_init(|| e.name.as_deref().map(|n| crate::facegraph::nets_for_part(a, n)).unwrap_or_default());
     // Triangle meshes: one primitive per geometry, grouped by model.
     let mut mesh_meta = Vec::new();
     let prims_of = |gi: usize, material: Option<usize>, mesh_meta: &mut Vec<serde_json::Value>| -> Option<crate::gltf::TriPrim> {
         let g = &info.geometries[gi];
         let h = info.buffers[g.vertex_buffer].mesh_blob.as_ref()?;
         let mut m = crate::drawable::decode_mesh(slice(g.vertex_buffer), h, slice(g.index_buffer));
-        let morphs = if face_nets.is_empty() {
-            Vec::new()
+        let stream8 = || h.sections.iter().find(|s| s.0 == 8 && s.2 == 0x8c).map(|s| slice(g.vertex_buffer).get(s.1 as usize..).unwrap_or(&[]));
+        let morphs = if !face_nets.is_empty() {
+            stream8().and_then(|b| crate::facegraph::vertex_map(b, m.positions.len())).map(|map| crate::facegraph::morph_targets(&face_nets, &map)).unwrap_or_default()
+        } else if let Some(map) = (skin.geometry_map.contains_key(&gi) || m.joints.is_some()).then(stream8).flatten().and_then(|b| crate::facegraph::surface_map(b, m.positions.len())) {
+            crate::facegraph::pose_targets(pose_nets_of(), &map)
         } else {
-            let blob = slice(g.vertex_buffer);
-            h.sections
-                .iter()
-                .find(|s| s.0 == 8 && s.2 == 0x8c)
-                .and_then(|s| crate::facegraph::vertex_map(blob.get(s.1 as usize..).unwrap_or(&[]), m.positions.len()))
-                .map(|map| crate::facegraph::morph_targets(&face_nets, &map))
-                .unwrap_or_default()
+            Vec::new()
         };
         // Ped clothing: joint index -> bone palette -> joint list.
         if let Some(map) = skin.geometry_map.get(&gi) {
@@ -1845,8 +1847,10 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             // bone that is in neither skeleton); their weight is moved
             // to the largest kept influence in the GLB.
             "unresolved_joints": skin_used.as_ref().map(|u| u.iter().filter(|&&i| i as usize >= skin.joints.len()).count()),
-            // ped heads: expression shape keys of the face network (morph targets)
-            "face_morphs": morphs.len(),
+            // ped heads: expression shape keys of the face network; other
+            // ped parts: pose correctives of the character's network
+            "face_morphs": morphs.iter().filter(|m| !m.0.starts_with("pose_")).count(),
+            "pose_morphs": morphs.iter().filter(|m| m.0.starts_with("pose_")).count(),
         }));
         // The placement tint of props (a palette embedded in the model,
         // picked by the vertex colours). Not on the vehicle shaders: their

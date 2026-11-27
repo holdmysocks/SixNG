@@ -393,6 +393,84 @@ pub fn morph_targets(nets: &[std::sync::Arc<FaceNet>], map: &[Option<u32>]) -> V
         .collect()
 }
 
+/// Pose correctives: besides its face networks, a character has one network
+/// stored under its ped model's name (`player_story000_00`: 294 inputs in 8
+/// groups of 36 x 7 + 42, 4,675 points). It is a body surface that bends
+/// with the pose, and garments sample it: a garment mesh's stream 8 (format
+/// 0x8c, 16 bytes) holds three surface points + 1 in the high halves of its
+/// first three words and the tag 0xb210 or 0xb220 in the fourth (all zero
+/// where the vertex does not follow the surface). A vertex moves by the mean
+/// of its three points (the equal-weight mean fits the garments' own
+/// neighbours best: the low halves do not work as weights). What feeds the
+/// inputs (body pose rigs reading the skeleton's rotations) is not decoded,
+/// so the inputs are exported as plain shape keys.
+pub fn surface_map(stream8: &[u8], vertices: usize) -> Option<Vec<Option<[u32; 3]>>> {
+    let b = stream8.get(..16 * vertices)?;
+    let mut tagged = false;
+    let mut map = Vec::with_capacity(vertices);
+    for c in b.chunks_exact(16) {
+        let w = |k: usize| u32::from_le_bytes(c[4 * k..4 * k + 4].try_into().unwrap());
+        let hi = |k: usize| w(k) >> 16;
+        match hi(3) {
+            0xb210 | 0xb220 if (0..3).all(|k| hi(k) != 0) => {
+                tagged = true;
+                map.push(Some([hi(0) - 1, hi(1) - 1, hi(2) - 1]));
+            }
+            0 if (0..3).all(|k| hi(k) == 0) => map.push(None),
+            _ => return None,
+        }
+    }
+    tagged.then_some(map)
+}
+
+/// The pose network of a ped part (`<ped model>_<part>`): the networks
+/// stored under the longest leading `_`-joined piece of its name that has
+/// any, largest first.
+pub fn nets_for_part(a: &crate::game::ArchiveInfo, part_name: &str) -> Vec<std::sync::Arc<FaceNet>> {
+    let words: Vec<&str> = part_name.split('_').collect();
+    for n in (1..words.len()).rev() {
+        let mut v = nets_named(a, &words[..n].join("_"));
+        if !v.is_empty() {
+            v.sort_by_key(|n| std::cmp::Reverse(n.outputs));
+            return v;
+        }
+    }
+    Vec::new()
+}
+
+/// Name of pose input `i` in exports.
+pub fn pose_name(i: usize) -> String {
+    format!("pose_{i:03}")
+}
+
+/// Shape keys of one garment geometry from its character's pose network:
+/// one per input that moves it, named by [`pose_name`]. `map` is
+/// [`surface_map`] of the geometry; the network used is the first that
+/// covers every point the mesh names.
+pub fn pose_targets(nets: &[std::sync::Arc<FaceNet>], map: &[Option<[u32; 3]>]) -> Vec<(String, Vec<[f32; 3]>)> {
+    let Some(top) = map.iter().flatten().flatten().max().copied() else { return Vec::new() };
+    let Some(net) = nets.iter().find(|n| n.vertices() > top as usize) else { return Vec::new() };
+    (0..net.inputs)
+        .filter_map(|i| {
+            let d: Vec<[f32; 3]> = map
+                .iter()
+                .map(|p| match p {
+                    Some(p) => {
+                        let mut s = [0.0f32; 3];
+                        for &g in p {
+                            let x = net.delta(i, g as usize);
+                            (0..3).for_each(|k| s[k] += x[k] / 3.0);
+                        }
+                        s.map(|x| if x.abs() < 1e-5 { 0.0 } else { x })
+                    }
+                    None => [0.0; 3],
+                })
+                .collect();
+            d.iter().any(|x| x.iter().any(|&c| c != 0.0)).then(|| (pose_name(i), d))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,5 +576,30 @@ mod tests {
         // vertex 1 needs the larger network; control 1 moves under 0.01 mm: dropped
         let t = morph_targets(&nets, &[Some(1), Some(0)]);
         assert_eq!(t, vec![(control_name(0), vec![[0.0, 2.0, 0.0], [0.0; 3]])]);
+    }
+
+    fn s8(w: [u32; 4]) -> Vec<u8> {
+        w.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn surface_map_reads_three_points() {
+        let mut s = s8([3 << 16 | 7, 1 << 16, 2 << 16 | 9, 0xb210 << 16 | 5]);
+        s.extend(s8([0, 0, 0, 40]));
+        s.extend(s8([1 << 16, 1 << 16, 1 << 16, 0xb220 << 16]));
+        assert_eq!(surface_map(&s, 3).unwrap(), vec![Some([2, 0, 1]), None, Some([0, 0, 0])]);
+        // nothing tagged, or a head's mapping stream: not a garment surface map
+        assert!(surface_map(&s8([0, 0, 0, 40]), 1).is_none());
+        assert!(surface_map(&s8([1 << 16, 0, 0, 0xb600 << 16]), 1).is_none());
+    }
+
+    #[test]
+    fn pose_targets_average_the_three_points() {
+        // one input, two points: point 0 moves +x by 3, point 1 not at all
+        let net = std::sync::Arc::new(FaceNet { graph: 1, inputs: 1, outputs: 6, basis: vec![3.0, 0.0, 0.0, 0.0, 0.0, 0.0] });
+        let t = pose_targets(&[net.clone()], &[Some([0, 0, 1]), None]);
+        assert_eq!(t, vec![(pose_name(0), vec![[2.0, 0.0, 0.0], [0.0; 3]])]);
+        // a point past the network: no targets
+        assert!(pose_targets(&[net], &[Some([0, 0, 2])]).is_empty());
     }
 }
