@@ -65,6 +65,7 @@ mod vehicle_db;
 ///  [--tod H] [--paint r,g,b] [--finish N] [--pearl A] [--spin R] [--door R] [--yaw R] [--pitch R] [--zoom F]
 ///  [--sector-grid [N]] (Map 2D / 3D: grid N of levels.rpf, default the world grid)
 ///  [--no-tint] [--expr face_039=1,…] [--hair hex,hex] [--hair-width MM] [--full-set] [--size WxH] --screenshot out.png --exit`
+/// `--bake-model-cache [--cache-root <dir>]` (macOS + metal4-poc: offline SXMTLIO2 model cache baking)
 #[derive(Default, Clone)]
 struct Cli {
     args: std::collections::HashMap<String, String>,
@@ -217,6 +218,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = b.run(&only) {
             mapbake::log(std::path::Path::new(&work), &format!("bake failed: {e:#}"));
             std::process::exit(1);
+        }
+        return Ok(());
+    }
+    #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+    if cli.has("bake-model-cache") {
+        // 离线批量烘焙 SXMTLIO2 模型缓存：扫描 <work> 下 .glb，预生成 GPU-ready buffer。
+        // 用法：sixng-gui --bake-model-cache [--cache-root <dir>]
+        let work = PathBuf::from(default_work());
+        let cache_root = cli
+            .get("cache-root")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| work.clone());
+        match render3d_metal4::bake_model_cache_dir(Path::new(&work), &cache_root) {
+            Ok(stats) => {
+                eprintln!(
+                    "[bake-model-cache] found={} baked={} skipped={} failed={} verified={}",
+                    stats.found, stats.baked, stats.skipped, stats.failed, stats.verified
+                );
+            }
+            Err(error) => {
+                eprintln!("[bake-model-cache] failed: {error:#}");
+                std::process::exit(1);
+            }
         }
         return Ok(());
     }
