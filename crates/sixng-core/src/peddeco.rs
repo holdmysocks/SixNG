@@ -402,9 +402,10 @@ fn rgb_to_hsv([r, g, b]: [f32; 3]) -> [f32; 3] {
 /// sRGB (D65) to XYZ, as the game's makeup code has it.
 const XYZ: [[f32; 3]; 3] = [[0.412_456_4, 0.357_576_1, 0.180_437_5], [0.212_672_9, 0.715_152_2, 0.072_175], [0.019_333_9, 0.119_192, 0.950_304_1]];
 
-/// The white of [`XYZ`] (its row sums).
+/// The reference white the game's Lab conversion divides by: the D65 entry
+/// of its illuminant table (CIE 1931 2°), copied at start-up.
 fn white() -> [f32; 3] {
-    XYZ.map(|r| r[0] + r[1] + r[2])
+    [0.950_47, 1.0, 1.088_83]
 }
 
 fn signed(f: fn(f32) -> f32, c: f32) -> f32 {

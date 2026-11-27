@@ -761,6 +761,11 @@ enum Cmd {
         /// and pools/pools.glb. Scans every map file of levels.rpf.
         #[arg(long)]
         pools: bool,
+        /// Also export the water textures the game binds at run time (bump,
+        /// foam, caustics, shore wave profiles, ocean control maps):
+        /// detail/*.png, detail/*.dds and detail/detail.json.
+        #[arg(long)]
+        detail: bool,
         #[arg(long, short)]
         out: Option<PathBuf>,
     },
@@ -3015,13 +3020,13 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             out.print(&json!({"ok": true, "result": res}));
         }
-        Cmd::Water { fog_px, height_px, shore_px, height_tiles, inland, pools, out: po } => {
+        Cmd::Water { fog_px, height_px, shore_px, height_tiles, inland, pools, detail, out: po } => {
             for (n, v, max) in [("--fog-px", *fog_px, 128), ("--height-px", *height_px, 512), ("--shore-px", *shore_px, 256)] {
                 if v == 0 || max % v != 0 {
                     anyhow::bail!("{n} {v}: must divide {max}");
                 }
             }
-            let o = sixng_core::water::Options { fog_px: *fog_px, height_px: *height_px, shore_px: *shore_px, height_tiles: *height_tiles, inland: *inland, pools: *pools };
+            let o = sixng_core::water::Options { fog_px: *fog_px, height_px: *height_px, shore_px: *shore_px, height_tiles: *height_tiles, inland: *inland, pools: *pools, detail: *detail };
             let r = sixng_core::water::export(&ws, po.as_deref(), &o)?;
             out.print(&json!({"ok": true, "result": r}));
         }

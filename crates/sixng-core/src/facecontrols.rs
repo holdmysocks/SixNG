@@ -6,7 +6,8 @@
 //! game files: they were recovered by matching joaat hashes of FACS-style
 //! word combinations (`face_[l_|r_]<region>_<action>`) against the 91 ids
 //! the facial clips use. Every left/right name also has its mirror, which
-//! is a check on each find. 12 ids remain unnamed and show as hex.
+//! is a check on each find. 11 ids remain unnamed and show as hex: four are
+//! 2-D controls the teeth and tongue rig reads, seven are read by no rig.
 //!
 //! The face rigs read these controls as pseudo-bone channels (track types
 //! 4 and 5: a control's value and, for the 2-D controls such as `face_jaw`,
@@ -97,6 +98,7 @@ pub const NAMES: &[&str] = &[
     "face_tonguefold",
     "face_tonguepress",
     "face_tonguethickness",
+    "face_tonguethicknesstip",
     "face_tonguetipcurl",
     "face_tonguetwist",
     "face_tonguewidth",
@@ -126,6 +128,7 @@ mod tests {
         assert_eq!(name(0xee13ea8b), Some("face_mouth"));
         assert_eq!(name(0x56833078), Some("face_l_lowerlip_depressor"));
         assert_eq!(name(0x960e1ee5), Some("face_tongueextension"));
+        assert_eq!(name(0x2e37b26c), Some("face_tonguethicknesstip"));
         assert_eq!(name(0x0375a088), None);
         assert_eq!(label(0x0375a088), "0375a088");
         assert_eq!(crate::meta7a::joaat("facialtranslation"), FACIAL_TRANSLATION);
@@ -133,7 +136,7 @@ mod tests {
 
     #[test]
     fn sides_mirror() {
-        assert_eq!(NAMES.len(), 79);
+        assert_eq!(NAMES.len(), 80);
         for n in NAMES {
             let m = if let Some(r) = n.strip_prefix("face_l_") { format!("face_r_{r}") } else if let Some(r) = n.strip_prefix("face_r_") { format!("face_l_{r}") } else { continue };
             assert!(NAMES.contains(&m.as_str()), "{n} has no mirror");
