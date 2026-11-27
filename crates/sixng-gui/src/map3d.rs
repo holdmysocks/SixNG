@@ -4072,6 +4072,63 @@ impl Map3D {
                 top.join("; ")
             );
         }
+        self.texture_class_log();
+    }
+
+    /// With the draw log: the loaded textures grouped by (format, size, mip
+    /// count), the classes a texture-array material table would need.
+    fn texture_class_log(&self) {
+        let cache = self.tex_cache.lock().unwrap();
+        let mut classes: HashMap<(wgpu::TextureFormat, u32, u32, u32), (u32, u64)> = HashMap::new();
+        for t in cache.values() {
+            let f = t.format();
+            let (bw, bh) = f.block_dimensions();
+            let bs = f.block_copy_size(None).unwrap_or(4) as u64;
+            let bytes: u64 = (0..t.mip_level_count())
+                .map(|l| {
+                    let w = (t.width() >> l).max(1).div_ceil(bw) as u64;
+                    let h = (t.height() >> l).max(1).div_ceil(bh) as u64;
+                    w * h * bs
+                })
+                .sum();
+            let e = classes.entry((f, t.width(), t.height(), t.mip_level_count())).or_default();
+            e.0 += 1;
+            e.1 += bytes;
+        }
+        let n: u32 = classes.values().map(|c| c.0).sum();
+        let bytes: u64 = classes.values().map(|c| c.1).sum();
+        let mut v: Vec<_> = classes.iter().collect();
+        v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        // how many classes cover 90 % / 99 % of the textures
+        let cover = |share: f32| {
+            let mut acc = 0u32;
+            v.iter().take_while(|c| {
+                let before = acc;
+                acc += c.1 .0;
+                (before as f32) < share * n as f32
+            }).count()
+        };
+        let chunks = |layers: u32| v.iter().map(|c| c.1 .0.div_ceil(layers)).sum::<u32>();
+        let small = v.iter().filter(|c| c.1 .0 < 4).count();
+        let formats: std::collections::HashSet<_> = v.iter().map(|c| c.0 .0).collect();
+        let top: Vec<String> = v
+            .iter()
+            .take(15)
+            .map(|(k, c)| format!("{:?} {}x{} m{}: {}", k.0, k.1, k.2, k.3, c.0))
+            .collect();
+        eprintln!(
+            "[map3d] texture classes: {n} textures, {:.2} GB, {} classes ({} formats; {} with under 4 textures), 90 % in {}, 99 % in {}, arrays needed at 16/64/256 layers {}/{}/{}; top: {}",
+            bytes as f64 / 1e9,
+            v.len(),
+            formats.len(),
+            small,
+            cover(0.9),
+            cover(0.99),
+            chunks(16),
+            chunks(64),
+            chunks(256),
+            top.join("; ")
+        );
     }
 
     fn frames_ok(&self) -> bool {
