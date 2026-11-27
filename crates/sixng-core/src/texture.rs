@@ -229,17 +229,23 @@ pub fn embedded_hash(r: &Resource, t: &TexInfo) -> Option<u64> {
 /// Row layout of a tint palette `width` texels wide: (entries per row, rows).
 /// The width is a power of two `p` plus `k` extra texels; a row holds
 /// `256 >> k` entries (at most `p`). Placements pick the row with their
-/// tint value (`Entity::tint_row`). Derived from our own data: the largest
-/// tint value placed with each palette width is rows - 1, and later rows
-/// start on these boundaries.
+/// tint value (`Entity::tint_row`).
+///
+/// This is the game's prop mesh shader rule (MS_VS_TransformD_c5fd36bb):
+/// with `k = width & 7`, a row holds `256 >> k` entries, there are
+/// `width >> (8 - k)` rows, and the shader reads entry
+/// `min(tint, rows - 1) * (256 >> k) + round(255 * COLOR0.b)`. When that
+/// gives no whole row (width 32, 7 palettes in use: 0 rows of 256), this
+/// returns one row of the whole width instead.
 pub fn tint_layout(width: u32) -> (u32, u32) {
     if width == 0 {
         return (0, 0);
     }
-    let p = 1u32 << (31 - width.leading_zeros());
-    let k = width - p;
-    let len = if k >= 8 { 1 } else { (256u32 >> k).min(p) };
-    (len, p / len)
+    let k = width & 7;
+    match (256u32 >> k, width >> (8 - k)) {
+        (_, 0) => (width, 1),
+        l => l,
+    }
 }
 
 /// RGBA8 pixels of mip 0 of an embedded texture. One-row textures (the
@@ -1149,8 +1155,20 @@ mod band_tests {
 mod tint_tests {
     #[test]
     fn tint_layouts() {
-        for (w, l) in [(13, (8, 1)), (37, (8, 4)), (131, (32, 4)), (256, (256, 1)), (513, (128, 4)), (1024, (256, 4)), (1028, (16, 64)), (8194, (64, 128))] {
+        for (w, l) in [(13, (8, 1)), (32, (32, 1)), (37, (8, 4)), (131, (32, 4)), (256, (256, 1)), (260, (16, 16)), (513, (128, 4)), (1024, (256, 4)), (1028, (16, 64)), (8194, (64, 128))] {
             assert_eq!(super::tint_layout(w), l, "width {w}");
+        }
+    }
+
+    /// Old layout (power of two plus extras, rows = p / len) for the widths
+    /// it got right: the shader rule agrees with it unless k >= 6.
+    #[test]
+    fn tint_layout_matches_the_older_rule() {
+        for p in (3..14).map(|e| 1u32 << e) {
+            for k in (0..6).filter(|&k| 256 >> k <= p) {
+                let len = 256 >> k;
+                assert_eq!(super::tint_layout(p + k), (len, p / len), "width {}", p + k);
+            }
         }
     }
 }

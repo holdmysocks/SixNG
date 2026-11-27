@@ -597,8 +597,8 @@ pub struct Entity {
     pub guid: String,
     /// Tint palette row of this instance (field `3c852527`; absent = 0):
     /// the colour is palette entry `tint_row * row_length + COLOR0.b`, with
-    /// the row layout from the model's model.json (rows past the last one
-    /// are assumed to clamp to it).
+    /// the row layout from the model's model.json. Rows past the last one
+    /// clamp to it (the prop mesh shader takes `min(tint_row, rows - 1)`).
     #[serde(skip_serializing_if = "is_zero")]
     pub tint_row: u32,
     /// `false` when the placement should not be drawn by default (proxy,
