@@ -958,7 +958,10 @@ mod tests {
         assert_eq!(enum_value_name(0x4b5a_cc2f, 6), Some("LODTYPES_DEPTH_SLOD4"));
         assert_eq!(enum_value_name(0x0701_af5f, 0), Some("PRI_REQUIRED"));
         assert_eq!(enum_value_name(0x0701_af5f, 99), None);
-        assert!(enum_values().values().map(|v| v.len()).sum::<usize>() > 3000);
+        // from the prefix brute force
+        assert_eq!(enum_value_name(0x0100_f80e, 2), Some("TYPE_QUADRATIC_OUT"));
+        assert_eq!(enum_value_name(0x391d_8bab, 10), Some("RC_CarPark"));
+        assert!(enum_values().values().map(|v| v.len()).sum::<usize>() > 3500);
         for (h, vals) in enum_values() {
             assert_ne!(*h, 0);
             for n in vals.values() {
