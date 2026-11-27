@@ -864,8 +864,12 @@ again**).
   Colour: row tint 0 of `ped_tint_hair` for the items that name that
   palette (a few hundred, mostly named characters); the others leave the
   colour to the game, so the viewer starts dark and has a colour picker.
-  The panel also shows the colours of the game's hair palette as
-  swatches to click (`--hair-colour r,g,b`), and lists the character's
+  Each hair piece (hair, brows, lashes, beard ...) has its own row:
+  its own colour, its stored colours, or the same colour as another
+  piece. Brows, lashes and the rest start linked to the hair. The game's
+  hair palette is shown as swatches that paint the chosen piece
+  (`--hair-colour r,g,b` for all of them, `--hair-pieces
+  "brows:r,g,b;beard:r,g,b"` for some). The panel also lists the character's
   other hair styles (its own placeholders that have grooms placed) to
   tick (`--hair-style TEXT`). Under a hat the scalp hair is pressed in: strand
   points beyond the hat's lining are pulled to 3 mm under it (then each
