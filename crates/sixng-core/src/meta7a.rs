@@ -108,7 +108,8 @@ pub fn enum_values() -> &'static HashMap<u32, BTreeMap<i64, &'static str>> {
         for l in include_str!("enum_values.txt").lines().filter(|l| !l.starts_with('#')) {
             let mut it = l.split_whitespace();
             let (Some(h), Some(v), Some(n)) = (it.next().and_then(|h| u32::from_str_radix(h, 16).ok()), it.next().and_then(|v| v.parse().ok()), it.next()) else { continue };
-            m.entry(h).or_default().insert(v, n);
+            // a value with several names (aliases) keeps the first one listed
+            m.entry(h).or_default().entry(v).or_insert(n);
         }
         m
     })
@@ -958,7 +959,13 @@ mod tests {
         assert_eq!(enum_value_name(0x4b5a_cc2f, 6), Some("LODTYPES_DEPTH_SLOD4"));
         assert_eq!(enum_value_name(0x0701_af5f, 0), Some("PRI_REQUIRED"));
         assert_eq!(enum_value_name(0x0701_af5f, 99), None);
-        assert!(enum_values().values().map(|v| v.len()).sum::<usize>() > 3000);
+        // from the prefix brute force
+        assert_eq!(enum_value_name(0x0100_f80e, 2), Some("TYPE_QUADRATIC_OUT"));
+        assert_eq!(enum_value_name(0x391d_8bab, 10), Some("RC_CarPark"));
+        // the key enum follows the Windows virtual-key codes; pad buttons sit at 0x20000
+        assert_eq!(enum_value_name(0xacc0_e29b, 112), Some("KEY_F1"));
+        assert_eq!(enum_value_name(0xacc0_e29b, 0x2_0009), Some("L3"));
+        assert!(enum_values().values().map(|v| v.len()).sum::<usize>() > 4000);
         for (h, vals) in enum_values() {
             assert_ne!(*h, 0);
             for n in vals.values() {
