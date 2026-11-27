@@ -131,6 +131,14 @@ pub struct SimData {
     /// System +0xF6 (half float): the velocity damping rate per second; the
     /// game damps by clamp(1 - dt x rate, 1e-6, 1) per step.
     pub damping: f32,
+    /// The leash radius R per point: the length of the point's rest offset
+    /// in graphics header +0x3c (B3; 4 bytes per segment, the fourth byte /
+    /// 600 m), 0 at the roots. Empty when the groom stores no B3; the game
+    /// then uses 4 a c.
+    pub leash: Vec<f32>,
+    /// Graphics header +0x70 byte 2 (E): the leash exponent is 3 E / 255
+    /// (0: no leash), and E sets the range of the pull's time scale.
+    pub leash_e: u8,
 }
 
 /// One strand style record: 2D offsets across the strand along its length.
@@ -865,7 +873,15 @@ pub fn parse(r: &Resource) -> Result<Groom> {
             let bend: Vec<f32> = cb.chunks_exact(4).map(|q| f16(u16::from_le_bytes([q[2], q[3]]))).collect();
             let rest: Vec<f32> = lb.chunks_exact(2).map(|q| f16(u16::from_le_bytes([q[0], q[1]]))).collect();
             let ok = c.iter().chain(&rest).all(|x| x.is_finite() && *x >= 0.0 && *x < 1.0e4) && bend.iter().all(|x| x.is_finite());
-            ok.then(|| SimData { c, bend, bend_on: gu32(0x50) & 0x80 != 0, rest, damping: Some(f16(r.u16(0xF6))).filter(|x| x.is_finite() && *x >= 0.0).unwrap_or(0.0) })
+            // B3: per segment (strand-major, K - 1 per strand) a direction in bytes 0..2 and the offset's
+            // length in byte 3 (/600 m); with the character in its bind pose the leash radius is that length
+            let b3 = b(3);
+            let leash = match g.get(b3..b3 + s * (k - 1) * 4) {
+                Some(lb) if b3 > 0 && k > 1 => (0..s * k).map(|i| if i % k == 0 { 0.0 } else { lb[4 * (i / k * (k - 1) + i % k - 1) + 3] as f32 / 600.0 }).collect(),
+                _ => Vec::new(),
+            };
+            let leash_e = (gu32(0x70) >> 16) as u8;
+            ok.then(|| SimData { c, bend, bend_on: gu32(0x50) & 0x80 != 0, rest, damping: Some(f16(r.u16(0xF6))).filter(|x| x.is_finite() && *x >= 0.0).unwrap_or(0.0), leash, leash_e })
         }
         _ => None,
     };
@@ -889,9 +905,14 @@ impl Groom {
     /// m/s^2 as the game's code sets it):
     /// - start: x_k = x_(k-1) + L_k normalize((B_k - B_(k-1)) + c a g)
     ///   (the game's start estimate), then out of the colliders;
-    /// - each step (dt = 1/30 s, the rate the program's constants are tuned
-    ///   to): v = damp (v + g dt / 2), x += dt v; x += f (B - x) with
-    ///   f = 1 / (1 + a c / dt^2); out of the colliders; then from the root,
+    /// - each step: v = damp (v + g dt / 2), x += dt v; x += f (B - x) with
+    ///   f = 1 / (1 + a c' / dt^2), c' = c m P the compliance scaled by the
+    ///   leash: m = lo + 15 dt (hi - lo) with lo = max(0, 0.8 - 0.00235 E),
+    ///   hi = min(2, 1.2 + 0.00235 E), and P = (R / |x - B|)^e with
+    ///   e = 3 E / 255 (P = 1 when e = 0), r^e at most 1e6, R the point's
+    ///   leash radius (4 a c without B3): a point within R of its stored
+    ///   place is pulled less, one beyond it more, and a point with R = 0
+    ///   stays where it is stored; out of the colliders; then from the root,
     ///   x_k = x_(k-1) + L_k normalize((x_k - x_(k-1)) + s (x_(k+1) - x_k))
     ///   with s the program's look-ahead when the next segment is
     ///   stretched; then, from the third point on when the bend constraint
@@ -904,13 +925,13 @@ impl Groom {
     ///   v from the change of position.
     ///
     /// The roots stay. Runs until no point moves 0.05 mm in a step, or 300
-    /// steps, at dt = 0.05 s (the game's substeps run from 1.8 to 1 times
-    /// the frame time; the settled shape does not depend on dt). Left out:
-    /// the extra velocity damping of the follow-the-leader step and the
-    /// point radius against the colliders (both set per instance at run
-    /// time), wind, and sim_1's distance-dependent scale on the pull's
-    /// compliance (medium confidence in its reading, and it needs per-node
-    /// pose data the viewer does not build). Returns false
+    /// steps, at dt = 0.06 s (the game's substeps at 30 fps; dt enters the
+    /// settled shape only through m). The leash radius is the B3 offset's
+    /// length after skinning, which in the bind pose is its stored length
+    /// (medium confidence in which lengths the game takes). Left out: the
+    /// extra velocity damping of the follow-the-leader step and the point
+    /// radius against the colliders (both set per instance at run time),
+    /// and wind. Returns false
     /// (guides unchanged) when the groom stores no simulation data.
     pub fn settle(&mut self, colliders: Option<&Colliders>) -> bool {
         let Some(sim) = self.sim.as_ref() else { return false };
@@ -918,8 +939,15 @@ impl Groom {
         if k < 2 || sim.c.len() != self.points.len() || sim.rest.len() != self.points.len() || self.w.len() != self.points.len() {
             return false;
         }
-        const DT: f32 = 0.05;
+        const DT: f32 = 0.06;
         const G: [f32; 3] = [0.0, 0.0, -9.8];
+        if !sim.leash.is_empty() && sim.leash.len() != self.points.len() {
+            return false;
+        }
+        // the leash: the exponent and the time scale of the pull from E
+        let ex = 3.0 * sim.leash_e as f32 / 255.0;
+        let (lo, hi) = ((0.8 - 0.00235 * sim.leash_e as f32).max(0.0), (1.2 + 0.00235 * sim.leash_e as f32).min(2.0));
+        let m = lo + 15.0 * DT * (hi - lo);
         let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
         let cross = |a: [f32; 3], b: [f32; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
         let damp = (1.0 - DT * sim.damping).clamp(1.0e-6, 1.0);
@@ -939,7 +967,12 @@ impl Groom {
             let a = |j: usize| self.w[at + j].max(0.0);
             let c = |j: usize| sim.c[at + j];
             let l = |j: usize| sim.rest[at + j].max(1.0e-6);
-            let f = |j: usize| 1.0 / (1.0 + a(j) * c(j) / (DT * DT));
+            let radius = |j: usize| if sim.leash.is_empty() { 4.0 * a(j) * c(j) } else { sim.leash[at + j] };
+            // the pull toward the stored point at distance `dist`
+            let f = |j: usize, dist: f32| {
+                let cs = if ex > 0.0 { c(j) * m * (radius(j) / dist.max(1.0e-9)).powf(ex).min(1.0e6) } else { c(j) };
+                1.0 / (1.0 + a(j) * cs / (DT * DT))
+            };
             // the start estimate
             let mut x = b.to_vec();
             for j in 1..k {
@@ -954,7 +987,7 @@ impl Groom {
                 for j in 1..k {
                     v[j] = scale(add(v[j], scale(G, DT * 0.5)), damp);
                     let p = add(start[j], scale(v[j], DT));
-                    let p = add(p, scale(sub(b[j], p), f(j)));
+                    let p = add(p, scale(sub(b[j], p), f(j, len(sub(p, b[j])))));
                     x[j] = out(p);
                 }
                 let mut remaining = total;
@@ -1814,7 +1847,7 @@ mod tests {
         let rest: Vec<f32> = (0..k).map(|j| if j == 0 { l * (k - 1) as f32 } else { l }).collect();
         let w: Vec<f32> = rest.iter().map(|r| r / 10.0).collect();
         let cs: Vec<f32> = (0..k).map(|j| if j == 0 { 0.0 } else { c }).collect();
-        Groom { tint_weight: 1.0, strands: 1, points_per_strand: k, points, w, roots: vec![], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![], twist: vec![], curl: Default::default(), sim: Some(SimData { c: cs, bend: vec![bend; k], bend_on, rest, damping: 0.0 }) }
+        Groom { tint_weight: 1.0, strands: 1, points_per_strand: k, points, w, roots: vec![], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![], twist: vec![], curl: Default::default(), sim: Some(SimData { c: cs, bend: vec![bend; k], bend_on, rest, damping: 0.0, leash: vec![], leash_e: 0 }) }
     }
 
     fn seg(g: &Groom, j: usize) -> f32 {
@@ -1865,6 +1898,22 @@ mod tests {
         let (free, bent) = (cornered(false), cornered(true));
         // gravity straightens the free guide; the bend constraint keeps the corner
         assert!(turn(&bent) > turn(&free) + 20.0, "bent {} free {}", turn(&bent), turn(&free));
+    }
+
+    #[test]
+    fn the_leash_holds_points_near_their_stored_place() {
+        let hang = |radius: f32| {
+            let mut g = hanging(6, 100.0, 10.0, false);
+            let sim = g.sim.as_mut().unwrap();
+            sim.leash_e = 85;
+            sim.leash = (0..6).map(|j| if j == 0 { 0.0 } else { radius }).collect();
+            g.settle(None);
+            g.points[5][2]
+        };
+        let (none, short, long) = (hang(0.0), hang(0.01), hang(0.2));
+        // R = 0 keeps the guide as stored; a longer leash lets it hang further
+        assert!(none.abs() < 1.0e-4, "{none}");
+        assert!(short < -1.0e-3 && long < short - 0.01, "short {short} long {long}");
     }
 
     #[test]
