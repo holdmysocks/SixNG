@@ -1775,7 +1775,7 @@ fn write_pools(dir: &std::path::Path, pools: &[PoolSurface], unplaced: &Unplaced
         let prims = ix.iter().map(|&i| &pools[i]).map(|p| TriPrim {
             name: p.name.clone(), positions: p.positions.clone(), normals: None, tangents: None, uvs: if p.uvs.is_empty() { vec![] } else { vec![p.uvs.clone()] },
             colors: None, colors1: None, regions: None, tint: None, indices: p.indices.clone(), material: Some(mi),
-            joints: None, weights: None, joints1: None, weights1: None,
+            joints: None, weights: None, joints1: None, weights1: None, morphs: Vec::new(),
         }).collect();
         groups.push(NodeGroup { name: k.to_string(), prims });
     }
@@ -1852,7 +1852,7 @@ fn write_inland(dir: &std::path::Path, tiles: &[InlandTile], check: &Value, set:
         let prims = tiles.iter().filter(|t| t.kind == *k).map(|t| TriPrim {
             name: t.name.clone(), positions: t.positions.clone(), normals: None, tangents: None, uvs: if t.uvs.is_empty() { vec![] } else { vec![t.uvs.clone()] },
             colors: None, colors1: None, regions: None, tint: None, indices: t.indices.clone(), material: Some(mi),
-            joints: None, weights: None, joints1: None, weights1: None,
+            joints: None, weights: None, joints1: None, weights1: None, morphs: Vec::new(),
         }).collect();
         groups.push(NodeGroup { name: kind_name(k).to_string(), prims });
     }

@@ -1195,7 +1195,7 @@ mod paint_tests {
         }
         crate::gltf::TriPrim {
             name: String::new(), positions, normals: None, tangents: None, uvs: vec![u0, u1], colors: None, colors1: None, regions: None, tint: None,
-            indices: vec![], material: Some(0), joints: None, weights: None, joints1: None, weights1: None,
+            indices: vec![], material: Some(0), joints: None, weights: None, joints1: None, weights1: None, morphs: Vec::new(),
         }
     }
 

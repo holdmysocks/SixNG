@@ -1734,12 +1734,28 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         &r.gfx[(b.gfx_off as usize).min(end)..end]
     };
     let skin = ped_skin(a, e, r, info, o, item);
+    // Ped heads: the face network's expression shape keys (`facegraph`).
+    let face_nets = match e.name.as_deref() {
+        Some(n) if n.to_ascii_lowercase().contains("head") => crate::facegraph::nets_for_head(a, n),
+        _ => Vec::new(),
+    };
     // Triangle meshes: one primitive per geometry, grouped by model.
     let mut mesh_meta = Vec::new();
     let prims_of = |gi: usize, material: Option<usize>, mesh_meta: &mut Vec<serde_json::Value>| -> Option<crate::gltf::TriPrim> {
         let g = &info.geometries[gi];
         let h = info.buffers[g.vertex_buffer].mesh_blob.as_ref()?;
         let mut m = crate::drawable::decode_mesh(slice(g.vertex_buffer), h, slice(g.index_buffer));
+        let morphs = if face_nets.is_empty() {
+            Vec::new()
+        } else {
+            let blob = slice(g.vertex_buffer);
+            h.sections
+                .iter()
+                .find(|s| s.0 == 8 && s.2 == 0x8c)
+                .and_then(|s| crate::facegraph::vertex_map(blob.get(s.1 as usize..).unwrap_or(&[]), m.positions.len()))
+                .map(|map| crate::facegraph::morph_targets(&face_nets, &map))
+                .unwrap_or_default()
+        };
         // Ped clothing: joint index -> bone palette -> joint list.
         if let Some(map) = skin.geometry_map.get(&gi) {
             let remap = |js: &mut Vec<[u16; 4]>| js.iter_mut().flatten().for_each(|j| *j = map.get(*j as usize).copied().unwrap_or(u16::MAX));
@@ -1789,6 +1805,8 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             // bone that is in neither skeleton); their weight is moved
             // to the largest kept influence in the GLB.
             "unresolved_joints": skin_used.as_ref().map(|u| u.iter().filter(|&&i| i as usize >= skin.joints.len()).count()),
+            // ped heads: expression shape keys of the face network (morph targets)
+            "face_morphs": morphs.len(),
         }));
         // The placement tint of props (a palette embedded in the model,
         // picked by the vertex colours). Not on the vehicle shaders: their
@@ -1841,7 +1859,7 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         }
         Some(crate::gltf::TriPrim {
             name, positions: m.positions, normals: m.normals, tangents: m.tangents, uvs: m.uvs.into_iter().map(|u| u.1).collect(),
-            colors: m.colors, colors1: m.colors1, regions: m.regions, tint, indices: m.indices, material, joints: m.joints, weights: m.weights, joints1: m.joints1, weights1: m.weights1,
+            colors: m.colors, colors1: m.colors1, regions: m.regions, tint, indices: m.indices, material, joints: m.joints, weights: m.weights, joints1: m.joints1, weights1: m.weights1, morphs,
         })
     };
     let nlod = info.models.iter().filter(|m| !m.part).map(|m| m.lod + 1).max().unwrap_or(1);
@@ -4099,7 +4117,7 @@ mod dictionary_tests {
         let group = || crate::gltf::NodeGroup { name: "member".into(), prims: vec![crate::gltf::TriPrim {
             name: "triangle".into(), positions: vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
             normals: None, tangents: None, uvs: vec![], colors: None, colors1: None, regions: None, tint: None, indices: vec![0, 1, 2],
-            material: None, joints: None, weights: None, joints1: None, weights1: None,
+            material: None, joints: None, weights: None, joints1: None, weights1: None, morphs: Vec::new(),
         }] };
         let mut groups = vec![vec![], vec![], vec![group()], vec![group()], vec![], vec![group()]];
         assert_eq!(lod_exports(&groups), [(2, "model.glb".into()), (3, "model_lod3.glb".into()), (5, "model_lod5.glb".into())]);

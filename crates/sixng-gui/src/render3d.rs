@@ -2164,7 +2164,8 @@ impl Uploader {
         let vb = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("vb"),
             size: (nv * vsz).max(vsz).next_multiple_of(4),
-            usage: wgpu::BufferUsages::VERTEX,
+            // COPY_DST: morph targets (face expressions) rewrite a mesh's vertices
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: true,
         });
         let ib = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2350,6 +2351,18 @@ impl Renderer3D {
         rs.queue
             .write_buffer(&gm.joints_buf, 0, bytemuck::cast_slice(&v));
         self.bump_accum(bytemuck::cast_slice(&v));
+    }
+
+    /// Replace one mesh's vertices (same count as uploaded), e.g. after
+    /// morph targets changed its shape.
+    pub fn write_vertices(&self, rs: &egui_wgpu::RenderState, gm: &GpuModel, mesh: usize, verts: &[glb::Vertex]) {
+        let Some(me) = gm.meshes.get(mesh) else { return };
+        let bytes: &[u8] = bytemuck::cast_slice(verts);
+        if bytes.len() as u64 != me.vb_range.end - me.vb_range.start || bytes.len() % 4 != 0 {
+            return;
+        }
+        rs.queue.write_buffer(&me.vb, me.vb_range.start, bytes);
+        self.bump_accum(&bytes[..bytes.len().min(4096)]);
     }
 
     /// Restart the still-camera mean when data it shows changed outside `render`.
