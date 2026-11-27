@@ -653,6 +653,7 @@ mod tests {
                     weights: [0; 4],
                     tint: [255; 4],
                     zone: [0; 4],
+                    uv23: [0; 4],
                 };
                 3
             ],

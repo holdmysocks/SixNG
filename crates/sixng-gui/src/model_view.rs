@@ -350,6 +350,25 @@ pub struct HairPick {
     pub tone: Option<HairTone>,
 }
 
+/// A character's hair piece (hair, brows, lashes, beard ...) and how it is
+/// coloured: its own colour or stored colours, or the same as another piece.
+#[derive(Clone, Debug)]
+pub struct HairPiece {
+    /// The item slot (alternatives count as their piece: "other hair" as "hair").
+    pub slot: String,
+    /// Coloured as this other piece (which has its own colour); None: its own.
+    pub link: Option<String>,
+    pub colour: [f32; 3],
+    /// Each groom takes the colours of the hair preset its item names.
+    pub stored: bool,
+}
+
+/// The piece a hair item's slot belongs to: an alternative ("other hair",
+/// "other beard") is coloured with its piece.
+fn piece_slot(slot: &str) -> &str {
+    slot.strip_prefix("other ").unwrap_or(slot)
+}
+
 /// The hair colour of one hair item as the viewer draws it: the preset of
 /// each of the four strand variants (`hairtone::Table::variants`).
 #[derive(Clone)]
@@ -700,6 +719,12 @@ pub struct Automation {
     pub hair_style: Option<String>,
     /// `--hair-width MM` for a character's own hair.
     pub hair_width: Option<f32>,
+    /// `--hair-colour r,g,b`: one colour for a character's hair in place of
+    /// its stored colours.
+    pub hair_colour: Option<[f32; 3]>,
+    /// `--hair-pieces "brows:r,g,b;lashes:r,g,b"`: own colours for some of
+    /// a character's hair pieces.
+    pub hair_pieces: Vec<(String, [f32; 3])>,
 }
 
 /// Shared-wheel scale per unit of the car's wheelScale. Every shared rim
@@ -998,6 +1023,11 @@ pub struct Hair {
     pub tones: HashMap<u64, HairTone>,
     /// Colour the grooms that have a preset with it (else the one colour).
     pub stored_colours: bool,
+    /// Characters: the colour of each hair piece, and the piece of each groom.
+    pub pieces: Vec<HairPiece>,
+    slot_of: HashMap<u64, String>,
+    /// The piece the hair palette swatches paint.
+    paint: usize,
     /// Draw the chosen grooms (the guide strands); off hides them without
     /// dropping the choice.
     pub show: bool,
@@ -1046,6 +1076,9 @@ impl Default for Hair {
             skin_colour: true,
             tones: HashMap::new(),
             stored_colours: true,
+            pieces: Vec::new(),
+            slot_of: HashMap::new(),
+            paint: 0,
             show: true,
             full_coat: true,
             density: 1.0,
@@ -1059,10 +1092,43 @@ impl Default for Hair {
 }
 
 impl Hair {
+    /// The piece whose colour piece `i` takes: itself, or the one it links to.
+    fn resolve(&self, mut i: usize) -> usize {
+        for _ in 0..self.pieces.len() {
+            match self.pieces[i].link.as_ref().and_then(|l| self.pieces.iter().position(|p| p.slot == *l)) {
+                Some(j) if j != i => i = j,
+                _ => break,
+            }
+        }
+        i
+    }
+
+    /// Per groom of a character: its colour and whether it takes its stored colours.
+    fn groom_colours(&self) -> HashMap<u64, ([f32; 3], bool)> {
+        self.slot_of
+            .iter()
+            .filter_map(|(g, slot)| {
+                let i = self.resolve(self.pieces.iter().position(|p| p.slot == *slot)?);
+                Some((*g, (self.pieces[i].colour, self.pieces[i].stored)))
+            })
+            .collect()
+    }
+
+    /// The stored colours drawn: per piece for a character, else all or none.
+    fn tones_drawn(&self) -> HashMap<u64, HairTone> {
+        if self.pieces.is_empty() {
+            return if self.stored_colours { self.tones.clone() } else { HashMap::new() };
+        }
+        let gc = self.groom_colours();
+        self.tones.iter().filter(|(g, _)| gc.get(*g).is_none_or(|c| c.1)).map(|(g, t)| (*g, t.clone())).collect()
+    }
+
     fn want_key(&self) -> String {
-        let mut tones: Vec<(u64, u32)> = self.tones.iter().filter(|_| self.stored_colours).map(|(k, t)| (*k, t.name)).collect();
+        let mut tones: Vec<(u64, u32)> = self.tones_drawn().iter().map(|(k, t)| (*k, t.name)).collect();
         tones.sort();
-        format!("{tones:?}|{:?}|{}|{:?}|{}|{}|{}|{:?}|{:?}|{:?}", self.selected, self.width_mm, self.colour, self.skin_colour && !self.skin.is_empty(), self.full_coat, self.density, self.hat.as_ref().map(|h| h.id), self.collide.as_ref().map(|c| c.id), self.rig.as_ref().map(|r| (r.verts.len(), r.joints.len())))
+        let mut own: Vec<(u64, [u32; 3])> = self.groom_colours().iter().map(|(g, c)| (*g, c.0.map(f32::to_bits))).collect();
+        own.sort();
+        format!("{tones:?}|{own:?}|{:?}|{}|{:?}|{}|{}|{}|{:?}|{:?}|{:?}", self.selected, self.width_mm, self.colour, self.skin_colour && !self.skin.is_empty(), self.full_coat, self.density, self.hat.as_ref().map(|h| h.id), self.collide.as_ref().map(|c| c.id), self.rig.as_ref().map(|r| (r.verts.len(), r.joints.len())))
     }
     pub fn settled(&self) -> bool {
         !self.loading && !self.listing && !self.exporting && self.key == self.want_key()
@@ -1362,7 +1428,8 @@ impl ModelView {
         let (hat, under_hat) = (self.hair.hat.clone(), self.hair.under_hat.clone());
         let collide = self.hair.collide.clone();
         let rig = self.hair.rig.clone();
-        let tones = if self.hair.stored_colours { self.hair.tones.clone() } else { HashMap::new() };
+        let tones = self.hair.tones_drawn();
+        let own: HashMap<u64, [f32; 3]> = self.hair.groom_colours().into_iter().map(|(g, c)| (g, c.0)).collect();
         // The game's strand tables (colour and parameter ramps and sets, hair LOD presets) are read from the
         // game's own files (`hairtables`, cached in the index folder) when the hair is built. Overrides for
         // research: SIXNG_HAIR_DATA=<json> and SIXNG_HAIR_LOD=<json> take parsed tables from files;
@@ -1415,7 +1482,7 @@ impl ModelView {
                         h.press_strands(&mut g.points, g.points_per_strand, 0.003);
                     }
                     // linear colour from the sRGB picker value
-                    let lin = rgb.map(|c| c.powf(2.2));
+                    let lin = own.get(&off).copied().unwrap_or(rgb).map(|c| c.powf(2.2));
                     let p = dir.join(format!("{off:x}.glb"));
                     let nearest = |r: [f32; 3], skin: &[([f32; 3], [u8; 3])]| {
                         let d = |p: &[f32; 3]| (p[0] - r[0]).powi(2) + (p[1] - r[1]).powi(2) + (p[2] - r[2]).powi(2);
@@ -1809,7 +1876,14 @@ impl ModelView {
                         ui.add(egui::Slider::new(&mut self.hair.density, 0.05..=1.0).text("density"));
                     }
                 }
-                if !self.hair.tones.is_empty() {
+                if !self.hair.tones.is_empty() && !self.hair.pieces.is_empty() {
+                    let mut all = self.hair.pieces.iter().filter(|p| p.link.is_none()).all(|p| p.stored);
+                    if ui.checkbox(&mut all, "stored hair colours").on_hover_text("Each piece takes the colours of the hair preset its item names. Per piece: Hair colours in the Character panel.").changed() {
+                        for p in &mut self.hair.pieces {
+                            p.stored = all;
+                        }
+                    }
+                } else if !self.hair.tones.is_empty() {
                     ui.checkbox(&mut self.hair.stored_colours, "stored hair colours").on_hover_text("Each hair, brow, lash and beard piece takes the two colours of the hair preset its item names, mixed per strand by the preset's noise texture (how the game mixes them is not decoded). Shown brighter than stored: the game's hair shader scatters light and the viewer's does not. Off: the one colour above.");
                 }
                 if !self.hair.skin.is_empty() {
@@ -2273,30 +2347,104 @@ impl ModelView {
                     }
                 }
             }
-            ui.horizontal(|ui| {
-                ui.label("colour");
-                ui.color_edit_button_rgb(&mut self.hair.colour);
-                ui.label(egui::RichText::new("(stored for items that name the hair palette; most leave it to the game, so pick one)").weak().small());
-            });
-            if !look.hair_swatches.is_empty() {
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
-                    for c in look.hair_swatches.iter().take(64) {
-                        let (r, resp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
-                        ui.painter().rect_filled(r, 2.0, egui::Color32::from_rgb(c[0], c[1], c[2]));
-                        if resp.on_hover_text("A colour of the game's hair palette (ped_tint_hair)").clicked() {
-                            self.hair.colour = c.map(|x| x as f32 / 255.0);
-                        }
-                    }
-                });
-            }
         }
-        let unplaced: Vec<&str> = look.strands.iter().filter(|s| !look.hair.iter().any(|h| h.slot == s.0)).map(|s| s.1.as_str()).collect();
+        let unplaced: Vec<String> = look.strands.iter().filter(|s| !look.hair.iter().any(|h| h.slot == s.0)).map(|s| s.1.clone()).collect();
+        let swatches = (!look.hair.is_empty()).then(|| look.hair_swatches.clone());
+        if let Some(sw) = swatches {
+            self.hair_pieces_ui(ui, &sw);
+        }
         if !unplaced.is_empty() {
             ui.label(egui::RichText::new(format!("Strand hair with no grooms placed: {}", unplaced.join(", "))).weak().small());
         }
         ui.separator();
         reload
+    }
+
+    /// A character's hair colours: one row per piece (hair, brows, lashes,
+    /// beard ...), each with its own colour, its stored colours, or the same
+    /// colour as another piece; the palette swatches paint the chosen piece.
+    fn hair_pieces_ui(&mut self, ui: &mut egui::Ui, swatches: &[[u8; 3]]) {
+        let n = self.hair.pieces.len();
+        if n == 0 {
+            return;
+        }
+        let has_tones = !self.hair.tones.is_empty();
+        ui.label("Hair colours").on_hover_text("Each piece has its own colour, or the same colour as another piece. Click a piece's name to choose it for the palette swatches below.");
+        egui::Grid::new("hair_pieces").num_columns(3).spacing([6.0, 2.0]).show(ui, |ui| {
+            for i in 0..n {
+                let slot = self.hair.pieces[i].slot.clone();
+                if ui.selectable_label(self.hair.paint == i, &slot).on_hover_text("Paint this piece with the palette swatches").clicked() {
+                    self.hair.paint = i;
+                }
+                let link = self.hair.pieces[i].link.clone();
+                let targets: Vec<String> = self.hair.pieces.iter().enumerate().filter(|(j, p)| *j != i && p.link.is_none()).map(|(_, p)| p.slot.clone()).collect();
+                let mut pick = link.clone();
+                egui::ComboBox::from_id_salt(("hair_link", i))
+                    .selected_text(link.as_ref().map_or("own colour".to_string(), |l| format!("same as {l}")))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut pick, None, "own colour");
+                        for t in &targets {
+                            ui.selectable_value(&mut pick, Some(t.clone()), format!("same as {t}"));
+                        }
+                    });
+                if pick != link {
+                    // keep what is drawn: a piece cut loose starts from the colour it showed
+                    let r = self.hair.resolve(i);
+                    let (c, st) = (self.hair.pieces[r].colour, self.hair.pieces[r].stored);
+                    let p = &mut self.hair.pieces[i];
+                    p.colour = c;
+                    p.stored = st;
+                    p.link = pick.clone();
+                    // pieces that followed this one now follow its new target
+                    if let Some(t) = pick {
+                        for q in &mut self.hair.pieces {
+                            if q.link.as_deref() == Some(slot.as_str()) {
+                                q.link = Some(t.clone());
+                            }
+                        }
+                    }
+                }
+                ui.horizontal(|ui| {
+                    if self.hair.pieces[i].link.is_none() {
+                        let p = &mut self.hair.pieces[i];
+                        // a colour picked here is drawn: it turns the stored colours off
+                        if ui.color_edit_button_rgb(&mut p.colour).changed() {
+                            p.stored = false;
+                        }
+                        if has_tones {
+                            ui.checkbox(&mut p.stored, "stored").on_hover_text("On: each groom of this piece (and of the pieces linked to it) takes the colours of the hair preset its item names. Off: the colour picked here.");
+                        }
+                    } else {
+                        let r = self.hair.resolve(i);
+                        let p = &self.hair.pieces[r];
+                        let c = p.colour.map(|x| (x.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+                        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                        ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(c[0], c[1], c[2]));
+                        if p.stored {
+                            ui.label(egui::RichText::new("stored").weak());
+                        }
+                    }
+                });
+                ui.end_row();
+            }
+        });
+        ui.label(egui::RichText::new("(stored for items that name the hair palette; most leave it to the game, so pick one)").weak().small());
+        if !swatches.is_empty() {
+            let r = self.hair.resolve(self.hair.paint.min(n - 1));
+            ui.label(egui::RichText::new(format!("palette: paints {}", self.hair.pieces[r].slot)).weak().small());
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+                for c in swatches.iter().take(64) {
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+                    ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(c[0], c[1], c[2]));
+                    if resp.on_hover_text("A colour of the game's hair palette (ped_tint_hair)").clicked() {
+                        let p = &mut self.hair.pieces[r];
+                        p.colour = c.map(|x| x as f32 / 255.0);
+                        p.stored = false;
+                    }
+                }
+            });
+        }
     }
 
     /// Parts panel for animals and characters: one choice (or none) per
@@ -2607,10 +2755,45 @@ impl ModelView {
                         self.hair.look_key = key;
                         let want = self.auto.hair_style.clone();
                         self.hair.selected = look.hair.iter().filter(|h| h.shown || want.as_ref().is_some_and(|w| h.placeholder.contains(w.as_str()))).flat_map(|h| h.grooms.iter().copied()).collect();
-                        if let Some(c) = look.hair.iter().find(|h| h.slot == "hair").or(look.hair.first()).and_then(|h| h.colour) {
+                        if let Some(c) = self.auto.hair_colour {
+                            self.hair.colour = c;
+                            self.hair.stored_colours = false;
+                        } else if let Some(c) = look.hair.iter().find(|h| h.slot == "hair").or(look.hair.first()).and_then(|h| h.colour) {
                             self.hair.colour = c.map(|x| x as f32 / 255.0);
                         }
                         self.hair.tones = look.hair.iter().filter_map(|h| Some((h, h.tone.as_ref()?))).flat_map(|(h, t)| h.grooms.iter().map(move |g| (*g, t.clone()))).collect();
+                        // one piece per slot: hair has its own colour, the rest start linked to it
+                        self.hair.pieces.clear();
+                        self.hair.slot_of.clear();
+                        self.hair.paint = 0;
+                        for h in &look.hair {
+                            let slot = piece_slot(&h.slot).to_string();
+                            if !self.hair.pieces.iter().any(|p| p.slot == slot) {
+                                let colour = look.hair.iter().filter(|x| piece_slot(&x.slot) == slot).find_map(|x| x.colour).map_or(self.hair.colour, |c| c.map(|x| x as f32 / 255.0));
+                                self.hair.pieces.push(HairPiece { slot: slot.clone(), link: None, colour, stored: self.auto.hair_colour.is_none() });
+                            }
+                            for g in &h.grooms {
+                                self.hair.slot_of.insert(*g, slot.clone());
+                            }
+                        }
+                        self.hair.pieces.sort_by_key(|p| p.slot != "hair");
+                        if let Some(first) = self.hair.pieces.first().map(|p| p.slot.clone()) {
+                            for p in self.hair.pieces.iter_mut().skip(1) {
+                                p.link = Some(first.clone());
+                            }
+                        }
+                        if let Some(c) = self.auto.hair_colour {
+                            for p in &mut self.hair.pieces {
+                                p.colour = c;
+                            }
+                        }
+                        for (slot, c) in &self.auto.hair_pieces {
+                            if let Some(p) = self.hair.pieces.iter_mut().find(|p| p.slot == *slot) {
+                                p.link = None;
+                                p.colour = *c;
+                                p.stored = false;
+                            }
+                        }
                         if !look.hair.is_empty() {
                             self.hair.full_coat = true;
                             self.hair.skin_colour = false;
@@ -2627,6 +2810,8 @@ impl ModelView {
                     }
                 } else if !self.hair.look_key.is_empty() {
                     self.hair.look_key.clear();
+                    self.hair.pieces.clear();
+                    self.hair.slot_of.clear();
                     self.hair.hat = None;
                     self.hair.collide = None;
                     if self.hair.fur.is_none() {
@@ -3302,6 +3487,9 @@ impl ModelView {
                     // each part id's second-layer colour (sRGB), which the
                     // game's shader uses as the first wear layer's tint
                     let wear_tint = pc["wear_tint"][idx].as_str().filter(|w| w.len() == 256 * 6);
+                    // each part id's colour step amounts (sun bleach screen,
+                    // albedo multiply, albedo screen of both layers)
+                    let tone = pc["surface_tone"][idx].as_str().filter(|w| w.len() == 256 * 12);
                     // rows 512..: the low and high of the first layer's
                     // metalness and roughness, which the shader blends by the
                     // material map at each pixel
@@ -3372,6 +3560,15 @@ impl ModelView {
                         // bytes (PartWear::dust)
                         for (c, v) in pw.dust.iter().enumerate() {
                             px[(768 + id) * 512 + (73 + c) * 4 + 3] = *v;
+                        }
+                        // columns 89 to 94: the colour step amounts of the
+                        // surface's first layer, then of its second (sun
+                        // bleach screen, albedo multiply, albedo screen);
+                        // 95: 255 when the part's own colour is a palette row
+                        let t6 = tone.and_then(|t| (0..6).map(|k| u8::from_str_radix(&t[id * 12 + k * 2..id * 12 + k * 2 + 2], 16).ok()).collect::<Option<Vec<u8>>>()).unwrap_or(vec![0; 6]);
+                        let pal_row = rows.get(id * 4..id * 4 + 4).is_some_and(|r| r != "ffff");
+                        for (c, v) in t6.iter().copied().chain([if pal_row { 255 } else { 0 }]).enumerate() {
+                            px[(768 + id) * 512 + (89 + c) * 4 + 3] = v;
                         }
                         let set = primer_set(primer_sets.as_ref().map_or(1, |m| m[id]), self.look.primer_set);
                         let prow = primer_rows.and_then(|s| usize::from_str_radix(&s[id * 12 + set * 4..id * 12 + set * 4 + 4], 16).ok()).filter(|r| *r != 0xffff);

@@ -1127,6 +1127,16 @@ fn guid_drawable(guid: &str, main: impl Fn(u64) -> Option<String>, pack: impl Fn
     (slot_of(&n) != "head" && !n.ends_with("_fp") && !n.contains("_fp_")).then_some((n, how))
 }
 
+/// The first-person mesh an item's asset GUID names (`hand_fr1_000_nude_cull_fp`,
+/// the arms seen in first person), if it names one. Such an item is not
+/// drawn: its third-person look is another item. Matched by its textures
+/// instead it lands on the whole upper body with the first-person hands
+/// texture (pale and streaky over the chest: `cs_lucia`'s default outfit).
+fn first_person_drawable(guid: &str, main: impl Fn(u64) -> Option<String>, pack: impl Fn(u64) -> Option<String>) -> Option<String> {
+    let g = u64::from_str_radix(guid, 16).ok()?;
+    main(g).or_else(|| pack(g)).filter(|n| n.ends_with("_fp") || n.contains("_fp_"))
+}
+
 /// Why a drawable is not drawn although an item names it: the content
 /// pack's invisible stand-ins (`invisible_brabalcony_fr1_000_…`, the bra of
 /// Lucia's body-detail set; the texture match finds the visible bra).
@@ -1982,6 +1992,10 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
                 // head template (`head_mr1_base_000_m_full`); the face is
                 // the head the item names.
                 let own = || guid_drawable(p.guid.as_deref()?, |g| by_guid.get(&g).map(|n| (*n).clone()), &pack_name);
+                if let Some(n) = p.guid.as_deref().and_then(|g| first_person_drawable(g, |g| by_guid.get(&g).map(|n| (*n).clone()), &pack_name)) {
+                    not_shown.push(format!("{} (first person only: the item names {n})", p.item));
+                    continue;
+                }
                 let Some((drawable, found_by)) = own().or_else(|| choose(p, fit.as_deref(), &exists)).or_else(by_asset) else {
                     // items without textures or names are settings, not parts;
                     // a garment that names a model by GUID is a part whose
@@ -2274,5 +2288,19 @@ mod tests {
         assert!(is_skin_insert("nipples") && is_skin_insert("genitals") && !is_skin_insert("body upper"));
         assert!(invisible_reason("invisible_brabalcony_fr1_000_regular_ws00_full").is_some());
         assert!(invisible_reason("brabalcony_fr1_000_regular_ws00_full").is_none());
+    }
+
+    #[test]
+    fn items_naming_a_first_person_mesh_are_not_drawn() {
+        let fp = "hand_fr1_000_nude_cull_fp";
+        let g = crate::meta7a::asset_id(fp);
+        let hex = format!("{g:016x}");
+        let main = |x: u64| (x == g).then(|| fp.to_string());
+        let none = |_: u64| None::<String>;
+        assert_eq!(first_person_drawable(&hex, main, none).as_deref(), Some(fp));
+        assert!(first_person_drawable(&hex, |_| Some("hand_fr1_000_nude_cull".into()), none).is_none());
+        assert!(first_person_drawable(&hex, none, none).is_none());
+        // and the GUID lookup leaves it to this rule
+        assert!(guid_drawable(&hex, main, none).is_none());
     }
 }

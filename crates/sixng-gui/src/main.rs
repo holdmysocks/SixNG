@@ -1923,6 +1923,18 @@ impl App {
             let v: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse::<f32>().ok()).collect();
             if v.len() == 3 {
                 m.hair.colour = [v[0] / 255.0, v[1] / 255.0, v[2] / 255.0];
+                // kept over the stored colours of the character's hair
+                m.auto.hair_colour = Some(m.hair.colour);
+            }
+        }
+        // --hair-pieces "brows:r,g,b;lashes:r,g,b" (0..255): own colours per hair piece
+        if let Some(v) = c.get("hair-pieces") {
+            for e in v.split(';') {
+                let Some((slot, rgb)) = e.split_once(':') else { continue };
+                let v: Vec<f32> = rgb.split(',').filter_map(|x| x.trim().parse::<f32>().ok()).collect();
+                if v.len() == 3 {
+                    m.auto.hair_pieces.push((slot.trim().to_string(), [v[0] / 255.0, v[1] / 255.0, v[2] / 255.0]));
+                }
             }
         }
         // --pose rest|down|walk|sit|wave: a character's pose
@@ -1983,6 +1995,7 @@ impl App {
         m.livery.ed.auto_click = c.get("livery-click").map(pairs).unwrap_or_default();
         m.livery.ed.auto_drag = c.get("livery-drag").map(pairs).and_then(|v| v.first().copied());
         m.livery.ed.auto_save = c.has("livery-save");
+        m.livery.ed.auto_brand = c.get("livery-brand").map(str::to_string);
         if let Some(t) = c.get("livery-tool") {
             m.livery.ed.tool = match t {
                 "zones" => crate::livery_ui::Tool::Zones,

@@ -82,7 +82,8 @@ pub struct Sticker {
     #[serde(default)]
     pub model: String,
     pub zones: Vec<u8>,
-    /// UV set: 0 = first, 1 = second (the game uses the second for most).
+    /// UV set: 0 = first, 1 = second. The game's own placements (`game_uv`)
+    /// may also use 2 and 3 (its layouts' UV mode minus one).
     #[serde(default)]
     pub uv_set: u8,
     /// Centre in the UV set.
@@ -110,6 +111,12 @@ pub struct Sticker {
     /// ov): written for reference, recomputed from the model on load.
     #[serde(default)]
     pub shader_uv: Option<[f32; 6]>,
+    /// A sticker of one of the game's liveries: the game's own transform
+    /// (a, b, c, d, ou, ov, from its layout; see
+    /// `sixng_core::vehstickers::game_uv`), used as it is instead of the
+    /// placement above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game_uv: Option<[f32; 6]>,
     /// Not placed by hand yet: it is fitted again when its zones change.
     #[serde(skip)]
     pub fresh: bool,
@@ -117,7 +124,7 @@ pub struct Sticker {
 
 impl Sticker {
     pub fn new(picture: Picture) -> Sticker {
-        Sticker { name: String::new(), picture, model: String::new(), zones: Vec::new(), uv_set: 1, centre: [0.5, 0.5], size: [1.0, 1.0], rotation: 0.0, mirror: false, mask: false, colours: white3(), opacity: 1.0, visible: true, shader_uv: None, fresh: true }
+        Sticker { name: String::new(), picture, model: String::new(), zones: Vec::new(), uv_set: 1, centre: [0.5, 0.5], size: [1.0, 1.0], rotation: 0.0, mirror: false, mask: false, colours: white3(), opacity: 1.0, visible: true, shader_uv: None, game_uv: None, fresh: true }
     }
 }
 
@@ -481,8 +488,13 @@ pub fn records(l: &mut Livery, zones: &Zones, layer_of: &dyn Fn(&Picture) -> Opt
         }
         let selected = hl.selected == Some(i);
         let Some(slot) = zones.slot_of(&s.model) else { continue };
-        let Some(set) = zones.set(slot, &s.zones, s.uv_set.min(1) as usize) else { continue };
-        let uv = set.shader_uv(s);
+        let uv = match s.game_uv {
+            Some(m) => m,
+            None => {
+                let Some(set) = zones.set(slot, &s.zones, s.uv_set.min(1) as usize) else { continue };
+                set.shader_uv(s)
+            }
+        };
         s.shader_uv = Some(uv);
         if !s.visible && !selected {
             continue;
@@ -502,7 +514,9 @@ pub fn records(l: &mut Livery, zones: &Zones, layer_of: &dyn Fn(&Picture) -> Opt
             zones: zone_bits(&s.zones),
             m: [uv[0], uv[1], uv[2], uv[3]],
             o: [uv[4], uv[5], s.opacity.clamp(0.0, 1.0), layer.map_or(-1.0, |l| l as f32)],
-            flags: [flags, slot as u32, s.uv_set.min(1) as u32, 0],
+            // UV sets 2 and 3 only for the game's own placements (hand
+            // placing measures the zones in the first two)
+            flags: [flags, slot as u32, s.uv_set.min(if s.game_uv.is_some() { 3 } else { 1 }) as u32, 0],
             c: s.colours.map(lin),
         });
     }

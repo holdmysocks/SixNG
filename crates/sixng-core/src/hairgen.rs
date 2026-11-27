@@ -35,9 +35,9 @@
 //!    copies into the per-instance record the program reads.
 //!
 //! Not covered: the cull groups (hat and clothing masks), the length
-//! texture, skinning, the twist value written per vertex (the style
-//! offset's frame uses it: here the root triangle's normal stands in)
-//! and clumping (bits 2 / 4 / 8 / 16, only partly
+//! texture, skinning, the root frame's exact in-plane direction (the
+//! style offset's frame axis, `apply_style`: here a stand-in in the same
+//! plane) and clumping (bits 2 / 4 / 8 / 16, only partly
 //! read). Both amplitudes are scaled by `1 - m`, `m` the root corners'
 //! collider-proximity value (run time, blended at the root; 0 at rest
 //! without colliders): taken as 0.
@@ -195,7 +195,8 @@ impl Style {
 }
 
 /// The 2D style offset at arc length `s` of a strand with `seed` and length
-/// draw `r` (x along `cross(T, N)`, y along `N`), fade-in included.
+/// draw `r` (x along the frame axis made square to T, y along T x that;
+/// `apply_style`), fade-in included.
 pub fn style_offset(st: &Style, seed: u32, r: f32, s: f32) -> [f32; 2] {
     let mut n = [0.0f32; 2];
     if st.noise_freq != 0.0 && st.noise != 0.0 {
@@ -217,11 +218,18 @@ pub fn style_offset(st: &Style, seed: u32, r: f32, s: f32) -> [f32; 2] {
     [n[0] * k, n[1] * k]
 }
 
-/// Add the style offsets to a grown strand (`grow`'s points). `reference`
-/// is the vector the frame is built from (`N = normalize(cross(reference,
-/// T))`): the game's per-vertex twist vector, not decoded; callers pass
-/// the root triangle's normal.
-pub fn apply_style(points: &mut [[f32; 3]], st: &Style, seed: u32, r: f32, reference: [f32; 3]) {
+/// Add the style offsets to a grown strand (`grow`'s points). The program
+/// builds the frame per point from a vector A and the strand tangent T:
+/// x = A made square to T (unit), y = T x A (unit). A is the guide's frame
+/// carried into the strand's root frame (B1, B2, with B2 x B1 the root
+/// normal): A = (D.P) B1 + (D.Q) B2 for the guide segment P, its reference
+/// axis Q and D = normalize((Q x P) x T). Where the strand runs along its
+/// guide, D = -Q and A = -B2, a fixed direction in the root's surface
+/// plane. B2 comes from per-strand data that is not read, so callers pass
+/// an in-plane root direction as `axis`; another in-plane direction turns
+/// x and y about T, which only shifts the curl's phase (already random per
+/// strand) and the noise directions.
+pub fn apply_style(points: &mut [[f32; 3]], st: &Style, seed: u32, r: f32, axis: [f32; 3]) {
     if st.is_flat() || points.len() < 2 {
         return;
     }
@@ -243,16 +251,17 @@ pub fn apply_style(points: &mut [[f32; 3]], st: &Style, seed: u32, r: f32, refer
         }
         let tl = len(t);
         let tn = [t[0] / tl, t[1] / tl, t[2] / tl];
-        let n = cross(reference, tn);
-        let nl = len(n);
-        if nl < 1e-9 {
+        let at = axis[0] * tn[0] + axis[1] * tn[1] + axis[2] * tn[2];
+        let x = [axis[0] - at * tn[0], axis[1] - at * tn[1], axis[2] - at * tn[2]];
+        let xl = len(x);
+        if xl < 1e-9 {
             continue;
         }
-        let n = [n[0] / nl, n[1] / nl, n[2] / nl];
-        let u = cross(tn, n);
+        let x = [x[0] / xl, x[1] / xl, x[2] / xl];
+        let y = cross(tn, x);
         let o = style_offset(st, seed, r, s);
         for c in 0..3 {
-            points[j][c] = walk[j][c] + o[0] * u[c] + o[1] * n[c];
+            points[j][c] = walk[j][c] + o[0] * x[c] + o[1] * y[c];
         }
     }
 }
@@ -337,6 +346,13 @@ mod tests {
         apply_style(&mut pts, &curl, 7, 0.25, [1.0, 0.0, 0.0]);
         assert!(pts.iter().enumerate().all(|(j, p)| (p[2] - j as f32 * 0.01).abs() < 1e-7));
         assert!(pts[3][0].abs() + pts[3][1].abs() > 1e-4);
+        // the frame: x = the axis made square to T, y = T x axis (along +z with axis +x: x = +x, y = +y)
+        let mut pts: Vec<[f32; 3]> = (0..8).map(|j| [0.0, 0.0, j as f32 * 0.01]).collect();
+        apply_style(&mut pts, &curl, 7, 0.25, [1.0, 0.0, 0.5]);
+        for (j, p) in pts.iter().enumerate() {
+            let o = style_offset(&curl, 7, 0.25, j as f32 * 0.01);
+            assert!((p[0] - o[0]).abs() < 1e-7 && (p[1] - o[1]).abs() < 1e-7, "{j}: {p:?} {o:?}");
+        }
         // the table is the one in the program
         assert_eq!(TABLE[0], [-0.610765994, 0.449018002]);
         assert_eq!(TABLE[3], [-0.0722979978, 0.386516005]);

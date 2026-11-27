@@ -1466,9 +1466,18 @@ pub fn inland_tiles(ws: &crate::export::Workspace) -> Result<Vec<InlandTile>> {
 /// box. A surface sits above the lowest ground under it (the bed) and
 /// below the highest (the banks).
 pub fn check_inland(tiles: &[InlandTile], hgt: &Layer) -> Value {
-    let (m, _) = hgt.mosaic();
+    let (m, src) = hgt.mosaic();
     let b = hgt.grid.world_box();
     let mpt = hgt.grid.tile / hgt.px as f32;
+    // the cell's source: its own tile (2) or the low-resolution fallback (1)
+    let cell_src = |x: f32, y: f32| -> u8 {
+        let (c, r) = (((x - b[0]) / hgt.grid.tile).floor(), ((b[3] - y) / hgt.grid.tile).floor());
+        if c < 0.0 || r < 0.0 || c as usize >= hgt.grid.cols() || r as usize >= hgt.grid.rows() {
+            return 0;
+        }
+        src.get(r as usize * hgt.grid.cols() + c as usize).copied().unwrap_or(0)
+    };
+    let mut outside = Vec::new();
     let ground = |x: f32, y: f32| -> Option<f32> {
         let (c, r) = (((x - b[0]) / mpt).floor(), ((b[3] - y) / mpt).floor());
         (c >= 0.0 && r >= 0.0 && (c as usize) < m.w && (r as usize) < m.h).then(|| height_m(m.at(c as usize, r as usize, 0)))
@@ -1483,7 +1492,19 @@ pub fn check_inland(tiles: &[InlandTile], hgt: &Layer) -> Value {
         }
         let lo = g.iter().copied().fold(f32::MAX, f32::min);
         let hi = g.iter().copied().fold(f32::MIN, f32::max);
-        per.entry(t.kind).or_default().push((z - lo, hi - z, lo <= z && z <= hi));
+        let ok = lo <= z && z <= hi;
+        if !ok {
+            let c = [(bb[0][0] + bb[1][0]) / 2.0, (bb[0][1] + bb[1][1]) / 2.0];
+            let mut u: Vec<f32> = t.positions.iter().filter_map(|v| ground(v[0], v[1])).collect();
+            u.sort_by(f32::total_cmp);
+            let under = u.get(u.len() / 2).copied();
+            outside.push(json!({"name": t.name, "kind": t.kind, "surface_z": z, "lowest_ground": lo, "highest_ground": hi,
+                "side": if z < lo { "below the lowest ground" } else { "above the highest ground" }, "by_m": if z < lo { lo - z } else { z - hi },
+                "cell": match cell_src(c[0], c[1]) { 2 => "tile", 1 => "fallback", _ => "none" }, "width_m": [bb[1][0] - bb[0][0], bb[1][1] - bb[0][1]],
+                "vertices": t.positions.len(), "ground_above_surface_share": g.iter().filter(|&&h| h > z).count() as f32 / g.len() as f32,
+                "ground_under_vertices_median": under}));
+        }
+        per.entry(t.kind).or_default().push((z - lo, hi - z, ok));
     }
     let med = |mut v: Vec<f32>| {
         v.sort_by(f32::total_cmp);
@@ -1498,7 +1519,13 @@ pub fn check_inland(tiles: &[InlandTile], hgt: &Layer) -> Value {
                 "median_highest_ground_above_surface_m": med(v.iter().map(|x| x.1).collect())}))
         })
         .collect();
-    json!({"method": "height map sampled on a 9 x 9 grid over each tile's box; surface = median vertex height", "kinds": kinds})
+    // slivers: edge pieces of a channel cut by the 64 m tile grid, where the samples fall on the bank
+    let sliver = |x: &Value| x["width_m"].as_array().is_some_and(|w| w.iter().any(|v| v.as_f64().unwrap_or(0.0) < 6.0)) || x["vertices"].as_u64().unwrap_or(0) < 30;
+    let full: Vec<&Value> = outside.iter().filter(|x| !sliver(x)).collect();
+    json!({"method": "height map sampled on a 9 x 9 grid over each tile's box; surface = median vertex height", "metres_per_texel": mpt, "kinds": kinds,
+        "outside_tiles": outside.len(), "outside_slivers": outside.len() - full.len(), "outside_full_tiles": full.len(),
+        "outside_full_tiles_within_0_65_m": full.iter().filter(|x| x["by_m"].as_f64().unwrap_or(f64::MAX) <= 0.65).count(),
+        "slivers": "outside tiles under 6 m across or with fewer than 30 vertices: edge pieces of a channel cut by the 64 m tile grid", "outside": outside})
 }
 
 /// `inland/inland.json` and `inland/inland.glb` (one node per kind, one
