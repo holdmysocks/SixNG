@@ -66,9 +66,17 @@
 //! `tintablepatterntint`, `stitchtint` (3, per preset), `dirttint`,
 //! `sheencolor`, `engravingcolor`; their composition is not decoded.
 //!
-//! Not decoded: the remaining parameter names, the defaults of parameters
-//! a record leaves out (loaded by the game from a separate file that was
-//! not found), and how the layers above are composed. The item's
+//! Defaults ([`Defaults`]): a parameter that neither a preset nor its base
+//! material sets takes the game's default, from the file
+//! `$(target)/data/dynamic_art/muv_parameter_default_values` (content type
+//! `DYNAMIC_ART_MUV_PARAMETER_DEFAULTS_FILE`, a PSO in data.rpf that only
+//! the archive's table of contents reaches). Its root `e5f515b3` holds the
+//! same four lists as a record, as maps from parameter name to one value
+//! (no index or sub-material). The game builds its starting parameter
+//! blocks from them; a name missing from the file is 0.
+//!
+//! Not decoded: the remaining parameter names and how the layers above are
+//! composed. The item's
 //! `Tint0..2` bytes are not the blend byte: an item's colour tag fits
 //! entry 0 whatever they are.
 
@@ -96,7 +104,7 @@ pub const METALLIC: u32 = 0x0e55_5ef5;
 pub const ROUGHNESS: u32 = 0x8347_2381;
 
 /// Index format version of [`Index`].
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 
 /// One parameter: (name hash, index, sub-material, value).
 pub type Param<T> = (u32, u8, u8, T);
@@ -124,6 +132,72 @@ pub struct Library {
     pub presets: HashMap<u32, Record>,
     pub tiles: HashMap<u32, Record>,
     pub profiles: HashMap<u32, Record>,
+    /// The game's parameter defaults (empty when the file was not read).
+    pub defaults: Defaults,
+}
+
+/// Root struct of the parameter-defaults file.
+pub const DEFAULTS_ROOT: u32 = 0xe5f5_15b3;
+
+/// The game's default for each parameter, by name hash (see the module
+/// notes). Keys are hex in JSON.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Defaults {
+    pub floats: BTreeMap<String, f32>,
+    pub colours: BTreeMap<String, u32>,
+    pub ints: BTreeMap<String, i64>,
+    pub textures: BTreeMap<String, String>,
+}
+
+impl Defaults {
+    /// From the decoded root object of the defaults file (`Pso::root_json`).
+    pub fn from_root(v: &Value) -> Defaults {
+        fn map<T>(v: &Value, list: u32, val: impl Fn(&Value) -> Option<T>) -> BTreeMap<String, T> {
+            v[field_name(list)].as_array().into_iter().flatten().filter_map(|e| Some((format!("{:08x}", e["key"].as_u64()?), val(&e["value"])?))).collect()
+        }
+        Defaults {
+            floats: map(v, 0x1652_fce8, |x| x.as_f64().map(|f| f as f32)),
+            colours: map(v, 0xfc24_d9c5, |x| x.as_u64().map(|c| c as u32)),
+            ints: map(v, 0x9f6b_5b03, |x| x.as_i64()),
+            textures: map(v, 0x0f20_8402, |x| Some(x.as_str()?.to_string())),
+        }
+    }
+
+    /// Read the defaults file from data.rpf through its table of contents:
+    /// the small plain PSO whose root is [`DEFAULTS_ROOT`].
+    pub fn read(ws: &crate::export::Workspace) -> Result<Defaults, String> {
+        let e = |e: anyhow::Error| format!("{e:#}");
+        let a = ws.resolve("data").map_err(e)?;
+        let mut cipher = crate::gamecipher::open(&crate::export::game_root(&a)).map_err(e)?;
+        let mut f = std::fs::File::open(&a.path).map_err(|x| x.to_string())?;
+        let toc = crate::rpf9toc::open_toc(cipher.as_mut(), &mut f, 0).map_err(e)?;
+        for fe in toc.files().map_err(e)?.iter().filter(|x| x.resource.is_none() && x.unpacked > 0 && x.unpacked < 1 << 16) {
+            let Ok((d, _)) = crate::rpf9toc::read_file(cipher.as_mut(), &mut f, 0, fe) else { continue };
+            let Some(p) = crate::pso::parse(&d).filter(|p| p.structs.contains_key(&DEFAULTS_ROOT)) else { continue };
+            let m = p.meta();
+            if let Some(r) = m.objects(DEFAULTS_ROOT).into_iter().next().and_then(|o| m.object(DEFAULTS_ROOT, o, 0)) {
+                return Ok(Defaults::from_root(&r));
+            }
+        }
+        Err("no parameter-defaults file (PSO with root e5f515b3) in data.rpf".into())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.floats.is_empty() && self.colours.is_empty() && self.ints.is_empty() && self.textures.is_empty()
+    }
+
+    pub fn float(&self, name: u32) -> Option<f32> {
+        self.floats.get(&format!("{name:08x}")).copied()
+    }
+    pub fn colour(&self, name: u32) -> Option<u32> {
+        self.colours.get(&format!("{name:08x}")).copied()
+    }
+    pub fn int(&self, name: u32) -> Option<i64> {
+        self.ints.get(&format!("{name:08x}")).copied()
+    }
+    pub fn texture(&self, name: u32) -> Option<u64> {
+        u64::from_str_radix(self.textures.get(&format!("{name:08x}"))?, 16).ok()
+    }
 }
 
 /// One tint-mask layer of a sub-material (see the module notes).
@@ -236,6 +310,12 @@ impl Library {
         if all.presets.is_empty() {
             return Err("no layered-material library found in data.rpf".into());
         }
+        // the index keeps a copy, which saves reading the table of contents;
+        // SIXNG_NO_MUV_DEFAULTS leaves them out (before / after comparisons)
+        if std::env::var_os("SIXNG_NO_MUV_DEFAULTS").is_some() {
+            return Ok(all);
+        }
+        all.defaults = Index::load(ws).map(|i| i.defaults).filter(|d| !d.is_empty()).unwrap_or_else(|| Defaults::read(ws).unwrap_or_default());
         Ok(all)
     }
 
@@ -250,7 +330,10 @@ impl Library {
 
     /// The tint-mask layers of sub-material `sub` of a preset that have a
     /// mask texture and a non-zero opacity. Each value is the preset's
-    /// entry for the sub-material, else its base material's.
+    /// entry for the sub-material, else its base material's, else the
+    /// game's default ([`Defaults`]: opacity 1, scale 1, rotation and
+    /// translation 0, flags 8). The tint has no default here: the file's is
+    /// transparent black, which leaves the layer out.
     pub fn layers(&self, preset: u32, sub: usize) -> Vec<Layer> {
         let j = crate::meta7a::joaat;
         let Some(p) = self.presets.get(&preset) else { return Vec::new() };
@@ -258,13 +341,14 @@ impl Library {
         fn pick<T: Copy>(own: &[Param<T>], base: Option<&[Param<T>]>, name: u32, index: u8, sub: usize) -> Option<T> {
             own.iter().find(|x| x.0 == name && x.1 == index && x.2 as usize == sub).or_else(|| base?.iter().find(|x| x.0 == name && x.1 == index)).map(|x| x.3)
         }
-        let f = |n: &str, i: u8| pick(&p.floats, base.map(|b| &b.floats[..]), j(n), i, sub);
+        let d = &self.defaults;
+        let f = |n: &str, i: u8| pick(&p.floats, base.map(|b| &b.floats[..]), j(n), i, sub).or_else(|| d.float(j(n)));
         let c = |i: u8| pick(&p.colours, base.map(|b| &b.colours[..]), j("tintmasktint"), i, sub).map(rgba);
         (0..4u8)
             .filter_map(|l| {
-                let mask = pick(&p.textures, base.map(|b| &b.textures[..]), j("tintmaskmap"), l, sub).filter(|&h| h != 0)?;
+                let mask = pick(&p.textures, base.map(|b| &b.textures[..]), j("tintmaskmap"), l, sub).or_else(|| d.texture(j("tintmaskmap"))).filter(|&h| h != 0)?;
                 let opacity = f("tintmaskopacity", l).filter(|&o| o > 0.0)?;
-                let flags = pick(&p.ints, base.map(|b| &b.ints[..]), j("tintmaskflags"), l, sub).unwrap_or(0) as u32;
+                let flags = pick(&p.ints, base.map(|b| &b.ints[..]), j("tintmaskflags"), l, sub).or_else(|| d.int(j("tintmaskflags"))).unwrap_or(0) as u32;
                 Some(Layer {
                     layer: l,
                     mask_map: format!("{mask:016x}"),
@@ -284,8 +368,10 @@ impl Library {
     /// Metalness and roughness of sub-material `sub` of a preset (see
     /// [`METALLIC`]): the preset's value for the sub-material, else its
     /// base material's. Without one, metalness is the tile's
-    /// `tilemetallic`, else 0, and roughness is 0.5. Inferred from the
-    /// data; the shader's own use of these values was not read.
+    /// `tilemetallic`, else 0, and roughness is 0.5. The defaults file gives
+    /// 0 for both, but in the weapon shader these two are blend targets
+    /// under a mask, not the base surface, so a missing roughness is not
+    /// taken as 0 (mirror-smooth) here.
     pub fn surface(&self, preset: u32, sub: usize) -> Option<[f32; 2]> {
         let p = self.presets.get(&preset)?;
         let base = self.base.get(p.bases.get(sub)?);
@@ -295,7 +381,8 @@ impl Library {
         Some([f(METALLIC).or(tile_metal).unwrap_or(0.0).clamp(0.0, 1.0), f(ROUGHNESS).unwrap_or(0.5).clamp(0.0, 1.0)])
     }
 
-    /// The tiling surface of sub-material `sub` of a preset.
+    /// The tiling surface of sub-material `sub` of a preset. `scale` and
+    /// `rotation` fall back to the game's defaults (1 and 0).
     pub fn tile(&self, preset: u32, sub: usize) -> Option<Tile> {
         let j = crate::meta7a::joaat;
         let p = self.presets.get(&preset)?;
@@ -305,7 +392,7 @@ impl Library {
         let tex = |n: &str| t.textures.iter().find(|x| x.0 == j(n)).filter(|x| x.3 != 0).map(|x| format!("{:016x}", x.3)).unwrap_or_default();
         let num = |n: &str| {
             let own = p.floats.iter().find(|x| x.0 == j(n) && x.2 as usize == sub);
-            own.or_else(|| base?.floats.iter().find(|x| x.0 == j(n))).or_else(|| t.floats.iter().find(|x| x.0 == j(n))).map(|x| x.3)
+            own.or_else(|| base?.floats.iter().find(|x| x.0 == j(n))).or_else(|| t.floats.iter().find(|x| x.0 == j(n))).map(|x| x.3).or_else(|| self.defaults.float(j(n)))
         };
         Some(Tile { tile: format!("{id:08x}"), material_map: tex("tilematerialmap"), normal_map: tex("tilenormalmap"), scale: num("tilescale"), rotation: num("tilerotation") })
     }
@@ -395,6 +482,9 @@ pub struct Index {
     /// type (hex), longest list first: (variant name hash hex, preset hex)
     /// in the order of the weapon's mod list (`link_weapons`).
     pub model_finishes: BTreeMap<String, Vec<(String, Vec<(String, String)>)>>,
+    /// The game's parameter defaults, applied to every preset above.
+    #[serde(default)]
+    pub defaults: Defaults,
     #[serde(skip)]
     links: WeaponLinks,
 }
@@ -520,11 +610,13 @@ impl Index {
         }
         let a = ws.resolve("data").map_err(|e| format!("{e:#}"))?;
         let aix = ws.load_index(&a).map_err(|e| format!("data.rpf index: {e:#}; index data.rpf first"))?;
-        let mut index = Index { version: VERSION, ..Default::default() };
+        let mut index = Index { version: VERSION, defaults: Defaults::read(ws).unwrap_or_default(), ..Default::default() };
         for e in aix.entries.iter().filter(|e| e.kind == crate::classify::Kind::Pso) {
             let Ok(b) = crate::scan::read_entry(&a.path, e) else { continue };
             let Some(p) = crate::pso::parse(&b).filter(|p| p.structs.contains_key(&ROOT)) else { continue };
-            index.add(&e.id, &Library::from_meta(&p.meta()));
+            let mut lib = Library::from_meta(&p.meta());
+            lib.defaults = index.defaults.clone();
+            index.add(&e.id, &lib);
         }
         if index.presets.is_empty() {
             return Err("no layered-material library found in data.rpf".into());
@@ -648,6 +740,33 @@ mod tests {
         assert_eq!(ix.libraries, vec![("data.rpf@0".to_string(), 1, 1)]);
         assert_eq!(ix.presets["00000022"][0], ["1d55a280".to_string(), "bb7f7fff".to_string(), String::new(), String::new()]);
         assert_eq!(ix.colours("00000022").unwrap()[..3], [Some([0x1d, 0x55, 0xa2, 0x80]), Some([0x7a, 0x7a, 0x7a, 0xff]), None]);
+    }
+
+    #[test]
+    fn missing_parameters_take_the_game_defaults() {
+        let j = crate::meta7a::joaat;
+        let kv = |k: u32, v: Value| json!({"key": k, "value": v});
+        let root = json!({
+            field_name(0x1652_fce8): [kv(j("tintmaskopacity"), json!(1.0)), kv(j("tintmaskscale"), json!(1.0)), kv(j("tilescale"), json!(1.0)), kv(ROUGHNESS, json!(0.0))],
+            field_name(0x9f6b_5b03): [kv(j("tintmaskflags"), json!(8))],
+            field_name(0xfc24_d9c5): [kv(COLOUR, json!(0))],
+            field_name(0x0f20_8402): [kv(j("tintmaskmap"), json!("0000000000000000"))],
+        });
+        let d = Defaults::from_root(&root);
+        assert_eq!((d.float(j("tintmaskscale")), d.int(j("tintmaskflags")), d.colour(COLOUR), d.texture(j("tintmaskmap")), d.float(0x1234)), (Some(1.0), Some(8), Some(0), Some(0), None));
+        let mut lib = Library { defaults: d, ..Default::default() };
+        let base = json!({field_name(0x0f20_8402): [param(j("tintmaskmap"), 0, 255, json!("00000000000000ee"))]});
+        lib.base.insert(0x11, record(&base));
+        let preset = json!({field_name(0x4a1e_bc36): [0x11u32, 0, 0, 0, 0, 0, 0, 0], field_name(0x1652_fce8): [param(j("tintmaskscale"), 1, 0, json!(3.0))]});
+        lib.presets.insert(0x22, record(&preset));
+        lib.tiles.insert(0x33, Record::default());
+        lib.base.get_mut(&0x11).unwrap().tiles[0] = 0x33;
+        // a mask with no opacity, scale or flags of its own takes opacity 1, scale 1 (entry 1 is the preset's) and flags 8
+        let l = lib.layers(0x22, 0);
+        assert_eq!((l.len(), l[0].opacity, l[0].scale, l[0].flags, l[0].invert, l[0].rotation), (1, 1.0, [Some(1.0), Some(3.0)], 8, false, None));
+        assert_eq!(lib.tile(0x22, 0).map(|t| (t.scale, t.rotation)), Some((Some(1.0), None)));
+        // roughness stays 0.5 when missing, although the file's default is 0
+        assert_eq!(lib.surface(0x22, 0), Some([0.0, 0.5]));
     }
 
     #[test]

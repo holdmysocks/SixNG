@@ -334,6 +334,8 @@ pub struct Shell {
     pub id: u64,
     /// The hat's own triangles, when known (`Shell::with_lining`).
     lining: Option<Lining>,
+    /// Per cell: the outermost head point in that direction (0: none).
+    scalp: Vec<f32>,
 }
 
 /// A hat's triangles, binned by their direction from the shell's centre
@@ -452,6 +454,8 @@ impl Lining {
 impl Shell {
     const W: usize = 72;
     const H: usize = 36;
+    /// How far hair may stand out of an opening the hat encloses (m).
+    const OPENING_BULGE: f32 = 0.01;
 
     fn cell(d: [f32; 3], r: f32) -> usize {
         let lon = d[1].atan2(d[0]);
@@ -532,15 +536,16 @@ impl Shell {
                 if v.is_empty() {
                     left = true;
                 } else {
-                    // no cloth here: the hair may lie on the scalp
-                    r[c] = (v.iter().sum::<f32>() / v.len() as f32).max(scalp[c] + 0.006);
+                    // no cloth here: the hair fills the opening and stands up to
+                    // `OPENING_BULGE` out of it, as hair does through a cap's strap gap
+                    r[c] = (v.iter().sum::<f32>() / v.len() as f32 + Self::OPENING_BULGE).max(scalp[c] + 0.006);
                 }
             }
             if !left {
                 break;
             }
         }
-        Shell { centre, r, id, lining: None }
+        Shell { centre, r, id, lining: None, scalp }
     }
 
     /// The same shell with the hat's own triangles (RAGE space), for
@@ -555,7 +560,8 @@ impl Shell {
     /// its root: where a segment crosses the hat, its far point goes back
     /// under the hat, `gap` inside it on the line from the centre (or,
     /// where the segment would still cross, `gap` short of the crossing
-    /// along the segment). The shell alone is coarse (5 degree cells,
+    /// along the segment; a point below the hat's edge is tucked in toward
+    /// the head instead, `tuck`). The shell alone is coarse (5 degree cells,
     /// blended out toward the hat's edges) and lets a few points through.
     /// Returns how many points moved.
     pub fn press_strands(&self, points: &mut [[f32; 3]], k: usize, gap: f32) -> usize {
@@ -573,6 +579,11 @@ impl Shell {
                         let q = [c[0] + (b[0] - c[0]) * f, c[1] + (b[1] - c[1]) * f, c[2] + (b[2] - c[2]) * f];
                         l.first_hit(c, a, q).is_none().then_some(q)
                     });
+                    // a point below the hat's edge (no hat behind it) that the
+                    // way to it from under the hat would cross: tucked in toward
+                    // the head until that way is clear, so the rest of the strand
+                    // still hangs below the edge instead of being pulled under
+                    let under = under.or_else(|| self.tuck(l, a, b, gap));
                     s[j] = under.unwrap_or_else(|| {
                         let len = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2) + (b[2] - a[2]).powi(2)).sqrt().max(1e-9);
                         let f = (t - gap / len).max(0.0);
@@ -582,6 +593,25 @@ impl Shell {
             }
         }
         before.iter().zip(points.iter()).filter(|(a, b)| a != b).count()
+    }
+
+    /// For `press_strands`: `b` on the line from the centre, as far out as
+    /// the segment from `a` to it does not cross the hat, and at least `gap`
+    /// over the head there. None where `b` lies behind the hat, the head is
+    /// not known in that direction, or no such point is found.
+    fn tuck(&self, l: &Lining, a: [f32; 3], b: [f32; 3], gap: f32) -> Option<[f32; 3]> {
+        let c = self.centre;
+        if l.first_hit(c, c, b).is_some() {
+            return None;
+        }
+        let d = [b[0] - c[0], b[1] - c[1], b[2] - c[2]];
+        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        let head = self.scalp[Self::cell(d, len.max(1e-9))];
+        if head <= 0.0 || len <= head + gap {
+            return None;
+        }
+        let lo = (head + gap) / len;
+        (1..=16).map(|i| 1.0 - (1.0 - lo) * i as f32 / 16.0).map(|f| [c[0] + d[0] * f, c[1] + d[1] * f, c[2] + d[2] * f]).find(|q| l.first_hit(c, a, *q).is_none())
     }
 
     /// Pull the points that lie beyond the hat to `gap` under it. Returns
@@ -895,9 +925,10 @@ impl Groom {
     ///
     /// Every strand then gets the game's noise and curl
     /// (`hairgen::apply_style`, the groom's first curl group) on its grown
-    /// or walked points, with its own seed and length draw; the root
-    /// triangle's normal stands in for the game's twist vector. The style
-    /// record pass comes after it.
+    /// or walked points, with its own seed and length draw. Its frame axis
+    /// is a direction in the root's surface plane, as in the game (the
+    /// game's exact direction is not read; see `hairgen::apply_style`). The
+    /// style record pass comes after it.
     pub fn coat(&self, share: f32) -> Coat {
         self.coat_with(share, None)
     }
@@ -987,6 +1018,18 @@ impl Groom {
             };
             self.styles[i].apply(pts, &axis, swap, &weight);
         };
+        // the noise and curl frame's in-plane root direction (`hairgen::apply_style`): square to the
+        // strand's heading in the root triangle's plane (its first segment, else the triangle's first
+        // edge), so it stays clear of the tangent where hair lies along the scalp
+        let plane_axis = |pts: &[[f32; 3]], t: [u32; 3]| {
+            let nr = normal(t);
+            let g0 = self.points[t[0] as usize * k];
+            let edge = unit(sub(self.points[t[1] as usize * k], g0), [1.0, 0.0, 0.0]);
+            let head = pts.get(1).map_or([0.0; 3], |p| sub(*p, pts[0]));
+            let in_plane = sub(head, scale(nr, dot(head, nr)));
+            let heading = unit(if dot(in_plane, in_plane) > 1e-12 { in_plane } else { sub(edge, scale(nr, dot(edge, nr))) }, edge);
+            unit(cross(nr, heading), heading)
+        };
         // scattered strands
         let density: Vec<u8> = self.tri_counts.iter().map(|q| q[0]).collect();
         let top = density.iter().copied().max().unwrap_or(0);
@@ -1000,7 +1043,8 @@ impl Groom {
                 let (d_len, _, d_var) = (draws.next(), draws.next(), draws.next());
                 let at = c.points.len();
                 c.points.extend(hairgen::grow(k, length(t, w, d_len), |j| blend(t, w, j)));
-                hairgen::apply_style(&mut c.points[at..], &curl, seed, d_len, normal(t));
+                let ax = plane_axis(&c.points[at..], t);
+                hairgen::apply_style(&mut c.points[at..], &curl, seed, d_len, ax);
                 style(&mut c.points[at..], normal(t), d_var, &[(t[0] as usize, w[0]), (t[1] as usize, w[1]), (t[2] as usize, w[2])], None);
                 c.normals.push(normal(t));
                 c.guides.push((t, w));
@@ -1083,7 +1127,7 @@ impl Groom {
                 let len = if self.lengths.len() == self.strands { hairgen::length(self.lengths[idx], d_len, self.length_var) } else { f32::MAX };
                 walk(&mut c.points, &centre, fa, fb, radius, tx, ty, len, nr);
                 let at = c.points.len() - k;
-                hairgen::apply_style(&mut c.points[at..], &curl, mseed, d_len, nr);
+                hairgen::apply_style(&mut c.points[at..], &curl, mseed, d_len, fb);
                 // the style frame starts on the root frame's axis, the same for every strand of guide idx (the
                 // generator carries it along from the root frame): the guide's strands curl together into one ringlet
                 style(&mut c.points[at..], nr, d_var, &[(idx, 1.0)], Some(fa));
@@ -1133,7 +1177,7 @@ impl Groom {
                     let len = length(t, b, d_len);
                     walk(&mut c.points, &centre, fa, fb, radius, tx, ty, len, nr);
                     let at = c.points.len() - k;
-                    hairgen::apply_style(&mut c.points[at..], &curl, mseed, d_len, nr);
+                    hairgen::apply_style(&mut c.points[at..], &curl, mseed, d_len, fb);
                     style(&mut c.points[at..], nr, d_var, &[(t[0] as usize, b[0]), (t[1] as usize, b[1]), (t[2] as usize, b[2])], None);
                     c.normals.push(nr);
                     c.guides.push((t, b));
@@ -1194,7 +1238,7 @@ impl Groom {
             "curl": self.curl,
             "curl_note": "system +0xF8 and +0x104: unread word, fade-in length, noise amplitude, curl radius, noise and curl frequency; the game's generator reads the first group for every strand, the second is not read by any known program",
             "taper_note": "16 width steps from root to tip, each / 255 of the strand width (inferred)",
-            "method": "per root triangle, c0 + c1 strands at random barycentric points; every point of a strand is the same barycentric blend of the three guide strands' points. Noise and curl from the groom's first style group (the root triangle normal stands in for the game's twist vector); clumping is not decoded",
+            "method": "per root triangle, c0 + c1 strands at random barycentric points; every point of a strand is the same barycentric blend of the three guide strands' points. Noise and curl from the groom's first style group (frame axis: an in-plane root direction standing in for the game's); clumping is not decoded",
         })
     }
 
@@ -1637,6 +1681,41 @@ mod tests {
         let s = Shell::new([0.0, 0.0, 1.7], &holed, &[]);
         let mut through = [[0.14, 0.0, 1.75]];
         assert_eq!(s.press(&mut through, 0.003), 1);
+    }
+
+    #[test]
+    fn hair_below_the_hat_edge_keeps_hanging() {
+        // a dome of triangles, radius 10 cm, from its edge (z 1.7) to its pole,
+        // on a head of radius 9 cm
+        let at = |i: usize, j: usize| {
+            let (lat, lon) = ((i as f32 * 10.0).min(90.0).to_radians(), (j as f32 * 15.0).to_radians());
+            [0.1 * lat.cos() * lon.cos(), 0.1 * lat.cos() * lon.sin(), 1.7 + 0.1 * lat.sin()]
+        };
+        let mut tris = Vec::new();
+        for i in 0..9 {
+            for j in 0..24 {
+                tris.push([at(i, j), at(i, j + 1), at(i + 1, j + 1)]);
+                tris.push([at(i, j), at(i + 1, j + 1), at(i + 1, j)]);
+            }
+        }
+        let pts: Vec<[f32; 3]> = tris.iter().flatten().copied().collect();
+        let head: Vec<[f32; 3]> = (0..36).flat_map(|i| (0..72).map(move |j| {
+            let (lat, lon) = ((i as f32 * 5.0 - 87.5).to_radians(), (j as f32 * 5.0).to_radians());
+            [0.09 * lat.cos() * lon.cos(), 0.09 * lat.cos() * lon.sin(), 1.7 + 0.09 * lat.sin()]
+        })).collect();
+        let s = Shell::new([0.0, 0.0, 1.7], &pts, &head).with_lining(tris.clone());
+        // rooted under the hat, out through its side, then down below its edge
+        let mut strand = vec![[0.07, 0.0, 1.75], [0.11, 0.0, 1.72], [0.13, 0.0, 1.66], [0.13, 0.0, 1.6]];
+        s.press_strands(&mut strand, 4, 0.003);
+        // the tail still hangs below the edge, where it was
+        assert_eq!(strand[3], [0.13, 0.0, 1.6]);
+        assert!(strand[2][2] < 1.7, "{:?}", strand[2]);
+        let r = |p: [f32; 3]| (p[0] * p[0] + p[1] * p[1] + (p[2] - 1.7).powi(2)).sqrt();
+        assert!(r(strand[2]) >= 0.092, "{:?}", strand[2]);
+        let l = s.lining.as_ref().unwrap();
+        for w in strand.windows(2) {
+            assert!(l.first_hit(s.centre, w[0], w[1]).is_none(), "{w:?} crosses");
+        }
     }
 
     #[test]

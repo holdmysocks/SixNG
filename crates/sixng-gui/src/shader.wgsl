@@ -801,6 +801,25 @@ fn wear_gamma(l: f32, g: f32) -> f32 {
     return pow(l, 100.0 / max(0.001, 100.0 * g * g));
 }
 
+// RGB to hue, saturation, value and back, as the game's paint shader does
+// for its colour step (epsilon 1e-10).
+fn rgb_to_hsv(c: vec3<f32>) -> vec3<f32> {
+    let mx = max(c.r, max(c.g, c.b));
+    let mn = min(c.r, min(c.g, c.b));
+    let d = mx - mn;
+    var h = 0.0;
+    if (d > 0.0) {
+        if (mx == c.r) { h = (c.g - c.b) / d; } else if (mx == c.g) { h = 2.0 + (c.b - c.r) / d; } else { h = 4.0 + (c.r - c.g) / d; }
+        h = fract(h / 6.0 + 1.0);
+    }
+    return vec3(h, d / (mx + 1.0e-10), mx);
+}
+
+fn hsv_to_rgb(c: vec3<f32>) -> vec3<f32> {
+    let k = clamp(abs(fract(c.x + vec3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, vec3(0.0), vec3(1.0));
+    return c.z * mix(vec3(1.0), k, c.y);
+}
+
 // One window of the game's W2 weight (the first wear layer's palette
 // weight): sat((x - start) / width x 255 / divisor), start, width and the
 // divisor byte as 0 to 1. A zero width or divisor is the game's infinite
@@ -862,6 +881,7 @@ struct VIn {
     @location(12) extra: vec4<f32>, // x skinned, y highlight, z tint code, w unused
     @location(13) tint: vec4<f32>,  // model tint palette colour (linear; white = none)
     @location(14) zone: vec4<u32>,  // x sticker zone, y model of an assembled vehicle
+    @location(15) uv23: vec4<f32>,  // third and fourth UV sets (stickers the game's livery layouts place)
     @builtin(vertex_index) vi: u32,
 };
 
@@ -881,6 +901,8 @@ struct VOut {
     @location(9) @interpolate(flat) zone: vec2<u32>,
     // a strand ribbon's own dither seed (a hash of its point), so overlapping strands keep different samples
     @location(10) @interpolate(flat) seed: u32,
+    // third and fourth UV sets
+    @location(11) uv23: vec4<f32>,
 };
 
 fn skin_matrix(v: VIn) -> mat4x4<f32> {
@@ -962,6 +984,7 @@ fn mesh_vertex(v: VIn) -> VOut {
     o.tan = vec4((m * vec4(v.tan.xyz, 0.0)).xyz, edge);
     o.uv0 = v.uv0;
     o.uv1 = uv1;
+    o.uv23 = v.uv23;
     o.col = v.col;
     o.extra = v.extra;
     // w: -1 on a mirrored instance (right-hand wheels): its triangles wind
@@ -1306,6 +1329,72 @@ fn strand_openness(clip: vec4<f32>) -> f32 {
         }
     }
     return clamp(0.15249 * s, 0.0, 1.0);
+}
+
+// Share of a hair pixel's diffuse ambient that the game's screen-space ray march finds open (1 = all open).
+// The game's diffuse ambient is its screen-probe light: probes sit on the drawn pixels, hair probes
+// turned by the strand tangent; each probe ray is first marched on screen through the depth buffer, and
+// only a ray the march does not stop goes on into the ray-tracing structure; the pixel then takes a
+// cosine lobe around the tangent from its probes. Ported here: the screen march, as read from the
+// game's ray request pass (high confidence on the march, medium on the parameters): the ray runs from
+// the pixel for L = the view depth, at most 1 m at character range (the game's cap past 1 m reads a
+// frame value not traced); 8 depth taps at (k + 1 + r) / 8 of the way on screen (r random per ray), with
+// depth interpolated on screen; the first tap behind the drawn depth stops the march, the crossing is
+// refined between that tap and the one before it, and it counts as a hit only within half of one step's
+// depth change (in device depth). A ray that leaves the screen, never crosses or crosses too deep
+// is open here: the game traces it on into the world, where the viewer has only its sky. Rays are drawn
+// cosine-weighted about t (4 per frame; the frame accumulation averages them).
+fn hair_gi_open(clip: vec4<f32>, wp: vec3<f32>, t: vec3<f32>) -> f32 {
+    if (F.light_vp[3][3] == 0.0) { return 1.0; }
+    let size = F.frame.yz;
+    let c0 = F.view_proj * vec4(wp, 1.0);
+    if (c0.w <= 1.0e-4) { return 1.0; }
+    let s0 = vec3(c0.xy / c0.w, c0.z / c0.w);
+    let len = min(c0.w, 1.0);
+    let tb = select(vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0), abs(t.x) > 0.9);
+    let b1 = normalize(cross(t, tb));
+    let b2 = cross(t, b1);
+    let fr = F.frame.x;
+    var open = 0.0;
+    for (var k = 0; k < 4; k++) {
+        let fk = f32(k);
+        let u1 = ign(clip.xy + vec2(fr * 5.71 + fk * 13.1, fr * 2.33 + fk * 7.7));
+        let u2 = ign(clip.xy * 1.31 + vec2(fr * 3.13 + fk * 4.9, fk * 17.3 + 11.0));
+        let r = ign(clip.xy * 0.77 + vec2(fr * 1.97 + fk * 9.3, fk * 3.1 + 23.0));
+        let ph = 6.2831853 * u2;
+        let st = sqrt(u1);
+        let dir = t * sqrt(max(1.0 - u1, 0.0)) + (b1 * cos(ph) + b2 * sin(ph)) * st;
+        let c1 = F.view_proj * vec4(wp + dir * len, 1.0);
+        if (c1.w <= 1.0e-4) { open += 1.0; continue; }
+        var d = vec3(c1.xy / c1.w, c1.z / c1.w) - s0;
+        // keep the ray on screen
+        if (max(abs(s0.x + d.x), abs(s0.y + d.y)) > 1.0) {
+            let ex = select((sign(d.x) - s0.x) / d.x, 1.0e9, abs(d.x) < 1.0e-6);
+            let ey = select((sign(d.y) - s0.y) / d.y, 1.0e9, abs(d.y) < 1.0e-6);
+            d = d * clamp(min(ex, ey), 0.0, 1.0);
+        }
+        let thick = 0.5 * abs(d.z) / 8.0;
+        var hit = false;
+        var prev = 0.0;
+        for (var i = 0; i < 8; i++) {
+            let ti = (f32(i) + 1.0 + r) / 8.0;
+            let p = s0 + d * ti;
+            let q = vec2((p.x * 0.5 + 0.5) * size.x, (0.5 - p.y * 0.5) * size.y);
+            if (q.x < 0.0 || q.y < 0.0 || q.x >= size.x || q.y >= size.y) { break; }
+            let diff = p.z - eye_depth(vec2<i32>(q));
+            if (diff < 0.0) {
+                // refine between this tap and the one before it, then test the thickness there
+                let f = clamp(-diff / max(prev - diff, 1.0e-4), 0.0, 1.0);
+                let ph2 = s0 + d * (ti - f / 8.0);
+                let q2 = vec2((ph2.x * 0.5 + 0.5) * size.x, (0.5 - ph2.y * 0.5) * size.y);
+                hit = abs(ph2.z - eye_depth(vec2<i32>(q2))) < thick;
+                break;
+            }
+            prev = diff;
+        }
+        if (!hit) { open += 1.0; }
+    }
+    return open * 0.25;
 }
 
 // Screen-space occlusion of the ambient light on an opaque surface, from the
@@ -1683,6 +1772,8 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         let dy0 = dpdy(i.uv0);
         let dx1 = dpdx(i.uv1);
         let dy1 = dpdy(i.uv1);
+        let dx23 = dpdx(i.uv23);
+        let dy23 = dpdy(i.uv23);
         let zb = i.zone.x & 255u;
         for (var k = 1u; k <= st_n; k++) {
             let fl = ST[k].flags;
@@ -1696,6 +1787,8 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             var dx = dx0;
             var dy = dy0;
             if (fl.z == 1u) { uv = i.uv1; dx = dx1; dy = dy1; }
+            else if (fl.z == 2u) { uv = i.uv23.xy; dx = dx23.xy; dy = dy23.xy; }
+            else if (fl.z == 3u) { uv = i.uv23.zw; dx = dx23.zw; dy = dy23.zw; }
             let p = vec2(dot(m.xy, uv), dot(m.zw, uv)) + o.xy;
             if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0) { continue; }
             let gx = vec2(dot(m.xy, dx), dot(m.zw, dx));
@@ -1765,6 +1858,10 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         var dust_k1 = 0.0;
         var dust_k3 = 0.0;
         var dust_g = vec3(0.0);
+        // the dust mask's bleach driver (-1 to 1) and whether the game's
+        // colour step runs (the part's own wear data)
+        var dust_sgn = 0.0;
+        var tone_on = false;
         let id = floor(i.col.a * 255.0 + 0.5);
         // the primer's weight (layer B) and its roughness and metalness
         var w3 = 0.0;
@@ -1898,7 +1995,12 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
                     dust_k1 = clamp(f32((lo >> 0u) & 1u) * dr + f32((lo >> 3u) & 1u) * db + dg, 0.0, 1.0) * 10.0 * textureLoad(t_em, vec2(83, row), 0).a;
                     dust_k3 = clamp(f32((lo >> 2u) & 1u) * dr + f32((lo >> 5u) & 1u) * db + f32((hi >> 2u) & 1u) * dg, 0.0, 1.0);
                     dust_g = vec3(textureLoad(t_em, vec2(80, row), 0).a, textureLoad(t_em, vec2(81, row), 0).a, textureLoad(t_em, vec2(82, row), 0).a);
+                    // the bleach driver: the scratch channels with signed
+                    // gains (columns 84, 86) and the dust, not saturated
+                    let ga = (textureLoad(t_em, vec2(76, row), 0).a * i.col.g + textureLoad(t_em, vec2(77, row), 0).a) * t.g;
+                    dust_sgn = clamp((2.0 * textureLoad(t_em, vec2(84, row), 0).a - 1.0) * dr + ga + (2.0 * textureLoad(t_em, vec2(86, row), 0).a - 1.0) * db, -1.0, 1.0);
                 }
+                tone_on = M.tile.w > 1.5;
             } else {
                 let t = wear_threshold(wear_amt);
                 k = smoothstep(t, t + 0.08, m.g);
@@ -1915,6 +2017,40 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         // and weight, clear coat taken off the base paint
         rough = clamp(rough + dust_k3 * dot(dust_g, vec3(w0, w3, k)), 0.04, 1.0);
         coat.x = clamp(coat.x - dust_k1 * w0 * dust_g.x, 0.0, 1.0);
+        // The game's colour step: where the colour does not come from a
+        // palette row (1 - its palette weight: the first wear layer's W2,
+        // the primer, the base when it has a row, column 95), the layer
+        // detail texture's green below 0.5 darkens it by the albedo
+        // multiply and above 0.5 lightens it by the albedo screen, in HSV;
+        // the dust mask's bleach driver then screens it toward white by
+        // the sun bleach screen. The amounts are the surface's first layer's
+        // (columns 89 to 91, for the base and the primer) and second layer's
+        // (92 to 94, for the first wear layer), by weight. The game adds a
+        // detail term to the green's offset; it is not added here.
+        if (tone_on) {
+            let row = 768 + i32(id);
+            let a0 = vec3(textureLoad(t_em, vec2(89, row), 0).a, textureLoad(t_em, vec2(90, row), 0).a, textureLoad(t_em, vec2(91, row), 0).a);
+            let a2 = vec3(textureLoad(t_em, vec2(92, row), 0).a, textureLoad(t_em, vec2(93, row), 0).a, textureLoad(t_em, vec2(94, row), 0).a);
+            let amt = a2 * k + a0 * (w3 + w0);
+            let pal_w = clamp(k * w2 + w3 + w0 * textureLoad(t_em, vec2(95, row), 0).a, 0.0, 1.0);
+            let gr = (1.0 - pal_w) * 2.0 * (dt.g - 0.5);
+            var hsv = rgb_to_hsv(max(albedo, vec3(0.0)));
+            if (gr < 0.0) {
+                let f = 1.0 + gr * amt.y;
+                hsv.z *= f;
+                hsv.y = 1.0 - f * (1.0 - hsv.y);
+            } else if (gr > 0.0) {
+                let f = 1.0 - gr * amt.z;
+                hsv.z = 1.0 - (1.0 - hsv.z) * f;
+                hsv.y *= f;
+            }
+            if (dust_sgn != 0.0) {
+                let q = dust_sgn * dot(dust_g, vec3(w0, w3, k)) * amt.x;
+                hsv.z = 1.0 - (1.0 - q) * (1.0 - hsv.z);
+                hsv.y *= 1.0 - q;
+            }
+            albedo = hsv_to_rgb(clamp(hsv, vec3(0.0), vec3(1.0)));
+        }
         metal = metal * w0 + m1 * k + p_metal * w3;
         pearl = pearl * w0;
     }
@@ -2118,7 +2254,10 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             // ambient: the game's diffuse probe light for hair is a plain cosine (Lambert) lobe with the strand
             // tangent in place of the normal (its final-gather pass; medium-high confidence). Here: the viewer's
             // diffuse ambient around the tangent, with the game's factor
-            let sky_h = ambient(tdir);
+            // diffuse ambient around the tangent; rays the game's screen march stops on take one bounce off
+            // the hair (albedo x the open light) in place of the game's previous-frame radiance
+            let g_h = hair_gi_open(i.clip, i.world, tdir);
+            let sky_h = ambient(tdir) * (g_h + (1.0 - g_h) * albedo);
             // o = sqrt(profile4 / 15 x openness) (profile4: the ramp's profile value in 15 steps)
             let o_h = sqrt(select(1.0, round(15.0 * clamp(i.uv1.x, 0.0, 1.0)) / 15.0, ramped) * strand_openness(i.clip));
             // the reflection part of the game's hair ambient (read from its hair program, medium confidence):

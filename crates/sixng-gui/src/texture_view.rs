@@ -730,6 +730,11 @@ impl TextureView {
                 .size_range(220.0..=600.0)
                 .show(ui, |ui| self.users_ui(ui, h));
         }
+        // The preview gets what the list and "Used by" panels leave.
+        egui::CentralPanel::default().show(ui, |ui| self.preview_ui(ui, set));
+    }
+
+    fn preview_ui(&mut self, ui: &mut egui::Ui, set: &'static TtpfSet) {
         // Over the preview at fit zoom the wheel steps through the list (one
         // texture per notch, also past textures that cannot decode); zoomed in, it pans.
         if self.zoom <= 0.0 && ui.rect_contains_pointer(ui.available_rect_before_wrap()) {

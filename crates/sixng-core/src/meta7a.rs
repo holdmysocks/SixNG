@@ -88,6 +88,38 @@ mod asset_id_tests {
     }
 }
 
+/// Member types decoded as one plain value (no pointer, array, map or
+/// embedded struct). Type codes are a family in the high nibble: 0x0_
+/// bool, struct (05), pointer (07), 64-bit id (08); 0x1_ integers s8, u8,
+/// s16, u16, s32, u32, s64, u64; 0x2_ f16, f32; 0x3_ vectors and matrices;
+/// 0x4_ strings and hashes; 0x5_ arrays; 0x6_ enums (60-62) and bit sets
+/// (63-68); 0x7_ maps. Checked against the executable's parser tables on
+/// every meta file.
+pub fn is_scalar_type(t: u8) -> bool {
+    matches!(t, 0x01 | 0x08 | 0x10..=0x17 | 0x20 | 0x21 | 0x30..=0x36 | 0x42 | 0x44 | 0x4a | 0x4d | 0x4f | 0x60..=0x65 | 0x68)
+}
+
+/// Named values of the executable's enums (`enum_values.txt`): enum hash
+/// -> value -> name.
+pub fn enum_values() -> &'static HashMap<u32, BTreeMap<i64, &'static str>> {
+    static M: std::sync::OnceLock<HashMap<u32, BTreeMap<i64, &'static str>>> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let mut m: HashMap<u32, BTreeMap<i64, &'static str>> = HashMap::new();
+        for l in include_str!("enum_values.txt").lines().filter(|l| !l.starts_with('#')) {
+            let mut it = l.split_whitespace();
+            let (Some(h), Some(v), Some(n)) = (it.next().and_then(|h| u32::from_str_radix(h, 16).ok()), it.next().and_then(|v| v.parse().ok()), it.next()) else { continue };
+            m.entry(h).or_default().insert(v, n);
+        }
+        m
+    })
+}
+
+/// Name of one enum value (`enum_hash` is the member's `extra`), if the
+/// executable's tables name it.
+pub fn enum_value_name(enum_hash: u32, value: i64) -> Option<&'static str> {
+    enum_values().get(&enum_hash)?.get(&value).copied()
+}
+
 /// A half float (member type 0x20) as f32. Infinity and NaN read as f32::MAX.
 pub fn half(h: u16) -> f32 {
     let (s, e, f) = (if h & 0x8000 != 0 { -1.0f32 } else { 1.0 }, (h >> 10) & 0x1f, (h & 0x3ff) as f32);
@@ -264,25 +296,14 @@ impl<'a> Meta<'a> {
     pub fn scalars_by_hash(&self, hash: u32, o: usize, skip: &[u32]) -> BTreeMap<u32, serde_json::Value> {
         let mut out = BTreeMap::new();
         let Some(sd) = self.structs.get(&hash) else { return out };
-        let r = self.r;
         for m in &sd.members {
             if m.hash == 0x100 || skip.contains(&m.off) {
                 continue;
             }
-            let p = o + m.off as usize;
-            let f = |i: usize| serde_json::json!(r.f32(p + 4 * i));
-            let v = match m.ty {
-                0x10 => serde_json::json!(r.sys.get(p).map(|&x| x as i8)),
-                0x11 | 0x60 => serde_json::json!(r.sys.get(p).copied()),
-                0x12 => serde_json::json!(r.u16(p) as i16),
-                0x13 => serde_json::json!(r.u16(p)),
-                0x15 | 0x4a => serde_json::json!(r.u32(p)),
-                0x21 => f(0),
-                0x32 | 0x33 => serde_json::json!([f(0), f(1), f(2)]),
-                0x34 => serde_json::json!([f(0), f(1), f(2), f(3)]),
-                0x08 | 0x4f => serde_json::json!(format!("{:016x}", r.u64(p))),
-                _ => continue,
-            };
+            if !is_scalar_type(m.ty) {
+                continue;
+            }
+            let Some(v) = self.value(sd, m, o + m.off as usize, 0) else { continue };
             out.insert(m.hash, v);
         }
         out
@@ -295,9 +316,14 @@ impl<'a> Meta<'a> {
         match el.ty {
             0x01 | 0x10 | 0x11 | 0x60 => 1,
             0x12 | 0x13 => 2,
-            0x14 | 0x15 | 0x4a | 0x21 => 4,
-            0x31 | 0x32 | 0x33 | 0x34 => 16,
-            0x08 | 0x4f | 0x07 | 0x4d => 8,
+            0x20 | 0x61 => 2,
+            0x14 | 0x15 | 0x4a | 0x21 | 0x62 => 4,
+            0x32 => 12,
+            0x31 | 0x33 | 0x34 => 16,
+            0x35 => 48,
+            0x36 => 64,
+            0x08 | 0x4f | 0x07 | 0x4d | 0x16 | 0x17 | 0x30 | 0x42 => 8,
+            0x44 => 16,
             // An array of arrays: each element is a 16-byte array header.
             0x52 => 16,
             0x05 => self.structs.get(&el.extra).map(|x| x.size as usize).unwrap_or(0),
@@ -316,7 +342,16 @@ impl<'a> Meta<'a> {
             0x13 => json!(r.u16(p)),
             0x14 => json!(r.u32(p) as i32),
             0x15 | 0x4a => json!(r.u32(p)),
+            0x16 => json!(r.u64(p) as i64),
+            0x17 => json!(r.u64(p)),
             0x21 => f(0),
+            0x30 => json!([f(0), f(1)]),
+            // 3x3 and 3x4 matrices: three or four 16-byte columns.
+            0x35 => json!((0..3).map(|c| [r.f32(p + 16 * c), r.f32(p + 16 * c + 4), r.f32(p + 16 * c + 8)]).collect::<Vec<_>>()),
+            0x36 => json!((0..4).map(|c| [r.f32(p + 16 * c), r.f32(p + 16 * c + 4), r.f32(p + 16 * c + 8)]).collect::<Vec<_>>()),
+            // Enums: 8-, 16- and 32-bit values (0x60 is above, with u8).
+            0x61 => json!(r.u16(p)),
+            0x62 => json!(r.u32(p)),
             0x32 | 0x33 => json!([f(0), f(1), f(2)]),
             0x34 | 0x31 => json!([f(0), f(1), f(2), f(3)]),
             0x08 | 0x4f => json!(format!("{:016x}", r.u64(p))),
@@ -337,19 +372,29 @@ impl<'a> Meta<'a> {
                 json!((0..n).filter_map(|i| self.value(sd, el, base + i * esz, depth)).collect::<Vec<_>>())
             }
             0x01 => json!(r.sys.get(p).map(|&x| x != 0)),
-            // Map (PSO): u32 count, u32 capacity, u64 pointer to a hash table
-            // struct (control bytes `b8794c89`, slots `93c495af`); only the
+            // Map (PSO): u32 group count, u32 entry count, u64 pointer to
+            // the first of `groups` consecutive hash-table group structs
+            // (16 control bytes `b8794c89`, 16 slots `93c495af`); only the
             // occupied slots ({key, value}) are returned.
             0x75 => {
                 let Some((h, o)) = self.ptr(r.u64(p + 8)) else { return Some(json!([])) };
-                let t = self.object(h, o, depth + 1)?;
-                let (Some(ctrl), Some(slots)) = (t.get(field_name(0xb879_4c89)).and_then(|x| x.as_array()), t.get(field_name(0x93c4_95af)).and_then(|x| x.as_array())) else { return Some(t) };
-                json!(ctrl
-                    .iter()
-                    .zip(slots)
-                    .filter(|(c, _)| c.as_u64().is_some_and(|c| c < 0x80))
-                    .map(|(_, sl)| json!({"key": sl.get(field_name(0x6098_a50e)), "value": sl.get(field_name(0x063f_a3f2))}))
-                    .collect::<Vec<_>>())
+                let size = self.structs.get(&h).map_or(0, |s| s.size as usize);
+                let groups = (r.u32(p) as usize).clamp(1, 4096);
+                let mut out = Vec::new();
+                for g in 0..if size == 0 { 1 } else { groups } {
+                    if g > 0 && o + (g + 1) * size > r.sys.len() {
+                        break;
+                    }
+                    let Some(t) = self.object(h, o + g * size, depth + 1) else { break };
+                    let (Some(ctrl), Some(slots)) = (t.get(field_name(0xb879_4c89)).and_then(|x| x.as_array()), t.get(field_name(0x93c4_95af)).and_then(|x| x.as_array())) else {
+                        if g == 0 {
+                            return Some(t);
+                        }
+                        break;
+                    };
+                    out.extend(ctrl.iter().zip(slots).filter(|(c, _)| c.as_u64().is_some_and(|c| c < 0x80)).map(|(_, sl)| json!({"key": sl.get(field_name(0x6098_a50e)), "value": sl.get(field_name(0x063f_a3f2))})));
+                }
+                json!(out)
             }
             // Map (meta, 24 bytes): u64 1, u64 pool reference, u16 count,
             // u16 capacity. The reference points at `count` consecutive entry
@@ -367,12 +412,16 @@ impl<'a> Meta<'a> {
             // Bit set / flags: `reference` bits, stored as 64-bit words, lowest
             // first. Printed as one hex number (16 digits per word, highest
             // word first), so a set of up to 64 bits is its single word.
-            0x65 => {
-                let words = (m.reference as usize).div_ceil(64).clamp(1, 16);
-                json!((0..words).rev().map(|w| format!("{:016x}", r.u64(p + 8 * w))).collect::<String>())
+            // 0x63, 0x64, 0x65 and 0x68 store the bits in 8-, 16-, 32- and
+            // 64-bit words (the member sizes in every meta file agree);
+            // `reference` 0 (one 256-bit set) takes 32 bytes.
+            0x63 | 0x64 | 0x65 | 0x68 => {
+                let wb = match m.ty { 0x63 => 1, 0x64 => 2, 0x65 => 4, _ => 8 };
+                let bits = if m.reference == 0 { 256 } else { m.reference as usize };
+                let words = bits.div_ceil(wb * 8).clamp(1, 64);
+                let bytes = r.sys.get(p..p + words * wb).unwrap_or(&[]);
+                json!(bytes.iter().rev().map(|b| format!("{b:02x}")).collect::<String>())
             }
-            // Tagged value (PSO, 16 bytes): u32 tag, then payload.
-            0x62 => json!({"tag": r.u32(p), "u32": [r.u32(p + 4), r.u32(p + 8), r.u32(p + 12)], "f32": [r.f32(p + 4), r.f32(p + 8), r.f32(p + 12)]}),
             // 64-bit hash (PSO).
             0x4d => json!(format!("{:016x}", r.u64(p))),
             // Array, count first (PSO): u32 count, u32 capacity, u64 pointer.
@@ -411,6 +460,17 @@ impl<'a> Meta<'a> {
             }
             // Half float (2 bytes).
             0x20 => json!(half(r.u16(p))),
+            // Strings: 0x42 a pointer to NUL-terminated text, 0x44 the same
+            // pointer followed by a u16 length (16 bytes).
+            0x42 | 0x44 => match self.ptr(r.u64(p)) {
+                Some((_, o)) => {
+                    let max = if m.ty == 0x44 { r.u16(p + 8) as usize } else { 4096 };
+                    let b = r.sys.get(o..(o + max.min(4096)).min(r.sys.len())).unwrap_or(&[]);
+                    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+                    json!(String::from_utf8_lossy(&b[..end]))
+                }
+                None => serde_json::Value::Null,
+            },
             _ => json!({"type": m.ty, "sub": m.sub, "hex": r.sys.get(p..p + 16).map(|b| b.iter().map(|x| format!("{x:02x}")).collect::<String>())}),
         })
     }
@@ -464,7 +524,33 @@ impl<'a> Meta<'a> {
     /// followed through pool references.
     pub fn dump(&self) -> serde_json::Value {
         let roots: Vec<_> = self.root_block().and_then(|(h, o)| self.object(h, o, 0)).into_iter().collect();
-        serde_json::json!({"schema": self.schema(), "roots": roots})
+        let mut v = serde_json::json!({"schema": self.schema(), "roots": roots});
+        let en = self.enum_names();
+        if !en.is_empty() {
+            v["enum_names"] = serde_json::json!(en);
+        }
+        v
+    }
+
+    /// Value names of the enum members (types 0x60-0x62, and arrays of
+    /// them) of this resource's structs, by field name: value -> name.
+    /// Only values named in the executable's enum tables are listed, so a
+    /// value missing here is unknown, not invalid.
+    pub fn enum_names(&self) -> BTreeMap<String, BTreeMap<i64, &'static str>> {
+        let mut out: BTreeMap<String, BTreeMap<i64, &'static str>> = BTreeMap::new();
+        for sd in self.structs.values() {
+            for m in &sd.members {
+                if m.hash == 0x100 {
+                    continue;
+                }
+                // an array's element is the member its `reference` points at
+                let el = if matches!(m.ty, 0x50..=0x5f) { sd.members.get(m.reference as usize) } else { Some(m) };
+                let Some(el) = el.filter(|e| matches!(e.ty, 0x60..=0x62)) else { continue };
+                let Some(vals) = enum_values().get(&el.extra) else { continue };
+                out.entry(field_name(m.hash)).or_default().extend(vals.iter().map(|(&v, &n)| (v, n)));
+            }
+        }
+        out
     }
 
     /// Every instance of every struct (hash 0x100 and up), decoded in full,
@@ -511,8 +597,8 @@ pub struct Entity {
     pub guid: String,
     /// Tint palette row of this instance (field `3c852527`; absent = 0):
     /// the colour is palette entry `tint_row * row_length + COLOR0.b`, with
-    /// the row layout from the model's model.json (rows past the last one
-    /// are assumed to clamp to it).
+    /// the row layout from the model's model.json. Rows past the last one
+    /// clamp to it (the prop mesh shader takes `min(tint_row, rows - 1)`).
     #[serde(skip_serializing_if = "is_zero")]
     pub tint_row: u32,
     /// `false` when the placement should not be drawn by default (proxy,
@@ -796,6 +882,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn member_types_from_the_parser_tables() {
+        // one struct: u32 enum, 6-bit set (32-bit words), 40-bit set,
+        // 8-byte vec2, s32, a string pointer into block 2, then u64
+        let mut sys = vec![0u8; 0x80];
+        sys[0..4].copy_from_slice(&5u32.to_le_bytes());
+        sys[4..8].copy_from_slice(&0x2au32.to_le_bytes());
+        sys[8..16].copy_from_slice(&0x0000_0081_0000_0003u64.to_le_bytes());
+        sys[16..20].copy_from_slice(&1.5f32.to_le_bytes());
+        sys[20..24].copy_from_slice(&(-2.0f32).to_le_bytes());
+        sys[24..28].copy_from_slice(&(-7i32).to_le_bytes());
+        sys[32..40].copy_from_slice(&2u64.to_le_bytes());
+        sys[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+        sys[0x60..0x63].copy_from_slice(b"ab\0");
+        let r = Resource { sys, gfx: vec![], gfx_base: 0 };
+        let mem = |hash, off, ty, reference| Member { hash, off, ty, sub: 0, reference, extra: 0 };
+        let sd = StructDef { hash: 0x1234, size: 48, members: vec![mem(1, 0, 0x62, 0), mem(2, 4, 0x65, 6), mem(3, 8, 0x65, 40), mem(4, 16, 0x30, 0), mem(5, 24, 0x14, 0), mem(6, 32, 0x42, 0), mem(7, 40, 0x17, 0)] };
+        let m = Meta { r: &r, structs: [(0x1234, sd)].into_iter().collect(), blocks: vec![(0x1234, 48, 0), (0x10, 3, 0x60)], pso: false };
+        let v = m.scalars_by_hash(0x1234, 0, &[]);
+        assert_eq!(v[&1], serde_json::json!(5));
+        // a 6-bit set is one 32-bit word: the neighbouring field is not read
+        assert_eq!(v[&2], serde_json::json!("0000002a"));
+        assert_eq!(v[&3], serde_json::json!("0000008100000003"));
+        assert_eq!(v[&4], serde_json::json!([1.5, -2.0]));
+        assert_eq!(v[&5], serde_json::json!(-7));
+        assert_eq!(v[&6], serde_json::json!("ab"));
+        assert_eq!(v[&7], serde_json::json!(u64::MAX));
+        assert!(is_scalar_type(0x01) && !is_scalar_type(0x05) && !is_scalar_type(0x52));
+    }
+
+    #[test]
+    fn pso_map_reads_every_group() {
+        let m = |hash: u32, off: u32, ty: u8, reference: u16, extra: u32| Member { hash, off, ty, sub: 0, reference, extra };
+        let mut structs = HashMap::new();
+        structs.insert(0x100, StructDef { hash: 0x100, size: 8, members: vec![m(0x6098_a50e, 0, 0x4a, 0, 0), m(0x063f_a3f2, 4, 0x21, 0, 0)] });
+        structs.insert(0x101, StructDef { hash: 0x101, size: 144, members: vec![m(0x100, 0, 0x11, 0, 0), m(0xb879_4c89, 0, 0x50, 0, 16), m(0x100, 0, 0x05, 0, 0x100), m(0x93c4_95af, 16, 0x50, 2, 16)] });
+        structs.insert(0xaaaa, StructDef { hash: 0xaaaa, size: 16, members: vec![m(0x1652_fce8, 0, 0x75, 0, 0)] });
+        let mut sys = vec![0u8; 16 + 288];
+        sys[0..4].copy_from_slice(&2u32.to_le_bytes()); // groups
+        sys[4..8].copy_from_slice(&2u32.to_le_bytes()); // entries
+        sys[8..16].copy_from_slice(&2u64.to_le_bytes()); // block 2, offset 0
+        for g in 0..2 {
+            sys[16 + 144 * g..16 + 144 * g + 16].fill(0x80);
+        }
+        let slot = |sys: &mut Vec<u8>, g: usize, i: usize, k: u32, v: f32| {
+            sys[16 + 144 * g + i] = 0x05;
+            let o = 16 + 144 * g + 16 + 8 * i;
+            sys[o..o + 4].copy_from_slice(&k.to_le_bytes());
+            sys[o + 4..o + 8].copy_from_slice(&v.to_le_bytes());
+        };
+        slot(&mut sys, 0, 0, 7, 1.5);
+        slot(&mut sys, 1, 3, 9, 2.5);
+        let r = Resource { sys, gfx: Vec::new(), gfx_base: 0 };
+        let meta = Meta { r: &r, structs, blocks: vec![(0xaaaa, 16, 0), (0x101, 288, 16)], pso: true };
+        let v = meta.object(0xaaaa, 0, 0).unwrap();
+        assert_eq!(v[field_name(0x1652_fce8)], serde_json::json!([{"key": 7, "value": 1.5}, {"key": 9, "value": 2.5}]));
+    }
+
+    #[test]
     fn entity_lod_names() {
         let mut f = BTreeMap::new();
         f.insert("6c8f1715".to_string(), serde_json::json!(5));
@@ -805,6 +949,22 @@ mod tests {
         assert_eq!(l["priority"], 2);
         assert_eq!(l["priority_name"], "OPTIONAL_MEDIUM");
         assert!(entity_lod(&BTreeMap::new())["priority_name"].is_null());
+    }
+
+    #[test]
+    fn enum_value_table() {
+        // rage__eLodType and the entity priority enum
+        assert_eq!(enum_value_name(0x4b5a_cc2f, 5), Some("LODTYPES_DEPTH_ORPHANHD"));
+        assert_eq!(enum_value_name(0x4b5a_cc2f, 6), Some("LODTYPES_DEPTH_SLOD4"));
+        assert_eq!(enum_value_name(0x0701_af5f, 0), Some("PRI_REQUIRED"));
+        assert_eq!(enum_value_name(0x0701_af5f, 99), None);
+        assert!(enum_values().values().map(|v| v.len()).sum::<usize>() > 3000);
+        for (h, vals) in enum_values() {
+            assert_ne!(*h, 0);
+            for n in vals.values() {
+                assert!(!n.is_empty() && !n.contains(char::is_whitespace));
+            }
+        }
     }
 
     #[test]
