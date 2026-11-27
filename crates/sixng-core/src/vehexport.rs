@@ -219,9 +219,10 @@ struct Piece {
 /// Export `vehicle` (a record of `vehicles.json`) with the parts of its
 /// configuration `config` to `out` (a .glb path; textures go beside it).
 /// `with` adds parts to the configuration's (a part in the same slot is
-/// replaced), `without` takes parts off.
+/// replaced), `without` takes parts off. `livery`: stickers to write as
+/// decal meshes (`vehlivery`).
 #[allow(clippy::too_many_arguments)]
-pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value, config: usize, with: &[u32], without: &[u32], wheels: bool, out: &Path, o: &ExportOptions) -> Result<Value> {
+pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value, config: usize, with: &[u32], without: &[u32], wheels: bool, livery: &[crate::vehlivery::Decal], out: &Path, o: &ExportOptions) -> Result<Value> {
     let model = vehicle["model"].as_str().ok_or_else(|| anyhow!("the vehicle record has no model name"))?.to_ascii_lowercase();
     let configs = vehicle["configurations"].as_array().cloned().unwrap_or_default();
     let cfg = configs.get(config).ok_or_else(|| anyhow!("{model} has {} configurations; --config {config} is out of range", configs.len()))?;
@@ -606,6 +607,7 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
     if groups.iter().all(|g| g.prims.is_empty()) {
         bail!("nothing to export for {model}");
     }
+    let stickers = crate::vehlivery::add(&mut groups, &mut materials, livery);
     let extras = json!({"vehicle": model, "configuration": config, "parts_key": cfg["parts_key"], "colour": cfg["colour"], "paint_coat": paint_coat, "coordinate_system": crate::export::COORDS});
     let glb = crate::gltf::mesh_glb_with(&model, &groups, &materials, &joints, extras, &crate::gltf::GlbOptions { animations: &[], trs_joints: true, skinned_meshes_at_root: true });
     crate::atomic::write(out, &glb)?;
@@ -614,6 +616,7 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
         "pieces": reports, "joints": joints.len(), "stock_triangles_replaced": dropped,
         "part_colours": if look.is_some() { "the configuration's" } else { "as exported (the vehicle has no part colours per configuration)" },
         "paint": paint, "paint_coat": paint_coat, "wheels": wheel_report, "repeated_elements_skipped": repeated, "not_fitted": skipped, "left_out": unresolved, "warnings": warnings,
+        "livery": if livery.is_empty() { Value::Null } else { json!({"stickers": stickers, "note": "each sticker is a mesh of its own, cut out of the faces under it and lifted off them (0.8 mm, 0.2 mm more per sticker), with the picture as a blended material"}) },
     }))
 }
 
