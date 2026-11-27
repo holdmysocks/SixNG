@@ -579,9 +579,13 @@ impl GpuModel {
 pub const CULL_MAX_INST: usize = 8;
 
 /// Meshes skipped by the per-mesh cull in the last frame: main pass,
-/// coverage fallbacks, shadow cascades.
-pub static MESH_CULLED: [std::sync::atomic::AtomicU32; 3] =
-    [std::sync::atomic::AtomicU32::new(0), std::sync::atomic::AtomicU32::new(0), std::sync::atomic::AtomicU32::new(0)];
+/// coverage fallbacks, shadow cascades, decal and see-through.
+pub static MESH_CULLED: [std::sync::atomic::AtomicU32; 4] = [
+    std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0),
+];
 
 /// A per-mesh visibility test: the camera's frustum sides, or a shadow cascade.
 #[derive(Clone, Copy)]
@@ -2831,11 +2835,13 @@ impl Renderer3D {
     /// Draw sorted decal or see-through meshes (pipeline, model number,
     /// model, mesh) in the given order. Groups and buffers are bound only
     /// when they change, and a mesh that follows straight on from the
-    /// pending draw (same pipeline, model and material) joins it. Returns
-    /// the number of draws.
+    /// pending draw (same pipeline, model and material) joins it. A mesh
+    /// the per-mesh cull hides (`shown` false) is not drawn, but when it
+    /// follows on from the pending draw a later mesh can still join across
+    /// it, so the cull never splits a draw. Returns the number of draws.
     fn record_joined<'a>(
         be: &mut wgpu::RenderPass<'_>,
-        list: impl Iterator<Item = (&'a wgpu::RenderPipeline, usize, &'a GpuModel, &'a GpuMesh)>,
+        list: impl Iterator<Item = (&'a wgpu::RenderPipeline, usize, &'a GpuModel, &'a GpuMesh, bool)>,
     ) -> u32 {
         let mut n = 0u32;
         let mut pipe: Option<&wgpu::RenderPipeline> = None;
@@ -2843,12 +2849,22 @@ impl Renderer3D {
         let mut mat = usize::MAX;
         let mut inst = 0..0u32;
         let mut run: Option<std::ops::Range<u32>> = None;
-        for (p, mi, gm, me) in list {
+        // end of the hidden meshes that follow on from the run
+        let mut reach = u32::MAX;
+        for (p, mi, gm, me, shown) in list {
             let first = me.first();
             let same_pipe = pipe.is_some_and(|q| std::ptr::eq(q, p));
+            let joins = same_pipe && model == mi && mat == me.material;
+            if !shown {
+                if run.is_some() && joins && reach == first {
+                    reach = first + me.n_idx;
+                }
+                continue;
+            }
             if let Some(r) = &mut run {
-                if same_pipe && model == mi && mat == me.material && r.end == first {
+                if joins && (r.end == first || reach == first) {
                     r.end = first + me.n_idx;
+                    reach = r.end;
                     continue;
                 }
                 be.draw_indexed(r.clone(), 0, inst.clone());
@@ -2872,6 +2888,7 @@ impl Renderer3D {
                 mat = me.material;
             }
             run = Some(first..first + me.n_idx);
+            reach = first + me.n_idx;
         }
         if let Some(r) = run {
             be.draw_indexed(r, 0, inst);
@@ -3608,13 +3625,15 @@ impl Renderer3D {
             // decals: after all opaque surfaces, by layer order; opaque-mode
             // decals (terrain blend layers) write depth, blended ones do not
             let mut late = 0u32;
+            let mut late_culled = 0u32;
             if self.decal_bias {
                 let eye = cam.eye();
-                let mut dl: Vec<(u8, bool, f32, usize, usize, &GpuModel, &GpuMesh)> = Vec::new();
+                let mut dl: Vec<(u8, bool, f32, usize, usize, &GpuModel, &GpuMesh, bool)> = Vec::new();
                 for (mi, gm) in models.iter().enumerate() {
                     if gm.n_normal() == 0 {
                         continue;
                     }
+                    let ci = cull_inst(gm, &(0..gm.n_normal()));
                     let model_d = gm.world.map(|(c, _)| (c - eye).length());
                     for (pos, me) in gm.ordered().enumerate().filter(|(_, m)| m.visible && m.n_idx > 0) {
                         if let Some(o) = gm.mat_decal[me.material] {
@@ -3627,7 +3646,8 @@ impl Renderer3D {
                             // meshes of one material join; blended ones go far to
                             // near by mesh
                             let d = if blend { (me.centre - eye).length() } else { model_d.unwrap_or((me.centre - eye).length()) };
-                            dl.push((o, blend, d, mi, pos, gm, me));
+                            let shown = ci.as_ref().is_none_or(|ir| view_cull.mesh(&gm.inst_cpu[ir.clone()], me));
+                            dl.push((o, blend, d, mi, pos, gm, me, shown));
                         }
                     }
                 }
@@ -3640,9 +3660,10 @@ impl Renderer3D {
                         .then(a.3.cmp(&b.3))
                         .then(a.4.cmp(&b.4))
                 });
+                late_culled += dl.iter().filter(|e| !e.7).count() as u32;
                 late += Self::record_joined(
                     &mut pass,
-                    dl.iter().map(|e| (if e.1 { &self.pipe_decal_blend } else { &self.pipe_decal }, e.3, e.5, e.6)),
+                    dl.iter().map(|e| (if e.1 { &self.pipe_decal_blend } else { &self.pipe_decal }, e.3, e.5, e.6, e.7)),
                 );
             }
             drop(pass);
@@ -3672,11 +3693,12 @@ impl Renderer3D {
             // blended, back to front by mesh centre
             if look.mode == 0 {
                 let eye = cam.eye();
-                let mut bl: Vec<(f32, usize, usize, &GpuModel, &GpuMesh)> = Vec::new();
+                let mut bl: Vec<(f32, usize, usize, &GpuModel, &GpuMesh, bool)> = Vec::new();
                 for (mi, gm) in models.iter().enumerate() {
                     if gm.n_normal() == 0 {
                         continue;
                     }
+                    let ci = cull_inst(gm, &(0..gm.n_normal()));
                     for (pos, me) in gm.ordered().enumerate().filter(|(_, m)| m.visible && m.n_idx > 0) {
                         if self.decal_bias && gm.mat_decal[me.material].is_some() {
                             continue;
@@ -3684,7 +3706,8 @@ impl Renderer3D {
                         if gm.mat_alpha[me.material] == 2
                             || matches!(gm.mat_class[me.material], 5 | 6 | 8)
                         {
-                            bl.push(((me.centre - eye).length(), mi, pos, gm, me));
+                            let shown = ci.as_ref().is_none_or(|ir| view_cull.mesh(&gm.inst_cpu[ir.clone()], me));
+                            bl.push(((me.centre - eye).length(), mi, pos, gm, me, shown));
                         }
                     }
                 }
@@ -3695,8 +3718,10 @@ impl Renderer3D {
                         .then(a.2.cmp(&b.2))
                 });
                 pass.set_bind_group(2, &t.scene_bg, &[]);
-                late += Self::record_joined(&mut pass, bl.iter().map(|e| (&self.pipe_blend, e.1, e.3, e.4)));
+                late_culled += bl.iter().filter(|e| !e.5).count() as u32;
+                late += Self::record_joined(&mut pass, bl.iter().map(|e| (&self.pipe_blend, e.1, e.3, e.4, e.5)));
             }
+            MESH_CULLED[3].fetch_add(late_culled, std::sync::atomic::Ordering::Relaxed);
             draws += late;
             late_n = late;
             if look.wire {
