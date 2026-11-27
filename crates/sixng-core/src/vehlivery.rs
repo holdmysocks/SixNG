@@ -19,6 +19,12 @@
 //!
 //! A colour mask (the picture's red, green and blue each take a colour) is
 //! written as a picture in those colours.
+//!
+//! A sticker the viewer laid on flat (`flat` in the livery file) is not
+//! placed through a UV set: its place in the picture is `u = A·P + ou`,
+//! `v = B·P + ov` of the place P on the vehicle, on the faces that look
+//! along N (the file's `projection`, in the viewer's Y-up space). It may
+//! lie on zones of several models (`also`).
 use crate::gltf::{Material, NodeGroup, TriPrim};
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
@@ -45,6 +51,19 @@ pub struct Decal {
     pub uri: String,
     /// Linear RGBA the picture is multiplied by.
     pub factor: [f32; 4],
+    /// Laid on flat: A, ou, B, ov, N in the export's own space (RAGE, Z
+    /// up), used instead of `m`.
+    pub flat: Option<[f32; 11]>,
+    /// A flat sticker's zones on other models: (model, zones).
+    pub also: Vec<(String, Vec<u8>)>,
+}
+
+/// A flat sticker's numbers from the viewer's space (glTF, Y up) to the
+/// export's (RAGE, Z up): glb(x, y, z) = rage(x, z, -y).
+pub fn flat_to_rage(p: [f32; 11]) -> [f32; 11] {
+    let v = |x: f32, y: f32, z: f32| [x, -z, y];
+    let (a, b, n) = (v(p[0], p[1], p[2]), v(p[4], p[5], p[6]), v(p[8], p[9], p[10]));
+    [a[0], a[1], a[2], p[3], b[0], b[1], b[2], p[7], n[0], n[1], n[2]]
 }
 
 fn lin(c: u8) -> f32 {
@@ -104,10 +123,22 @@ pub fn prepare(game: &Path, file: &Path, dir: &Path) -> Result<(Vec<Decal>, Vec<
             left.push(format!("{name}: the file has no shader numbers for it (open and save the livery in the viewer)"));
             continue;
         };
-        let zones: Vec<u8> = s["zones"].as_array().into_iter().flatten().filter_map(|z| z.as_u64().map(|z| z as u8)).collect();
+        let zones_of = |v: &Value| -> Vec<u8> { v.as_array().into_iter().flatten().filter_map(|z| z.as_u64().map(|z| z as u8)).collect() };
+        let zones = zones_of(&s["zones"]);
         if zones.is_empty() {
             left.push(format!("{name}: no zones chosen"));
             continue;
+        }
+        let mut flat = None;
+        let mut also = Vec::new();
+        if s["flat"] == true && s["game_uv"].is_null() {
+            let p: Vec<f32> = s["projection"].as_array().into_iter().flatten().filter_map(|x| x.as_f64().map(|x| x as f32)).collect();
+            let Ok(p) = <[f32; 11]>::try_from(p) else {
+                left.push(format!("{name}: laid on flat, but the file has no projection numbers for it (open and save the livery in the viewer)"));
+                continue;
+            };
+            flat = Some(flat_to_rage(p));
+            also = s["also"].as_array().into_iter().flatten().map(|a| (a["model"].as_str().unwrap_or("").to_ascii_lowercase(), zones_of(&a["zones"]))).collect();
         }
         let colours: [[u8; 3]; 3] = std::array::from_fn(|k| std::array::from_fn(|c| s["colours"][k][c].as_u64().unwrap_or(255) as u8));
         let mask = s["mask"] == true;
@@ -136,7 +167,7 @@ pub fn prepare(game: &Path, file: &Path, dir: &Path) -> Result<(Vec<Decal>, Vec<
         img.save(dir.join(&uri))?;
         let opacity = s["opacity"].as_f64().unwrap_or(1.0).clamp(0.0, 1.0) as f32;
         let tint = if mask { [1.0; 3] } else { colours[0].map(lin) };
-        out.push(Decal { name, model: s["model"].as_str().unwrap_or("").to_ascii_lowercase(), zones, uv_set: s["uv_set"].as_u64().unwrap_or(1).min(3) as usize, m, uri, factor: [tint[0], tint[1], tint[2], opacity] });
+        out.push(Decal { name, model: s["model"].as_str().unwrap_or("").to_ascii_lowercase(), zones, uv_set: s["uv_set"].as_u64().unwrap_or(1).min(3) as usize, m, uri, factor: [tint[0], tint[1], tint[2], opacity], flat, also });
     }
     let _ = std::fs::remove_dir_all(&cache);
     Ok((out, left))
@@ -248,14 +279,6 @@ pub fn decal_prim(prims: &[TriPrim], skip: &dyn Fn(&TriPrim) -> bool, d: &Decal,
             if !on[zone[i[0]][3] as usize] {
                 continue;
             }
-            let at = i.map(|i| [uv[i][0] * m[0] + uv[i][1] * m[1] + m[4], uv[i][0] * m[2] + uv[i][1] * m[3] + m[5]]);
-            if (0..2).any(|a| at.iter().all(|q| q[a] < 0.0) || at.iter().all(|q| q[a] > 1.0)) || at.iter().flatten().any(|x| !x.is_finite()) {
-                continue;
-            }
-            let poly = cut(at);
-            if poly.len() < 3 {
-                continue;
-            }
             let pos = i.map(|i| p.positions[i]);
             let face = {
                 let (a, b) = (std::array::from_fn::<f32, 3, _>(|k| pos[1][k] - pos[0][k]), std::array::from_fn::<f32, 3, _>(|k| pos[2][k] - pos[0][k]));
@@ -265,6 +288,25 @@ pub fn decal_prim(prims: &[TriPrim], skip: &dyn Fn(&TriPrim) -> bool, d: &Decal,
                 Some(n) => i.map(|i| n[i]),
                 None => [face; 3],
             };
+            let at = match d.flat {
+                None => i.map(|i| [uv[i][0] * m[0] + uv[i][1] * m[1] + m[4], uv[i][0] * m[2] + uv[i][1] * m[3] + m[5]]),
+                Some(f) => {
+                    // only faces that look the sticker's way (the viewer
+                    // asks this of every pixel; here of the face's corners)
+                    let look: f32 = nrm.iter().map(|n| (n[0] * f[8] + n[1] * f[9] + n[2] * f[10]) / (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-9)).sum::<f32>() / 3.0;
+                    if !(look >= 0.25) {
+                        continue;
+                    }
+                    pos.map(|q| [q[0] * f[0] + q[1] * f[1] + q[2] * f[2] + f[3], q[0] * f[4] + q[1] * f[5] + q[2] * f[6] + f[7]])
+                }
+            };
+            if (0..2).any(|a| at.iter().all(|q| q[a] < 0.0) || at.iter().all(|q| q[a] > 1.0)) || at.iter().flatten().any(|x| !x.is_finite()) {
+                continue;
+            }
+            let poly = cut(at);
+            if poly.len() < 3 {
+                continue;
+            }
             let base = out.positions.len() as u32;
             for c in &poly {
                 let mut n: [f32; 3] = std::array::from_fn(|k| nrm[0][k] * c.w[0] + nrm[1][k] * c.w[1] + nrm[2][k] * c.w[2]);
@@ -313,10 +355,17 @@ pub fn add(groups: &mut [NodeGroup], materials: &mut Vec<Material>, decals: &[De
         let mut placed = Vec::new();
         let mut material = None;
         for (g, group) in groups.iter_mut().enumerate() {
-            let own = if d.model.is_empty() { g == 0 } else { group.name.eq_ignore_ascii_case(&d.model) };
-            if !own {
+            let is = |model: &str| if model.is_empty() { g == 0 } else { group.name.eq_ignore_ascii_case(model) };
+            // a flat sticker's other models take its zones there
+            let other;
+            let d = if is(&d.model) {
+                d
+            } else if let Some((_, zones)) = d.also.iter().find(|a| is(&a.0)) {
+                other = Decal { zones: zones.clone(), ..d.clone() };
+                &other
+            } else {
                 continue;
-            }
+            };
             let Some(mut p) = decal_prim(&group.prims, &skip, d, lift) else { continue };
             let at = *material.get_or_insert_with(|| {
                 materials.push(Material {
@@ -324,7 +373,7 @@ pub fn add(groups: &mut [NodeGroup], materials: &mut Vec<Material>, decals: &[De
                     base_color_uri: Some(d.uri.clone()),
                     normal_uri: None,
                     gltf: json!({"alphaMode": "BLEND", "pbrMetallicRoughness": {"baseColorFactor": d.factor, "metallicFactor": 0.0, "roughnessFactor": 0.45}}),
-                    extras: json!({"livery": {"sticker": d.name, "model": d.model, "zones": d.zones, "uv_set": d.uv_set, "uv": d.m}, "clamp": true}),
+                    extras: json!({"livery": {"sticker": d.name, "model": d.model, "zones": d.zones, "uv_set": d.uv_set, "uv": d.m, "flat": d.flat}, "clamp": true}),
                 });
                 materials.len() - 1
             });
@@ -377,7 +426,7 @@ mod tests {
     #[test]
     fn a_sticker_is_cut_out_of_the_faces_under_it() {
         // 2 m x 1 m in the middle of the wall: U 0.25..0.75, V 0.25..0.75
-        let d = Decal { name: "s".into(), model: String::new(), zones: vec![7, 8], uv_set: 1, m: [2.0, 0.0, 0.0, 2.0, -0.5, -0.5], uri: "s.png".into(), factor: [1.0; 4] };
+        let d = Decal { name: "s".into(), model: String::new(), zones: vec![7, 8], uv_set: 1, m: [2.0, 0.0, 0.0, 2.0, -0.5, -0.5], uri: "s.png".into(), factor: [1.0; 4], flat: None, also: Vec::new() };
         let p = decal_prim(&[wall()], &|_| false, &d, 0.001).unwrap();
         assert!((area(&p) - 2.0).abs() < 1e-4, "{}", area(&p));
         // inside the picture, lifted off the wall, skinned as the wall is
@@ -402,7 +451,7 @@ mod tests {
     fn stickers_go_to_the_model_they_name() {
         let mut groups = vec![NodeGroup { name: "truck".into(), prims: vec![wall()] }, NodeGroup { name: "box_hi".into(), prims: vec![wall()] }];
         let mut mats = Vec::new();
-        let d = |model: &str| Decal { name: "s".into(), model: model.into(), zones: vec![7], uv_set: 1, m: [2.0, 0.0, 0.0, 2.0, -0.5, -0.5], uri: "s.png".into(), factor: [1.0, 1.0, 1.0, 0.5] };
+        let d = |model: &str| Decal { name: "s".into(), model: model.into(), zones: vec![7], uv_set: 1, m: [2.0, 0.0, 0.0, 2.0, -0.5, -0.5], uri: "s.png".into(), factor: [1.0, 1.0, 1.0, 0.5], flat: None, also: Vec::new() };
         let r = add(&mut groups, &mut mats, &[d(""), d("box_hi"), d("other")]);
         assert_eq!((groups[0].prims.len(), groups[1].prims.len(), mats.len()), (2, 2, 2));
         assert_eq!(groups[1].prims[1].material, Some(1));
@@ -411,6 +460,38 @@ mod tests {
         assert!(r[2]["note"].as_str().unwrap().contains("covers nothing"));
         // a later sticker lies above an earlier one
         assert!(groups[1].prims[1].positions[0][1] < groups[0].prims[1].positions[0][1]);
+    }
+
+    #[test]
+    fn a_flat_sticker_runs_over_two_models() {
+        // the wall as the vehicle and, 0.3 m further out and 4 m along,
+        // as a fitted box; a sticker 4 m x 1 m centred where they meet
+        // (x 2, z 1), looking along -Y. Viewer space: (x, z, -y).
+        let mut far = wall();
+        for q in &mut far.positions {
+            q[0] += 4.0;
+            q[1] -= 0.3;
+        }
+        // u = x/4, v = (1.5 - z)/1: in the viewer's space z is its y
+        let view = [0.25, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 1.5, 0.0, 0.0, 1.0];
+        let f = flat_to_rage(view);
+        assert_eq!(&f[8..], &[0.0, -1.0, 0.0]);
+        let d = Decal { name: "s".into(), model: String::new(), zones: vec![8], uv_set: 1, m: [0.0; 6], uri: "s.png".into(), factor: [1.0; 4], flat: Some(f), also: vec![("box_hi".into(), vec![7])] };
+        let mut groups = vec![NodeGroup { name: "truck".into(), prims: vec![wall()] }, NodeGroup { name: "box_hi".into(), prims: vec![far] }];
+        let mut mats = Vec::new();
+        let r = add(&mut groups, &mut mats, &[d.clone()]);
+        assert_eq!((groups[0].prims.len(), groups[1].prims.len(), mats.len()), (2, 2, 1));
+        assert_eq!(r[0]["on"].as_array().unwrap().len(), 2);
+        // 2 m x 1 m on each: x 0..2 on the vehicle, 2..4 on the box
+        let (a, b) = (&groups[0].prims[1], &groups[1].prims[1]);
+        assert!((area(a) - 2.0).abs() < 1e-4 && (area(b) - 2.0).abs() < 1e-4, "{} {}", area(a), area(b));
+        assert!(a.positions.iter().all(|q| (-1e-5..=2.0 + 1e-5).contains(&q[0])) && b.positions.iter().all(|q| (2.0 - 1e-5..=4.0 + 1e-5).contains(&q[0])));
+        // the picture runs on: its middle column is where they meet
+        assert!(a.uvs[0].iter().all(|t| t[0] <= 0.5 + 1e-5) && b.uvs[0].iter().all(|t| t[0] >= 0.5 - 1e-5));
+        // a face that looks the other way takes nothing
+        let mut back = wall();
+        back.normals = Some(vec![[0.0, 1.0, 0.0]; back.positions.len()]);
+        assert!(decal_prim(&[back], &|_| false, &d, 0.001).is_none());
     }
 
     #[test]
