@@ -268,13 +268,27 @@ fn read_list(game: &str, work: &str, cache: &Path) -> Result<Vec<GameSticker>, S
 /// from the game files.
 fn read_brands(game: &str, work: &str, cache: &Path) -> Result<Brands, String> {
     let file = cache.join("vehicle_liveries_f4.json");
-    if let Some(b) = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<Brands>(&b).ok()) {
-        return Ok(b);
+    let mut b = match std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<Brands>(&b).ok()) {
+        Some(b) => b,
+        None => {
+            let ws = sixng_core::export::Workspace::new(game, work);
+            let (b, _) = sixng_core::vehstickers::liveries(&ws, &HashMap::new()).map_err(|e| format!("{e:#}"))?;
+            let _ = std::fs::create_dir_all(cache);
+            let _ = sixng_core::atomic::write(&file, serde_json::to_vec(&b).unwrap_or_default());
+            b
+        }
+    };
+    // a model whose records are filed under its handlingId (guardiantx2's
+    // under guardian): its liveries are those of that hash
+    if let Ok(db) = crate::vehicle_db::shared(game, work) {
+        for (model, v) in db.iter() {
+            let Some(from) = v.records_from else { continue };
+            let own = format!("{:08x}", sixng_core::meta7a::joaat(model));
+            if let Some(list) = b.get(&format!("{from:08x}")).filter(|_| !b.contains_key(&own)).cloned() {
+                b.insert(own, list);
+            }
+        }
     }
-    let ws = sixng_core::export::Workspace::new(game, work);
-    let (b, _) = sixng_core::vehstickers::liveries(&ws, &HashMap::new()).map_err(|e| format!("{e:#}"))?;
-    let _ = std::fs::create_dir_all(cache);
-    let _ = sixng_core::atomic::write(&file, serde_json::to_vec(&b).unwrap_or_default());
     Ok(b)
 }
 
