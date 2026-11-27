@@ -665,10 +665,22 @@ again**).
     and records the material in `model.json` (`spec` in the part's skin
     record). A colour texture whose states name more than one material
     (shared defaults) is left out. The maps are carried as stored, in the
-    material `extras` and as PNGs; they are not RMA (`speculartex` is
-    mostly 0/155/255, `speculartex2` has a detail mask in R and a smooth
-    field in G), and what the skin program does with each channel is not
-    decoded, so the GLB maps no roughness or metal from them. The table
+    material `extras` and as PNGs. They are not RMA. The skin pixel
+    program (`PS_DeferredPedTexturedNC`, read on 2026-11-26) uses the
+    channels this way. `speculartex` R is a translucency mask: `saturate(R
+    - c)` goes to a G-buffer target of its own, and it is non-zero only on
+    thin parts such as the finger segments. G is roughness (about 0.6 on
+    skin): overlay layers blend it toward their own value, the detail map
+    adjusts it, a view-dependent factor and specular anti-aliasing widen
+    it, and the G-buffer stores 1 - roughness. B is occlusion,
+    `lerp(1, B, strength)`, stored in 6 bits (mostly 1). `speculartex2` R
+    is the detail strength mask; G is a skin region number (`16 x G`, the
+    high nibble, 0-15). A per-draw table turns the region into a
+    layer of the detail normal and detail control atlases (2D arrays
+    `0cd27763` and `7c0055b9`), sampled at the UV times a tiling constant.
+    R scales how much they change the normal, the colour and the
+    roughness. There is no metalness. The GLB does not map these yet. The
+    table
     is built from the `packs.rpf` index on first use and cached as
     `<work>/index/skin_spec.json`.
   - **Fabric shading.** The colour is shaded by the green channel of the

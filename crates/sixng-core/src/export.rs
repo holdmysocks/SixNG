@@ -2034,7 +2034,7 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
                     "speculartex": format!("{:016x}", sp.spec),
                     "speculartex2": format!("{:016x}", sp.spec2),
                     "in_game_files": [set.get(sp.spec).is_some(), set.get(sp.spec2).is_some()],
-                    "note": "the spec maps of the wardrobe state's material asset (skinspec), put in the shader's speculartex (c6f46e79) and speculartex2 (739e3d0d) slots where the mesh binds a texture that is in no store. Channel use in the skin shader is not decoded; the maps are as stored."
+                    "note": "the spec maps of the wardrobe state's material asset (skinspec), put in the shader's speculartex (c6f46e79) and speculartex2 (739e3d0d) slots where the mesh binds a texture that is in no store. Channels (skin pixel program): speculartex R translucency mask, G roughness, B occlusion; speculartex2 R detail strength mask, G skin region (high nibble) that picks the detail atlas layer. The maps are as stored."
                 });
             }
             return Some((sh, rec));

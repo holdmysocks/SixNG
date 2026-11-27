@@ -31,9 +31,18 @@
 //! left out and counted in `conflicts`. Built once from the packs.rpf index (meta
 //! resources and PSO files) and cached as `<work>/index/skin_spec.json`.
 //!
-//! What the skin shader does with each channel is not decoded, so the maps
-//! are carried as they are (export material extras, viewer slots), not
-//! turned into glTF metallic / roughness.
+//! The channels, from the skin pixel program (`PS_DeferredPedTexturedNC`):
+//! * `speculartex` R: translucency mask, `saturate(R - c)` written to a
+//!   G-buffer target of its own (non-zero on thin parts such as fingers).
+//! * `speculartex` G: roughness. Overlay layers blend it toward their own
+//!   value, the detail map adjusts it, and the G-buffer stores 1 - roughness.
+//! * `speculartex` B: occlusion, `lerp(1, B, strength)`, stored in 6 bits.
+//! * `speculartex2` R: detail strength mask.
+//! * `speculartex2` G: skin region (`G * 16`, high nibble 0-15). A
+//!   per-draw table maps the region to a layer of the detail-normal
+//!   and detail-control atlases.
+//!
+//! The maps are carried as they are (export material extras, viewer slots).
 
 use crate::meta7a::{field_name, Meta};
 use crate::resource::Resource;
