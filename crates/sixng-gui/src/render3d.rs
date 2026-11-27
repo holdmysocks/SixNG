@@ -527,7 +527,7 @@ pub struct GpuModel {
     pub sticker_buf: Option<wgpu::Buffer>,
     pub instances: wgpu::Buffer,
     /// The instances' transforms and largest axis scale, in buffer order,
-    /// when the model has at most `CULL_MAX_INST` of them (empty otherwise):
+    /// when the model has at most `cull_max_inst()` of them (empty otherwise):
     /// its meshes are then culled one by one (`MeshCull`).
     pub inst_cpu: Vec<(Mat4, f32)>,
     pub n_instances: u32,
@@ -578,9 +578,18 @@ impl GpuModel {
     }
 }
 
-/// Models with at most this many instances have their meshes culled one by
-/// one (big single placements: SLOD tiles, buildings).
-pub const CULL_MAX_INST: usize = 8;
+/// Models with at most this many instances have their placements and
+/// meshes culled one by one (`SIXNG_MAP_CULL_INST` overrides it; 0 turns
+/// the cull off).
+pub fn cull_max_inst() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("SIXNG_MAP_CULL_INST")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(64)
+    })
+}
 
 /// Meshes skipped by the per-mesh cull in the last frame: main pass,
 /// coverage fallbacks, shadow cascades, decal and see-through.
@@ -622,11 +631,21 @@ impl MeshCull<'_> {
     }
 }
 
-/// The instances a model's meshes are culled against, when it has its
-/// transforms on the CPU and no skeleton (None: draw every mesh).
-fn cull_inst(gm: &GpuModel, range: &std::ops::Range<u32>) -> Option<std::ops::Range<usize>> {
-    (gm.inst_cpu.len() == gm.n_instances as usize && !gm.meshes.iter().any(|m| m.skinned))
-        .then(|| range.start as usize..range.end as usize)
+/// The instances in `range` that `c` may show the model through (its box's
+/// bounding sphere), when the model has its transforms on the CPU and no
+/// skeleton. None: draw every mesh; empty: none of the instances is seen,
+/// so the model draws nothing in this pass.
+fn cull_set(gm: &GpuModel, range: &std::ops::Range<u32>, c: &MeshCull) -> Option<Vec<(Mat4, f32)>> {
+    if gm.inst_cpu.len() != gm.n_instances as usize || gm.meshes.iter().any(|m| m.skinned) {
+        return None;
+    }
+    let bc = (gm.bbox[0] + gm.bbox[1]) * 0.5;
+    let br = (gm.bbox[1] - gm.bbox[0]).length() * 0.5;
+    if !bc.is_finite() || !br.is_finite() {
+        return None;
+    }
+    let inst = gm.inst_cpu.get(range.start as usize..range.end as usize)?;
+    Some(inst.iter().copied().filter(|(m, s)| c.sees(m.transform_point3(bc), br * s)).collect())
 }
 
 /// Which pass draws a mesh of this material, as the buffer layout groups
@@ -2501,7 +2520,7 @@ impl Renderer3D {
                 .write_buffer(&gm.instances, 0, bytemuck::cast_slice(&v));
         }
         gm.inst_cpu.clear();
-        if inst.len() <= CULL_MAX_INST {
+        if inst.len() <= cull_max_inst() {
             let ordered = inst.iter().filter(|i| !i.is_fallback()).chain(inst.iter().filter(|i| i.is_fallback()));
             gm.inst_cpu.extend(ordered.map(|i| {
                 let m = Mat4::from_cols_array_2d(&i.m);
@@ -2932,6 +2951,12 @@ impl Renderer3D {
             if range.is_empty() {
                 continue;
             }
+            // the instances the view may show it through (None: no cull)
+            let vis = cull.and_then(|c| cull_set(gm, &range, c));
+            if vis.as_ref().is_some_and(|v| v.is_empty()) {
+                culled += gm.meshes.iter().filter(|m| m.visible && m.n_idx > 0).count() as u32;
+                continue;
+            }
             let want = if fb { 0 } else { gm.stencil };
             if sref != want {
                 be.set_stencil_reference(want);
@@ -2959,7 +2984,7 @@ impl Renderer3D {
             // (drawing them costs only vertex work), so the cull never
             // splits one draw into two
             let mut reach = u32::MAX;
-            let ci = cull.zip(cull_inst(gm, &range));
+            let ci = cull.zip(vis.as_ref());
             for me in gm.ordered().filter(|m| m.visible && m.n_idx > 0) {
                 let blend = gm.mat_alpha[me.material] == 2
                     || matches!(gm.mat_class[me.material], 5 | 6 | 8);
@@ -2975,8 +3000,8 @@ impl Renderer3D {
                     continue;
                 }
                 let first = me.first();
-                if let Some((c, ir)) = &ci {
-                    if me.strand_lod.is_none() && !c.mesh(&gm.inst_cpu[ir.clone()], me) {
+                if let Some((c, v)) = &ci {
+                    if me.strand_lod.is_none() && !c.mesh(v, me) {
                         if run.is_some() && mat == me.material && bound == Some(&me.vb) && reach == first {
                             reach = first + cnt;
                         }
@@ -3050,6 +3075,12 @@ impl Renderer3D {
                     continue;
                 }
             }
+            let cc = MeshCull::Cascade(c);
+            let ci = cull_set(gm, &range, &cc);
+            if ci.as_ref().is_some_and(|v| v.is_empty()) {
+                culled += gm.meshes.iter().filter(|m| m.visible && m.n_idx > 0).count() as u32;
+                continue;
+            }
             be.set_vertex_buffer(1, Some(gm.instances.slice(..)));
             let mut bound: Option<&wgpu::Buffer> = None;
             // the material bound now, and whether it is cut out
@@ -3059,8 +3090,6 @@ impl Renderer3D {
             let mut run: Option<std::ops::Range<u32>> = None;
             // culled solid meshes that follow on from the run (see `record_opaque`)
             let mut reach = u32::MAX;
-            let ci = cull_inst(gm, &range);
-            let cc = MeshCull::Cascade(c);
             for me in gm.ordered().filter(|m| m.visible && m.n_idx > 0) {
                 let see_through = gm.mat_alpha[me.material] == 2
                     || matches!(gm.mat_class[me.material], 5 | 6 | 8);
@@ -3069,8 +3098,8 @@ impl Renderer3D {
                 }
                 let cut = gm.mat_alpha[me.material] == 1;
                 let first = me.first();
-                if let Some(ir) = &ci {
-                    if !cc.mesh(&gm.inst_cpu[ir.clone()], me) {
+                if let Some(v) = &ci {
+                    if !cc.mesh(v, me) {
                         if !cut && run.is_some() && bound == Some(&me.vb) && reach == first {
                             reach = first + me.n_idx;
                         }
@@ -3640,7 +3669,10 @@ impl Renderer3D {
                     if gm.n_normal() == 0 {
                         continue;
                     }
-                    let ci = cull_inst(gm, &(0..gm.n_normal()));
+                    let ci = cull_set(gm, &(0..gm.n_normal()), &view_cull);
+                    if ci.as_ref().is_some_and(|v| v.is_empty()) {
+                        continue;
+                    }
                     let model_d = gm.world.map(|(c, _)| (c - eye).length());
                     for (pos, me) in gm.ordered().enumerate().filter(|(_, m)| m.visible && m.n_idx > 0) {
                         if let Some(o) = gm.mat_decal[me.material] {
@@ -3653,7 +3685,7 @@ impl Renderer3D {
                             // meshes of one material join; blended ones go far to
                             // near by mesh
                             let d = if blend { (me.centre - eye).length() } else { model_d.unwrap_or((me.centre - eye).length()) };
-                            let shown = ci.as_ref().is_none_or(|ir| view_cull.mesh(&gm.inst_cpu[ir.clone()], me));
+                            let shown = ci.as_ref().is_none_or(|v| view_cull.mesh(v, me));
                             dl.push((o, blend, d, mi, pos, gm, me, shown));
                         }
                     }
@@ -3705,7 +3737,10 @@ impl Renderer3D {
                     if gm.n_normal() == 0 {
                         continue;
                     }
-                    let ci = cull_inst(gm, &(0..gm.n_normal()));
+                    let ci = cull_set(gm, &(0..gm.n_normal()), &view_cull);
+                    if ci.as_ref().is_some_and(|v| v.is_empty()) {
+                        continue;
+                    }
                     for (pos, me) in gm.ordered().enumerate().filter(|(_, m)| m.visible && m.n_idx > 0) {
                         if self.decal_bias && gm.mat_decal[me.material].is_some() {
                             continue;
@@ -3713,7 +3748,7 @@ impl Renderer3D {
                         if gm.mat_alpha[me.material] == 2
                             || matches!(gm.mat_class[me.material], 5 | 6 | 8)
                         {
-                            let shown = ci.as_ref().is_none_or(|ir| view_cull.mesh(&gm.inst_cpu[ir.clone()], me));
+                            let shown = ci.as_ref().is_none_or(|v| view_cull.mesh(v, me));
                             bl.push(((me.centre - eye).length(), mi, pos, gm, me, shown));
                         }
                     }

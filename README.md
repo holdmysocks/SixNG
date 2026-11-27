@@ -1528,12 +1528,16 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   when they follow on in the same model and material; opaque-mode decals,
   which write depth and do not blend, are kept together per model for
   this. The tick line counts these draws as "decal/see-through".
-- **Per-mesh culling** (since 2026-11-27): a model placed at most 8 times
-  (SLOD tiles, buildings, most city models) keeps its placements'
-  transforms on the CPU, and each of its meshes is tested on its own
-  bounding sphere: against the view's sides in the opaque and
-  coverage-fallback passes, and against each shadow cascade's box. A
-  mesh no placement shows is skipped. When culled meshes lie between two
+- **Per-mesh culling** (since 2026-11-27): a model placed at most 64
+  times (`SIXNG_MAP_CULL_INST` sets another limit; 0 turns the cull off)
+  keeps its placements' transforms on the CPU. In each pass its
+  placements are first tested on the model's bounding sphere (the view
+  loads models in a widened frustum, so some lie just outside it); a
+  model none of whose placements is seen draws nothing. Then each mesh
+  is tested on its own bounding sphere against the placements left:
+  against the view's sides in the opaque and coverage-fallback passes,
+  and against each shadow cascade's box. A mesh no placement shows is
+  skipped. When culled meshes lie between two
   that would have joined into one draw, the draw still spans them, so
   the cull never turns one draw into two. Decal and see-through meshes
   are tested against the view the same way (their sort order is kept;
