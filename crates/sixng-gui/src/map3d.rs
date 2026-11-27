@@ -3573,7 +3573,7 @@ impl Map3D {
                 }
             );
             let line = format!("{line} | gpu ms/frame sky|shadows|main|post {}", crate::gpu_time::take_line());
-            let line = format!("{line} | draws {} (shadow {}) | {} ({} placements) | {} fallbacks ({:?} draws, by level unlinked/linked {:?}) | wait: terrain idle {}, keep missing {}{}, inflight {}", self.stats.draws, self.renderer.as_ref().map_or(0, |r| r.shadow_draws), self.cells.summary(), self.stats.in_cells, self.stats.n_fb, self.renderer.as_ref().map_or([0, 0], |r| r.fb_draws), self.stats.fb_lvl, self.world.idle(), self.keep.iter().filter(|m| !self.cache.contains_key(m)).count(), if self.stats.capped { " (model cap full)" } else { "" }, self.stats.inflight);
+            let line = format!("{line} | draws {} (shadow {}){} | {} ({} placements) | {} fallbacks ({:?} draws, by level unlinked/linked {:?}) | wait: terrain idle {}, keep missing {}{}, inflight {}", self.stats.draws, self.renderer.as_ref().map_or(0, |r| r.shadow_draws), self.renderer.as_ref().map_or(String::new(), |r| r.gd_summary()), self.cells.summary(), self.stats.in_cells, self.stats.n_fb, self.renderer.as_ref().map_or([0, 0], |r| r.fb_draws), self.stats.fb_lvl, self.world.idle(), self.keep.iter().filter(|m| !self.cache.contains_key(m)).count(), if self.stats.capped { " (model cap full)" } else { "" }, self.stats.inflight);
             eprintln!("{line}");
             self.draw_log();
         }

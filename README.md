@@ -1508,6 +1508,21 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   material (only cut-out ones need theirs). `SIXNG_MAP_DRAWLOG=1` prints,
   with each automation tick, the draw calls per frame of the main and
   shadow passes and the ten models with the most.
+- **GPU-driven draws** (since 2026-11-27): on a graphics card that can
+  index texture arrays per pixel and draw indirectly from a first
+  instance, the map keeps the geometry of its static models in a few large
+  shared buffers (256 MB of vertices and 128 MB of indices each), their
+  materials in one table and their textures in pages of 4096. The opaque,
+  coverage-fallback and shadow passes then draw everything in one buffer
+  and page with one indirect call, each mesh run an entry in it. The
+  instances are copied for each material, which the vertex program reads
+  from the copy. Skinned models, strand hair, see-through and decal
+  surfaces, models with more than 4096 instance copies, and models whose
+  page has not been rebuilt since they arrived (one page every ten frames
+  at most) still draw one call per run. The tick line shows sub-draws,
+  calls, instance copies, the models drawn the old way, and the pool's
+  use. `SIXNG_MAP_GPU_DRAWS=0` turns the path off. The draw budget counts
+  calls, so the screen-size cut can drop with the path on.
 - **Map cells** (far placements merged per area): a placement more than
   0.3× the HD distance from the camera can be drawn from its cell instead
   of one by one (`SIXNG_CELLS_NEAR` sets another fraction). The cells are

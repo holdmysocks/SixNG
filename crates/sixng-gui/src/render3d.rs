@@ -532,6 +532,11 @@ pub struct GpuModel {
     /// Draw calls recorded for this model (main, shadow), summed until the
     /// map's draw log takes them.
     pub drawn: [std::sync::atomic::AtomicU32; 2],
+    /// The map's GPU-driven draws (gpu_draw.rs): the model's place in the
+    /// shared pool and tables, and its instances as written (normal ones
+    /// first), which each frame copies per sub-draw.
+    pub gd: Option<crate::gpu_draw::Handle>,
+    pub inst_cpu: Vec<Instance>,
 }
 
 impl GpuModel {
@@ -726,6 +731,35 @@ pub struct Renderer3D {
     pub shadows: bool,
     /// Draw calls into the shadow cascades in the last frame.
     pub shadow_draws: u32,
+    /// GPU-driven draws of the map's models (gpu_draw.rs): the shared
+    /// tables, the opaque, fallback and shadow pipelines that read them,
+    /// and the frame's instance and indirect buffers.
+    gd: Option<std::sync::Arc<crate::gpu_draw::Shared>>,
+    gd_pipes: Option<[wgpu::RenderPipeline; 3]>,
+    gd_bufs: Option<(wgpu::Buffer, wgpu::Buffer)>,
+    /// Off: every model draws the old way (the map's A/B switch).
+    pub gd_on: bool,
+    /// Last frame: sub-draws, indirect calls, instances copied, models drawn the old way.
+    pub gd_stats: [u32; 4],
+}
+
+/// Indirect calls of one pass: those of a pool chunk and texture page
+/// (and stencil value) one after another in the frame's indirect buffer.
+struct GdList {
+    stencil: u32,
+    chunk: usize,
+    page: usize,
+    args: std::ops::Range<u32>,
+}
+
+/// What the GPU-driven path draws this frame.
+struct GdFrame<'a> {
+    snap: crate::gpu_draw::Snapshot,
+    main: Vec<GdList>,
+    fb: Vec<GdList>,
+    shadow: [Vec<GdList>; crate::shadow::CASCADES],
+    /// Models it does not draw (the old path draws them).
+    rest: Vec<&'a GpuModel>,
 }
 
 /// A map cell on the GPU (see cells.rs).
@@ -1711,7 +1745,66 @@ impl Renderer3D {
         };
         let pipe_shadow = shadow_pipe("shadow", &layout, "vs_mesh", "fs_shadow", &vbufs);
         let pipe_shadow_cell = shadow_pipe("shadow cell", &layout_cell, "vs_cell", "fs_shadow_cell", &cbufs);
+        // the map's GPU-driven draws: the same programs reading the shared
+        // material table and texture pages (gpu_draw.rs)
+        let gd = if hdr { crate::gpu_draw::Shared::new(device, &rs.queue, &white) } else { None };
+        let gd_src = gd.as_ref().and_then(|_| crate::gpu_draw::shader(include_str!("atmo_common.wgsl"), include_str!("shader.wgsl")));
+        let gd = gd.filter(|_| gd_src.is_some());
+        let gd_pipes = gd.as_ref().zip(gd_src).map(|(g, src)| {
+            let m = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("sixng shader (gpu draws)"),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            });
+            let lay = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("mesh (gpu draws)"),
+                bind_group_layouts: &[Some(&bgl_frame), Some(&g.bgl)],
+                immediate_size: 0,
+            });
+            let main = |label: &str, ds: Option<wgpu::DepthStencilState>, cull: Option<wgpu::Face>| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&lay),
+                    vertex: wgpu::VertexState { module: &m, entry_point: Some("vs_mesh"), compilation_options: Default::default(), buffers: &vbufs },
+                    primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: cull, ..Default::default() },
+                    depth_stencil: ds,
+                    multisample: ms,
+                    fragment: Some(wgpu::FragmentState {
+                        module: &m,
+                        entry_point: Some("fs_mesh"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState { format: color_fmt, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
+            let opaque = main("opaque (gpu draws)", depth_st(&st_write), None);
+            let fb = main("fallback (gpu draws)", depth_st(&st_fb), Some(wgpu::Face::Back));
+            let shadow = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("shadow (gpu draws)"),
+                layout: Some(&lay),
+                vertex: wgpu::VertexState { module: &m, entry_point: Some("vs_mesh"), compilation_options: Default::default(), buffers: &vbufs },
+                primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: crate::shadow::FMT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Greater),
+                    stencil: Default::default(),
+                    bias: wgpu::DepthBiasState { constant: 0, slope_scale: -2.0, clamp: 0.0 },
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState { module: &m, entry_point: Some("fs_shadow"), compilation_options: Default::default(), targets: &[] }),
+                multiview_mask: None,
+                cache: None,
+            });
+            [opaque, fb, shadow]
+        });
         Renderer3D {
+            gd,
+            gd_pipes,
+            gd_bufs: None,
+            gd_on: true,
+            gd_stats: [0; 4],
             shadow,
             shadow_bgs,
             pipe_shadow,
@@ -1864,6 +1957,7 @@ impl Renderer3D {
             hair_luts: self.hair_luts.clone(),
             sun_map: self.sun_map.clone(),
             scene: self.atmo.binds.clone(),
+            gd: self.gd.clone(),
         }
     }
 }
@@ -1890,6 +1984,7 @@ pub struct Uploader {
     hair_luts: Vec<wgpu::TextureView>,
     sun_map: (wgpu::TextureView, wgpu::Sampler, wgpu::TextureView),
     scene: crate::atmo::SceneBinds,
+    gd: Option<std::sync::Arc<crate::gpu_draw::Shared>>,
 }
 
 impl Uploader {
@@ -2043,6 +2138,7 @@ impl Uploader {
         let mut mat_alpha = Vec::new();
         let mut mat_class = Vec::new();
         let mut mat_decal = Vec::new();
+        let mut mat_src: Vec<[Option<usize>; 8]> = Vec::new();
         let default = glb::Material {
             name: "default".into(),
             class: "opaque".into(),
@@ -2169,6 +2265,8 @@ impl Uploader {
             };
             let o = k * MAT_STRIDE as usize;
             mat_bytes[o..o + std::mem::size_of::<MatU>()].copy_from_slice(bytemuck::bytes_of(&u));
+            let src = mat_sources(mt);
+            mat_src.push(src);
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("mat bg"),
                 layout: &self.bgl_mat,
@@ -2181,38 +2279,14 @@ impl Uploader {
                             size: wgpu::BufferSize::new(std::mem::size_of::<MatU>() as u64),
                         }),
                     },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(view(mt.base)),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(view(mt.normal)),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::TextureView(view(mt.packed)),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: wgpu::BindingResource::TextureView(view(mt.emissive.or(mt.ramp))),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: wgpu::BindingResource::TextureView(view(mt.detail.map(|d| d.image).or(mt.ramp_u.filter(|_| mt.ramp.is_some() && mt.emissive.is_none())))),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: wgpu::BindingResource::TextureView(view(mt.wear_mask.or(mt.skin_detail.and_then(|d| d.spec2)))),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 7,
-                        resource: wgpu::BindingResource::TextureView(view(mt.primer_mask.or(mt.wear_mask).or(mt.skin_detail.and_then(|d| d.normal)))),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 8,
-                        resource: wgpu::BindingResource::TextureView(view(mt.dust_mask.or(mt.wear_mask).or(mt.skin_detail.and_then(|d| d.control)))),
-                    },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(view(src[0])) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(view(src[1])) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(view(src[2])) },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(view(src[3])) },
+                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(view(src[4])) },
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(view(src[5])) },
+                    wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(view(src[6])) },
+                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(view(src[7])) },
                 ],
             });
             mat_bg.push(bg);
@@ -2222,74 +2296,124 @@ impl Uploader {
             mat_decal.push(mt.decal);
         }
         queue.write_buffer(&mat_ub, 0, &mat_bytes);
-        // one vertex and one index buffer for all meshes (fewer GPU objects:
-        // creating them is what costs when a model has many parts)
         let vsz = std::mem::size_of::<glb::Vertex>() as u64;
         let nv: u64 = m.meshes.iter().map(|me| me.verts.len() as u64).sum();
         let ni: u64 = m.meshes.iter().map(|me| me.indices.len() as u64).sum();
-        // sizes rounded up to 4 bytes, as mapped buffers need
-        let vb = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("vb"),
-            size: (nv * vsz).max(vsz).next_multiple_of(4),
-            // COPY_DST: morph targets (face expressions) rewrite a mesh's vertices
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: true,
-        });
-        let ib = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ib"),
-            size: (ni * 4).max(4),
-            usage: wgpu::BufferUsages::INDEX,
-            mapped_at_creation: true,
+        // the map's GPU-driven draws: static models without strand hair go
+        // into the shared pool and tables
+        let pooled = m.joints.is_empty() && m.meshes.iter().all(|me| !me.skinned && me.strand_lod.is_none());
+        let gd = self.gd.as_ref().filter(|_| pooled && nv > 0 && ni > 0).and_then(|g| {
+            let tex = g.textures(&views)?;
+            let slot = |i: Option<usize>| i.and_then(|i| tex.of_image.get(i).copied()).unwrap_or(0);
+            let mb: Vec<crate::gpu_draw::MatB> = mat_cpu
+                .iter()
+                .zip(&mat_src)
+                .map(|(u, s)| crate::gpu_draw::MatB { m: bytemuck::cast(*u), t: (*s).map(slot) })
+                .collect();
+            g.place(tex, &mb, nv * vsz, ni * 4)
         });
         let mut meshes = Vec::with_capacity(m.meshes.len());
-        {
-            let mut vmap = vb
-                .slice(..)
-                .get_mapped_range_mut()
-                .expect("vertex buffer was mapped at creation");
-            let mut imap = ib
-                .slice(..)
-                .get_mapped_range_mut()
-                .expect("index buffer was mapped at creation");
-            let (mut vo, mut io) = (0u64, 0u64);
+        if let Some(h) = &gd {
+            // indices address the chunk's whole vertex buffer, as below they
+            // address the model's own
+            let base = (h.v_start() / vsz) as u32;
+            let mut vbytes: Vec<u8> = Vec::with_capacity((nv * vsz) as usize);
+            let mut ibytes: Vec<u32> = Vec::with_capacity(ni as usize);
             for me in &m.meshes {
-                let vbytes: &[u8] = bytemuck::cast_slice(&me.verts);
-                // indices point into the whole shared vertex buffer (no base
-                // vertex), so neighbouring meshes can be drawn as one range
-                let v0 = (vo / vsz) as u32;
-                let abs: Vec<u32> = me.indices.iter().map(|&i| i + v0).collect();
-                let ibytes: &[u8] = bytemuck::cast_slice(&abs);
-                vmap.slice(vo as usize..vo as usize + vbytes.len())
-                    .copy_from_slice(vbytes);
-                imap.slice(io as usize..io as usize + ibytes.len())
-                    .copy_from_slice(ibytes);
-                let (vr, ir) = (vo..vo + vbytes.len() as u64, io..io + ibytes.len() as u64);
-                vo += vbytes.len() as u64;
-                io += ibytes.len() as u64;
-                // an empty range is not a valid slice: point it at the start
+                let v0 = base + (vbytes.len() as u64 / vsz) as u32;
+                let (vo, io) = (h.v_start() + vbytes.len() as u64, h.i_start() + ibytes.len() as u64 * 4);
+                vbytes.extend_from_slice(bytemuck::cast_slice(&me.verts));
+                ibytes.extend(me.indices.iter().map(|&i| i + v0));
+                let (vr, ir) = (vo..h.v_start() + vbytes.len() as u64, io..h.i_start() + ibytes.len() as u64 * 4);
                 let vr = if vr.is_empty() { 0..vsz } else { vr };
                 let ir = if ir.is_empty() { 0..4 } else { ir };
                 meshes.push(GpuMesh {
-                    vb: vb.clone(),
-                    ib: ib.clone(),
+                    vb: h.vb.clone(),
+                    ib: h.ib.clone(),
                     vb_range: vr,
                     ib_range: ir,
                     n_idx: me.indices.len() as u32,
                     eb: None,
                     n_edge: 0,
                     material: me.material.unwrap_or(0).min(mats.len() - 1),
-                    skinned: me.skinned,
+                    skinned: false,
                     centre: Vec3::from(me.centre),
                     visible: true,
-                    strand_lod: me.strand_lod,
+                    strand_lod: None,
                     n_draw: std::sync::atomic::AtomicU32::new(me.indices.len() as u32),
                     n_shadow: std::sync::atomic::AtomicU32::new(me.indices.len() as u32),
                     shadow_slot: std::sync::atomic::AtomicU32::new(0),
                 });
             }
+            queue.write_buffer(&h.vb, h.v_start(), &vbytes);
+            queue.write_buffer(&h.ib, h.i_start(), bytemuck::cast_slice(&ibytes));
         }
-        vb.unmap();
-        ib.unmap();
+        // one vertex and one index buffer for all meshes (fewer GPU objects:
+        // creating them is what costs when a model has many parts)
+        // sizes rounded up to 4 bytes, as mapped buffers need
+        if gd.is_none() {
+            let vb = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("vb"),
+                size: (nv * vsz).max(vsz).next_multiple_of(4),
+                // COPY_DST: morph targets (face expressions) rewrite a mesh's vertices
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: true,
+            });
+            let ib = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ib"),
+                size: (ni * 4).max(4),
+                usage: wgpu::BufferUsages::INDEX,
+                mapped_at_creation: true,
+            });
+            {
+                let mut vmap = vb
+                    .slice(..)
+                    .get_mapped_range_mut()
+                    .expect("vertex buffer was mapped at creation");
+                let mut imap = ib
+                    .slice(..)
+                    .get_mapped_range_mut()
+                    .expect("index buffer was mapped at creation");
+                let (mut vo, mut io) = (0u64, 0u64);
+                for me in &m.meshes {
+                    let vbytes: &[u8] = bytemuck::cast_slice(&me.verts);
+                    // indices point into the whole shared vertex buffer (no base
+                    // vertex), so neighbouring meshes can be drawn as one range
+                    let v0 = (vo / vsz) as u32;
+                    let abs: Vec<u32> = me.indices.iter().map(|&i| i + v0).collect();
+                    let ibytes: &[u8] = bytemuck::cast_slice(&abs);
+                    vmap.slice(vo as usize..vo as usize + vbytes.len())
+                        .copy_from_slice(vbytes);
+                    imap.slice(io as usize..io as usize + ibytes.len())
+                        .copy_from_slice(ibytes);
+                    let (vr, ir) = (vo..vo + vbytes.len() as u64, io..io + ibytes.len() as u64);
+                    vo += vbytes.len() as u64;
+                    io += ibytes.len() as u64;
+                    // an empty range is not a valid slice: point it at the start
+                    let vr = if vr.is_empty() { 0..vsz } else { vr };
+                    let ir = if ir.is_empty() { 0..4 } else { ir };
+                    meshes.push(GpuMesh {
+                        vb: vb.clone(),
+                        ib: ib.clone(),
+                        vb_range: vr,
+                        ib_range: ir,
+                        n_idx: me.indices.len() as u32,
+                        eb: None,
+                        n_edge: 0,
+                        material: me.material.unwrap_or(0).min(mats.len() - 1),
+                        skinned: me.skinned,
+                        centre: Vec3::from(me.centre),
+                        visible: true,
+                        strand_lod: me.strand_lod,
+                        n_draw: std::sync::atomic::AtomicU32::new(me.indices.len() as u32),
+                        n_shadow: std::sync::atomic::AtomicU32::new(me.indices.len() as u32),
+                        shadow_slot: std::sync::atomic::AtomicU32::new(0),
+                    });
+                }
+            }
+            vb.unmap();
+            ib.unmap();
+        }
         let nj = m.joints.len().max(1);
         let joints_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("joints"),
@@ -2332,8 +2456,24 @@ impl Uploader {
                 .map(|mt| format!("{} [{}] {}", mt.name, mt.shader_hash, mt.class))
                 .collect(),
             drawn: Default::default(),
+            gd,
+            inst_cpu: inst.to_vec(),
         }
     }
+}
+
+/// The images a material binds at bindings 1-8 of its group (None: white).
+fn mat_sources(mt: &glb::Material) -> [Option<usize>; 8] {
+    [
+        mt.base,
+        mt.normal,
+        mt.packed,
+        mt.emissive.or(mt.ramp),
+        mt.detail.map(|d| d.image).or(mt.ramp_u.filter(|_| mt.ramp.is_some() && mt.emissive.is_none())),
+        mt.wear_mask.or(mt.skin_detail.and_then(|d| d.spec2)),
+        mt.primer_mask.or(mt.wear_mask).or(mt.skin_detail.and_then(|d| d.normal)),
+        mt.dust_mask.or(mt.wear_mask).or(mt.skin_detail.and_then(|d| d.control)),
+    ]
 }
 
 impl Renderer3D {
@@ -2374,6 +2514,10 @@ impl Renderer3D {
         if n_fb == 0 || n_fb == inst.len() {
             rs.queue
                 .write_buffer(&gm.instances, 0, bytemuck::cast_slice(inst));
+            if gm.gd.is_some() {
+                gm.inst_cpu.clear();
+                gm.inst_cpu.extend_from_slice(inst);
+            }
         } else {
             // normal instances first, fallbacks after them
             let v: Vec<Instance> = inst
@@ -2384,6 +2528,9 @@ impl Renderer3D {
                 .collect();
             rs.queue
                 .write_buffer(&gm.instances, 0, bytemuck::cast_slice(&v));
+            if gm.gd.is_some() {
+                gm.inst_cpu = v;
+            }
         }
         gm.n_instances = inst.len() as u32;
         gm.n_fb = n_fb as u32;
@@ -2457,6 +2604,9 @@ impl Renderer3D {
             u.base = base;
             rs.queue
                 .write_buffer(&gm.mat_ub, k as u64 * MAT_STRIDE, bytemuck::bytes_of(u));
+            if let Some(h) = &gm.gd {
+                h.write_mat(k, bytemuck::cast(*u));
+            }
             self.bump_accum(bytemuck::bytes_of(u));
         }
     }
@@ -2477,6 +2627,9 @@ impl Renderer3D {
             };
             rs.queue
                 .write_buffer(&gm.mat_ub, k as u64 * MAT_STRIDE, bytemuck::bytes_of(u));
+            if let Some(h) = &gm.gd {
+                h.write_mat(k, bytemuck::cast(*u));
+            }
             self.bump_accum(bytemuck::bytes_of(u));
         }
     }
@@ -2703,11 +2856,11 @@ impl Renderer3D {
                 be.set_bind_group(1, Some(&gm.mat_bg[me.material]), &[]);
                 be.set_vertex_buffer(0, Some(me.vb.slice(..)));
                 be.set_index_buffer(me.ib.slice(..), wgpu::IndexFormat::Uint32);
-                let first = (me.ib_range.start / 4) as u32;
-                let base = (me.vb_range.start / std::mem::size_of::<glb::Vertex>() as u64) as i32;
+                let first = me.first();
                 let cnt = me.n_draw.load(std::sync::atomic::Ordering::Relaxed).min(me.n_idx);
                 if cnt > 0 {
-                    be.draw_indexed(first..first + cnt, base, range.clone());
+                    // the indices address the whole vertex buffer: no base vertex
+                    be.draw_indexed(first..first + cnt, 0, range.clone());
                     n += 1;
                 }
             }
@@ -2903,6 +3056,267 @@ impl Renderer3D {
         n
     }
 
+    /// The GPU-driven draws of the last frame, for the map's tick line
+    /// (empty when the path is off), and once in a while the shared tables'
+    /// use: pool chunks, texture pages, materials, page rebuilds.
+    pub fn gd_summary(&self) -> String {
+        let Some(g) = &self.gd else {
+            return String::new();
+        };
+        let [sub, calls, inst, old] = self.gd_stats;
+        let (chunks, pages, mats, (rb, rb_us)) = g.stats();
+        format!(
+            ", gpu {sub} sub-draws in {calls} calls ({inst} instance copies, {old} models the old way; {chunks} pool chunks, {pages} pages, {mats} materials, {rb} page rebuilds {:.1} ms)",
+            rb_us as f32 / 1000.0
+        )
+    }
+
+    /// The frame's shadow cascades and which of them are drawn this frame
+    /// (None: no shadows).
+    fn shadow_plan(&self, cam: &Camera, look: &Look, aspect: f32) -> Option<([crate::shadow::Cascade; crate::shadow::CASCADES], [bool; crate::shadow::CASCADES])> {
+        let light = look.sun_dir.normalize_or_zero();
+        let on = self.hdr && self.shadows && self.sky.is_some() && look.mode == 0 && light.y > 0.02;
+        if !on {
+            return None;
+        }
+        let fwd = -cam.view().row(2).truncate();
+        Some((crate::shadow::cascades(cam.eye(), fwd, cam.fov, aspect, light, cam.near), self.shadow.due()))
+    }
+
+    /// The GPU-driven part of the frame (gpu_draw.rs): the sub-draws of the
+    /// models whose geometry, materials and textures are in the shared
+    /// tables, per pass, written to the frame's instance and indirect
+    /// buffers. The other models are left in `rest` for the old path.
+    #[allow(clippy::too_many_arguments)]
+    fn gd_frame<'a>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        cam: &Camera,
+        look: &Look,
+        aspect: f32,
+        models: &[&'a GpuModel],
+    ) -> Option<GdFrame<'a>> {
+        use crate::gpu_draw::Args;
+        use crate::shadow::CASCADES;
+        // instance copies one model may take a frame; one with more draws the old way
+        const MAX_COPIES: u32 = 4096;
+        self.gd_stats = [0; 4];
+        let g = self.gd.clone()?;
+        self.gd_pipes.as_ref()?;
+        // every frame, also with the path off: freed ranges come back, pages rebuild
+        let snap = g.prepare();
+        if !self.gd_on || look.mode != 0 {
+            return None;
+        }
+        let plan = self.shadow_plan(cam, look, aspect);
+        type Key = (u32, usize, usize);
+        let mut main: Vec<(Key, Args)> = Vec::new();
+        let mut fb: Vec<(Key, Args)> = Vec::new();
+        let mut shadow: [Vec<(Key, Args)>; CASCADES] = Default::default();
+        let mut inst: Vec<Instance> = Vec::new();
+        let mut rest = Vec::new();
+        // per model: runs of neighbouring meshes (first index, count, material)
+        let mut runs: Vec<(u32, u32, u32)> = Vec::new();
+        let mut sruns: Vec<(u32, u32, u32)> = Vec::new();
+        // per material of the model: first instance of its block (normal, fallback)
+        let mut blocks: Vec<(u32, u32, u32)> = Vec::new();
+        for &gm in models {
+            let Some(h) = gm.gd.as_ref().filter(|h| snap.ready(h)) else {
+                rest.push(gm);
+                continue;
+            };
+            let (nn, nall) = (gm.n_normal(), gm.n_instances);
+            if nall == 0 {
+                continue;
+            }
+            if (gm.inst_cpu.len() as u32) < nall {
+                rest.push(gm);
+                continue;
+            }
+            runs.clear();
+            sruns.clear();
+            for me in gm.meshes.iter().filter(|m| m.visible && m.n_idx > 0) {
+                let k = me.material;
+                if gm.mat_alpha[k] == 2 || matches!(gm.mat_class[k], 5 | 6 | 8) {
+                    continue;
+                }
+                let decal = gm.mat_decal[k].is_some();
+                let (first, mid) = (me.first(), h.mid0 + k as u32);
+                if !(self.decal_bias && decal) {
+                    match runs.last_mut() {
+                        Some(r) if r.2 == mid && r.0 + r.1 == first => r.1 += me.n_idx,
+                        _ => runs.push((first, me.n_idx, mid)),
+                    }
+                }
+                // shadow casters: no decals; solid surfaces read the material
+                // only for its cut-out flag, so neighbouring solid meshes are
+                // one draw whatever their material
+                if !decal {
+                    let cut = gm.mat_alpha[k] == 1;
+                    match sruns.last_mut() {
+                        Some(r) if !cut && gm.mat_alpha[(r.2 - h.mid0) as usize] != 1 && r.0 + r.1 == first => r.1 += me.n_idx,
+                        _ => sruns.push((first, me.n_idx, mid)),
+                    }
+                }
+            }
+            blocks.clear();
+            for r in runs.iter().chain(&sruns) {
+                if !blocks.iter().any(|b| b.0 == r.2) {
+                    blocks.push((r.2, u32::MAX, u32::MAX));
+                }
+            }
+            if blocks.len() as u32 * nall > MAX_COPIES {
+                rest.push(gm);
+                continue;
+            }
+            // the instance blocks: the model's instances with the material in extra.w
+            let fb_on = nall > nn && !runs.is_empty();
+            for b in blocks.iter_mut() {
+                let mid = b.0 as f32;
+                let put = |inst: &mut Vec<Instance>, src: &[Instance]| {
+                    let at = inst.len() as u32;
+                    inst.extend(src.iter().map(|i| {
+                        let mut i = *i;
+                        i.extra[3] = mid;
+                        i
+                    }));
+                    at
+                };
+                if nn > 0 {
+                    b.1 = put(&mut inst, &gm.inst_cpu[..nn as usize]);
+                }
+                if fb_on {
+                    b.2 = put(&mut inst, &gm.inst_cpu[nn as usize..nall as usize]);
+                }
+            }
+            let block = |mid: u32| blocks.iter().find(|b| b.0 == mid).copied().unwrap();
+            let args = |r: &(u32, u32, u32), first_instance: u32, n: u32| Args {
+                index_count: r.1,
+                instance_count: n,
+                first_index: r.0,
+                base_vertex: 0,
+                first_instance,
+            };
+            if nn > 0 {
+                for r in &runs {
+                    main.push(((gm.stencil, h.chunk, h.page), args(r, block(r.2).1, nn)));
+                }
+            }
+            if fb_on {
+                for r in &runs {
+                    fb.push(((0, h.chunk, h.page), args(r, block(r.2).2, nall - nn)));
+                }
+            }
+            if let (Some((cs, due)), true) = (&plan, nn > 0) {
+                for i in 0..CASCADES {
+                    let c = &cs[i];
+                    if !due[i] || (c.min_radius > 0.0 && (gm.bbox[1] - gm.bbox[0]).length() * 0.5 < c.min_radius) {
+                        continue;
+                    }
+                    if let Some((wc, wr)) = gm.world {
+                        if !crate::shadow::in_cascade(c, wc, wr) {
+                            continue;
+                        }
+                    }
+                    for r in &sruns {
+                        shadow[i].push(((0, h.chunk, h.page), args(r, block(r.2).1, nn)));
+                    }
+                }
+            }
+        }
+        // per pass: the sub-draws of a chunk and page one after another (a
+        // stable sort keeps the models' order inside each)
+        let mut all: Vec<Args> = Vec::new();
+        let mut lists = |v: &mut Vec<(Key, Args)>| -> Vec<GdList> {
+            v.sort_by_key(|(k, _)| *k);
+            let mut out: Vec<GdList> = Vec::new();
+            for (k, a) in v.drain(..) {
+                let at = all.len() as u32;
+                all.push(a);
+                match out.last_mut() {
+                    Some(l) if (l.stencil, l.chunk, l.page) == k => l.args.end = at + 1,
+                    _ => out.push(GdList { stencil: k.0, chunk: k.1, page: k.2, args: at..at + 1 }),
+                }
+            }
+            out
+        };
+        let main = lists(&mut main);
+        let fb = lists(&mut fb);
+        let shadow: [Vec<GdList>; CASCADES] = std::array::from_fn(|i| lists(&mut shadow[i]));
+        drop(lists);
+        let lists_n = main.len() + fb.len() + shadow.iter().map(|s| s.len()).sum::<usize>();
+        self.gd_stats = [all.len() as u32, lists_n as u32, inst.len() as u32, rest.len() as u32];
+        if !all.is_empty() {
+            let ib = (inst.len().max(1) * std::mem::size_of::<Instance>()) as u64;
+            let ab = all.len() as u64 * crate::gpu_draw::ARGS;
+            let small = self.gd_bufs.as_ref().is_none_or(|(i, a)| i.size() < ib || a.size() < ab);
+            if small {
+                let mk = |label, size: u64, usage| {
+                    device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(label),
+                        size: size.next_power_of_two().max(1 << 16),
+                        usage: usage | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    })
+                };
+                self.gd_bufs = Some((
+                    mk("gpu draw instances", ib, wgpu::BufferUsages::VERTEX),
+                    mk("gpu draw args", ab, wgpu::BufferUsages::INDIRECT),
+                ));
+            }
+            let (ibuf, abuf) = self.gd_bufs.as_ref().unwrap();
+            if !inst.is_empty() {
+                queue.write_buffer(ibuf, 0, bytemuck::cast_slice(&inst));
+            }
+            queue.write_buffer(abuf, 0, bytemuck::cast_slice(&all));
+        }
+        Some(GdFrame { snap, main, fb, shadow, rest })
+    }
+
+    /// Record one pass's GPU-driven lists: per chunk and page one indirect
+    /// call. `stencil`: set each list's stencil value.
+    #[allow(clippy::too_many_arguments)]
+    fn record_gd(
+        be: &mut wgpu::RenderPass<'_>,
+        pipe: &wgpu::RenderPipeline,
+        frame_bg: &wgpu::BindGroup,
+        f: &GdFrame,
+        lists: &[GdList],
+        bufs: &(wgpu::Buffer, wgpu::Buffer),
+        stencil: bool,
+    ) -> u32 {
+        if lists.is_empty() {
+            return 0;
+        }
+        be.set_pipeline(pipe);
+        be.set_bind_group(0, Some(frame_bg), &[]);
+        be.set_vertex_buffer(1, bufs.0.slice(..));
+        let mut n = 0;
+        let (mut sref, mut chunk, mut page) = (u32::MAX, usize::MAX, usize::MAX);
+        for l in lists {
+            let (Some(Some(bg)), Some(Some((vb, ib)))) = (f.snap.bgs.get(l.page), f.snap.chunks.get(l.chunk)) else {
+                continue;
+            };
+            if stencil && l.stencil != sref {
+                be.set_stencil_reference(l.stencil);
+                sref = l.stencil;
+            }
+            if l.page != page {
+                be.set_bind_group(1, Some(bg), &[]);
+                page = l.page;
+            }
+            if l.chunk != chunk {
+                be.set_vertex_buffer(0, vb.slice(..));
+                be.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                chunk = l.chunk;
+            }
+            be.multi_draw_indexed_indirect(&bufs.1, l.args.start as u64 * crate::gpu_draw::ARGS, l.args.end - l.args.start);
+            n += 1;
+        }
+        n
+    }
+
     /// Draw the shadow cascades of the frame's light (sun or moon) and set
     /// the uniform the mesh shaders read them with.
     #[allow(clippy::too_many_arguments)]
@@ -2915,19 +3329,17 @@ impl Renderer3D {
         fu: &FrameU,
         aspect: f32,
         models: &[&GpuModel],
+        gd: Option<&GdFrame>,
     ) {
-        use crate::shadow::{cascades, ShadowU, CASCADES};
-        let light = look.sun_dir.normalize_or_zero();
-        let on = self.hdr && self.shadows && self.sky.is_some() && look.mode == 0 && light.y > 0.02;
+        use crate::shadow::{ShadowU, CASCADES};
         self.shadow_draws = 0;
-        if !on {
+        let Some((cs, due)) = self.shadow_plan(cam, look, aspect) else {
             self.shadow.drawn = [None; CASCADES];
             queue.write_buffer(&self.shadow.ub, 0, bytemuck::bytes_of(&ShadowU::default()));
             return;
-        }
-        let fwd = -cam.view().row(2).truncate();
-        let cs = cascades(cam.eye(), fwd, cam.fov, aspect, light, cam.near);
-        let due = self.shadow.due();
+        };
+        // the models the GPU-driven lists do not draw
+        let models = gd.map_or(models, |f| &f.rest[..]);
         for i in 0..CASCADES {
             if !due[i] {
                 continue;
@@ -2952,6 +3364,9 @@ impl Renderer3D {
                 multiview_mask: None,
             });
             let bg = &self.shadow_bgs[i];
+            if let (Some(f), Some(p), Some(b)) = (gd, &self.gd_pipes, &self.gd_bufs) {
+                self.shadow_draws += Self::record_gd(&mut pass, &p[2], bg, f, &f.shadow[i], b, false);
+            }
             self.shadow_draws += Self::record_shadow(&self.pipe_shadow, bg, &mut pass, models, &c);
             // map cells stand in for placements far from the camera: none
             // in the nearest cascade
@@ -3193,6 +3608,9 @@ impl Renderer3D {
                 usage: wgpu::BufferUsages::VERTEX,
             })
         });
+        // the GPU-driven part (map models in the shared tables), gathered and
+        // written before any pass is recorded
+        let gdf = self.gd_frame(device, queue, cam, look, aspect, models);
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("viewer"),
         });
@@ -3213,7 +3631,7 @@ impl Renderer3D {
             self.atmo.compute(&mut enc, sky);
         }
         gmark(&self.gpu_timer, &mut enc, 1);
-        self.render_shadows(queue, &mut enc, cam, look, &fu, aspect, models);
+        self.render_shadows(queue, &mut enc, cam, look, &fu, aspect, models, gdf.as_ref());
         gmark(&self.gpu_timer, &mut enc, 2);
         let t = self.target.as_ref().unwrap();
         let mut draws = 0u32;
@@ -3297,12 +3715,17 @@ impl Renderer3D {
             // opaque + mask
             // no render bundles: wgpu 24 never frees a bundle, and with it
             // everything it draws (evicted models stayed in GPU memory)
+            // the GPU-driven lists first, then the models they leave
+            let rest = gdf.as_ref().map_or(models, |f| &f.rest[..]);
+            if let (Some(f), Some(p), Some(b)) = (&gdf, &self.gd_pipes, &self.gd_bufs) {
+                draws += Self::record_gd(&mut pass, &p[0], &self.default_frame_bg, f, &f.main, b, true);
+            }
             draws += Self::record_opaque(
                 &self.pipe_opaque,
                 &self.default_frame_bg,
                 self.decal_bias,
                 &mut pass,
-                models,
+                rest,
                 look.mode,
                 false,
             );
@@ -3317,12 +3740,16 @@ impl Renderer3D {
             );
             // coverage fallbacks: after every real opaque surface, only on
             // pixels still showing far field or sky
-            let fm = Self::record_opaque(
+            let mut fm = 0;
+            if let (Some(f), Some(p), Some(b)) = (&gdf, &self.gd_pipes, &self.gd_bufs) {
+                fm += Self::record_gd(&mut pass, &p[1], &self.default_frame_bg, f, &f.fb, b, true);
+            }
+            fm += Self::record_opaque(
                 &self.pipe_fb,
                 &self.default_frame_bg,
                 self.decal_bias,
                 &mut pass,
-                models,
+                rest,
                 0,
                 true,
             );
