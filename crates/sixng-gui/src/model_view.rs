@@ -6968,6 +6968,10 @@ struct Wrap {
 
 impl Wrap {
     const CELL: f32 = 0.04;
+    /// Skin vertices an offset is taken from.
+    const NEAR: usize = 16;
+    /// Distance (m) below which nearer skin vertices weigh no more.
+    const SOFT: f32 = 0.02;
 
     fn key(p: [f32; 3]) -> (i32, i32, i32) {
         ((p[0] / Self::CELL).floor() as i32, (p[1] / Self::CELL).floor() as i32, (p[2] / Self::CELL).floor() as i32)
@@ -6981,11 +6985,13 @@ impl Wrap {
         Wrap { pts, grid }
     }
 
-    /// Offset at a point: the inverse-square-distance mean of the six
-    /// nearest skin vertices (searched up to about 30 cm away). With the
-    /// point's normal, the offset along it is at least the largest of those
-    /// six, so where the skin swells unevenly (a belly at full weight) a
-    /// garment is not left inside it.
+    /// Offset at a point: the mean of the `NEAR` nearest skin vertices
+    /// (searched up to about 30 cm away), weighted 1 / (d² + `SOFT`²). The
+    /// softening keeps neighbouring garment points from each taking the
+    /// offset of a different single skin vertex, which on a heavy body
+    /// left hems jagged. With the point's normal, the offset along it is at
+    /// least the largest of those vertices', so where the skin swells
+    /// unevenly (a belly at full weight) a garment is not left inside it.
     fn at(&self, p: [f32; 3], n: Option<[f32; 3]>) -> [f32; 3] {
         let best = self.nearest(p);
         if best.is_empty() {
@@ -6993,7 +6999,7 @@ impl Wrap {
         }
         let (mut o, mut wsum) = ([0f32; 3], 0f32);
         for (d2, i) in &best {
-            let w = 1.0 / (d2 + 1e-5);
+            let w = 1.0 / (d2 + Self::SOFT * Self::SOFT);
             let d = self.pts[*i as usize].1;
             for c in 0..3 {
                 o[c] += d[c] * w;
@@ -7014,7 +7020,7 @@ impl Wrap {
         o
     }
 
-    /// The six nearest skin vertices (squared distance, index), nearest
+    /// The `NEAR` nearest skin vertices (squared distance, index), nearest
     /// first; searched up to about 30 cm away.
     fn nearest(&self, p: [f32; 3]) -> Vec<(f32, u32)> {
         let k = Self::key(p);
@@ -7036,13 +7042,13 @@ impl Wrap {
             }
             // points found within (r - 1) cells are certainly the nearest
             let sure = ((r - 1) as f32 * Self::CELL).powi(2);
-            if best.iter().filter(|b| b.0 <= sure).count() >= 6 || r >= 8 {
+            if best.iter().filter(|b| b.0 <= sure).count() >= Self::NEAR || r >= 8 {
                 break;
             }
             r += if best.is_empty() { 2 } else { 1 };
         }
         best.sort_by(|a, b| a.0.total_cmp(&b.0));
-        best.truncate(6);
+        best.truncate(Self::NEAR);
         best
     }
 
