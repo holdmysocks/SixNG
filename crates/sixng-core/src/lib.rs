@@ -22,6 +22,7 @@ pub mod pedset;
 pub mod pedskel;
 pub mod bodyshape;
 pub mod headskin;
+pub mod skinspec;
 pub mod batches;
 pub mod drawable;
 pub mod export;

@@ -2106,6 +2106,18 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
             // Body items list their colour texture twice, the first time
             // without a normal map: take the normal from the entry that has one.
             let nrm = list.iter().find(|s| s.0 == alb && s.1 != 0 && set.get(s.1).is_some()).map_or(nrm, |s| s.1);
+            // the spec maps of the item's material asset (`skinspec`), for
+            // the slots the shader has whose bound texture is in no store
+            let spec = crate::skinspec::get(&game_root(a)).ok().and_then(|t| t.of_albedo(alb));
+            let put_spec = |s: &mut crate::drawable::Shader| {
+                let Some(sp) = spec else { return };
+                for (slot, h) in [(crate::skinspec::SLOT_SPEC, sp.spec), (crate::skinspec::SLOT_SPEC2, sp.spec2)] {
+                    if h != 0 && set.get(h).is_some() && s.textures.iter().any(|t| t.param_hash == slot && !stored(t)) {
+                        s.textures.retain(|t| t.param_hash != slot);
+                        s.textures.push(tex(slot, h));
+                    }
+                }
+            };
             let sh = shaders
                 .iter()
                 .map(|s| {
@@ -2120,11 +2132,21 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
                             s.textures.push(tex("1e77bf4c", nrm));
                         }
                         s.textures.extend(extras(alb).iter().map(|&(k, h)| tex(&format!("{k:08x}"), h)));
+                        put_spec(&mut s);
                     }
                     s
                 })
                 .collect();
-            let rec = serde_json::json!({"source": "outfit item", "group": "", "index": 0, "count": 1, "albedo": format!("{alb:016x}"), "normal": format!("{nrm:016x}"), "extra_textures": extras_json(alb)});
+            let mut rec = serde_json::json!({"source": "outfit item", "group": "", "index": 0, "count": 1, "albedo": format!("{alb:016x}"), "normal": format!("{nrm:016x}"), "extra_textures": extras_json(alb)});
+            if let Some(sp) = spec {
+                rec["spec"] = serde_json::json!({
+                    "material": format!("{:016x}", sp.material),
+                    "speculartex": format!("{:016x}", sp.spec),
+                    "speculartex2": format!("{:016x}", sp.spec2),
+                    "in_game_files": [set.get(sp.spec).is_some(), set.get(sp.spec2).is_some()],
+                    "note": "the spec maps of the wardrobe state's material asset (skinspec), put in the shader's speculartex (c6f46e79) and speculartex2 (739e3d0d) slots where the mesh binds a texture that is in no store. Channels (skin pixel program): speculartex R translucency mask, G roughness, B occlusion; speculartex2 R detail strength mask, G skin region (high nibble) that picks the detail atlas layer. The maps are as stored."
+                });
+            }
             return Some((sh, rec));
         }
     }
@@ -2162,6 +2184,15 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
                     s.textures.push(tex("1e77bf4c", c.skin.normal));
                 }
                 s.textures.extend(extras(c.skin.albedo).iter().map(|&(k, h)| tex(&format!("{k:08x}"), h)));
+                // the face's material asset spec maps, over placeholders only
+                if let Some(sp) = crate::skinspec::get(&game_root(a)).ok().and_then(|t| t.of_albedo(c.skin.albedo)) {
+                    for (slot, h) in [(crate::skinspec::SLOT_SPEC, sp.spec), (crate::skinspec::SLOT_SPEC2, sp.spec2)] {
+                        if h != 0 && set.get(h).is_some() && s.textures.iter().any(|t| t.param_hash == slot && !stored(t)) {
+                            s.textures.retain(|t| t.param_hash != slot);
+                            s.textures.push(tex(slot, h));
+                        }
+                    }
+                }
             }
             s
         })

@@ -117,6 +117,13 @@ pub const SHADER_SLOTS: &[(&str, &str, &str)] = &[
     // colour toward a wear ramp, scales metalness by 1 - wear, moves roughness
     // toward a block value); G modulates gloss. Metalness comes from another map.
     ("e68a4a98", "739e3d0d", "wear overlay amount (R) and gloss modulation (G), linear; not a metal mask"),
+    // ped skin (`ped_standard_skin`, `ped_standard_lod_skin`): the two spec
+    // maps of the wardrobe material asset (see `skinspec`), channels as the
+    // skin pixel program (`PS_DeferredPedTexturedNC`) reads them.
+    ("210fbc6a", "c6f46e79", "skin spec map (speculartex) from the wardrobe material asset, linear, read from the skin pixel program: R translucency mask (sat(R - constant) goes to a G-buffer target of its own; non-zero only on thin parts such as fingers), G roughness (stored as 1 - roughness after overlays, detail and specular anti-aliasing), B occlusion (lerp(1, B, strength), 6 bits in the G-buffer)"),
+    ("210fbc6a", "739e3d0d", "skin detail map (speculartex2) from the wardrobe material asset, linear: R detail strength mask, G skin region (high nibble, 0-15) that picks the detail-normal / detail-control atlas layer through a per-draw table"),
+    ("8d69edab", "c6f46e79", "skin spec map (speculartex) from the wardrobe material asset, linear, read from the skin pixel program: R translucency mask (sat(R - constant) goes to a G-buffer target of its own; non-zero only on thin parts such as fingers), G roughness (stored as 1 - roughness after overlays, detail and specular anti-aliasing), B occlusion (lerp(1, B, strength), 6 bits in the G-buffer)"),
+    ("8d69edab", "739e3d0d", "skin detail map (speculartex2) from the wardrobe material asset, linear: R detail strength mask, G skin region (high nibble, 0-15) that picks the detail-normal / detail-control atlas layer through a per-draw table"),
 ];
 
 /// Slot role for a slot as one shader uses it, else the generic role.
