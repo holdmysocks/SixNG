@@ -132,6 +132,8 @@ pub struct Editor {
     done: Arc<Mutex<Vec<ThumbDone>>>,
     workers: bool,
     previews: HashMap<String, egui::TextureHandle>,
+    /// Where the Liveries window was drawn last (the picker opens beside it).
+    panel_rect: Option<egui::Rect>,
     /// Pictures still being read (a scripted screenshot waits for them).
     pub reading: usize,
     /// Pictures whose stickers were first placed before their size was
@@ -199,6 +201,7 @@ impl Default for Editor {
             done: Default::default(),
             workers: false,
             previews: HashMap::new(),
+            panel_rect: None,
             reading: 0,
             await_fit: Default::default(),
             grab: None,
@@ -659,9 +662,18 @@ impl State {
             return;
         }
         let mut open = true;
-        egui::Window::new("Liveries").open(&mut open).default_pos(within.left_top() + egui::vec2(12.0, 12.0)).default_size([340.0, (within.height() - 70.0).clamp(300.0, 760.0)]).constrain_to(within).resizable(true).show(ctx, |ui| {
+        // The panel may lie anywhere below the top bars, also over the side
+        // panels. Where the view is too narrow to show the vehicle beside
+        // it, it starts over the list to the left of the view.
+        let area = Self::window_area(ctx, within);
+        let beside = within.left() - 340.0 - 12.0;
+        let x = if within.width() < 900.0 && beside >= area.left() + 4.0 { beside } else { within.left() + 12.0 };
+        let shown = egui::Window::new("Liveries").open(&mut open).default_pos(egui::pos2(x, within.top() + 12.0)).default_size([340.0, (within.height() - 70.0).clamp(300.0, 760.0)]).constrain_to(area).resizable(true).show(ctx, |ui| {
             egui::ScrollArea::vertical().max_height((within.height() - 80.0).max(200.0)).show(ui, |ui| self.panel_body(ui, env));
         });
+        if let Some(r) = shown {
+            self.ed.panel_rect = Some(r.response.rect);
+        }
         self.ed.open = open;
         if self.ed.picker_open {
             self.picker(ctx, within, env);
@@ -1120,6 +1132,13 @@ impl State {
         Some(t)
     }
 
+    /// Where the Liveries windows may lie: the whole window below the top
+    /// bars (the view starts under them).
+    fn window_area(ctx: &egui::Context, within: egui::Rect) -> egui::Rect {
+        let screen = ctx.content_rect();
+        egui::Rect::from_min_max(egui::pos2(screen.left(), within.top()), screen.right_bottom())
+    }
+
     /// The picker of the game's sticker textures.
     fn picker(&mut self, ctx: &egui::Context, within: egui::Rect, env: &Env) {
         self.ed.start_list(env, ctx);
@@ -1128,7 +1147,18 @@ impl State {
         let mut open = true;
         let mut chosen: Option<GameSticker> = None;
         let title = if self.ed.picker_replace { "Game stickers: change the picture" } else { "Game stickers: add one" };
-        egui::Window::new(title).id(egui::Id::new("livery_picker")).open(&mut open).default_pos(within.left_top() + egui::vec2(370.0, 12.0)).default_size([500.0, 520.0]).constrain_to(within).show(ctx, |ui| {
+        // beside the Liveries panel, not on it: to its right where there
+        // is room, else to its left
+        let area = Self::window_area(ctx, within);
+        let panel = self.ed.panel_rect.unwrap_or(egui::Rect::from_min_size(within.left_top(), egui::vec2(352.0, 0.0)));
+        let x = if panel.right() + 8.0 + 500.0 <= area.right() {
+            panel.right() + 8.0
+        } else if panel.left() - 8.0 - 500.0 >= area.left() {
+            panel.left() - 8.0 - 500.0
+        } else {
+            within.left() + 370.0
+        };
+        egui::Window::new(title).id(egui::Id::new("livery_picker")).open(&mut open).default_pos(egui::pos2(x, within.top() + 12.0)).default_size([500.0, 520.0]).constrain_to(area).show(ctx, |ui| {
             let list = match list {
                 None => {
                     ui.horizontal(|ui| {
