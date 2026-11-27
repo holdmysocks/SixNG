@@ -773,7 +773,7 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                                         let (len, rows) = texture::tint_layout(et.width);
                                         e["tint_row_length"] = len.into();
                                         e["tint_rows"] = rows.into();
-                                        e["applied"] = "GLB COLOR_0 = palette entry at vertex colour blue (row 0), multiplied into the base colour. Placed instances pick a row: entry tint_row * tint_row_length + COLOR0.b (tint_row from the placement, clamped at tint_rows - 1 as the game's mesh shader does)".into();
+                                        e["applied"] = "GLB COLOR_0 = palette entry at vertex colour blue (row 0), multiplied into the base colour. Placed instances pick a row: entry tint_row * tint_row_length + COLOR0.b (tint_row from the placement, assumed to clamp at tint_rows - 1)".into();
                                     }
                                     e["status"] = "ok (embedded in the model)".into();
                                     if o.png {
@@ -1551,8 +1551,6 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                         v["wear_records_note"] = serde_json::Value::from("the game's wear records the parts reach (vehicle material library, as stored; links as 8 hex digits). Each part id's surface names a wear ladder and a detail set: ladder_by_look and detail_by_look give per look the index into ladders and details of each part id (256 x 2 hex digits, ff = none). A ladder lists six surfaces (materialPresets) and six wear presets (wearPresets, see presets: dustIntensity, rust, primer and control intensities). A preset names an age record (ageWearHash: in ages, or in age_ranges with minWear / maxWear), an edge record (7f1fe0a2, in edges) and two colour range records (879774bd, 02a27216, in colour_ranges). details: detailIndex0 / 1 are probably slices of the detail texture arrays (0cd27763, 7c0055b9), which no material binds. global: the library's shared dirt settings. levels_by_config (configuration key, as in configs) gives each part id's wear level and primer sets under that configuration (256 x 4 hex digits: level 0 to 5, then a bit mask; ffff = none); the level is the entry of its ladder's materialPresets and wearPresets. levels_default is the levels most configurations give. The configuration parts that set the levels sit in slots named wear, wear_interior, wear_engine, wear_wheels and six more. A dirt level and what the shader does with these values are not decoded; nothing here is applied to the GLB.");
                         v["primer"] = part_looks["primer"].clone();
                         v["wear_tint"] = part_looks["wear_tint"].clone();
-                        v["surface_tone"] = part_looks["surface_tone"].clone();
-                        v["surface_tone_note"] = serde_json::Value::from("per look, each part id's colour step amounts (256 x 12 hex digits, 0 to 255): sun bleach screen, albedo multiply and albedo screen of its surface's first layer (the 307f162c record its 2cc72f7c names), then of its second layer (174770cc). The game packs them into bytes 1 to 3 of surface record +28 (rva 0x37766a0); its paint shader darkens (multiply) or lightens (screen) the colour in HSV by the layer detail texture's green where the colour does not come from a palette row, and bleaches it toward white by the dust mask.");
                         v["wear_tint_note"] = serde_json::Value::from("per look, the colour of each part id's second layer (256 x 6 hex digits, sRGB red, green, blue): the colour of the colour record its surface names for the layer (5cffe5e0). The game packs it as that layer's tint (rva 0x37766a0, surface record +16, in linear); its paint shader shows the tint where the layer's palette weight is low and the palette row (wear) where it is high.");
                         v["primer_note"] = serde_json::Value::from("per look, the palette rows of each part id's primer (the game's second wear layer) for primer sets 0, 1 and 2 (256 x 12 hex digits: three rows as in rows, ffff = none). They are the part's colour record's primer entries of its surface's primerType; a set the record leaves empty takes set 0. A part's set is the first of a per-vehicle random order of 0, 1, 2 that its primerSets mask (levels_by_config) allows. The shader reads the row at the column the primer's summed mask gives through the wear preset's primerGradientStart / primerGradientEnd window. Not applied to the GLB.");
                         v["surfaces"] = part_looks["surfaces"].clone();
@@ -2066,13 +2064,13 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
             let (data, skipped) = store.data_ex(tx).ok()?;
             let mip = if skipped == 0 { 0 } else { store.best_mip(tx)? };
             let (rgba, w, h) = crate::ttpf::decode_rgba(tx, &data, mip).ok()?;
-            Some(Arc::new(crate::peddeco::Image { w, h, rgba }))
+            Some(Arc::new(crate::peddeco::Image { w, h, rgba, srgb: crate::peddeco::dxgi_is_srgb(tx.dxgi_format) }))
         });
         cache.lock().unwrap().insert(h, img.clone());
         img
     };
     // the same name for the same list, so a part shared by outfits keeps one file per list
-    let key = names.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &n| (h ^ n as u64).wrapping_mul(0x100_0000_01b3));
+    let key = names.iter().fold((0xcbf2_9ce4_8422_2325u64 ^ crate::peddeco::BAKE_RULE as u64).wrapping_mul(0x100_0000_01b3), |h, &n| (h ^ n as u64).wrapping_mul(0x100_0000_01b3));
     for st in shader_tex.iter_mut() {
         let Some(base) = st.base.clone() else { continue };
         let src = dir.join(&base);
@@ -2083,14 +2081,14 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
             "categories": found.iter().map(|d| format!("{:08x}", d.category)).collect::<Vec<_>>(),
             "layers": layers.len(),
             "source": base,
-            "rule": "decal UV = part UV (row vector) x the layer matrix (projective), clipped by the layer's edge quad in part UV; colour = the decal's own colour with the layer's saturation (HSV); coverage = decal alpha x opacity; blended in linear light",
-            "ink_rule": "unknown: layers coloured by ink (a layer that sets an ink, or whose decal is a mask) are not baked; the encoding of the ink words and the code that turns them into the shader's colour stops are not decoded",
+            "rule": "decal UV = part UV (row vector) x the layer matrix (projective), clipped by the layer's edge quad in part UV; colour = ink 0's gradient at decal green x ink 0 alpha (the decal's own colour when ink 0 is off), covered by ink 1 by alpha x red and ink 2 by alpha x blue, then the layer's saturation (HSV); coverage = decal alpha x opacity; blended (normal, multiply, screen or overlay by the flags) in linear light",
+            "ink_rule": "ink word 0xAAVVSSHH (HSV + alpha); stops in sRGB: 0.1V x lerp(1, hue, S), V x lerp(1, hue, S) with alpha A, (0.45 + 0.55V) x lerp(1, hue, 0.55S); each to linear and quantised to a byte; head makeup (an ink with a non-zero p3 w) and masks on layers with no ink are left out",
         });
         if !unknown.is_empty() {
             rec["not_in_catalogue"] = unknown.clone().into();
         }
-        if layers.iter().all(|l| l.uses_ink()) {
-            rec["ink_layers_left_out"] = layers.len().into();
+        if layers.iter().all(|l| l.is_makeup()) {
+            rec["makeup_layers_left_out"] = layers.len().into();
             rec["applied"] = false.into();
             st.decorations = Some(rec);
             continue;
@@ -2102,7 +2100,7 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
             (|| -> anyhow::Result<crate::peddeco::Skipped> {
                 let img = image::open(&src)?.to_rgba8();
                 let (w, h) = img.dimensions();
-                let mut skin = crate::peddeco::Image { w, h, rgba: img.into_raw() };
+                let mut skin = crate::peddeco::Image { w, h, rgba: img.into_raw(), srgb: true };
                 let skipped = crate::peddeco::bake(&mut skin, &layers, &decal);
                 texture::save_png(&out, &skin.rgba, w, h)?;
                 Ok(skipped)
@@ -2114,7 +2112,8 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
                     rec["layers_without_decal"] = skipped.missing.into();
                 }
                 if !cached {
-                    rec["ink_layers_left_out"] = skipped.ink.into();
+                    rec["makeup_layers_left_out"] = skipped.makeup.into();
+                    rec["uncoloured_masks_left_out"] = skipped.uncoloured_masks.into();
                 }
                 true
             }
@@ -2686,9 +2685,6 @@ pub fn export_placements(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], ou
                     }
                     if let Some(t) = arch_lod.get(&en.archetype).and_then(|al| crate::lodlinks::time_json(al.time_flags)) {
                         j["time"] = t;
-                    }
-                    if let Some(k) = arch_lod.get(&en.archetype).and_then(crate::lodlinks::kind_json) {
-                        j["archetype_kind"] = k;
                     }
                 }
             }
