@@ -25,6 +25,15 @@
 //! takes the layer only inside every edge of the clip quad: the shader drops
 //! it when `(u - x0)(y1 - y0) - (v - y0)(x1 - x0) < 0` for any edge.
 //!
+//! The record has a matrix too (`6e8249bf`, +32, same layout). The game's
+//! bake mesh shader (`MSNC_VS_BakeDecorations`) rasterises the part in the
+//! record's own UV, the part UV times that matrix, and hands that UV to the
+//! pixel shader, so a layer's clip quad, fold and matrix all work in it;
+//! outside `0..1` the record draws nothing. Most records' matrices are the
+//! identity or a uniform scale and offset that zooms into one region (arm
+//! tattoos into the arm), which is why some layer matrices alone put
+//! their decal somewhere else on the body.
+//!
 //! Colour: a decal is either full-colour art or a mask. In a mask, alpha
 //! is the line art, green a flat 0.5 and red / blue the regions of a second
 //! and third ink. Each ink word is hue, saturation, value and alpha bytes
@@ -61,9 +70,9 @@ pub const TAG: u32 = 0xd9f1_087b;
 /// them when no part has that item category.
 pub const SKIN_CATEGORIES: [(u32, &str); 3] = [(0x3817_131d, "body upper"), (0x4492_5bfd, "body lower"), (0x378a_d10c, "head")];
 
-const VERSION: u32 = 3;
+const VERSION: u32 = 5;
 /// Changes when the bake rule changes, so baked textures are made again.
-pub const BAKE_RULE: u32 = 5;
+pub const BAKE_RULE: u32 = 6;
 /// The skin tone record struct (`data.rpf`): a name, a linear colour.
 pub const SKIN_TONE: u32 = 0x27a7_a4ef;
 /// Wardrobe tag key whose item names the skin tone (a skin-tone item, or
@@ -93,6 +102,15 @@ pub struct Layer {
     /// [`Layer::is_makeup`]).
     #[serde(default)]
     pub p3: [[f32; 4]; 3],
+    /// The record's matrix (`6e8249bf`, the same for all its layers): part
+    /// UV -> the record's own UV, in which the game bakes the record and
+    /// places its layers (see the module notes).
+    #[serde(default = "identity")]
+    pub zone: [[f32; 3]; 3],
+}
+
+fn identity() -> [[f32; 3]; 3] {
+    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -162,6 +180,7 @@ fn read_layer(p: &Pso, o: usize, m: &impl Fn(u32) -> Option<usize>) -> Option<La
         mode: at(0x8765_2efd).map_or(0, |x| le32(d, x)),
         uv: std::array::from_fn(|i| std::array::from_fn(|k| f32at(d, uv + 16 * i + 4 * k))),
         p3: p3.map_or([[0.0; 4]; 3], |p| std::array::from_fn(|i| std::array::from_fn(|k| f32at(d, p + 16 * i + 4 * k)))),
+        zone: identity(),
     })
 }
 
@@ -172,13 +191,15 @@ impl Catalogue {
         let lm = |h: u32| member(p, LAYER, h);
         let lsize = p.structs.get(&LAYER)?.size as usize;
         let (name, cat, layers) = (rm(0xacec_22be)?, rm(0xb536_67be)?, rm(0xef88_8d7e)?);
+        let zone = rm(0x6e82_49bf);
         let d = &p.res.sys;
         let decorations: Vec<Decoration> = p
             .meta()
             .objects(RECORD)
             .into_iter()
             .map(|o| {
-                let ls = array(p, o + layers).map(|(n, b)| (0..n).filter_map(|i| read_layer(p, b + i * lsize, &lm)).collect()).unwrap_or_default();
+                let z = zone.map_or_else(identity, |z| std::array::from_fn(|i| std::array::from_fn(|k| f32at(d, o + z + 16 * i + 4 * k))));
+                let ls = array(p, o + layers).map(|(n, b)| (0..n).filter_map(|i| read_layer(p, b + i * lsize, &lm)).map(|l| Layer { zone: z, ..l }).collect()).unwrap_or_default();
                 Decoration { name: le32(d, o + name), category: le32(d, o + cat), layers: ls }
             })
             .collect();
@@ -271,10 +292,21 @@ pub fn decal_uv(m: &[[f32; 3]; 3], u: f32, v: f32) -> Option<(f32, f32)> {
 impl Layer {
     /// The part UV the decal transform reads. Flag 0x400 folds U about the
     /// middle (`0.5 - |u - 0.5|`), 0x800 folds V, so one decal lands on both
-    /// sides (eye make-up on both eyes). The clip quad still uses the raw UV.
+    /// sides (eye make-up on both eyes). The clip quad uses the unfolded UV.
     pub fn fold(&self, u: f32, v: f32) -> (f32, f32) {
         let f = |x: f32, bit: u32| if self.flags & bit != 0 { 0.5 - (x - 0.5).abs() } else { x };
         (f(u, 0x400), f(v, 0x800))
+    }
+
+    /// The record's UV at a part UV: the part UV times the record matrix
+    /// ([`Layer::zone`]). `None` outside `0..1`, where the game draws
+    /// nothing of the record (its bake covers that square only).
+    pub fn zone_uv(&self, u: f32, v: f32) -> Option<(f32, f32)> {
+        if self.zone == identity() {
+            return Some((u, v));
+        }
+        let (zu, zv) = decal_uv(&self.zone, u, v)?;
+        ((0.0..=1.0).contains(&zu) && (0.0..=1.0).contains(&zv)).then_some((zu, zv))
     }
 }
 
@@ -643,7 +675,7 @@ pub fn bake(skin: &mut Image, layers: &[&Layer], decal: &dyn Fn(u64) -> Option<s
         skin.rgba.par_chunks_mut(4 * w).enumerate().for_each(|(y, row)| {
             let v = (y as f32 + 0.5) / h as f32;
             for x in 0..w {
-                let u = (x as f32 + 0.5) / w as f32;
+                let Some((u, v)) = l.zone_uv((x as f32 + 0.5) / w as f32, v) else { continue };
                 if !inside_clip(&l.clip, u, v) {
                     continue;
                 }
@@ -676,7 +708,7 @@ mod tests {
 
     fn layer() -> Layer {
         let none = [0.0, f32::MAX, f32::MAX, f32::MAX];
-        Layer { textures: vec![1], colours: [0, 0, 0], clip: [none; 4], flags: 0, opacity: 1.0, saturation: 1.0, mode: 0, uv: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], p3: [[0.0; 4]; 3] }
+        Layer { textures: vec![1], colours: [0, 0, 0], clip: [none; 4], flags: 0, opacity: 1.0, saturation: 1.0, mode: 0, uv: identity(), p3: [[0.0; 4]; 3], zone: identity() }
     }
 
     #[test]
@@ -691,6 +723,18 @@ mod tests {
         // projective: divided by w = m02 u + m12 v + m22
         let m = [[1.0, 0.0, 1.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         assert_eq!(decal_uv(&m, 1.0, 0.5), Some((0.5, 0.25)));
+    }
+
+    #[test]
+    fn record_matrix_maps_into_its_square_first() {
+        let mut l = layer();
+        assert_eq!(l.zone_uv(1.5, -0.25), Some((1.5, -0.25)));
+        // scale 4 in u, 2 in v, then move u by -0.25: part u 0.0625..0.3125
+        // is the record's 0..1
+        l.zone = [[4.0, 0.0, 0.0], [0.0, 2.0, 0.0], [-0.25, 0.0, 1.0]];
+        assert_eq!(l.zone_uv(0.125, 0.25), Some((0.25, 0.5)));
+        assert_eq!(l.zone_uv(0.5, 0.25), None);
+        assert_eq!(l.zone_uv(0.125, 0.75), None);
     }
 
     #[test]
