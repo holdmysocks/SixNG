@@ -1140,6 +1140,32 @@ pub fn is_skin_insert(slot: &str) -> bool {
     matches!(slot, "nipples" | "genitals")
 }
 
+/// The inserts' items name the body's own skin, laid out for the whole skin
+/// mesh: Lucia's nipple item names `cb95198f…`, the same image as the torso
+/// map `hand_fr1_000_nude_cull` binds, and the genital items list the lower
+/// body's textures. A body item found by its textures (its own mesh is not in
+/// the install) can name a skin laid out for that other mesh (Lucia's body
+/// item: a square sheet with the fingers down one side), so the insert's
+/// skins are added after the body part's own as further choices, for the
+/// body part of the same layer (`export` takes the first that fits the mesh).
+/// Bodies without skins are left to `approx_body_skins`.
+fn add_insert_skins(parts: &mut [LookPart]) {
+    let from: Vec<(Option<String>, &'static str, Vec<(String, String)>)> = parts
+        .iter()
+        .filter(|p| is_skin_insert(&p.slot) && !p.skins.is_empty())
+        .map(|p| (p.layer.clone(), if p.slot == "nipples" { "body upper" } else { "body lower" }, p.skins.clone()))
+        .collect();
+    for (layer, slot, skins) in from {
+        let body = |b: &LookPart| matches!(b.slot.as_str(), "body upper" | "body lower") && !b.skins.is_empty();
+        let Some(b) = parts.iter_mut().find(|b| body(b) && (b.layer.is_some() && b.layer == layer || b.layer.is_none() && b.slot == slot)) else { continue };
+        for s in skins {
+            if !b.skins.iter().any(|x| x.0 == s.0) {
+                b.skins.push(s);
+            }
+        }
+    }
+}
+
 /// Asset ids of the anatomical body layer drawables
 /// (`bodygenitalsgen_<fit>_<nnn>_regular_ws00_full`, `_alt_00` to `_alt_02`;
 /// ten of them are in core_restofworld, of fits `fr1`, `fb1`, `fo1` and
@@ -2021,6 +2047,7 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
             }
         }
         let plain = |slot: &str, drawable: String, found_by: &'static str| LookPart { slot: slot.into(), drawable, item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, layer_set: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by, category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, skin_from: None, state_guids: vec![] };
+        add_insert_skins(&mut parts);
         // another variation of the wardrobe: only what it holds itself
         if !listed {
             let main: Vec<String> = parts.iter().filter(|p| ["full", "outer", "top", "bottom"].contains(&p.slot.as_str())).map(|p| pretty(item_word(&p.drawable))).collect();
@@ -2274,5 +2301,27 @@ mod tests {
         assert!(is_skin_insert("nipples") && is_skin_insert("genitals") && !is_skin_insert("body upper"));
         assert!(invisible_reason("invisible_brabalcony_fr1_000_regular_ws00_full").is_some());
         assert!(invisible_reason("brabalcony_fr1_000_regular_ws00_full").is_none());
+    }
+
+    #[test]
+    fn inserts_offer_their_skins_to_the_body_of_their_layer() {
+        let part = |slot: &str, layer: &str, skins: &[(&str, &str)]| LookPart { slot: slot.into(), drawable: slot.into(), item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: skins.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(), found_by: "x", category: None, layer: Some(layer.into()), hides: vec![], hides_sub: vec![], hair_state: None, state_guids: vec![], layer_set: None, skin_from: None };
+        // in look order: the inserts come before the body set
+        let mut parts = vec![
+            part("nipples", "b4d9d470", &[("cb95", "9d33"), ("d228", "13b3")]),
+            part("body upper", "b4d9d470", &[("9138", "4fc8"), ("d228", "13b3")]),
+            part("body lower", "e0622b84", &[("6847", "5091")]),
+            part("genitals", "e0622b84", &[("6847", "0000"), ("02c1", "5091")]),
+        ];
+        add_insert_skins(&mut parts);
+        let ids = |i: usize| parts[i].skins.iter().map(|s| s.0.as_str()).collect::<Vec<_>>();
+        // the body's own first, then the insert's that it does not list
+        assert_eq!(ids(1), ["9138", "d228", "cb95"]);
+        assert_eq!(ids(2), ["6847", "02c1"]);
+        assert_eq!(ids(0), ["cb95", "d228"]);
+        // a body without skins (added as "default") is left to approx_body_skins
+        let mut bare = vec![part("body upper", "b4d9d470", &[]), part("nipples", "b4d9d470", &[("cb95", "9d33")])];
+        add_insert_skins(&mut bare);
+        assert!(bare[0].skins.is_empty());
     }
 }

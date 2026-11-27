@@ -1964,6 +1964,19 @@ struct SkinSetup {
     geometry_map: std::collections::HashMap<usize, Vec<u16>>,
 }
 
+/// The (colour, normal) pair an outfit item's skin list gives a mesh: the
+/// first whose colour texture is stored (`dims` knows it) and has the shape
+/// of the stored maps the mesh binds itself (`own`, its UV layout), else the
+/// first stored one. A skin laid out for another mesh (Lucia's body item
+/// names a square sheet for a body mesh that is not in the install; the
+/// torso mesh drawn instead is laid out on a 1:2 map) would put flat,
+/// unrelated texels on the mesh.
+fn part_skin_for(list: &[(u64, u64)], dims: impl Fn(u64) -> Option<(u32, u32)>, own: &[(u32, u32)]) -> Option<(u64, u64)> {
+    let fits = |(w, h): (u32, u32)| own.is_empty() || own.iter().any(|&(ow, oh)| u64::from(w) * u64::from(oh) == u64::from(ow) * u64::from(h));
+    let stored = || list.iter().filter_map(|&s| Some((s, dims(s.0)?)));
+    stored().find(|&(_, d)| fits(d)).or_else(|| stored().next()).map(|(s, _)| s)
+}
+
 /// Ped heads bind no textures: add the face (albedo and normal map) chosen
 /// by `headskin` to their texture-less shaders, with the choice record for
 /// model.json. None when not a head.
@@ -1992,7 +2005,15 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
         // a shader has its colour texture when the one it binds is in a store
         let stored = |t: &crate::drawable::TexRef| u64::from_str_radix(&t.hash64, 16).is_ok_and(|h| set.get(h).is_some());
         let has_albedo = |s: &crate::drawable::Shader| s.textures.iter().any(|t| ALBEDO_PARAMS.contains(&t.param_hash.as_str()) && stored(t));
-        if let (Some(&(alb, nrm)), true) = (list.iter().find(|s| set.get(s.0).is_some()), shaders.iter().any(|s| !has_albedo(s))) {
+        // the shapes of the colour and normal maps the mesh binds itself that are in a store: its UV layout
+        let dims = |h: u64| set.get(h).map(|(_, t)| (t.width, t.height));
+        let own: Vec<(u32, u32)> = shaders
+            .iter()
+            .flat_map(|s| &s.textures)
+            .filter(|t| ALBEDO_PARAMS.contains(&t.param_hash.as_str()) || NORMAL_PARAMS.contains(&t.param_hash.as_str()))
+            .filter_map(|t| dims(u64::from_str_radix(&t.hash64, 16).ok()?))
+            .collect();
+        if let (Some((alb, nrm)), true) = (part_skin_for(list, dims, &own), shaders.iter().any(|s| !has_albedo(s))) {
             // Body items list their colour texture twice, the first time
             // without a normal map: take the normal from the entry that has one.
             let nrm = list.iter().find(|s| s.0 == alb && s.1 != 0 && set.get(s.1).is_some()).map_or(nrm, |s| s.1);
@@ -3792,6 +3813,25 @@ fn lod_exports(groups: &[Vec<crate::gltf::NodeGroup>]) -> Vec<(usize, String)> {
 #[cfg(test)]
 mod dictionary_tests {
     use super::*;
+
+    #[test]
+    fn part_skin_takes_the_one_laid_out_for_the_mesh() {
+        // Lucia's upper body: the body item's square sheet first, then the
+        // torso map (1:2) the nipple item names; the mesh binds a 512 x 1024 normal map
+        let list = [(0x9138, 0x4fc8), (0x1832, 0x4fc8), (0xcb95, 0x9d33)];
+        let dims = |h: u64| match h {
+            0x9138 | 0x1832 => Some((1024, 1024)),
+            0xcb95 => Some((1024, 2048)),
+            _ => None,
+        };
+        assert_eq!(part_skin_for(&list, dims, &[(512, 1024)]), Some((0xcb95, 0x9d33)));
+        // nothing fits, or the mesh binds nothing stored (heads): the first stored one
+        assert_eq!(part_skin_for(&list, dims, &[(256, 256), (512, 512)]).unwrap().0, 0x9138);
+        assert_eq!(part_skin_for(&list, dims, &[]).unwrap().0, 0x9138);
+        // textures in no store are passed over
+        assert_eq!(part_skin_for(&[(0x1, 0), (0xcb95, 0)], dims, &[]).unwrap().0, 0xcb95);
+        assert!(part_skin_for(&[(0x1, 0)], dims, &[]).is_none());
+    }
 
     #[test]
     fn lit_map_is_colour_times_alpha() {
