@@ -766,7 +766,7 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                                         let (len, rows) = texture::tint_layout(et.width);
                                         e["tint_row_length"] = len.into();
                                         e["tint_rows"] = rows.into();
-                                        e["applied"] = "GLB COLOR_0 = palette entry at vertex colour blue (row 0), multiplied into the base colour. Placed instances pick a row: entry tint_row * tint_row_length + COLOR0.b (tint_row from the placement, assumed to clamp at tint_rows - 1)".into();
+                                        e["applied"] = "GLB COLOR_0 = palette entry at vertex colour blue (row 0), multiplied into the base colour. Placed instances pick a row: entry tint_row * tint_row_length + COLOR0.b (tint_row from the placement, clamped at tint_rows - 1 as the game's mesh shader does)".into();
                                     }
                                     e["status"] = "ok (embedded in the model)".into();
                                     if o.png {
