@@ -96,6 +96,7 @@ fn export_glb(game: &str, work: &str, vehicle: &str, config: usize, livery: &Pat
         part_colours: Default::default(),
         part_hidden: Default::default(),
         skin_tone: 0,
+        part_layers: Default::default(),
     };
     let r = sixng_core::vehexport::export_vehicle(&a, &ix, v, config, &[], &[], true, &decals, glb, &o)?;
     let on = r["livery"]["stickers"].as_array().map_or(0, |s| s.iter().filter(|s| s["on"].as_array().is_some_and(|o| !o.is_empty())).count());
