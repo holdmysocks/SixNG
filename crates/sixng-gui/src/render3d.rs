@@ -661,6 +661,10 @@ pub struct Renderer3D {
     depth_ub: wgpu::Buffer,
     depth_frame_bg: wgpu::BindGroup,
     pipe_cam_depth: wgpu::RenderPipeline,
+    /// The game's screen-space hair blur (hairblur.rs) and the pipeline of its strand mask: strands drawn again
+    /// over the main pass's depth.
+    hair_blur: Option<crate::hairblur::HairBlur>,
+    pipe_hair_mask: Option<wgpu::RenderPipeline>,
     light_vp: [[f32; 4]; 4],
     /// Map cells: opaque, decal, decal blend, blend pipelines.
     pipe_cell: [wgpu::RenderPipeline; 4],
@@ -1528,6 +1532,33 @@ impl Renderer3D {
             multiview_mask: None,
             cache: None,
         });
+        let hair_blur = Some(crate::hairblur::HairBlur::new(device));
+        let pipe_hair_mask = Some({
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("hair blur mask"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_mesh"), compilation_options: Default::default(), buffers: &vbufs },
+                primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: depth_fmt,
+                    depth_write_enabled: Some(false),
+                    // the main pass's own strand draw: a sample passes where the strand is the surface kept there
+                    // (not where it was dithered out or lies behind something)
+                    depth_compare: Some(wgpu::CompareFunction::Equal),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState { count: MSAA, ..Default::default() },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_hair_mask"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState { format: crate::hairblur::MASK_FMT, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        });
         let default_frame_bg = frame_bind_group(device, &bgl_frame, &frame_ub, &dummy_joints, &sampler, &stickers.none, &stickers.view, &stickers.sampler, &atmo.binds, &hair_luts, &sun_map);
         let stand_in = crate::atmo::SceneBinds { shadow: shadow.stand_in.clone(), ..atmo.binds.clone() };
         let shadow_bgs = shadow
@@ -1713,6 +1744,8 @@ impl Renderer3D {
             depth_ub,
             depth_frame_bg,
             pipe_cam_depth,
+            hair_blur,
+            pipe_hair_mask,
             light_vp: [[0.0; 4]; 4],
             hair_tried: false,
             default_frame_bg,
@@ -2612,6 +2645,38 @@ impl Renderer3D {
         }
     }
 
+    /// The strand pieces of `models` as the main pass draws them (same frame groups, instances and strand
+    /// counts), for the hair blur's mask. Returns the number of draws.
+    fn record_strand_mask(pipe: &wgpu::RenderPipeline, default_frame_bg: &wgpu::BindGroup, be: &mut wgpu::RenderPass<'_>, models: &[&GpuModel]) -> u32 {
+        let mut n = 0u32;
+        be.set_pipeline(pipe);
+        for gm in models {
+            let range = 0..gm.n_normal();
+            if range.is_empty() || !gm.meshes.iter().any(|m| m.visible && m.strand_lod.is_some()) {
+                continue;
+            }
+            let skinned = gm.meshes.iter().any(|m| m.skinned);
+            be.set_bind_group(0, Some(if skinned { &gm.frame_bg } else { default_frame_bg }), &[]);
+            be.set_vertex_buffer(1, Some(gm.instances.slice(..)));
+            for me in gm.meshes.iter().filter(|m| m.visible && m.n_idx > 0 && m.strand_lod.is_some()) {
+                if gm.mat_alpha[me.material] == 2 || matches!(gm.mat_class[me.material], 5 | 6 | 8) {
+                    continue;
+                }
+                be.set_bind_group(1, Some(&gm.mat_bg[me.material]), &[]);
+                be.set_vertex_buffer(0, Some(me.vb.slice(..)));
+                be.set_index_buffer(me.ib.slice(..), wgpu::IndexFormat::Uint32);
+                let first = (me.ib_range.start / 4) as u32;
+                let base = (me.vb_range.start / std::mem::size_of::<glb::Vertex>() as u64) as i32;
+                let cnt = me.n_draw.load(std::sync::atomic::Ordering::Relaxed).min(me.n_idx);
+                if cnt > 0 {
+                    be.draw_indexed(first..first + cnt, base, range.clone());
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
     /// Opaque and cutout draws of `models` into a render pass.
     /// `fb`: draw the coverage-fallback instances instead of the normal ones.
     fn record_opaque(
@@ -3343,6 +3408,32 @@ impl Renderer3D {
                 t_r.elapsed().as_micros() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
+        }
+        // the game's hair blur, on the lit colour before tone mapping: the strand mask first (the strands again
+        // over the main pass's depth), then the blur where it found strands
+        if let (Some(hb), Some(pm)) = (self.hair_blur.as_mut().filter(|h| h.enabled), &self.pipe_hair_mask) {
+            if models.iter().any(|gm| gm.meshes.iter().any(|m| m.visible && m.strand_lod.is_some())) {
+                hb.ensure(device, size);
+                let (ms, one) = hb.mask_views();
+                let mut mp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("hair blur mask"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: ms,
+                        resolve_target: Some(one),
+                        depth_slice: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Discard },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &t.depth, depth_ops: None, stencil_ops: None }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                let n = Self::record_strand_mask(pm, &self.default_frame_bg, &mut mp, models);
+                drop(mp);
+                if n > 0 {
+                    hb.run(device, queue, &mut enc, &t.resolve, &t.resolve_view, size, cam.near, cam.far);
+                }
+            }
         }
         gmark(&self.gpu_timer, &mut enc, 3);
         if let (Some(_), Some(d)) = (&sky, &t.display) {

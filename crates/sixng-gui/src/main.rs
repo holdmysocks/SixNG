@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 mod accum;
 mod assemble;
+mod hairblur;
 mod atmo;
 mod bc;
 mod cells;

@@ -2716,3 +2716,11 @@ fn fs_glow(i: GlowOut) -> @location(0) vec4<f32> {
     let k = GLOW_PEAK * (1.0 - exp(-m / GLOW_PEAK)) / m;
     return vec4(c * k, 0.0);
 }
+
+// Strand mask for the hair blur (hairblur.rs): the strands drawn again over the main pass's depth with an equal
+// test, so a sample counts where a strand is the surface the main pass kept (the pixels the game marks with its
+// strand stencil class). r: 1, g: the depth there (both averaged by the multisample resolve).
+@fragment
+fn fs_hair_mask(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    return vec4(1.0, p.z, 0.0, 1.0);
+}
