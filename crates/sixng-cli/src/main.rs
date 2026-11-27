@@ -1924,6 +1924,8 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 let outfit_of = ped.as_ref().ok().and_then(|l| l.outfits.get(look.unwrap_or(0)));
                 let tables = sixng_core::hairtables::load_or_build(&ws, &a).map_err(|e| eprintln!("--hair: strand tables not read: {e:#}")).ok().map(|v| sixng_core::hairtone::StrandData::from_json(&v));
                 let presets = sixng_core::hairtone::Table::load_or_build(&ws).ok();
+                // the strand parameter sets the hair assets name (widths along the strands)
+                let asset_sets = sixng_core::hairsets::get(&ws.work, &a, &ix.entries);
                 for st in hair_style {
                     let re = regex::RegexBuilder::new(st).case_insensitive(true).build()?;
                     pieces.extend(sixng_core::hairexport::placeholder_grooms(&ws.work, &a, &ix.entries, &re).map_err(|e| anyhow!(e))?);
@@ -1952,7 +1954,13 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                             ex["colour_set"] = json!(format!("{set:08x}"));
                             ex["colour_source"] = json!(match c { sixng_core::hairexport::HairColour::Set(_) => "strand tables", sixng_core::hairexport::HairColour::Presets(_) => "item presets" });
                         }
-                        let (p, mut sum) = sixng_core::hairexport::piece(&g, &name, &o, colour.as_ref().map(|c| &c.0), hat.as_ref().filter(|_| slot == "hair"), ex);
+                        let guid = outfit_of.and_then(|of| of.parts.iter().find(|p| p.strands && p.slot == *slot)).and_then(|p| p.guid.as_deref());
+                        let pset = sixng_core::hairexport::slot_param_set(asset_sets, guid, slot);
+                        let params = pset.and_then(|n| tables.as_ref()?.param_set(n));
+                        if let (Some(n), Some(_)) = (pset, params) {
+                            ex["param_set"] = json!(format!("{n:08x}"));
+                        }
+                        let (p, mut sum) = sixng_core::hairexport::piece_with(&g, &name, &o, colour.as_ref().map(|c| &c.0), params, hat.as_ref().filter(|_| slot == "hair"), ex);
                         sum["head_uv_set"] = json!(uv_set);
                         sum["colour_set"] = json!(colour.as_ref().map(|c| format!("{:08x}", c.1)));
                         sum["slot"] = json!(slot);
