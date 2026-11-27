@@ -8269,9 +8269,12 @@ fn load_query_sel(
     // vehicles: mod parts (bonnets, bumpers, spoilers, exhausts, truck beds
     // ...) are separate models; the vehicle data says which bone each is
     // modelled around and which stock bones it replaces. The parts of the
-    // first configuration are on by default.
+    // first configuration are on by default. Boats have no wheel mounts
+    // but fit parts the same way (the Rhode's outboard engine): a fragment
+    // with a chassis bone counts as a vehicle too.
     let mut veh_opts = Vec::new();
-    if e.rtype.as_deref() == Some("ft") && info["wheel_mounts"].as_array().is_some_and(|w| !w.is_empty()) {
+    let has_chassis = info["drawable"]["skeleton"].as_array().is_some_and(|b| b.iter().any(|b| b["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case("chassis"))));
+    if e.rtype.as_deref() == Some("ft") && (has_chassis || info["wheel_mounts"].as_array().is_some_and(|w| !w.is_empty())) {
         let db = sixng_core::names::work_dir().and_then(|w| crate::vehicle_db::shared(&export::game_root(&a).to_string_lossy(), &w.to_string_lossy()).ok());
         if let Some(v) = db.as_ref().and_then(|db| crate::vehicle_db::find(db, &crate::vehicle_db::model_key(name))) {
             let (opts, mut kits, part_names, assets) = vehicle_part_options(&ix, name, v);
