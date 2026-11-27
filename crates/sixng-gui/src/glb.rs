@@ -309,6 +309,10 @@ pub struct Material {
     pub shader_hash: String,
     /// Decal layer order when the material is in the decal bucket.
     pub decal: Option<u8>,
+    /// Ped glass (`ped_standard_muv_alpha` lenses): the material library's
+    /// transmission record of the glass sub-material, drawn by the viewer's
+    /// tinted-glass blend. Set by the model view, not read from the GLB.
+    pub glass: Option<sixng_core::matlib::Transmission>,
 }
 
 pub struct Joint {
@@ -1137,6 +1141,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             gap: gap.into(),
             shader_hash: ex["shader_name_hash"].as_str().unwrap_or("").into(),
             decal,
+            glass: None,
         });
     }
     // skeleton
@@ -1461,9 +1466,17 @@ pub fn merge(into: &mut Model, other: Model) {
         if let Some(d) = &mut m.detail {
             d.image += img0;
         }
-        for x in [&mut m.ramp_u, &mut m.ramp] {
+        for x in [&mut m.ramp_u, &mut m.ramp, &mut m.wear_mask, &mut m.primer_mask, &mut m.dust_mask] {
             if let Some(i) = x {
                 *i += img0;
+            }
+        }
+        // ped skin's engine detail: speculartex2 and the two tile sheets
+        if let Some(d) = &mut m.skin_detail {
+            for x in [&mut d.spec2, &mut d.normal, &mut d.control] {
+                if let Some(i) = x {
+                    *i += img0;
+                }
             }
         }
         into.materials.push(m);

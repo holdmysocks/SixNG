@@ -409,7 +409,11 @@ fn wgpu_options(no_vsync: bool, gpu: Option<String>) -> eframe::egui_wgpu::WgpuC
         c.device_descriptor = std::sync::Arc::new(move |adapter| {
             let mut d = base(adapter);
             d.required_features |= adapter.features()
-                & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::DEPTH32FLOAT_STENCIL8 | crate::gpu_time::features());
+                & (wgpu::Features::TEXTURE_COMPRESSION_BC
+                    | wgpu::Features::DEPTH32FLOAT_STENCIL8
+                    // ped glass's blend (render3d's glass pipeline)
+                    | wgpu::Features::DUAL_SOURCE_BLENDING
+                    | crate::gpu_time::features());
             // the mesh shaders read more than wgpu's default 16 textures per stage (sky, shadow cascades, hair
             // lighting tables, materials); ask for what the adapter has, up to 32
             d.required_limits.max_sampled_textures_per_shader_stage =
@@ -2077,6 +2081,7 @@ impl App {
         m.livery.ed.auto_select = c.get("livery-select").and_then(|s| s.parse().ok());
         m.livery.ed.auto_add = c.get("livery-add").map(|s| s.split(',').map(str::to_string).collect()).unwrap_or_default();
         m.livery.ed.auto_click = c.get("livery-click").map(pairs).unwrap_or_default();
+        m.livery.ed.auto_flat = c.has("livery-flat");
         m.livery.ed.auto_drag = c.get("livery-drag").map(pairs).and_then(|v| v.first().copied());
         m.livery.ed.auto_save = c.has("livery-save");
         m.livery.ed.auto_undo = c.get("livery-undo").and_then(|s| s.parse().ok()).unwrap_or(0);

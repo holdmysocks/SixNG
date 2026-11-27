@@ -2225,9 +2225,10 @@ impl ModelView {
         egui::CollapsingHeader::new("Shape details").id_salt("body_details").show(ui, |ui| {
             egui::Grid::new("body_detail_grid").num_columns(2).show(ui, |ui| {
                 for k in BODY_DETAILS..shape.len() {
-                    let (name, _, neg) = sixng_core::bodyshape::CONTROLS[k];
-                    let lo = if neg.is_some() { -1.0 } else { 0.0 };
-                    ui.label(detail_label(name)).on_hover_text(format!("The game's {name} control ({lo}..1)."));
+                    let name = sixng_core::bodyshape::CONTROLS[k].0;
+                    let lo = sixng_core::bodyshape::control_min(name);
+                    let more = if name == "gcheadscale" { " The rig scales the head by 1 + v (x 2 at 1); below -0.5 the head shrinks out of sight (1 % at -1), so the slider stops at half size." } else { "" };
+                    ui.label(detail_label(name)).on_hover_text(format!("The game's {name} control ({lo}..1).{more}"));
                     released |= ui.add(egui::Slider::new(&mut shape[k], lo..=1.0)).drag_stopped();
                     ui.end_row();
                 }
@@ -6465,7 +6466,30 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
                 // pixel on opaque garments (alpha carries its texels); the
                 // Metal 4 renderer has no such path and keeps the baked weave.
                 let detail = !crate::METAL4_BUILD && std::env::var_os("SIXNG_NO_FABRIC_DETAIL").is_none() && mats.iter().all(|&k| m.materials[k].alpha_mode == "OPAQUE");
-                if let Some(main) = crate::fabric::bake(m, &mats, i, &fab, &|w, h| sub_material_map(&mat, &[cache, shaped.as_path()], w, h), detail) {
+                // materials sharing the texture that mark their sub-material per
+                // vertex (a lens on a frame that has a `materialid` texture)
+                let by_vertex: Vec<usize> = mats.iter().copied().filter(|&k| sub_material_map(&m.materials[k], &[cache, shaped.as_path()], 1, 1).is_none()).collect();
+                // ped glass (`ped_standard_muv_alpha` drawn blended, its
+                // sub-material per vertex): the transmission record of the
+                // sub-material most of its vertices name, for the viewer's
+                // tinted-glass blend; its texels' alpha becomes the glass
+                // opacity in the bake
+                let mut glass = Vec::new();
+                let lenses: Vec<usize> = by_vertex.iter().copied().filter(|&k| m.materials[k].shader_hash == "1c43a65b" && m.materials[k].alpha_mode == "BLEND").collect();
+                for k in lenses {
+                    let mut count = [0usize; 8];
+                    for me in m.meshes.iter().filter(|me| me.material == Some(k)) {
+                        for v in &me.verts {
+                            count[((v.col[1] >> 2) & 7) as usize] += 1;
+                        }
+                    }
+                    let Some(s) = (0..8).filter(|&s| count[s] > 0).max_by_key(|&s| (count[s], 8 - s)) else { continue };
+                    if let Some(rec) = f.preset.and_then(|p| crate::fabric::transmission(game, p, s)) {
+                        m.materials[k].glass = Some(rec);
+                        glass.push(k);
+                    }
+                }
+                if let Some(main) = crate::fabric::bake(m, &mats, &by_vertex, &glass, i, &fab, &|w, h| sub_material_map(&mat, &[cache, shaped.as_path()], w, h), detail) {
                     m.images[i].key = format!("{}#fabric{:08x}{}", m.images[i].key, f.preset.unwrap_or(0), if main.is_some() { "d" } else { "" });
                     if let Some((tile, scale, rot)) = main.and_then(|s| fab.detail(s)) {
                         let (w, h, px) = tile.rgba();

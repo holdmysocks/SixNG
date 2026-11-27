@@ -155,6 +155,21 @@ pub const DERIVED: &[&str] = &[
     "furnoiseuvscale", "grassdecaluvscale", "grassnoisetilescale", "masktexturetex", "scrollspeedmultiplier", "shadowalpha",
     "specularcolortex", "terrainfresnel", "terraintranslucency", "tintoverride", "vertexdisplacementmultiplier",
     "wrinklebumpscale", "wrinklemultiplier", "dirtdiffuseintensity", "emissivedistortionstrength",
+    // known name + word search (2026-11-27); each sits next to the name it extends or in a parallel block
+    // (waterfall layer1/layer2 sets: tiling, offset, intensity, opacitythreshold, opacitycontrast)
+    "layer1tiling", "layer1offset", "layer1intensity", "layer1opacitythreshold", "layer1opacitycontrast",
+    "layer2tiling", "layer2offset", "layer2intensity", "layer2opacitythreshold", "layer2opacitycontrast",
+    "dirttintchannel", "furlengthjitter", "normalmaptiling2", "specularfresnelselector", "waterfadestartrandom",
+    "stickermetalness", "stickerroughness", "stickerbackopacity",
+    // water_micro_geom (the inland water tiles): meet-in-the-middle joaat search over water and shader words (2026-11-27),
+    // about 16 random hits expected over 45 hashes; kept only names that fit the value or a sibling. The three use* flags
+    // are integer 1 on every tile and 0 on the 6 tiles whose flow, height and surface map textures are 4 x 4 placeholders;
+    // watersurfacemaptexture is the per-tile BC7 texture that usesurfacemap switches on; surfacedetailfadenear / far are
+    // 500 and 1500 side by side; surfacedetailtintcoloura / b and surfacedetailtintmultiplier are float4 ones next to
+    // the surface detail textures, which usesurfacedetailmap (0) leaves off; microgeomcontrol is 0, 1 or 4
+    "useflowmap", "useheighttexture", "usesurfacemap", "watersurfacemaptexture", "usesurfacedetailmap", "surfacedetailfadenear",
+    "surfacedetailfadefar", "surfacedetailtintcoloura", "surfacedetailtintcolourb", "surfacedetailtintmultiplier", "surfacedetailcontrol",
+    "microgeomcontrol",
     // texture parameters of the minigame pack's water and interior shaders (joaat search, 2026-11-23)
     "watersurfacedetailtexture", "surfacedetailnormal0", "surfacedetailnormal1", "surfacedetailnormal2", "surfacedetailiridescence", "interiordiffusemaskmap", "interiorlayerdiffusemap",
     // shader constants of the 4-layer ground shaders (dictionary search, 2026-11-22)
