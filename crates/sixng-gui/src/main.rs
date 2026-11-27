@@ -2093,6 +2093,10 @@ impl App {
             m.cam.pitch = v;
         }
         m.zoom_after_load = c.f("zoom");
+        // --skin-detail off: ped skin without the engine detail (also SIXNG_SKIN_DETAIL=0)
+        if let Some(v) = c.get("skin-detail") {
+            m.look.skin_detail = !matches!(v.to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no");
+        }
         // --body <weight>,<muscle>[,<breasts>,<butt>] (-1..1, 0..1, -1..1,
         // 0..1; missing values are 0) or a --body-shape spec
         // (gcweightbelly=0.5,gcbutt=1,...): body shape of characters, kept
