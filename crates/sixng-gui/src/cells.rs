@@ -729,6 +729,7 @@ mod tests {
             wear_mask: None,
             primer_mask: None,
             dust_mask: None,
+            base_uv: 0,
             ramp: None,
             parts: false,
             occlusion_only: false,

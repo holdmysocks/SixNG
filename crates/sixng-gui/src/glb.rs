@@ -241,6 +241,9 @@ pub struct Material {
     pub alpha_mode: String,
     pub base_factor: [f32; 4],
     pub base: Option<usize>,
+    /// The UV set the base colour texture is laid out in (its `texCoord`:
+    /// 0, or 3 for an upper body with its decorations baked in).
+    pub base_uv: u32,
     pub normal: Option<usize>,
     pub packed: Option<usize>,
     pub emissive: Option<usize>,
@@ -951,6 +954,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             !with_png.is_empty() && with_png.iter().all(|t| tiny_png(t).is_some());
         let base = uri_of(&m["pbrMetallicRoughness"]["baseColorTexture"])
             .and_then(|p| add_img(p, true, &mut images));
+        let base_uv = m["pbrMetallicRoughness"]["baseColorTexture"]["texCoord"].as_u64().unwrap_or(0) as u32;
         let normal = uri_of(&m["normalTexture"])
             .filter(|p| !opts.base_only && !is_tiny(p))
             .and_then(|p| add_img(p, false, &mut images));
@@ -1091,6 +1095,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             alpha_mode,
             base_factor,
             base,
+            base_uv,
             normal,
             packed,
             emissive,
