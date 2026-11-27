@@ -231,7 +231,7 @@ fn read_list(game: &str, work: &str, cache: &Path) -> Result<Vec<GameSticker>, S
 /// The game's liveries of every vehicle, from the viewer's cache or (once)
 /// from the game files.
 fn read_brands(game: &str, work: &str, cache: &Path) -> Result<Brands, String> {
-    let file = cache.join("vehicle_liveries_f3.json");
+    let file = cache.join("vehicle_liveries_f4.json");
     if let Some(b) = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<Brands>(&b).ok()) {
         return Ok(b);
     }
@@ -240,6 +240,12 @@ fn read_brands(game: &str, work: &str, cache: &Path) -> Result<Brands, String> {
     let _ = std::fs::create_dir_all(cache);
     let _ = sixng_core::atomic::write(&file, serde_json::to_vec(&b).unwrap_or_default());
     Ok(b)
+}
+
+/// How many variants a brand has: the most options of any of its slots
+/// that place stickers (the game fits one option per slot).
+fn variants(brand: &serde_json::Value) -> usize {
+    brand["stickers"].as_array().into_iter().flatten().filter_map(|e| e["options"].as_u64()).max().unwrap_or(1).max(1) as usize
 }
 
 /// The brands of a vehicle (`vehicle_key`): looked up by its model name's
@@ -252,12 +258,18 @@ fn brands_of<'b>(all: &'b Brands, vehicle: &str) -> &'b [serde_json::Value] {
 /// A brand's stickers as placements with the game's own transform. The
 /// layout's UV mode k (1..4) picks the mesh's UV set k - 1, as the paint
 /// shader does.
-fn brand_stickers(brand: &serde_json::Value) -> Vec<Sticker> {
+fn brand_stickers(brand: &serde_json::Value, variant: usize) -> Vec<Sticker> {
     let title = brand["name"].as_str().or(brand["brand"].as_str()).unwrap_or("").to_string();
     brand["stickers"]
         .as_array()
         .into_iter()
         .flatten()
+        .filter(|e| {
+            // a slot with several options fits one of them: variant k takes
+            // option k (wrapping) of every such slot
+            let n = e["options"].as_u64().unwrap_or(1).max(1) as usize;
+            n == 1 || e["option"].as_u64().unwrap_or(0) as usize == variant % n
+        })
         .filter_map(|e| {
             let texture = e["texture"].as_str().filter(|t| sixng_core::vehstickers::parse_texture_id(t).is_some_and(|id| id != 0))?;
             let uv: Vec<f32> = e["uv"].as_array()?.iter().filter_map(|x| x.as_f64().map(|x| x as f32)).collect();
@@ -474,14 +486,14 @@ impl State {
 
     /// Put on one of the game's liveries: its stickers replace the placed
     /// ones (saved only when you save).
-    fn put_on_brand(&mut self, brand: &serde_json::Value) {
+    fn put_on_brand(&mut self, brand: &serde_json::Value, variant: usize) {
         // A layout names zones only, and the game draws a layer on every
         // mesh carrying one of them: a fitted part (a truck box) or each of
         // a boat's four outboards. So a sticker goes on every model holding
         // its zones, one copy each. Zones 0, 63 and 255 are on nearly every
         // model and do not count; a sticker with no other zone stays as is.
         let mut s = Vec::new();
-        for st in brand_stickers(brand) {
+        for st in brand_stickers(brand, variant) {
             let mut on = 0;
             for (slot, model) in self.zones.models.iter().enumerate() {
                 if st.zones.iter().any(|z| !matches!(*z, 0 | 63 | 255) && self.zones.zones.contains_key(&(slot as u8, *z))) {
@@ -495,7 +507,9 @@ impl State {
                 s.push(st);
             }
         }
-        self.status = format!("{}: {} stickers placed by the game's layouts", brand["name"].as_str().or(brand["brand"].as_str()).unwrap_or("livery"), s.len());
+        let n = variants(brand);
+        let which = if n > 1 { format!(", variant {} of {n}", variant % n + 1) } else { String::new() };
+        self.status = format!("{}{which}: {} stickers placed by the game's layouts", brand["name"].as_str().or(brand["brand"].as_str()).unwrap_or("livery"), s.len());
         self.livery.stickers = s;
         self.ed.selected = None;
         self.ed.tool = Tool::None;
@@ -612,11 +626,21 @@ impl State {
                         }
                         egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                             for b in list {
-                                let n = b["stickers"].as_array().map_or(0, |s| s.len());
-                                if ui.button(format!("{} ({n})", b["name"].as_str().or(b["brand"].as_str()).unwrap_or("?"))).clicked() {
-                                    self.put_on_brand(b);
-                                    ui.close();
-                                }
+                                let v = variants(b);
+                                ui.horizontal_wrapped(|ui| {
+                                    let name = b["name"].as_str().or(b["brand"].as_str()).unwrap_or("?");
+                                    if ui.button(name).on_hover_text(if v > 1 { "Put on its first variant" } else { "Put on this livery" }).clicked() {
+                                        self.put_on_brand(b, 0);
+                                        ui.close();
+                                    }
+                                    // the game fits one option of a slot with several, at random
+                                    for k in 1..v {
+                                        if ui.small_button(format!("{}", k + 1)).on_hover_text(format!("Variant {} of {v}: the game picks one of a slot's options at random", k + 1)).clicked() {
+                                            self.put_on_brand(b, k);
+                                            ui.close();
+                                        }
+                                    }
+                                });
                             }
                         });
                     }
@@ -1141,9 +1165,14 @@ impl State {
                 }
             };
             let list = brands_of(&all, &self.vehicle).to_vec();
+            // NAME or NAME:k, k the variant counted from 1
+            let (want, variant) = match want.rsplit_once(':') {
+                Some((n, k)) if k.parse::<usize>().is_ok() => (n.to_string(), k.parse::<usize>().unwrap_or(1).max(1) - 1),
+                _ => (want, 0),
+            };
             let hit = list.iter().find(|b| b["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(&want)) || b["brand"].as_str() == Some(want.as_str())).or_else(|| want.parse::<usize>().ok().and_then(|k| list.get(k)));
             match hit {
-                Some(b) => self.put_on_brand(&b.clone()),
+                Some(b) => self.put_on_brand(&b.clone(), variant),
                 None => self.status = format!("no game livery {want} for {}", self.vehicle),
             }
             return false;

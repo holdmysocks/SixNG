@@ -28,8 +28,12 @@
 //! third set. A layout names zones only; on a vehicle built from parts they
 //! may lie on a fitted part (the Benson's box) rather than the body.
 //!
+//! A slot can have several options, each with a probability (percent): the
+//! game fits one, so their stickers are alternatives, not layers. The Rhode
+//! police brand inherits a slot of six decal sets at 16.7 % each.
+//!
 //! Not decoded: why some layouts name zones no vertex of the vehicle or
-//! its parts carries (Buffalo gang liveries: 93-99; Rhode: 252, 253);
+//! its parts carries (Buffalo gang liveries: 93-99);
 //! what the layout's `Location`, `80c88a97` and `9f8b8007`
 //! mean (the game packs `80c88a97` beside the UV mode), and how the game
 //! picks a brand for a vehicle.
@@ -329,40 +333,47 @@ pub fn liveries(ws: &crate::export::Workspace, models: &HashMap<u32, String>) ->
                 chain.push(x);
                 todo.extend(list(get(x, PARENTS)).iter().filter_map(|p| own.get(p).or_else(|| lib_var.get(p)).copied()));
             }
-            let mut slots: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+            // slot -> its options (part, probability in percent)
+            let mut slots: BTreeMap<u32, Vec<(u32, f64)>> = BTreeMap::new();
             for x in chain.iter().rev() {
                 for s in named(x, "slots").and_then(|s| s.as_array()).into_iter().flatten() {
-                    let mods: Vec<u32> = named(s, "options").and_then(|o| o.as_array()).into_iter().flatten().map(|o| u(named(o, "mod"))).collect();
+                    let mods: Vec<(u32, f64)> = named(s, "options").and_then(|o| o.as_array()).into_iter().flatten().map(|o| (u(named(o, "mod")), named(o, "probability").and_then(|p| p.as_f64()).unwrap_or(100.0))).collect();
                     slots.insert(u(named(s, "slot")), mods);
                 }
             }
             let mut placed: Vec<Value> = Vec::new();
-            for part in slots.values().flatten() {
-                let Some(mods) = r.parts.get(part).or_else(|| lib_parts.get(part).copied()) else { continue };
-                for e in mods.iter().filter_map(|m| r.entries.get(m).or_else(|| lib_entries.get(m).copied())) {
-                    let (sticker, group, layout) = (u(named(e, "sticker")), u(get(e, ENTRY_GROUP)), u(named(e, "layout")));
-                    let s = r.stickers.get(&sticker).or_else(|| stickers.get(&sticker).copied());
-                    let l = groups.get(&group).and_then(|g| g.get(&layout));
-                    let f = |v: Option<&Value>, h: u32| v.and_then(|v| get(v, h)).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
-                    let uv = l.map(|l| {
-                        let lo = s.and_then(|s| get(s, STICKER_SCALE_LO)).and_then(|x| x.as_f64()).unwrap_or(1.0) as f32;
-                        let deg = cased(l, "Rotation").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
-                        game_uv([f(Some(l), LAYOUT_POS[0]), f(Some(l), LAYOUT_POS[1])], [f(Some(l), LAYOUT_SIZE[0]), f(Some(l), LAYOUT_SIZE[1])], deg, lo, f(s, STICKER_TURN), [0.5, 0.5])
-                    });
-                    placed.push(json!({
-                        "part": hex(*part),
-                        "sticker": hex(sticker),
-                        "texture": s.and_then(|s| get(s, STICKER_TEXTURE)).and_then(|x| x.as_str()),
-                        "colours": s.map(|s| STICKER_COLOURS.iter().map(|h| hex(u(get(s, *h)))).collect::<Vec<_>>()),
-                        "other_colour": s.map(|s| hex(u(get(s, STICKER_OTHER_COLOUR)))),
-                        "group": hex(group),
-                        "layout_name": hex(layout),
-                        "layout": l.map(layout_json),
-                        "mask": s.and_then(|s| get(s, STICKER_MASK)).and_then(|x| x.as_bool()),
-                        "scale_lo": s.and_then(|s| get(s, STICKER_SCALE_LO)).and_then(|x| x.as_f64()),
-                        "turn": s.and_then(|s| get(s, STICKER_TURN)).and_then(|x| x.as_f64()),
-                        "uv": uv,
-                    }));
+            for (slot, options) in &slots {
+                for (option, (part, probability)) in options.iter().enumerate() {
+                    let Some(mods) = r.parts.get(part).or_else(|| lib_parts.get(part).copied()) else { continue };
+                    for e in mods.iter().filter_map(|m| r.entries.get(m).or_else(|| lib_entries.get(m).copied())) {
+                        let (sticker, group, layout) = (u(named(e, "sticker")), u(get(e, ENTRY_GROUP)), u(named(e, "layout")));
+                        let s = r.stickers.get(&sticker).or_else(|| stickers.get(&sticker).copied());
+                        let l = groups.get(&group).and_then(|g| g.get(&layout));
+                        let f = |v: Option<&Value>, h: u32| v.and_then(|v| get(v, h)).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+                        let uv = l.map(|l| {
+                            let lo = s.and_then(|s| get(s, STICKER_SCALE_LO)).and_then(|x| x.as_f64()).unwrap_or(1.0) as f32;
+                            let deg = cased(l, "Rotation").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+                            game_uv([f(Some(l), LAYOUT_POS[0]), f(Some(l), LAYOUT_POS[1])], [f(Some(l), LAYOUT_SIZE[0]), f(Some(l), LAYOUT_SIZE[1])], deg, lo, f(s, STICKER_TURN), [0.5, 0.5])
+                        });
+                        placed.push(json!({
+                            "part": hex(*part),
+                            "slot": hex(*slot),
+                            "option": option,
+                            "options": options.len(),
+                            "probability": probability,
+                            "sticker": hex(sticker),
+                            "texture": s.and_then(|s| get(s, STICKER_TEXTURE)).and_then(|x| x.as_str()),
+                            "colours": s.map(|s| STICKER_COLOURS.iter().map(|h| hex(u(get(s, *h)))).collect::<Vec<_>>()),
+                            "other_colour": s.map(|s| hex(u(get(s, STICKER_OTHER_COLOUR)))),
+                            "group": hex(group),
+                            "layout_name": hex(layout),
+                            "layout": l.map(layout_json),
+                            "mask": s.and_then(|s| get(s, STICKER_MASK)).and_then(|x| x.as_bool()),
+                            "scale_lo": s.and_then(|s| get(s, STICKER_SCALE_LO)).and_then(|x| x.as_f64()),
+                            "turn": s.and_then(|s| get(s, STICKER_TURN)).and_then(|x| x.as_f64()),
+                            "uv": uv,
+                        }));
+                    }
                 }
             }
             if placed.is_empty() {
@@ -391,8 +402,8 @@ pub fn build(ws: &crate::export::Workspace, models: &HashMap<u32, String>, out: 
     let n_unplaced = all().flat_map(|b| b["stickers"].as_array().into_iter().flatten()).filter(|s| s["layout"].is_null()).count();
     let stats = json!({"vehicles": vehicles.len(), "brands": n_brands, "stickers": n_stickers, "without_layout": n_unplaced, "layout_groups": n_groups, "layouts": n_layouts, "sticker_records": n_records});
     let doc = json!({
-        "format": 3,
-        "note": "Vehicle liveries. Per vehicle its brands (variation records whose parts place stickers), each with its stickers: the part that carries the entry, the sticker record, its texture (64-bit id in the vehicle texture stores), colours (ARGB as stored: colorRed, colorGreen and colorBlue, the colours of the texture's red, green and blue mask channels; 00000000 where a channel has none) and other_colour (a fourth stored colour, use not known), and the layout: zones = the sticker zones it covers (a vertex's zone is the fourth byte of the mesh's second colour stream, GLB _COLOR1), position and size as stored, rotation in degrees, uv_mode (k = 1..4: the mesh's UV set k - 1, as the paint shader picks it; 3, the third set, for most), aspect (0 square, 1 two to one, 2 four to one). size is (U, V): the game reads 9d2ff2b1 as U's and 8eed562c as V's. uv = the game's transform (a, b, c, d, ou, ov): the sticker is drawn where u = U*a + V*b + ou and v = U*c + V*d + ov lie in 0..1, built as translate by the position, rotate about (0.5, 0.5), scale about (0.5, 0.5) by size / lerp(scale_lo, 1, r), the rotation moved by turn * (2r' - 1) degrees; r and r' are per-vehicle random draws, taken as 0.5 here (game packer rva 0x37766a0). mask: the picture is a colour mask. location and other are not understood. A brand also lists the stickers of its parent variations. How the game picks a brand for a vehicle is not known.",
+        "format": 4,
+        "note": "Vehicle liveries. Per vehicle its brands (variation records whose parts place stickers), each with its stickers: the part that carries the entry, its slot, option (its index among the slot's options), options (how many the slot has) and probability (percent); the game fits one option per slot, picked by these weights, so a slot with several options gives the brand variants (the Rhode police brand: six decal sets at 16.7 % each). Then the sticker record, its texture (64-bit id in the vehicle texture stores), colours (ARGB as stored: colorRed, colorGreen and colorBlue, the colours of the texture's red, green and blue mask channels; 00000000 where a channel has none) and other_colour (a fourth stored colour, use not known), and the layout: zones = the sticker zones it covers (a vertex's zone is the fourth byte of the mesh's second colour stream, GLB _COLOR1), position and size as stored, rotation in degrees, uv_mode (k = 1..4: the mesh's UV set k - 1, as the paint shader picks it; 3, the third set, for most), aspect (0 square, 1 two to one, 2 four to one). size is (U, V): the game reads 9d2ff2b1 as U's and 8eed562c as V's. uv = the game's transform (a, b, c, d, ou, ov): the sticker is drawn where u = U*a + V*b + ou and v = U*c + V*d + ov lie in 0..1, built as translate by the position, rotate about (0.5, 0.5), scale about (0.5, 0.5) by size / lerp(scale_lo, 1, r), the rotation moved by turn * (2r' - 1) degrees; r and r' are per-vehicle random draws, taken as 0.5 here (game packer rva 0x37766a0). mask: the picture is a colour mask. location and other are not understood. A brand also lists the stickers of its parent variations. How the game picks a brand for a vehicle is not known.",
         "stats": stats,
         "vehicles": vehicles,
     });
