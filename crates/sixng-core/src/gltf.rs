@@ -49,6 +49,10 @@ pub struct TriPrim {
     /// together sum to 255.
     pub joints1: Option<Vec<[u16; 4]>>,
     pub weights1: Option<Vec<[u8; 4]>>,
+    /// Morph targets (glTF `targets`, Blender shape keys): name and one
+    /// position offset per vertex, RAGE space. Names go to the mesh's
+    /// `extras.targetNames`.
+    pub morphs: Vec<(String, Vec<[f32; 3]>)>,
 }
 
 /// A skeleton joint: name, parent index, bind pose (bone -> model,
@@ -216,6 +220,34 @@ impl Builder {
         self.views.push(v);
         self.views.len() - 1
     }
+    /// A VEC3 float accessor stored sparse: only the non-zero elements (with
+    /// their u32 indices), the rest read as zero. For morph targets, which
+    /// move a small part of a mesh.
+    fn vec3_sparse(&mut self, data: &[[f32; 3]]) -> usize {
+        let (mut mn, mut mx) = ([0f32; 3], [0f32; 3]);
+        let (mut idx, mut val) = (Vec::new(), Vec::new());
+        for (i, v) in data.iter().enumerate() {
+            if v.iter().all(|&x| x == 0.0) {
+                continue;
+            }
+            idx.extend_from_slice(&(i as u32).to_le_bytes());
+            for k in 0..3 {
+                mn[k] = mn[k].min(v[k]);
+                mx[k] = mx[k].max(v[k]);
+                val.extend_from_slice(&v[k].to_le_bytes());
+            }
+        }
+        let n = idx.len() / 4;
+        let mut a = json!({"componentType": 5126, "count": data.len(), "type": "VEC3", "min": mn, "max": mx});
+        if n > 0 {
+            let iv = self.view(&idx, None);
+            let vv = self.view(&val, None);
+            a["sparse"] = json!({"count": n, "indices": {"bufferView": iv, "componentType": 5125}, "values": {"bufferView": vv}});
+        }
+        self.accessors.push(a);
+        self.accessors.len() - 1
+    }
+
     fn vec3(&mut self, data: &[[f32; 3]], minmax: bool) -> usize {
         let mut bytes = Vec::with_capacity(data.len() * 12);
         let (mut mn, mut mx) = ([f32::MAX; 3], [f32::MIN; 3]);
@@ -486,7 +518,15 @@ pub fn mesh_glb_with(name: &str, groups: &[NodeGroup], materials: &[Material], s
             if let Some(m) = p.material.filter(|&m| m < mats.len()) {
                 prim["material"] = json!(m);
             }
-            meshes.push(json!({"name": p.name, "primitives": [prim]}));
+            let morphs: Vec<&(String, Vec<[f32; 3]>)> = p.morphs.iter().filter(|m| m.1.len() == p.positions.len()).collect();
+            let mut mesh = json!({"name": p.name, "primitives": [prim]});
+            if !morphs.is_empty() {
+                let targets: Vec<Value> = morphs.iter().map(|m| { let d: Vec<[f32; 3]> = m.1.iter().map(|&v| yup(v)).collect(); json!({"POSITION": b.vec3_sparse(&d)}) }).collect();
+                mesh["primitives"][0]["targets"] = json!(targets);
+                mesh["weights"] = json!(vec![0.0; morphs.len()]);
+                mesh["extras"] = json!({"targetNames": morphs.iter().map(|m| m.0.as_str()).collect::<Vec<_>>()});
+            }
+            meshes.push(mesh);
             let mut nd = json!({"name": p.name, "mesh": meshes.len() - 1});
             if skinned {
                 nd["skin"] = json!(0);
