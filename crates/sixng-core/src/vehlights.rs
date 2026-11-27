@@ -295,7 +295,8 @@ fn light_rows(path: &Path, e: &crate::scan::Entry, names: &HashSet<u32>, ids: &H
 }
 
 /// The light sets of the wanted archetypes, from the cache or a scan of
-/// levels.rpf's meta resources: the first resource that holds one is taken
+/// levels.rpf's meta resources: the first resource (in index order) that
+/// holds one is taken
 /// when it covers them all (it does: the vehicles' light archetypes share a
 /// resource), otherwise every resource is read.
 fn light_table(game_root: &Path, work: &Path, names: &HashSet<u32>, ids: &HashSet<u64>) -> LightTable {
@@ -310,7 +311,7 @@ fn light_table(game_root: &Path, work: &Path, names: &HashSet<u32>, ids: &HashSe
     let Ok(ix) = crate::scan::load_index(&crate::scan::index_path(&work.join("index"), "levels.rpf")) else { return LightTable::default() };
     let es: Vec<&crate::scan::Entry> = ix.entries.iter().filter(|e| e.kind == crate::classify::Kind::Resource && e.sub == "7a").collect();
     let path = game_root.join("levels.rpf");
-    let mut t = LightTable { format: LIGHT_TABLE_FORMAT, complete: false, sets: es.par_iter().find_map_any(|e| light_rows(&path, e, names, ids)).unwrap_or_default() };
+    let mut t = LightTable { format: LIGHT_TABLE_FORMAT, complete: false, sets: es.par_iter().find_map_first(|e| light_rows(&path, e, names, ids)).unwrap_or_default() };
     if !covers(&t) {
         t.sets = es.par_iter().filter_map(|e| light_rows(&path, e, names, ids)).flatten().collect();
         t.complete = true;
@@ -385,7 +386,12 @@ impl Index {
             for (b, a) in &p.archetypes {
                 arch.insert(format!("{b:08x}"), archetype_name(*a));
             }
-            for lamps in p.lamp_sets.values() {
+            // lamp sets by name hash, lowest first: a bone in several sets
+            // takes the lowest set's light, the same on every run (the map's
+            // own order is random per process)
+            let mut sets: Vec<_> = p.lamp_sets.iter().collect();
+            sets.sort_unstable_by_key(|(k, _)| **k);
+            for (_, lamps) in sets {
                 add(lamps, &mut arch);
             }
         }
