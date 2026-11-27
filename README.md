@@ -690,9 +690,14 @@ again**).
     has `specularFactor` = 1 + `fresnel`. The raw maps and their channels
     stay in the material extras (`skin_spec`). The viewer shades skin the
     same way. Not carried: the detail atlases are engine-wide (no mesh
-    binds them), the game scales F0 by a window on the albedo's brightness
-    whose bounds are set per frame (taken as 1), and translucency and
-    occlusion feed only the deferred lighting pass, which is not decoded.
+    binds them), and translucency and occlusion feed only the deferred
+    lighting pass, which is not decoded. Both skin programs also scale F0
+    by a window on the albedo's brightness, `saturate((max(r, g, b) - lo)
+    / (hi - lo))` on the linear albedo. The engine sets the bounds every
+    frame from two constants, sRGB 5 and 20 (linear 0.0015 and 0.0070),
+    the same at any time of day, so only near-black albedo loses its
+    specular and skin keeps all of it. The viewer applies the window; the
+    GLB records it in `extras.skin_spec.albedo_window`.
     The table is built from the `packs.rpf` index on first use and cached as
     `<work>/index/skin_spec.json`.
   - **Fabric shading.** The colour is shaded by the green channel of the

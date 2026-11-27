@@ -2158,6 +2158,10 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     // factor x 100 in bits 16-23
     if ((M.flags.w & 32u) != 0u && (M.flags.w & 256u) == 0u) {
         f0 = vec3(0.04 * f32((M.flags.w >> 16u) & 255u) / 100.0);
+        // the engine's per-frame albedo window: skin darker than sRGB 5..20
+        // (linear 0.0015176..0.0069954) loses its specular, brighter keeps it
+        let amax = max(albedo.r, max(albedo.g, albedo.b));
+        f0 = f0 * clamp((amax - 0.0015176) / (0.0069954 - 0.0015176), 0.0, 1.0);
     }
     // Thin film (pearlescent paint): light mirrored at the top and at the
     // bottom of a film interferes, so the colour of the mirror image turns
