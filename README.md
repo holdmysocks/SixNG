@@ -1535,8 +1535,11 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   coverage-fallback passes, and against each shadow cascade's box. A
   mesh no placement shows is skipped. When culled meshes lie between two
   that would have joined into one draw, the draw still spans them, so
-  the cull never turns one draw into two. The tick line shows the meshes
-  culled per frame as "meshes culled [main, fallbacks, shadows]".
+  the cull never turns one draw into two. Decal and see-through meshes
+  are tested against the view the same way (their sort order is kept;
+  a hidden one between two that would join stays inside the draw). The
+  tick line shows the meshes culled per frame as "meshes culled [main,
+  fb, shadow, late]" (late: decal and see-through).
 - **Map cells** (far placements merged per area): a placement more than
   0.3× the HD distance from the camera can be drawn from its cell instead
   of one by one (`SIXNG_CELLS_NEAR` sets another fraction). The cells are
