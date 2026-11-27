@@ -351,19 +351,29 @@ impl<'a> Meta<'a> {
                 json!((0..n).filter_map(|i| self.value(sd, el, base + i * esz, depth)).collect::<Vec<_>>())
             }
             0x01 => json!(r.sys.get(p).map(|&x| x != 0)),
-            // Map (PSO): u32 count, u32 capacity, u64 pointer to a hash table
-            // struct (control bytes `b8794c89`, slots `93c495af`); only the
+            // Map (PSO): u32 group count, u32 entry count, u64 pointer to
+            // the first of `groups` consecutive hash-table group structs
+            // (16 control bytes `b8794c89`, 16 slots `93c495af`); only the
             // occupied slots ({key, value}) are returned.
             0x75 => {
                 let Some((h, o)) = self.ptr(r.u64(p + 8)) else { return Some(json!([])) };
-                let t = self.object(h, o, depth + 1)?;
-                let (Some(ctrl), Some(slots)) = (t.get(field_name(0xb879_4c89)).and_then(|x| x.as_array()), t.get(field_name(0x93c4_95af)).and_then(|x| x.as_array())) else { return Some(t) };
-                json!(ctrl
-                    .iter()
-                    .zip(slots)
-                    .filter(|(c, _)| c.as_u64().is_some_and(|c| c < 0x80))
-                    .map(|(_, sl)| json!({"key": sl.get(field_name(0x6098_a50e)), "value": sl.get(field_name(0x063f_a3f2))}))
-                    .collect::<Vec<_>>())
+                let size = self.structs.get(&h).map_or(0, |s| s.size as usize);
+                let groups = (r.u32(p) as usize).clamp(1, 4096);
+                let mut out = Vec::new();
+                for g in 0..if size == 0 { 1 } else { groups } {
+                    if g > 0 && o + (g + 1) * size > r.sys.len() {
+                        break;
+                    }
+                    let Some(t) = self.object(h, o + g * size, depth + 1) else { break };
+                    let (Some(ctrl), Some(slots)) = (t.get(field_name(0xb879_4c89)).and_then(|x| x.as_array()), t.get(field_name(0x93c4_95af)).and_then(|x| x.as_array())) else {
+                        if g == 0 {
+                            return Some(t);
+                        }
+                        break;
+                    };
+                    out.extend(ctrl.iter().zip(slots).filter(|(c, _)| c.as_u64().is_some_and(|c| c < 0x80)).map(|(_, sl)| json!({"key": sl.get(field_name(0x6098_a50e)), "value": sl.get(field_name(0x063f_a3f2))})));
+                }
+                json!(out)
             }
             // Map (meta, 24 bytes): u64 1, u64 pool reference, u16 count,
             // u16 capacity. The reference points at `count` consecutive entry
@@ -852,6 +862,34 @@ mod tests {
         assert_eq!(v[&6], serde_json::json!("ab"));
         assert_eq!(v[&7], serde_json::json!(u64::MAX));
         assert!(is_scalar_type(0x01) && !is_scalar_type(0x05) && !is_scalar_type(0x52));
+    }
+
+    #[test]
+    fn pso_map_reads_every_group() {
+        let m = |hash: u32, off: u32, ty: u8, reference: u16, extra: u32| Member { hash, off, ty, sub: 0, reference, extra };
+        let mut structs = HashMap::new();
+        structs.insert(0x100, StructDef { hash: 0x100, size: 8, members: vec![m(0x6098_a50e, 0, 0x4a, 0, 0), m(0x063f_a3f2, 4, 0x21, 0, 0)] });
+        structs.insert(0x101, StructDef { hash: 0x101, size: 144, members: vec![m(0x100, 0, 0x11, 0, 0), m(0xb879_4c89, 0, 0x50, 0, 16), m(0x100, 0, 0x05, 0, 0x100), m(0x93c4_95af, 16, 0x50, 2, 16)] });
+        structs.insert(0xaaaa, StructDef { hash: 0xaaaa, size: 16, members: vec![m(0x1652_fce8, 0, 0x75, 0, 0)] });
+        let mut sys = vec![0u8; 16 + 288];
+        sys[0..4].copy_from_slice(&2u32.to_le_bytes()); // groups
+        sys[4..8].copy_from_slice(&2u32.to_le_bytes()); // entries
+        sys[8..16].copy_from_slice(&2u64.to_le_bytes()); // block 2, offset 0
+        for g in 0..2 {
+            sys[16 + 144 * g..16 + 144 * g + 16].fill(0x80);
+        }
+        let slot = |sys: &mut Vec<u8>, g: usize, i: usize, k: u32, v: f32| {
+            sys[16 + 144 * g + i] = 0x05;
+            let o = 16 + 144 * g + 16 + 8 * i;
+            sys[o..o + 4].copy_from_slice(&k.to_le_bytes());
+            sys[o + 4..o + 8].copy_from_slice(&v.to_le_bytes());
+        };
+        slot(&mut sys, 0, 0, 7, 1.5);
+        slot(&mut sys, 1, 3, 9, 2.5);
+        let r = Resource { sys, gfx: Vec::new(), gfx_base: 0 };
+        let meta = Meta { r: &r, structs, blocks: vec![(0xaaaa, 16, 0), (0x101, 288, 16)], pso: true };
+        let v = meta.object(0xaaaa, 0, 0).unwrap();
+        assert_eq!(v[field_name(0x1652_fce8)], serde_json::json!([{"key": 7, "value": 1.5}, {"key": 9, "value": 2.5}]));
     }
 
     #[test]
