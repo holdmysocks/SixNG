@@ -6601,10 +6601,10 @@ fn bare_tint(m: &mut glb::Model, colour: impl Fn([u8; 4]) -> [u8; 3]) -> bool {
 /// Attached accessories (a watch, a ring) are modelled at their own root
 /// bone (`Watch_Root`, at the authoring origin under the feet) and carry
 /// attach bones under the body's bones (`Watch_L_Wrist` under the wrist)
-/// that no vertex uses. The game moves the root onto an attach bone; do the
-/// same in the bind pose, so the part sits on the body in the merged model.
-/// The left one is taken when there are two. Parts modelled in place (their
-/// vertices are near the bones that move them) are left alone.
+/// that no vertex uses (`sixng_core::outfit::accessory_attach`). The game
+/// moves the root onto an attach bone; do the same in the bind pose, so the
+/// part sits on the body in the merged model. Parts modelled in place
+/// (their vertices are near the bones that move them) are left alone.
 fn place_attached(m: &mut glb::Model) -> Option<usize> {
     use glam::{Mat4, Vec3};
     if m.joints.is_empty() || m.meshes.iter().any(|me| !me.skinned) {
@@ -6621,36 +6621,11 @@ fn place_attached(m: &mut glb::Model) -> Option<usize> {
         }
     }
     let bind = |i: usize| Mat4::from_cols_array(&m.joints[i].ibm).inverse();
-    let pos = |i: usize| bind(i).transform_point3(Vec3::ZERO);
-    let prefix = |i: usize| m.joints[i].name.split('_').next().unwrap_or("").to_string();
-    let first = used.iter().position(|u| *u)?;
-    let pre = prefix(first);
-    // every used bone belongs to the accessory (same name prefix)
-    if pre.is_empty() || ["SKEL", "BM", "MH", "RB", "PH", "GM", "SEC", "FACIAL"].contains(&pre.as_str()) || (0..used.len()).any(|i| used[i] && prefix(i) != pre) {
-        return None;
-    }
-    // its root: the topmost ancestor with that prefix
-    let mut root = first;
-    while let Some(p) = m.joints[root].parent.filter(|&p| prefix(p) == pre) {
-        root = p;
-    }
-    // attach bones: same prefix, unused, not under the root
-    let under_root = |mut i: usize| loop {
-        if i == root {
-            return true;
-        }
-        match m.joints[i].parent {
-            Some(p) => i = p,
-            None => return false,
-        }
-    };
-    let mut attach: Vec<usize> = (0..used.len()).filter(|&i| !used[i] && prefix(i) == pre && !under_root(i)).collect();
-    attach.sort_by_key(|&i| (!m.joints[i].name.contains("_L_"), i));
-    let &at = attach.first()?;
+    let names: Vec<&str> = m.joints.iter().map(|j| j.name.as_str()).collect();
+    let parents: Vec<Option<usize>> = m.joints.iter().map(|j| j.parent).collect();
+    let pos: Vec<[f32; 3]> = (0..m.joints.len()).map(|i| bind(i).transform_point3(Vec3::ZERO).to_array()).collect();
     let c = (Vec3::from(m.bbox[0]) + Vec3::from(m.bbox[1])) * 0.5;
-    if (c - pos(root)).length() > 0.25 || (pos(at) - pos(root)).length() < 0.3 {
-        return None;
-    }
+    let (root, at) = sixng_core::outfit::accessory_attach(&names, &parents, &pos, &used, c.to_array())?;
     let t = bind(at) * bind(root).inverse();
     if !t.is_finite() {
         return None;
