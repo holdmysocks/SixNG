@@ -82,6 +82,9 @@ const TAG_PLACEHOLDER: u32 = 0x023e_5a2f;
 const STATE_BASE: u32 = 0x44e2_1c90;
 const REGISTRY_RECORD: u32 = 0x20e0_f6ed;
 const TYPE_HAIR: i64 = 30;
+/// The registry record's asset type field (named `shaderId` in the
+/// executable's parser table).
+const FIELD_TYPE: u32 = 0x2d49_58cf;
 /// Registry tag list holding the words of the asset's name.
 const PROP_WORDS: u32 = 0xe3da_9c8b;
 /// Fur slots (body, head): tags of animal assets.
@@ -199,24 +202,40 @@ impl HairLinks {
     }
 }
 
-/// The table (built on first use, then cached in the work directory).
+/// The table (built on first use, then cached in the work directory). A
+/// cached inferred table is a fallback, not an answer: each run tries the
+/// stored link again first and replaces the cache when it can be read
+/// (a table inferred once, by a version or on a setup that could not read
+/// it, would otherwise stay in use).
 pub fn get(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry]) -> Result<&'static HairLinks, String> {
     static T: OnceLock<Result<HairLinks, String>> = OnceLock::new();
     T.get_or_init(|| {
         let cache = work.join("index").join("hair_links.json");
         let ixp = crate::scan::index_path(&work.join("index"), &a.id);
         let stamp = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        let save = |t: &HairLinks| {
+            if let Ok(b) = serde_json::to_vec(t) {
+                let _ = crate::atomic::write(&cache, b);
+            }
+        };
         if let Ok(b) = std::fs::read(&cache) {
             if let Ok(t) = serde_json::from_slice::<HairLinks>(&b) {
                 if t.version == CACHE_VERSION && stamp(&cache) >= stamp(&ixp) {
-                    return Ok(t);
+                    if t.exact {
+                        return Ok(t);
+                    }
+                    return Ok(match build_exact(work, a, all) {
+                        Ok(x) => {
+                            save(&x);
+                            x
+                        }
+                        Err(_) => t,
+                    });
                 }
             }
         }
         let t = build(work, a, all).map_err(|e| e.to_string())?;
-        if let Ok(b) = serde_json::to_vec(&t) {
-            let _ = crate::atomic::write(&cache, b);
-        }
+        save(&t);
         Ok(t)
     })
     .as_ref()
@@ -555,7 +574,14 @@ pub fn walk(slots: &[Slot], shapes: &[Shape]) -> Vec<Vec<Placed>> {
 /// A field of a decoded meta object: under its name when the name
 /// dictionary is loaded, under its hash otherwise.
 fn fld<'a>(v: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
-    v.get(name).or_else(|| v.get(format!("{:08x}", crate::names::joaat_exact(name))))
+    v.get(name).or_else(|| fld_h(v, crate::names::joaat_exact(name)))
+}
+
+/// A field by its hash, under the name the dictionaries give it (the JSON
+/// is written with `field_name`, so a hash named later, such as `2d4958cf`
+/// = `shaderId`, no longer appears as hex) or as hex.
+fn fld_h(v: &serde_json::Value, h: u32) -> Option<&serde_json::Value> {
+    v.get(crate::meta7a::field_name(h)).or_else(|| v.get(format!("{h:08x}")))
 }
 
 /// Asset registries: GUID -> (type, name-word hashes), from every PSO file
@@ -583,7 +609,7 @@ pub(crate) fn registry_props(archive: &Path, all: &[crate::scan::Entry], keys: &
                 for o in objs.as_array().into_iter().flatten() {
                     for rec in o.as_object().into_iter().flat_map(|m| m.values()).filter_map(|v| v.as_array()).flatten() {
                         let (Some(key), Some(item)) = (fld(rec, "Key").and_then(|k| k.as_str()), fld(rec, "Item")) else { continue };
-                        if item.get("_struct").and_then(|s| s.as_str()) != Some("20e0f6ed") || item.get("2d4958cf").and_then(|t| t.as_i64()) != Some(TYPE_HAIR) {
+                        if item.get("_struct").and_then(|s| s.as_str()) != Some("20e0f6ed") || fld_h(item, FIELD_TYPE).and_then(|t| t.as_i64()) != Some(TYPE_HAIR) {
                             continue;
                         }
                         let Ok(guid) = u64::from_str_radix(key, 16) else { continue };
@@ -618,7 +644,8 @@ fn wardrobe_tags(archive: &Path, all: &[crate::scan::Entry]) -> HashMap<u64, BTr
             for o in m.objects(ITEM) {
                 let Some(it) = m.object(ITEM, o, 4) else { continue };
                 let tags: Vec<u32> = it
-                    .get("12f85293")
+                    .get(&crate::meta7a::field_name(0x12f8_5293))
+                    .or_else(|| it.get("12f85293"))
                     .and_then(|t| t.as_array())
                     .into_iter()
                     .flatten()
@@ -633,7 +660,7 @@ fn wardrobe_tags(archive: &Path, all: &[crate::scan::Entry]) -> HashMap<u64, BTr
                     if fld(st, "StateName").and_then(|n| n.as_u64()) != Some(STATE_BASE as u64) {
                         continue;
                     }
-                    let Some(g) = st.get("e7cb9e1b").and_then(|x| x.get("41acf8eb")).and_then(|g| g.as_str()).and_then(|g| u64::from_str_radix(g, 16).ok()).filter(|&g| g != 0) else { continue };
+                    let Some(g) = fld_h(st, 0xe7cb_9e1b).and_then(|x| fld_h(x, 0x41ac_f8eb)).and_then(|g| g.as_str()).and_then(|g| u64::from_str_radix(g, 16).ok()).filter(|&g| g != 0) else { continue };
                     out.extend(tags.iter().map(|&t| (g, t)));
                 }
             }
@@ -1064,6 +1091,18 @@ pub fn build_inferred(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The registry's type field is found whether the JSON names it (the
+    /// parser table calls `2d4958cf` `shaderId`) or writes it as hex, and
+    /// so are fields asked for by name.
+    #[test]
+    fn registry_fields_by_hash() {
+        let named = serde_json::json!({ crate::meta7a::field_name(FIELD_TYPE): 30, "Key": "ab" });
+        let hex = serde_json::json!({ "2d4958cf": 30 });
+        assert_eq!(fld_h(&named, FIELD_TYPE).and_then(|t| t.as_i64()), Some(TYPE_HAIR));
+        assert_eq!(fld_h(&hex, FIELD_TYPE).and_then(|t| t.as_i64()), Some(TYPE_HAIR));
+        assert_eq!(fld(&named, "Key").and_then(|k| k.as_str()), Some("ab"));
+    }
 
     #[test]
     fn names() {
