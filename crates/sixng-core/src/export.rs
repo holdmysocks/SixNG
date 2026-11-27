@@ -401,6 +401,22 @@ pub struct ExportOptions {
     /// hidden regions (the part's `_REGION` stream).
     #[serde(default)]
     pub part_hidden: std::collections::HashMap<String, (Vec<String>, Vec<String>)>,
+    /// Layer facts by lower-case drawable name, for hiding the anatomical
+    /// inserts under clothes (`outfit::hide_inserts`).
+    #[serde(default)]
+    pub part_layers: std::collections::HashMap<String, PartLayer>,
+}
+
+/// A worn part's hide-mask layer, its kind and the layers it hides.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PartLayer {
+    pub layer: String,
+    /// An anatomical insert drawn over the body skin (`pedlook::is_skin_insert`).
+    pub insert: bool,
+    /// Clothing or an accessory (not skin, head, eyes or teeth).
+    pub garment: bool,
+    /// Layers this part's hide masks name.
+    pub hides: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4240,7 +4256,7 @@ mod dictionary_tests {
         let a = ArchiveInfo { id: "levels.rpf".into(), path: work.join("levels.rpf"), size: archive.len() as u64, container: "rpf9".into() };
         crate::atomic::write(&a.path, archive).unwrap();
         let o = ExportOptions { out: work.join("out"), png: false, dds: false, raw: false,
-            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_decorations: Default::default(), part_colours: Default::default(), part_hidden: Default::default() };
+            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_decorations: Default::default(), part_colours: Default::default(), part_hidden: Default::default(), part_layers: Default::default() };
         let dir = o.out.join("models/levels").join(export_base_name(&e));
         fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("model.json");

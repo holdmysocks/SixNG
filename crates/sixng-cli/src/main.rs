@@ -158,7 +158,7 @@ impl OutArgs {
                     std::process::exit(2);
                 }
             }),
-            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_decorations: Default::default(), part_colours: Default::default(), part_hidden: Default::default(),
+            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_decorations: Default::default(), part_colours: Default::default(), part_hidden: Default::default(), part_layers: Default::default(),
         }
     }
 }
@@ -1736,6 +1736,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             // it): --parts, --add and the default parts. A garment another
             // part hides regions of is drawn as its `_cull_00` twin.
             let mut hidden: std::collections::HashMap<String, (Vec<String>, Vec<String>)> = Default::default();
+            let mut layers: std::collections::HashMap<String, sixng_core::export::PartLayer> = Default::default();
             if !animal {
                 let name_of = |off: u64| ix.entries.iter().find(|e| e.off == off).and_then(|e| e.name.as_ref()).map(|n| n.to_ascii_lowercase());
                 let mut all = look_outfit.clone();
@@ -1756,6 +1757,11 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     let (own, waist) = sixng_core::pedlook::hidden_masks(&all, i);
                     if !own.is_empty() || !waist.is_empty() {
                         hidden.insert(twins.get(&p.drawable).unwrap_or(&p.drawable).clone(), (own, waist));
+                    }
+                    if let Some(layer) = &p.layer {
+                        let insert = sixng_core::pedlook::is_skin_insert(&p.slot);
+                        let garment = !insert && !matches!(p.slot.as_str(), "body upper" | "body lower" | "head" | "eyes" | "teeth");
+                        layers.insert(twins.get(&p.drawable).unwrap_or(&p.drawable).clone(), sixng_core::export::PartLayer { layer: layer.clone(), insert, garment, hides: p.hides.iter().map(|h| h.0.clone()).collect() });
                     }
                 }
                 let twin_of = sixng_core::outfit::dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
@@ -1885,6 +1891,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 }
             }
             eo.part_hidden = hidden;
+            eo.part_layers = layers;
             for t in tint {
                 let (name, pal, rows) = sixng_core::pedtint::parse_spec(t).map_err(|e| anyhow!(e))?;
                 eo.ped_tints.insert(name, (pal, rows));

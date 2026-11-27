@@ -540,6 +540,159 @@ pub fn add_mover(channels: &mut Vec<AnimChannel>, d: &crate::anim::ClipDictionar
     Some(((p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt(), 2.0 * q[2].atan2(q[3]).to_degrees()))
 }
 
+/// What `hide_inserts` did to one anatomical insert.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InsertHiding {
+    pub part: String,
+    /// Vertices without a region that took the nearest body skin vertex's.
+    pub inherited: usize,
+    /// Triangles hidden by the hide masks of its layer.
+    pub masked: usize,
+    /// Triangles hidden because a garment lies over most of it.
+    pub covered: usize,
+}
+
+/// Keep the anatomical inserts (the genitals, the nipples: skin meshes drawn
+/// over the body skin) under clothes, as the viewer does:
+/// - An insert vertex without a region takes the region of the nearest
+///   vertex of a body skin part of the same layer, so the worn items' hide
+///   masks for that layer (`hidden`, by lower-case part name) hide it with
+///   the skin around it. The male genitals carry no regions at all.
+/// - An insert stands out of the body, so a loose garment (a towel) whose
+///   masks leave the skin under it can still let it through: the insert
+///   goes whole when, for half or more of its vertices, a surface point of
+///   a garment that hides its layer lies within 9 mm of the line along the
+///   vertex normal, from 30 mm inside to 50 mm outside.
+///
+/// `layers` holds the parts' layer facts by lower-case name. By nearness,
+/// not the game's own data.
+pub fn hide_inserts(groups: &mut [NodeGroup], layers: &HashMap<String, crate::export::PartLayer>, hidden: &HashMap<String, (Vec<String>, Vec<String>)>) -> Vec<InsertHiding> {
+    let info = |g: &NodeGroup| layers.get(&g.name.to_ascii_lowercase()).cloned();
+    let inserts: Vec<usize> = (0..groups.len()).filter(|&i| info(&groups[i]).is_some_and(|l| l.insert)).collect();
+    let mut out = Vec::new();
+    for gi in inserts {
+        let Some(me) = info(&groups[gi]) else { continue };
+        let mut res = InsertHiding { part: groups[gi].name.clone(), inherited: 0, masked: 0, covered: 0 };
+        // donors: body skin vertices of the insert's layer that carry a region
+        let donors: Vec<([f32; 3], u8)> = groups
+            .iter()
+            .enumerate()
+            .filter(|(i, g)| *i != gi && info(g).is_some_and(|l| !l.insert && !l.garment && l.layer == me.layer))
+            .flat_map(|(_, g)| &g.prims)
+            .flat_map(|p| p.positions.iter().zip(p.regions.iter().flatten()).filter(|(_, r)| r[0] != 0).map(|(q, r)| (*q, r[0])))
+            .collect();
+        if !donors.is_empty() {
+            for p in &mut groups[gi].prims {
+                let n = p.positions.len();
+                let regions = p.regions.get_or_insert_with(|| vec![[0; 4]; n]);
+                regions.resize(n, [0; 4]);
+                for (q, r) in p.positions.iter().zip(regions.iter_mut()).filter(|(_, r)| r[0] == 0) {
+                    let d = |a: &[f32; 3]| (a[0] - q[0]).powi(2) + (a[1] - q[1]).powi(2) + (a[2] - q[2]).powi(2);
+                    if let Some(z) = donors.iter().min_by(|a, b| d(&a.0).total_cmp(&d(&b.0))).map(|x| x.1) {
+                        r[0] = z;
+                        res.inherited += 1;
+                    }
+                }
+            }
+        }
+        // the hide masks of its layer
+        if let Some((own, _)) = hidden.get(&groups[gi].name.to_ascii_lowercase()) {
+            let hide: Vec<bool> = (0..256u32).map(|n| n != 0 && own.iter().any(|k| crate::wardrobe::mask_has(k, n))).collect();
+            for p in &mut groups[gi].prims {
+                let Some(r) = p.regions.as_ref() else { continue };
+                let gone = |i: u32| r.get(i as usize).is_some_and(|r| hide[r[0] as usize]);
+                let before = p.indices.len();
+                p.indices = p.indices.chunks_exact(3).filter(|t| !t.iter().all(|&i| gone(i))).flatten().copied().collect();
+                res.masked += (before - p.indices.len()) / 3;
+            }
+        }
+        // a garment over most of it
+        let grid = {
+            let cover: Vec<&TriPrim> = groups.iter().enumerate().filter(|(i, g)| *i != gi && info(g).is_some_and(|l| l.garment && l.hides.contains(&me.layer))).flat_map(|(_, g)| &g.prims).collect();
+            CoverGrid::new(&cover)
+        };
+        if let Some(grid) = grid {
+            let (mut n, mut hit) = (0usize, 0usize);
+            for p in &groups[gi].prims {
+                let Some(nrm) = p.normals.as_ref() else { continue };
+                for (q, v) in p.positions.iter().zip(nrm) {
+                    n += 1;
+                    hit += grid.covered(*q, *v, 0.03) as usize;
+                }
+            }
+            if n > 0 && hit * 2 >= n {
+                for p in &mut groups[gi].prims {
+                    res.covered += p.indices.len() / 3;
+                    p.indices.clear();
+                }
+            }
+        }
+        out.push(res);
+    }
+    out
+}
+
+/// Points on garment surfaces, about 8 mm apart, in 2 cm cells.
+struct CoverGrid {
+    grid: HashMap<(i32, i32, i32), Vec<[f32; 3]>>,
+}
+
+impl CoverGrid {
+    const CELL: f32 = 0.02;
+    const STEP: f32 = 0.008;
+
+    fn key(p: [f32; 3]) -> (i32, i32, i32) {
+        ((p[0] / Self::CELL).floor() as i32, (p[1] / Self::CELL).floor() as i32, (p[2] / Self::CELL).floor() as i32)
+    }
+
+    /// None when the primitives have no triangles.
+    fn new(prims: &[&TriPrim]) -> Option<CoverGrid> {
+        let mut grid: HashMap<(i32, i32, i32), Vec<[f32; 3]>> = HashMap::new();
+        let len = |a: [f32; 3], b: [f32; 3]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+        for p in prims {
+            for t in p.indices.chunks_exact(3) {
+                let (Some(&a), Some(&b), Some(&c)) = (p.positions.get(t[0] as usize), p.positions.get(t[1] as usize), p.positions.get(t[2] as usize)) else { continue };
+                let n = ((len(a, b).max(len(a, c)).max(len(b, c)) / Self::STEP).ceil() as usize).clamp(1, 40);
+                for i in 0..=n {
+                    for j in 0..=(n - i) {
+                        let (u, v) = (i as f32 / n as f32, j as f32 / n as f32);
+                        let q: [f32; 3] = std::array::from_fn(|k| a[k] + (b[k] - a[k]) * u + (c[k] - a[k]) * v);
+                        grid.entry(Self::key(q)).or_default().push(q);
+                    }
+                }
+            }
+        }
+        (!grid.is_empty()).then_some(CoverGrid { grid })
+    }
+
+    /// A garment surface point within 9 mm of the line through `p` along
+    /// `n`, between `inside` inside and 50 mm outside.
+    fn covered(&self, p: [f32; 3], n: [f32; 3], inside: f32) -> bool {
+        let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        if l < 1e-6 {
+            return false;
+        }
+        let n = n.map(|x| x / l);
+        let k = Self::key(p);
+        for x in -3..=3 {
+            for y in -3..=3 {
+                for z in -3..=3 {
+                    let Some(v) = self.grid.get(&(k.0 + x, k.1 + y, k.2 + z)) else { continue };
+                    for g in v {
+                        let d = [g[0] - p[0], g[1] - p[1], g[2] - p[2]];
+                        let along = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
+                        let side = [d[0] - n[0] * along, d[1] - n[1] * along, d[2] - n[2] * along];
+                        if (-inside..=0.05).contains(&along) && side[0] * side[0] + side[1] * side[1] + side[2] * side[2] < 0.009 * 0.009 {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
 /// Write one rigged GLB of `parts` (LOD0) at `out`. Textures go to
 /// `<out folder>/textures/`. Each clip becomes one glTF animation, named
 /// `<dictionary>/<clip>`. With `anim_only` the GLB holds the skeleton and
@@ -602,6 +755,14 @@ pub fn export_outfit(a: &ArchiveInfo, parts: &[&Entry], name: &str, out: &Path, 
         }));
         part_joints.push(if skinned { b.joints } else { Vec::new() });
         groups.push(NodeGroup { name: pname, prims });
+    }
+    let inserts = hide_inserts(&mut groups, &o.part_layers, &o.part_hidden);
+    for (r, g) in reports.iter_mut().zip(&groups) {
+        if let Some(x) = inserts.iter().find(|x| x.part == g.name) {
+            r["hidden_triangles"] = (r["hidden_triangles"].as_u64().unwrap_or(0) + (x.masked + x.covered) as u64).into();
+            r["insert"] = serde_json::json!({"regions_inherited": x.inherited, "masked_triangles": x.masked, "covered_triangles": x.covered});
+            r["triangles"] = g.prims.iter().map(|p| p.indices.len() / 3).sum::<usize>().into();
+        }
     }
     let (joints, maps) = merge_skeletons(&part_joints);
     for (g, map) in groups.iter_mut().zip(&maps) {
@@ -714,6 +875,36 @@ mod tests {
         assert_eq!(p.joints.unwrap(), [[4, 3, 1, u16::MAX], [0, 0, 0, 0]]);
     }
 
+    /// An insert without regions takes the nearest body skin region of its
+    /// layer and goes with it; a loose garment over another insert hides
+    /// that one whole.
+    #[test]
+    fn inserts_stay_under_clothes() {
+        use crate::export::PartLayer;
+        let tri = |name: &str, z: f32, region: Option<u8>| NodeGroup {
+            name: name.into(),
+            prims: vec![TriPrim {
+                name: "p".into(), positions: vec![[0.0, 0.0, z], [0.01, 0.0, z], [0.0, 0.01, z]], normals: Some(vec![[0.0, 0.0, 1.0]; 3]), tangents: None, uvs: vec![], colors: None, colors1: None,
+                regions: region.map(|r| vec![[r, 0, 0, 0]; 3]), tint: None, indices: vec![0, 1, 2], material: None, joints: None, weights: None, joints1: None, weights1: None, morphs: Vec::new(),
+            }],
+        };
+        let layer = |l: &str, insert: bool, garment: bool, hides: &[&str]| PartLayer { layer: l.into(), insert, garment, hides: hides.iter().map(|h| h.to_string()).collect() };
+        // masked: region 5 of layer "low" is hidden for the insert
+        let mut groups = vec![tri("skin", 0.0, Some(5)), tri("genitals", 0.005, None)];
+        let layers = HashMap::from([("skin".to_string(), layer("low", false, false, &[])), ("genitals".to_string(), layer("low", true, false, &[]))]);
+        let hidden = HashMap::from([("genitals".to_string(), (vec!["10".to_string()], vec![]))]);
+        let r = hide_inserts(&mut groups, &layers, &hidden);
+        assert_eq!(r, [InsertHiding { part: "genitals".into(), inherited: 3, masked: 1, covered: 0 }]);
+        assert!(groups[1].prims[0].indices.is_empty() && !groups[0].prims[0].indices.is_empty());
+        // covered: a towel 2 cm out that hides layer "low", masks leave the skin
+        let mut groups = vec![tri("skin", 0.0, Some(5)), tri("genitals", 0.005, None), tri("towel", 0.025, None)];
+        let mut layers = layers;
+        layers.insert("towel".into(), layer("top", false, true, &["low"]));
+        let r = hide_inserts(&mut groups, &layers, &HashMap::new());
+        assert_eq!(r[0].covered, 1);
+        assert!(groups[1].prims[0].indices.is_empty() && !groups[2].prims[0].indices.is_empty());
+    }
+
     #[test]
     fn default_parts() {
         let opts = |names: &[&str]| {
@@ -750,7 +941,7 @@ mod tests {
         let parts = outfit_parts(&ix, "player_story000_00");
         assert!(parts.len() >= 5, "{} parts", parts.len());
         let out = std::env::temp_dir().join("sixng_outfit_real").join("outfit.glb");
-        let o = ExportOptions { out: out.parent().unwrap().into(), png: false, dds: false, raw: false, force: true, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_decorations: Default::default(), part_colours: Default::default(), part_hidden: Default::default() };
+        let o = ExportOptions { out: out.parent().unwrap().into(), png: false, dds: false, raw: false, force: true, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_decorations: Default::default(), part_colours: Default::default(), part_hidden: Default::default(), part_layers: Default::default() };
         let r = export_outfit(&a, &parts, "player_story000_00", &out, &o, &[(&d, clip)], false, false).unwrap();
         println!("{}", serde_json::to_string_pretty(&r).unwrap());
         assert_eq!(r["unresolved_influences"], 0);

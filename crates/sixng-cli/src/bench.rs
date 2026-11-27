@@ -327,7 +327,7 @@ fn models(indexes: &[(ArchiveInfo, ArchiveIndex)], a: &BenchArgs) -> Result<Valu
         ped_tints: Default::default(),
         part_skins: Default::default(), part_decorations: Default::default(),
         part_colours: Default::default(),
-        part_hidden: Default::default(),
+        part_hidden: Default::default(), part_layers: Default::default(),
     };
     let t = Instant::now();
     let items = export::export_many(ar, &sel, &o, export::no_progress())?;
