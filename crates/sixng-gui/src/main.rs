@@ -1991,6 +1991,7 @@ impl App {
         m.livery.ed.auto_click = c.get("livery-click").map(pairs).unwrap_or_default();
         m.livery.ed.auto_drag = c.get("livery-drag").map(pairs).and_then(|v| v.first().copied());
         m.livery.ed.auto_save = c.has("livery-save");
+        m.livery.ed.auto_brand = c.get("livery-brand").map(str::to_string);
         if let Some(t) = c.get("livery-tool") {
             m.livery.ed.tool = match t {
                 "zones" => crate::livery_ui::Tool::Zones,

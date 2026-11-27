@@ -17,10 +17,22 @@
 //! where its transformed UV is between 0 and 1; the size acts as a scale
 //! (a larger number is a smaller sticker).
 //!
-//! Not decoded: the exact map from a layout's position to the sticker's
-//! place in UV space (about: a constant per panel group minus half the
-//! position), what the layout's `Location`, `80c88a97` and `9f8b8007` mean,
-//! and how the game picks a brand for a vehicle.
+//! Where a sticker lands (`game_uv`, read from the game's packer, rva
+//! 0x37766a0 at 0x3777c97): the shader's transform is a 3 x 3 matrix
+//! applied to the mesh UV as a row vector, built as: translate by the
+//! layout's position, rotate about (0.5, 0.5) by its rotation, scale about
+//! (0.5, 0.5) by its size divided by a random factor from the sticker
+//! record. The shader draws where the result is between 0 and 1. The
+//! layout's UV mode k (1..4) picks the mesh's UV set k - 1 (the paint
+//! shader reads the record's first byte at 00d78-00dcc); most use the
+//! third set. A layout names zones only; on a vehicle built from parts they
+//! may lie on a fitted part (the Benson's box) rather than the body.
+//!
+//! Not decoded: why some layouts name zones no vertex of the vehicle or
+//! its parts carries (Buffalo gang liveries: 93-99; Rhode: 252, 253);
+//! what the layout's `Location`, `80c88a97` and `9f8b8007`
+//! mean (the game packs `80c88a97` beside the UV mode), and how the game
+//! picks a brand for a vehicle.
 
 use crate::meta7a::{self, Meta};
 use crate::resource::Resource;
@@ -55,7 +67,14 @@ const GROUP_LAYOUTS: u32 = 0xc19c_0de4;
 const ROOT_GROUPS: u32 = 0x3274_d53f;
 const LAYOUT_ZONES: u32 = 0x20b7_57b6;
 const LAYOUT_POS: [u32; 2] = [0x26ba_b388, 0x79dd_59cc];
-const LAYOUT_SIZE: [u32; 2] = [0x8eed_562c, 0x9d2f_f2b1];
+/// The size across and down: the game reads `9d2ff2b1` (+0xc) as the scale
+/// of U and `8eed562c` (+0xe) as that of V.
+const LAYOUT_SIZE: [u32; 2] = [0x9d2f_f2b1, 0x8eed_562c];
+/// A sticker record's random ranges (f16, +0x38 and +0x3a): the size is
+/// divided by lerp(`9a8a7565`, 1, r) and the rotation moves by up to
+/// `27cf98d0` degrees either way, r drawn per vehicle.
+const STICKER_SCALE_LO: u32 = 0x9a8a_7565;
+const STICKER_TURN: u32 = 0x27cf_98d0;
 const LAYOUT_ASPECT: u32 = 0x041e_bd1d;
 const LAYOUT_UV: u32 = 0x4d76_3aa5;
 const LAYOUT_OTHER: [u32; 2] = [0x80c8_8a97, 0x9f8b_8007];
@@ -178,6 +197,20 @@ fn layout_json(l: &Value) -> Value {
     })
 }
 
+/// The game's UV transform of a placed sticker: (a, b, c, d, ou, ov), the
+/// shader drawing it where u = U*a + V*b + ou and v = U*c + V*d + ov lie
+/// in 0..1 (U, V: the mesh UV of the layout's set). `r`: the game's
+/// per-vehicle random draws (0..1) for the scale and the turn; 0.5 is the
+/// middle of both ranges (no turn).
+pub fn game_uv(pos: [f32; 2], size: [f32; 2], degrees: f32, scale_lo: f32, turn: f32, r: [f32; 2]) -> [f32; 6] {
+    let k = scale_lo + (1.0 - scale_lo) * r[0];
+    let (sx, sy) = (size[0] / k, size[1] / k);
+    let a = (degrees + turn * (2.0 * r[1] - 1.0)).to_radians();
+    let (s, c) = a.sin_cos();
+    let (px, py) = (pos[0] - 0.5, pos[1] - 0.5);
+    [sx * c, -sx * s, sy * s, sy * c, sx * (c * px - s * py) + 0.5, sy * (s * px + c * py) + 0.5]
+}
+
 /// A texture id as stored in a sticker record (hex, with or without `0x`).
 pub fn parse_texture_id(s: &str) -> Option<u64> {
     u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
@@ -261,9 +294,11 @@ pub fn export_stickers(ws: &crate::export::Workspace, out: &std::path::Path, tex
     Ok(stats)
 }
 
-/// Write `<out>/vehicles/liveries.json`: per vehicle its brands, each with
-/// the stickers it places. `models`: joaat -> model name.
-pub fn build(ws: &crate::export::Workspace, models: &HashMap<u32, String>, out: &std::path::Path) -> Result<Value> {
+/// Per vehicle its brands, each with the stickers it places (see `build`),
+/// and the counts of layout groups, layouts and sticker records read.
+/// `models`: joaat -> model name; a vehicle not in it is keyed by its
+/// name hash (8 hex digits).
+pub fn liveries(ws: &crate::export::Workspace, models: &HashMap<u32, String>) -> Result<(BTreeMap<String, Vec<Value>>, [usize; 3])> {
     let library = metas(ws, "data")?;
     let packs = metas(ws, "packs")?;
     let groups = layouts(ws)?;
@@ -308,6 +343,12 @@ pub fn build(ws: &crate::export::Workspace, models: &HashMap<u32, String>, out: 
                     let (sticker, group, layout) = (u(named(e, "sticker")), u(get(e, ENTRY_GROUP)), u(named(e, "layout")));
                     let s = r.stickers.get(&sticker).or_else(|| stickers.get(&sticker).copied());
                     let l = groups.get(&group).and_then(|g| g.get(&layout));
+                    let f = |v: Option<&Value>, h: u32| v.and_then(|v| get(v, h)).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+                    let uv = l.map(|l| {
+                        let lo = s.and_then(|s| get(s, STICKER_SCALE_LO)).and_then(|x| x.as_f64()).unwrap_or(1.0) as f32;
+                        let deg = cased(l, "Rotation").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+                        game_uv([f(Some(l), LAYOUT_POS[0]), f(Some(l), LAYOUT_POS[1])], [f(Some(l), LAYOUT_SIZE[0]), f(Some(l), LAYOUT_SIZE[1])], deg, lo, f(s, STICKER_TURN), [0.5, 0.5])
+                    });
                     placed.push(json!({
                         "part": hex(*part),
                         "sticker": hex(sticker),
@@ -317,6 +358,10 @@ pub fn build(ws: &crate::export::Workspace, models: &HashMap<u32, String>, out: 
                         "group": hex(group),
                         "layout_name": hex(layout),
                         "layout": l.map(layout_json),
+                        "mask": s.and_then(|s| get(s, STICKER_MASK)).and_then(|x| x.as_bool()),
+                        "scale_lo": s.and_then(|s| get(s, STICKER_SCALE_LO)).and_then(|x| x.as_f64()),
+                        "turn": s.and_then(|s| get(s, STICKER_TURN)).and_then(|x| x.as_f64()),
+                        "uv": uv,
                     }));
                 }
             }
@@ -332,15 +377,22 @@ pub fn build(ws: &crate::export::Workspace, models: &HashMap<u32, String>, out: 
         b.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()).then(a["brand"].as_str().cmp(&b["brand"].as_str())));
         b.dedup_by(|a, b| a["brand"] == b["brand"]);
     }
+    Ok((vehicles, [groups.len(), groups.values().map(|g| g.len()).sum::<usize>(), stickers.len()]))
+}
+
+/// Write `<out>/vehicles/liveries.json`: per vehicle its brands, each with
+/// the stickers it places. `models`: joaat -> model name.
+pub fn build(ws: &crate::export::Workspace, models: &HashMap<u32, String>, out: &std::path::Path) -> Result<Value> {
+    let (vehicles, [n_groups, n_layouts, n_records]) = liveries(ws, models)?;
     // counted once per vehicle: a vehicle's records can sit in two packs
     let all = || vehicles.values().flatten();
     let n_brands = all().count();
     let n_stickers: usize = all().map(|b| b["stickers"].as_array().map_or(0, |s| s.len())).sum();
     let n_unplaced = all().flat_map(|b| b["stickers"].as_array().into_iter().flatten()).filter(|s| s["layout"].is_null()).count();
-    let stats = json!({"vehicles": vehicles.len(), "brands": n_brands, "stickers": n_stickers, "without_layout": n_unplaced, "layout_groups": groups.len(), "layouts": groups.values().map(|g| g.len()).sum::<usize>(), "sticker_records": stickers.len()});
+    let stats = json!({"vehicles": vehicles.len(), "brands": n_brands, "stickers": n_stickers, "without_layout": n_unplaced, "layout_groups": n_groups, "layouts": n_layouts, "sticker_records": n_records});
     let doc = json!({
-        "format": 2,
-        "note": "Vehicle liveries. Per vehicle its brands (variation records whose parts place stickers), each with its stickers: the part that carries the entry, the sticker record, its texture (64-bit id in the vehicle texture stores), colours (ARGB as stored: colorRed, colorGreen and colorBlue, the colours of the texture's red, green and blue mask channels; 00000000 where a channel has none) and other_colour (a fourth stored colour, use not known), and the layout: zones = the sticker zones it covers (a vertex's zone is the fourth byte of the mesh's second colour stream, GLB _COLOR1), position and size as stored, rotation in degrees, uv_mode (1 = first UV set, 3 = second, 4 = third; 0 and 2 = the second half of the first), aspect (0 square, 1 two to one, 2 four to one). The size acts as a scale: a larger number is a smaller sticker. The exact map from position to UV space is not decoded (about: a constant per panel group minus half the position); location and other are not understood. A brand also lists the stickers of its parent variations. How the game picks a brand for a vehicle is not known.",
+        "format": 3,
+        "note": "Vehicle liveries. Per vehicle its brands (variation records whose parts place stickers), each with its stickers: the part that carries the entry, the sticker record, its texture (64-bit id in the vehicle texture stores), colours (ARGB as stored: colorRed, colorGreen and colorBlue, the colours of the texture's red, green and blue mask channels; 00000000 where a channel has none) and other_colour (a fourth stored colour, use not known), and the layout: zones = the sticker zones it covers (a vertex's zone is the fourth byte of the mesh's second colour stream, GLB _COLOR1), position and size as stored, rotation in degrees, uv_mode (k = 1..4: the mesh's UV set k - 1, as the paint shader picks it; 3, the third set, for most), aspect (0 square, 1 two to one, 2 four to one). size is (U, V): the game reads 9d2ff2b1 as U's and 8eed562c as V's. uv = the game's transform (a, b, c, d, ou, ov): the sticker is drawn where u = U*a + V*b + ou and v = U*c + V*d + ov lie in 0..1, built as translate by the position, rotate about (0.5, 0.5), scale about (0.5, 0.5) by size / lerp(scale_lo, 1, r), the rotation moved by turn * (2r' - 1) degrees; r and r' are per-vehicle random draws, taken as 0.5 here (game packer rva 0x37766a0). mask: the picture is a colour mask. location and other are not understood. A brand also lists the stickers of its parent variations. How the game picks a brand for a vehicle is not known.",
         "stats": stats,
         "vehicles": vehicles,
     });
@@ -357,5 +409,22 @@ mod tests {
         assert_eq!(super::parse_texture_id("112afea77897b738"), Some(0x112a_fea7_7897_b738));
         assert_eq!(super::parse_texture_id(" 0x10 "), Some(16));
         assert_eq!(super::parse_texture_id("zz"), None);
+    }
+
+    #[test]
+    fn game_uv_translates_rotates_and_scales_about_the_middle() {
+        let near = |a: [f32; 6], b: [f32; 6]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5);
+        // nothing moved: the mesh UV itself
+        assert!(near(super::game_uv([0.0, 0.0], [1.0, 1.0], 0.0, 1.0, 0.0, [0.5, 0.5]), [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]));
+        // the sticker's middle (0.5, 0.5) lies at mesh UV 0.5 - position,
+        // whatever the size and turn
+        let m = super::game_uv([0.2, -0.1], [3.0, 2.0], 30.0, 1.0, 0.0, [0.5, 0.5]);
+        let (u, v) = (0.3, 0.6);
+        assert!((u * m[0] + v * m[1] + m[4] - 0.5).abs() < 1e-5 && (u * m[2] + v * m[3] + m[5] - 0.5).abs() < 1e-5);
+        // a quarter turn, size 2 in U: U goes to v, V to -u, twice as fast in u
+        assert!(near(super::game_uv([0.0, 0.0], [2.0, 1.0], 90.0, 1.0, 0.0, [0.5, 0.5]), [0.0, -2.0, 1.0, 0.0, 1.5, 0.0]));
+        // the random factor: size / lerp(lo, 1, r); the turn: +-turn
+        assert!(near(super::game_uv([0.0, 0.0], [1.0, 1.0], 0.0, 0.5, 0.0, [0.0, 0.5]), [2.0, 0.0, 0.0, 2.0, -0.5, -0.5]));
+        assert!(near(super::game_uv([0.0, 0.0], [1.0, 1.0], 0.0, 1.0, 90.0, [0.5, 1.0]), super::game_uv([0.0, 0.0], [1.0, 1.0], 90.0, 1.0, 0.0, [0.5, 0.5])));
     }
 }
