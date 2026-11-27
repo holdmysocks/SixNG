@@ -43,6 +43,7 @@ pub mod gamenames;
 pub mod texusers;
 pub mod facecontrols;
 pub mod facegraph;
+pub mod jawkeys;
 pub mod headdelta;
 pub mod meta7a;
 pub mod names;

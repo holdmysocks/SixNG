@@ -8,7 +8,10 @@
 //! Every point of a piece carries:
 //! - `TEXCOORD_0`: the strand's root UV (the barycentric blend of its
 //!   three guides' root UVs; the same for every point of the strand),
-//! - `_WIDTH`: the strand's width (metres) at that point,
+//! - `_WIDTH`: the strand's width (metres) at that point: with the game's
+//!   strand tables, the width and thickness curve of the strand variant's
+//!   parameter ramp (`slot_params`), as the viewer draws it; else the
+//!   groom's stored width and taper,
 //! - `_CLUMP`: the strand's clump (1-based; 0 = a scattered strand),
 //! - `_VARIANT`: the strand's colour variant 0-3 (which of the four colour
 //!   ramps of its colour set the game's strand shader takes),
@@ -131,10 +134,33 @@ pub fn slot_colour(outfit: &crate::pedlook::Outfit, slot: &str, tables: Option<&
     (!v[0].flag).then(|| (HairColour::Presets(Box::new(v)), p))
 }
 
+/// Parameter set per hair slot for a piece whose hair asset names none
+/// (each asset names its own, `hairsets`): the sets one character's assets
+/// name.
+pub const DEFAULT_PARAMSETS: [(&str, &str); 3] = [("hair", "Long_HighGloss_000"), ("brows", "Eyebrows_MidGloss_000"), ("lashes", "Eyelashes_HighGloss_002")];
+
+/// The strand parameter set of a slot, as the viewer picks it: the one the
+/// hair asset `guid` names (`hairsets`), else the slot's default
+/// (`DEFAULT_PARAMSETS`). Returns the set's name hash.
+pub fn slot_param_set(sets: &crate::hairsets::AssetSets, guid: Option<&str>, slot: &str) -> Option<u32> {
+    let asset = guid.and_then(|g| u64::from_str_radix(g, 16).ok()).and_then(|g| sets.of(g)).map(|s| s.param).filter(|&p| p != 0);
+    asset.or_else(|| DEFAULT_PARAMSETS.iter().find(|d| d.0 == slot).map(|d| crate::meta7a::joaat(&d.1.to_ascii_lowercase())))
+}
+
+/// Width (metres) of a strand of variant `variant` at `t` along it (0 root,
+/// 1 tip) by its parameter ramp: the ramp's width times its thickness
+/// curve (at least 5 %), as the viewer draws it.
+pub fn ramp_width(params: &[crate::hairtone::ParamRamp; 4], variant: u8, t: f32) -> f32 {
+    let r = &params[(variant & 3) as usize];
+    r.width * r.at(t)[3].max(0.05)
+}
+
 /// Strands of one piece as a `StrandPrim`: `points` are n strands of `k`
-/// points; `uv`, `clump` and `variant` one value per strand.
+/// points; `uv`, `clump` and `variant` one value per strand. With `params`
+/// the width along each strand is its variant's (`ramp_width`), else the
+/// groom's (`Groom::width_at`).
 #[allow(clippy::too_many_arguments)]
-fn prim(g: &Groom, name: String, k: usize, points: &[[f32; 3]], uv: &[[f32; 2]], clump: &[u32], variant: &[u8], colour: Option<&HairColour>, o: &Options, extras: Value) -> StrandPrim {
+fn prim(g: &Groom, name: String, k: usize, points: &[[f32; 3]], uv: &[[f32; 2]], clump: &[u32], variant: &[u8], colour: Option<&HairColour>, params: Option<&[crate::hairtone::ParamRamp; 4]>, o: &Options, extras: Value) -> StrandPrim {
     let n = if k == 0 { 0 } else { points.len() / k };
     let kk = if o.points >= 2 { o.points } else { k };
     let mut pos = Vec::with_capacity(n * kk);
@@ -148,12 +174,16 @@ fn prim(g: &Groom, name: String, k: usize, points: &[[f32; 3]], uv: &[[f32; 2]],
             pos.extend(resample(src, kk));
         }
         for j in 0..kk {
-            width.push(g.width_at(j, kk));
+            let t = j as f32 / (kk.max(2) - 1) as f32;
+            width.push(match params {
+                Some(p) => ramp_width(p, variant.get(s).copied().unwrap_or(0), t),
+                None => g.width_at(j, kk),
+            });
             uvs.push(uv.get(s).copied().unwrap_or([0.0, 0.0]));
             cl.push(clump.get(s).copied().unwrap_or(0) as f32);
             var.push(variant.get(s).copied().unwrap_or(0) as f32);
             if let Some(c) = colour {
-                let v = c.at(variant.get(s).copied().unwrap_or(0), j as f32 / (kk.max(2) - 1) as f32);
+                let v = c.at(variant.get(s).copied().unwrap_or(0), t);
                 col.push([v[0], v[1], v[2], 1.0]);
             }
         }
@@ -200,6 +230,12 @@ pub fn coat_uvs(g: &Groom, c: &Coat) -> Vec<[f32; 2]> {
 /// guides). Returns the pieces and a summary
 /// (strands written, stored, guides, points pressed).
 pub fn piece(g: &Groom, name: &str, o: &Options, colour: Option<&HairColour>, hat: Option<&Shell>, extras: Value) -> (Vec<StrandPrim>, Value) {
+    piece_with(g, name, o, colour, None, hat, extras)
+}
+
+/// `piece`, with the grown strands' widths from the parameter ramps of
+/// their variants (`ramp_width`) when `params` is given.
+pub fn piece_with(g: &Groom, name: &str, o: &Options, colour: Option<&HairColour>, params: Option<&[crate::hairtone::ParamRamp; 4]>, hat: Option<&Shell>, extras: Value) -> (Vec<StrandPrim>, Value) {
     let k = g.points_per_strand;
     let mut out = Vec::new();
     let mut pressed = 0;
@@ -223,15 +259,15 @@ pub fn piece(g: &Groom, name: &str, o: &Options, colour: Option<&HairColour>, ha
     ex["grown"] = json!(grown);
     if grown {
         ex["share"] = json!(sh);
-        out.push(prim(g, name.to_string(), k, &coat.points, &coat_uvs(g, &coat), &coat.clumps, &coat.variants, colour, o, ex));
+        out.push(prim(g, name.to_string(), k, &coat.points, &coat_uvs(g, &coat), &coat.clumps, &coat.variants, colour, params, o, ex));
     } else {
         // nothing stored to grow from: the guides are the hair
-        out.push(prim(g, name.to_string(), k, &g.points, &g.root_uv, &[], &[], colour, o, ex));
+        out.push(prim(g, name.to_string(), k, &g.points, &g.root_uv, &[], &[], colour, params, o, ex));
     }
     if o.guides && grown {
         let mut ex = extras;
         ex["guides"] = json!(true);
-        out.push(prim(g, format!("{name}_guides"), k, &g.points, &g.root_uv, &[], &[], None, o, ex));
+        out.push(prim(g, format!("{name}_guides"), k, &g.points, &g.root_uv, &[], &[], None, params, o, ex));
     }
     let summary = json!({"name": name, "written": if grown { coat.guides.len() } else { g.strands }, "stored": g.stored_strands(), "guides": g.strands,
         "points_per_strand": if o.points >= 2 { o.points } else { k }, "grown": grown, "hat_pressed": hat.map(|_| pressed)});
@@ -496,6 +532,17 @@ mod tests {
         assert_eq!(c.colour[s0 * 3 + 2], [0.0, 0.0, 1.0, 1.0]);
         assert_eq!(p.len(), 1);
         assert!(s["written"].as_u64().unwrap() <= 11);
+        // with a parameter set: each strand's width along it from its variant's ramp
+        let flat = [0.0, 1.0, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let taper = [0.0, 1.0, 0.33, 1.0, 0.66, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
+        let ramp = |w: f32, a: [f32; 20]| crate::hairtone::ParamRamp { width: w, mul: [1.0; 3], curves: [a, flat, flat, flat] };
+        let ps = [ramp(0.0002, taper), ramp(0.0001, flat), ramp(0.0001, flat), ramp(0.0001, flat)];
+        let (p, _) = piece_with(&g, "t", &Options { points: 3, guides: false, ..Default::default() }, None, Some(&ps), None, json!({}));
+        let (var, wid) = (&p[0].attrs.iter().find(|a| a.0 == "_VARIANT").unwrap().1, &p[0].attrs.iter().find(|a| a.0 == "_WIDTH").unwrap().1);
+        let s0 = (0..wid.len() / 3).find(|&s| var[s * 3] == 0.0).unwrap();
+        assert!((wid[s0 * 3] - 0.0002).abs() < 1e-7 && wid[s0 * 3 + 2] < 0.00002, "{:?}", &wid[s0 * 3..s0 * 3 + 3]);
+        let s1 = (0..wid.len() / 3).find(|&s| var[s * 3] != 0.0).unwrap();
+        assert!((wid[s1 * 3 + 2] - 0.0001).abs() < 1e-7);
         let glb = crate::gltf::strands_glb("t", &p, json!({}));
         assert_eq!(&glb[0..4], b"glTF");
         // under a hat (a dome of 5 cm): every point above its rim, guide or

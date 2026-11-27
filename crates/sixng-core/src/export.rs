@@ -2058,7 +2058,12 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
                 .then(|| st.entries.iter().find(|t| t["param_hash"] == crate::skinspec::SLOT_SPEC).and_then(|t| t["png"].as_str()))
                 .flatten()
                 .and_then(|p| crate::skinspec::write_occlusion_png(&o.out, p));
-            crate::skinspec::apply_gltf(&mut m.gltf, &mut m.extras, &s.name_hash, &st.entries, &k, detail, occ.as_deref());
+            // translucency through the skin_default profile (absent where no pixel is translucent)
+            let sss = (o.png && crate::skinspec::SKIN_SHADERS.contains(&s.name_hash.as_str()))
+                .then(|| st.entries.iter().find(|t| t["param_hash"] == crate::skinspec::SLOT_SPEC).and_then(|t| t["png"].as_str()))
+                .flatten()
+                .and_then(|p| crate::skinspec::write_translucency_png(&o.out, p, k.translucency_bias.unwrap_or(0.0), &crate::skinspec::SKIN_DEFAULT));
+            crate::skinspec::apply_gltf(&mut m.gltf, &mut m.extras, &s.name_hash, &st.entries, &k, detail, occ.as_deref(), sss.as_deref());
         }
     }
     if let (Some(o), Some(f)) = (part_looks.as_object_mut(), part_set.as_ref().and_then(|(_, parts)| crate::vehcolour::paint_finish(parts, mat_blend, &part_id_counts.borrow()))) {

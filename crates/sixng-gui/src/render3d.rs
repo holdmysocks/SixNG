@@ -502,6 +502,10 @@ pub struct GpuMesh {
 
 pub struct GpuModel {
     pub meshes: Vec<GpuMesh>,
+    /// Mesh indices in the order their indices sit in the shared buffer
+    /// (`draw_order`): drawing in this order puts meshes of one material
+    /// next to each other, so they join into one draw.
+    pub order: Vec<usize>,
     pub mat_bg: Vec<wgpu::BindGroup>,
     pub mat_alpha: Vec<u32>,
     pub mat_class: Vec<u32>,
@@ -557,6 +561,35 @@ impl GpuModel {
     pub fn n_normal(&self) -> u32 {
         self.n_instances - self.n_fb.min(self.n_instances)
     }
+
+    /// The meshes in buffer order (see `order`).
+    pub fn ordered(&self) -> impl Iterator<Item = &GpuMesh> {
+        self.order.iter().filter_map(|&i| self.meshes.get(i))
+    }
+}
+
+/// Which pass draws a mesh of this material, as the buffer layout groups
+/// them: 0 solid, 1 cut-out, 2 decal, 3 see-through.
+fn mesh_kind(alpha: u32, class: u32, decal: bool) -> u8 {
+    if decal {
+        2
+    } else if alpha == 2 || matches!(class, 5 | 6 | 8) {
+        3
+    } else if alpha == 1 {
+        1
+    } else {
+        0
+    }
+}
+
+/// The order a model's meshes go into its shared buffers: by kind
+/// (`mesh_kind`), then material, then their own order. A model's solid
+/// meshes then follow on for the shadow passes, and the meshes of one
+/// material for the main pass.
+pub fn draw_order(mats: &[usize], kind: impl Fn(usize) -> u8) -> Vec<usize> {
+    let mut o: Vec<usize> = (0..mats.len()).collect();
+    o.sort_by_key(|&i| (kind(mats[i]), mats[i], i));
+    o
 }
 
 /// World bounding sphere of a model's instances from its local box.
@@ -726,6 +759,8 @@ pub struct Renderer3D {
     pub shadows: bool,
     /// Draw calls into the shadow cascades in the last frame.
     pub shadow_draws: u32,
+    /// Decal and see-through model draw calls in the last frame (part of `draws`).
+    pub late_draws: u32,
 }
 
 /// A map cell on the GPU (see cells.rs).
@@ -1718,6 +1753,7 @@ impl Renderer3D {
             pipe_shadow_cell,
             shadows: true,
             shadow_draws: 0,
+            late_draws: 0,
             pipe_fb,
             pipe_cell_fb,
             depth_fmt,
@@ -2161,8 +2197,9 @@ impl Uploader {
                 tile: match (mt.detail, mt.ramp_u.zip(mt.ramp).filter(|_| mt.emissive.is_none()), mt.skin_detail.filter(|_| mt.skin_spec.is_some())) {
                     (Some(d), _, _) => [d.scale, d.rot, d.mean, 1.0],
                     (None, Some(_), _) => [0.0, 0.0, 0.0, 2.0],
-                    // ped skin (w stays 0): x occlusion strength, y detail normal strength
-                    (None, None, Some(s)) => [s.occlusion, s.strength[1], 0.0, 0.0],
+                    // ped skin (w stays 0): x occlusion strength, y detail normal
+                    // strength, z 1 + translucency bias (0 = no translucency)
+                    (None, None, Some(s)) => [s.occlusion, s.strength[1], s.translucency.map_or(0.0, |b| 1.0 + b.clamp(0.0, 1.0)), 0.0],
                     _ => [0.0; 4],
                 },
                 emis: [mt.emissive_scale, mt.emissive_tint[0], mt.emissive_tint[1], mt.emissive_tint[2]],
@@ -2246,7 +2283,9 @@ impl Uploader {
             usage: wgpu::BufferUsages::INDEX,
             mapped_at_creation: true,
         });
-        let mut meshes = Vec::with_capacity(m.meshes.len());
+        let mesh_mat: Vec<usize> = m.meshes.iter().map(|me| me.material.unwrap_or(0).min(mats.len() - 1)).collect();
+        let order = draw_order(&mesh_mat, |k| mesh_kind(mat_alpha[k], mat_class[k], mat_decal[k].is_some()));
+        let mut slots: Vec<Option<GpuMesh>> = (0..m.meshes.len()).map(|_| None).collect();
         {
             let mut vmap = vb
                 .slice(..)
@@ -2257,7 +2296,8 @@ impl Uploader {
                 .get_mapped_range_mut()
                 .expect("index buffer was mapped at creation");
             let (mut vo, mut io) = (0u64, 0u64);
-            for me in &m.meshes {
+            for &k in &order {
+                let me = &m.meshes[k];
                 let vbytes: &[u8] = bytemuck::cast_slice(&me.verts);
                 // indices point into the whole shared vertex buffer (no base
                 // vertex), so neighbouring meshes can be drawn as one range
@@ -2274,7 +2314,7 @@ impl Uploader {
                 // an empty range is not a valid slice: point it at the start
                 let vr = if vr.is_empty() { 0..vsz } else { vr };
                 let ir = if ir.is_empty() { 0..4 } else { ir };
-                meshes.push(GpuMesh {
+                slots[k] = Some(GpuMesh {
                     vb: vb.clone(),
                     ib: ib.clone(),
                     vb_range: vr,
@@ -2282,7 +2322,7 @@ impl Uploader {
                     n_idx: me.indices.len() as u32,
                     eb: None,
                     n_edge: 0,
-                    material: me.material.unwrap_or(0).min(mats.len() - 1),
+                    material: mesh_mat[k],
                     skinned: me.skinned,
                     centre: Vec3::from(me.centre),
                     visible: true,
@@ -2313,8 +2353,10 @@ impl Uploader {
             contents: bytemuck::cast_slice(&inst),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
+        let meshes: Vec<GpuMesh> = slots.into_iter().map(|s| s.expect("every mesh is laid out once")).collect();
         GpuModel {
             meshes,
+            order,
             mat_bg,
             mat_alpha,
             mat_class,
@@ -2664,7 +2706,7 @@ impl Renderer3D {
             }
             be.set_vertex_buffer(1, Some(gm.instances.slice(..)));
             let mut bound: Option<&wgpu::Buffer> = None;
-            for me in gm.meshes.iter().filter(|m| m.visible && m.n_idx > 0) {
+            for me in gm.ordered().filter(|m| m.visible && m.n_idx > 0) {
                 if gm.mat_alpha[me.material] == 2 || matches!(gm.mat_class[me.material], 5 | 6 | 8) || gm.mat_decal[me.material].is_some() {
                     continue;
                 }
@@ -2720,6 +2762,58 @@ impl Renderer3D {
         n
     }
 
+    /// Draw sorted decal or see-through meshes (pipeline, model number,
+    /// model, mesh) in the given order. Groups and buffers are bound only
+    /// when they change, and a mesh that follows straight on from the
+    /// pending draw (same pipeline, model and material) joins it. Returns
+    /// the number of draws.
+    fn record_joined<'a>(
+        be: &mut wgpu::RenderPass<'_>,
+        list: impl Iterator<Item = (&'a wgpu::RenderPipeline, usize, &'a GpuModel, &'a GpuMesh)>,
+    ) -> u32 {
+        let mut n = 0u32;
+        let mut pipe: Option<&wgpu::RenderPipeline> = None;
+        let mut model = usize::MAX;
+        let mut mat = usize::MAX;
+        let mut inst = 0..0u32;
+        let mut run: Option<std::ops::Range<u32>> = None;
+        for (p, mi, gm, me) in list {
+            let first = me.first();
+            let same_pipe = pipe.is_some_and(|q| std::ptr::eq(q, p));
+            if let Some(r) = &mut run {
+                if same_pipe && model == mi && mat == me.material && r.end == first {
+                    r.end = first + me.n_idx;
+                    continue;
+                }
+                be.draw_indexed(r.clone(), 0, inst.clone());
+                n += 1;
+            }
+            if !same_pipe {
+                be.set_pipeline(p);
+                pipe = Some(p);
+            }
+            if model != mi {
+                be.set_bind_group(0, Some(&gm.frame_bg), &[]);
+                be.set_vertex_buffer(1, Some(gm.instances.slice(..)));
+                be.set_vertex_buffer(0, Some(me.vb.slice(..)));
+                be.set_index_buffer(me.ib.slice(..), wgpu::IndexFormat::Uint32);
+                model = mi;
+                mat = usize::MAX;
+                inst = 0..gm.n_normal();
+            }
+            if mat != me.material {
+                be.set_bind_group(1, Some(&gm.mat_bg[me.material]), &[]);
+                mat = me.material;
+            }
+            run = Some(first..first + me.n_idx);
+        }
+        if let Some(r) = run {
+            be.draw_indexed(r, 0, inst);
+            n += 1;
+        }
+        n
+    }
+
     /// Opaque and cutout draws of `models` into a render pass.
     /// `fb`: draw the coverage-fallback instances instead of the normal ones.
     fn record_opaque(
@@ -2768,7 +2862,7 @@ impl Renderer3D {
             // pending run of indices: neighbouring meshes with the same
             // material and buffers are one draw
             let mut run: Option<std::ops::Range<u32>> = None;
-            for me in gm.meshes.iter().filter(|m| m.visible && m.n_idx > 0) {
+            for me in gm.ordered().filter(|m| m.visible && m.n_idx > 0) {
                 let blend = gm.mat_alpha[me.material] == 2
                     || matches!(gm.mat_class[me.material], 5 | 6 | 8);
                 if blend && mode == 0 {
@@ -2852,7 +2946,7 @@ impl Renderer3D {
             // solid surfaces read the material only for its cut-out flag, so
             // neighbouring solid meshes are one draw whatever their material
             let mut run: Option<std::ops::Range<u32>> = None;
-            for me in gm.meshes.iter().filter(|m| m.visible && m.n_idx > 0) {
+            for me in gm.ordered().filter(|m| m.visible && m.n_idx > 0) {
                 let see_through = gm.mat_alpha[me.material] == 2
                     || matches!(gm.mat_class[me.material], 5 | 6 | 8);
                 if see_through || gm.mat_decal[me.material].is_some() {
@@ -3245,6 +3339,7 @@ impl Renderer3D {
         gmark(&self.gpu_timer, &mut enc, 2);
         let t = self.target.as_ref().unwrap();
         let mut draws = 0u32;
+        let late_n: u32;
         if shadow_fu.is_some() {
             let mut sp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("sun shadow pass"),
@@ -3403,16 +3498,27 @@ impl Renderer3D {
             }
             // decals: after all opaque surfaces, by layer order; opaque-mode
             // decals (terrain blend layers) write depth, blended ones do not
+            let mut late = 0u32;
             if self.decal_bias {
                 let eye = cam.eye();
-                let mut dl: Vec<(u8, bool, f32, &GpuModel, &GpuMesh)> = Vec::new();
-                for gm in models {
-                    for me in gm.meshes.iter().filter(|m| m.visible) {
+                let mut dl: Vec<(u8, bool, f32, usize, usize, &GpuModel, &GpuMesh)> = Vec::new();
+                for (mi, gm) in models.iter().enumerate() {
+                    if gm.n_normal() == 0 {
+                        continue;
+                    }
+                    let model_d = gm.world.map(|(c, _)| (c - eye).length());
+                    for (pos, me) in gm.ordered().enumerate().filter(|(_, m)| m.visible && m.n_idx > 0) {
                         if let Some(o) = gm.mat_decal[me.material] {
                             let blend = look.mode == 0
                                 && (gm.mat_alpha[me.material] == 2
                                     || matches!(gm.mat_class[me.material], 5 | 6 | 8));
-                            dl.push((o, blend, (me.centre - eye).length(), gm, me));
+                            // opaque-mode decals write depth and do not blend, so
+                            // their order matters only between coplanar ones: keep
+                            // a model's together (far to near by model) so its
+                            // meshes of one material join; blended ones go far to
+                            // near by mesh
+                            let d = if blend { (me.centre - eye).length() } else { model_d.unwrap_or((me.centre - eye).length()) };
+                            dl.push((o, blend, d, mi, pos, gm, me));
                         }
                     }
                 }
@@ -3422,25 +3528,13 @@ impl Renderer3D {
                     a.0.cmp(&b.0)
                         .then(a.1.cmp(&b.1))
                         .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+                        .then(a.3.cmp(&b.3))
+                        .then(a.4.cmp(&b.4))
                 });
-                let mut cur: Option<bool> = None;
-                for (_, blend, _, gm, me) in dl {
-                    if cur != Some(blend) {
-                        pass.set_pipeline(if blend {
-                            &self.pipe_decal_blend
-                        } else {
-                            &self.pipe_decal
-                        });
-                        cur = Some(blend);
-                    }
-                    pass.set_bind_group(0, &gm.frame_bg, &[]);
-                    pass.set_vertex_buffer(1, gm.instances.slice(..));
-                    pass.set_bind_group(1, &gm.mat_bg[me.material], &[]);
-                    pass.set_vertex_buffer(0, me.vb.slice(..));
-                    pass.set_index_buffer(me.islice(), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..me.n_idx, 0, 0..gm.n_normal());
-                    draws += 1;
-                }
+                late += Self::record_joined(
+                    &mut pass,
+                    dl.iter().map(|e| (if e.1 { &self.pipe_decal_blend } else { &self.pipe_decal }, e.3, e.5, e.6)),
+                );
             }
             drop(pass);
             // the blended pass: the depth is read only, so the blended draws
@@ -3469,32 +3563,33 @@ impl Renderer3D {
             // blended, back to front by mesh centre
             if look.mode == 0 {
                 let eye = cam.eye();
-                let mut bl: Vec<(f32, &GpuModel, &GpuMesh)> = Vec::new();
-                for gm in models {
-                    for me in gm.meshes.iter().filter(|m| m.visible) {
+                let mut bl: Vec<(f32, usize, usize, &GpuModel, &GpuMesh)> = Vec::new();
+                for (mi, gm) in models.iter().enumerate() {
+                    if gm.n_normal() == 0 {
+                        continue;
+                    }
+                    for (pos, me) in gm.ordered().enumerate().filter(|(_, m)| m.visible && m.n_idx > 0) {
                         if self.decal_bias && gm.mat_decal[me.material].is_some() {
                             continue;
                         }
                         if gm.mat_alpha[me.material] == 2
                             || matches!(gm.mat_class[me.material], 5 | 6 | 8)
                         {
-                            bl.push(((me.centre - eye).length(), gm, me));
+                            bl.push(((me.centre - eye).length(), mi, pos, gm, me));
                         }
                     }
                 }
-                bl.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-                pass.set_pipeline(&self.pipe_blend);
+                bl.sort_by(|a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.1.cmp(&b.1))
+                        .then(a.2.cmp(&b.2))
+                });
                 pass.set_bind_group(2, &t.scene_bg, &[]);
-                for (_, gm, me) in bl {
-                    pass.set_bind_group(0, &gm.frame_bg, &[]);
-                    pass.set_vertex_buffer(1, gm.instances.slice(..));
-                    pass.set_bind_group(1, &gm.mat_bg[me.material], &[]);
-                    pass.set_vertex_buffer(0, me.vb.slice(..));
-                    pass.set_index_buffer(me.islice(), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..me.n_idx, 0, 0..gm.n_normal());
-                    draws += 1;
-                }
+                late += Self::record_joined(&mut pass, bl.iter().map(|e| (&self.pipe_blend, e.1, e.3, e.4)));
             }
+            draws += late;
+            late_n = late;
             if look.wire {
                 pass.set_pipeline(&self.pipe_wire);
                 for gm in models {
@@ -3587,6 +3682,7 @@ impl Renderer3D {
         );
         RTIME[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.draws = draws;
+        self.late_draws = late_n;
         let _ = &self.dummy_joints;
         let id = t.egui_id;
         if self.accumulate {
@@ -3716,5 +3812,22 @@ mod joints_tests {
         assert!(!joints_fit(64, 129));
         assert!(joints_fit(129 * 64, 129));
         assert!(joints_fit(135 * 64, 129));
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::{draw_order, mesh_kind};
+
+    #[test]
+    fn draw_order_groups_kinds_then_materials() {
+        // materials: 0 solid, 1 see-through, 2 solid, 3 decal, 4 cut-out
+        let kinds = [mesh_kind(0, 0, false), mesh_kind(2, 0, false), mesh_kind(0, 0, false), mesh_kind(0, 0, true), mesh_kind(1, 0, false)];
+        assert_eq!(kinds, [0, 3, 0, 2, 1]);
+        let mats = [2, 1, 0, 3, 2, 4, 0, 1];
+        let o = draw_order(&mats, |m| kinds[m]);
+        // solid by material (0, 0, 2, 2), then cut-out, decal, see-through;
+        // meshes of one material keep their own order
+        assert_eq!(o, vec![2, 6, 0, 4, 5, 3, 1, 7]);
     }
 }

@@ -76,10 +76,17 @@
 //! teeth. Where it is above 0 the GLB gets an occlusion texture (B moved
 //! to R, glTF's channel) with that strength.
 //!
-//! Translucency (`speculartex` R) goes to a G-buffer target of its own;
-//! the lighting turns it into a thickness through a per-entity profile
-//! and adds a Burley-style transmittance per light. The profiles are
-//! loaded data not found yet, so it is recorded, not mapped.
+//! Translucency (`speculartex` R, minus constant `381999f3`) goes to a
+//! G-buffer target of its own; the lighting turns it into a thickness
+//! through a per-entity subsurface profile and adds a Burley-style
+//! transmittance per light (`SssProfile`). The profiles are a PSO file of
+//! data.rpf that only the table of contents reaches (`toc-extract`), root
+//! struct `a0ec2837`: an array of `73bc6e91` records (`name`,
+//! `scatterColor`, `scatterDistance`, thickness range, exponent, a kind
+//! enum) and two floats. The loader (data-file type 355) copies them to
+//! the engine's table from slot 1 (slot 0 is an empty default). Which slot
+//! a ped's draw writes is set at run time and is not traced, so ped skin
+//! takes the profile named `skin_default` (`SKIN_DEFAULT`).
 //!
 //! Both skin programs scale F0 by a window on the albedo's brightness,
 //! `saturate((max(r, g, b) - lo) / (hi - lo))` on the linear albedo. The
@@ -301,6 +308,122 @@ pub const OCCLUSION_PARAM: &str = "4d1ecedd";
 /// Material constant +0x60: subtracted from `speculartex` R for the translucency.
 pub const TRANSLUCENCY_BIAS_PARAM: &str = "381999f3";
 
+/// A subsurface (translucency) profile of the engine's profile file.
+///
+/// The engine's table: radii `d = max((byte / 255)^2 * scatter_distance,
+/// 1e-5)` per channel of `scatter_color` (bytes in memory order, red
+/// first), lo and hi x 0.001. The skin lighting program: thickness `s = lo
+/// + (hi - lo) (1 - t)^p` for the G-buffer translucency `t`, per channel `e
+/// = exp(-0.480898 s / d)` (d x 0.001, so both in metres), `T = (e^3 + 3e) /
+/// 4`, and per light `0.17182 T (2 + 0.75 / (1.25 + L.V)^1.5)` times the
+/// light's colour and shadow, added to the diffuse light (no N.L).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SssProfile {
+    pub name: &'static str,
+    /// joaat of the name, as the file stores it.
+    pub name_hash: u32,
+    pub scatter_color: u32,
+    /// Millimetres.
+    pub scatter_distance: f32,
+    /// Thickness at full and at no translucency, millimetres.
+    pub lo: f32,
+    pub hi: f32,
+    pub exponent: f32,
+    /// Enum `d4057236` (1 = `Post`).
+    pub kind: i32,
+}
+
+/// The profile file's `skin_default` (record 0, engine slot 1).
+pub const SKIN_DEFAULT: SssProfile = SssProfile { name: "skin_default", name_hash: 0x51d0_f039, scatter_color: 0xff0d_21ff, scatter_distance: 1.5, lo: 0.5, hi: 40.0, exponent: 1.3, kind: 1 };
+
+/// Share of the per-light term that does not depend on the angle
+/// (`0.17182 x 2`), the factor of the glTF transmission.
+pub const SSS_ISOTROPIC: f32 = 2.0 * 0.17182;
+
+impl SssProfile {
+    /// Scatter radii per channel (red, green, blue), millimetres.
+    pub fn radii(&self) -> [f32; 3] {
+        let b = self.scatter_color.to_le_bytes();
+        std::array::from_fn(|c| ((b[c] as f32 / 255.0).powi(2) * self.scatter_distance).max(1e-5))
+    }
+
+    /// Thickness for a translucency `t` (0..1), millimetres.
+    pub fn thickness(&self, t: f32) -> f32 {
+        self.lo + (self.hi - self.lo) * (1.0 - t.clamp(0.0, 1.0)).powf(self.exponent)
+    }
+
+    /// Transmittance per channel for a translucency `t`.
+    pub fn transmittance(&self, t: f32) -> [f32; 3] {
+        let (s, d) = (self.thickness(t), self.radii());
+        std::array::from_fn(|c| {
+            let e = (-0.480898 * s / d[c]).exp();
+            0.25 * (e * e * e + 3.0 * e)
+        })
+    }
+
+    pub fn json(&self) -> Value {
+        serde_json::json!({
+            "name": self.name,
+            "name_hash": format!("{:08x}", self.name_hash),
+            "scatter_color": format!("{:08x}", self.scatter_color),
+            "scatter_distance_mm": self.scatter_distance,
+            "radii_mm": self.radii(),
+            "thickness_mm": [self.lo, self.hi],
+            "exponent": self.exponent,
+            "kind": self.kind,
+        })
+    }
+}
+
+fn srgb8(c: f32) -> u8 {
+    let c = c.clamp(0.0, 1.0);
+    let s = if c <= 0.0031308 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+    (s * 255.0 + 0.5) as u8
+}
+
+/// A skin spec map's translucency (red) baked through a profile for
+/// `KHR_materials_diffuse_transmission`, next to it: `<stem>_sss.png`.
+/// RGB (sRGB) = the transmittance's colour (largest channel 1), alpha
+/// (linear) = `SSS_ISOTROPIC` x its largest channel. None where no pixel
+/// is translucent. `out` is the export root and `spec` the map's path
+/// under it.
+pub fn write_translucency_png(out: &Path, spec: &str, bias: f32, prof: &SssProfile) -> Option<String> {
+    let rel = spec.strip_suffix(".png")?.to_string() + "_sss.png";
+    let dst = out.join(&rel);
+    if dst.exists() {
+        return Some(rel);
+    }
+    let img = image::open(out.join(spec)).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    let mut px = img.into_raw();
+    // one entry per red value: the baked pixel
+    let lut: Vec<[u8; 4]> = (0..256)
+        .map(|r| {
+            let t = (r as f32 / 255.0 - bias).clamp(0.0, 1.0);
+            if t <= 0.0 {
+                return [0, 0, 0, 0];
+            }
+            let tr = prof.transmittance(t);
+            let m = tr[0].max(tr[1]).max(tr[2]);
+            if m <= 0.0 {
+                return [0, 0, 0, 0];
+            }
+            [srgb8(tr[0] / m), srgb8(tr[1] / m), srgb8(tr[2] / m), ((SSS_ISOTROPIC * m).clamp(0.0, 1.0) * 255.0 + 0.5) as u8]
+        })
+        .collect();
+    let mut any = false;
+    for p in px.chunks_exact_mut(4) {
+        let v = lut[p[0] as usize];
+        any |= v[3] > 0;
+        p.copy_from_slice(&v);
+    }
+    if !any {
+        return None;
+    }
+    crate::texture::save_png(&dst, &px, w, h).ok()?;
+    Some(rel)
+}
+
 /// The tile of the detail atlases a skin region (0-15) uses.
 pub fn detail_slice(table: [u32; 3], region: u32) -> u32 {
     let f = |w: u32| (w >> (2 * region)) & 3;
@@ -429,7 +552,8 @@ fn slot_png<'a>(entries: &'a [Value], slot: &str) -> Option<&'a str> {
 /// metallic factors, and `KHR_materials_specular`. Merged into `g`; the
 /// raw maps go in `extras.skin_spec`. Not a skin shader, or no decoded
 /// `speculartex`: nothing changes.
-pub fn apply_gltf(g: &mut Value, extras: &mut Value, shader_hash: &str, entries: &[Value], k: &SkinConsts, detail: Option<Value>, occlusion_png: Option<&str>) {
+#[allow(clippy::too_many_arguments)]
+pub fn apply_gltf(g: &mut Value, extras: &mut Value, shader_hash: &str, entries: &[Value], k: &SkinConsts, detail: Option<Value>, occlusion_png: Option<&str>, translucency_png: Option<&str>) {
     let fresnel = k.fresnel;
     if !SKIN_SHADERS.contains(&shader_hash) {
         return;
@@ -451,6 +575,14 @@ pub fn apply_gltf(g: &mut Value, extras: &mut Value, shader_hash: &str, entries:
     if let (true, Some(p)) = (occ > 0.0, occlusion_png) {
         g["occlusionTexture"] = serde_json::json!({"uri": p, "strength": occ});
     }
+    if let Some(p) = translucency_png {
+        g["extensions"]["KHR_materials_diffuse_transmission"] = serde_json::json!({
+            "diffuseTransmissionFactor": 1.0,
+            "diffuseTransmissionTexture": {"uri": p},
+            "diffuseTransmissionColorFactor": [1.0, 1.0, 1.0],
+            "diffuseTransmissionColorTexture": {"uri": p}
+        });
+    }
     extras["skin_spec"] = serde_json::json!({
         "speculartex": spec,
         "speculartex2": slot_png(entries, SLOT_SPEC2),
@@ -458,7 +590,13 @@ pub fn apply_gltf(g: &mut Value, extras: &mut Value, shader_hash: &str, entries:
         "f0": 0.04 * specular_factor(f),
         "albedo_window": {"lo": ALBEDO_LO, "hi": ALBEDO_HI, "srgb": [5, 20], "rule": "F0 *= saturate((max(r, g, b) of the linear albedo - lo) / (hi - lo))"},
         "occlusion": {"strength": k.occlusion, "png": if occ > 0.0 { occlusion_png } else { None }, "rule": "G-buffer occlusion = lerp(1, speculartex B, strength); the game's lighting: diffuse ambient x it, specular ambient x its fourth root, direct light not at all. Strength 0 = B unused (human body skin)"},
-        "translucency": {"bias": k.translucency_bias, "rule": "t = saturate(speculartex R - bias) to a G-buffer target of its own; per light the game adds 0.17182 x T x (2 + 0.75 / (1.25 - cos)^1.5) with T = (e^3 + 3e) / 4, e = exp(-0.480898 s / d) per channel, thickness s = lo + (hi - lo)(1 - t)^p from a per-entity profile (d, p, lo, hi: loaded data, not found). Not in the GLB."},
+        "translucency": {
+            "bias": k.translucency_bias,
+            "profile": SKIN_DEFAULT.json(),
+            "png": translucency_png,
+            "rule": "t = saturate(speculartex R - bias) to a G-buffer target of its own; thickness s = lo + (hi - lo)(1 - t)^p (mm), per channel e = exp(-0.480898 s / d) with d the profile's radii (mm), T = (e^3 + 3e) / 4; per light the game adds 0.17182 x T x (2 + 0.75 / (1.25 + L.V)^1.5) x the light's colour and shadow to the diffuse light (no N.L). The profile a ped draws with is picked at run time (not traced): skin_default is taken",
+            "gltf": "KHR_materials_diffuse_transmission from the png: RGB (sRGB) the colour of T (largest channel 1), alpha the factor 2 x 0.17182 x max(T) (the term without its angle part); absent where no pixel is translucent"
+        },
         "detail": detail,
         "channels": {
             "speculartex": "R translucency mask, G roughness, B occlusion",
@@ -517,7 +655,9 @@ mod tests {
         ];
         let (mut g, mut x) = (json!({}), json!({}));
         let k = SkinConsts { fresnel: Some(-0.3), occlusion: Some(1.0), translucency_bias: Some(0.0) };
-        apply_gltf(&mut g, &mut x, "210fbc6a", &entries, &k, None, Some("textures/ttpf/a_occ.png"));
+        apply_gltf(&mut g, &mut x, "210fbc6a", &entries, &k, None, Some("textures/ttpf/a_occ.png"), Some("textures/ttpf/a_sss.png"));
+        assert_eq!(g["extensions"]["KHR_materials_diffuse_transmission"]["diffuseTransmissionTexture"]["uri"], "textures/ttpf/a_sss.png");
+        assert_eq!(x["skin_spec"]["translucency"]["profile"]["name"], "skin_default");
         assert_eq!(g["occlusionTexture"]["uri"], "textures/ttpf/a_occ.png");
         assert_eq!(g["occlusionTexture"]["strength"], 1.0);
         assert_eq!(g["pbrMetallicRoughness"]["metallicRoughnessTexture"]["uri"], "textures/ttpf/a.png");
@@ -528,10 +668,26 @@ mod tests {
         assert_eq!(x["skin_spec"]["speculartex2"], "textures/ttpf/b.png");
         // other shaders, and skin without a decoded speculartex, are left alone
         let (mut g2, mut x2) = (json!({}), json!({}));
-        apply_gltf(&mut g2, &mut x2, "deadbeef", &entries, &SkinConsts { fresnel: None, ..Default::default() }, None, None);
-        apply_gltf(&mut g2, &mut x2, "210fbc6a", &entries[1..], &SkinConsts { fresnel: None, ..Default::default() }, None, None);
+        apply_gltf(&mut g2, &mut x2, "deadbeef", &entries, &SkinConsts { fresnel: None, ..Default::default() }, None, None, None);
+        apply_gltf(&mut g2, &mut x2, "210fbc6a", &entries[1..], &SkinConsts { fresnel: None, ..Default::default() }, None, None, None);
         assert_eq!(g2, json!({}));
         assert_eq!(x2, json!({}));
+    }
+
+    #[test]
+    fn skin_default_profile() {
+        let d = SKIN_DEFAULT.radii();
+        assert!((d[0] - 1.5).abs() < 1e-6);
+        assert!((d[1] - 1.5 * (33.0f32 / 255.0).powi(2)).abs() < 1e-6);
+        assert!((d[2] - 1.5 * (13.0f32 / 255.0).powi(2)).abs() < 1e-6);
+        assert!((SKIN_DEFAULT.thickness(1.0) - 0.5).abs() < 1e-6);
+        assert!((SKIN_DEFAULT.thickness(0.0) - 40.0).abs() < 1e-4);
+        // thin skin passes red, next to no green or blue; thick skin passes nothing
+        let t = SKIN_DEFAULT.transmittance(1.0);
+        let e = (-0.480898f32 * 0.5 / 1.5).exp();
+        assert!((t[0] - 0.25 * (e * e * e + 3.0 * e)).abs() < 1e-6);
+        assert!(t[1] < 1e-3 && t[2] < 1e-3);
+        assert!(SKIN_DEFAULT.transmittance(0.0)[0] < 1e-5);
     }
 
     #[test]

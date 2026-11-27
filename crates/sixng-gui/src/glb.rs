@@ -228,6 +228,10 @@ pub struct SkinDetail {
     pub strength: [f32; 2],
     /// `lerp(1, speculartex B, occlusion)` is the skin's ambient occlusion.
     pub occlusion: f32,
+    /// Translucency bias (`saturate(speculartex R - bias)`), when the export
+    /// found translucent pixels (`extras.skin_spec.translucency.png`); the
+    /// viewer shades it through the skin_default profile.
+    pub translucency: Option<f32>,
 }
 
 #[derive(Clone)]
@@ -1006,6 +1010,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                 uv_scale: f2(&d["uv_scale"], 1.0),
                 strength: f2(&d["strength"], 0.0),
                 occlusion: ex["skin_spec"]["occlusion"]["strength"].as_f64().unwrap_or(0.0) as f32,
+                translucency: ex["skin_spec"]["translucency"]["png"].is_string().then(|| ex["skin_spec"]["translucency"]["bias"].as_f64().unwrap_or(0.0) as f32),
             }
         });
         for t in ex["textures"].as_array().cloned().unwrap_or_default() {

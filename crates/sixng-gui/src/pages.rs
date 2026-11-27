@@ -554,6 +554,47 @@ impl App {
                     ui.label(&self.settings_msg);
                 }
             });
+            #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+            {
+                ui.add_space(10.0);
+                ui.separator();
+                ui.heading("Metal 4 model cache");
+                ui.weak(
+                    "Pre-generate GPU-ready model caches for every .glb in the work folder. \
+                     Runs in a separate process; a large asset set can take a while.",
+                );
+                ui.horizontal_wrapped(|ui| {
+                    if self.model_bake.running() {
+                        ui.spinner();
+                        ui.label(format!(
+                            "Baking models ({}:{:02}) · {}",
+                            self.model_bake.elapsed() / 60,
+                            self.model_bake.elapsed() % 60,
+                            self.model_bake.last_line
+                        ));
+                        if ui.button("Cancel").clicked() {
+                            self.model_bake.cancel();
+                        }
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(500));
+                    } else {
+                        if ui.button("🍞 Bake model cache").clicked() {
+                            if let Err(e) = self.model_bake.start(&self.work) {
+                                self.model_bake.result = Some(e);
+                            }
+                        }
+                        ui.weak(format!(
+                            "Cache: {}",
+                            Path::new(&self.work)
+                                .join("metal_io_models_v2")
+                                .display()
+                        ));
+                    }
+                    if let Some(r) = &self.model_bake.result {
+                        ui.label(r);
+                    }
+                });
+            }
             ui.add_space(6.0);
             ui.weak(format!(
                 "Settings file: {}",
