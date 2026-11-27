@@ -699,6 +699,10 @@ impl Map3D {
             let tex_cache = self.tex_cache.clone();
             std::thread::spawn(move || {
                 for (m, used, res) in up_rx {
+                    // nothing more to the device once it is lost (the app exits)
+                    if crate::gpu_lost() {
+                        return;
+                    }
                     let res = res.map(|model| {
                         let tu = Instant::now();
                         let gm =
