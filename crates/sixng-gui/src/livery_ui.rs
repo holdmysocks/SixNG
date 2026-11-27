@@ -558,14 +558,14 @@ impl State {
                         egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                             for b in list {
                                 let v = variants(b);
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     let name = b["name"].as_str().or(b["brand"].as_str()).unwrap_or("?");
                                     if ui.button(name).on_hover_text(if v > 1 { "Put on its first variant" } else { "Put on this livery" }).clicked() {
                                         self.put_on_brand(b, 0);
                                         ui.close();
                                     }
                                     // the game fits one option of a slot with several, at random
-                                    for k in (1..v).take(9) {
+                                    for k in 1..v {
                                         if ui.small_button(format!("{}", k + 1)).on_hover_text(format!("Variant {} of {v}: the game picks one of a slot's options at random", k + 1)).clicked() {
                                             self.put_on_brand(b, k);
                                             ui.close();
