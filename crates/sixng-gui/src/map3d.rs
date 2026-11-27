@@ -127,6 +127,15 @@ struct Gpu {
 /// Texture cache (key -> texture, shared between models and with the workers).
 type TexCache = Arc<Mutex<HashMap<String, crate::render3d::Tex>>>;
 
+/// Marks a table watchdog site when dropped (see gpu_draw::watch).
+struct Watch(usize, usize);
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        crate::gpu_draw::watch::at(self.0, self.1);
+    }
+}
+
 /// Detail settings (the "detail" slider sets them all; each can be tuned).
 #[derive(Clone, PartialEq)]
 pub struct Detail {
@@ -1615,6 +1624,8 @@ impl Map3D {
                     up_ms,
                 })) => {
                     {
+                        crate::gpu_draw::watch::at(2, 26);
+                        let _done = Watch(2, 27);
                         let mut k = self.tex_keys.lock().unwrap();
                         let mut cache = self.tex_cache.lock().unwrap();
                         let mut names = Vec::with_capacity(keys.len());
@@ -1833,6 +1844,8 @@ impl Map3D {
     }
 
     fn remove_model(&mut self, m: u32) {
+        crate::gpu_draw::watch::at(2, 28);
+        let _done = Watch(2, 29);
         if let (Some(Slot::Ready { gm, .. }), Some(d)) = (self.cache.remove(&m), &self.dropper) {
             let _ = d.send(gm);
         }

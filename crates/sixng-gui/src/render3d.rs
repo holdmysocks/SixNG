@@ -1077,7 +1077,9 @@ pub fn tex_rgba(device: &wgpu::Device, queue: &wgpu::Queue, img: &glb::Image) ->
 /// Upload an image into a layer of the map's shared texture arrays, or as a
 /// texture of its own when there is no table or it does not fit one.
 pub fn tex_upload(device: &wgpu::Device, queue: &wgpu::Queue, img: &glb::Image, gd: Option<&std::sync::Arc<crate::gpu_draw::Shared>>) -> Tex {
+    crate::gpu_draw::watch::at(1, 10);
     if let Some((layer, t, l)) = gd.and_then(|g| g.layer(tex_class(img))) {
+        crate::gpu_draw::watch::at(1, 11);
         tex_write(queue, &t, l, img);
         let view = t.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2),
@@ -1087,6 +1089,7 @@ pub fn tex_upload(device: &wgpu::Device, queue: &wgpu::Queue, img: &glb::Image, 
         });
         return Tex { tex: t, view, layer: Some(layer) };
     }
+    crate::gpu_draw::watch::at(1, 12);
     Tex::own(tex_rgba(device, queue, img))
 }
 
@@ -2521,6 +2524,7 @@ impl Uploader {
                     rows.extend_from_slice(&s.to_le_bytes());
                 }
             }
+            crate::gpu_draw::watch::at(1, 13);
             g.place(&rows, nv, ni, need)
         });
         // one vertex and one index buffer for all meshes (fewer GPU objects:
@@ -2614,8 +2618,10 @@ impl Uploader {
                 });
             }
             if gd.is_some() {
+                crate::gpu_draw::watch::at(1, 14);
                 queue.write_buffer(&vb, v_at, bytemuck::cast_slice(&pv));
                 queue.write_buffer(&ib, i_at, bytemuck::cast_slice(&pi));
+                crate::gpu_draw::watch::at(1, 15);
             }
         }
         if gd.is_none() {
@@ -3426,11 +3432,13 @@ impl Renderer3D {
         let g = self.gd.clone()?;
         self.gd_pipes.as_ref()?;
         // every frame: freed ranges come back, the bind group follows new arrays
+        crate::gpu_draw::watch::at(0, 2);
         let snap = g.prepare();
-        if look.mode != 0 {
+        crate::gpu_draw::watch::at(0, 3);
+        if look.mode != 0 || crate::gpu_draw::opt("nodraw") {
             return None;
         }
-        let plan = self.shadow_plan(cam, look, aspect);
+        let plan = self.shadow_plan(cam, look, aspect).filter(|_| !crate::gpu_draw::opt("noshadow"));
         // (stencil, vertex, index, instance chunk)
         type Key = (u32, usize, usize, usize);
         let mut main: Vec<(Key, Args)> = Vec::new();
@@ -3614,7 +3622,13 @@ impl Renderer3D {
                 be.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                 i = l.i;
             }
-            be.multi_draw_indexed_indirect(args, l.args.start as u64 * crate::gpu_draw::ARGS, l.args.end - l.args.start);
+            if crate::gpu_draw::opt("nomulti") {
+                for k in l.args.clone() {
+                    be.draw_indexed_indirect(args, k as u64 * crate::gpu_draw::ARGS);
+                }
+            } else {
+                be.multi_draw_indexed_indirect(args, l.args.start as u64 * crate::gpu_draw::ARGS, l.args.end - l.args.start);
+            }
             n += 1;
         }
         n
@@ -3961,7 +3975,9 @@ impl Renderer3D {
         let view_cull = MeshCull::view(Mat4::from_cols_array_2d(&fu.view_proj));
         // the material table's part (map models in the shared pools),
         // gathered and written before any pass is recorded
+        crate::gpu_draw::watch::at(0, 3);
         let gdf = self.gd_frame(device, queue, cam, look, aspect, models, &view_cull);
+        crate::gpu_draw::watch::at(0, 4);
         self.render_shadows(queue, &mut enc, cam, look, &fu, aspect, models, gdf.as_ref());
         gmark(&self.gpu_timer, &mut enc, 2);
         let t = self.target.as_ref().unwrap();
@@ -4046,6 +4062,7 @@ impl Renderer3D {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            crate::gpu_draw::watch::at(0, 5);
             if look.mode == 0 || look.mode == 7 {
                 pass.set_pipeline(&self.pipe_sky);
                 pass.set_bind_group(0, &self.default_frame_bg, &[]);
@@ -4188,6 +4205,7 @@ impl Renderer3D {
                 );
             }
             drop(pass);
+            crate::gpu_draw::watch::at(0, 6);
             // the blended pass: the depth is read only, so the blended draws
             // can read it as a texture too (the water's depth over the scene
             // under it); nothing from here on writes depth
@@ -4320,6 +4338,7 @@ impl Renderer3D {
         if let (Some(g), Some(slot)) = (&self.gpu_timer, gslot) {
             g.end(&mut enc, slot);
         }
+        crate::gpu_draw::watch::at(0, 7);
         let t_e = std::time::Instant::now();
         let cb = enc.finish();
         RTIME[1].fetch_add(
@@ -4327,7 +4346,9 @@ impl Renderer3D {
             std::sync::atomic::Ordering::Relaxed,
         );
         let t_s = std::time::Instant::now();
+        crate::gpu_draw::watch::at(0, 8);
         queue.submit([cb]);
+        crate::gpu_draw::watch::at(0, 9);
         if let (Some(g), Some(slot)) = (&self.gpu_timer, gslot) {
             g.after_submit(slot);
         }

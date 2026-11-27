@@ -52,6 +52,86 @@ const LAYER_MAX: u64 = 16 << 20;
 /// Layers of a class's first array; each later one doubles, up to the caps.
 const FIRST_LAYERS: u32 = 4;
 
+/// Where the threads that touch the table are (hang diagnosis): one slot
+/// per thread kind, each holding an index into `SITES`.
+pub mod watch {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    pub const SITES: [&str; 30] = [
+        "-",
+        "render: start",
+        "render: table prepare",
+        "render: table frame",
+        "render: shadows",
+        "render: main pass",
+        "render: blended pass",
+        "render: finish",
+        "render: submit",
+        "render: done",
+        "loader: texture layer",
+        "loader: texture write",
+        "loader: texture own",
+        "loader: place",
+        "loader: pool write",
+        "loader: model done",
+        "lock: layer drop",
+        "lock: v_bytes",
+        "lock: set_instances",
+        "lock: handle drop",
+        "lock: layer",
+        "lock: place",
+        "lock: prepare",
+        "lock: summary",
+        "set_instances: write",
+        "set_instances: done",
+        "map: take loaded",
+        "map: loaded done",
+        "map: remove model",
+        "map: remove done",
+    ];
+    /// Thread kinds: render, loader, other (drops, instance writes).
+    pub static AT: [AtomicUsize; 3] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
+    /// The site that holds the table lock (0: none).
+    pub static HOLDER: AtomicUsize = AtomicUsize::new(0);
+    pub static FRAMES: AtomicU64 = AtomicU64::new(0);
+
+    pub fn at(kind: usize, site: usize) {
+        AT[kind].store(site, Ordering::Relaxed);
+    }
+
+    pub fn line() -> String {
+        let n = |a: &AtomicUsize| SITES.get(a.load(Ordering::Relaxed)).copied().unwrap_or("?");
+        format!("render [{}], loader [{}], other [{}], table lock held by [{}]", n(&AT[0]), n(&AT[1]), n(&AT[2]), n(&HOLDER))
+    }
+
+    /// A thread that prints where everyone is once frames stop for 3 s.
+    pub fn start() {
+        std::thread::spawn(|| {
+            let mut last = (0u64, std::time::Instant::now());
+            let mut told = 0u32;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let f = FRAMES.load(Ordering::Relaxed);
+                if f != last.0 {
+                    last = (f, std::time::Instant::now());
+                    told = 0;
+                } else if f > 0 && last.1.elapsed().as_secs() >= 3 * (told as u64 + 1) && told < 10 {
+                    told += 1;
+                    eprintln!("[map3d] table watchdog: no frame for {:.0} s after frame {f}: {}", last.1.elapsed().as_secs_f32(), line());
+                }
+            }
+        });
+    }
+}
+
+/// `SIXNG_MAP_GPU_TABLE`: a comma list of `nodraw` (pools and arrays
+/// filled, but every model drawn the old way), `noshadow` (the table skips
+/// the shadow cascades), `nomulti` (one indirect call per sub-draw).
+pub fn opt(name: &str) -> bool {
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(|| std::env::var("SIXNG_MAP_GPU_TABLE").unwrap_or_default()).split(',').any(|s| s.trim() == name)
+}
+
 /// The features the path needs.
 pub fn features() -> wgpu::Features {
     wgpu::Features::TEXTURE_BINDING_ARRAY
@@ -302,7 +382,7 @@ pub struct Layer {
 
 impl Drop for Layer {
     fn drop(&mut self) {
-        let mut g = self.shared.inner.lock().unwrap();
+        let mut g = self.shared.lock(16);
         let f = g.frame;
         g.held.push((f, Held::Layer(self.slot)));
     }
@@ -332,7 +412,7 @@ impl Handle {
     }
     /// Byte offsets of its vertices and indices in their chunks.
     pub fn v_bytes(&self) -> u64 {
-        self.v.start * self.shared.inner.lock().unwrap().v.unit
+        self.v.start * self.shared.lock(17).v.unit
     }
     pub fn i_bytes(&self) -> u64 {
         self.i.start * 4
@@ -353,7 +433,7 @@ impl Handle {
     /// model then draws the old way).
     pub fn set_instances(&mut self, inst: &[Instance]) -> bool {
         let n = inst.len() as u64;
-        let mut g = self.shared.inner.lock().unwrap();
+        let mut g = self.shared.lock(18);
         let fits = self.n.as_ref().is_some_and(|(_, r)| r.end - r.start >= n && n > 0);
         if !fits {
             if let Some((c, r)) = self.n.take() {
@@ -382,14 +462,16 @@ impl Handle {
                 i
             })
             .collect();
+        watch::at(2, 24);
         self.shared.queue.write_buffer(&buf, r.start * unit, bytemuck::cast_slice(&v));
+        watch::at(2, 25);
         true
     }
 }
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        let mut g = self.shared.inner.lock().unwrap();
+        let mut g = self.shared.lock(19);
         let f = g.frame;
         g.held.push((f, Held::V(self.vc, std::mem::take(&mut self.v))));
         g.held.push((f, Held::I(self.ic, std::mem::take(&mut self.i))));
@@ -402,6 +484,33 @@ impl Drop for Handle {
 }
 
 impl Shared {
+    /// The table lock, from `site` (see `watch::SITES`): a wait over 2 s
+    /// says who waits and who took the lock last.
+    fn lock(&self, site: usize) -> std::sync::MutexGuard<'_, Inner> {
+        let t = std::time::Instant::now();
+        let mut warned = false;
+        loop {
+            match self.inner.try_lock() {
+                Ok(g) => {
+                    watch::HOLDER.store(site, std::sync::atomic::Ordering::Relaxed);
+                    return g;
+                }
+                Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if !warned && t.elapsed().as_secs() >= 2 {
+                        warned = true;
+                        eprintln!("[map3d] table lock: [{}] waits over 2 s; {}", watch::SITES[site], watch::line());
+                    }
+                    if t.elapsed().as_micros() < 500 {
+                        std::thread::yield_now();
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                    }
+                }
+            }
+        }
+    }
+
     /// None when the device lacks a feature, or `SIXNG_MAP_GPU_DRAWS=0`.
     /// `mat_bytes`: size of the material uniform (a multiple of 16).
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, mat_bytes: u64) -> Option<Arc<Shared>> {
@@ -482,6 +591,7 @@ impl Shared {
         let wview = white.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
         let wclass = Class { format: wgpu::TextureFormat::Rgba8Unorm, w: 1, h: 1, mips: 1 };
         let max_layers = device.limits().max_texture_array_layers.min(MAX_LAYERS);
+        watch::start();
         eprintln!(
             "[map3d] GPU-driven draws: on (material table; pool chunks {} + {} + {} MB; texture arrays up to {} layers, {} arrays)",
             v.cap * v.unit >> 20,
@@ -525,7 +635,7 @@ impl Shared {
         if bytes == 0 || bytes > LAYER_MAX || class.mips == 0 {
             return None;
         }
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.lock(20);
         let g = &mut *g;
         let list = g.classes.entry(class).or_default();
         // the lowest free layer of the class's first array with room
@@ -579,7 +689,7 @@ impl Shared {
         if n_mats == 0 || rows.len() as u64 != n_mats * self.row || nv == 0 || ni == 0 {
             return None;
         }
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.lock(21);
         let m = g.mats.alloc(n_mats)?;
         let Some((vc, v)) = g.v.alloc(&self.device, nv) else {
             g.mats.free(m);
@@ -605,9 +715,10 @@ impl Shared {
     /// enough ago, give empty chunks back, rebuild the bind group when an
     /// array came, and return what the frame draws with.
     pub fn prepare(&self) -> Snapshot {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.lock(22);
         let g = &mut *g;
         g.frame += 1;
+        watch::FRAMES.store(g.frame, std::sync::atomic::Ordering::Relaxed);
         let f = g.frame;
         for (at, h) in std::mem::take(&mut g.held) {
             if f < at + HOLD_FRAMES {
@@ -661,7 +772,7 @@ impl Shared {
 
     /// Pool and table use for the tick line.
     pub fn summary(&self) -> String {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.lock(23);
         let (vn, vb, vu) = g.v.stats();
         let (inn, ib, iu) = g.i.stats();
         let (nn, nb, nu) = g.n.stats();
