@@ -17,6 +17,13 @@
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
+/// SIXNG_MAP_GPU_TINY=1 (timing experiment only): pages bind one view and
+/// every texture read takes it, to measure what binding the pages costs.
+pub fn tiny() -> bool {
+    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("SIXNG_MAP_GPU_TINY").is_ok_and(|v| v != "0"))
+}
+
 /// Textures in one page (one bind group); slot 0 is always the white texture.
 pub const PAGE: u32 = 4096;
 const MAX_PAGES: usize = 64;
@@ -493,7 +500,7 @@ impl Shared {
         if let Some(k) = pick {
             let t = std::time::Instant::now();
             let p = &g.pages[k];
-            let n = if self.partial { p.hi as usize } else { PAGE as usize };
+            let n = if self.partial && tiny() { 1 } else if self.partial { p.hi as usize } else { PAGE as usize };
             let views: Vec<&wgpu::TextureView> = p.views[..n].iter().map(|v| v.as_ref().unwrap_or(&self.white)).collect();
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("gpu draw page"),
@@ -598,6 +605,11 @@ pub fn shader(common: &str, src: &str) -> Option<String> {
         ("t_dust", "TEX[TI1.w]"),
     ] {
         s = replace_ident(&s, name, to);
+    }
+    // timing experiment: every texture read takes slot 0 (white), so a page
+    // binds one view
+    if tiny() {
+        s = s.replace("TEX[", "TEX[0u*");
     }
     // the material now comes from a table indexed per pixel, so naga's
     // uniformity check would reject the texture reads under its branches;
