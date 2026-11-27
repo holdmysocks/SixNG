@@ -95,6 +95,14 @@ pub struct Part {
     /// face. Many are in no store (the game builds body skin at run time).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skins: Vec<(String, String)>,
+    /// Decorations the item lists (tag `d9f1087b`, decoration presets; the
+    /// first chain item that lists any), as hex names of `peddeco` records:
+    /// tattoos, makeup, body marks, garment prints.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decorations: Vec<String>,
+    /// The item category hash (`Category`, first along the chain), 0 when none.
+    #[serde(skip)]
+    pub category_hash: u32,
     /// Drawables that use the item's textures, with the number of textures
     /// shared (`pick` takes the best; `pedlook` prefers the model's own fit).
     #[serde(skip)]
@@ -389,6 +397,8 @@ pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers,
                 }
             }
             let name = chain.iter().find_map(|c| NAME_TAGS.iter().flat_map(|&k| tags(c, k)).find_map(|x| pre.get(&x).filter(|p| p.0.contains('_'))));
+            let category_hash = chain.iter().find_map(|c| c["Category"].as_u64().filter(|&x| x != 0)).unwrap_or(0) as u32;
+            let decorations: Vec<String> = chain.iter().map(|c| tags(c, crate::peddeco::TAG)).find(|v| !v.is_empty()).unwrap_or_default().into_iter().map(|x| format!("{x:08x}")).collect();
             let category = chain.iter().find_map(|c| c["Category"].as_u64().filter(|&x| x != 0)).map(|h| crate::names::lookup(h as u32, crate::names::Ctx::Field).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("{h:08x}")));
             let drawable = pick_with_name(&counts, name, ped_class.as_deref(), head_prefix.as_deref());
             let named = name.filter(|p| p.0.split('_').any(crate::outfit::is_fit)).map(|p| p.1.clone());
@@ -452,7 +462,7 @@ pub fn variations(m: &Meta, pre: &HashMap<u32, (String, String)>, tu: &TexUsers,
                     }
                 }
             }
-            parts.push(Part { layer, hides, hides_sub, state_guids, item: format!("{:08x}", it[f(0x6512_1749)].as_u64().unwrap_or(0)), category, name: name.map(|p| p.0.clone()), drawable, tex_remap, tags: tg, tint, named, guid, colour, colour_tag, hair_preset, layer_set, strand_colour, preset, state: format!("{want_state:08x}"), skins, candidates: counts });
+            parts.push(Part { layer, hides, hides_sub, state_guids, item: format!("{:08x}", it[f(0x6512_1749)].as_u64().unwrap_or(0)), category, name: name.map(|p| p.0.clone()), drawable, tex_remap, tags: tg, tint, named, guid, colour, colour_tag, hair_preset, layer_set, strand_colour, preset, state: format!("{want_state:08x}"), skins, decorations, category_hash, candidates: counts });
         }
         let mut tags = BTreeMap::new();
         tag_words(&v, pre, &mut tags);
