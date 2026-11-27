@@ -806,6 +806,9 @@ pub fn read_layer(p: &Picture, game: &Path, cache: &Path) -> anyhow::Result<Laye
     Ok(Layer { mips, size })
 }
 
+/// A picture that was read, or why it could not be.
+type Read = Result<std::sync::Arc<Layer>, String>;
+
 /// A vehicle's livery in the viewer: the placements, the survey of the
 /// loaded model's zones, and the pictures on the GPU.
 #[derive(Default)]
@@ -824,7 +827,14 @@ pub struct State {
     pub zones: Zones,
     /// Pictures read so far, by `Picture::key`; an error text for the ones
     /// that could not be read.
-    layers: std::collections::HashMap<String, Result<std::sync::Arc<Layer>, String>>,
+    layers: std::collections::HashMap<String, Read>,
+    /// Pictures being read on worker threads (by key, with the number of
+    /// the read), and what the threads hand back.
+    reading: std::collections::HashMap<String, u64>,
+    reads: u64,
+    read: std::sync::Arc<std::sync::Mutex<Vec<(String, u64, Read)>>>,
+    /// Pictures that came in and that the panel has not looked at yet.
+    pub arrived: Vec<String>,
     /// The keys of the texture array's layers, in order.
     on_gpu: Vec<String>,
     view: Option<wgpu::TextureView>,
@@ -837,18 +847,64 @@ pub struct State {
 }
 
 impl State {
-    /// The size of a picture in pixels (reads it on first use).
+    /// The size of a picture in pixels (starts reading it on first use;
+    /// None until it is read, see `picture_reading`).
     pub fn picture_size(&mut self, p: &Picture, game: &Path, cache: &Path) -> Option<[u32; 2]> {
-        self.layer(p, game, cache).ok().map(|l| l.size)
+        self.layer(p, game, cache)?.ok().map(|l| l.size)
     }
 
-    fn layer(&mut self, p: &Picture, game: &Path, cache: &Path) -> Result<std::sync::Arc<Layer>, String> {
-        self.layers.entry(p.key()).or_insert_with(|| read_layer(p, game, cache).map(std::sync::Arc::new).map_err(|e| format!("{e:#}"))).clone()
+    /// A picture as a layer. It is read on a thread of its own (a large
+    /// file, or a game texture that is not in the cache yet, takes a
+    /// while): None until that is done.
+    fn layer(&mut self, p: &Picture, game: &Path, cache: &Path) -> Option<Read> {
+        let key = p.key();
+        if let Some(r) = self.layers.get(&key) {
+            return Some(r.clone());
+        }
+        if !self.reading.contains_key(&key) {
+            self.reads += 1;
+            self.reading.insert(key.clone(), self.reads);
+            let (n, p, game, cache, out) = (self.reads, p.clone(), game.to_path_buf(), cache.to_path_buf(), self.read.clone());
+            std::thread::spawn(move || {
+                let r = read_layer(&p, &game, &cache).map(std::sync::Arc::new).map_err(|e| format!("{e:#}"));
+                if let Ok(mut out) = out.lock() {
+                    out.push((key, n, r));
+                }
+            });
+        }
+        None
+    }
+
+    /// Take in the pictures the threads have read since. True when one
+    /// came in.
+    fn take_read(&mut self) -> bool {
+        let got = self.read.lock().map(|mut r| std::mem::take(&mut *r)).unwrap_or_default();
+        let mut any = false;
+        for (key, n, r) in got {
+            // (not a read that was started before the picture was forgotten)
+            if self.reading.get(&key) == Some(&n) {
+                self.reading.remove(&key);
+                self.layers.insert(key.clone(), r);
+                self.arrived.push(key);
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// How many pictures are still being read.
+    pub fn reading(&self) -> usize {
+        self.reading.len()
+    }
+
+    /// This picture is still being read.
+    pub fn picture_reading(&self, p: &Picture) -> bool {
+        self.reading.contains_key(&p.key())
     }
 
     /// A picture at 128 x 128 (stretched like its layer), for previews.
     pub fn layer_small(&mut self, p: &Picture, game: &Path, cache: &Path) -> Option<(Vec<u8>, usize)> {
-        let l = self.layer(p, game, cache).ok()?;
+        let l = self.layer(p, game, cache)?.ok()?;
         let k = l.mips.iter().position(|m| m.len() == 128 * 128 * 4)?;
         Some((l.mips[k].clone(), 128))
     }
@@ -861,6 +917,7 @@ impl State {
     /// Forget a picture read from a file (after the file changed).
     pub fn forget(&mut self, p: &Picture) {
         self.layers.remove(&p.key());
+        self.reading.remove(&p.key());
         self.on_gpu.clear();
         self.dirty = true;
     }
@@ -911,6 +968,11 @@ impl State {
                 let _ = sixng_core::atomic::write(f, serde_json::to_vec_pretty(&self.zones.describe()).unwrap_or_default());
             }
         }
+        // a picture that has been read now is drawn from this frame on
+        if self.take_read() {
+            self.dirty = true;
+        }
+        self.ed.reading = self.reading.len();
         let nothing = self.livery.stickers.is_empty() && self.highlight == Highlight::default();
         if !self.dirty && (gpu.sticker_buf.is_some() || nothing) {
             return;
@@ -925,11 +987,13 @@ impl State {
         let mut keys = Vec::new();
         let mut data = Vec::new();
         for p in &want {
-            if let Ok(l) = self.layer(p, game, cache) {
+            // (one still being read is drawn when it comes in)
+            if let Some(Ok(l)) = self.layer(p, game, cache) {
                 keys.push(p.key());
                 data.push(l);
             }
         }
+        self.ed.reading = self.reading.len();
         if keys != self.on_gpu {
             self.view = (!data.is_empty()).then(|| crate::render3d::sticker_array(&rs.device, &rs.queue, LAYER, &data.iter().map(|l| l.mips.clone()).collect::<Vec<_>>()));
             self.on_gpu = keys;

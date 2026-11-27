@@ -3573,7 +3573,7 @@ impl Map3D {
                 }
             );
             let line = format!("{line} | gpu ms/frame sky|shadows|main|post {}", crate::gpu_time::take_line());
-            let line = format!("{line} | draws {} (shadow {}, decal/see-through {}) | {} ({} placements) | {} fallbacks ({:?} draws, by level unlinked/linked {:?}) | wait: terrain idle {}, keep missing {}{}, inflight {}", self.stats.draws, self.renderer.as_ref().map_or(0, |r| r.shadow_draws), self.renderer.as_ref().map_or(0, |r| r.late_draws), self.cells.summary(), self.stats.in_cells, self.stats.n_fb, self.renderer.as_ref().map_or([0, 0], |r| r.fb_draws), self.stats.fb_lvl, self.world.idle(), self.keep.iter().filter(|m| !self.cache.contains_key(m)).count(), if self.stats.capped { " (model cap full)" } else { "" }, self.stats.inflight);
+            let line = format!("{line} | draws {} (shadow {}, decal/see-through {}, meshes culled {:?}) | {} ({} placements) | {} fallbacks ({:?} draws, by level unlinked/linked {:?}) | wait: terrain idle {}, keep missing {}{}, inflight {}", self.stats.draws, self.renderer.as_ref().map_or(0, |r| r.shadow_draws), self.renderer.as_ref().map_or(0, |r| r.late_draws), crate::render3d::MESH_CULLED.each_ref().map(|a| a.load(std::sync::atomic::Ordering::Relaxed)), self.cells.summary(), self.stats.in_cells, self.stats.n_fb, self.renderer.as_ref().map_or([0, 0], |r| r.fb_draws), self.stats.fb_lvl, self.world.idle(), self.keep.iter().filter(|m| !self.cache.contains_key(m)).count(), if self.stats.capped { " (model cap full)" } else { "" }, self.stats.inflight);
             eprintln!("{line}");
             self.draw_log();
         }

@@ -150,6 +150,11 @@ pub const DERIVED: &[&str] = &[
     // sheenfallbackroughness and sheencutoffthreshold sit two slots apart after the cloth sheen constants;
     // tintsplitcolor is a float3 in the tint weight block
     "sheenfallbackroughness", "sheencutoffthreshold", "tintsplitcolor",
+    // prefix + word + suffix search over the 748 still-unnamed shader constants (2026-11-27), about 1 random hit
+    // expected per pass; kept only hits whose shader fits (fur, grass, terrain, water, ped wrinkle, cutout, texture slots)
+    "furnoiseuvscale", "grassdecaluvscale", "grassnoisetilescale", "masktexturetex", "scrollspeedmultiplier", "shadowalpha",
+    "specularcolortex", "terrainfresnel", "terraintranslucency", "tintoverride", "vertexdisplacementmultiplier",
+    "wrinklebumpscale", "wrinklemultiplier", "dirtdiffuseintensity", "emissivedistortionstrength",
     // texture parameters of the minigame pack's water and interior shaders (joaat search, 2026-11-23)
     "watersurfacedetailtexture", "surfacedetailnormal0", "surfacedetailnormal1", "surfacedetailnormal2", "surfacedetailiridescence", "interiordiffusemaskmap", "interiorlayerdiffusemap",
     // shader constants of the 4-layer ground shaders (dictionary search, 2026-11-22)
