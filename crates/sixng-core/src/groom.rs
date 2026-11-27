@@ -720,6 +720,36 @@ pub struct Coat {
     pub stored: usize,
 }
 
+impl Coat {
+    /// The strands in a fixed shuffled order. The viewer draws the first share of a piece's strands at a
+    /// distance (the game's strand count rule), and the ray-traced passes keep the first n. The clump
+    /// members are grown root triangle by root triangle, so a cut list left whole areas of the scalp bare
+    /// (on short hair the crown, where the strands are mostly clump members). Shuffled, every cut keeps an
+    /// even spread. The order is the same for every build of the same piece.
+    fn interleaved(mut self) -> Coat {
+        let (n, k) = (self.guides.len(), self.k);
+        if n < 2 || self.points.len() != n * k || [self.normals.len(), self.variants.len(), self.clumps.len()] != [n; 3] {
+            return self;
+        }
+        let hash = |i: u32| {
+            let mut x = i.wrapping_mul(0x9e37_79b9) ^ 0x85eb_ca6b;
+            x ^= x >> 16;
+            x = x.wrapping_mul(0x7feb_352d);
+            x ^= x >> 15;
+            x = x.wrapping_mul(0x846c_a68b);
+            x ^ (x >> 16)
+        };
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| (hash(i as u32), i));
+        self.points = order.iter().flat_map(|&i| self.points[i * k..i * k + k].iter().copied()).collect();
+        self.guides = order.iter().map(|&i| self.guides[i]).collect();
+        self.normals = order.iter().map(|&i| self.normals[i]).collect();
+        self.variants = order.iter().map(|&i| self.variants[i]).collect();
+        self.clumps = order.iter().map(|&i| self.clumps[i]).collect();
+        self
+    }
+}
+
 /// Cheap test on the system page alone.
 pub fn is_groom(sys: &[u8]) -> bool {
     sys.len() >= 0xE0 && sys[0x1A] == TYPE_GROOM && sys.get(0x1C..0x20) == Some(&GROOM_TAG.to_le_bytes()[..])
@@ -1335,7 +1365,7 @@ impl Groom {
                 c.variants.push(hairgen::variant(d_var, steps(t, w)));
                 c.clumps.push(idx as u32 + 1);
             }
-            return c;
+            return c.interleaved();
         }
         let mut acc = 0.0f32;
         let mut clump_id = 0u32;
@@ -1378,7 +1408,7 @@ impl Groom {
                 }
             }
         }
-        c
+        c.interleaved()
     }
 
     /// Width (metres) of a strand at point `j` of `k`: the stored width
@@ -2119,4 +2149,32 @@ mod tests {
         assert_eq!(&glb[0..4], b"glTF");
     }
 
+    #[test]
+    fn a_cut_coat_keeps_every_area() {
+        // a strip of 20 root triangles along x, clump members only: grown triangle by triangle
+        let mut pts = Vec::new();
+        for i in 0..21 {
+            for y in [0.0, 1.0] {
+                pts.extend([[i as f32, y, 0.0], [i as f32, y, 0.1]]);
+            }
+        }
+        let roots: Vec<[u32; 3]> = (0..20u32).map(|i| [2 * i, 2 * i + 2, 2 * i + 1]).collect();
+        let g = Groom { tint_weight: 1.0, strands: 42, points_per_strand: 2, points: pts, w: vec![0.0; 84], roots, lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![[0, 20, 2, 0]; 20], width: 0.0003, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![], twist: vec![], curl: Default::default(), sim: None };
+        let c = g.coat(1.0);
+        assert_eq!(c.guides.len(), 400);
+        // the first fifth (the share drawn at a distance) is spread over the strip: in the grown order it held
+        // the first 4 triangles only; shuffled, 80 strands leave at most a chance gap
+        let mut hit = [false; 20];
+        for s in 0..80 {
+            hit[(c.points[2 * s][0] as usize).min(19)] = true;
+        }
+        assert!(hit.iter().filter(|&&h| h).count() >= 18, "{hit:?}");
+        // each strand keeps its own points, guides and normal; the order is the same every time
+        for s in 0..400 {
+            let (t, w) = c.guides[s];
+            let x = [0, 1, 2].iter().map(|&q| w[q] * g.points[t[q] as usize * 2][0]).sum::<f32>();
+            assert!((x - c.points[2 * s][0]).abs() < 1e-4);
+        }
+        assert_eq!(g.coat(1.0).points, c.points);
+    }
 }
