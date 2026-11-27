@@ -152,6 +152,9 @@ impl GroundShadow {
 #[derive(Clone)]
 pub struct Look {
     pub mode: u32,
+    /// Ped skin's engine detail (pores, wrinkles) on. Off for checking
+    /// whether a pattern on the skin comes from it; sent as bit 8 of mode.y.
+    pub skin_detail: bool,
     pub rma_order: u32,
     pub finish: u32,
     /// The vehicle's own paint finish (metalness, roughness), for finish 4.
@@ -243,6 +246,7 @@ impl Default for Look {
             emissive: 2.0,
             fog: 0.0,
             wire: false,
+            skin_detail: std::env::var("SIXNG_SKIN_DETAIL").map_or(true, |v| v != "0" && !v.eq_ignore_ascii_case("off")),
             tint: true,
             clear: [0.6, 0.65, 0.7],
         }
@@ -2726,7 +2730,7 @@ impl Renderer3D {
                 look.sky_hor[2],
                 look.exposure,
             ],
-            mode: [look.mode, look.rma_order, look.finish, look.slot],
+            mode: [look.mode, look.rma_order | if look.skin_detail { 0 } else { 256 }, look.finish, look.slot],
             paint1,
             paint2: [
                 look.pearl[0],

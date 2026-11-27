@@ -9,7 +9,7 @@ struct Frame {
     sun_col: vec4<f32>,
     sky_top: vec4<f32>,   // w flake size of the body paint's coat
     sky_hor: vec4<f32>,   // w exposure
-    mode: vec4<u32>,      // x view mode, y packed channel order, z paint finish, w slot view
+    mode: vec4<u32>,      // x view mode, y packed channel order (bit 8: ped skin detail off), z paint finish, w slot view
     paint1: vec4<f32>,    // primary paint colour (linear), w the vehicle's own paint roughness
     paint2: vec4<f32>,    // pearl colour (linear), w pearl amount
     misc: vec4<f32>,      // x wetness, y emissive boost, z time, w ambient
@@ -1664,7 +1664,7 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     // ped skin's engine detail (both skin programs; the two per-ped scales
     // on it are 1 up close, which the viewer takes: the strength fades out
     // from 6 to 9 m from the camera; the per-tile roughness term as 0)
-    let skin_det_on = (M.flags.w & 64u) != 0u && (M.flags.w & 256u) == 0u;
+    let skin_det_on = (M.flags.w & 64u) != 0u && (M.flags.w & 256u) == 0u && (F.mode.y & 256u) == 0u;
     let det_gx = dpdx(i.uv0 * M.strand.yz);
     let det_gy = dpdy(i.uv0 * M.strand.yz);
     var sd: SkinDet;
@@ -1712,10 +1712,10 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         // occlusion: lerp(1, B, the material's strength); diffuse ambient x
         // it, specular ambient x its fourth root (below), direct light not
         if ((M.flags.w & 128u) != 0u) { ao = mix(1.0, sp.b, clamp(M.tile.x, 0.0, 1.0)); }
-    } else if ((has & 4u) != 0u && F.mode.y < 3u) {
+    } else if ((has & 4u) != 0u && (F.mode.y & 255u) < 3u) {
         let p = textureSample(t_pk, samp, i.uv0);
-        if (F.mode.y == 0u) { rough = p.r; metal = p.g; ao = p.b; }
-        else if (F.mode.y == 1u) { ao = p.r; rough = p.g; metal = p.b; }
+        if ((F.mode.y & 255u) == 0u) { rough = p.r; metal = p.g; ao = p.b; }
+        else if ((F.mode.y & 255u) == 1u) { ao = p.r; rough = p.g; metal = p.b; }
         else { metal = p.r; rough = p.g; ao = p.b; }
         rough = clamp(rough, 0.04, 1.0);
     }

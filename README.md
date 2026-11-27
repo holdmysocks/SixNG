@@ -1725,7 +1725,9 @@ gaps, vertex colour, lighting), `--slot 0-3`, `--rma 0-3`, `--wire`,
 `--skeleton`, `--normals`, `--tod H`, `--weather W` (the game's lighting for
 that weather type at `--tod`, see below), `--paint r,g,b`, `--finish 0-3`,
 `--pearl A`, `--wet A`, `--exposure E`, `--spin R`, `--door R`, `--yaw R`,
-`--pitch R`, `--zoom F`, `--size WxH`.
+`--pitch R`, `--zoom F`, `--size WxH`, `--skin-detail off` (characters' bare skin
+without the engine detail maps; also `SIXNG_SKIN_DETAIL=0`, or the **skin detail**
+checkbox under the body sliders).
 
 **Time of day and weather.** The model view's Light section has the
 hour slider and a **weather** list: *viewer default* keeps the viewer's own

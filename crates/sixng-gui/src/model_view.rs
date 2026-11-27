@@ -2248,6 +2248,7 @@ impl ModelView {
             let how = if look.body_preset.is_some() { "the sliders open in its values" } else { "its values could not be read (anim.rpf and common.rpf need to be indexed); the sliders open neutral" };
             ui.label(egui::RichText::new(format!("Body-shape preset of this outfit: {p} ({how}).")).weak().small());
         }
+        ui.checkbox(&mut self.look.skin_detail, "skin detail").on_hover_text("The engine's skin detail maps (pores, fine wrinkles) on the bare skin, as the game draws them up close. Turn it off to see whether a pattern on the skin comes from them. Also --skin-detail off or SIXNG_SKIN_DETAIL=0.");
         if shape != before {
             *BODY_SHAPE.lock().unwrap() = shape;
         }
