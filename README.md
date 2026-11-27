@@ -1926,9 +1926,13 @@ the cue it plays (`Variation`). SixNG derives:
 - the wave: `<cue>_<take as two digits>`, whose joaat's low 29 bits are the
   stream ID. The stream is the one stream with that ID in the archive's
   audio index or, when that has none, in the first other archive with an
-  audio index that has it (story lines also play from `audio.rpf`). A line
-  whose ID is in no index, or in several banks of the index that has it,
-  gets no audio;
+  audio index that has it (story lines also play from `audio.rpf`). Generic
+  speech (a wave each character voice records) sits in several banks, one
+  per voice. Such a line plays from its speaker's voice bank: the candidate
+  bank whose container (from `sixng audio-meta <archive>`) holds at least
+  two of the speaker's lines that are in one bank only, while no other
+  candidate holds any. A line whose ID is in no index, or in several banks
+  with no voice bank to pick, gets no audio;
 - the speaker: the conversation's character hash. In a conversation with
   several characters, each character has a slot number and each line names
   the slot of the character who says it. A line without a slot falls back
@@ -1937,8 +1941,9 @@ the cue it plays (`Variation`). SixNG derives:
 
 The archive's audio index must exist (`sixng audio <archive>`). The report
 counts, per archive, the conversation files, lines, speakers and linked
-streams (by the archive that holds them), and the lines without a speaker
-by reason (`no_speaker`).
+streams (by the archive that holds them; `audio_from_voice_banks` of them
+picked by voice bank), and the lines without a speaker by reason
+(`no_speaker`).
 
 **Address table.**
 The table is a TSV file with a header row. The command reads these

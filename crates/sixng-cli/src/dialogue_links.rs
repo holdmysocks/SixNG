@@ -5,6 +5,7 @@ use crate::scene_dialogue::{read_json, AudioSource, AudioTarget, TextTable};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use sixng_core::audio::{StemWindow, StreamAddress};
+use sixng_core::audiometa::BankContainers;
 use sixng_core::dialogue::{self, DialogueLink, DialogueLinks, LinkedAudio, Speaker};
 use sixng_core::export::Workspace;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -79,23 +80,40 @@ fn derive(ws: &Workspace, archive: &str, sources: &mut HashMap<String, Result<Au
     if let Some(Err(e)) = sources.get(&a.id) {
         bail!("{e}");
     }
-    let usable: Vec<&AudioSource> = order.iter().filter_map(|o| sources.get(&o.id).and_then(|s| s.as_ref().ok())).collect();
-    let (links, audio, speakers) = link_lines(&lines, &usable, reject);
+    let usable: Vec<(&AudioSource, BankContainers)> = order
+        .iter()
+        .filter_map(|o| sources.get(&o.id).and_then(|s| s.as_ref().ok()).map(|s| (s, sixng_core::audiometa::load_containers(&ws.work, &o.id).unwrap_or_default())))
+        .collect();
+    let (usable, containers): (Vec<&AudioSource>, Vec<BankContainers>) = usable.into_iter().unzip();
+    let (links, audio, by_voice, speakers) = link_lines(&lines, &usable, &containers, reject);
     let mut gaps: BTreeMap<&str, usize> = BTreeMap::new();
     for l in &lines {
         if let Some(g) = l.speaker_gap {
             *gaps.entry(g).or_default() += 1;
         }
     }
-    let summary = json!({"archive": a.id, "conversation_files": n_files, "lines": lines.len(), "audio": audio, "speakers": speakers, "no_speaker": gaps});
+    let summary = json!({"archive": a.id, "conversation_files": n_files, "lines": lines.len(), "audio": audio, "audio_from_voice_banks": by_voice, "speakers": speakers, "no_speaker": gaps});
     Ok((links, summary))
 }
 
+/// A wave in several banks goes to its speaker's voice bank: the
+/// candidate bank whose container holds at least this many of the
+/// speaker's lines whose wave is in one bank only, while no other candidate
+/// holds any.
+const VOICE_BANK_SUPPORT: usize = 2;
+
 /// Links for conversation lines: each wave's stream, from the first source
 /// (archive audio index) that has the wave's id, when that source has
-/// exactly one such stream. Returns the links, audio links per archive and
-/// the number with a speaker.
-fn link_lines(lines: &[dialogue::ConversationLine], sources: &[&AudioSource], reject: &mut impl FnMut(String, String)) -> (Vec<DialogueLink>, BTreeMap<String, usize>, usize) {
+/// exactly one such stream or the speaker's voice bank picks one
+/// (`containers`: each source's bank containers, from `audio-meta`).
+/// Returns the links, audio links per archive, how many of them a voice
+/// bank picked, and the number with a speaker.
+fn link_lines(
+    lines: &[dialogue::ConversationLine],
+    sources: &[&AudioSource],
+    containers: &[BankContainers],
+    reject: &mut impl FnMut(String, String),
+) -> (Vec<DialogueLink>, BTreeMap<String, usize>, usize, usize) {
     let by_id: Vec<HashMap<u32, Vec<(u64, usize)>>> = sources
         .iter()
         .map(|s| {
@@ -108,21 +126,52 @@ fn link_lines(lines: &[dialogue::ConversationLine], sources: &[&AudioSource], re
             m
         })
         .collect();
+    // (source, its streams with the line's wave id), per line
+    let hits: Vec<Option<(usize, &[(u64, usize)])>> = lines
+        .iter()
+        .map(|l| {
+            let id = dialogue::wave_stream_id(&l.wave);
+            by_id.iter().enumerate().find_map(|(i, m)| m.get(&id).map(|v| (i, v.as_slice())))
+        })
+        .collect();
+    let bank_containers = |source: usize, bank: u64| containers.get(source).and_then(|c| c.get(&bank)).into_iter().flat_map(|m| m.keys().copied());
+    // per (speaker, source, container): the speaker's lines with a wave in that one bank only
+    let mut support: HashMap<(u32, usize, u32), usize> = HashMap::new();
+    for (l, hit) in lines.iter().zip(&hits) {
+        if let (Some(speaker), Some((source, &[(bank, _)]))) = (l.speaker, hit) {
+            for c in bank_containers(*source, bank) {
+                *support.entry((speaker, *source, c)).or_default() += 1;
+            }
+        }
+    }
+    let voice_bank = |speaker: Option<u32>, source: usize, candidates: &[(u64, usize)]| -> Option<(u64, usize)> {
+        let speaker = speaker?;
+        let score: Vec<usize> = candidates.iter().map(|&(bank, _)| bank_containers(source, bank).map(|c| support.get(&(speaker, source, c)).copied().unwrap_or(0)).max().unwrap_or(0)).collect();
+        let best = score.iter().copied().max()?;
+        (best >= VOICE_BANK_SUPPORT && score.iter().filter(|&&s| s > 0).count() == 1).then(|| candidates[score.iter().position(|&s| s == best).unwrap()])
+    };
     let own = sources.first().map(|s| s.index.archive.clone()).unwrap_or_default();
     let mut links = Vec::new();
     let mut audio: BTreeMap<String, usize> = BTreeMap::new();
-    let mut speakers = 0;
-    for l in lines {
+    let (mut speakers, mut by_voice) = (0, 0);
+    for (l, hit) in lines.iter().zip(&hits) {
         let id = dialogue::wave_stream_id(&l.wave);
-        let hit = sources.iter().zip(&by_id).find_map(|(s, m)| m.get(&id).map(|v| (*s, v.as_slice())));
-        let found = match hit {
-            Some((source, &[(bank_offset, stream_index)])) => {
-                let target = AudioTarget { archive: source.index.archive.clone(), bank_offset, stream_index, stream_id: id, stem: None };
-                source.resolve(&target).and_then(|v| Ok(serde_json::from_value::<StreamAddress>(v)?))
-            }
-            Some(_) => Err(anyhow::anyhow!("wave id in several banks")),
+        let picked = match *hit {
+            Some((source, &[one])) => Ok((source, one)),
+            Some((source, several)) => match voice_bank(l.speaker, source, several) {
+                Some(one) => {
+                    by_voice += 1;
+                    Ok((source, one))
+                }
+                None => Err(anyhow::anyhow!("wave id in several banks")),
+            },
             None => Err(anyhow::anyhow!("wave in no audio index")),
         };
+        let found = picked.and_then(|(source, (bank_offset, stream_index))| {
+            let source = sources[source];
+            let target = AudioTarget { archive: source.index.archive.clone(), bank_offset, stream_index, stream_id: id, stem: None };
+            source.resolve(&target).and_then(|v| Ok(serde_json::from_value::<StreamAddress>(v)?))
+        });
         let audio_link = match found {
             Ok(address) => {
                 *audio.entry(address.archive.clone()).or_default() += 1;
@@ -143,7 +192,7 @@ fn link_lines(lines: &[dialogue::ConversationLine], sources: &[&AudioSource], re
             scene: None,
         });
     }
-    (links, audio, speakers)
+    (links, audio, by_voice, speakers)
 }
 
 /// Build `dialogue_links.json` from the conversation files of `conversations`
@@ -438,10 +487,11 @@ mod tests {
             let one = dialogue::wave_stream_id("FXAU_AAAB_01");
             let twice = dialogue::wave_stream_id("FXAU_AAAC_01");
             let elsewhere = dialogue::wave_stream_id("FXAU_AAAE_01");
+            let (v1, v2, w1) = (dialogue::wave_stream_id("FXAU_AAAV_01"), dialogue::wave_stream_id("FXAU_AAAW_01"), dialogue::wave_stream_id("FXAU_AAAX_01"));
             let index: AudioIndex = serde_json::from_value(json!({
                 "version": audio::INDEX_VERSION, "archive": "fixture.rpf", "archive_size": 8192, "note": "",
-                "banks": [{"off":4096,"size":768,"flags":0,"streams":[[one,48,48000,0,1,4,128,128],[twice,48,48000,0,1,4,256,128]]},
-                          {"off":6144,"size":768,"flags":0,"streams":[[twice,48,48000,0,1,4,128,128]]}]
+                "banks": [{"off":4096,"size":768,"flags":0,"streams":[[one,48,48000,0,1,4,128,128],[twice,48,48000,0,1,4,256,128],[w1,48,48000,0,1,4,384,128]]},
+                          {"off":6144,"size":768,"flags":0,"streams":[[twice,48,48000,0,1,4,128,128],[v1,48,48000,0,1,4,256,128],[v2,48,48000,0,1,4,384,128]]}]
             }))?;
             audio::save_index(&ws.work, &index)?;
             // another archive has the first wave too (the own archive wins) and one wave the first lacks
@@ -458,11 +508,20 @@ mod tests {
             let line = |label: &str, wave: &str, speaker| dialogue::ConversationLine {
                 label: label.into(), subtitle_key: sixng_core::meta7a::joaat(label), cue: wave[..wave.len() - 3].into(), variation: 1, wave: wave.into(), speaker, speaker_gap: None };
             let lines = [line("FX_A_01", "FXAU_AAAB_01", Some(5)), line("FX_B_01", "FXAU_AAAC_01", None), line("FX_C_01", "FXAU_AAAD_01", Some(5)),
-                line("FX_E_01", "FXAU_AAAE_01", None)];
+                line("FX_E_01", "FXAU_AAAE_01", None),
+                // speaker 7 has two lines in the second bank's voice alone: its line in both banks plays from there
+                line("FX_V_01", "FXAU_AAAV_01", Some(7)), line("FX_V_02", "FXAU_AAAW_01", Some(7)), line("FX_V_03", "FXAU_AAAC_01", Some(7)),
+                // speaker 8 has only one: not enough to pick
+                line("FX_W_01", "FXAU_AAAX_01", Some(8)), line("FX_W_02", "FXAU_AAAC_01", Some(8))];
+            // bank containers (voices): the first bank is voice 0xa, the second 0xb
+            let containers = [BankContainers::from([(4096, [(0xa, 1)].into()), (6144, [(0xb, 1)].into())]), BankContainers::new()];
             let mut rejected = Vec::new();
-            let (links, audio_links, speakers) = link_lines(&lines, &[&own, &second], &mut |at, why| rejected.push((at, why)));
-            assert_eq!((links.len(), speakers), (4, 2));
-            assert_eq!(audio_links, BTreeMap::from([("fixture.rpf".to_string(), 1), ("other.rpf".to_string(), 1)]));
+            let (links, audio_links, by_voice, speakers) = link_lines(&lines, &[&own, &second], &containers, &mut |at, why| rejected.push((at, why)));
+            assert_eq!((links.len(), speakers, by_voice), (9, 7, 1));
+            assert_eq!(audio_links, BTreeMap::from([("fixture.rpf".to_string(), 5), ("other.rpf".to_string(), 1)]));
+            let v3 = links[6].audio.as_ref().unwrap();
+            assert_eq!((v3.address.bank_offset, v3.address.stream_index), (6144, 0));
+            assert!(links[8].audio.is_none());
             let a0 = links[0].audio.as_ref().unwrap();
             assert_eq!((a0.address.archive.as_str(), a0.address.bank_offset, a0.address.stream_index, a0.address.data_offset), ("fixture.rpf", 4096, 0, 4224));
             assert_eq!(a0.wave.as_deref(), Some("FXAU_AAAB_01"));
@@ -470,8 +529,8 @@ mod tests {
             assert!(links[1].audio.is_none() && links[2].audio.is_none());
             let a3 = links[3].audio.as_ref().unwrap();
             assert_eq!((a3.address.archive.as_str(), a3.address.bank_offset, a3.address.stream_index), ("other.rpf", 1024, 1));
-            assert_eq!(rejected.len(), 2);
-            assert!(rejected[0].1.contains("several banks") && rejected[1].1.contains("no audio index"));
+            assert_eq!(rejected.len(), 3);
+            assert!(rejected[0].1.contains("several banks") && rejected[1].1.contains("no audio index") && rejected[2].1.contains("several banks"));
             assert!(rejected[1].0.contains("FXAU_AAAD_01"));
             Ok(())
         })();
