@@ -166,6 +166,55 @@ fn jaw_weights(p: &crate::gltf::TriPrim, under: &[bool]) -> Option<Vec<f32>> {
     any.then_some(out)
 }
 
+/// A head key's fitted jaw motion.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JawKey {
+    pub name: String,
+    pub motion: JawMotion,
+    /// The share of the chin's motion each fit leaves unexplained.
+    pub turn_residual: f32,
+    pub shift_residual: f32,
+}
+
+/// Fit a head's jaw keys. Positions are in the model's space, Z up and -Y
+/// forward. `head_jaw` is each head vertex's skin weight under the jaw (its
+/// inner mouth, left out of the chin); `lo` and `hi` bound the lower teeth.
+/// Returns the number of chin vertices and the keys, or why none were fitted.
+pub fn fit_keys(pivot: [f32; 3], head: &[[f32; 3]], head_jaw: &[f32], morphs: &[(String, Vec<[f32; 3]>)], lo: [f32; 3], hi: [f32; 3]) -> Result<(usize, Vec<JawKey>), String> {
+    // the chin: below the lower teeth, in front of their middle, within
+    // their width
+    let half = lo[0].abs().max(hi[0].abs());
+    let mid_y = (lo[1] + hi[1]) / 2.0;
+    let chin: Vec<usize> = head.iter().enumerate().filter(|(i, v)| v[2] < lo[2] && v[2] > lo[2] - CHIN_DEPTH && v[0].abs() < half && v[1] < mid_y && head_jaw.get(*i).copied().unwrap_or(0.0) < 0.01).map(|(i, _)| i).collect();
+    if chin.len() < 50 {
+        return Err(format!("only {} chin vertices", chin.len()));
+    }
+    let rest: Vec<[f32; 3]> = chin.iter().map(|&i| head[i]).collect();
+    let mut keys = Vec::new();
+    for m in morphs.iter().filter(|m| !m.0.starts_with("pose_") && m.1.len() == head.len()) {
+        let d: Vec<[f32; 3]> = chin.iter().map(|&i| m.1[i]).collect();
+        if let Some([turn, shift]) = fit_both(pivot, &rest, &d) {
+            if let Some((motion, _)) = [turn, shift].into_iter().find(|x| x.1 < MAX_RESIDUAL) {
+                keys.push(JawKey { name: m.0.clone(), motion, turn_residual: turn.1, shift_residual: shift.1 });
+            }
+        }
+    }
+    Ok((chin.len(), keys))
+}
+
+/// Add the keys to a mesh's morph targets: each vertex moves with the jaw by
+/// its weight under it (`jaw`). A key the mesh already has gets the motion
+/// added; a new one is appended.
+pub fn add_keys(morphs: &mut Vec<(String, Vec<[f32; 3]>)>, keys: &[JawKey], pivot: [f32; 3], positions: &[[f32; 3]], jaw: &[f32]) {
+    for k in keys {
+        let d: Vec<[f32; 3]> = positions.iter().zip(jaw).map(|(&v, &x)| if x > 0.0 { sub(k.motion.apply(pivot, v), v).map(|c| c * x) } else { [0.0; 3] }).collect();
+        match morphs.iter_mut().find(|m| m.0 == k.name && m.1.len() == d.len()) {
+            Some(m) => m.1.iter_mut().zip(&d).for_each(|(a, b)| (0..3).for_each(|c| a[c] += b[c])),
+            None => morphs.push((k.name.clone(), d)),
+        }
+    }
+}
+
 /// Give the teeth, tongue and inner mouth the head's jaw keys (see the module
 /// notes). `joints` is the merged skeleton the primitives are skinned to.
 /// Returns the report: each key fitted, and the parts that took them.
@@ -209,50 +258,29 @@ pub fn follow_jaw(groups: &mut [NodeGroup], joints: &[Joint]) -> serde_json::Val
     if lo[0] > hi[0] {
         return serde_json::json!({"applied": false, "note": "no teeth or tongue part skinned under FB_Jaw"});
     }
-    // the chin (Z up, -Y forward): below the lower teeth, in front of their
-    // middle, within their width; the head's own jaw vertices left out
     let head = &groups[hg].prims[hp];
     let hw = weights[hg][hp].clone().unwrap_or_else(|| vec![0.0; head.positions.len()]);
-    let half = lo[0].abs().max(hi[0].abs());
-    let mid_y = (lo[1] + hi[1]) / 2.0;
-    let chin: Vec<usize> = head.positions.iter().enumerate().filter(|(i, v)| v[2] < lo[2] && v[2] > lo[2] - CHIN_DEPTH && v[0].abs() < half && v[1] < mid_y && hw[*i] < 0.01).map(|(i, _)| i).collect();
-    if chin.len() < 50 {
-        return serde_json::json!({"applied": false, "note": format!("only {} chin vertices", chin.len())});
-    }
-    let rest: Vec<[f32; 3]> = chin.iter().map(|&i| head.positions[i]).collect();
-    let mut keys: Vec<(String, JawMotion, f32, f32)> = Vec::new();
-    for m in head.morphs.iter().filter(|m| is_face(m) && m.1.len() == head.positions.len()) {
-        let d: Vec<[f32; 3]> = chin.iter().map(|&i| m.1[i]).collect();
-        if let Some([turn, shift]) = fit_both(pivot, &rest, &d) {
-            if let Some((motion, _)) = [turn, shift].into_iter().find(|x| x.1 < MAX_RESIDUAL) {
-                keys.push((m.0.clone(), motion, turn.1, shift.1));
-            }
-        }
-    }
+    let (chin, keys) = match fit_keys(pivot, &head.positions, &hw, &head.morphs, lo, hi) {
+        Ok(x) => x,
+        Err(note) => return serde_json::json!({"applied": false, "note": note}),
+    };
     let mut parts = Vec::new();
     if !keys.is_empty() {
         for (g, gr) in groups.iter_mut().enumerate() {
             for (k, p) in gr.prims.iter_mut().enumerate() {
                 let Some(w) = &weights[g][k] else { continue };
-                let delta = |motion: &JawMotion, v: [f32; 3], x: f32| sub(motion.apply(pivot, v), v).map(|c| c * x);
-                for (name, motion, _, _) in &keys {
-                    let d: Vec<[f32; 3]> = p.positions.iter().zip(w).map(|(&v, &x)| if x > 0.0 { delta(motion, v, x) } else { [0.0; 3] }).collect();
-                    match p.morphs.iter_mut().find(|m| &m.0 == name && m.1.len() == d.len()) {
-                        Some(m) => m.1.iter_mut().zip(&d).for_each(|(a, b)| (0..3).for_each(|c| a[c] += b[c])),
-                        None => p.morphs.push((name.clone(), d)),
-                    }
-                }
+                add_keys(&mut p.morphs, &keys, pivot, &p.positions, w);
                 parts.push(format!("{}/{}", gr.name, p.name));
             }
         }
     }
     serde_json::json!({
         "applied": !keys.is_empty(),
-        "chin_vertices": chin.len(),
+        "chin_vertices": chin,
         // residuals: the share of the chin's motion each fit leaves unexplained
-        "keys": keys.iter().map(|(name, m, turn_res, shift_res)| match m {
-            JawMotion::Turn(w) => serde_json::json!({"key": name, "turn_degrees": len(*w).to_degrees(), "axis": w.map(|c| c / len(*w).max(1e-9)), "turn_residual": turn_res, "shift_residual": shift_res}),
-            JawMotion::Shift(t) => serde_json::json!({"key": name, "shift_mm": t.map(|c| c * 1000.0), "turn_residual": turn_res, "shift_residual": shift_res}),
+        "keys": keys.iter().map(|k| match k.motion {
+            JawMotion::Turn(w) => serde_json::json!({"key": k.name, "turn_degrees": len(w).to_degrees(), "axis": w.map(|c| c / len(w).max(1e-9)), "turn_residual": k.turn_residual, "shift_residual": k.shift_residual}),
+            JawMotion::Shift(t) => serde_json::json!({"key": k.name, "shift_mm": t.map(|c| c * 1000.0), "turn_residual": k.turn_residual, "shift_residual": k.shift_residual}),
         }).collect::<Vec<_>>(),
         "parts": parts,
     })
