@@ -2072,7 +2072,13 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
             continue;
         }
         let o = o.expect("listed");
-        if let (false, Some(h)) = (parts.iter().any(|p| p.slot == "head"), &self_head) {
+        // A legacy outfit (`legacypedcs_…_fullbody` with `legacyheadcs_…`):
+        // one mesh is the whole clothed body and one the head with its
+        // hair. The character's own head and the bare body skin are not
+        // added to it; they would show through.
+        let legacy = |w: &str| parts.iter().any(|p| item_word(&p.drawable).starts_with(w));
+        let (legacy_body, legacy_head) = (parts.iter().any(|p| item_word(&p.drawable).starts_with("legacyped") && p.drawable.contains("_fullbody")), legacy("legacyhead"));
+        if let (false, false, false, Some(h)) = (parts.iter().any(|p| p.slot == "head"), legacy_body, legacy_head, &self_head) {
             parts.push(plain("head", h.clone(), "own"));
         }
         // The eyes that go with the head (`<head>_eyes_full`): the item's
@@ -2107,7 +2113,7 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
         }
         // No body set resolved (it is in a shared resource for many
         // characters): the whole skin meshes of the fit.
-        if parts.iter().any(|p| p.slot == "head") {
+        if parts.iter().any(|p| p.slot == "head") && !legacy_body {
             for (slot, w) in [("body upper", "hand"), ("body lower", "feet")] {
                 if !parts.iter().any(|p| p.slot == slot) {
                     if let Some(n) = fit.as_deref().and_then(|f| whole_body(w, f, &exists)) {
@@ -2135,7 +2141,8 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
     debug_assert_eq!(outfits.len(), n_listed);
     if own_head {
         let p = format!("{model}_");
-        outfits.retain(|o| o.parts.iter().any(|x| x.slot == "head" && x.drawable.starts_with(&p)));
+        // its own head, or its own legacy head or body (which stand in for the head)
+        outfits.retain(|o| o.parts.iter().any(|x| x.drawable.starts_with(&p) && (x.slot == "head" || item_word(&x.drawable).starts_with("legacy"))));
         if outfits.is_empty() {
             return Err(format!("{model} is not in the game's outfit list, and no listed outfit of the wardrobe that names its head wears that head"));
         }
