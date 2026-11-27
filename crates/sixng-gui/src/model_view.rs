@@ -3675,7 +3675,7 @@ impl ModelView {
         let cache = self.cache_dir();
         self.livery.ed.ready = !self.loading && self.idle_for_model() && self.frames_since_load >= 3;
         let Some(l) = &self.loaded else { return false };
-        let env = crate::livery_ui::Env { game: &self.game, work: &self.work, cache: &cache };
+        let env = crate::livery_ui::Env { game: &self.game, work: &self.work, cache: &cache, config: self.veh_cfg };
         self.livery.pointer(ui, resp, rect, &self.cam, &l.model, &env)
     }
 
@@ -4512,7 +4512,7 @@ impl ModelView {
         // the Liveries panel floats over the view
         if self.is_vehicle() {
             let cache = self.cache_dir();
-            let env = crate::livery_ui::Env { game: &self.game, work: &self.work, cache: &cache };
+            let env = crate::livery_ui::Env { game: &self.game, work: &self.work, cache: &cache, config: self.veh_cfg };
             self.livery.panel(&ctx, rect, &env);
         }
         self.sync_livery(rs);
@@ -4944,7 +4944,7 @@ impl ModelView {
         }
         if !self.expr.is_empty() {
             egui::CollapsingHeader::new("Expression").id_salt("face_expr").show(ui, |ui| {
-                ui.label(egui::RichText::new("The face's expression controls: shape keys of the game's face network (exported as glTF morph targets).").weak().small());
+                ui.label(egui::RichText::new("Shape keys (exported as glTF morph targets): face_* are the face network's expression controls, pose_* the pose correctives garments take from the character's body network (driven by the pose in the game; what drives each one is not decoded).").weak().small());
                 ui.horizontal(|ui| {
                     ui.label("filter");
                     ui.text_edit_singleline(&mut self.expr_filter);
@@ -4955,7 +4955,9 @@ impl ModelView {
                 let f = self.expr_filter.to_ascii_lowercase();
                 egui::ScrollArea::vertical().max_height(320.0).id_salt("face_expr_list").show(ui, |ui| {
                     for e in self.expr.iter_mut().filter(|e| e.0.to_ascii_lowercase().contains(&f)) {
-                        ui.add(egui::Slider::new(&mut e.1, 0.0..=1.0).text(e.0.as_str()));
+                        // pose inputs come from joint rotations and go both ways
+                        let lo = if e.0.starts_with("pose_") { -1.0 } else { 0.0 };
+                        ui.add(egui::Slider::new(&mut e.1, lo..=1.0).text(e.0.as_str()));
                     }
                 });
             });
@@ -6603,10 +6605,10 @@ fn bare_tint(m: &mut glb::Model, colour: impl Fn([u8; 4]) -> [u8; 3]) -> bool {
 /// Attached accessories (a watch, a ring) are modelled at their own root
 /// bone (`Watch_Root`, at the authoring origin under the feet) and carry
 /// attach bones under the body's bones (`Watch_L_Wrist` under the wrist)
-/// that no vertex uses. The game moves the root onto an attach bone; do the
-/// same in the bind pose, so the part sits on the body in the merged model.
-/// The left one is taken when there are two. Parts modelled in place (their
-/// vertices are near the bones that move them) are left alone.
+/// that no vertex uses (`sixng_core::outfit::accessory_attach`). The game
+/// moves the root onto an attach bone; do the same in the bind pose, so the
+/// part sits on the body in the merged model. Parts modelled in place
+/// (their vertices are near the bones that move them) are left alone.
 fn place_attached(m: &mut glb::Model) -> Option<usize> {
     use glam::{Mat4, Vec3};
     if m.joints.is_empty() || m.meshes.iter().any(|me| !me.skinned) {
@@ -6623,36 +6625,11 @@ fn place_attached(m: &mut glb::Model) -> Option<usize> {
         }
     }
     let bind = |i: usize| Mat4::from_cols_array(&m.joints[i].ibm).inverse();
-    let pos = |i: usize| bind(i).transform_point3(Vec3::ZERO);
-    let prefix = |i: usize| m.joints[i].name.split('_').next().unwrap_or("").to_string();
-    let first = used.iter().position(|u| *u)?;
-    let pre = prefix(first);
-    // every used bone belongs to the accessory (same name prefix)
-    if pre.is_empty() || ["SKEL", "BM", "MH", "RB", "PH", "GM", "SEC", "FACIAL"].contains(&pre.as_str()) || (0..used.len()).any(|i| used[i] && prefix(i) != pre) {
-        return None;
-    }
-    // its root: the topmost ancestor with that prefix
-    let mut root = first;
-    while let Some(p) = m.joints[root].parent.filter(|&p| prefix(p) == pre) {
-        root = p;
-    }
-    // attach bones: same prefix, unused, not under the root
-    let under_root = |mut i: usize| loop {
-        if i == root {
-            return true;
-        }
-        match m.joints[i].parent {
-            Some(p) => i = p,
-            None => return false,
-        }
-    };
-    let mut attach: Vec<usize> = (0..used.len()).filter(|&i| !used[i] && prefix(i) == pre && !under_root(i)).collect();
-    attach.sort_by_key(|&i| (!m.joints[i].name.contains("_L_"), i));
-    let &at = attach.first()?;
+    let names: Vec<&str> = m.joints.iter().map(|j| j.name.as_str()).collect();
+    let parents: Vec<Option<usize>> = m.joints.iter().map(|j| j.parent).collect();
+    let pos: Vec<[f32; 3]> = (0..m.joints.len()).map(|i| bind(i).transform_point3(Vec3::ZERO).to_array()).collect();
     let c = (Vec3::from(m.bbox[0]) + Vec3::from(m.bbox[1])) * 0.5;
-    if (c - pos(root)).length() > 0.25 || (pos(at) - pos(root)).length() < 0.3 {
-        return None;
-    }
+    let (root, at) = sixng_core::outfit::accessory_attach(&names, &parents, &pos, &used, c.to_array())?;
     let t = bind(at) * bind(root).inverse();
     if !t.is_finite() {
         return None;

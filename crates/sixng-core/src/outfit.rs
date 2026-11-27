@@ -540,6 +540,117 @@ pub fn add_mover(channels: &mut Vec<AnimChannel>, d: &crate::anim::ClipDictionar
     Some(((p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt(), 2.0 * q[2].atan2(q[3]).to_degrees()))
 }
 
+/// Attached accessories (a watch, a ring) are modelled at their own root
+/// bone (`Watch_Root`, at the authoring origin under the feet) and carry
+/// attach bones under the body's bones (`Watch_L_Wrist` under the wrist)
+/// that no vertex uses. The game moves the root onto an attach bone.
+/// Given a part's joints (names, parents, bind positions in model space),
+/// which of them its vertices use, and the centre of its vertices, returns
+/// (root, attach bone) when the part is such an accessory: every used bone
+/// has one name prefix that is not the body's, the root is the topmost
+/// ancestor with that prefix, the vertices lie at the root (within 25 cm)
+/// and the attach bone (unused, same prefix, not under the root) at least
+/// 30 cm from it. The left attach bone is taken when there are two.
+pub fn accessory_attach(names: &[&str], parents: &[Option<usize>], pos: &[[f32; 3]], used: &[bool], centre: [f32; 3]) -> Option<(usize, usize)> {
+    let n = names.len().min(parents.len()).min(pos.len()).min(used.len());
+    let prefix = |i: usize| names[i].split('_').next().unwrap_or("");
+    let first = (0..n).find(|&i| used[i])?;
+    let pre = prefix(first);
+    if pre.is_empty() || ["SKEL", "BM", "MH", "RB", "PH", "GM", "SEC", "FACIAL"].contains(&pre) || (0..n).any(|i| used[i] && prefix(i) != pre) {
+        return None;
+    }
+    let mut root = first;
+    while let Some(p) = parents[root].filter(|&p| p < n && prefix(p) == pre) {
+        root = p;
+    }
+    let under_root = |mut i: usize| {
+        for _ in 0..=n {
+            if i == root {
+                return true;
+            }
+            match parents[i].filter(|&p| p < n) {
+                Some(p) => i = p,
+                None => return false,
+            }
+        }
+        false
+    };
+    let mut attach: Vec<usize> = (0..n).filter(|&i| !used[i] && prefix(i) == pre && !under_root(i)).collect();
+    attach.sort_by_key(|&i| (!names[i].contains("_L_"), i));
+    let &at = attach.first()?;
+    let d = |a: [f32; 3], b: [f32; 3]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+    if d(centre, pos[root]) > 0.25 || d(pos[at], pos[root]) < 0.3 {
+        return None;
+    }
+    Some((root, at))
+}
+
+/// Put each attached accessory among `groups` (`accessory_attach`) on its
+/// attach bone: its root bone becomes a child of the attach bone, and the
+/// root and the bones under it are moved by bind(attach) * bind(root)^-1 in
+/// the rest pose, so the accessory sits on the body and follows that bone
+/// in animations. The inverse bind matrices are unchanged. Returns
+/// (part, root bone, attach bone) per accessory placed.
+fn attach_accessories(joints: &mut [Joint], groups: &[NodeGroup]) -> Vec<(String, String, String)> {
+    let names: Vec<String> = joints.iter().map(|j| j.name.clone()).collect();
+    let mut placed = Vec::new();
+    for g in groups {
+        let mut used = vec![false; joints.len()];
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for p in &g.prims {
+            for (j, w) in [(&p.joints, &p.weights), (&p.joints1, &p.weights1)].into_iter().filter_map(|(j, w)| j.as_ref().zip(w.as_ref())) {
+                for (j, w) in j.iter().zip(w).flat_map(|(a, b)| a.iter().zip(b)) {
+                    if *w > 0 {
+                        if let Some(u) = used.get_mut(*j as usize) {
+                            *u = true;
+                        }
+                    }
+                }
+            }
+            for q in &p.positions {
+                for c in 0..3 {
+                    lo[c] = lo[c].min(q[c]);
+                    hi[c] = hi[c].max(q[c]);
+                }
+            }
+        }
+        if lo[0] > hi[0] {
+            continue;
+        }
+        let centre = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5];
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let parents: Vec<Option<usize>> = joints.iter().map(|j| j.parent).collect();
+        let pos: Vec<[f32; 3]> = joints.iter().map(|j| [j.bind[12], j.bind[13], j.bind[14]]).collect();
+        let Some((root, at)) = accessory_attach(&refs, &parents, &pos, &used, centre) else { continue };
+        if joints[root].parent == Some(at) {
+            continue;
+        }
+        let t = crate::gltf::mat_mul(&joints[at].pose.unwrap_or(joints[at].bind), &crate::drawable::affine_inverse(&joints[root].bind));
+        if t.iter().any(|x| !x.is_finite()) {
+            continue;
+        }
+        let under = |mut i: usize| {
+            for _ in 0..=parents.len() {
+                if i == root {
+                    return true;
+                }
+                match parents[i] {
+                    Some(p) => i = p,
+                    None => return false,
+                }
+            }
+            false
+        };
+        for i in (0..joints.len()).filter(|&i| under(i)) {
+            let m = joints[i].pose.unwrap_or(joints[i].bind);
+            joints[i].pose = Some(crate::gltf::mat_mul(&t, &m));
+        }
+        joints[root].parent = Some(at);
+        placed.push((g.name.clone(), names[root].clone(), names[at].clone()));
+    }
+    placed
+}
+
 /// Write one rigged GLB of `parts` (LOD0) at `out`. Textures go to
 /// `<out folder>/textures/`. Each clip becomes one glTF animation, named
 /// `<dictionary>/<clip>`. With `anim_only` the GLB holds the skeleton and
@@ -603,7 +714,7 @@ pub fn export_outfit(a: &ArchiveInfo, parts: &[&Entry], name: &str, out: &Path, 
         part_joints.push(if skinned { b.joints } else { Vec::new() });
         groups.push(NodeGroup { name: pname, prims });
     }
-    let (joints, maps) = merge_skeletons(&part_joints);
+    let (mut joints, maps) = merge_skeletons(&part_joints);
     for (g, map) in groups.iter_mut().zip(&maps) {
         for p in &mut g.prims {
             if map.is_empty() {
@@ -614,6 +725,7 @@ pub fn export_outfit(a: &ArchiveInfo, parts: &[&Entry], name: &str, out: &Path, 
             }
         }
     }
+    let attached = attach_accessories(&mut joints, &groups);
     let mut anims = Vec::new();
     let mut clip_reports = Vec::new();
     for &(d, c) in clips {
@@ -672,6 +784,7 @@ pub fn export_outfit(a: &ArchiveInfo, parts: &[&Entry], name: &str, out: &Path, 
         "renamed_joints": joints.iter().filter(|j| j.name.contains('.')).map(|j| j.name.clone()).collect::<Vec<_>>(),
         "joint_roots": joints.iter().filter(|j| j.parent.is_none()).map(|j| j.name.clone()).collect::<Vec<_>>(),
         "unresolved_influences": unresolved,
+        "attached": attached.iter().map(|(part, root, at)| serde_json::json!({"part": part, "root": root, "on": at})).collect::<Vec<_>>(),
         "clip": clip_report, "warnings": warnings,
     }))
 }
@@ -712,6 +825,25 @@ mod tests {
         };
         remap_joints(&mut p, &maps[1]);
         assert_eq!(p.joints.unwrap(), [[4, 3, 1, u16::MAX], [0, 0, 0, 0]]);
+    }
+
+    /// A watch modelled at its own root at the origin, with an unused
+    /// attach bone under the wrist, goes onto the wrist; a part on the
+    /// body's own bones stays.
+    #[test]
+    fn watch_goes_on_the_wrist() {
+        let mut joints = vec![j("SKEL_ROOT", None, 0.0), j("SKEL_L_Hand", Some(0), 0.6), j("Watch_Root", Some(0), 0.0), j("Watch_Case", Some(2), 0.01), j("Watch_L_Wrist", Some(1), 0.55), j("Watch_R_Wrist", Some(0), -0.55)];
+        let prim = |joint: u16, x: f32| TriPrim {
+            name: "p".into(), positions: vec![[x, 0.0, 0.0], [x + 0.02, 0.0, 0.0]], normals: None, tangents: None, uvs: vec![], colors: None, colors1: None, regions: None, tint: None, indices: vec![], material: None,
+            joints: Some(vec![[joint, 0, 0, 0]; 2]), weights: Some(vec![[255, 0, 0, 0]; 2]), joints1: None, weights1: None, morphs: Vec::new(),
+        };
+        let groups = vec![NodeGroup { name: "glove".into(), prims: vec![prim(1, 0.6)] }, NodeGroup { name: "watch".into(), prims: vec![prim(3, 0.0)] }];
+        let placed = attach_accessories(&mut joints, &groups);
+        assert_eq!(placed, [("watch".to_string(), "Watch_Root".to_string(), "Watch_L_Wrist".to_string())]);
+        assert_eq!(joints[2].parent, Some(4));
+        assert!((joints[2].pose.unwrap()[12] - 0.55).abs() < 1e-6);
+        assert!((joints[3].pose.unwrap()[12] - 0.56).abs() < 1e-6);
+        assert!(joints[1].pose.is_none() && joints[4].pose.is_none());
     }
 
     #[test]
