@@ -835,7 +835,7 @@ mod tests {
         let mut joints = vec![j("SKEL_ROOT", None, 0.0), j("SKEL_L_Hand", Some(0), 0.6), j("Watch_Root", Some(0), 0.0), j("Watch_Case", Some(2), 0.01), j("Watch_L_Wrist", Some(1), 0.55), j("Watch_R_Wrist", Some(0), -0.55)];
         let prim = |joint: u16, x: f32| TriPrim {
             name: "p".into(), positions: vec![[x, 0.0, 0.0], [x + 0.02, 0.0, 0.0]], normals: None, tangents: None, uvs: vec![], colors: None, colors1: None, regions: None, tint: None, indices: vec![], material: None,
-            joints: Some(vec![[joint, 0, 0, 0]; 2]), weights: Some(vec![[255, 0, 0, 0]; 2]), joints1: None, weights1: None,
+            joints: Some(vec![[joint, 0, 0, 0]; 2]), weights: Some(vec![[255, 0, 0, 0]; 2]), joints1: None, weights1: None, morphs: Vec::new(),
         };
         let groups = vec![NodeGroup { name: "glove".into(), prims: vec![prim(1, 0.6)] }, NodeGroup { name: "watch".into(), prims: vec![prim(3, 0.0)] }];
         let placed = attach_accessories(&mut joints, &groups);
