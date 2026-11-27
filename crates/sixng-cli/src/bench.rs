@@ -325,7 +325,7 @@ fn models(indexes: &[(ArchiveInfo, ArchiveIndex)], a: &BenchArgs) -> Result<Valu
         paint: None,
         tex_remap: Default::default(),
         ped_tints: Default::default(),
-        part_skins: Default::default(), part_decorations: Default::default(),
+        part_skins: Default::default(), part_decorations: Default::default(), skin_tone: 0,
         part_colours: Default::default(),
         part_hidden: Default::default(),
     };
