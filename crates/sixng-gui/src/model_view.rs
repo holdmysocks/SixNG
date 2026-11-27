@@ -9744,7 +9744,7 @@ fn export_load_shaped(
         part_skins: e.name.as_ref().filter(|_| !skins.is_empty()).map(|n| (n.to_ascii_lowercase(), skins.to_vec())).into_iter().collect(),
         part_decorations: e.name.as_ref().filter(|_| !decorations.is_empty()).map(|n| (n.to_ascii_lowercase(), decorations.to_vec())).into_iter().collect(),
         part_colours: Default::default(),
-        part_hidden: Default::default(),
+        part_hidden: Default::default(), part_layers: Default::default(),
     };
     let item = export::export_entry(a, e, &opts)?;
     let lods = lods_in(&dir);
