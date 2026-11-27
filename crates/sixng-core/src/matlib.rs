@@ -310,7 +310,11 @@ impl Library {
         if all.presets.is_empty() {
             return Err("no layered-material library found in data.rpf".into());
         }
-        // the index keeps a copy, which saves reading the table of contents
+        // the index keeps a copy, which saves reading the table of contents;
+        // SIXNG_NO_MUV_DEFAULTS leaves them out (before / after comparisons)
+        if std::env::var_os("SIXNG_NO_MUV_DEFAULTS").is_some() {
+            return Ok(all);
+        }
         all.defaults = Index::load(ws).map(|i| i.defaults).filter(|d| !d.is_empty()).unwrap_or_else(|| Defaults::read(ws).unwrap_or_default());
         Ok(all)
     }
