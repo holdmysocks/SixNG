@@ -1885,6 +1885,48 @@ pre-skip, with an exclusive end.
 plays only that channel and frame range. The full bank is still available
 in Audio.
 
+### Dialogue links
+
+`sixng dialogue-links` links subtitles to their speaker and audio stream
+from a local address table and writes `<work>/dialogue_links.json`:
+
+```sh
+sixng audio 'pack/story000/story000'
+sixng dialogue-links --addresses addresses.tsv --text-table 'text-export/text/data/1000.json'
+```
+
+The table is a TSV file with a header row. The command reads these
+columns and ignores the rest: `subtitle_key` (`<table>/<hex key>`, the
+last part being the text label hash), `character_id`, `speaker_hash_hex`,
+`speaker_status`, `mission_id`, `scene`, `archive`, `bank_offset`,
+`stream_index`, `stream_id_hex`, `clip_name`, `data_offset`, `data_size`,
+`channel_id_hex`, `pcm_start_frame`, `pcm_end_frame_exclusive` and
+`confirmed`. A row needs only the key plus a speaker or an audio address.
+
+The table only names the stream. The command rebuilds every address from
+the archive's SixNG audio index: the stream at `bank_offset` and
+`stream_index` must have the given ID, and the encoded byte range comes
+from the index. A table range that disagrees with the index rejects the
+row. A wave name (`clip_name`) is kept only when the low 29 bits of its
+joaat are the stream ID. Rows with a speaker state of `conflict`,
+`unattributed` or `no_verified_dialogue` get no speaker. The report
+counts linked and rejected addresses for confirmed and unconfirmed rows
+and groups the rejections by reason.
+
+With the file in place:
+
+- `sixng text --label` and `--find` add a `dialogue` list to each label
+  that has links: speaker, speaker hash, archive, bank, stream position,
+  stream ID, wave name and stem window.
+- **Audio** adds a **Subtitle** column to banks with linked streams. It
+  shows the speaker and the line; hover for every subtitle key.
+- **Scenes** fills the audio of a dialogue row from its subtitle's link
+  when the link names exactly one stream. Links that name a scene are
+  added to that scene's dialogue.
+
+Keep the address table and `dialogue_links.json` local: they hold game
+data.
+
 ## Output layout
 
 ```

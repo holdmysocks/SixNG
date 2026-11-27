@@ -1,7 +1,8 @@
 //! Audio page: banks found in audio.rpf, their streams, playback and export.
 //!
 //! Stream names are hashes in the game data (not recovered), so streams are
-//! listed by bank offset and stream id. Playback decodes the Opus packets
+//! listed by bank offset and stream id. A stream that `dialogue_links.json`
+//! links to a subtitle shows the speaker and line. Playback decodes the Opus packets
 //! with libopus in a background thread and plays them through the default
 //! output device.
 
@@ -70,6 +71,40 @@ pub struct AudioView {
     bank_names: std::collections::HashMap<u64, String>,
     /// bank offset -> stream id -> name, where recovered
     stream_names: std::collections::BTreeMap<u64, std::collections::BTreeMap<u32, String>>,
+    /// (bank offset, stream index) -> the subtitles linked to the stream, from
+    /// `<work>/dialogue_links.json` (`sixng dialogue-links`)
+    dialogue: std::collections::HashMap<(u64, usize), Vec<StreamLine>>,
+}
+
+/// A subtitle linked to a stream, as the stream list shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamLine {
+    pub speaker: Option<String>,
+    pub subtitle_key: u32,
+    pub text: Option<String>,
+}
+
+impl StreamLine {
+    /// `speaker: text`, or the key where no text was joined.
+    pub fn label(&self) -> String {
+        let text = self.text.as_deref().map(sixng_core::text::plain).unwrap_or_else(|| format!("subtitle {:08x}", self.subtitle_key));
+        match &self.speaker {
+            Some(s) => format!("{s}: {text}"),
+            None => text,
+        }
+    }
+}
+
+/// The subtitles of an archive's streams, by (bank offset, stream index).
+pub fn stream_lines(links: &sixng_core::dialogue::DialogueLinks, archive: &str) -> std::collections::HashMap<(u64, usize), Vec<StreamLine>> {
+    links
+        .by_stream(archive)
+        .into_iter()
+        .map(|(k, v)| {
+            let lines = v.into_iter().map(|l| StreamLine { speaker: l.speaker.as_ref().map(|s| s.label.clone()), subtitle_key: l.subtitle_key, text: l.text.clone() }).collect();
+            (k, lines)
+        })
+        .collect()
 }
 
 fn fmt_secs(s: f64) -> String {
@@ -119,6 +154,7 @@ impl AudioView {
             scroll_to_stream: false,
             bank_names: Default::default(),
             stream_names: Default::default(),
+            dialogue: Default::default(),
         }
     }
 
@@ -270,6 +306,14 @@ impl AudioView {
         let c = sixng_core::audiometa::load_containers(work, archive).map(|c| sixng_core::audiometa::bank_container(&c)).unwrap_or_default();
         self.bank_names = c.into_iter().filter_map(|(b, h)| sixng_core::names::lookup(h, sixng_core::names::Ctx::Audio).map(|n| (b, n))).collect();
         self.stream_names = sixng_core::names::all_stream_names(work, ix);
+        self.dialogue = match sixng_core::dialogue::load(work) {
+            Ok(Some(links)) => stream_lines(&links, archive),
+            Ok(None) => Default::default(),
+            Err(e) => {
+                self.error = Some(format!("Could not load dialogue_links.json: {e:#}"));
+                Default::default()
+            }
+        };
     }
 
     fn refilter(&mut self) {
@@ -626,9 +670,13 @@ impl AudioView {
                 let scroll_to_stream = std::mem::take(&mut self.scroll_to_stream);
                 egui::ScrollArea::vertical().id_salt("audio_streams").auto_shrink([false, false]).show(ui, |ui| {
                     let names = self.stream_names.get(&b.off).cloned().unwrap_or_default();
-                    egui::Grid::new("audio_stream_grid").striped(true).num_columns(7).show(ui, |ui| {
+                    let has_lines = streams.iter().any(|(i, _)| self.dialogue.contains_key(&(b.off, *i)));
+                    egui::Grid::new("audio_stream_grid").striped(true).num_columns(if has_lines { 8 } else { 7 }).show(ui, |ui| {
                         ui.strong("Stream id");
                         ui.strong("Name");
+                        if has_lines {
+                            ui.strong("Subtitle");
+                        }
                         ui.strong("Length");
                         ui.strong("Rate");
                         ui.strong("Layout");
@@ -655,6 +703,21 @@ impl AudioView {
                                 row.scroll_to_me(Some(egui::Align::Center));
                             }
                             ui.label(names.get(&s.id).map(|n| n.as_str()).unwrap_or(""));
+                            if has_lines {
+                                match self.dialogue.get(&(b.off, i)) {
+                                    Some(lines) => {
+                                        let first = lines[0].label();
+                                        let shown = if lines.len() > 1 { format!("{first} (+{})", lines.len() - 1) } else { first };
+                                        let hover = lines.iter().map(|l| format!("{:08x}  {}", l.subtitle_key, l.label())).collect::<Vec<_>>().join("
+");
+                                        ui.add(egui::Label::new(shown).truncate()).on_hover_text(format!("Subtitle key and line (dialogue_links.json):
+{hover}"));
+                                    }
+                                    None => {
+                                        ui.label("");
+                                    }
+                                }
+                            }
                             if let Some(window) = stem {
                                 ui.label(format!("{:.3}–{:.3} s", f64::from(window.start_frame) / 48000.0,
                                     f64::from(window.end_frame) / 48000.0))
@@ -764,5 +827,24 @@ mod tests {
         assert!(view.search.is_empty());
         assert_eq!(view.min_seconds, 0.0);
         assert!(view.player.is_none() && view.decoding.is_none());
+    }
+
+    #[test]
+    fn linked_subtitles_are_listed_by_stream_position() {
+        let links = sixng_core::dialogue::parse(serde_json::json!({"schema_version": 1, "links": [
+            {"subtitle_key": 3, "speaker": {"label": "guide", "hash": 7}, "text": "~sl:0:1.2~Come in.~n~Sit.",
+             "audio": {"archive": "local/fixture.rpf", "bank_offset": 4096, "stream_index": 1, "stream_id": 66, "data_offset": 4352, "data_size": 512}},
+            {"subtitle_key": 4,
+             "audio": {"archive": "local/fixture.rpf", "bank_offset": 4096, "stream_index": 1, "stream_id": 66, "data_offset": 4352, "data_size": 512}},
+            {"subtitle_key": 5, "speaker": {"label": "guide"},
+             "audio": {"archive": "other.rpf", "bank_offset": 4096, "stream_index": 0, "stream_id": 9, "data_offset": 4224, "data_size": 128}},
+            {"subtitle_key": 6, "speaker": {"label": "guide"}}
+        ]}).to_string().as_bytes()).unwrap();
+        let lines = stream_lines(&links, "local/fixture.rpf");
+        assert_eq!(lines.len(), 1);
+        let at = &lines[&(4096, 1)];
+        assert_eq!(at.len(), 2);
+        assert_eq!(at[0].label(), "guide: Come in. Sit.");
+        assert_eq!(at[1].label(), "subtitle 00000004");
     }
 }
