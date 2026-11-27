@@ -562,6 +562,18 @@ impl GpuModel {
         self.n_instances - self.n_fb.min(self.n_instances)
     }
 
+    /// Distance from `eye` to the centre of the model's normally drawn
+    /// instances (its own box centre when that is unknown).
+    pub fn eye_distance(&self, eye: Vec3) -> f32 {
+        let c = self.world.map_or((self.bbox[0] + self.bbox[1]) * 0.5, |(c, _)| c);
+        let d = (c - eye).length();
+        if d.is_finite() {
+            d
+        } else {
+            0.0
+        }
+    }
+
     /// The meshes in buffer order (see `order`).
     pub fn ordered(&self) -> impl Iterator<Item = &GpuMesh> {
         self.order.iter().filter_map(|&i| self.meshes.get(i))
@@ -3502,18 +3514,16 @@ impl Renderer3D {
                     if gm.n_normal() == 0 {
                         continue;
                     }
-                    let model_d = gm.world.map(|(c, _)| (c - eye).length());
+                    let model_d = gm.eye_distance(eye);
                     for (pos, me) in gm.ordered().enumerate().filter(|(_, m)| m.visible && m.n_idx > 0) {
                         if let Some(o) = gm.mat_decal[me.material] {
                             let blend = look.mode == 0
                                 && (gm.mat_alpha[me.material] == 2
                                     || matches!(gm.mat_class[me.material], 5 | 6 | 8));
-                            // opaque-mode decals write depth and do not blend, so
-                            // their order matters only between coplanar ones: keep
-                            // a model's together (far to near by model) so its
-                            // meshes of one material join; blended ones go far to
-                            // near by mesh
-                            let d = if blend { (me.centre - eye).length() } else { model_d.unwrap_or((me.centre - eye).length()) };
+                            // far to near by model, as see-through draws are
+                            // sorted per placed object: a model's decals stay
+                            // together, so its meshes of one material join
+                            let d = model_d;
                             dl.push((o, blend, d, mi, pos, gm, me));
                         }
                     }
@@ -3564,6 +3574,8 @@ impl Renderer3D {
                     if gm.n_normal() == 0 {
                         continue;
                     }
+                    // far to near by model (see the decals above)
+                    let model_d = gm.eye_distance(eye);
                     for (pos, me) in gm.ordered().enumerate().filter(|(_, m)| m.visible && m.n_idx > 0) {
                         if self.decal_bias && gm.mat_decal[me.material].is_some() {
                             continue;
@@ -3571,7 +3583,7 @@ impl Renderer3D {
                         if gm.mat_alpha[me.material] == 2
                             || matches!(gm.mat_class[me.material], 5 | 6 | 8)
                         {
-                            bl.push(((me.centre - eye).length(), mi, pos, gm, me));
+                            bl.push((model_d, mi, pos, gm, me));
                         }
                     }
                 }

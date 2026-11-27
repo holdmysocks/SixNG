@@ -1511,11 +1511,12 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   meshes go into those buffers grouped by kind (solid, cut-out, decal,
   see-through) and then by material, so a model's meshes of one material
   follow on and draw as one call, and its solid meshes draw as one call in
-  the shadow passes. Decal and see-through meshes keep their order (by
-  layer, far to near), bind only what changed, and join the pending draw
-  when they follow on in the same model and material; opaque-mode decals,
-  which write depth and do not blend, are kept together per model for
-  this. The tick line counts these draws as "decal/see-through".
+  the shadow passes. Decal and see-through meshes are drawn by layer, then
+  far to near by model (the centre of its placements; within a model in
+  buffer order), bind only what changed, and join the pending draw when
+  they follow on in the same model and material, so a model's decals or
+  glass of one material are one call. The tick line counts these draws
+  as "decal/see-through".
 - **Map cells** (far placements merged per area): a placement more than
   0.3× the HD distance from the camera can be drawn from its cell instead
   of one by one (`SIXNG_CELLS_NEAR` sets another fraction). The cells are
