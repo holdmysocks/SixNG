@@ -397,6 +397,9 @@ pub struct Shell {
     lining: Option<Lining>,
     /// Per cell: the outermost head point in that direction (0: none).
     scalp: Vec<f32>,
+    /// The hat's crown as a containment volume for the settle
+    /// (`Shell::with_crown`).
+    pub crown: Option<Crown>,
 }
 
 /// A hat's triangles, binned by their direction from the shell's centre
@@ -606,13 +609,20 @@ impl Shell {
                 break;
             }
         }
-        Shell { centre, r, id, lining: None, scalp }
+        Shell { centre, r, id, lining: None, scalp, crown: None }
     }
 
     /// The same shell with the hat's own triangles (RAGE space), for
     /// `press_strands`.
     pub fn with_lining(mut self, tris: Vec<[[f32; 3]; 3]>) -> Shell {
         self.lining = (!tris.is_empty()).then(|| Lining::new(self.centre, tris));
+        self
+    }
+
+    /// The same shell with the hat's crown fitted as a containment volume
+    /// (`Crown::fit`, 6 mm inside the hat's points) for `Groom::settle_in`.
+    pub fn with_crown(mut self, hat: &[[f32; 3]]) -> Shell {
+        self.crown = Crown::fit(hat, [self.centre[0], self.centre[1]], 0.006);
         self
     }
 
@@ -746,6 +756,65 @@ pub fn f16(h: u16) -> f32 {
 
 fn v3(r: &Resource, o: usize) -> [f32; 3] {
     [r.f32(o), r.f32(o + 4), r.f32(o + 8)]
+}
+
+/// A hat's crown as a containment volume for the strand settle: the
+/// game's containment kind 16 (an ellipsoid, sizes less the point radius,
+/// with a cut plane across the up axis), fitted to the hat. Points above
+/// the floor plane that lie outside the ellipsoid are pulled back onto it;
+/// below the floor (the brim) the hair is free. The game gives hats no
+/// such volume (it swaps the hair for a hat variant where the hair item has
+/// one); the fit is the viewer's own.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Crown {
+    /// The ellipsoid's centre, on the floor plane.
+    pub centre: [f32; 3],
+    /// Its semi-axes along x, y and z.
+    pub axes: [f32; 3],
+    /// The floor plane's height (z).
+    pub floor: f32,
+}
+
+impl Crown {
+    /// The crown of a hat (its points, RAGE space, z up) worn over a head
+    /// whose top is at `centre` (x, y): the floor is where the hat reaches
+    /// out furthest (the brim, or a brimless hat's lower edge), and the
+    /// ellipsoid spans the hat's points above it, `gap` inside them. None
+    /// for too few points or a crown under 2 cm.
+    pub fn fit(hat: &[[f32; 3]], centre: [f32; 2], gap: f32) -> Option<Crown> {
+        if hat.len() < 16 {
+            return None;
+        }
+        let out = |p: &[f32; 3]| ((p[0] - centre[0]).powi(2) + (p[1] - centre[1]).powi(2)).sqrt();
+        let far = hat.iter().map(out).fold(0.0f32, f32::max);
+        // the brim: the points within 15 % of the furthest reach; its height their median
+        let mut rim: Vec<f32> = hat.iter().filter(|p| out(p) >= 0.85 * far).map(|p| p[2]).collect();
+        rim.sort_by(f32::total_cmp);
+        let floor = *rim.get(rim.len() / 2)?;
+        // the crown: the points 1 cm and more above the brim
+        let crown: Vec<&[f32; 3]> = hat.iter().filter(|p| p[2] > floor + 0.01).collect();
+        if crown.len() < 8 {
+            return None;
+        }
+        let ax = crown.iter().map(|p| (p[0] - centre[0]).abs()).fold(0.0f32, f32::max) - gap;
+        let ay = crown.iter().map(|p| (p[1] - centre[1]).abs()).fold(0.0f32, f32::max) - gap;
+        let az = crown.iter().map(|p| p[2]).fold(f32::MIN, f32::max) - floor - gap;
+        (ax > 0.02 && ay > 0.02 && az > 0.02).then_some(Crown { centre: [centre[0], centre[1], floor], axes: [ax, ay, az], floor })
+    }
+
+    /// `p` pulled back onto the ellipsoid when it lies above the floor and
+    /// outside it (the game's containment: p = c + (p - c) / rho).
+    pub fn contain(&self, p: [f32; 3]) -> [f32; 3] {
+        if p[2] <= self.floor {
+            return p;
+        }
+        let d = [p[0] - self.centre[0], p[1] - self.centre[1], p[2] - self.centre[2]];
+        let rho = (0..3).map(|i| (d[i] / self.axes[i]).powi(2)).sum::<f32>().sqrt();
+        if rho <= 1.0 {
+            return p;
+        }
+        [0, 1, 2].map(|i| self.centre[i] + d[i] / rho)
+    }
 }
 
 /// Decode a groom from a loaded resource (system page and graphics pages).
@@ -934,6 +1003,13 @@ impl Groom {
     /// and wind. Returns false
     /// (guides unchanged) when the groom stores no simulation data.
     pub fn settle(&mut self, colliders: Option<&Colliders>) -> bool {
+        self.settle_in(colliders, None)
+    }
+
+    /// `settle`, with the guides also kept inside a hat's crown
+    /// (`Crown::contain`) after the follow-the-leader and bend steps of
+    /// every iteration, as the game's containment shapes act.
+    pub fn settle_in(&mut self, colliders: Option<&Colliders>, crown: Option<&Crown>) -> bool {
         let Some(sim) = self.sim.as_ref() else { return false };
         let k = self.points_per_strand;
         if k < 2 || sim.c.len() != self.points.len() || sim.rest.len() != self.points.len() || self.w.len() != self.points.len() {
@@ -1015,6 +1091,11 @@ impl Groom {
                         let delta = scale(sub(target, sub(x[j], x[j - 1])), h);
                         x[j] = add(x[j], delta);
                         x[j - 1] = sub(x[j - 1], delta);
+                    }
+                }
+                if let Some(cr) = crown {
+                    for p in x.iter_mut().skip(1) {
+                        *p = cr.contain(*p);
                     }
                 }
                 let mut moved = 0.0f32;
@@ -1914,6 +1995,31 @@ mod tests {
         // R = 0 keeps the guide as stored; a longer leash lets it hang further
         assert!(none.abs() < 1.0e-4, "{none}");
         assert!(short < -1.0e-3 && long < short - 0.01, "short {short} long {long}");
+    }
+
+    #[test]
+    fn a_crown_holds_hair_inside_above_its_floor() {
+        // a cylinder-like hat: brim ring 16 cm out at z 1.70, crown 9 cm out from 1.71 to 1.82
+        let mut hat = Vec::new();
+        for i in 0..36 {
+            let a = (i as f32 * 10.0).to_radians();
+            hat.push([0.16 * a.cos(), 0.16 * a.sin(), 1.70]);
+            for z in [1.71, 1.75, 1.79, 1.82] {
+                hat.push([0.09 * a.cos(), 0.09 * a.sin(), z]);
+            }
+        }
+        let c = Crown::fit(&hat, [0.0, 0.0], 0.005).unwrap();
+        assert!((c.floor - 1.70).abs() < 1.0e-4 && (c.axes[0] - 0.085).abs() < 1.0e-3 && (c.axes[2] - 0.115).abs() < 1.0e-3, "{c:?}");
+        // out through the crown's side: back on the ellipsoid; under the brim: left alone
+        let p = c.contain([0.2, 0.0, 1.72]);
+        assert!((p[0] / 0.085).powi(2) + ((p[2] - 1.70) / 0.115).powi(2) < 1.0001 && p[0] < 0.09, "{p:?}");
+        assert_eq!(c.contain([0.2, 0.0, 1.65]), [0.2, 0.0, 1.65]);
+        assert_eq!(c.contain([0.02, 0.0, 1.75]), [0.02, 0.0, 1.75]);
+        // a guide standing up out of the crown is settled inside it
+        let mut g = hanging(6, 0.0, 0.0, false);
+        g.points = (0..6).map(|j| [0.0, 0.0, 1.75 + j as f32 * 0.02]).collect();
+        assert!(g.settle_in(None, Some(&c)));
+        assert!(g.points.iter().all(|p| p[2] <= 1.70 + 0.115 + 1.0e-4), "{:?}", g.points);
     }
 
     #[test]
