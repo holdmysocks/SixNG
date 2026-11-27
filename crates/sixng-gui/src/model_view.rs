@@ -396,6 +396,9 @@ pub struct PartFx {
     pub head: bool,
     /// A skin mesh without a colour texture: takes the head's neck tone.
     pub body: bool,
+    /// An anatomical insert drawn over the body skin (the genitals, the
+    /// nipples: `pedlook::is_skin_insert`).
+    pub insert: bool,
     /// Heads and body skin: the textures the outfit item names (colour,
     /// normal); the first colour texture in a store is used.
     pub skins: Vec<(u64, u64)>,
@@ -5524,6 +5527,10 @@ fn load_parts(
     }
     let mut by_distance: Vec<std::ops::Range<usize>> = skin_meshes.clone();
     if let Some(m) = &mut model {
+        let inherited = inherit_skin_regions(m, &region_parts, &skin_meshes);
+        if inherited > 0 {
+            notes.push(format!("Skin inserts: {inherited} vertices of a skin mesh without regions (the genitals, the nipples) take the region of the nearest body skin vertex of their layer, so the clothes that hide that skin hide them too (by nearness, not the game's own data)."));
+        }
         let (mut skin_hidden, mut cloth_hidden) = (0, 0);
         for (range, layer, off) in &region_parts {
             let has_regions = range.clone().filter_map(|i| m.meshes.get(i)).any(|me| me.verts.iter().any(|v| v.zone[3] != 0));
@@ -5567,6 +5574,16 @@ fn load_parts(
         m.triangles = m.triangles.saturating_sub(skin_hidden + cloth_hidden);
         if skin_hidden + cloth_hidden > 0 {
             notes.push(format!("Worn under something: {skin_hidden} skin triangles and {cloth_hidden} triangles of clothes are hidden by the hide masks of the worn items (each item lists per layer the regions it covers; every vertex carries its region)."));
+        }
+    }
+    if let Some(m) = &mut model {
+        let inserts: Vec<(std::ops::Range<usize>, u32)> = region_parts.iter().filter(|p| fx.get(&p.2).is_some_and(|f| f.insert)).map(|p| (p.0.clone(), p.1)).collect();
+        if !inserts.is_empty() {
+            let garments: Vec<(std::ops::Range<usize>, Vec<u32>)> = region_parts.iter().filter_map(|p| fx.get(&p.2).filter(|f| !f.body && !f.head).map(|f| (p.0.clone(), f.hides.iter().map(|h| h.0).collect()))).collect();
+            let hidden = hide_covered_inserts(m, &inserts, &garments);
+            if hidden > 0 {
+                notes.push(format!("Skin inserts under clothes: {hidden} triangles of an insert (the genitals, the nipples) over which a garment of its layer lies are hidden, so it does not come through a loose garment (by distance, not the game's own rule)."));
+            }
         }
     }
     if let (Some(m), false, false) = (&mut model, by_distance.is_empty(), cover_meshes.is_empty()) {
@@ -6646,6 +6663,41 @@ fn garment_levels(shown: impl Iterator<Item = u64>, fx: &HashMap<u64, PartFx>) -
     level
 }
 
+/// A skin mesh that carries no regions (an anatomical insert: the genitals,
+/// the nipples) takes, per vertex, the region of the nearest vertex of a body
+/// skin mesh of the same layer that does, so the hide masks that cover that
+/// skin cover the insert too. Returns how many vertices took a region.
+fn inherit_skin_regions(m: &mut glb::Model, region_parts: &[(std::ops::Range<usize>, u32, u64)], skin: &[std::ops::Range<usize>]) -> usize {
+    let has = |m: &glb::Model, r: &std::ops::Range<usize>| r.clone().filter_map(|i| m.meshes.get(i)).any(|me| me.verts.iter().any(|v| v.zone[3] != 0));
+    let mut n = 0;
+    for (range, layer, _) in region_parts.iter().filter(|p| skin.contains(&p.0)) {
+        if has(m, range) {
+            continue;
+        }
+        let donors: Vec<([f32; 3], u8)> = region_parts
+            .iter()
+            .filter(|p| p.1 == *layer && p.0 != *range && skin.contains(&p.0))
+            .flat_map(|p| p.0.clone())
+            .filter_map(|i| m.meshes.get(i))
+            .flat_map(|me| me.verts.iter().filter(|v| v.zone[3] != 0).map(|v| (v.pos, v.zone[3])))
+            .collect();
+        if donors.is_empty() {
+            continue;
+        }
+        for i in range.clone() {
+            let Some(me) = m.meshes.get_mut(i) else { continue };
+            for v in &mut me.verts {
+                let d = |q: [f32; 3]| (q[0] - v.pos[0]).powi(2) + (q[1] - v.pos[1]).powi(2) + (q[2] - v.pos[2]).powi(2);
+                if let Some(z) = donors.iter().min_by(|a, b| d(a.0).total_cmp(&d(b.0))).map(|x| x.1) {
+                    v.zone[3] = z;
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
 /// Keeps the `inner` meshes behind the `outer` ones after both followed the
 /// shaped skin. An inner vertex that lay behind an outer garment's surface on
 /// the neutral body (an outer vertex within 6 cm, at most 2 cm to the side
@@ -6733,46 +6785,8 @@ fn keep_layer_order(m: &mut glb::Model, inner: &[std::ops::Range<usize>], outer:
 /// three vertices are covered. Returns the number of triangles hidden.
 fn hide_covered_skin(m: &mut glb::Model, skin: &[std::ops::Range<usize>], cover: &[std::ops::Range<usize>], inside: f32) -> usize {
     use glam::Vec3;
-    const CELL: f32 = 0.02;
-    const STEP: f32 = 0.008;
-    let key = |p: Vec3| ((p.x / CELL).floor() as i32, (p.y / CELL).floor() as i32, (p.z / CELL).floor() as i32);
-    // points on the garment surfaces, about 8 mm apart
-    let mut grid: HashMap<(i32, i32, i32), Vec<Vec3>> = HashMap::new();
-    for me in cover.iter().cloned().flatten().filter_map(|i| m.meshes.get(i)) {
-        for t in me.indices.chunks_exact(3) {
-            let [a, b, c] = [t[0], t[1], t[2]].map(|i| Vec3::from(me.verts[i as usize].pos));
-            let n = (((b - a).length().max((c - a).length()).max((c - b).length()) / STEP).ceil() as usize).clamp(1, 40);
-            for i in 0..=n {
-                for j in 0..=(n - i) {
-                    let (u, v) = (i as f32 / n as f32, j as f32 / n as f32);
-                    let p = a + (b - a) * u + (c - a) * v;
-                    grid.entry(key(p)).or_default().push(p);
-                }
-            }
-        }
-    }
-    if grid.is_empty() {
-        return 0;
-    }
-    let covered = |p: Vec3, n: Vec3| -> bool {
-        let k = key(p);
-        // cells within 50 mm
-        for x in -3..=3 {
-            for y in -3..=3 {
-                for z in -3..=3 {
-                    let Some(v) = grid.get(&(k.0 + x, k.1 + y, k.2 + z)) else { continue };
-                    for g in v {
-                        let d = *g - p;
-                        let along = d.dot(n);
-                        if (-inside..=0.05).contains(&along) && (d - n * along).length_squared() < 0.009 * 0.009 {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-        false
-    };
+    let Some(grid) = CoverGrid::new(m, cover) else { return 0 };
+    let covered = |p: Vec3, n: Vec3| grid.covered(p, n, inside);
     let mut hidden = 0;
     for i in skin.iter().cloned().flatten() {
         let Some(me) = m.meshes.get_mut(i) else { continue };
@@ -6795,6 +6809,93 @@ fn hide_covered_skin(m: &mut glb::Model, skin: &[std::ops::Range<usize>], cover:
         let before = me.indices.len() / 3;
         me.indices = me.indices.chunks_exact(3).filter(|t| !t.iter().all(|&i| cov[i as usize])).flatten().copied().collect();
         hidden += before - me.indices.len() / 3;
+    }
+    m.triangles = m.triangles.saturating_sub(hidden);
+    hidden
+}
+
+/// Points on garment surfaces, about 8 mm apart, in 2 cm cells.
+struct CoverGrid {
+    grid: HashMap<(i32, i32, i32), Vec<glam::Vec3>>,
+}
+
+impl CoverGrid {
+    const CELL: f32 = 0.02;
+    const STEP: f32 = 0.008;
+
+    fn key(p: glam::Vec3) -> (i32, i32, i32) {
+        ((p.x / Self::CELL).floor() as i32, (p.y / Self::CELL).floor() as i32, (p.z / Self::CELL).floor() as i32)
+    }
+
+    /// None when the meshes have no triangles.
+    fn new(m: &glb::Model, cover: &[std::ops::Range<usize>]) -> Option<CoverGrid> {
+        use glam::Vec3;
+        let mut grid: HashMap<(i32, i32, i32), Vec<Vec3>> = HashMap::new();
+        for me in cover.iter().cloned().flatten().filter_map(|i| m.meshes.get(i)) {
+            for t in me.indices.chunks_exact(3) {
+                let [a, b, c] = [t[0], t[1], t[2]].map(|i| Vec3::from(me.verts[i as usize].pos));
+                let n = (((b - a).length().max((c - a).length()).max((c - b).length()) / Self::STEP).ceil() as usize).clamp(1, 40);
+                for i in 0..=n {
+                    for j in 0..=(n - i) {
+                        let (u, v) = (i as f32 / n as f32, j as f32 / n as f32);
+                        let p = a + (b - a) * u + (c - a) * v;
+                        grid.entry(Self::key(p)).or_default().push(p);
+                    }
+                }
+            }
+        }
+        (!grid.is_empty()).then_some(CoverGrid { grid })
+    }
+
+    /// A garment surface point within 9 mm of the line through `p` along
+    /// `n`, between `inside` inside and 50 mm outside.
+    fn covered(&self, p: glam::Vec3, n: glam::Vec3, inside: f32) -> bool {
+        let k = Self::key(p);
+        // cells within 50 mm
+        for x in -3..=3 {
+            for y in -3..=3 {
+                for z in -3..=3 {
+                    let Some(v) = self.grid.get(&(k.0 + x, k.1 + y, k.2 + z)) else { continue };
+                    for g in v {
+                        let d = *g - p;
+                        let along = d.dot(n);
+                        if (-inside..=0.05).contains(&along) && (d - n * along).length_squared() < 0.009 * 0.009 {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Hide an anatomical insert (`PartFx::insert`) whole where a garment whose
+/// hide masks name the insert's layer lies over most of it (half or more of
+/// its vertices, `CoverGrid::covered` from 30 mm inside): the insert stands
+/// out of the body and comes through a loose garment (a towel) whose masks
+/// leave the skin under it. Returns the number of triangles hidden.
+fn hide_covered_inserts(m: &mut glb::Model, inserts: &[(std::ops::Range<usize>, u32)], garments: &[(std::ops::Range<usize>, Vec<u32>)]) -> usize {
+    use glam::Vec3;
+    let mut hidden = 0;
+    for (range, layer) in inserts {
+        let cover: Vec<std::ops::Range<usize>> = garments.iter().filter(|g| g.1.contains(layer) && g.0 != *range).map(|g| g.0.clone()).collect();
+        let Some(grid) = CoverGrid::new(m, &cover) else { continue };
+        let (mut n, mut hit) = (0usize, 0usize);
+        for me in range.clone().filter_map(|i| m.meshes.get(i)) {
+            for v in &me.verts {
+                n += 1;
+                hit += grid.covered(Vec3::from(v.pos), Vec3::from(v.nrm).normalize_or_zero(), 0.03) as usize;
+            }
+        }
+        if n > 0 && hit * 2 >= n {
+            for i in range.clone() {
+                if let Some(me) = m.meshes.get_mut(i) {
+                    hidden += me.indices.len() / 3;
+                    me.indices.clear();
+                }
+            }
+        }
     }
     m.triangles = m.triangles.saturating_sub(hidden);
     hidden
@@ -7382,7 +7483,7 @@ fn load_query_sel(
                                 };
                                 info.notes.push(format!("Body skin ({}): approximate. The outfit data read here names no body set for this character, so the skin is {why}.", p.slot));
                             }
-                            fx.insert(e.off, PartFx { tint: p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t.rows[0]))).filter(|t| t.1 != 255), colour: p.colour.map(|c| [c[1], c[2], c[3]]), tag: p.colour_tag, subs: p.preset_colours.clone(), preset: p.preset.as_deref().and_then(|h| u32::from_str_radix(h, 16).ok()), head: p.slot == "head", body, skeletal: body || matches!(p.slot.as_str(), "head" | "eyes" | "teeth" | "teeth accessory"), covers: matches!(p.slot.as_str(), "top" | "outer" | "bottom" | "full" | "feet" | "gloves"), layer: match p.slot.as_str() { "outer" => 2, "top" | "bottom" | "full" => 1, _ => 0 }, heel: p.slot == "feet" && p.drawable.split('_').any(|t| matches!(t, "sh" | "mh" | "hh")), region_layer: p.layer.as_deref().and_then(|l| u32::from_str_radix(l, 16).ok()).unwrap_or(match p.slot.as_str() { "body upper" => 0xb4d9_d470, "body lower" => 0xe062_2b84, _ => 0 }), hides: p.hides.iter().filter_map(|(l, m)| Some((u32::from_str_radix(l, 16).ok()?, m.clone()))).collect(), hides_sub: p.hides_sub.iter().filter_map(|(l, k, m)| Some((u32::from_str_radix(l, 16).ok()?, *k, m.clone()))).collect(), under: Vec::new(), skins: if p.slot == "head" || body { p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect() } else { Vec::new() } });
+                            fx.insert(e.off, PartFx { tint: p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t.rows[0]))).filter(|t| t.1 != 255), colour: p.colour.map(|c| [c[1], c[2], c[3]]), tag: p.colour_tag, subs: p.preset_colours.clone(), preset: p.preset.as_deref().and_then(|h| u32::from_str_radix(h, 16).ok()), head: p.slot == "head", body, insert: sixng_core::pedlook::is_skin_insert(&p.slot), skeletal: body || matches!(p.slot.as_str(), "head" | "eyes" | "teeth" | "teeth accessory"), covers: matches!(p.slot.as_str(), "top" | "outer" | "bottom" | "full" | "feet" | "gloves"), layer: match p.slot.as_str() { "outer" => 2, "top" | "bottom" | "full" => 1, _ => 0 }, heel: p.slot == "feet" && p.drawable.split('_').any(|t| matches!(t, "sh" | "mh" | "hh")), region_layer: p.layer.as_deref().and_then(|l| u32::from_str_radix(l, 16).ok()).unwrap_or(match p.slot.as_str() { "body upper" => 0xb4d9_d470, "body lower" => 0xe062_2b84, _ => 0 }), hides: p.hides.iter().filter_map(|(l, m)| Some((u32::from_str_radix(l, 16).ok()?, m.clone()))).collect(), hides_sub: p.hides_sub.iter().filter_map(|(l, k, m)| Some((u32::from_str_radix(l, 16).ok()?, *k, m.clone()))).collect(), under: Vec::new(), skins: if p.slot == "head" || body { p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect() } else { Vec::new() } });
                         }
                     }
                 }
