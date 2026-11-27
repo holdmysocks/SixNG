@@ -1490,7 +1490,9 @@ impl ModelView {
                     // rest lengths, the pull back to the stored shape, the body's colliders); research:
                     // SIXNG_HAIR_NO_SIM=1 keeps the stored guides
                     if coat_on && std::env::var_os("SIXNG_HAIR_NO_SIM").is_none() {
-                        let settled = g.settle(collide.as_deref());
+                        // scalp hair under a hat stays inside its crown
+                        let crown = hat.as_ref().filter(|_| under_hat.contains(&off)).and_then(|h| h.crown);
+                        let settled = g.settle_in(collide.as_deref(), crown.as_ref());
                         if std::env::var("SIXNG_DEBUG_HAIR").is_ok() { eprintln!("coat {off:x}: settled {settled}"); }
                     }
                     // scalp hair stays under the hat (3 mm inside its lining)
@@ -5682,7 +5684,7 @@ fn load_parts(
                 if let Some(f) = f {
                     if !f.skeletal {
                         attached = place_attached(&mut m);
-                        if let Some(s) = head_shape.filter(|_| on_head(&m)) {
+                        if let Some(s) = head_shape.filter(|_| on_head(&m) || attached.is_some_and(|at| under_head(&m, at))) {
                             transform_part(&mut m, s);
                         } else if let Some(w) = &wrap {
                             pre = Some(m.meshes.iter().map(|me| me.verts.iter().map(|v| v.pos).collect()).collect());
@@ -7543,21 +7545,27 @@ fn joint_skin(m: &glb::Model, name: &str) -> Option<glam::Mat4> {
     Some(w * Mat4::from_cols_array(&m.joints[i].ibm))
 }
 
+/// Whether joint `i` is SKEL_Head or hangs under it.
+fn under_head(m: &glb::Model, mut i: usize) -> bool {
+    for _ in 0..256 {
+        if m.joints.get(i).is_none() {
+            return false;
+        }
+        if m.joints[i].name == "SKEL_Head" {
+            return true;
+        }
+        match m.joints[i].parent.filter(|&p| p < m.joints.len() && p != i) {
+            Some(p) => i = p,
+            None => return false,
+        }
+    }
+    false
+}
+
 /// Whether every bone a part's vertices use hangs under `SKEL_Head` (an
 /// earring, glasses): such a part follows the head's own shaping.
 fn on_head(m: &glb::Model) -> bool {
-    let under = |mut i: usize| {
-        for _ in 0..256 {
-            if m.joints[i].name == "SKEL_Head" {
-                return true;
-            }
-            match m.joints[i].parent.filter(|&p| p < m.joints.len() && p != i) {
-                Some(p) => i = p,
-                None => return false,
-            }
-        }
-        false
-    };
+    let under = |i: usize| under_head(m, i);
     let mut any = false;
     for v in m.meshes.iter().filter(|me| me.skinned).flat_map(|me| &me.verts) {
         for k in 0..4 {
@@ -8015,19 +8023,29 @@ fn load_query_sel(
             // The hat as seen from inside the head: its centre is 10 cm
             // under the crown, in the middle of the top of the head.
             let is_head = |n: &str| n.contains("_head_") || n.starts_with("head_");
-            let hat: Vec<[f32; 3]> = skin.iter().filter(|(n, _)| l.hats.contains(&n.to_ascii_lowercase())).flat_map(|(_, p)| p.iter().copied()).collect();
-            let top = skin.iter().filter(|(n, _)| is_head(n)).flat_map(|(_, p)| p.iter()).map(|p| p[2]).fold(f32::MIN, f32::max);
+            // the head and hat come scaled by the body shape's head scale, the hair
+            // is scaled with BM_Head only when drawn: back to the hair's space
+            let unshape = model.extras["head_shape"].as_array().filter(|a| a.len() == 16).map(|a| {
+                let mut c = [0f32; 16];
+                c.iter_mut().zip(a).for_each(|(c, v)| *c = v.as_f64().unwrap_or(0.0) as f32);
+                glam::Mat4::from_cols_array(&c).inverse()
+            }).filter(|m| m.is_finite());
+            let back = |p: [f32; 3]| unshape.map_or(p, |m| m.transform_point3(glam::Vec3::from(p)).to_array());
+            let hskin: Vec<(String, Vec<[f32; 3]>)> = skin.iter().map(|(n, p)| (n.clone(), p.iter().map(|q| back(*q)).collect())).collect();
+            let hat_tris: Vec<[[f32; 3]; 3]> = hat_tris.iter().map(|t| t.map(back)).collect();
+            let hat: Vec<[f32; 3]> = hskin.iter().filter(|(n, _)| l.hats.contains(&n.to_ascii_lowercase())).flat_map(|(_, p)| p.iter().copied()).collect();
+            let top = hskin.iter().filter(|(n, _)| is_head(n)).flat_map(|(_, p)| p.iter()).map(|p| p[2]).fold(f32::MIN, f32::max);
             if !hat.is_empty() && top > f32::MIN && !l.hair.is_empty() {
                 let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
-                for p in skin.iter().filter(|(n, _)| is_head(n)).flat_map(|(_, p)| p.iter()).filter(|p| p[2] > top - 0.12) {
+                for p in hskin.iter().filter(|(n, _)| is_head(n)).flat_map(|(_, p)| p.iter()).filter(|p| p[2] > top - 0.12) {
                     for a in 0..2 {
                         lo[a] = lo[a].min(p[a]);
                         hi[a] = hi[a].max(p[a]);
                     }
                 }
-                let head: Vec<[f32; 3]> = skin.iter().filter(|(n, _)| is_head(n)).flat_map(|(_, p)| p.iter().copied()).collect();
-                l.hat = Some(Arc::new(sixng_core::groom::Shell::new([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, top - 0.10], &hat, &head).with_lining(hat_tris)));
-                l.notes.push("Hat: the scalp hair is pressed under the hat's lining (strand points beyond it are pulled in to 3 mm under it), so the hair does not come through the hat; an opening the hat encloses (over a cap's strap) counts as closed. A stand-in, not the game's method: the outfit asks for the plain hair, and no stored rule says how the game keeps it under the hat.".to_string());
+                let head: Vec<[f32; 3]> = hskin.iter().filter(|(n, _)| is_head(n)).flat_map(|(_, p)| p.iter().copied()).collect();
+                l.hat = Some(Arc::new(sixng_core::groom::Shell::new([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, top - 0.10], &hat, &head).with_lining(hat_tris).with_crown(&hat)));
+                l.notes.push("Hat: the scalp hair is kept inside the hat's crown while it settles, then pressed under the hat's lining (strand points beyond it are pulled in to 3 mm under it), so the hair does not come through the hat; an opening the hat encloses (over a cap's strap) counts as closed. A stand-in, not the game's method: the outfit asks for the plain hair, and no stored rule says how the game keeps it under the hat.".to_string());
             }
             // The style pass is damped near the body bound's pieces (head,
             // neck, shoulders, chest), as the game does; without one, near
