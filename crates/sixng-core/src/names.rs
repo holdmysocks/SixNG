@@ -146,6 +146,10 @@ pub const DERIVED: &[&str] = &[
     "edgefadenoisestrength", "endfadeposition", "startfadeposition", "layermaskdistortion", "layermaskposition", "flakecoverage",
     "flakeorientation", "foamalbedo", "foamcolor", "foamdensity", "foammaptiling", "furlength", "furstiffness", "ripplebumpiness",
     "ripplescale", "eyewetness", "scleracolorvalue", "wateredgerange", "waterfadegradient", "waterfadestart",
+    // prefix + word + suffix search built from the library's own naming (2026-11-27); about 0.1 random hits expected.
+    // sheenfallbackroughness and sheencutoffthreshold sit two slots apart after the cloth sheen constants;
+    // tintsplitcolor is a float3 in the tint weight block
+    "sheenfallbackroughness", "sheencutoffthreshold", "tintsplitcolor",
     // texture parameters of the minigame pack's water and interior shaders (joaat search, 2026-11-23)
     "watersurfacedetailtexture", "surfacedetailnormal0", "surfacedetailnormal1", "surfacedetailnormal2", "surfacedetailiridescence", "interiordiffusemaskmap", "interiorlayerdiffusemap",
     // shader constants of the 4-layer ground shaders (dictionary search, 2026-11-22)
