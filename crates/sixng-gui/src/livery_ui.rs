@@ -218,7 +218,10 @@ fn brand_stickers(brand: &serde_json::Value) -> Vec<Sticker> {
             s.zones = l["zones"].as_array()?.iter().filter_map(|z| z.as_u64().map(|z| z as u8)).collect();
             s.uv_set = l["uv_mode"].as_u64().unwrap_or(1).clamp(1, 4) as u8 - 1;
             s.mask = e["mask"].as_bool().unwrap_or(false);
-            if let Some(c) = e["colours"].as_array().filter(|c| c.len() == 3) {
+            // Only a colour mask takes the layout's colours. A picture with
+            // its own colours keeps them: most such stickers (1,899 of 2,444)
+            // list three zero colours, which would draw them black.
+            if let Some(c) = e["colours"].as_array().filter(|c| s.mask && c.len() == 3) {
                 s.colours = std::array::from_fn(|k| argb(c[k].as_str().unwrap_or("ffffffff")));
             }
             s.game_uv = Some(<[f32; 6]>::try_from(uv).ok()?);
@@ -423,20 +426,24 @@ impl State {
     /// Put on one of the game's liveries: its stickers replace the placed
     /// ones (saved only when you save).
     fn put_on_brand(&mut self, brand: &serde_json::Value) {
-        let mut s = brand_stickers(brand);
-        // A layout names zones only; they may lie on a fitted part (a truck
-        // box), so each sticker goes on the model holding most of them.
-        // Zones 0, 63 and 255 are on nearly every model and do not count.
-        for st in &mut s {
-            let mut best: Option<(usize, usize)> = None;
-            for slot in 0..self.zones.models.len() {
-                let n = st.zones.iter().filter(|z| !matches!(**z, 0 | 63 | 255) && self.zones.zones.contains_key(&(slot as u8, **z))).count();
-                if n > 0 && best.map_or(true, |(_, b)| n > b) {
-                    best = Some((slot, n));
+        // A layout names zones only, and the game draws a layer on every
+        // mesh carrying one of them: a fitted part (a truck box) or each of
+        // a boat's four outboards. So a sticker goes on every model holding
+        // its zones, one copy each. Zones 0, 63 and 255 are on nearly every
+        // model and do not count; a sticker with no other zone stays as is.
+        let mut s = Vec::new();
+        for st in brand_stickers(brand) {
+            let mut on = 0;
+            for (slot, model) in self.zones.models.iter().enumerate() {
+                if st.zones.iter().any(|z| !matches!(*z, 0 | 63 | 255) && self.zones.zones.contains_key(&(slot as u8, *z))) {
+                    let mut c = st.clone();
+                    c.model = model.clone();
+                    s.push(c);
+                    on += 1;
                 }
             }
-            if let Some(m) = best.and_then(|(slot, _)| self.zones.models.get(slot)) {
-                st.model = m.clone();
+            if on == 0 {
+                s.push(st);
             }
         }
         self.status = format!("{}: {} stickers placed by the game's layouts", brand["name"].as_str().or(brand["brand"].as_str()).unwrap_or("livery"), s.len());
