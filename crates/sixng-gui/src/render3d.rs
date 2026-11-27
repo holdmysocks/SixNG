@@ -2703,11 +2703,11 @@ impl Renderer3D {
                 be.set_bind_group(1, Some(&gm.mat_bg[me.material]), &[]);
                 be.set_vertex_buffer(0, Some(me.vb.slice(..)));
                 be.set_index_buffer(me.ib.slice(..), wgpu::IndexFormat::Uint32);
-                let first = (me.ib_range.start / 4) as u32;
-                let base = (me.vb_range.start / std::mem::size_of::<glb::Vertex>() as u64) as i32;
+                let first = me.first();
                 let cnt = me.n_draw.load(std::sync::atomic::Ordering::Relaxed).min(me.n_idx);
                 if cnt > 0 {
-                    be.draw_indexed(first..first + cnt, base, range.clone());
+                    // the indices address the whole vertex buffer: no base vertex
+                    be.draw_indexed(first..first + cnt, 0, range.clone());
                     n += 1;
                 }
             }
