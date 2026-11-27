@@ -2039,8 +2039,14 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
     let mut mats = mats;
     for (m, (s, st)) in mats.iter_mut().zip(info.shaders.iter().zip(shader_tex.iter())) {
         if !is_hidden(s, st) {
-            let fresnel = s.constants.iter().find(|c| c.hash == crate::skinspec::FRESNEL_PARAM).and_then(|c| c.components()).and_then(|v| v.first().copied());
-            crate::skinspec::apply_gltf(&mut m.gltf, &mut m.extras, &s.name_hash, &st.entries, fresnel);
+            let k = crate::skinspec::SkinConsts::of(&s.constants);
+            let tdir = o.out.join("textures").join("ttpf");
+            let detail = if o.png { crate::skinspec::detail_json(&s.name_hash, &s.constants, &game_root(a), &tdir, &|p| rel(&o.out, p)) } else { None };
+            let occ = (o.png && k.occlusion.is_some_and(|x| x > 0.0))
+                .then(|| st.entries.iter().find(|t| t["param_hash"] == crate::skinspec::SLOT_SPEC).and_then(|t| t["png"].as_str()))
+                .flatten()
+                .and_then(|p| crate::skinspec::write_occlusion_png(&o.out, p));
+            crate::skinspec::apply_gltf(&mut m.gltf, &mut m.extras, &s.name_hash, &st.entries, &k, detail, occ.as_deref());
         }
     }
     if let (Some(o), Some(f)) = (part_looks.as_object_mut(), part_set.as_ref().and_then(|(_, parts)| crate::vehcolour::paint_finish(parts, mat_blend, &part_id_counts.borrow()))) {
