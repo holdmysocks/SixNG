@@ -15,6 +15,7 @@ pub mod partskin;
 pub mod pedtint;
 pub mod paths;
 pub mod outfit;
+pub mod peddeco;
 pub mod pedlook;
 pub mod packparts;
 pub mod pedset;
