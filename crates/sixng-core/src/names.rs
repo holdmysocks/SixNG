@@ -161,6 +161,10 @@ pub const DERIVED: &[&str] = &[
     "layer2tiling", "layer2offset", "layer2intensity", "layer2opacitythreshold", "layer2opacitycontrast",
     "dirttintchannel", "furlengthjitter", "normalmaptiling2", "specularfresnelselector", "waterfadestartrandom",
     "stickermetalness", "stickerroughness", "stickerbackopacity",
+    // neighbour-stem search (2026-11-27): each constant tried as a prefix of a named neighbour + word (+ suffix),
+    // about 0.14 random hits expected over all of them
+    "vertexdisplacementnoisetiling", "tintroughnessmod", "grassdecallayer", "grassdecaluvoffset", "verttintblendamount",
+    "tangentuvset", "clearcoatuvset", "heightfilter",
     // texture parameters of the minigame pack's water and interior shaders (joaat search, 2026-11-23)
     "watersurfacedetailtexture", "surfacedetailnormal0", "surfacedetailnormal1", "surfacedetailnormal2", "surfacedetailiridescence", "interiordiffusemaskmap", "interiorlayerdiffusemap",
     // shader constants of the 4-layer ground shaders (dictionary search, 2026-11-22)
