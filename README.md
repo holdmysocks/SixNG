@@ -680,9 +680,21 @@ again**).
     layer of the detail normal and detail control atlases (2D arrays
     `0cd27763` and `7c0055b9`), sampled at the UV times a tiling constant.
     R scales how much they change the normal, the colour and the
-    roughness. There is no metalness. The GLB does not map these yet. The
-    table
-    is built from the `packs.rpf` index on first use and cached as
+    roughness. There is no metalness. The game's forward skin program
+    (`PS_StudioPedTextured_Eight`) reads only `speculartex` G and
+    `speculartex2` R: roughness G (GGX alpha = roughness squared), no
+    metal, and F0 = 0.04 x (1 + `fresnel`), the material's
+    `specularfresnel` constant (-0.3 on the body skin, so F0 = 0.028).
+    The GLB maps that as glTF does: `speculartex` is the material's
+    `metallicRoughnessTexture` (glTF reads roughness from G; the metallic
+    factor is 0, so B is not read as metal), and `KHR_materials_specular`
+    has `specularFactor` = 1 + `fresnel`. The raw maps and their channels
+    stay in the material extras (`skin_spec`). The viewer shades skin the
+    same way. Not carried: the detail atlases are engine-wide (no mesh
+    binds them), the game scales F0 by a window on the albedo's brightness
+    whose bounds are set per frame (taken as 1), and translucency and
+    occlusion feed only the deferred lighting pass, which is not decoded.
+    The table is built from the `packs.rpf` index on first use and cached as
     `<work>/index/skin_spec.json`.
   - **Fabric shading.** The colour is shaded by the green channel of the
     garment's own packed map (`speculartex`: seams and folds, mid grey on

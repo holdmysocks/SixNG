@@ -42,7 +42,21 @@
 //!   per-draw table maps the region to a layer of the detail-normal
 //!   and detail-control atlases.
 //!
-//! The maps are carried as they are (export material extras, viewer slots).
+//! The forward studio program (`PS_StudioPedTextured_Eight`), the game's
+//! own complete skin shading outside the deferred path, reads only
+//! `speculartex` G and `speculartex2` R: roughness `r = G` (plus the detail
+//! term), GGX alpha `r^2`, no metal, and F0 `0.04 * (1 + fresnel)` from the
+//! material's `fresnel` constant (`specularfresnel`), with f90 =
+//! `saturate(49.5 * F0)`. The GLB maps that as glTF does: the `speculartex`
+//! PNG is the metallic-roughness texture (G = roughness, metallic factor 0
+//! so B is not read as metal) and `KHR_materials_specular` carries
+//! `1 + fresnel` as its specular factor (glTF's dielectric F0 is 0.04). The
+//! raw maps stay in the material extras (`skin_spec`).
+//!
+//! Not in the export: the detail-normal and detail-control atlases are
+//! engine-wide (no mesh binds them), and the studio program scales F0 by a
+//! window on the albedo's brightness whose bounds come from a per-frame
+//! buffer (runtime; taken as 1 here).
 
 use crate::meta7a::{field_name, Meta};
 use crate::resource::Resource;
@@ -227,6 +241,58 @@ pub fn get(game_root: &Path) -> Result<&'static SkinSpec, String> {
     .map_err(|e| e.clone())
 }
 
+/// The skin shaders: `ped_standard_skin`, `ped_standard_lod_skin`.
+pub const SKIN_SHADERS: [&str; 2] = ["210fbc6a", "8d69edab"];
+/// The skin material's `fresnel` constant (`specularfresnel`).
+pub const FRESNEL_PARAM: &str = "b5fe3acb";
+
+/// `KHR_materials_specular` factor for a skin `fresnel`: the game's F0 is
+/// `0.04 * (1 + fresnel)` and glTF's is `0.04 * factor`. Clamped so F0 stays
+/// within 0..1.
+pub fn specular_factor(fresnel: f32) -> f32 {
+    (1.0 + fresnel).clamp(0.0, 25.0)
+}
+
+/// PNG of a texture slot in a material's texture list.
+fn slot_png<'a>(entries: &'a [Value], slot: &str) -> Option<&'a str> {
+    entries.iter().find(|t| t["param_hash"] == slot).and_then(|t| t["png"].as_str())
+}
+
+/// The glTF fields of a skin material whose `speculartex` decoded:
+/// metallic-roughness texture (G = roughness, metallic 0), roughness and
+/// metallic factors, and `KHR_materials_specular`. Merged into `g`; the
+/// raw maps go in `extras.skin_spec`. Not a skin shader, or no decoded
+/// `speculartex`: nothing changes.
+pub fn apply_gltf(g: &mut Value, extras: &mut Value, shader_hash: &str, entries: &[Value], fresnel: Option<f32>) {
+    if !SKIN_SHADERS.contains(&shader_hash) {
+        return;
+    }
+    let Some(spec) = slot_png(entries, SLOT_SPEC) else { return };
+    let f = fresnel.unwrap_or(0.0);
+    if !g["pbrMetallicRoughness"].is_object() {
+        g["pbrMetallicRoughness"] = serde_json::json!({});
+    }
+    let pbr = &mut g["pbrMetallicRoughness"];
+    pbr["metallicFactor"] = serde_json::json!(0.0);
+    pbr["roughnessFactor"] = serde_json::json!(1.0);
+    pbr["metallicRoughnessTexture"] = serde_json::json!({"uri": spec});
+    if !g["extensions"].is_object() {
+        g["extensions"] = serde_json::json!({});
+    }
+    g["extensions"]["KHR_materials_specular"] = serde_json::json!({"specularFactor": specular_factor(f)});
+    extras["skin_spec"] = serde_json::json!({
+        "speculartex": spec,
+        "speculartex2": slot_png(entries, SLOT_SPEC2),
+        "fresnel": fresnel,
+        "f0": 0.04 * specular_factor(f),
+        "channels": {
+            "speculartex": "R translucency mask, G roughness, B occlusion",
+            "speculartex2": "R detail strength, G skin region (G * 16) for the engine detail atlases"
+        },
+        "gltf": "metallicRoughnessTexture = speculartex (G roughness; metallic 0, so B is not read), KHR_materials_specular.specularFactor = 1 + fresnel"
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +305,33 @@ mod tests {
         // the wardrobe asset fields as the meta decoder names them (the
         // material id is the case-sensitive hash of `Material`)
         assert_eq!(field_name(crate::names::joaat_exact("Material")), "Material");
+    }
+
+    #[test]
+    fn fresnel_hash() {
+        assert_eq!(format!("{:08x}", crate::names::joaat_exact("fresnel")), FRESNEL_PARAM);
+    }
+
+    #[test]
+    fn skin_spec_becomes_gltf_channels() {
+        let entries = vec![
+            json!({"param_hash": SLOT_SPEC, "png": "textures/ttpf/a.png"}),
+            json!({"param_hash": SLOT_SPEC2, "png": "textures/ttpf/b.png"}),
+        ];
+        let (mut g, mut x) = (json!({}), json!({}));
+        apply_gltf(&mut g, &mut x, "210fbc6a", &entries, Some(-0.3));
+        assert_eq!(g["pbrMetallicRoughness"]["metallicRoughnessTexture"]["uri"], "textures/ttpf/a.png");
+        assert_eq!(g["pbrMetallicRoughness"]["metallicFactor"], 0.0);
+        assert_eq!(g["pbrMetallicRoughness"]["roughnessFactor"], 1.0);
+        let f = g["extensions"]["KHR_materials_specular"]["specularFactor"].as_f64().unwrap();
+        assert!((f - 0.7).abs() < 1e-6);
+        assert_eq!(x["skin_spec"]["speculartex2"], "textures/ttpf/b.png");
+        // other shaders, and skin without a decoded speculartex, are left alone
+        let (mut g2, mut x2) = (json!({}), json!({}));
+        apply_gltf(&mut g2, &mut x2, "deadbeef", &entries, None);
+        apply_gltf(&mut g2, &mut x2, "210fbc6a", &entries[1..], None);
+        assert_eq!(g2, json!({}));
+        assert_eq!(x2, json!({}));
     }
 
     #[test]
