@@ -3275,6 +3275,9 @@ impl ModelView {
                     // each part id's second-layer colour (sRGB), which the
                     // game's shader uses as the first wear layer's tint
                     let wear_tint = pc["wear_tint"][idx].as_str().filter(|w| w.len() == 256 * 6);
+                    // each part id's colour step amounts (sun bleach screen,
+                    // albedo multiply, albedo screen of both layers)
+                    let tone = pc["surface_tone"][idx].as_str().filter(|w| w.len() == 256 * 12);
                     // rows 512..: the low and high of the first layer's
                     // metalness and roughness, which the shader blends by the
                     // material map at each pixel
@@ -3345,6 +3348,15 @@ impl ModelView {
                         // bytes (PartWear::dust)
                         for (c, v) in pw.dust.iter().enumerate() {
                             px[(768 + id) * 512 + (73 + c) * 4 + 3] = *v;
+                        }
+                        // columns 89 to 94: the colour step amounts of the
+                        // surface's first layer, then of its second (sun
+                        // bleach screen, albedo multiply, albedo screen);
+                        // 95: 255 when the part's own colour is a palette row
+                        let t6 = tone.and_then(|t| (0..6).map(|k| u8::from_str_radix(&t[id * 12 + k * 2..id * 12 + k * 2 + 2], 16).ok()).collect::<Option<Vec<u8>>>()).unwrap_or(vec![0; 6]);
+                        let pal_row = rows.get(id * 4..id * 4 + 4).is_some_and(|r| r != "ffff");
+                        for (c, v) in t6.iter().copied().chain([if pal_row { 255 } else { 0 }]).enumerate() {
+                            px[(768 + id) * 512 + (89 + c) * 4 + 3] = v;
                         }
                         let set = primer_set(primer_sets.as_ref().map_or(1, |m| m[id]), self.look.primer_set);
                         let prow = primer_rows.and_then(|s| usize::from_str_radix(&s[id * 12 + set * 4..id * 12 + set * 4 + 4], 16).ok()).filter(|r| *r != 0xffff);
