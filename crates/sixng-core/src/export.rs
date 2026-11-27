@@ -2122,7 +2122,7 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
     let set = crate::ttpf::global(&root);
     let found: Vec<&crate::peddeco::Decoration> = names.iter().filter_map(|&n| cat.get(n)).collect();
     let unknown: Vec<String> = names.iter().filter(|&&n| cat.get(n).is_none()).map(|n| format!("{n:08x}")).collect();
-    let layers: Vec<&crate::peddeco::Layer> = found.iter().flat_map(|d| &d.layers).collect();
+    let layers: Vec<(&crate::peddeco::Layer, Option<&crate::peddeco::Layer>)> = found.iter().flat_map(|d| crate::peddeco::masked(&d.layers)).collect();
     // decal textures, decoded once per part
     let cache: Mutex<HashMap<u64, Option<Arc<crate::peddeco::Image>>>> = Mutex::new(HashMap::new());
     let decal = |h: u64| -> Option<Arc<crate::peddeco::Image>> {
@@ -2160,7 +2160,7 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
             "layers": layers.len(),
             "source": base,
             "rule": "decal UV = part UV (row vector) x the layer matrix (projective), clipped by the layer's edge quad in part UV; colour = ink 0's gradient at decal green x ink 0 alpha (the decal's own colour when ink 0 is off), covered by ink 1 by alpha x red and ink 2 by alpha x blue, then the layer's saturation (HSV); coverage = decal alpha x opacity; blended (normal, multiply, screen or overlay by the flags) in linear light",
-            "ink_rule": "ink word 0xAAVVSSHH (HSV + alpha); stops in sRGB: 0.1V x lerp(1, hue, S), V x lerp(1, hue, S) with alpha A, (0.45 + 0.55V) x lerp(1, hue, 0.55S); each to linear and quantised to a byte; masks on layers with no ink are left out",
+            "ink_rule": "ink word 0xAAVVSSHH (HSV + alpha); stops in sRGB: 0.1V x lerp(1, hue, S), V x lerp(1, hue, S) with alpha A, (0.45 + 0.55V) x lerp(1, hue, 0.55S); each to linear and quantised to a byte; a layer with flag 0x4 is a mask on the layer before it in its record (its decal alpha a, inverted with flag 0x80000000, scales that layer's coverage by 1 - (1 - a) x opacity; it is not drawn itself); other mask decals on layers with no ink are left out",
             "makeup_rule": "an ink whose p3 row (dL, da, db, w) has w != 0 is first moved w of the way (in sRGB) toward the skin tone shifted by (dL, da, db) in CIELAB (D65), then repacked as HSV",
             "skin_tone": format!("{:08x}", if o.skin_tone == 0 { crate::peddeco::DEFAULT_SKIN_TONE } else { o.skin_tone }),
             "space": match space {
@@ -2171,7 +2171,7 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
         if !unknown.is_empty() {
             rec["not_in_catalogue"] = unknown.clone().into();
         }
-        if tone.is_none() && layers.iter().all(|l| l.is_makeup()) {
+        if tone.is_none() && layers.iter().all(|(l, _)| l.is_makeup()) {
             rec["makeup_layers_left_out"] = layers.len().into();
             rec["applied"] = false.into();
             st.decorations = Some(rec);
