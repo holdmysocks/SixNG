@@ -158,7 +158,7 @@ impl OutArgs {
                     std::process::exit(2);
                 }
             }),
-            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_decorations: Default::default(), part_colours: Default::default(), part_hidden: Default::default(),
+            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_decorations: Default::default(), skin_tone: 0, part_colours: Default::default(), part_hidden: Default::default(),
         }
     }
 }
@@ -1876,6 +1876,9 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 // tattoos, makeup and body marks the outfit bakes into the skin
                 if !p.decorations.is_empty() {
                     eo.part_decorations.insert(p.drawable.to_ascii_lowercase(), p.decorations.iter().filter_map(|n| u32::from_str_radix(n, 16).ok()).collect());
+                    if let Some(t) = p.skin_tone.as_deref().and_then(|t| u32::from_str_radix(t, 16).ok()) {
+                        eo.skin_tone = t;
+                    }
                 }
                 if p.colour.is_none() && p.preset_colours.iter().any(|c| c.is_some()) {
                     eo.part_colours.insert(p.drawable.clone(), p.preset_colours.clone());

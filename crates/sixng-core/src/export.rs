@@ -390,6 +390,10 @@ pub struct ExportOptions {
     /// in order (`pedlook::LookPart::decorations`).
     #[serde(default)]
     pub part_decorations: std::collections::HashMap<String, Vec<u32>>,
+    /// The ped's skin tone (`peddeco::SKIN_TONE_TAG` name; 0: none), which
+    /// head makeup in `part_decorations` starts from.
+    #[serde(default)]
+    pub skin_tone: u32,
     /// Ped clothing colours by lower-case drawable name: the base colour
     /// (sRGB) per sub-material of the item's garment preset (`pedlook`,
     /// `matlib`). Where a part has one it wins over `ped_tints`.
@@ -2070,7 +2074,10 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
         img
     };
     // the same name for the same list, so a part shared by outfits keeps one file per list
-    let key = names.iter().fold((0xcbf2_9ce4_8422_2325u64 ^ crate::peddeco::BAKE_RULE as u64).wrapping_mul(0x100_0000_01b3), |h, &n| (h ^ n as u64).wrapping_mul(0x100_0000_01b3));
+    // head makeup starts from the skin tone (the game's default when the
+    // look names none)
+    let tone = cat.skin_tone_word(if o.skin_tone == 0 { crate::peddeco::DEFAULT_SKIN_TONE } else { o.skin_tone });
+    let key = [o.skin_tone].iter().chain(names).fold((0xcbf2_9ce4_8422_2325u64 ^ crate::peddeco::BAKE_RULE as u64).wrapping_mul(0x100_0000_01b3), |h, &n| (h ^ n as u64).wrapping_mul(0x100_0000_01b3));
     for st in shader_tex.iter_mut() {
         let Some(base) = st.base.clone() else { continue };
         let src = dir.join(&base);
@@ -2082,12 +2089,14 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
             "layers": layers.len(),
             "source": base,
             "rule": "decal UV = part UV (row vector) x the layer matrix (projective), clipped by the layer's edge quad in part UV; colour = ink 0's gradient at decal green x ink 0 alpha (the decal's own colour when ink 0 is off), covered by ink 1 by alpha x red and ink 2 by alpha x blue, then the layer's saturation (HSV); coverage = decal alpha x opacity; blended (normal, multiply, screen or overlay by the flags) in linear light",
-            "ink_rule": "ink word 0xAAVVSSHH (HSV + alpha); stops in sRGB: 0.1V x lerp(1, hue, S), V x lerp(1, hue, S) with alpha A, (0.45 + 0.55V) x lerp(1, hue, 0.55S); each to linear and quantised to a byte; head makeup (an ink with a non-zero p3 w) and masks on layers with no ink are left out",
+            "ink_rule": "ink word 0xAAVVSSHH (HSV + alpha); stops in sRGB: 0.1V x lerp(1, hue, S), V x lerp(1, hue, S) with alpha A, (0.45 + 0.55V) x lerp(1, hue, 0.55S); each to linear and quantised to a byte; masks on layers with no ink are left out",
+            "makeup_rule": "an ink whose p3 row (dL, da, db, w) has w != 0 is first moved w of the way (in sRGB) toward the skin tone shifted by (dL, da, db) in CIELAB (D65), then repacked as HSV",
+            "skin_tone": format!("{:08x}", if o.skin_tone == 0 { crate::peddeco::DEFAULT_SKIN_TONE } else { o.skin_tone }),
         });
         if !unknown.is_empty() {
             rec["not_in_catalogue"] = unknown.clone().into();
         }
-        if layers.iter().all(|l| l.is_makeup()) {
+        if tone.is_none() && layers.iter().all(|l| l.is_makeup()) {
             rec["makeup_layers_left_out"] = layers.len().into();
             rec["applied"] = false.into();
             st.decorations = Some(rec);
@@ -2101,7 +2110,7 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
                 let img = image::open(&src)?.to_rgba8();
                 let (w, h) = img.dimensions();
                 let mut skin = crate::peddeco::Image { w, h, rgba: img.into_raw(), srgb: true };
-                let skipped = crate::peddeco::bake(&mut skin, &layers, &decal);
+                let skipped = crate::peddeco::bake(&mut skin, &layers, &decal, tone);
                 texture::save_png(&out, &skin.rgba, w, h)?;
                 Ok(skipped)
             })()
@@ -4240,7 +4249,7 @@ mod dictionary_tests {
         let a = ArchiveInfo { id: "levels.rpf".into(), path: work.join("levels.rpf"), size: archive.len() as u64, container: "rpf9".into() };
         crate::atomic::write(&a.path, archive).unwrap();
         let o = ExportOptions { out: work.join("out"), png: false, dds: false, raw: false,
-            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_decorations: Default::default(), part_colours: Default::default(), part_hidden: Default::default() };
+            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_decorations: Default::default(), skin_tone: 0, part_colours: Default::default(), part_hidden: Default::default() };
         let dir = o.out.join("models/levels").join(export_base_name(&e));
         fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("model.json");

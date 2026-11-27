@@ -446,6 +446,9 @@ pub struct PartFx {
     /// Heads and body skin: the decorations (tattoos, makeup, body marks)
     /// the outfit bakes into the colour texture (`peddeco` names).
     pub decorations: Vec<u32>,
+    /// The outfit's skin tone (`peddeco::SKIN_TONE_TAG` name; 0: none),
+    /// which head makeup starts from.
+    pub skin_tone: u32,
 }
 
 /// The strand count rule of a piece from its hair LOD preset (a record of the parsed presets) and the first
@@ -5639,7 +5642,7 @@ fn load_parts(
     if shape != NEUTRAL_BODY {
         for e in parts {
             let Some(f) = fx.get(&e.off).filter(|f| f.skeletal) else { continue };
-            let mut r = export_load_shaped(a, e, cache, lod, &f.skins, &f.decorations, shape);
+            let mut r = export_load_shaped(a, e, cache, lod, &f.skins, (f.decorations.as_slice(), f.skin_tone), shape);
             if let Ok((m, _, _)) = &mut r {
                 if f.head || head_shape.is_none() {
                     if let Some(s) = joint_skin(m, "BM_Head").filter(|s| !s.abs_diff_eq(glam::Mat4::IDENTITY, 1e-5)) {
@@ -5665,7 +5668,7 @@ fn load_parts(
         let f = fx.get(&e.off);
         let r = match posed.remove(&e.off) {
             Some(r) => r,
-            None => export_load_skin(a, e, cache, lod, f.map_or(&[], |f| &f.skins), f.map_or(&[], |f| &f.decorations)),
+            None => export_load_skin(a, e, cache, lod, f.map_or(&[], |f| &f.skins), f.map_or((&[][..], 0), |f| (f.decorations.as_slice(), f.skin_tone))),
         };
         match r {
             Ok((mut m, lods, _)) => {
@@ -7869,7 +7872,7 @@ fn load_query_sel(
                                 };
                                 info.notes.push(format!("Body skin ({}): approximate. The outfit data read here names no body set for this character, so the skin is {why}.", p.slot));
                             }
-                            fx.insert(e.off, PartFx { tint: p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t.rows[0]))).filter(|t| t.1 != 255), colour: p.colour.map(|c| [c[1], c[2], c[3]]), tag: p.colour_tag, subs: p.preset_colours.clone(), preset: p.preset.as_deref().and_then(|h| u32::from_str_radix(h, 16).ok()), head: p.slot == "head", body, insert: sixng_core::pedlook::is_skin_insert(&p.slot), skeletal: body || matches!(p.slot.as_str(), "head" | "eyes" | "teeth" | "teeth accessory"), covers: matches!(p.slot.as_str(), "top" | "outer" | "bottom" | "full" | "feet" | "gloves"), layer: match p.slot.as_str() { "outer" => 2, "top" | "bottom" | "full" => 1, _ => 0 }, heel: p.slot == "feet" && p.drawable.split('_').any(|t| matches!(t, "sh" | "mh" | "hh")), region_layer: p.layer.as_deref().and_then(|l| u32::from_str_radix(l, 16).ok()).unwrap_or(match p.slot.as_str() { "body upper" => 0xb4d9_d470, "body lower" => 0xe062_2b84, _ => 0 }), hides: p.hides.iter().filter_map(|(l, m)| Some((u32::from_str_radix(l, 16).ok()?, m.clone()))).collect(), hides_sub: p.hides_sub.iter().filter_map(|(l, k, m)| Some((u32::from_str_radix(l, 16).ok()?, *k, m.clone()))).collect(), under: Vec::new(), decorations: p.decorations.iter().filter_map(|n| u32::from_str_radix(n, 16).ok()).collect(), skins: if p.slot == "head" || body { p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect() } else { Vec::new() } });
+                            fx.insert(e.off, PartFx { tint: p.tint.as_ref().and_then(|t| Some((u32::from_str_radix(&t.palette, 16).ok()?, t.rows[0]))).filter(|t| t.1 != 255), colour: p.colour.map(|c| [c[1], c[2], c[3]]), tag: p.colour_tag, subs: p.preset_colours.clone(), preset: p.preset.as_deref().and_then(|h| u32::from_str_radix(h, 16).ok()), head: p.slot == "head", body, insert: sixng_core::pedlook::is_skin_insert(&p.slot), skeletal: body || matches!(p.slot.as_str(), "head" | "eyes" | "teeth" | "teeth accessory"), covers: matches!(p.slot.as_str(), "top" | "outer" | "bottom" | "full" | "feet" | "gloves"), layer: match p.slot.as_str() { "outer" => 2, "top" | "bottom" | "full" => 1, _ => 0 }, heel: p.slot == "feet" && p.drawable.split('_').any(|t| matches!(t, "sh" | "mh" | "hh")), region_layer: p.layer.as_deref().and_then(|l| u32::from_str_radix(l, 16).ok()).unwrap_or(match p.slot.as_str() { "body upper" => 0xb4d9_d470, "body lower" => 0xe062_2b84, _ => 0 }), hides: p.hides.iter().filter_map(|(l, m)| Some((u32::from_str_radix(l, 16).ok()?, m.clone()))).collect(), hides_sub: p.hides_sub.iter().filter_map(|(l, k, m)| Some((u32::from_str_radix(l, 16).ok()?, *k, m.clone()))).collect(), under: Vec::new(), decorations: p.decorations.iter().filter_map(|n| u32::from_str_radix(n, 16).ok()).collect(), skin_tone: p.skin_tone.as_deref().and_then(|t| u32::from_str_radix(t, 16).ok()).unwrap_or(0), skins: if p.slot == "head" || body { p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect() } else { Vec::new() } });
                         }
                     }
                 }
@@ -9666,7 +9669,7 @@ fn export_load(
     cache: &Path,
     lod: usize,
 ) -> anyhow::Result<(glb::Model, Vec<PathBuf>, serde_json::Value)> {
-    export_load_skin(a, e, cache, lod, &[], &[])
+    export_load_skin(a, e, cache, lod, &[], (&[], 0))
 }
 
 /// `export_load` with the face textures an outfit names for a head
@@ -9677,7 +9680,7 @@ fn export_load_skin(
     cache: &Path,
     lod: usize,
     skins: &[(u64, u64)],
-    decorations: &[u32],
+    decorations: (&[u32], u32),
 ) -> anyhow::Result<(glb::Model, Vec<PathBuf>, serde_json::Value)> {
     export_load_shaped(a, e, cache, lod, skins, decorations, NEUTRAL_BODY)
 }
@@ -9690,7 +9693,7 @@ fn export_load_shaped(
     cache: &Path,
     lod: usize,
     skins: &[(u64, u64)],
-    decorations: &[u32],
+    (decorations, skin_tone): (&[u32], u32),
     shape: BodyShape,
 ) -> anyhow::Result<(glb::Model, Vec<PathBuf>, serde_json::Value)> {
     // a content-pack part of an outfit is read from its own archive
@@ -9766,6 +9769,7 @@ fn export_load_shaped(
         tex_remap: Default::default(), ped_tints: Default::default(),
         part_skins: e.name.as_ref().filter(|_| !skins.is_empty()).map(|n| (n.to_ascii_lowercase(), skins.to_vec())).into_iter().collect(),
         part_decorations: e.name.as_ref().filter(|_| !decorations.is_empty()).map(|n| (n.to_ascii_lowercase(), decorations.to_vec())).into_iter().collect(),
+        skin_tone,
         part_colours: Default::default(),
         part_hidden: Default::default(),
     };

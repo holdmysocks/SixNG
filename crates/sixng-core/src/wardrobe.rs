@@ -187,6 +187,8 @@ fn tag_words(v: &Value, pre: &HashMap<u32, (String, String)>, out: &mut BTreeMap
                     // a body-shape preset's profile word is kept as its hash
                     // when unnamed (`bodyshape::preset_controls` matches it)
                     .or_else(|| (k == 0xc2cf_c00a).then(|| format!("{x:08x}")))
+                    // a skin tone name (`peddeco::SKIN_TONE_TAG`) stays a hash
+                    .or_else(|| (k == crate::peddeco::SKIN_TONE_TAG as u64).then(|| format!("{x:08x}")))
             })
             .collect();
         if !words.is_empty() {

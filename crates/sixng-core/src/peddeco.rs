@@ -35,9 +35,14 @@
 //! The result goes on the skin by the blend the flag bits select
 //! ([`Layer::blend`]), in linear light.
 //!
-//! Left out: head makeup ([`Layer::is_makeup`]), whose inks the game moves
-//! toward another colour by a lookup that is not decoded, and mask decals
-//! on a layer with no ink, which the game colours at run time.
+//! Head makeup ([`Layer::is_makeup`]): before packing, the game moves such
+//! an ink toward the ped's skin tone shifted in CIELAB by the layer's `p3`
+//! row ([`makeup_ink`]). The skin tone is a wardrobe tag (`0d6de047`) that
+//! names a record of the skin tone table in data.rpf (struct `27a7a4ef`,
+//! a linear colour).
+//!
+//! Left out: mask decals on a layer with no ink, which the game colours at
+//! run time.
 
 use crate::pso::Pso;
 use rayon::prelude::*;
@@ -56,9 +61,16 @@ pub const TAG: u32 = 0xd9f1_087b;
 /// them when no part has that item category.
 pub const SKIN_CATEGORIES: [(u32, &str); 3] = [(0x3817_131d, "body upper"), (0x4492_5bfd, "body lower"), (0x378a_d10c, "head")];
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 /// Changes when the bake rule changes, so baked textures are made again.
-pub const BAKE_RULE: u32 = 2;
+pub const BAKE_RULE: u32 = 4;
+/// The skin tone record struct (`data.rpf`): a name, a linear colour.
+pub const SKIN_TONE: u32 = 0x27a7_a4ef;
+/// Wardrobe tag key whose item names the skin tone (a skin-tone item, or
+/// the kit).
+pub const SKIN_TONE_TAG: u32 = 0x0d6d_e047;
+/// The skin tone the game uses when a name is not in the table.
+pub const DEFAULT_SKIN_TONE: u32 = 0xac23_15da;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Layer {
@@ -96,6 +108,9 @@ pub struct Catalogue {
     /// The data.rpf entry the records were read from.
     pub source: String,
     pub decorations: Vec<Decoration>,
+    /// Skin tones: name, linear RGB (the colour head makeup starts from).
+    #[serde(default)]
+    pub skin_tones: Vec<(u32, [f32; 3])>,
     #[serde(skip)]
     by_name: HashMap<u32, usize>,
 }
@@ -167,7 +182,7 @@ impl Catalogue {
                 Decoration { name: le32(d, o + name), category: le32(d, o + cat), layers: ls }
             })
             .collect();
-        (!decorations.is_empty()).then(|| Catalogue { version: VERSION, source: source.into(), decorations, by_name: HashMap::new() }.indexed())
+        (!decorations.is_empty()).then(|| Catalogue { version: VERSION, source: source.into(), decorations, skin_tones: Vec::new(), by_name: HashMap::new() }.indexed())
     }
 
     fn indexed(mut self) -> Self {
@@ -177,6 +192,23 @@ impl Catalogue {
 
     pub fn get(&self, name: u32) -> Option<&Decoration> {
         self.by_name.get(&name).map(|&i| &self.decorations[i])
+    }
+
+    /// The skin tones of a PSO file that holds the skin tone struct.
+    pub fn skin_tones_from_pso(p: &Pso) -> Vec<(u32, [f32; 3])> {
+        let m = |h: u32| member(p, SKIN_TONE, h);
+        let (Some(name), Some(col)) = (m(crate::meta7a::joaat("name")), m(0xf644_6016)) else { return Vec::new() };
+        let d = &p.res.sys;
+        p.meta().objects(SKIN_TONE).into_iter().map(|o| (le32(d, o + name), std::array::from_fn(|i| f32at(d, o + col + 4 * i)))).collect()
+    }
+
+    /// A skin tone's colour as the game packs it for makeup: the linear
+    /// colour to sRGB bytes, `0xAABBGGRR`. A name that is not in the table
+    /// takes the game's default tone; None without a table.
+    pub fn skin_tone_word(&self, name: u32) -> Option<u32> {
+        let c = self.skin_tones.iter().find(|t| t.0 == name).or_else(|| self.skin_tones.iter().find(|t| t.0 == DEFAULT_SKIN_TONE))?.1;
+        let b = c.map(|x| (lin_to_srgb(x) * 255.0 + 0.5).clamp(0.0, 255.0) as u32);
+        Some(0xff00_0000 | b[2] << 16 | b[1] << 8 | b[0])
     }
 
     pub fn path(ws: &crate::export::Workspace) -> std::path::PathBuf {
@@ -196,16 +228,9 @@ impl Catalogue {
         }
         let a = ws.resolve("data").map_err(|e| format!("{e:#}"))?;
         let aix = ws.load_index(&a).map_err(|e| format!("data.rpf index: {e:#}; index data.rpf first"))?;
-        let c = aix
-            .entries
-            .iter()
-            .filter(|e| e.kind == crate::classify::Kind::Pso)
-            .find_map(|e| {
-                let b = crate::scan::read_entry(&a.path, e).ok()?;
-                let p = crate::pso::parse(&b).filter(|p| p.structs.contains_key(&RECORD))?;
-                Catalogue::from_pso(&p, &e.id)
-            })
-            .ok_or("no ped decoration catalogue found in data.rpf")?;
+        let psos = || aix.entries.iter().filter(|e| e.kind == crate::classify::Kind::Pso).filter_map(|e| Some((e, crate::pso::parse(&crate::scan::read_entry(&a.path, e).ok()?)?)));
+        let mut c = psos().find_map(|(e, p)| p.structs.contains_key(&RECORD).then(|| Catalogue::from_pso(&p, &e.id)).flatten()).ok_or("no ped decoration catalogue found in data.rpf")?;
+        c.skin_tones = psos().find(|(_, p)| p.structs.contains_key(&SKIN_TONE)).map(|(_, p)| Catalogue::skin_tones_from_pso(&p)).unwrap_or_default();
         if let Ok(b) = serde_json::to_vec(&c) {
             let p = Self::path(ws);
             if let Some(d) = p.parent() {
@@ -241,6 +266,16 @@ pub fn decal_uv(m: &[[f32; 3]; 3], u: f32, v: f32) -> Option<(f32, f32)> {
         return None;
     }
     Some(((m[0][0] * u + m[1][0] * v + m[2][0]) / w, (m[0][1] * u + m[1][1] * v + m[2][1]) / w))
+}
+
+impl Layer {
+    /// The part UV the decal transform reads. Flag 0x400 folds U about the
+    /// middle (`0.5 - |u - 0.5|`), 0x800 folds V, so one decal lands on both
+    /// sides (eye make-up on both eyes). The clip quad still uses the raw UV.
+    pub fn fold(&self, u: f32, v: f32) -> (f32, f32) {
+        let f = |x: f32, bit: u32| if self.flags & bit != 0 { 0.5 - (x - 0.5).abs() } else { x };
+        (f(u, 0x400), f(v, 0x800))
+    }
 }
 
 /// Inside the clip quad (every edge; see the module notes).
@@ -296,6 +331,103 @@ pub fn ink_stops(w: u32) -> Option<[[f32; 4]; 3]> {
     Some([stop(0.1 * v, s, 1.0), stop(v, s, a), stop(0.45 + 0.55 * v, 0.55 * s, 1.0)])
 }
 
+/// The game's HSV to RGB (all 0..1).
+fn hsv_to_rgb([h, s, v]: [f32; 3]) -> [f32; 3] {
+    if s == 0.0 {
+        return [v; 3];
+    }
+    let h6 = (h - h.floor()) * 6.0;
+    let i = h6 as i32;
+    let f = h6 - h6.floor();
+    let (p, q, t) = (v * (1.0 - s), v * (1.0 - s * f), v * (1.0 - s * (1.0 - f)));
+    match i {
+        0 => [v, t, p],
+        1 => [q, v, p],
+        2 => [p, v, t],
+        3 => [p, q, v],
+        4 => [t, p, v],
+        _ => [v, p, q],
+    }
+}
+
+/// The game's RGB to HSV.
+fn rgb_to_hsv([r, g, b]: [f32; 3]) -> [f32; 3] {
+    let v = r.max(g).max(b);
+    let d = v - r.min(g).min(b);
+    if d == 0.0 {
+        return [0.0, 0.0, v];
+    }
+    let h = if r == v {
+        (g - b) / d
+    } else if g == v {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+    [if h < 0.0 { h + 6.0 } else { h } / 6.0, d / v, v]
+}
+
+/// sRGB (D65) to XYZ, as the game's makeup code has it.
+const XYZ: [[f32; 3]; 3] = [[0.412_456_4, 0.357_576_1, 0.180_437_5], [0.212_672_9, 0.715_152_2, 0.072_175], [0.019_333_9, 0.119_192, 0.950_304_1]];
+
+/// The white of [`XYZ`] (its row sums).
+fn white() -> [f32; 3] {
+    XYZ.map(|r| r[0] + r[1] + r[2])
+}
+
+fn signed(f: fn(f32) -> f32, c: f32) -> f32 {
+    if c < 0.0 { -f(-c) } else { f(c) }
+}
+
+/// sRGB (0..1, may leave the range) to CIELAB.
+fn srgb_to_lab(c: [f32; 3]) -> [f32; 3] {
+    let l = c.map(|x| signed(srgb_to_lin, x));
+    let w = white();
+    let xyz: [f32; 3] = std::array::from_fn(|i| (XYZ[i][0] * l[0] + XYZ[i][1] * l[1] + XYZ[i][2] * l[2]) / w[i]);
+    let f = |t: f32| if t > 0.008_856_452 { t.powf(1.0 / 3.0) } else { 7.787_037 * t + 16.0 / 116.0 };
+    let [fx, fy, fz] = xyz.map(f);
+    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+}
+
+/// CIELAB to sRGB (not clamped).
+fn lab_to_srgb([l, a, b]: [f32; 3]) -> [f32; 3] {
+    let fy = (l + 16.0) / 116.0;
+    let (fx, fz) = (fy + a * 0.002, fy - b * 0.005);
+    let finv = |t: f32| if t * t * t > 0.008_856_452 { t * t * t } else { (t - 16.0 / 116.0) / 7.787_037 };
+    let w = white();
+    let y = if l > 8.0 { fy * fy * fy } else { l * 0.001_107_056 };
+    let xyz = [finv(fx) * w[0], y * w[1], finv(fz) * w[2]];
+    // the inverse of XYZ
+    let m = XYZ;
+    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    let inv = [
+        [m[1][1] * m[2][2] - m[1][2] * m[2][1], m[0][2] * m[2][1] - m[0][1] * m[2][2], m[0][1] * m[1][2] - m[0][2] * m[1][1]],
+        [m[1][2] * m[2][0] - m[1][0] * m[2][2], m[0][0] * m[2][2] - m[0][2] * m[2][0], m[0][2] * m[1][0] - m[0][0] * m[1][2]],
+        [m[1][0] * m[2][1] - m[1][1] * m[2][0], m[0][1] * m[2][0] - m[0][0] * m[2][1], m[0][0] * m[1][1] - m[0][1] * m[1][0]],
+    ];
+    let lin: [f32; 3] = std::array::from_fn(|i| (inv[i][0] * xyz[0] + inv[i][1] * xyz[1] + inv[i][2] * xyz[2]) / det);
+    lin.map(|x| signed(|c| if c <= 0.003_130_8 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }, x))
+}
+
+/// Head makeup: the game moves an ink toward a colour made from the skin
+/// tone before it packs the stops. With `p = (dL, da, db, w)` (the ink's
+/// `p3` row): the target is `base` (an sRGB word `0xAABBGGRR`, the ped's
+/// skin tone) moved by `(dL, da, db)` in CIELAB; the ink (HSV) goes to RGB,
+/// `w` of the way to the target, back to HSV, and is packed again with its
+/// own alpha. `w = 0` leaves the ink as it is.
+pub fn makeup_ink(ink: u32, p: [f32; 4], base: u32) -> u32 {
+    if p[3] == 0.0 {
+        return ink;
+    }
+    let byte = |w: u32, i: u32| (w >> (8 * i) & 0xff) as f32 / 255.0;
+    let rgb = hsv_to_rgb([byte(ink, 0), byte(ink, 1), byte(ink, 2)]);
+    let lab = srgb_to_lab([byte(base, 0), byte(base, 1), byte(base, 2)]);
+    let target = lab_to_srgb([lab[0] + p[0], lab[1] + p[1], lab[2] + p[2]]);
+    let hsv = rgb_to_hsv(std::array::from_fn(|i| rgb[i] + (target[i] - rgb[i]) * p[3]));
+    let q = |x: f32| ((x * 255.0 + 0.5) as i32).clamp(0, 255) as u32;
+    (ink & 0xff00_0000) | q(hsv[2]) << 16 | q(hsv[1]) << 8 | q(hsv[0])
+}
+
 /// The colour of a set of stops at gradient position `g`: stop 0 to 1 over
 /// the first half, 1 to 2 over the second.
 fn gradient(s: &[[f32; 4]; 3], g: f32) -> [f32; 3] {
@@ -315,6 +447,18 @@ impl Layer {
     /// baked.
     pub fn is_makeup(&self) -> bool {
         (0..3).any(|i| self.colours[i] >> 24 != 0 && self.p3[i][3] != 0.0)
+    }
+
+    /// The layer with its makeup inks moved toward the skin tone
+    /// ([`makeup_ink`]; `base` is the tone's sRGB word).
+    pub fn with_makeup(&self, base: u32) -> Layer {
+        let mut l = self.clone();
+        for i in 0..3 {
+            if l.colours[i] >> 24 != 0 {
+                l.colours[i] = makeup_ink(l.colours[i], l.p3[i], base);
+            }
+        }
+        l
     }
 
     /// The blend mode, from the flag bits the shader tests.
@@ -458,7 +602,8 @@ impl Image {
 pub struct Skipped {
     /// Layers whose decal texture is in no store.
     pub missing: usize,
-    /// Head makeup layers ([`Layer::is_makeup`]).
+    /// Head makeup layers ([`Layer::is_makeup`]) baked with no skin tone
+    /// to start from.
     pub makeup: usize,
     /// Mask decals ([`Image::is_mask`]) on a layer with no ink: the game
     /// colours them at run time, from code that is not decoded.
@@ -466,17 +611,25 @@ pub struct Skipped {
 }
 
 /// Bake layers, in order, into a part's colour texture (sRGB RGBA8; its
-/// alpha is kept). `decal` gives a layer's first decal texture. Makeup
-/// layers, uncoloured masks and layers whose decal is missing are left out
-/// and counted.
-pub fn bake(skin: &mut Image, layers: &[&Layer], decal: &dyn Fn(u64) -> Option<std::sync::Arc<Image>>) -> Skipped {
+/// alpha is kept). `decal` gives a layer's first decal texture;
+/// `skin_tone` is the ped's skin tone word ([`Catalogue::skin_tone_word`]),
+/// which head makeup starts from. Makeup with no skin tone, uncoloured
+/// masks and layers whose decal is missing are left out and counted.
+pub fn bake(skin: &mut Image, layers: &[&Layer], decal: &dyn Fn(u64) -> Option<std::sync::Arc<Image>>, skin_tone: Option<u32>) -> Skipped {
     let mut skipped = Skipped::default();
     let (w, h) = (skin.w as usize, skin.h as usize);
-    for l in layers {
-        if l.is_makeup() {
-            skipped.makeup += 1;
-            continue;
-        }
+    for &l in layers {
+        let made;
+        let l = if l.is_makeup() {
+            let Some(base) = skin_tone else {
+                skipped.makeup += 1;
+                continue;
+            };
+            made = l.with_makeup(base);
+            &made
+        } else {
+            l
+        };
         let Some(t) = l.textures.first().and_then(|&x| decal(x)) else {
             skipped.missing += 1;
             continue;
@@ -493,7 +646,8 @@ pub fn bake(skin: &mut Image, layers: &[&Layer], decal: &dyn Fn(u64) -> Option<s
                 if !inside_clip(&l.clip, u, v) {
                     continue;
                 }
-                let Some((du, dv)) = decal_uv(&l.uv, u, v) else { continue };
+                let (fu, fv) = l.fold(u, v);
+                let Some((du, dv)) = decal_uv(&l.uv, fu, fv) else { continue };
                 // outside the decal: nothing (its edges are clear in every
                 // decal checked, so this matches clamping too)
                 if !(0.0..=1.0).contains(&du) || !(0.0..=1.0).contains(&dv) {
@@ -536,6 +690,19 @@ mod tests {
         // projective: divided by w = m02 u + m12 v + m22
         let m = [[1.0, 0.0, 1.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         assert_eq!(decal_uv(&m, 1.0, 0.5), Some((0.5, 0.25)));
+    }
+
+    #[test]
+    fn fold_flags_mirror_about_the_middle() {
+        let mut l = layer();
+        assert_eq!(l.fold(0.8, 0.9), (0.8, 0.9));
+        l.flags = 0x400;
+        let (u, v) = l.fold(0.8, 0.9);
+        assert!((u - 0.2).abs() < 1e-6 && v == 0.9);
+        assert_eq!(l.fold(0.3, 0.9), (0.3, 0.9));
+        l.flags = 0x800;
+        let (u, v) = l.fold(0.8, 0.9);
+        assert!(u == 0.8 && (v - 0.1).abs() < 1e-6);
     }
 
     #[test]
@@ -662,20 +829,20 @@ mod tests {
         l.opacity = 0.5;
         // only the left half: u -> u * 2
         l.uv = [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        assert_eq!(bake(&mut skin, &[&l], &|_| Some(d.clone())), Skipped::default());
+        assert_eq!(bake(&mut skin, &[&l], &|_| Some(d.clone()), None), Skipped::default());
         // black art at half coverage over white: linear 0.5 -> sRGB 188
         assert_eq!(&skin.rgba[..4], &[188, 188, 188, 200]);
         assert_eq!(&skin.rgba[4..], &[255, 255, 255, 200]);
-        assert_eq!(bake(&mut skin, &[&l], &|_| None), Skipped { missing: 1, ..Default::default() });
+        assert_eq!(bake(&mut skin, &[&l], &|_| None, None), Skipped { missing: 1, ..Default::default() });
         // a mask on a layer with no ink is left out
         let mask = std::sync::Arc::new(Image { w: 2, h: 1, rgba: vec![0, 128, 0, 255, 0, 120, 0, 200], srgb: false });
         l.colours = [0x004c_c382, 0, 0];
         assert!(mask.is_mask() && !d.is_mask());
-        assert_eq!(bake(&mut skin, &[&l], &|_| Some(mask.clone())), Skipped { uncoloured_masks: 1, ..Default::default() });
+        assert_eq!(bake(&mut skin, &[&l], &|_| Some(mask.clone()), None), Skipped { uncoloured_masks: 1, ..Default::default() });
         // makeup is left out, and the texture stays as it was
         l.colours = [0xff00_ff00, 0, 0];
         l.p3[0][3] = 1.0;
-        assert_eq!(bake(&mut skin, &[&l], &|_| Some(d.clone())), Skipped { makeup: 1, ..Default::default() });
+        assert_eq!(bake(&mut skin, &[&l], &|_| Some(d.clone()), None), Skipped { makeup: 1, ..Default::default() });
         assert_eq!(&skin.rgba[..4], &[188, 188, 188, 200]);
         // a black ink on the mask, multiplied: 188 x black at full coverage
         l.p3 = [[0.0; 4]; 3];
@@ -683,9 +850,48 @@ mod tests {
         l.opacity = 1.0;
         l.flags = 0x0400_0000;
         let solid = std::sync::Arc::new(Image { w: 1, h: 1, rgba: vec![0, 127, 0, 255], srgb: false });
-        assert_eq!(bake(&mut skin, &[&l], &|_| Some(solid.clone())), Skipped::default());
+        assert_eq!(bake(&mut skin, &[&l], &|_| Some(solid.clone()), None), Skipped::default());
         assert_eq!(&skin.rgba[..4], &[0, 0, 0, 200]);
         assert_eq!(&skin.rgba[4..], &[255, 255, 255, 200]);
+    }
+
+    #[test]
+    fn makeup_moves_the_ink_toward_the_skin_tone() {
+        // HSV round trips
+        for c in [[0.2, 0.5, 0.9], [0.9, 0.1, 0.1], [0.4, 0.4, 0.4]] {
+            let back = hsv_to_rgb(rgb_to_hsv(c));
+            assert!(close(back, c, 1e-6), "{c:?} {back:?}");
+        }
+        // CIELAB: white is L 100, a 0, b 0; round trip
+        let w = srgb_to_lab([1.0, 1.0, 1.0]);
+        assert!(close(w, [100.0, 0.0, 0.0], 1e-3), "{w:?}");
+        let c = [0.8, 0.5, 0.35];
+        assert!(close(lab_to_srgb(srgb_to_lab(c)), c, 1e-4));
+        // w = 0: unchanged
+        assert_eq!(makeup_ink(0xff91_6610, [5.0, 0.0, 0.0, 0.0], 0xff42_6890), 0xff91_6610);
+        // w = 1 with no offset: the skin tone itself (as HSV), alpha kept
+        let base = 0xff6b_8ec7; // sRGB (199, 142, 107)
+        let m = makeup_ink(0x8091_6610, [0.0, 0.0, 0.0, 1.0], base);
+        assert_eq!(m >> 24, 0x80);
+        let rgb = hsv_to_rgb([(m & 0xff) as f32 / 255.0, (m >> 8 & 0xff) as f32 / 255.0, (m >> 16 & 0xff) as f32 / 255.0]);
+        assert!(close(rgb, [199.0 / 255.0, 142.0 / 255.0, 107.0 / 255.0], 0.01), "{rgb:?}");
+        // a lower L darkens it
+        let dark = makeup_ink(0xff91_6610, [-20.0, 0.0, 0.0, 1.0], base);
+        assert!((dark >> 16 & 0xff) < (m >> 16 & 0xff));
+        // the tone word: linear colour to sRGB bytes, R in the low byte
+        let c = Catalogue { skin_tones: vec![(DEFAULT_SKIN_TONE, [1.0, 0.2, 0.0])], ..Default::default() };
+        // linear 0.2 is sRGB 0.4845: byte 124
+        assert_eq!(c.skin_tone_word(1), Some(0xff00_7cff));
+        assert_eq!(Catalogue::default().skin_tone_word(1), None);
+        // the bake takes makeup only with a tone
+        let mut skin = Image { w: 1, h: 1, rgba: vec![255, 255, 255, 255], srgb: true };
+        let mask = std::sync::Arc::new(Image { w: 1, h: 1, rgba: vec![0, 127, 0, 255], srgb: false });
+        let mut l = layer();
+        l.colours = [0xff91_6610, 0, 0];
+        l.p3[0] = [0.0, 0.0, 0.0, 1.0];
+        assert_eq!(bake(&mut skin, &[&l], &|_| Some(mask.clone()), None), Skipped { makeup: 1, ..Default::default() });
+        assert_eq!(bake(&mut skin, &[&l], &|_| Some(mask.clone()), Some(base)), Skipped::default());
+        assert_ne!(skin.rgba, vec![255, 255, 255, 255]);
     }
 
     /// A record and its layer laid out as the game's PSO stores them.
