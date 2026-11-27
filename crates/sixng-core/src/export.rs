@@ -2006,13 +2006,13 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
             let (data, skipped) = store.data_ex(tx).ok()?;
             let mip = if skipped == 0 { 0 } else { store.best_mip(tx)? };
             let (rgba, w, h) = crate::ttpf::decode_rgba(tx, &data, mip).ok()?;
-            Some(Arc::new(crate::peddeco::Image { w, h, rgba }))
+            Some(Arc::new(crate::peddeco::Image { w, h, rgba, srgb: crate::peddeco::dxgi_is_srgb(tx.dxgi_format) }))
         });
         cache.lock().unwrap().insert(h, img.clone());
         img
     };
     // the same name for the same list, so a part shared by outfits keeps one file per list
-    let key = names.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &n| (h ^ n as u64).wrapping_mul(0x100_0000_01b3));
+    let key = names.iter().fold((0xcbf2_9ce4_8422_2325u64 ^ crate::peddeco::BAKE_RULE as u64).wrapping_mul(0x100_0000_01b3), |h, &n| (h ^ n as u64).wrapping_mul(0x100_0000_01b3));
     for st in shader_tex.iter_mut() {
         let Some(base) = st.base.clone() else { continue };
         let src = dir.join(&base);
@@ -2023,14 +2023,14 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
             "categories": found.iter().map(|d| format!("{:08x}", d.category)).collect::<Vec<_>>(),
             "layers": layers.len(),
             "source": base,
-            "rule": "decal UV = part UV (row vector) x the layer matrix (projective), clipped by the layer's edge quad in part UV; colour = the decal's own colour with the layer's saturation (HSV); coverage = decal alpha x opacity; blended in linear light",
-            "ink_rule": "unknown: layers coloured by ink (a layer that sets an ink, or whose decal is a mask) are not baked; the encoding of the ink words and the code that turns them into the shader's colour stops are not decoded",
+            "rule": "decal UV = part UV (row vector) x the layer matrix (projective), clipped by the layer's edge quad in part UV; colour = ink 0's gradient at decal green x ink 0 alpha (the decal's own colour when ink 0 is off), covered by ink 1 by alpha x red and ink 2 by alpha x blue, then the layer's saturation (HSV); coverage = decal alpha x opacity; blended (normal, multiply, screen or overlay by the flags) in linear light",
+            "ink_rule": "ink word 0xAAVVSSHH (HSV + alpha); stops in sRGB: 0.1V x lerp(1, hue, S), V x lerp(1, hue, S) with alpha A, (0.45 + 0.55V) x lerp(1, hue, 0.55S); each to linear and quantised to a byte; head makeup (an ink with a non-zero p3 w) and masks on layers with no ink are left out",
         });
         if !unknown.is_empty() {
             rec["not_in_catalogue"] = unknown.clone().into();
         }
-        if layers.iter().all(|l| l.uses_ink()) {
-            rec["ink_layers_left_out"] = layers.len().into();
+        if layers.iter().all(|l| l.is_makeup()) {
+            rec["makeup_layers_left_out"] = layers.len().into();
             rec["applied"] = false.into();
             st.decorations = Some(rec);
             continue;
@@ -2042,7 +2042,7 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
             (|| -> anyhow::Result<crate::peddeco::Skipped> {
                 let img = image::open(&src)?.to_rgba8();
                 let (w, h) = img.dimensions();
-                let mut skin = crate::peddeco::Image { w, h, rgba: img.into_raw() };
+                let mut skin = crate::peddeco::Image { w, h, rgba: img.into_raw(), srgb: true };
                 let skipped = crate::peddeco::bake(&mut skin, &layers, &decal);
                 texture::save_png(&out, &skin.rgba, w, h)?;
                 Ok(skipped)
@@ -2054,7 +2054,8 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
                     rec["layers_without_decal"] = skipped.missing.into();
                 }
                 if !cached {
-                    rec["ink_layers_left_out"] = skipped.ink.into();
+                    rec["makeup_layers_left_out"] = skipped.makeup.into();
+                    rec["uncoloured_masks_left_out"] = skipped.uncoloured_masks.into();
                 }
                 true
             }
