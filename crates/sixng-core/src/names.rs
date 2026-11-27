@@ -155,6 +155,12 @@ pub const DERIVED: &[&str] = &[
     "furnoiseuvscale", "grassdecaluvscale", "grassnoisetilescale", "masktexturetex", "scrollspeedmultiplier", "shadowalpha",
     "specularcolortex", "terrainfresnel", "terraintranslucency", "tintoverride", "vertexdisplacementmultiplier",
     "wrinklebumpscale", "wrinklemultiplier", "dirtdiffuseintensity", "emissivedistortionstrength",
+    // known name + word search (2026-11-27); each sits next to the name it extends or in a parallel block
+    // (waterfall layer1/layer2 sets: tiling, offset, intensity, opacitythreshold, opacitycontrast)
+    "layer1tiling", "layer1offset", "layer1intensity", "layer1opacitythreshold", "layer1opacitycontrast",
+    "layer2tiling", "layer2offset", "layer2intensity", "layer2opacitythreshold", "layer2opacitycontrast",
+    "dirttintchannel", "furlengthjitter", "normalmaptiling2", "specularfresnelselector", "waterfadestartrandom",
+    "stickermetalness", "stickerroughness", "stickerbackopacity",
     // texture parameters of the minigame pack's water and interior shaders (joaat search, 2026-11-23)
     "watersurfacedetailtexture", "surfacedetailnormal0", "surfacedetailnormal1", "surfacedetailnormal2", "surfacedetailiridescence", "interiordiffusemaskmap", "interiorlayerdiffusemap",
     // shader constants of the 4-layer ground shaders (dictionary search, 2026-11-22)
