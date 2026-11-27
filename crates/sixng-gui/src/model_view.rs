@@ -700,6 +700,9 @@ pub struct Automation {
     pub hair_style: Option<String>,
     /// `--hair-width MM` for a character's own hair.
     pub hair_width: Option<f32>,
+    /// `--hair-colour r,g,b`: one colour for a character's hair in place of
+    /// its stored colours.
+    pub hair_colour: Option<[f32; 3]>,
 }
 
 /// Shared-wheel scale per unit of the car's wheelScale. Every shared rim
@@ -2263,7 +2266,13 @@ impl ModelView {
             }
             ui.horizontal(|ui| {
                 ui.label("colour");
-                ui.color_edit_button_rgb(&mut self.hair.colour);
+                // a colour picked here is drawn: it turns the stored colours off
+                if ui.color_edit_button_rgb(&mut self.hair.colour).changed() {
+                    self.hair.stored_colours = false;
+                }
+                if !self.hair.tones.is_empty() {
+                    ui.checkbox(&mut self.hair.stored_colours, "stored").on_hover_text("On: each piece takes the colours of the hair preset its item names. Off: the one colour picked here.");
+                }
                 ui.label(egui::RichText::new("(stored for items that name the hair palette; most leave it to the game, so pick one)").weak().small());
             });
             if !look.hair_swatches.is_empty() {
@@ -2274,6 +2283,7 @@ impl ModelView {
                         ui.painter().rect_filled(r, 2.0, egui::Color32::from_rgb(c[0], c[1], c[2]));
                         if resp.on_hover_text("A colour of the game's hair palette (ped_tint_hair)").clicked() {
                             self.hair.colour = c.map(|x| x as f32 / 255.0);
+                            self.hair.stored_colours = false;
                         }
                     }
                 });
@@ -2595,7 +2605,10 @@ impl ModelView {
                         self.hair.look_key = key;
                         let want = self.auto.hair_style.clone();
                         self.hair.selected = look.hair.iter().filter(|h| h.shown || want.as_ref().is_some_and(|w| h.placeholder.contains(w.as_str()))).flat_map(|h| h.grooms.iter().copied()).collect();
-                        if let Some(c) = look.hair.iter().find(|h| h.slot == "hair").or(look.hair.first()).and_then(|h| h.colour) {
+                        if let Some(c) = self.auto.hair_colour {
+                            self.hair.colour = c;
+                            self.hair.stored_colours = false;
+                        } else if let Some(c) = look.hair.iter().find(|h| h.slot == "hair").or(look.hair.first()).and_then(|h| h.colour) {
                             self.hair.colour = c.map(|x| x as f32 / 255.0);
                         }
                         self.hair.tones = look.hair.iter().filter_map(|h| Some((h, h.tone.as_ref()?))).flat_map(|(h, t)| h.grooms.iter().map(move |g| (*g, t.clone()))).collect();
@@ -3275,6 +3288,9 @@ impl ModelView {
                     // each part id's second-layer colour (sRGB), which the
                     // game's shader uses as the first wear layer's tint
                     let wear_tint = pc["wear_tint"][idx].as_str().filter(|w| w.len() == 256 * 6);
+                    // each part id's colour step amounts (sun bleach screen,
+                    // albedo multiply, albedo screen of both layers)
+                    let tone = pc["surface_tone"][idx].as_str().filter(|w| w.len() == 256 * 12);
                     // rows 512..: the low and high of the first layer's
                     // metalness and roughness, which the shader blends by the
                     // material map at each pixel
@@ -3345,6 +3361,15 @@ impl ModelView {
                         // bytes (PartWear::dust)
                         for (c, v) in pw.dust.iter().enumerate() {
                             px[(768 + id) * 512 + (73 + c) * 4 + 3] = *v;
+                        }
+                        // columns 89 to 94: the colour step amounts of the
+                        // surface's first layer, then of its second (sun
+                        // bleach screen, albedo multiply, albedo screen);
+                        // 95: 255 when the part's own colour is a palette row
+                        let t6 = tone.and_then(|t| (0..6).map(|k| u8::from_str_radix(&t[id * 12 + k * 2..id * 12 + k * 2 + 2], 16).ok()).collect::<Option<Vec<u8>>>()).unwrap_or(vec![0; 6]);
+                        let pal_row = rows.get(id * 4..id * 4 + 4).is_some_and(|r| r != "ffff");
+                        for (c, v) in t6.iter().copied().chain([if pal_row { 255 } else { 0 }]).enumerate() {
+                            px[(768 + id) * 512 + (89 + c) * 4 + 3] = v;
                         }
                         let set = primer_set(primer_sets.as_ref().map_or(1, |m| m[id]), self.look.primer_set);
                         let prow = primer_rows.and_then(|s| usize::from_str_radix(&s[id * 12 + set * 4..id * 12 + set * 4 + 4], 16).ok()).filter(|r| *r != 0xffff);
