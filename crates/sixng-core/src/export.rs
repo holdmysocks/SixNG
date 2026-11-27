@@ -3475,9 +3475,17 @@ pub fn export_paths(a: &ArchiveInfo, entries: &[&Entry], out: &Path, progress: P
 }
 
 /// Archetype definition (GTA V `CBaseArchetypeDef` equivalent, struct
-/// `82d6fc83`, 184 B): +0x40 bbox min, +0x4C bbox max, +0x74 name,
-/// +0x78 texture dictionary, +0x7C drawable dictionary, +0x80 physics
-/// dictionary, +0x88 asset name (all joaat).
+/// `82d6fc83`, 184 B; base struct rage__fwArchetypeDef `6cf9ab52`, 176 B):
+/// +0x40 bbox min, +0x4C bbox max, +0x74 the archetype's name hash as
+/// entities reference it (field `66d9cb52`, unnamed), +0x78 `name`,
+/// +0x7C `clipDictionary` (0 for most), +0x80 `physicsDictionary`,
+/// +0x84 `assetType` (rage__fwArchetypeDef__eAssetType: UNINITIALIZED,
+/// FRAGMENT, DRAWABLE, DRAWABLEDICTIONARY, ASSETLESS), +0x88 `assetName`
+/// (joaat hashes, mostly the same value), +0xB0 the MapEntityType enum
+/// (`079525da`: UNINITIALIZED, BUILDING, ANIMATED_BUILDING, DUMMY_OBJECT,
+/// COMPOSITE_ENTITY, INTERIOR_INSTANCE, GRASS_BATCH, PROP_BATCH = 0-7).
+/// Field names and offsets are from the executable's parser table
+/// (`examples/exeschema.rs`), which matches the meta files' own schema.
 pub const ARCHETYPE_DEF: u32 = 0x82d6_fc83;
 
 fn links_path(ws: &Workspace) -> PathBuf {
