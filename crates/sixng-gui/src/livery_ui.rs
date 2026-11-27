@@ -1379,7 +1379,21 @@ impl State {
                 // Ctrl + wheel: size; Shift + wheel: width; Ctrl + Shift +
                 // wheel: height; Alt + wheel: rotation (a wheel with Shift
                 // held arrives as a sideways scroll on some systems)
-                let (scroll, ctrl, alt, shift) = ui.input(|i| (if i.smooth_scroll_delta.y != 0.0 { i.smooth_scroll_delta.y } else { i.smooth_scroll_delta.x }, i.modifiers.command, i.modifiers.alt, i.modifiers.shift));
+                // With Ctrl held egui takes the wheel as a zoom gesture and
+                // reports no scroll: the scroll is worked back from the zoom
+                // factor (egui's zoom is exp(scroll / 200)). The gesture
+                // runs on for some frames after the wheel has stopped, so
+                // it counts as Ctrl also when the key is up again (as does
+                // a pinch on a touchpad).
+                let (scroll, ctrl, alt, shift) = ui.input(|i| {
+                    let s = if i.smooth_scroll_delta.y != 0.0 { i.smooth_scroll_delta.y } else { i.smooth_scroll_delta.x };
+                    let zoom = if s == 0.0 { i.zoom_delta() } else { 1.0 };
+                    if zoom != 1.0 && zoom > 0.0 {
+                        (zoom.ln() * 200.0, true, i.modifiers.alt, i.modifiers.shift)
+                    } else {
+                        (s, i.modifiers.command, i.modifiers.alt, i.modifiers.shift)
+                    }
+                });
                 let mut used = self.ed.grab.is_some();
                 if resp.hovered() && scroll != 0.0 && (ctrl || alt || shift) {
                     let s = &mut self.livery.stickers[i];
