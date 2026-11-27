@@ -965,7 +965,9 @@ mod tests {
         // the key enum follows the Windows virtual-key codes; pad buttons sit at 0x20000
         assert_eq!(enum_value_name(0xacc0_e29b, 112), Some("KEY_F1"));
         assert_eq!(enum_value_name(0xacc0_e29b, 0x2_0009), Some("L3"));
-        assert!(enum_values().values().map(|v| v.len()).sum::<usize>() > 4000);
+        // data file types
+        assert_eq!(enum_value_name(0x3ff1_9213, 6), Some("HANDLING_FILE"));
+        assert!(enum_values().values().map(|v| v.len()).sum::<usize>() > 5500);
         for (h, vals) in enum_values() {
             assert_ne!(*h, 0);
             for n in vals.values() {
