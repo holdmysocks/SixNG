@@ -158,7 +158,7 @@ impl OutArgs {
                     std::process::exit(2);
                 }
             }),
-            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default(), part_hidden: Default::default(),
+            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_decorations: Default::default(), part_colours: Default::default(), part_hidden: Default::default(),
         }
     }
 }
@@ -1867,6 +1867,10 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 // a head's face and a body item's painted skin, where stored
                 if (matches!(p.slot.as_str(), "head" | "body upper" | "body lower") || sixng_core::pedlook::is_skin_insert(&p.slot)) && !p.skins.is_empty() {
                     eo.part_skins.insert(p.drawable.clone(), p.skins.iter().filter_map(|(a, n)| Some((u64::from_str_radix(a, 16).ok()?, u64::from_str_radix(n, 16).unwrap_or(0)))).collect());
+                }
+                // tattoos, makeup and body marks the outfit bakes into the skin
+                if !p.decorations.is_empty() {
+                    eo.part_decorations.insert(p.drawable.to_ascii_lowercase(), p.decorations.iter().filter_map(|n| u32::from_str_radix(n, 16).ok()).collect());
                 }
                 if p.colour.is_none() && p.preset_colours.iter().any(|c| c.is_some()) {
                     eo.part_colours.insert(p.drawable.clone(), p.preset_colours.clone());

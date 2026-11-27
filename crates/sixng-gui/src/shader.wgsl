@@ -1331,6 +1331,72 @@ fn strand_openness(clip: vec4<f32>) -> f32 {
     return clamp(0.15249 * s, 0.0, 1.0);
 }
 
+// Share of a hair pixel's diffuse ambient that the game's screen-space ray march finds open (1 = all open).
+// The game's diffuse ambient is its screen-probe light: probes sit on the drawn pixels, hair probes
+// turned by the strand tangent; each probe ray is first marched on screen through the depth buffer, and
+// only a ray the march does not stop goes on into the ray-tracing structure; the pixel then takes a
+// cosine lobe around the tangent from its probes. Ported here: the screen march, as read from the
+// game's ray request pass (high confidence on the march, medium on the parameters): the ray runs from
+// the pixel for L = the view depth, at most 1 m at character range (the game's cap past 1 m reads a
+// frame value not traced); 8 depth taps at (k + 1 + r) / 8 of the way on screen (r random per ray), with
+// depth interpolated on screen; the first tap behind the drawn depth stops the march, the crossing is
+// refined between that tap and the one before it, and it counts as a hit only within half of one step's
+// depth change (in device depth). A ray that leaves the screen, never crosses or crosses too deep
+// is open here: the game traces it on into the world, where the viewer has only its sky. Rays are drawn
+// cosine-weighted about t (4 per frame; the frame accumulation averages them).
+fn hair_gi_open(clip: vec4<f32>, wp: vec3<f32>, t: vec3<f32>) -> f32 {
+    if (F.light_vp[3][3] == 0.0) { return 1.0; }
+    let size = F.frame.yz;
+    let c0 = F.view_proj * vec4(wp, 1.0);
+    if (c0.w <= 1.0e-4) { return 1.0; }
+    let s0 = vec3(c0.xy / c0.w, c0.z / c0.w);
+    let len = min(c0.w, 1.0);
+    let tb = select(vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0), abs(t.x) > 0.9);
+    let b1 = normalize(cross(t, tb));
+    let b2 = cross(t, b1);
+    let fr = F.frame.x;
+    var open = 0.0;
+    for (var k = 0; k < 4; k++) {
+        let fk = f32(k);
+        let u1 = ign(clip.xy + vec2(fr * 5.71 + fk * 13.1, fr * 2.33 + fk * 7.7));
+        let u2 = ign(clip.xy * 1.31 + vec2(fr * 3.13 + fk * 4.9, fk * 17.3 + 11.0));
+        let r = ign(clip.xy * 0.77 + vec2(fr * 1.97 + fk * 9.3, fk * 3.1 + 23.0));
+        let ph = 6.2831853 * u2;
+        let st = sqrt(u1);
+        let dir = t * sqrt(max(1.0 - u1, 0.0)) + (b1 * cos(ph) + b2 * sin(ph)) * st;
+        let c1 = F.view_proj * vec4(wp + dir * len, 1.0);
+        if (c1.w <= 1.0e-4) { open += 1.0; continue; }
+        var d = vec3(c1.xy / c1.w, c1.z / c1.w) - s0;
+        // keep the ray on screen
+        if (max(abs(s0.x + d.x), abs(s0.y + d.y)) > 1.0) {
+            let ex = select((sign(d.x) - s0.x) / d.x, 1.0e9, abs(d.x) < 1.0e-6);
+            let ey = select((sign(d.y) - s0.y) / d.y, 1.0e9, abs(d.y) < 1.0e-6);
+            d = d * clamp(min(ex, ey), 0.0, 1.0);
+        }
+        let thick = 0.5 * abs(d.z) / 8.0;
+        var hit = false;
+        var prev = 0.0;
+        for (var i = 0; i < 8; i++) {
+            let ti = (f32(i) + 1.0 + r) / 8.0;
+            let p = s0 + d * ti;
+            let q = vec2((p.x * 0.5 + 0.5) * size.x, (0.5 - p.y * 0.5) * size.y);
+            if (q.x < 0.0 || q.y < 0.0 || q.x >= size.x || q.y >= size.y) { break; }
+            let diff = p.z - eye_depth(vec2<i32>(q));
+            if (diff < 0.0) {
+                // refine between this tap and the one before it, then test the thickness there
+                let f = clamp(-diff / max(prev - diff, 1.0e-4), 0.0, 1.0);
+                let ph2 = s0 + d * (ti - f / 8.0);
+                let q2 = vec2((ph2.x * 0.5 + 0.5) * size.x, (0.5 - ph2.y * 0.5) * size.y);
+                hit = abs(ph2.z - eye_depth(vec2<i32>(q2))) < thick;
+                break;
+            }
+            prev = diff;
+        }
+        if (!hit) { open += 1.0; }
+    }
+    return open * 0.25;
+}
+
 // Screen-space occlusion of the ambient light on an opaque surface, from the
 // camera depth pre-pass: the game's horizon occlusion pass (read in full from
 // its shader archive by the shader archive work). Two perpendicular slices
@@ -2200,7 +2266,10 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             // ambient: the game's diffuse probe light for hair is a plain cosine (Lambert) lobe with the strand
             // tangent in place of the normal (its final-gather pass; medium-high confidence). Here: the viewer's
             // diffuse ambient around the tangent, with the game's factor
-            let sky_h = ambient(tdir);
+            // diffuse ambient around the tangent; rays the game's screen march stops on take one bounce off
+            // the hair (albedo x the open light) in place of the game's previous-frame radiance
+            let g_h = hair_gi_open(i.clip, i.world, tdir);
+            let sky_h = ambient(tdir) * (g_h + (1.0 - g_h) * albedo);
             // o = sqrt(profile4 / 15 x openness) (profile4: the ramp's profile value in 15 steps)
             let o_h = sqrt(select(1.0, round(15.0 * clamp(i.uv1.x, 0.0, 1.0)) / 15.0, ramped) * strand_openness(i.clip));
             // the reflection part of the game's hair ambient (read from its hair program, medium confidence):

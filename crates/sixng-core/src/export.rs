@@ -385,6 +385,11 @@ pub struct ExportOptions {
     /// store is used; without one the head-skin table decides.
     #[serde(default)]
     pub part_skins: std::collections::HashMap<String, Vec<(u64, u64)>>,
+    /// Decorations (tattoos, makeup, body marks) to bake into a part's
+    /// colour texture, by lower-case drawable name: `peddeco` record names,
+    /// in order (`pedlook::LookPart::decorations`).
+    #[serde(default)]
+    pub part_decorations: std::collections::HashMap<String, Vec<u32>>,
     /// Ped clothing colours by lower-case drawable name: the base colour
     /// (sRGB) per sub-material of the item's garment preset (`pedlook`,
     /// `matlib`). Where a part has one it wins over `ped_tints`.
@@ -503,6 +508,8 @@ struct ShaderTextures {
     /// interior, lamp or mechanical bones (`NOT_BODY_BONES`), so it is not
     /// body paint. Set once the meshes are decoded.
     not_body: bool,
+    /// Ped skin: the decorations baked into the base colour (`peddeco`).
+    decorations: Option<serde_json::Value>,
 }
 
 /// Shader slot of the per-model tint palette.
@@ -766,7 +773,7 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                                         let (len, rows) = texture::tint_layout(et.width);
                                         e["tint_row_length"] = len.into();
                                         e["tint_rows"] = rows.into();
-                                        e["applied"] = "GLB COLOR_0 = palette entry at vertex colour blue (row 0), multiplied into the base colour. Placed instances pick a row: entry tint_row * tint_row_length + COLOR0.b (tint_row from the placement, assumed to clamp at tint_rows - 1)".into();
+                                        e["applied"] = "GLB COLOR_0 = palette entry at vertex colour blue (row 0), multiplied into the base colour. Placed instances pick a row: entry tint_row * tint_row_length + COLOR0.b (tint_row from the placement, clamped at tint_rows - 1 as the game's mesh shader does)".into();
                                     }
                                     e["status"] = "ok (embedded in the model)".into();
                                     if o.png {
@@ -1535,6 +1542,9 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     if let Some(fb) = &st.fallback {
                         m["texture_fallback"] = fb.clone();
                     }
+                    if let Some(d) = &st.decorations {
+                        m["decorations"] = d.clone();
+                    }
                     if let Some(mut l) = crate::material::multilayer(s, &st.entries, || material_uv_fit(&lod_groups, si)) {
                         crate::material::four_layer_vertex_weights(&mut l, material_colours1(&lod_groups, si));
                         m["multilayer"] = l;
@@ -1649,6 +1659,9 @@ pub(crate) struct BuiltDrawable {
 pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &crate::drawable::DrawableInfo, dir: &Path, member: bool, o: &ExportOptions, item: &mut ExportedItem) -> BuiltDrawable {
     let head = head_skin_shaders(a, e, &info.shaders, o, item).or_else(|| part_skin_shaders(a, e, &info.shaders, item));
     let mut shader_tex = link_textures(a, head.as_ref().map_or(&info.shaders[..], |h| &h.0[..]), r, &info.embedded_textures, dir, o, e.name.as_deref());
+    if let Some(names) = e.name.as_deref().and_then(|n| o.part_decorations.get(&n.to_ascii_lowercase())).filter(|n| !n.is_empty() && o.png) {
+        bake_decorations(a, &mut shader_tex, names, dir, o);
+    }
     // Weapons: the `weapon` shader binds no colour map; a part's colours are
     // those of its layered-material preset, one per sub-material, and a
     // vertex names its sub-material in the green byte of the raw colour
@@ -1972,6 +1985,101 @@ struct SkinSetup {
     joints: Vec<crate::gltf::Joint>,
     /// geometry index -> (vertex joint index -> joint list index; u16::MAX = none)
     geometry_map: std::collections::HashMap<usize, Vec<u16>>,
+}
+
+/// Bake an outfit's decorations (tattoos, makeup, body marks; `peddeco`)
+/// into the base colour of each of a skin part's shaders that has one. The
+/// baked texture is written next to the plain one, named after it and the
+/// decoration list, and the material's `decorations` record says what went
+/// in and what did not.
+fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &[u32], dir: &Path, o: &ExportOptions) {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    let root = game_root(a);
+    let Some(cat) = crate::peddeco::get(&root) else {
+        for st in shader_tex.iter_mut().filter(|st| st.base.is_some()) {
+            st.decorations = Some(serde_json::json!({"names": names.iter().map(|n| format!("{n:08x}")).collect::<Vec<_>>(), "applied": false, "why": "the decoration catalogue (data.rpf) is not indexed"}));
+        }
+        return;
+    };
+    let set = crate::ttpf::global(&root);
+    let found: Vec<&crate::peddeco::Decoration> = names.iter().filter_map(|&n| cat.get(n)).collect();
+    let unknown: Vec<String> = names.iter().filter(|&&n| cat.get(n).is_none()).map(|n| format!("{n:08x}")).collect();
+    let layers: Vec<&crate::peddeco::Layer> = found.iter().flat_map(|d| &d.layers).collect();
+    // decal textures, decoded once per part
+    let cache: Mutex<HashMap<u64, Option<Arc<crate::peddeco::Image>>>> = Mutex::new(HashMap::new());
+    let decal = |h: u64| -> Option<Arc<crate::peddeco::Image>> {
+        if let Some(x) = cache.lock().unwrap().get(&h) {
+            return x.clone();
+        }
+        let img = set.get(h).and_then(|(store, tx)| {
+            let (data, skipped) = store.data_ex(tx).ok()?;
+            let mip = if skipped == 0 { 0 } else { store.best_mip(tx)? };
+            let (rgba, w, h) = crate::ttpf::decode_rgba(tx, &data, mip).ok()?;
+            Some(Arc::new(crate::peddeco::Image { w, h, rgba }))
+        });
+        cache.lock().unwrap().insert(h, img.clone());
+        img
+    };
+    // the same name for the same list, so a part shared by outfits keeps one file per list
+    let key = names.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &n| (h ^ n as u64).wrapping_mul(0x100_0000_01b3));
+    for st in shader_tex.iter_mut() {
+        let Some(base) = st.base.clone() else { continue };
+        let src = dir.join(&base);
+        let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let out = src.with_file_name(format!("{stem}_deco{key:016x}.png"));
+        let mut rec = serde_json::json!({
+            "names": names.iter().map(|n| format!("{n:08x}")).collect::<Vec<_>>(),
+            "categories": found.iter().map(|d| format!("{:08x}", d.category)).collect::<Vec<_>>(),
+            "layers": layers.len(),
+            "source": base,
+            "rule": "decal UV = part UV (row vector) x the layer matrix (projective), clipped by the layer's edge quad in part UV; colour = the decal's own colour with the layer's saturation (HSV); coverage = decal alpha x opacity; blended in linear light",
+            "ink_rule": "unknown: layers coloured by ink (a layer that sets an ink, or whose decal is a mask) are not baked; the encoding of the ink words and the code that turns them into the shader's colour stops are not decoded",
+        });
+        if !unknown.is_empty() {
+            rec["not_in_catalogue"] = unknown.clone().into();
+        }
+        if layers.iter().all(|l| l.uses_ink()) {
+            rec["ink_layers_left_out"] = layers.len().into();
+            rec["applied"] = false.into();
+            st.decorations = Some(rec);
+            continue;
+        }
+        let cached = out.exists() && !(o.force && crate::ttpf::first_write_this_run(&out));
+        let made = if cached {
+            Ok(crate::peddeco::Skipped::default())
+        } else {
+            (|| -> anyhow::Result<crate::peddeco::Skipped> {
+                let img = image::open(&src)?.to_rgba8();
+                let (w, h) = img.dimensions();
+                let mut skin = crate::peddeco::Image { w, h, rgba: img.into_raw() };
+                let skipped = crate::peddeco::bake(&mut skin, &layers, &decal);
+                texture::save_png(&out, &skin.rgba, w, h)?;
+                Ok(skipped)
+            })()
+        };
+        let done = match made {
+            Ok(skipped) => {
+                if skipped.missing > 0 {
+                    rec["layers_without_decal"] = skipped.missing.into();
+                }
+                if !cached {
+                    rec["ink_layers_left_out"] = skipped.ink.into();
+                }
+                true
+            }
+            Err(e) => {
+                rec["error"] = e.to_string().into();
+                false
+            }
+        };
+        rec["applied"] = done.into();
+        if done {
+            st.base = Some(format!("{}{}", base.strip_suffix(&format!("{stem}.png")).unwrap_or(""), out.file_name().unwrap().to_string_lossy()));
+            rec["png"] = rel(&o.out, &out).into();
+        }
+        st.decorations = Some(rec);
+    }
 }
 
 /// Ped heads bind no textures: add the face (albedo and normal map) chosen
@@ -4062,7 +4170,7 @@ mod dictionary_tests {
         let a = ArchiveInfo { id: "levels.rpf".into(), path: work.join("levels.rpf"), size: archive.len() as u64, container: "rpf9".into() };
         crate::atomic::write(&a.path, archive).unwrap();
         let o = ExportOptions { out: work.join("out"), png: false, dds: false, raw: false,
-            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default(), part_hidden: Default::default() };
+            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_decorations: Default::default(), part_colours: Default::default(), part_hidden: Default::default() };
         let dir = o.out.join("models/levels").join(export_base_name(&e));
         fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("model.json");

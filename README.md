@@ -1087,8 +1087,14 @@ again**).
   hashes. `gcheadscale` is two-sided: the input `5ebebbe7` (head and
   neck), which no preset item sets, shrinks the head as the other input
   grows it, so -1..1 scales the head bone from 0.01 to 2 (1.5 at 0.5;
-  since 2026-11-26, before that 0..1). The game also has
-  head-scale compensation rigs, which are not run here. `allmuscle` keeps
+  since 2026-11-26, before that 0..1). The head scale is on `BM_Head`.
+  The default earring roots hang from `SKEL_Head` beside it, so they are
+  posed under `BM_Head`, as the ears are, and the viewer's strand hair
+  and brows ride on `BM_Head` too. Without this, a scaled head leaves its
+  earrings and ponytail at full size. The game also has
+  head-scale
+  compensation rigs, which are not run here. They smooth the neck and
+  mastoid bones, from two inputs of their own. `allmuscle` keeps
   to the twelve regional muscle controls. The game has two body-shape
   rigs, female and male. The body type comes from the part's fit tag:
   every tag that starts with `m` (`mr1`, `mb1`, `mo1`, `mc1`, `msk1`) gets

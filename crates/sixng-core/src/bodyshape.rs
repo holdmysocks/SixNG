@@ -828,16 +828,31 @@ pub fn pose(bones: &[Bone], rig: &Rig, inputs: &HashMap<u32, f32>) -> Option<Pos
             moved += 1;
         }
     }
+    // The default earring roots hang from SKEL_Head, outside BM_Head, which
+    // carries gcheadscale; the ears (and the alternative earring roots on
+    // the ear lobes) are under BM_Head. So these follow BM_Head, or a
+    // scaled head would leave its earrings floating or buried.
+    let bm_head = by_hash.get(&joaat("BM_Head")).copied();
+    let mut parent: Vec<Option<usize>> = bones.iter().map(|b| b.parent.map(|p| p as usize)).collect();
+    let mut attached: HashMap<usize, Trs> = HashMap::new();
+    if let Some(h) = bm_head {
+        for i in ["FB_Earring_L_Root", "FB_Earring_R_Root"].iter().filter_map(|n| by_hash.get(&joaat(n)).copied()) {
+            if h < i && parent[i] == bones[h].parent.map(|p| p as usize) {
+                parent[i] = Some(h);
+                attached.insert(i, to_trs(&mul(&affine_inverse(&binds[h]), &binds[i])));
+            }
+        }
+    }
     let mut out = binds.clone();
     let mut model: Vec<Trs> = binds.iter().map(to_trs).collect();
     for i in 0..bones.len() {
-        model[i] = match bones[i].parent {
+        model[i] = match parent[i] {
             // parents come before children in RAGE skeletons; fall back to bind
-            Some(p) if (p as usize) < i => compose(model[p as usize], locals[i]),
+            Some(p) if p < i => compose(model[p], attached.get(&i).copied().unwrap_or(locals[i])),
             Some(_) => continue,
             None => locals[i],
         };
-        if touched[i] || bones[i].parent.is_some_and(|p| (p as usize) < i && out[p as usize] != binds[p as usize]) {
+        if touched[i] || parent[i].is_some_and(|p| p < i && out[p] != binds[p]) {
             out[i] = from_trs(model[i].0, model[i].1, model[i].2);
         }
     }
@@ -1106,5 +1121,34 @@ mod tests {
         assert!((len(2) - 3.0).abs() < 1e-5);
         assert!((len(1) - 1.0).abs() < 1e-5);
         assert!((m[2][9] + 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn earrings_follow_head_scale() {
+        let bone = |i: u16, name: &str, parent: Option<u16>, z: f32| {
+            let mut b: Bone = serde_json::from_value(serde_json::json!({"index": i, "name": name, "parent": parent, "next_sibling": null, "flags": 0, "hash16": 0, "rotation": [0.0, 0.0, 0.0, 1.0], "translation": [0.0, 0.0, z], "scale": [1.0, 1.0, 1.0]})).unwrap();
+            b.bind_matrix = Some(from_trs([0.0, 0.0, z], [0.0, 0.0, 0.0, 1.0], [1.0; 3]));
+            b
+        };
+        // the earring root hangs from SKEL_Head, a sibling of BM_Head
+        let bones = vec![bone(0, "root", None, 0.0), bone(1, "SKEL_Head", Some(0), 1.0), bone(2, "BM_Head", Some(1), 1.0), bone(3, "FB_Earring_R_Root", Some(1), 1.1), bone(4, "TGT_R_Earring", Some(3), 1.2)];
+        // scale of BM_Head += weight * (0, 0, 2)
+        let mut prog = Vec::new();
+        for x in [0u16, 1, 0, 0, 1, 0, 0] {
+            prog.extend(x.to_le_bytes());
+        }
+        for x in [0f32, 0.0, 2.0] {
+            prog.extend(x.to_le_bytes());
+        }
+        let ch = Channel { t: 2, reg: 1, hash: joaat("BM_Head") };
+        let rig = Rig { registers: 4, inputs: HashMap::from([(7, 0)]), bone_in: vec![ch], bone_out: vec![ch], blocks: vec![(0x86, 0, prog.len())], prog };
+        let m = pose(&bones, &rig, &HashMap::from([(7, 1.0)])).unwrap().matrices;
+        // the earring root and its child move and scale with BM_Head
+        assert!((m[3][14] - 1.3).abs() < 1e-5);
+        assert!((m[3][10] - 3.0).abs() < 1e-5);
+        assert!((m[4][14] - 1.6).abs() < 1e-5);
+        // unshaped, it stays in its bind pose
+        let n = pose(&bones, &rig, &HashMap::new()).unwrap().matrices;
+        assert!((n[3][14] - 1.1).abs() < 1e-6 && (n[3][10] - 1.0).abs() < 1e-6);
     }
 }
