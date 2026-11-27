@@ -530,6 +530,9 @@ struct ShaderTextures {
     not_body: bool,
     /// Ped skin: the decorations baked into the base colour (`peddeco`).
     decorations: Option<serde_json::Value>,
+    /// The UV set the base colour is laid out in (0; 3 for an upper body
+    /// whose decorations are baked into its fourth set, `peddeco::Space`).
+    base_uv: u32,
 }
 
 /// Shader slot of the per-model tint palette.
@@ -1603,6 +1606,9 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     if let Some(d) = &st.decorations {
                         m["decorations"] = d.clone();
                     }
+                    if st.base_uv != 0 {
+                        m["base_uv"] = st.base_uv.into();
+                    }
                     if let Some(mut l) = crate::material::multilayer(s, &st.entries, || material_uv_fit(&lod_groups, si)) {
                         crate::material::four_layer_vertex_weights(&mut l, material_colours1(&lod_groups, si));
                         m["multilayer"] = l;
@@ -1717,9 +1723,6 @@ pub(crate) struct BuiltDrawable {
 pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &crate::drawable::DrawableInfo, dir: &Path, member: bool, o: &ExportOptions, item: &mut ExportedItem) -> BuiltDrawable {
     let head = head_skin_shaders(a, e, &info.shaders, o, item).or_else(|| part_skin_shaders(a, e, &info.shaders, item));
     let mut shader_tex = link_textures(a, head.as_ref().map_or(&info.shaders[..], |h| &h.0[..]), r, &info.embedded_textures, dir, o, e.name.as_deref());
-    if let Some(names) = e.name.as_deref().and_then(|n| o.part_decorations.get(&n.to_ascii_lowercase())).filter(|n| !n.is_empty() && o.png) {
-        bake_decorations(a, &mut shader_tex, names, dir, o);
-    }
     // Weapons: the `weapon` shader binds no colour map; a part's colours are
     // those of its layered-material preset, one per sub-material, and a
     // vertex names its sub-material in the green byte of the raw colour
@@ -1958,6 +1961,11 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
     // Vehicles: shaders whose meshes hang mostly on interior, lamp or
     // mechanical bones are not body paint (see `classify_shader`).
     let mut shader_tex = shader_tex;
+    // decorations, once the meshes are decoded: the upper body bakes into a
+    // texture laid out in its fourth UV set (`peddeco::Space`)
+    if let Some(names) = e.name.as_deref().and_then(|n| o.part_decorations.get(&n.to_ascii_lowercase())).filter(|n| !n.is_empty() && o.png) {
+        bake_decorations(a, &mut shader_tex, names, dir, o, &|si| decoration_triangles(&lod_groups, si));
+    }
     for (si, st) in shader_tex.iter_mut().enumerate() {
         let mut bones: Vec<&str> = mesh_meta.iter().filter(|m| m["shader_index"] == si).flat_map(|m| m["bones"].as_array().into_iter().flatten()).filter_map(|b| b.as_str()).collect();
         bones.sort();
@@ -2019,6 +2027,10 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         extras: {
             let c = classify_shader(s, st);
             let mut x = serde_json::json!({"shader_name_hash": s.name_hash, "shader_name": crate::names::shader(&s.name_hash), "emissive_source": emissive_source_json(s, st, &c), "emissive_strength": emissive_strength_json(s, st, &c), "classification": c, "textures": st.entries, "texture_fallback": st.fallback});
+            // the base colour laid out in another UV set (glTF texCoord)
+            if st.base_uv != 0 {
+                x["base_uv"] = st.base_uv.into();
+            }
             if let Some(t) = &st.ped_tint {
                 x["ped_tint"] = t.clone();
             }
@@ -2078,7 +2090,21 @@ struct SkinSetup {
 /// baked texture is written next to the plain one, named after it and the
 /// decoration list, and the material's `decorations` record says what went
 /// in and what did not.
-fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &[u32], dir: &Path, o: &ExportOptions) {
+/// The first LOD's triangles of a shader's meshes, each corner (UV0, UV3);
+/// none when the meshes have no fourth UV set.
+fn decoration_triangles(lod_groups: &[Vec<crate::gltf::NodeGroup>], shader: usize) -> Vec<[([f32; 2], [f32; 2]); 3]> {
+    let lod = lod_groups.iter().find(|g| g.iter().any(|n| !n.prims.is_empty()));
+    let mut out = Vec::new();
+    for p in lod.into_iter().flatten().flat_map(|n| &n.prims).filter(|p| p.material == Some(shader)) {
+        let (Some(u0), Some(u3)) = (p.uvs.first(), p.uvs.get(3)) else { continue };
+        for t in p.indices.chunks_exact(3) {
+            out.push(std::array::from_fn(|k| (u0[t[k] as usize], u3[t[k] as usize])));
+        }
+    }
+    out
+}
+
+fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &[u32], dir: &Path, o: &ExportOptions, triangles: &dyn Fn(usize) -> Vec<[([f32; 2], [f32; 2]); 3]>) {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     let root = game_root(a);
@@ -2112,11 +2138,17 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
     // look names none)
     let tone = cat.skin_tone_word(if o.skin_tone == 0 { crate::peddeco::DEFAULT_SKIN_TONE } else { o.skin_tone });
     let key = [o.skin_tone].iter().chain(names).fold((0xcbf2_9ce4_8422_2325u64 ^ crate::peddeco::BAKE_RULE as u64).wrapping_mul(0x100_0000_01b3), |h, &n| (h ^ n as u64).wrapping_mul(0x100_0000_01b3));
-    for st in shader_tex.iter_mut() {
+    let body = found.iter().any(|d| crate::peddeco::is_body_upper(d.category));
+    for (si, st) in shader_tex.iter_mut().enumerate() {
         let Some(base) = st.base.clone() else { continue };
         let src = dir.join(&base);
         let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        let out = src.with_file_name(format!("{stem}_deco{key:016x}.png"));
+        // body-upper decorations on a part whose fourth UV set is UV0 at
+        // half width, by side (the upper body): bake into that set's layout
+        let tris = if body { triangles(si) } else { Vec::new() };
+        let corners: Vec<([f32; 2], [f32; 2])> = tris.iter().flatten().copied().collect();
+        let space = if body && crate::peddeco::is_split_layout(&corners) { crate::peddeco::Space::BodyUpper } else { crate::peddeco::Space::Part };
+        let out = src.with_file_name(format!("{stem}_deco{key:016x}{}.png", if space == crate::peddeco::Space::BodyUpper { "_uv3" } else { "" }));
         let mut rec = serde_json::json!({
             "names": names.iter().map(|n| format!("{n:08x}")).collect::<Vec<_>>(),
             "categories": found.iter().map(|d| format!("{:08x}", d.category)).collect::<Vec<_>>(),
@@ -2126,6 +2158,10 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
             "ink_rule": "ink word 0xAAVVSSHH (HSV + alpha); stops in sRGB: 0.1V x lerp(1, hue, S), V x lerp(1, hue, S) with alpha A, (0.45 + 0.55V) x lerp(1, hue, 0.55S); each to linear and quantised to a byte; masks on layers with no ink are left out",
             "makeup_rule": "an ink whose p3 row (dL, da, db, w) has w != 0 is first moved w of the way (in sRGB) toward the skin tone shifted by (dL, da, db) in CIELAB (D65), then repacked as HSV",
             "skin_tone": format!("{:08x}", if o.skin_tone == 0 { crate::peddeco::DEFAULT_SKIN_TONE } else { o.skin_tone }),
+            "space": match space {
+                crate::peddeco::Space::Part => "part UV0",
+                crate::peddeco::Space::BodyUpper => "upper body space (2 u3, v3): the texture is laid out in TEXCOORD_3 (twice the plain texture's width), and the material reads it there",
+            },
         });
         if !unknown.is_empty() {
             rec["not_in_catalogue"] = unknown.clone().into();
@@ -2144,8 +2180,11 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
                 let img = image::open(&src)?.to_rgba8();
                 let (w, h) = img.dimensions();
                 let mut skin = crate::peddeco::Image { w, h, rgba: img.into_raw(), srgb: true };
-                let skipped = crate::peddeco::bake(&mut skin, &layers, &decal, tone);
-                texture::save_png(&out, &skin.rgba, w, h)?;
+                if space == crate::peddeco::Space::BodyUpper {
+                    skin = crate::peddeco::uv3_layout(&skin, &tris);
+                }
+                let skipped = crate::peddeco::bake(&mut skin, &layers, &decal, tone, space);
+                texture::save_png(&out, &skin.rgba, skin.w, skin.h)?;
                 Ok(skipped)
             })()
         };
@@ -2169,6 +2208,9 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
         if done {
             st.base = Some(format!("{}{}", base.strip_suffix(&format!("{stem}.png")).unwrap_or(""), out.file_name().unwrap().to_string_lossy()));
             rec["png"] = rel(&o.out, &out).into();
+            if space == crate::peddeco::Space::BodyUpper {
+                st.base_uv = 3;
+            }
         }
         st.decorations = Some(rec);
     }

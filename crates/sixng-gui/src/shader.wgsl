@@ -23,7 +23,7 @@ struct Frame {
 
 struct Mat {
     base: vec4<f32>,
-    flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask, bit 12 = an emissive shader of another class (lit by its emissive map), bit 13 = the packed map is a vehicle material map, bit 14 = the emissive slot holds the part ramp image with the parts' surfaces, bit 5 = the packed map is ped skin's spec map (green = roughness) with the specular factor x 100 in bits 16-23, bit 6 = ped skin's engine detail bound (6 speculartex2, 7 / 8 the normal and control sheets; tiling in strand.yz, colour strength strand.w, normal strength tile.y), bit 7 = ped skin occlusion (strength tile.x)
+    flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive, 64 base on the fourth UV set), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask, bit 12 = an emissive shader of another class (lit by its emissive map), bit 13 = the packed map is a vehicle material map, bit 14 = the emissive slot holds the part ramp image with the parts' surfaces, bit 5 = the packed map is ped skin's spec map (green = roughness) with the specular factor x 100 in bits 16-23, bit 6 = ped skin's engine detail bound (6 speculartex2, 7 / 8 the normal and control sheets; tiling in strand.yz, colour strength strand.w, normal strength tile.y), bit 7 = ped skin occlusion (strength tile.x)
     tile: vec4<f32>,      // fabric detail tile: x UV scale, y rotation, z mean grey value, w bound
     emis: vec4<f32>,      // x emissive scale of the material (from the GLB's emissive strength), yzw the light's colour
     strand: vec4<f32>,    // x a strand piece's width factor this frame (stored over drawn strands; 1 otherwise)
@@ -1647,7 +1647,9 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     // texels of the sub-material the tile belongs to
     var weave_w = 0.0;
     if ((has & 1u) != 0u) {
-        var bt = textureSample(t_base, samp, i.uv0);
+        // an upper body with its decorations is laid out in its fourth UV
+        // set (both arms apart; UV0 is mirrored)
+        var bt = textureSample(t_base, samp, select(i.uv0, i.uv23.zw, (has & 64u) != 0u));
         // tint mask (animal coats): only the green channel (shading) is a picture
         if ((M.flags.w & 512u) != 0u) { bt = vec4(vec3(bt.g), 1.0); }
         if (M.tile.w > 0.5 && M.tile.w < 1.5) { weave_w = bt.a; bt.a = 1.0; }
