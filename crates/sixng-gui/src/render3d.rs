@@ -2022,6 +2022,7 @@ impl Uploader {
             parts: false,
             occlusion_only: false,
             skin_spec: None,
+            skin_detail: None,
             emissive_scale: 1.0,
             lit: false,
             emissive_tint: [1.0; 3],
@@ -2085,6 +2086,17 @@ impl Uploader {
                     (Some(f), Some(_), None) => 0x20 | (((f.clamp(0.0, 2.55) * 100.0 + 0.5) as u32) << 16),
                     _ => 0,
                 }
+                // bit 6: ped skin's engine detail is bound (bindings 6-8:
+                // speculartex2, the normal and control sheets); bit 7: skin
+                // occlusion (strength in tile.x)
+                | match (mt.skin_spec, mt.packed, mt.mr, mt.skin_detail) {
+                    (Some(_), Some(_), None, Some(d)) if d.spec2.is_some() && d.normal.is_some() && d.control.is_some() => 0x40,
+                    _ => 0,
+                }
+                | match (mt.skin_spec, mt.packed, mt.mr, mt.skin_detail) {
+                    (Some(_), Some(_), None, Some(d)) if d.occlusion > 0.0 => 0x80,
+                    _ => 0,
+                }
                 // bit 14: the emissive slot holds the part ramp image, whose
                 // rows 512.. are the parts' surfaces (low and high metalness
                 // and roughness)
@@ -2099,13 +2111,19 @@ impl Uploader {
                 // w: 1 = fabric detail tile, 2 = vehicle part ramps (the
                 // palette column map in the tile slot, the rows in the
                 // emissive slot)
-                tile: match (mt.detail, mt.ramp_u.zip(mt.ramp).filter(|_| mt.emissive.is_none())) {
-                    (Some(d), _) => [d.scale, d.rot, d.mean, 1.0],
-                    (None, Some(_)) => [0.0, 0.0, 0.0, 2.0],
+                tile: match (mt.detail, mt.ramp_u.zip(mt.ramp).filter(|_| mt.emissive.is_none()), mt.skin_detail.filter(|_| mt.skin_spec.is_some())) {
+                    (Some(d), _, _) => [d.scale, d.rot, d.mean, 1.0],
+                    (None, Some(_), _) => [0.0, 0.0, 0.0, 2.0],
+                    // ped skin (w stays 0): x occlusion strength, y detail normal strength
+                    (None, None, Some(s)) => [s.occlusion, s.strength[1], 0.0, 0.0],
                     _ => [0.0; 4],
                 },
                 emis: [mt.emissive_scale, mt.emissive_tint[0], mt.emissive_tint[1], mt.emissive_tint[2]],
-                strand: [1.0, 0.0, 0.0, 0.0],
+                // ped skin: yz detail UV tiling, w detail colour strength
+                strand: match mt.skin_detail.filter(|_| mt.skin_spec.is_some()) {
+                    Some(s) => [1.0, s.uv_scale[0], s.uv_scale[1], s.strength[0]],
+                    None => [1.0, 0.0, 0.0, 0.0],
+                },
             };
             let o = k * MAT_STRIDE as usize;
             mat_bytes[o..o + std::mem::size_of::<MatU>()].copy_from_slice(bytemuck::bytes_of(&u));
@@ -2143,15 +2161,15 @@ impl Uploader {
                     },
                     wgpu::BindGroupEntry {
                         binding: 6,
-                        resource: wgpu::BindingResource::TextureView(view(mt.wear_mask)),
+                        resource: wgpu::BindingResource::TextureView(view(mt.wear_mask.or(mt.skin_detail.and_then(|d| d.spec2)))),
                     },
                     wgpu::BindGroupEntry {
                         binding: 7,
-                        resource: wgpu::BindingResource::TextureView(view(mt.primer_mask.or(mt.wear_mask))),
+                        resource: wgpu::BindingResource::TextureView(view(mt.primer_mask.or(mt.wear_mask).or(mt.skin_detail.and_then(|d| d.normal)))),
                     },
                     wgpu::BindGroupEntry {
                         binding: 8,
-                        resource: wgpu::BindingResource::TextureView(view(mt.dust_mask.or(mt.wear_mask))),
+                        resource: wgpu::BindingResource::TextureView(view(mt.dust_mask.or(mt.wear_mask).or(mt.skin_detail.and_then(|d| d.control)))),
                     },
                 ],
             });

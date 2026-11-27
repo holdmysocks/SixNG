@@ -689,9 +689,39 @@ again**).
     factor is 0, so B is not read as metal), and `KHR_materials_specular`
     has `specularFactor` = 1 + `fresnel`. The raw maps and their channels
     stay in the material extras (`skin_spec`). The viewer shades skin the
-    same way. Not carried: the detail atlases are engine-wide (no mesh
-    binds them), and translucency and occlusion feed only the deferred
-    lighting pass, which is not decoded. Both skin programs also scale F0
+    same way. **Detail atlases**: no mesh binds the two detail slots, and
+    the engine falls back to two arrays of 48 tiles (256 x 256) in
+    `data/ttdb/graphics/ttdb_graphics.ttpf`: detail normals
+    (`e4bb0ab707979121`, BC5) and detail control (`3e830fd3713f2e21`, red).
+    Tiles 16-31 are skin pores and wrinkles, 0-15 fabric. The material's
+    region table (`a6b9e97a`) turns the region in `speculartex2` G into a
+    tile; on people it is tile 16 + region. The export writes each
+    material's 16 tiles in region order as two 4 x 4 sheets
+    (`textures/ttpf/skindetail_n_*.png`, `skindetail_c_*.png`) and records
+    them in `extras.skin_spec.detail` with the tiling (`6022028b` zw, 34 to
+    39 on people) and the strengths (`6022028b` xy, 1 and 1). The game
+    darkens the colour by `saturate(1 + x * mask * (2c - 1))` (c = control,
+    mask = `speculartex2` R) and adds `y * mask` times the detail normal
+    to the tangent-space normal; the viewer does the same. Two per-ped
+    engine values also scale these terms (record `3b316b01`, +0x74 and
+    +0x30). The engine's default record sets both to 0, which turns the
+    detail normal and colour off. What a ped writes there is not traced, so
+    the viewer takes 1. A per-tile roughness term is not traced either
+    (taken as 0). **Occlusion**
+    (`speculartex` B) enters the G-buffer as `lerp(1, B, strength)`, the
+    strength being material constant `4d1ecedd`. The lighting multiplies
+    the diffuse ambient by it and the specular ambient by its fourth root,
+    and leaves direct light alone. The strength is 0 on human body skin
+    (every hand and foot material read) and 1 on teeth. So the game does
+    not use B on body skin. Where the strength is above 0 the GLB gets an
+    occlusion texture (B copied to red, `<spec>_occ.png`) with that
+    strength, and the viewer applies it as the game does. **Translucency**
+    (`speculartex` R, minus constant `381999f3`) goes to a G-buffer target
+    of its own. The lighting turns it into a thickness through a profile
+    picked per entity and adds a Burley-style transmittance per light (the
+    formula is in `extras.skin_spec.translucency`). The profiles are loaded
+    data that is not found yet, so translucency is recorded but not shaded
+    and not mapped to a glTF extension. Both skin programs also scale F0
     by a window on the albedo's brightness, `saturate((max(r, g, b) - lo)
     / (hi - lo))` on the linear albedo. The engine sets the bounds every
     frame from two constants, sRGB 5 and 20 (linear 0.0015 and 0.0070),

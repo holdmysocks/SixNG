@@ -215,6 +215,17 @@ pub struct Slot {
     pub format: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct SkinDetail {
+    pub spec2: Option<usize>,
+    pub normal: Option<usize>,
+    pub control: Option<usize>,
+    pub uv_scale: [f32; 2],
+    pub strength: [f32; 2],
+    /// `lerp(1, speculartex B, occlusion)` is the skin's ambient occlusion.
+    pub occlusion: f32,
+}
+
 #[derive(Clone)]
 pub struct Material {
     pub name: String,
@@ -267,6 +278,10 @@ pub struct Material {
     /// slot holds the `speculartex` spec map, whose green is roughness, and
     /// this is the specular factor (`1 + fresnel`; F0 = 0.04 x it).
     pub skin_spec: Option<f32>,
+    /// Ped skin's engine detail (`extras.skin_spec.detail`): `speculartex2`,
+    /// the material's 4 x 4 sheets of detail-normal and detail-control
+    /// tiles, the tiling and strengths, and the occlusion strength.
+    pub skin_detail: Option<SkinDetail>,
     /// How much brighter (or dimmer) than the viewer's emissive level an
     /// emissive material lights, from the GLB's emissive strength
     /// (`emissive_scale`); 1 when the export does not say.
@@ -917,7 +932,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
         });
         // Ped skin: its spec map (`speculartex`) is the packed map, read as
         // the game's skin program reads it; `speculartex2` (detail strength
-        // and region for engine-wide atlases) is not.
+        // and region) goes with the engine detail sheets (`skin_detail`).
         let skin = matches!(ex["shader_name_hash"].as_str(), Some("210fbc6a" | "8d69edab"));
         let mut skin_spec = None;
         if skin && !opts.base_only {
@@ -933,6 +948,25 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                 }
             }
         }
+        let skin_detail = skin_spec.is_some().then(|| {
+            let d = &ex["skin_spec"]["detail"];
+            let f2 = |v: &serde_json::Value, z: f32| [v[0].as_f64().map_or(z, |x| x as f32), v[1].as_f64().map_or(z, |x| x as f32)];
+            let spec2 = tex_list
+                .iter()
+                .find(|t| t["param_hash"] == "739e3d0d" && t["png"].is_string() && tiny_png(t).is_none())
+                .and_then(|t| t["png"].as_str())
+                .and_then(|p| add_img(out_root.join(p), false, &mut images));
+            let normal = d["normal_sheet"].as_str().and_then(|p| add_img(out_root.join(p), false, &mut images));
+            let control = d["control_sheet"].as_str().and_then(|p| add_img(out_root.join(p), false, &mut images));
+            SkinDetail {
+                spec2,
+                normal,
+                control,
+                uv_scale: f2(&d["uv_scale"], 1.0),
+                strength: f2(&d["strength"], 0.0),
+                occlusion: ex["skin_spec"]["occlusion"]["strength"].as_f64().unwrap_or(0.0) as f32,
+            }
+        });
         for t in ex["textures"].as_array().cloned().unwrap_or_default() {
             let role = slot_role(&t);
             let (status, mip) = slot_status(&t);
@@ -1048,6 +1082,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             parts: ex["classification"]["stand_in"] == "parts",
             occlusion_only,
             skin_spec,
+            skin_detail,
             emissive_scale,
             lit,
             emissive_tint: emissive_tint(&m),

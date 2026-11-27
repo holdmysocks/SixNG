@@ -377,6 +377,13 @@ pub fn mesh_glb_with(name: &str, groups: &[NodeGroup], materials: &[Material], s
                 textures.push(json!({"source": images.len() - 1}));
                 mat["pbrMetallicRoughness"]["metallicRoughnessTexture"] = json!({"index": textures.len() - 1});
             }
+            // {"uri": …, "strength"} occlusion map (skin with an occlusion strength).
+            if let Some(uri) = mat["occlusionTexture"]["uri"].as_str().map(|u| u.to_string()) {
+                images.push(json!({"uri": uri}));
+                textures.push(json!({"source": images.len() - 1}));
+                let st = mat["occlusionTexture"]["strength"].clone();
+                mat["occlusionTexture"] = json!({"index": textures.len() - 1, "strength": st});
+            }
             // "emissiveTexture": "base" = light with the base-colour texture;
             // {"uri": …} = the material's own emissive map. With neither
             // texture nothing lights up (a flat white glow would be wrong).

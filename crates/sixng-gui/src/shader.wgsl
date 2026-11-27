@@ -23,7 +23,7 @@ struct Frame {
 
 struct Mat {
     base: vec4<f32>,
-    flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask, bit 12 = an emissive shader of another class (lit by its emissive map), bit 13 = the packed map is a vehicle material map, bit 14 = the emissive slot holds the part ramp image with the parts' surfaces, bit 5 = the packed map is ped skin's spec map (green = roughness) with the specular factor x 100 in bits 16-23
+    flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask, bit 12 = an emissive shader of another class (lit by its emissive map), bit 13 = the packed map is a vehicle material map, bit 14 = the emissive slot holds the part ramp image with the parts' surfaces, bit 5 = the packed map is ped skin's spec map (green = roughness) with the specular factor x 100 in bits 16-23, bit 6 = ped skin's engine detail bound (6 speculartex2, 7 / 8 the normal and control sheets; tiling in strand.yz, colour strength strand.w, normal strength tile.y), bit 7 = ped skin occlusion (strength tile.x)
     tile: vec4<f32>,      // fabric detail tile: x UV scale, y rotation, z mean grey value, w bound
     emis: vec4<f32>,      // x emissive scale of the material (from the GLB's emissive strength), yzw the light's colour
     strand: vec4<f32>,    // x a strand piece's width factor this frame (stored over drawn strands; 1 otherwise)
@@ -784,6 +784,36 @@ fn map_finish_added(col0: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
 // bit 4; the wear mask when the model has none)
 @group(1) @binding(8) var t_dust: texture_2d<f32>;
 
+
+// Ped skin's engine detail (flags.w bit 6): binding 6 = speculartex2 (R
+// strength mask, G region), bindings 7 / 8 = the material's 16 region
+// tiles of the engine detail-normal and detail-control atlases as 4 x 4
+// sheets (region r at column r % 4, row r / 4). As both skin programs read
+// them: the region from the min and max of the four nearest G texels (two
+// regions are averaged), at UV0 x the material's tiling (strand.yz).
+struct SkinDet { n: vec2<f32>, c: f32, mask: f32 };
+fn skin_tile(t: texture_2d<f32>, r: u32, p: vec2<f32>, gx: vec2<f32>, gy: vec2<f32>) -> vec4<f32> {
+    let cell = vec2(f32(r & 3u), f32(r >> 2u));
+    let q = (cell + fract(p) * (254.0 / 256.0) + 1.0 / 256.0) * 0.25;
+    return textureSampleGrad(t, samp, q, gx * 0.25, gy * 0.25);
+}
+fn skin_detail(uv: vec2<f32>, gx: vec2<f32>, gy: vec2<f32>) -> SkinDet {
+    let p = uv * M.strand.yz;
+    let g = textureGather(1, t_wear, samp, uv);
+    let r0 = min(u32(16.0 * min(min(g.x, g.y), min(g.z, g.w)) + 0.5), 15u);
+    let r1 = min(u32(16.0 * max(max(g.x, g.y), max(g.z, g.w)) + 0.5), 15u);
+    var nn = skin_tile(t_primer, r0, p, gx, gy).rg;
+    var cc = skin_tile(t_dust, r0, p, gx, gy).r;
+    if (r1 != r0) {
+        nn = 0.5 * (nn + skin_tile(t_primer, r1, p, gx, gy).rg);
+        cc = 0.5 * (cc + skin_tile(t_dust, r1, p, gx, gy).r);
+    }
+    var o: SkinDet;
+    o.n = nn * 2.0 - 1.0;
+    o.c = cc * 2.0 - 1.0;
+    o.mask = textureSampleGrad(t_wear, samp, uv, gx / max(M.strand.y, 1e-3), gy / max(M.strand.z, 1e-3)).r;
+    return o;
+}
 
 // How often the wear mask repeats across a part's UV0 (the age records'
 // minTiling / maxTiling are about 4 to 6.5).
@@ -1629,10 +1659,21 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     var n = normalize(i.nrm);
     if (ff == (i.extra.w < 0.0)) { n = -n; }
     let tl = length(i.tan.xyz);
+    // ped skin's engine detail (both skin programs; the two per-ped engine
+    // scales on it taken as 1, the per-tile roughness term as 0)
+    let skin_det_on = (M.flags.w & 64u) != 0u && (M.flags.w & 256u) == 0u;
+    let det_gx = dpdx(i.uv0 * M.strand.yz);
+    let det_gy = dpdy(i.uv0 * M.strand.yz);
+    var sd: SkinDet;
+    sd.n = vec2(0.0);
+    sd.c = 0.0;
+    sd.mask = 0.0;
+    if (skin_det_on) { sd = skin_detail(i.uv0, det_gx, det_gy); }
     if ((has & 2u) != 0u && tl > 0.1) {
         let t = normalize(i.tan.xyz - n * dot(n, i.tan.xyz) / tl * tl);
         let b = cross(n, t) * select(1.0, -1.0, i.tan.w < 0.0);
         var tn = textureSample(t_nrm, samp, i.uv0).xyz * 2.0 - 1.0;
+        if (skin_det_on) { tn = vec3(tn.xy + M.tile.y * sd.mask * sd.n, tn.z); }
         tn.z = sqrt(max(1.0 - tn.x * tn.x - tn.y * tn.y, 0.0));
         n = normalize(t * tn.x + b * tn.y + n * tn.z);
     }
@@ -1660,8 +1701,12 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         // as the game's studio skin program reads it (GGX alpha = roughness
         // squared). Red (translucency) and blue (occlusion) feed only its
         // deferred lighting pass, which is not decoded.
-        rough = clamp(textureSample(t_pk, samp, i.uv0).g, 0.04, 1.0);
+        let sp = textureSample(t_pk, samp, i.uv0);
+        rough = clamp(sp.g, 0.04, 1.0);
         metal = 0.0;
+        // occlusion: lerp(1, B, the material's strength); diffuse ambient x
+        // it, specular ambient x its fourth root (below), direct light not
+        if ((M.flags.w & 128u) != 0u) { ao = mix(1.0, sp.b, clamp(M.tile.x, 0.0, 1.0)); }
     } else if ((has & 4u) != 0u && F.mode.y < 3u) {
         let p = textureSample(t_pk, samp, i.uv0);
         if (F.mode.y == 0u) { rough = p.r; metal = p.g; ao = p.b; }
@@ -1672,6 +1717,8 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     var albedo = base.rgb;
     // the model's tint palette entry multiplies the base colour
     if (F.misc3.x > 0.5) { albedo = albedo * i.tint.rgb; }
+    // ped skin's detail control (it can only darken)
+    if (skin_det_on) { albedo = albedo * clamp(1.0 + M.strand.w * sd.mask * sd.c, 0.0, 1.0); }
     // close-up fabric weave: the baked colour was made at the tile's mean
     // grey value; the tile itself, sampled per pixel on the second UV set,
     // moves it to the value at this pixel (its mips bring it back to the
@@ -2196,11 +2243,12 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     // turned shadow ribbons stands in for that denoise
     let sh_k = select(1.0, 3.0, cls == 12u && i.uv1.y > 0.5);
     let sh = model_sun_shadow(i.world, dpdx(i.world) * sh_k, dpdy(i.world) * sh_k);
-    var ao_s = ao;
+    // ped skin with occlusion: the specular ambient takes its fourth root
+    var ao_s = select(ao, sqrt(sqrt(ao)), (M.flags.w & 160u) == 160u);
     // strength = max(0, I - 2 x roughness), I = 1 (the game's value in every weather and hour): no effect from
     // roughness 0.5 upward, so next to none on skin
     let occ_k = max(0.0, 1.0 - 2.0 * rough);
-    if (cls != 12u && occ_k > 0.0) { ao_s = ao * (1.0 + occ_k * (screen_occlusion(i.clip, i.world, n) - 1.0)); }
+    if (cls != 12u && occ_k > 0.0) { ao_s = ao_s * (1.0 + occ_k * (screen_occlusion(i.clip, i.world, n) - 1.0)); }
     // From roughness 0.5 up the cone test is off and only the traced reflections keep the model's own
     // body out of the mirrored surroundings: where the mirror ray meets the model, what it sees is that
     // surface in the ambient light (taken with this pixel's colour) instead of the sky and ground.

@@ -53,8 +53,33 @@
 //! `1 + fresnel` as its specular factor (glTF's dielectric F0 is 0.04). The
 //! raw maps stay in the material extras (`skin_spec`).
 //!
-//! Not in the export: the detail-normal and detail-control atlases are
-//! engine-wide (no mesh binds them).
+//! The detail-normal and detail-control atlases are engine-wide: no mesh
+//! binds them, and the material slots fall back to two 2D arrays of 48
+//! 256 x 256 tiles in `data/ttdb/graphics/ttdb_graphics.ttpf`
+//! (`DETAIL_NORMAL_ATLAS`, `DETAIL_CONTROL_ATLAS`). Tiles 16-31 are the
+//! skin pores and wrinkles, 0-15 fabric. A material's region table
+//! (`a6b9e97a`, three words of 2-bit fields) turns the region in
+//! `speculartex2` G into a tile. The export writes the material's 16
+//! tiles in region order as two 4 x 4 sheets (`detail_json`) and records
+//! the strengths and the tiling. The game's use (both skin programs):
+//! with `c` = control R and `mask` = `speculartex2` R,
+//! `colour *= saturate(1 + strength.x * mask * (2c - 1))`, tangent normal
+//! `xy += strength.y * mask * detail.xy`, at UV0 x `uv_scale`. Two values
+//! of a per-ped engine record scale the normal and colour terms (taken as
+//! 1); a per-tile engine value scales a roughness term (taken as 0).
+//!
+//! Occlusion (`speculartex` B) enters the G-buffer as
+//! `lerp(1, B, strength)` with the material's constant `4d1ecedd`; the
+//! lighting multiplies the diffuse ambient by it and the specular ambient
+//! by its fourth root, the direct light not at all. The strength is 0 on
+//! human body skin (hands and feet in every material read) and 1 on
+//! teeth. Where it is above 0 the GLB gets an occlusion texture (B moved
+//! to R, glTF's channel) with that strength.
+//!
+//! Translucency (`speculartex` R) goes to a G-buffer target of its own;
+//! the lighting turns it into a thickness through a per-entity profile
+//! and adds a Burley-style transmittance per light. The profiles are
+//! loaded data not found yet, so it is recorded, not mapped.
 //!
 //! Both skin programs scale F0 by a window on the albedo's brightness,
 //! `saturate((max(r, g, b) - lo) / (hi - lo))` on the linear albedo. The
@@ -260,6 +285,130 @@ pub fn albedo_window(rgb: [f32; 3]) -> f32 {
     ((m - ALBEDO_LO) / (ALBEDO_HI - ALBEDO_LO)).clamp(0.0, 1.0)
 }
 
+/// Engine detail-normal atlas (BC5, 48 tiles), the default of the skin
+/// shader's slot `0cd27763`.
+pub const DETAIL_NORMAL_ATLAS: u64 = 0xe4bb_0ab7_0797_9121;
+/// Engine detail-control atlas (BC7, data in R), slot `7c0055b9`.
+pub const DETAIL_CONTROL_ATLAS: u64 = 0x3e83_0fd3_713f_2e21;
+/// Material constant +0xc0 (int3): region -> tile, three 2-bit fields per region.
+pub const DETAIL_TABLE_PARAM: &str = "a6b9e97a";
+/// Material constant +0xa0: x colour (and roughness) strength, y normal strength, zw UV tiling.
+pub const DETAIL_SCALE_PARAM: &str = "6022028b";
+/// Material constant +0xb4: one tile for every region when >= 0.
+pub const DETAIL_FORCE_PARAM: &str = "24ffd0a6";
+/// Material constant +0x8: occlusion strength (`lerp(1, speculartex B, s)`).
+pub const OCCLUSION_PARAM: &str = "4d1ecedd";
+/// Material constant +0x60: subtracted from `speculartex` R for the translucency.
+pub const TRANSLUCENCY_BIAS_PARAM: &str = "381999f3";
+
+/// The tile of the detail atlases a skin region (0-15) uses.
+pub fn detail_slice(table: [u32; 3], region: u32) -> u32 {
+    let f = |w: u32| (w >> (2 * region)) & 3;
+    f(table[0]) | f(table[1]) << 2 | f(table[2]) << 4
+}
+
+/// The tiles of all 16 regions; a forced tile (>= 0) for all.
+pub fn detail_slices(table: [u32; 3], force: f32) -> [u32; 16] {
+    std::array::from_fn(|r| if force >= 0.0 { force as u32 } else { detail_slice(table, r as u32) })
+}
+
+/// Write the two 4 x 4 sheets of these tiles (region r at column r % 4,
+/// row r / 4) under `dir`, once per tile set: (normal, control).
+pub fn write_detail_sheets(game_root: &Path, dir: &Path, slices: &[u32; 16]) -> anyhow::Result<[std::path::PathBuf; 2]> {
+    let key: String = slices.iter().map(|s| format!("{s:02x}")).collect();
+    let mut out = Vec::new();
+    for (tag, h) in [("n", DETAIL_NORMAL_ATLAS), ("c", DETAIL_CONTROL_ATLAS)] {
+        let p = dir.join(format!("skindetail_{tag}_{key}.png"));
+        if !p.exists() {
+            let (store, tx) = crate::ttpf::global(game_root).get(h).ok_or_else(|| anyhow::anyhow!("skin detail atlas {h:016x} is in no store"))?;
+            let data = store.data(tx)?;
+            let (w, hh) = (tx.width as usize, tx.height as usize);
+            let mut sheet = vec![0u8; 16 * w * hh * 4];
+            for (r, &sl) in slices.iter().enumerate() {
+                let (rgba, tw, th) = crate::ttpf::decode_rgba_slice(tx, &data, 0, sl.min(tx.slices().saturating_sub(1)))?;
+                anyhow::ensure!(tw as usize == w && th as usize == hh, "atlas tile size");
+                let (cx, cy) = (r % 4, r / 4);
+                for y in 0..hh {
+                    let d = ((cy * hh + y) * 4 * w + cx * w) * 4;
+                    sheet[d..d + w * 4].copy_from_slice(&rgba[y * w * 4..(y + 1) * w * 4]);
+                }
+            }
+            std::fs::create_dir_all(dir)?;
+            crate::texture::save_png(&p, &sheet, (4 * w) as u32, (4 * hh) as u32)?;
+        }
+        out.push(p);
+    }
+    Ok([out[0].clone(), out[1].clone()])
+}
+
+/// Values of a skin material's constants that the exports use.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SkinConsts {
+    pub fresnel: Option<f32>,
+    pub occlusion: Option<f32>,
+    pub translucency_bias: Option<f32>,
+}
+
+impl SkinConsts {
+    pub fn of(consts: &[crate::drawable::ShaderConst]) -> SkinConsts {
+        let one = |h: &str| consts.iter().find(|c| c.hash == h).and_then(|c| c.components()).and_then(|v| v.first().copied());
+        SkinConsts { fresnel: one(FRESNEL_PARAM), occlusion: one(OCCLUSION_PARAM), translucency_bias: one(TRANSLUCENCY_BIAS_PARAM) }
+    }
+}
+
+/// `extras.skin_spec.detail` of a skin material: its tiles, strengths and
+/// tiling, and the two sheets (written under `tdir`, paths through `rel`).
+/// None for other shaders or without a region table.
+pub fn detail_json(shader_hash: &str, consts: &[crate::drawable::ShaderConst], game_root: &Path, tdir: &Path, rel: &dyn Fn(&Path) -> String) -> Option<Value> {
+    if !SKIN_SHADERS.contains(&shader_hash) {
+        return None;
+    }
+    let c = |h: &str| consts.iter().find(|c| c.hash == h).and_then(|c| c.components()).map(|v| v.to_vec());
+    let t = c(DETAIL_TABLE_PARAM).filter(|v| v.len() >= 3)?;
+    let table = [t[0].to_bits(), t[1].to_bits(), t[2].to_bits()];
+    let scale = c(DETAIL_SCALE_PARAM).filter(|v| v.len() >= 4)?;
+    let force = c(DETAIL_FORCE_PARAM).and_then(|v| v.first().copied()).unwrap_or(-1.0);
+    let slices = detail_slices(table, force);
+    let mut j = serde_json::json!({
+        "region_slices": slices,
+        "strength": [scale[0], scale[1]],
+        "uv_scale": [scale[2], scale[3]],
+        "forced_slice": force,
+        "atlases": {"normal": format!("{DETAIL_NORMAL_ATLAS:016x}"), "control": format!("{DETAIL_CONTROL_ATLAS:016x}"), "store": "data/ttdb/graphics/ttdb_graphics.ttpf"},
+        "layout": "4 x 4 sheets of 256 x 256 tiles, region r (speculartex2 G: u32(16 G + 0.5)) at column r % 4, row r / 4",
+        "rule": "uv = UV0 * uv_scale; c = control sheet R, d = normal sheet RG * 2 - 1, mask = speculartex2 R; colour *= saturate(1 + strength.x * mask * (2c - 1)); tangent-space normal xy += strength.y * mask * d (before z is rebuilt). Where speculartex2 G straddles two regions the game samples both and averages."
+    });
+    match write_detail_sheets(game_root, tdir, &slices) {
+        Ok([n, c]) => {
+            j["normal_sheet"] = rel(&n).into();
+            j["control_sheet"] = rel(&c).into();
+        }
+        Err(e) => j["error"] = e.to_string().into(),
+    }
+    Some(j)
+}
+
+/// A skin spec map's blue (occlusion) as an occlusion PNG for glTF (which
+/// reads red), next to it: `<stem>_occ.png`. `out` is the export root and
+/// `spec` the spec map's path under it.
+pub fn write_occlusion_png(out: &Path, spec: &str) -> Option<String> {
+    let rel = spec.strip_suffix(".png")?.to_string() + "_occ.png";
+    let dst = out.join(&rel);
+    if !dst.exists() {
+        let img = image::open(out.join(spec)).ok()?.to_rgba8();
+        let (w, h) = img.dimensions();
+        let mut px = img.into_raw();
+        for p in px.chunks_exact_mut(4) {
+            let b = p[2];
+            p[0] = b;
+            p[1] = b;
+            p[3] = 255;
+        }
+        crate::texture::save_png(&dst, &px, w, h).ok()?;
+    }
+    Some(rel)
+}
+
 /// The skin material's `fresnel` constant (`specularfresnel`).
 pub const FRESNEL_PARAM: &str = "b5fe3acb";
 
@@ -280,7 +429,8 @@ fn slot_png<'a>(entries: &'a [Value], slot: &str) -> Option<&'a str> {
 /// metallic factors, and `KHR_materials_specular`. Merged into `g`; the
 /// raw maps go in `extras.skin_spec`. Not a skin shader, or no decoded
 /// `speculartex`: nothing changes.
-pub fn apply_gltf(g: &mut Value, extras: &mut Value, shader_hash: &str, entries: &[Value], fresnel: Option<f32>) {
+pub fn apply_gltf(g: &mut Value, extras: &mut Value, shader_hash: &str, entries: &[Value], k: &SkinConsts, detail: Option<Value>, occlusion_png: Option<&str>) {
+    let fresnel = k.fresnel;
     if !SKIN_SHADERS.contains(&shader_hash) {
         return;
     }
@@ -297,12 +447,19 @@ pub fn apply_gltf(g: &mut Value, extras: &mut Value, shader_hash: &str, entries:
         g["extensions"] = serde_json::json!({});
     }
     g["extensions"]["KHR_materials_specular"] = serde_json::json!({"specularFactor": specular_factor(f)});
+    let occ = k.occlusion.unwrap_or(0.0).clamp(0.0, 1.0);
+    if let (true, Some(p)) = (occ > 0.0, occlusion_png) {
+        g["occlusionTexture"] = serde_json::json!({"uri": p, "strength": occ});
+    }
     extras["skin_spec"] = serde_json::json!({
         "speculartex": spec,
         "speculartex2": slot_png(entries, SLOT_SPEC2),
         "fresnel": fresnel,
         "f0": 0.04 * specular_factor(f),
         "albedo_window": {"lo": ALBEDO_LO, "hi": ALBEDO_HI, "srgb": [5, 20], "rule": "F0 *= saturate((max(r, g, b) of the linear albedo - lo) / (hi - lo))"},
+        "occlusion": {"strength": k.occlusion, "png": if occ > 0.0 { occlusion_png } else { None }, "rule": "G-buffer occlusion = lerp(1, speculartex B, strength); the game's lighting: diffuse ambient x it, specular ambient x its fourth root, direct light not at all. Strength 0 = B unused (human body skin)"},
+        "translucency": {"bias": k.translucency_bias, "rule": "t = saturate(speculartex R - bias) to a G-buffer target of its own; per light the game adds 0.17182 x T x (2 + 0.75 / (1.25 - cos)^1.5) with T = (e^3 + 3e) / 4, e = exp(-0.480898 s / d) per channel, thickness s = lo + (hi - lo)(1 - t)^p from a per-entity profile (d, p, lo, hi: loaded data, not found). Not in the GLB."},
+        "detail": detail,
         "channels": {
             "speculartex": "R translucency mask, G roughness, B occlusion",
             "speculartex2": "R detail strength, G skin region (G * 16) for the engine detail atlases"
@@ -331,6 +488,15 @@ mod tests {
     }
 
     #[test]
+    fn detail_tiles_of_the_human_table() {
+        // Lucia's and Jason's region table: tile 16 + region
+        let t = [0xE4E4_E4E4, 0xFFAA_5500, 0x5555_5555];
+        let s = detail_slices(t, -1.0);
+        assert_eq!(s, std::array::from_fn(|r| 16 + r as u32));
+        assert_eq!(detail_slices(t, 3.0), [3; 16]);
+    }
+
+    #[test]
     fn albedo_window_bounds() {
         fn lin(c: f32) -> f32 {
             let c = c / 255.0;
@@ -350,7 +516,10 @@ mod tests {
             json!({"param_hash": SLOT_SPEC2, "png": "textures/ttpf/b.png"}),
         ];
         let (mut g, mut x) = (json!({}), json!({}));
-        apply_gltf(&mut g, &mut x, "210fbc6a", &entries, Some(-0.3));
+        let k = SkinConsts { fresnel: Some(-0.3), occlusion: Some(1.0), translucency_bias: Some(0.0) };
+        apply_gltf(&mut g, &mut x, "210fbc6a", &entries, &k, None, Some("textures/ttpf/a_occ.png"));
+        assert_eq!(g["occlusionTexture"]["uri"], "textures/ttpf/a_occ.png");
+        assert_eq!(g["occlusionTexture"]["strength"], 1.0);
         assert_eq!(g["pbrMetallicRoughness"]["metallicRoughnessTexture"]["uri"], "textures/ttpf/a.png");
         assert_eq!(g["pbrMetallicRoughness"]["metallicFactor"], 0.0);
         assert_eq!(g["pbrMetallicRoughness"]["roughnessFactor"], 1.0);
@@ -359,8 +528,8 @@ mod tests {
         assert_eq!(x["skin_spec"]["speculartex2"], "textures/ttpf/b.png");
         // other shaders, and skin without a decoded speculartex, are left alone
         let (mut g2, mut x2) = (json!({}), json!({}));
-        apply_gltf(&mut g2, &mut x2, "deadbeef", &entries, None);
-        apply_gltf(&mut g2, &mut x2, "210fbc6a", &entries[1..], None);
+        apply_gltf(&mut g2, &mut x2, "deadbeef", &entries, &SkinConsts { fresnel: None, ..Default::default() }, None, None);
+        apply_gltf(&mut g2, &mut x2, "210fbc6a", &entries[1..], &SkinConsts { fresnel: None, ..Default::default() }, None, None);
         assert_eq!(g2, json!({}));
         assert_eq!(x2, json!({}));
     }

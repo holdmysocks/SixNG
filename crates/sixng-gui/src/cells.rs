@@ -685,6 +685,7 @@ mod tests {
             parts: false,
             occlusion_only: false,
             skin_spec: None,
+            skin_detail: None,
             emissive_scale: 1.0,
             lit: false,
             emissive_tint: [1.0; 3],
