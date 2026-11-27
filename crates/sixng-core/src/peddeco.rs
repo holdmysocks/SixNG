@@ -86,7 +86,7 @@ pub const SKIN_CATEGORIES: [(u32, &str); 3] = [(0x3817_131d, "body upper"), (0x4
 
 const VERSION: u32 = 5;
 /// Changes when the bake rule changes, so baked textures are made again.
-pub const BAKE_RULE: u32 = 8;
+pub const BAKE_RULE: u32 = 9;
 /// The skin tone record struct (`data.rpf`): a name, a linear colour.
 pub const SKIN_TONE: u32 = 0x27a7_a4ef;
 /// Wardrobe tag key whose item names the skin tone (a skin-tone item, or
@@ -751,8 +751,8 @@ pub struct Skipped {
     /// Head makeup layers ([`Layer::is_makeup`]) baked with no skin tone
     /// to start from.
     pub makeup: usize,
-    /// Mask decals ([`Image::is_mask`]) on a layer with no ink: the game
-    /// colours them at run time, from code that is not decoded.
+    /// Mask decals ([`Image::is_mask`]) on a layer with no ink that is not
+    /// itself a mask ([`MASK`]): how the game colours them is not decoded.
     pub uncoloured_masks: usize,
 }
 
@@ -762,7 +762,47 @@ pub struct Skipped {
 /// which head makeup starts from; `space` places the texture's UV in the
 /// decoration space ([`Space`]). Makeup with no skin tone, uncoloured
 /// masks and layers whose decal is missing are left out and counted.
+/// Layer flag: the layer is a mask on the layer before it in its record
+/// (`PS_BakeDecorations`: after drawing a layer's coverage, the shader looks
+/// at the next layer; if it has this bit, its decal's alpha `a` at its own
+/// UV scales the coverage by `1 - (1 - a) x opacity`, and the loop goes on
+/// after it, so a mask is never drawn itself).
+pub const MASK: u32 = 0x4;
+/// Mask flag: the mask's alpha is inverted (`1 - a`): it cuts out.
+pub const MASK_INVERTED: u32 = 0x8000_0000;
+
+/// A record's layers as the bake shader draws them: each layer with the
+/// mask that follows it, mask layers left out. A mask that opens a record
+/// has no layer before it and is drawn as a layer.
+pub fn masked(layers: &[Layer]) -> Vec<(&Layer, Option<&Layer>)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < layers.len() {
+        let mask = layers.get(i + 1).filter(|m| m.masks_previous());
+        out.push((&layers[i], mask));
+        i += 1 + mask.is_some() as usize;
+    }
+    out
+}
+
 impl Layer {
+    /// A mask on the layer before it ([`MASK`]).
+    pub fn masks_previous(&self) -> bool {
+        self.flags & MASK != 0
+    }
+
+    /// How much of the masked layer shows at record-space UV `(u, v)`:
+    /// `1 - (1 - a) x opacity`, `a` the mask decal's alpha there (clamped
+    /// to its edge texels; inverted with [`MASK_INVERTED`]).
+    pub fn mask_factor(&self, t: &Image, u: f32, v: f32) -> f32 {
+        let Some((du, dv)) = decal_uv(&self.uv, u, v) else { return 1.0 };
+        let mut a = t.shader_sample(du.clamp(0.0, 1.0), dv.clamp(0.0, 1.0))[3];
+        if self.flags & MASK_INVERTED != 0 {
+            a = 1.0 - a;
+        }
+        1.0 - (1.0 - a) * self.opacity
+    }
+
     /// A whole sheet: neither the layer nor its record moves it, so it
     /// covers the part's texture as laid out. A character's own tattoo
     /// sheet on the upper body is one; it spans both sides of the fourth UV
@@ -773,10 +813,12 @@ impl Layer {
     }
 }
 
-pub fn bake(skin: &mut Image, layers: &[&Layer], decal: &dyn Fn(u64) -> Option<std::sync::Arc<Image>>, skin_tone: Option<u32>, space: Space) -> Skipped {
+pub fn bake(skin: &mut Image, layers: &[(&Layer, Option<&Layer>)], decal: &dyn Fn(u64) -> Option<std::sync::Arc<Image>>, skin_tone: Option<u32>, space: Space) -> Skipped {
     let mut skipped = Skipped::default();
     let (w, h) = (skin.w as usize, skin.h as usize);
-    for &l in layers {
+    for &(l, mask) in layers {
+        // a mask whose decal is missing leaves the layer whole
+        let mask = mask.and_then(|m| Some((m, m.textures.first().and_then(|&x| decal(x))?)));
         let made;
         let l = if l.is_makeup() {
             let Some(base) = skin_tone else {
@@ -815,7 +857,10 @@ pub fn bake(skin: &mut Image, layers: &[&Layer], decal: &dyn Fn(u64) -> Option<s
                 if !(0.0..=1.0).contains(&du) || !(0.0..=1.0).contains(&dv) {
                     continue;
                 }
-                let (c, k) = shade(l, t.shader_sample(du, dv));
+                let (c, mut k) = shade(l, t.shader_sample(du, dv));
+                if let Some((m, mt)) = &mask {
+                    k *= m.mask_factor(mt, u, v);
+                }
                 if k <= 0.0 {
                     continue;
                 }
@@ -1003,20 +1048,20 @@ mod tests {
         l.opacity = 0.5;
         // only the left half: u -> u * 2
         l.uv = [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        assert_eq!(bake(&mut skin, &[&l], &|_| Some(d.clone()), None, Space::Part), Skipped::default());
+        assert_eq!(bake(&mut skin, &[(&l, None)], &|_| Some(d.clone()), None, Space::Part), Skipped::default());
         // black art at half coverage over white: linear 0.5 -> sRGB 188
         assert_eq!(&skin.rgba[..4], &[188, 188, 188, 200]);
         assert_eq!(&skin.rgba[4..], &[255, 255, 255, 200]);
-        assert_eq!(bake(&mut skin, &[&l], &|_| None, None, Space::Part), Skipped { missing: 1, ..Default::default() });
+        assert_eq!(bake(&mut skin, &[(&l, None)], &|_| None, None, Space::Part), Skipped { missing: 1, ..Default::default() });
         // a mask on a layer with no ink is left out
         let mask = std::sync::Arc::new(Image { w: 2, h: 1, rgba: vec![0, 128, 0, 255, 0, 120, 0, 200], srgb: false });
         l.colours = [0x004c_c382, 0, 0];
         assert!(mask.is_mask() && !d.is_mask());
-        assert_eq!(bake(&mut skin, &[&l], &|_| Some(mask.clone()), None, Space::Part), Skipped { uncoloured_masks: 1, ..Default::default() });
+        assert_eq!(bake(&mut skin, &[(&l, None)], &|_| Some(mask.clone()), None, Space::Part), Skipped { uncoloured_masks: 1, ..Default::default() });
         // makeup is left out, and the texture stays as it was
         l.colours = [0xff00_ff00, 0, 0];
         l.p3[0][3] = 1.0;
-        assert_eq!(bake(&mut skin, &[&l], &|_| Some(d.clone()), None, Space::Part), Skipped { makeup: 1, ..Default::default() });
+        assert_eq!(bake(&mut skin, &[(&l, None)], &|_| Some(d.clone()), None, Space::Part), Skipped { makeup: 1, ..Default::default() });
         assert_eq!(&skin.rgba[..4], &[188, 188, 188, 200]);
         // a black ink on the mask, multiplied: 188 x black at full coverage
         l.p3 = [[0.0; 4]; 3];
@@ -1024,7 +1069,7 @@ mod tests {
         l.opacity = 1.0;
         l.flags = 0x0400_0000;
         let solid = std::sync::Arc::new(Image { w: 1, h: 1, rgba: vec![0, 127, 0, 255], srgb: false });
-        assert_eq!(bake(&mut skin, &[&l], &|_| Some(solid.clone()), None, Space::Part), Skipped::default());
+        assert_eq!(bake(&mut skin, &[(&l, None)], &|_| Some(solid.clone()), None, Space::Part), Skipped::default());
         assert_eq!(&skin.rgba[..4], &[0, 0, 0, 200]);
         assert_eq!(&skin.rgba[4..], &[255, 255, 255, 200]);
     }
@@ -1063,8 +1108,8 @@ mod tests {
         let mut l = layer();
         l.colours = [0xff91_6610, 0, 0];
         l.p3[0] = [0.0, 0.0, 0.0, 1.0];
-        assert_eq!(bake(&mut skin, &[&l], &|_| Some(mask.clone()), None, Space::Part), Skipped { makeup: 1, ..Default::default() });
-        assert_eq!(bake(&mut skin, &[&l], &|_| Some(mask.clone()), Some(base), Space::Part), Skipped::default());
+        assert_eq!(bake(&mut skin, &[(&l, None)], &|_| Some(mask.clone()), None, Space::Part), Skipped { makeup: 1, ..Default::default() });
+        assert_eq!(bake(&mut skin, &[(&l, None)], &|_| Some(mask.clone()), Some(base), Space::Part), Skipped::default());
         assert_ne!(skin.rgba, vec![255, 255, 255, 255]);
     }
 
@@ -1111,6 +1156,47 @@ mod tests {
     }
 
     #[test]
+    fn a_mask_goes_with_the_layer_before_it() {
+        let a = layer();
+        let mut m = layer();
+        m.flags = MASK;
+        let b = layer();
+        let ls = [a.clone(), m.clone(), b.clone(), m.clone()];
+        let got = masked(&ls);
+        assert_eq!(got.len(), 2);
+        assert!(got[0].1.is_some() && got[1].1.is_some());
+        // a mask opening a record is drawn as a layer
+        let got = masked(std::slice::from_ref(&m));
+        assert_eq!((got.len(), got[0].1.is_some()), (1, false));
+    }
+
+    #[test]
+    fn a_mask_scales_the_coverage_by_its_alpha() {
+        // the mask decal: left texel clear, right texel opaque
+        let mt = Image { w: 2, h: 1, rgba: vec![0, 0, 0, 0, 0, 0, 0, 255], srgb: false };
+        let mut m = layer();
+        m.flags = MASK;
+        m.opacity = 0.5;
+        let (lo, hi) = (m.mask_factor(&mt, 0.0, 0.5), m.mask_factor(&mt, 1.0, 0.5));
+        assert!((lo - 0.5).abs() < 1e-6 && (hi - 1.0).abs() < 1e-6, "{lo} {hi}");
+        m.flags |= MASK_INVERTED;
+        let (lo, hi) = (m.mask_factor(&mt, 0.0, 0.5), m.mask_factor(&mt, 1.0, 0.5));
+        assert!((lo - 1.0).abs() < 1e-6 && (hi - 0.5).abs() < 1e-6, "{lo} {hi}");
+        // baked: a black layer over white skin, masked by a full-opacity
+        // mask whose decal is clear on the left half
+        m.flags = MASK;
+        m.opacity = 1.0;
+        m.textures = vec![2];
+        let l = layer();
+        let black = std::sync::Arc::new(Image { w: 1, h: 1, rgba: vec![0, 0, 0, 255], srgb: false });
+        let mt = std::sync::Arc::new(mt);
+        let mut skin = Image { w: 4, h: 1, rgba: vec![255; 16], srgb: true };
+        bake(&mut skin, &[(&l, Some(&m))], &|h| Some(if h == 2 { mt.clone() } else { black.clone() }), None, Space::Part);
+        let red: Vec<u8> = skin.rgba.chunks(4).map(|p| p[0]).collect();
+        assert_eq!((red[0], red[3]), (255, 0), "{red:?}");
+    }
+
+    #[test]
     fn a_whole_sheet_covers_both_sides_of_the_upper_body() {
         // no transform: the sheet is the upper body's texture as laid out
         // (UV3), both sides; moved at all, it is placed at (2u, v) and
@@ -1121,12 +1207,12 @@ mod tests {
         let white = || Image { w: 4, h: 1, rgba: vec![255; 16], srgb: true };
         let red = |s: &Image| s.rgba.chunks(4).map(|p| p[0]).collect::<Vec<_>>();
         let mut sheet = white();
-        bake(&mut sheet, &[&l], &|_| Some(d.clone()), None, Space::BodyUpper);
+        bake(&mut sheet, &[(&l, None)], &|_| Some(d.clone()), None, Space::BodyUpper);
         assert_eq!(red(&sheet), [0, 0, 0, 0]);
         l.uv[0][0] = 1.0001;
         assert!(!l.is_sheet());
         let mut moved = white();
-        bake(&mut moved, &[&l], &|_| Some(d.clone()), None, Space::BodyUpper);
+        bake(&mut moved, &[(&l, None)], &|_| Some(d.clone()), None, Space::BodyUpper);
         assert_eq!(red(&moved), [0, 0, 255, 255]);
     }
 
@@ -1142,10 +1228,10 @@ mod tests {
         let d = std::sync::Arc::new(Image { w: 1, h: 1, rgba: vec![0, 0, 0, 255], srgb: false });
         let white = || Image { w: 4, h: 1, rgba: vec![255; 16], srgb: true };
         let mut up = white();
-        bake(&mut up, &[&l], &|_| Some(d.clone()), None, Space::BodyUpper);
+        bake(&mut up, &[(&l, None)], &|_| Some(d.clone()), None, Space::BodyUpper);
         assert_eq!(up.rgba.chunks(4).map(|p| p[0]).collect::<Vec<_>>(), [255, 255, 0, 0]);
         let mut own = white();
-        bake(&mut own, &[&l], &|_| Some(d.clone()), None, Space::Part);
+        bake(&mut own, &[(&l, None)], &|_| Some(d.clone()), None, Space::Part);
         assert!(own.rgba.iter().all(|&b| b == 255));
     }
 
