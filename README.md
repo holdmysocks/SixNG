@@ -1888,13 +1888,36 @@ in Audio.
 ### Dialogue links
 
 `sixng dialogue-links` links subtitles to their speaker and audio stream
-from a local address table and writes `<work>/dialogue_links.json`:
+and writes `<work>/dialogue_links.json`. It takes the links from the
+game's own conversation files, from a local address table, or both:
 
 ```sh
+sixng audio 'pack/shared_minigame000/shared_minigame000'
+sixng dialogue-links --conversations 'pack/shared_minigame000/shared_minigame000'
 sixng audio 'pack/story000/story000'
-sixng dialogue-links --addresses addresses.tsv --text-table 'text-export/text/data/1000.json'
+sixng dialogue-links --conversations 'pack/shared_minigame000/shared_minigame000' --addresses addresses.tsv --text-table 'text-export/text/data/1000.json'
 ```
 
+**Conversation files.** A pack can hold one conversation file per mission
+(a PSO file; the minigame pack has four). A conversation lists its
+characters and its lines in the order they are spoken. Each line stores its
+subtitle label in plain text, its audio cue (`Context`) and which take of
+the cue it plays (`Variation`). SixNG derives:
+
+- the subtitle key: `joaat(label)`, the key in `sixng text` tables;
+- the wave: `<cue>_<take as two digits>`, whose joaat's low 29 bits are the
+  stream ID. The stream is the one stream in the archive's audio index with
+  that ID; a line whose ID is missing or in several banks gets no audio;
+- the speaker: the conversation's character hash. In a conversation with
+  several characters, a line's speaker is the character whose
+  single-speaker conversations use the same voice, when that is one of the
+  conversation's characters.
+
+The archive's audio index must exist (`sixng audio <archive>`). The report
+counts the conversation files, lines, linked streams and speakers per
+archive.
+
+**Address table.**
 The table is a TSV file with a header row. The command reads these
 columns and ignores the rest: `subtitle_key` (`<table>/<hex key>`, the
 last part being the text label hash), `character_id`, `speaker_hash_hex`,
@@ -1902,6 +1925,9 @@ last part being the text label hash), `character_id`, `speaker_hash_hex`,
 `stream_index`, `stream_id_hex`, `clip_name`, `data_offset`, `data_size`,
 `channel_id_hex`, `pcm_start_frame`, `pcm_end_frame_exclusive` and
 `confirmed`. A row needs only the key plus a speaker or an audio address.
+A row for a subtitle that the conversation files already link is not
+added. It is compared with the derived link instead, and the report's
+`table_check` counts agreeing and differing streams and speakers.
 
 The table only names the stream. The command rebuilds every address from
 the archive's SixNG audio index: the stream at `bank_offset` and

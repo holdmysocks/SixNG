@@ -1159,11 +1159,14 @@ enum Cmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Link subtitles to their speaker and audio stream: <work>/dialogue_links.json, read by `text --label`/`--find`, the Audio page and Scenes. Reads a local address table (TSV with a header: subtitle_key as `<table>/<hex key>`, character_id, speaker_hash_hex, speaker_status, archive, bank_offset, stream_index, stream_id_hex, clip_name, data_offset, data_size, channel_id_hex, pcm_start_frame, pcm_end_frame_exclusive, confirmed). Each audio address is rebuilt from the archive's audio index (`sixng audio <archive>` first): a stream id or byte range that does not match the index is rejected, and a wave name is kept only when its joaat gives the stream id. Reports linked and rejected rows, confirmed and unconfirmed apart
+    /// Link subtitles to their speaker and audio stream: <work>/dialogue_links.json, read by `text --label`/`--find`, the Audio page and Scenes. With --conversations, from the game's conversation files (PSO: per line its subtitle label, audio cue and take, and the conversation's characters; subtitle key = joaat(label), wave = <cue>_<take>); a table row for a subtitle these already link is only compared with them. Reads a local address table (TSV with a header: subtitle_key as `<table>/<hex key>`, character_id, speaker_hash_hex, speaker_status, archive, bank_offset, stream_index, stream_id_hex, clip_name, data_offset, data_size, channel_id_hex, pcm_start_frame, pcm_end_frame_exclusive, confirmed). Each audio address is rebuilt from the archive's audio index (`sixng audio <archive>` first): a stream id or byte range that does not match the index is rejected, and a wave name is kept only when its joaat gives the stream id. Reports linked and rejected rows, confirmed and unconfirmed apart
     DialogueLinks {
         /// The local address table (TSV).
         #[arg(long)]
-        addresses: PathBuf,
+        addresses: Option<PathBuf>,
+        /// Archives whose conversation files to derive links from (e.g. pack/shared_minigame000/shared_minigame000); needs its audio index. Repeat for several.
+        #[arg(long)]
+        conversations: Vec<String>,
         /// A JSON table from `sixng text --out`, for the subtitle text. Repeat for tables in one locale.
         #[arg(long)]
         text_table: Vec<PathBuf>,
@@ -2182,9 +2185,9 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let default = ws.work.join("scene_dialogue.json");
             out.print(&scene_dialogue::generate(&ws, input, text_table, path.as_deref().unwrap_or(&default))?);
         }
-        Cmd::DialogueLinks { addresses, text_table, out: path } => {
+        Cmd::DialogueLinks { addresses, conversations, text_table, out: path } => {
             let default = sixng_core::dialogue::links_path(&ws.work);
-            out.print(&dialogue_links::generate(&ws, addresses, text_table, path.as_deref().unwrap_or(&default))?);
+            out.print(&dialogue_links::generate(&ws, addresses.as_deref(), conversations, text_table, path.as_deref().unwrap_or(&default))?);
         }
         Cmd::Ttpf { store, hash, first, mip, all_slices, float, all, out: tout } => {
             let a = ws.resolve(store)?;

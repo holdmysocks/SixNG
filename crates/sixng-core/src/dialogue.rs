@@ -8,6 +8,14 @@
 //! match the index is left out. A voice line's wave name hashes to its
 //! stream id (`joaat(name)` low 29 bits), which is checked too.
 //!
+//! The links can also come from the game's own conversation files (PSO,
+//! one per mission in a pack such as `shared_minigame000`): a conversation
+//! lists its characters and its lines in spoken order, and each line stores
+//! its subtitle label in plain text, its audio cue (`Context`) and which
+//! take of the cue it uses (`Variation`). The subtitle key is
+//! `joaat(label)` and the wave is `<cue>_<take, 2 digits>`
+//! ([`conversation_lines`]).
+//!
 //! The CLI (`text --label`, `text --find`), the Audio page and the Scenes
 //! dialogue read the file when it exists.
 use crate::audio::{StemWindow, StreamAddress};
@@ -147,6 +155,139 @@ pub fn summary(l: &DialogueLink) -> serde_json::Value {
     v
 }
 
+/// Conversation fields without a known name (field hashes as `sixng pso`
+/// prints them).
+const F_ENTRIES: &str = "53c6b42d";
+const F_LABEL: &str = "66fb3a21";
+const F_CHARACTERS: &str = "827f53fd";
+/// A line's voice: lines of one character share it.
+const F_VOICE: &str = "7f3eebb0";
+
+/// One spoken line of a conversation file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationLine {
+    /// Subtitle label (`FX_INTRO_01`).
+    pub label: String,
+    /// `joaat(label)`: the key in the text tables.
+    pub subtitle_key: u32,
+    /// Audio cue (`FXAU_AAAB`).
+    pub cue: String,
+    pub variation: u32,
+    /// `<cue>_<variation, 2 digits>`; its joaat's low 29 bits are the stream id.
+    pub wave: String,
+    /// The speaking character's hash, where the file pins it to one.
+    pub speaker: Option<u32>,
+}
+
+/// A field by name, or by the case-sensitive joaat of the name (as PSO
+/// files hash field names) when the name
+/// dictionary did not resolve it.
+fn field<'a>(v: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+    v.get(name).or_else(|| v.get(format!("{:08x}", crate::names::joaat_exact(name))))
+}
+
+fn u32_of(v: Option<&serde_json::Value>) -> Option<u32> {
+    v.and_then(|x| x.as_u64()).and_then(|x| u32::try_from(x).ok())
+}
+
+/// Cheap test before decoding a PSO: conversation files declare the
+/// `Context` field.
+pub fn may_hold_conversations(bytes: &[u8]) -> bool {
+    let h = crate::names::joaat_exact("Context").to_le_bytes();
+    bytes.windows(4).any(|w| w == h)
+}
+
+struct RawLine {
+    label: String,
+    cue: String,
+    variation: u32,
+    voice: Option<u32>,
+    characters: Vec<u32>,
+}
+
+fn walk_conversations(v: &serde_json::Value, characters: &[u32], out: &mut Vec<RawLine>) {
+    match v {
+        serde_json::Value::Array(a) => a.iter().for_each(|x| walk_conversations(x, characters, out)),
+        serde_json::Value::Object(o) => {
+            let own: Vec<u32>;
+            let characters = match o.get(F_CHARACTERS).and_then(|c| c.as_array()) {
+                Some(list) => {
+                    own = list.iter().filter_map(|c| u32_of(field(c, "CharacterName"))).collect();
+                    &own[..]
+                }
+                None => characters,
+            };
+            if let (Some(entries), Some(variation)) = (o.get(F_ENTRIES).and_then(|e| e.as_array()), u32_of(field(v, "Variation"))) {
+                for e in entries {
+                    let (Some(label), Some(cue)) = (e.get(F_LABEL).and_then(|x| x.as_str()), field(e, "Context").and_then(|x| x.as_str())) else { continue };
+                    if label.is_empty() || cue.is_empty() || variation == 0 {
+                        continue;
+                    }
+                    out.push(RawLine { label: label.to_string(), cue: cue.to_string(), variation, voice: u32_of(o.get(F_VOICE)), characters: characters.to_vec() });
+                }
+            }
+            for (k, x) in o {
+                if k != F_ENTRIES {
+                    walk_conversations(x, characters, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The spoken lines of decoded conversation files (`pso::Pso::to_json`
+/// values). Lines are found by shape, wherever they sit: a conversation has
+/// a character list, a line a `Variation` and a list of entries, an entry a
+/// `Context` and a label. A line's speaker is the conversation's only
+/// character; in a conversation with several, it is the character whose
+/// single-speaker conversations use the line's voice, when that is one of
+/// them. Each (label, cue, take, speaker) is listed once, and a line found
+/// inside a conversation is not listed again from outside one.
+pub fn conversation_lines(files: &[serde_json::Value]) -> Vec<ConversationLine> {
+    let mut raw = Vec::new();
+    for f in files {
+        walk_conversations(f, &[], &mut raw);
+    }
+    let distinct = |c: &[u32]| {
+        let mut c = c.to_vec();
+        c.sort_unstable();
+        c.dedup();
+        c
+    };
+    let mut voices: HashMap<u32, std::collections::BTreeSet<u32>> = HashMap::new();
+    for r in &raw {
+        if let (Some(voice), [one]) = (r.voice, distinct(&r.characters).as_slice()) {
+            voices.entry(voice).or_default().insert(*one);
+        }
+    }
+    // PSO JSON lists objects both in place and flat: a line seen inside a
+    // conversation drops its copies seen outside one.
+    let in_conversation: std::collections::HashSet<(String, String, u32)> =
+        raw.iter().filter(|r| !r.characters.is_empty()).map(|r| (r.label.to_ascii_lowercase(), r.cue.to_ascii_lowercase(), r.variation)).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for r in raw {
+        if r.characters.is_empty() && in_conversation.contains(&(r.label.to_ascii_lowercase(), r.cue.to_ascii_lowercase(), r.variation)) {
+            continue;
+        }
+        let speaker = match distinct(&r.characters).as_slice() {
+            [] => None,
+            [one] => Some(*one),
+            many => {
+                let known: Vec<u32> = r.voice.and_then(|v| voices.get(&v)).map(|s| s.iter().copied().filter(|c| many.contains(c)).collect()).unwrap_or_default();
+                (known.len() == 1).then(|| known[0])
+            }
+        };
+        if !seen.insert((r.label.to_ascii_lowercase(), r.cue.to_ascii_lowercase(), r.variation, speaker)) {
+            continue;
+        }
+        let wave = format!("{}_{:02}", r.cue, r.variation);
+        out.push(ConversationLine { subtitle_key: crate::meta7a::joaat(&r.label), label: r.label, cue: r.cue, variation: r.variation, wave, speaker });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +324,42 @@ mod tests {
         assert_eq!(s["audio"]["wave"], "guide_hello_01");
         assert!(parse(br#"{"schema_version":2,"links":[]}"#).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn conversation_lines_by_shape_with_speakers_from_voices() {
+        use serde_json::json;
+        let line = |label: &str, cue: &str, var: u32, voice: u32| json!({"Variation": var, "7f3eebb0": voice,
+            "53c6b42d": [{"66fb3a21": label, "Context": cue, "StartTime": 0}]});
+        let mut unresolved = json!({});
+        unresolved[format!("{:08x}", crate::names::joaat_exact("CharacterName"))] = json!(100);
+        let file = json!({"objects": {"x": [{"MissionId": 1, "list": [
+            // one speaker; the field name left as its hash
+            {"827f53fd": [unresolved],
+             "cde324d0": [line("FX_INTRO_01", "FXAU_AAAB", 1, 7), line("FX_INTRO_02", "FXAU_AAAB", 2, 7)]},
+            {"827f53fd": [{"CharacterName": 200}], "cde324d0": [line("FX_REPLY_01", "FXAU_AAAC", 1, 8)]},
+            // two speakers: voices 7 and 8 name them; voice 9 is unknown
+            {"827f53fd": [{"CharacterName": 100}, {"CharacterName": 200}], "cde324d0": [
+                line("FX_TALK_1", "FXAU_AAAF", 1, 8), line("FX_TALK_2", "FXAU_AAAD", 1, 7), line("FX_TALK_3", "FXAU_AAAE", 3, 9)]}
+        ]}]}});
+        // listed twice, and once more outside its conversation (PSO JSON
+        // repeats objects): each line once, with its speaker
+        let flat = json!({"objects": {"y": [line("FX_INTRO_01", "FXAU_AAAB", 1, 7)]}});
+        let lines = conversation_lines(&[file.clone(), flat, file]);
+        assert_eq!(lines.len(), 6);
+        let by: HashMap<&str, &ConversationLine> = lines.iter().map(|l| (l.label.as_str(), l)).collect();
+        assert_eq!(by["FX_INTRO_02"].wave, "FXAU_AAAB_02");
+        assert_eq!(by["FX_INTRO_02"].subtitle_key, crate::meta7a::joaat("fx_intro_02"));
+        assert_eq!(by["FX_INTRO_01"].speaker, Some(100));
+        assert_eq!(by["FX_TALK_1"].speaker, Some(200));
+        assert_eq!(by["FX_TALK_2"].speaker, Some(100));
+        assert_eq!(by["FX_TALK_3"].speaker, None);
+        assert_eq!(by["FX_TALK_3"].wave, "FXAU_AAAE_03");
+        // a line outside any conversation has no speaker
+        let loose = json!({"objects": {"y": [line("FX_LOOSE_01", "FXAU_AAAG", 1, 7)]}});
+        assert_eq!(conversation_lines(&[loose])[0].speaker, None);
+        assert!(may_hold_conversations(&crate::names::joaat_exact("Context").to_le_bytes()));
+        assert!(!may_hold_conversations(b"none"));
     }
 
     #[test]

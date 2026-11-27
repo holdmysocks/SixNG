@@ -1,5 +1,6 @@
 //! `sixng dialogue-links`: link subtitles to their speaker and audio stream
-//! from a local address table, checked against the SixNG audio index.
+//! from the game's conversation files and/or a local address table, checked
+//! against the SixNG audio index.
 use crate::scene_dialogue::{read_json, AudioSource, AudioTarget, TextTable};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
@@ -49,15 +50,173 @@ struct Tally {
     rejected: usize,
 }
 
-pub fn generate(ws: &Workspace, addresses: &Path, tables: &[PathBuf], output: &Path) -> Result<Value> {
-    let raw = std::fs::read_to_string(addresses).with_context(|| format!("read {}", addresses.display()))?;
-    let mut lines = raw.lines();
-    let cols = Columns::new(lines.next().context("empty address table")?)?;
-    let rows: Vec<Vec<&str>> = lines.filter(|l| !l.trim().is_empty()).map(|l| l.trim_end_matches('\r').split('\t').collect()).collect();
+/// Links from the conversation files of `archive`: the subtitle key, the
+/// speaker and the wave come from the files; the stream is the one stream
+/// of the archive's audio index with the wave's id.
+fn derive(ws: &Workspace, archive: &str, sources: &mut HashMap<String, Result<AudioSource, String>>, reject: &mut impl FnMut(String, String)) -> Result<(Vec<DialogueLink>, Value)> {
+    let a = ws.resolve(archive)?;
+    let ix = ws.load_index(&a)?;
+    let mut files = Vec::new();
+    for e in ix.entries.iter().filter(|e| e.kind == sixng_core::classify::Kind::Pso) {
+        let Ok(bytes) = sixng_core::scan::read_entry(&a.path, e) else { continue };
+        if !dialogue::may_hold_conversations(&bytes) {
+            continue;
+        }
+        if let Some(p) = sixng_core::pso::parse(&bytes) {
+            files.push(p.to_json());
+        }
+    }
+    let lines = dialogue::conversation_lines(&files);
+    let source = sources.entry(a.id.clone()).or_insert_with(|| AudioSource::open(&ws.work, &a).map_err(|e| format!("{e:#}")));
+    let source = match source {
+        Ok(s) => s,
+        Err(e) => bail!("{e}"),
+    };
+    let (links, audio, speakers) = link_lines(&lines, source, reject);
+    let summary = json!({"archive": a.id, "conversation_files": files.len(), "lines": lines.len(), "audio": audio, "speakers": speakers});
+    Ok((links, summary))
+}
 
-    let mut texts: HashMap<u32, HashSet<String>> = HashMap::new();
+/// Links for conversation lines: each wave's stream, when exactly one
+/// stream of the archive's audio index has its id.
+fn link_lines(lines: &[dialogue::ConversationLine], source: &AudioSource, reject: &mut impl FnMut(String, String)) -> (Vec<DialogueLink>, usize, usize) {
+    let archive = source.index.archive.clone();
+    let mut by_id: HashMap<u32, Vec<(u64, usize)>> = HashMap::new();
+    for b in &source.index.banks {
+        for (i, st) in b.streams.iter().enumerate().filter(|(_, st)| st.layout != "none") {
+            by_id.entry(st.id).or_default().push((b.off, i));
+        }
+    }
+    let mut links = Vec::new();
+    let (mut audio, mut speakers) = (0, 0);
+    for l in lines {
+        let id = dialogue::wave_stream_id(&l.wave);
+        let found = match by_id.get(&id).map(|v| v.as_slice()) {
+            Some(&[(bank_offset, stream_index)]) => {
+                let target = AudioTarget { archive: archive.clone(), bank_offset, stream_index, stream_id: id, stem: None };
+                source.resolve(&target).and_then(|v| Ok(serde_json::from_value::<StreamAddress>(v)?))
+            }
+            Some(_) => Err(anyhow::anyhow!("wave id in several banks")),
+            None => Err(anyhow::anyhow!("wave not in the archive's audio index")),
+        };
+        let audio_link = match found {
+            Ok(address) => {
+                audio += 1;
+                Some(LinkedAudio { address, stem: None, wave: Some(l.wave.clone()) })
+            }
+            Err(e) => {
+                reject(format!("{archive}: {}", l.label), format!("conversation line: {e:#}"));
+                None
+            }
+        };
+        speakers += l.speaker.is_some() as usize;
+        links.push(DialogueLink {
+            subtitle_key: l.subtitle_key,
+            speaker: l.speaker.map(|h| Speaker { label: format!("{h:08x}"), hash: Some(h) }),
+            audio: audio_link,
+            text: None,
+            mission: None,
+            scene: None,
+        });
+    }
+    (links, audio, speakers)
+}
+
+/// Build `dialogue_links.json` from the conversation files of `conversations`
+/// (archives) and from a local address table. A table row for a subtitle
+/// that the conversation files already link is only compared with it.
+pub fn generate(ws: &Workspace, addresses: Option<&Path>, conversations: &[String], tables: &[PathBuf], output: &Path) -> Result<Value> {
+    ensure!(addresses.is_some() || !conversations.is_empty(), "give --addresses, --conversations or both");
+    let archives: HashMap<_, _> = ws.archives().into_iter().map(|a| (a.id.clone(), a)).collect();
+    let mut sources: HashMap<String, Result<AudioSource, String>> = HashMap::new();
+    let mut reasons: BTreeMap<String, (usize, Vec<String>)> = BTreeMap::new();
+    let mut reject = |at: String, why: String| {
+        let e = reasons.entry(why).or_default();
+        e.0 += 1;
+        if e.1.len() < 10 {
+            e.1.push(at);
+        }
+    };
+
+    let mut links = Vec::new();
+    let mut derived = Vec::new();
+    for archive in conversations {
+        let (l, summary) = derive(ws, archive, &mut sources, &mut reject)?;
+        links.extend(l);
+        derived.push(summary);
+    }
+    let derived_keys: HashMap<u32, Vec<usize>> = links.iter().enumerate().fold(HashMap::new(), |mut m, (i, l)| {
+        m.entry(l.subtitle_key).or_default().push(i);
+        m
+    });
+
+    let raw = match addresses {
+        Some(path) => std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?,
+        None => String::new(),
+    };
+    let mut table_lines = raw.lines();
+    let header = table_lines.next();
+    ensure!(addresses.is_none() || header.is_some(), "empty address table");
+    let cols = header.map(Columns::new).transpose()?;
+    let rows: Vec<Vec<&str>> = table_lines.filter(|l| !l.trim().is_empty()).map(|l| l.trim_end_matches('\r').split('\t').collect()).collect();
+
+    let (mut no_key, mut wave_mismatch) = (0, 0);
+    let mut tally: BTreeMap<&str, Tally> = BTreeMap::new();
+    let mut check: BTreeMap<&str, usize> = BTreeMap::new();
+    if let Some(cols) = &cols {
+        for (i, r) in rows.iter().enumerate() {
+            let line = (i + 2).to_string();
+            let Some(subtitle_key) = cols.get(r, "subtitle_key").rsplit('/').next().and_then(hex32) else {
+                no_key += 1;
+                continue;
+            };
+            let status = cols.get(r, "speaker_status");
+            let label = cols.get(r, "character_id");
+            let speaker = (!label.is_empty() && !NO_SPEAKER.contains(&status)).then(|| Speaker { label: label.to_string(), hash: hex32(cols.get(r, "speaker_hash_hex")) });
+
+            let mut audio = None;
+            let archive = cols.get(r, "archive");
+            if !archive.is_empty() {
+                let group = if cols.get(r, "confirmed") == "1" { "confirmed" } else { "unconfirmed" };
+                let resolved = resolve_row(ws, &archives, &mut sources, cols, r, archive);
+                let t = tally.entry(group).or_default();
+                match resolved {
+                    Ok((a, wave_ok)) => {
+                        t.linked += 1;
+                        wave_mismatch += !wave_ok as usize;
+                        audio = Some(a);
+                    }
+                    Err(e) => {
+                        t.rejected += 1;
+                        reject(line, format!("{e:#}"));
+                    }
+                }
+            }
+            if let Some(found) = derived_keys.get(&subtitle_key) {
+                // the conversation files decide; the table only checks them
+                let same_stream = |a: &LinkedAudio| found.iter().any(|&i| links[i].audio.as_ref().is_some_and(|d| d.address.archive == a.address.archive && d.address.bank_offset == a.address.bank_offset && d.address.stream_index == a.address.stream_index));
+                if let Some(a) = &audio {
+                    *check.entry(if same_stream(a) { "audio_agrees" } else { "audio_differs" }).or_default() += 1;
+                }
+                if let Some(h) = speaker.as_ref().and_then(|s| s.hash) {
+                    let ours: Vec<u32> = found.iter().filter_map(|&i| links[i].speaker.as_ref().and_then(|s| s.hash)).collect();
+                    if !ours.is_empty() {
+                        *check.entry(if ours.contains(&h) { "speaker_agrees" } else { "speaker_differs" }).or_default() += 1;
+                    }
+                }
+                continue;
+            }
+            if speaker.is_none() && audio.is_none() {
+                continue;
+            }
+            links.push(DialogueLink { subtitle_key, speaker, audio, text: None, mission: some(cols.get(r, "mission_id")), scene: some(cols.get(r, "scene")) });
+        }
+    }
+    ensure!(!links.is_empty(), "nothing to link");
+
     if !tables.is_empty() {
-        let wanted: HashSet<u32> = rows.iter().filter_map(|r| cols.get(r, "subtitle_key").rsplit('/').next().and_then(hex32)).collect();
+        let wanted: HashSet<u32> = links.iter().map(|l| l.subtitle_key).collect();
+        let mut texts: HashMap<u32, HashSet<String>> = HashMap::new();
         for path in tables {
             let table: TextTable = read_json(path)?;
             for (hash, text) in table.strings {
@@ -67,73 +226,20 @@ pub fn generate(ws: &Workspace, addresses: &Path, tables: &[PathBuf], output: &P
                 }
             }
         }
+        for l in &mut links {
+            l.text = texts.get(&l.subtitle_key).filter(|v| v.len() == 1).and_then(|v| v.iter().next().cloned());
+        }
     }
-
-    let archives: HashMap<_, _> = ws.archives().into_iter().map(|a| (a.id.clone(), a)).collect();
-    let mut sources: HashMap<String, Result<AudioSource, String>> = HashMap::new();
-    let mut links = Vec::new();
-    let mut reasons: BTreeMap<String, (usize, Vec<usize>)> = BTreeMap::new();
-    let mut reject = |line: usize, why: String| {
-        let e = reasons.entry(why).or_default();
-        e.0 += 1;
-        if e.1.len() < 10 {
-            e.1.push(line);
-        }
-    };
-    let (mut no_key, mut speakers, mut with_text, mut wave_mismatch) = (0, 0, 0, 0);
-    let mut tally: BTreeMap<&str, Tally> = BTreeMap::new();
-    for (i, r) in rows.iter().enumerate() {
-        let line = i + 2;
-        let Some(subtitle_key) = cols.get(r, "subtitle_key").rsplit('/').next().and_then(hex32) else {
-            no_key += 1;
-            continue;
-        };
-        let status = cols.get(r, "speaker_status");
-        let label = cols.get(r, "character_id");
-        let speaker = (!label.is_empty() && !NO_SPEAKER.contains(&status)).then(|| Speaker { label: label.to_string(), hash: hex32(cols.get(r, "speaker_hash_hex")) });
-        speakers += speaker.is_some() as usize;
-
-        let mut audio = None;
-        let archive = cols.get(r, "archive");
-        if !archive.is_empty() {
-            let group = if cols.get(r, "confirmed") == "1" { "confirmed" } else { "unconfirmed" };
-            let resolved = resolve_row(ws, &archives, &mut sources, &cols, r, archive);
-            let t = tally.entry(group).or_default();
-            match resolved {
-                Ok((a, wave_ok)) => {
-                    t.linked += 1;
-                    wave_mismatch += !wave_ok as usize;
-                    audio = Some(a);
-                }
-                Err(e) => {
-                    t.rejected += 1;
-                    reject(line, format!("{e:#}"));
-                }
-            }
-        }
-        let text = texts.get(&subtitle_key).filter(|v| v.len() == 1).and_then(|v| v.iter().next().cloned());
-        with_text += text.is_some() as usize;
-        if speaker.is_none() && audio.is_none() {
-            continue;
-        }
-        links.push(DialogueLink {
-            subtitle_key,
-            speaker,
-            audio,
-            text,
-            mission: some(cols.get(r, "mission_id")),
-            scene: some(cols.get(r, "scene")),
-        });
-    }
-    ensure!(!links.is_empty(), "no usable rows in the address table");
     let audio_links = links.iter().filter(|l| l.audio.is_some()).count();
+    let speakers = links.iter().filter(|l| l.speaker.is_some()).count();
+    let with_text = links.iter().filter(|l| l.text.is_some()).count();
     let count = links.len();
     dialogue::save(output, &DialogueLinks { schema_version: dialogue::SCHEMA_VERSION, links })?;
     let tally: BTreeMap<_, _> = tally.into_iter().map(|(k, t)| (k, json!({"linked": t.linked, "rejected": t.rejected}))).collect();
-    let rejected: Vec<Value> = reasons.into_iter().map(|(why, (n, lines))| json!({"reason": why, "rows": n, "first_lines": lines})).collect();
-    Ok(json!({"ok": true, "file": output, "rows": rows.len(), "links": count, "speakers": speakers,
+    let rejected: Vec<Value> = reasons.into_iter().map(|(why, (n, at))| json!({"reason": why, "count": n, "first": at})).collect();
+    Ok(json!({"ok": true, "file": output, "conversations": derived, "rows": rows.len(), "links": count, "speakers": speakers,
         "audio_links": audio_links, "with_text": with_text, "rows_without_subtitle_key": no_key,
-        "wave_names_dropped": wave_mismatch, "audio": tally, "rejected": rejected}))
+        "wave_names_dropped": wave_mismatch, "audio": tally, "table_check": check, "rejected": rejected}))
 }
 
 /// Rebuild a row's audio address from the audio index. Returns the address
@@ -232,7 +338,7 @@ mod tests {
             let table = root.join("en.json");
             std::fs::write(&table, r#"{"strings":{"00000003":"Hello.","00000008":"Who is there?"}}"#)?;
             let out = ws.work.join(dialogue::LINKS_FILE);
-            let summary = generate(&ws, &tsv, &[table], &out)?;
+            let summary = generate(&ws, Some(&tsv), &[], &[table], &out)?;
             assert_eq!(summary["rows"], 7);
             assert_eq!(summary["links"], 5);
             assert_eq!(summary["audio_links"], 2);
@@ -243,6 +349,7 @@ mod tests {
             assert_eq!(summary["audio"]["unconfirmed"]["linked"], 1);
             assert_eq!(summary["audio"]["unconfirmed"]["rejected"], 1);
             assert_eq!(summary["rejected"].as_array().unwrap().len(), 2);
+            assert_eq!(summary["rejected"][0]["count"], 1);
 
             let saved = dialogue::load(&ws.work)?.unwrap();
             let by = saved.by_subtitle();
@@ -262,6 +369,43 @@ mod tests {
             assert!(by[&8][0].audio.is_none());
             assert_eq!(by[&8][0].text.as_deref(), Some("Who is there?"));
             assert_eq!(saved.by_stream("fixture.rpf")[&(4096, 1)][0].subtitle_key, 4);
+            Ok(())
+        })();
+        let cleanup = std::fs::remove_dir_all(&root);
+        result.and_then(|()| Ok(cleanup?))
+    }
+
+    #[test]
+    fn conversation_lines_link_to_their_one_stream() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("sixng-dialogue-conv-{}", std::process::id()));
+        std::fs::create_dir_all(&root)?;
+        let result = (|| {
+            let ws = Workspace::new(root.join("game"), root.join("work"));
+            std::fs::create_dir_all(&ws.game)?;
+            sixng_core::atomic::write(ws.game.join("fixture.rpf"), [0; 8192])?;
+            let one = dialogue::wave_stream_id("FXAU_AAAB_01");
+            let twice = dialogue::wave_stream_id("FXAU_AAAC_01");
+            let index: AudioIndex = serde_json::from_value(json!({
+                "version": audio::INDEX_VERSION, "archive": "fixture.rpf", "archive_size": 8192, "note": "",
+                "banks": [{"off":4096,"size":768,"flags":0,"streams":[[one,48,48000,0,1,4,128,128],[twice,48,48000,0,1,4,256,128]]},
+                          {"off":6144,"size":768,"flags":0,"streams":[[twice,48,48000,0,1,4,128,128]]}]
+            }))?;
+            audio::save_index(&ws.work, &index)?;
+            let a = ws.archives().into_iter().find(|a| a.id == "fixture.rpf").context("fixture archive")?;
+            let source = AudioSource::open(&ws.work, &a)?;
+            let line = |label: &str, wave: &str, speaker| dialogue::ConversationLine {
+                label: label.into(), subtitle_key: sixng_core::meta7a::joaat(label), cue: wave[..wave.len() - 3].into(), variation: 1, wave: wave.into(), speaker };
+            let lines = [line("FX_A_01", "FXAU_AAAB_01", Some(5)), line("FX_B_01", "FXAU_AAAC_01", None), line("FX_C_01", "FXAU_AAAD_01", Some(5))];
+            let mut rejected = Vec::new();
+            let (links, audio_links, speakers) = link_lines(&lines, &source, &mut |at, why| rejected.push((at, why)));
+            assert_eq!((links.len(), audio_links, speakers), (3, 1, 2));
+            let a0 = links[0].audio.as_ref().unwrap();
+            assert_eq!((a0.address.bank_offset, a0.address.stream_index, a0.address.data_offset), (4096, 0, 4224));
+            assert_eq!(a0.wave.as_deref(), Some("FXAU_AAAB_01"));
+            assert_eq!(links[0].speaker, Some(Speaker { label: "00000005".into(), hash: Some(5) }));
+            assert!(links[1].audio.is_none() && links[2].audio.is_none());
+            assert_eq!(rejected.len(), 2);
+            assert!(rejected[0].1.contains("several banks") && rejected[1].1.contains("not in"));
             Ok(())
         })();
         let cleanup = std::fs::remove_dir_all(&root);

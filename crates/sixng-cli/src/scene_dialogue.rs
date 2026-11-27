@@ -39,8 +39,8 @@ pub(crate) struct TextTable {
 }
 
 pub(crate) struct AudioSource {
-    archive: ArchiveInfo,
-    index: AudioIndex,
+    pub(crate) archive: ArchiveInfo,
+    pub(crate) index: AudioIndex,
     banks: HashMap<u64, usize>,
 }
 
