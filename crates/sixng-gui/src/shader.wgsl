@@ -23,7 +23,7 @@ struct Frame {
 
 struct Mat {
     base: vec4<f32>,
-    flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask, bit 12 = an emissive shader of another class (lit by its emissive map), bit 13 = the packed map is a vehicle material map, bit 14 = the emissive slot holds the part ramp image with the parts' surfaces
+    flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask, bit 12 = an emissive shader of another class (lit by its emissive map), bit 13 = the packed map is a vehicle material map, bit 14 = the emissive slot holds the part ramp image with the parts' surfaces, bit 5 = the packed map is ped skin's spec map (green = roughness) with the specular factor x 100 in bits 16-23
     tile: vec4<f32>,      // fabric detail tile: x UV scale, y rotation, z mean grey value, w bound
     emis: vec4<f32>,      // x emissive scale of the material (from the GLB's emissive strength), yzw the light's colour
     strand: vec4<f32>,    // x a strand piece's width factor this frame (stored over drawn strands; 1 otherwise)
@@ -1655,6 +1655,13 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         mat_blend = mm.rg;
         ao = mm.b;
         ao_direct = ao;
+    } else if ((has & 4u) != 0u && (M.flags.w & 32u) != 0u) {
+        // ped skin's spec map (`speculartex`): green is roughness, no metal,
+        // as the game's studio skin program reads it (GGX alpha = roughness
+        // squared). Red (translucency) and blue (occlusion) feed only its
+        // deferred lighting pass, which is not decoded.
+        rough = clamp(textureSample(t_pk, samp, i.uv0).g, 0.04, 1.0);
+        metal = 0.0;
     } else if ((has & 4u) != 0u && F.mode.y < 3u) {
         let p = textureSample(t_pk, samp, i.uv0);
         if (F.mode.y == 0u) { rough = p.r; metal = p.g; ao = p.b; }
@@ -2147,6 +2154,11 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     let k = (rough + 1.0) * (rough + 1.0) / 8.0;
     let G = (ndl / (ndl * (1.0 - k) + k)) * (ndv / (ndv * (1.0 - k) + k));
     var f0 = mix(vec3(0.04), albedo, metal);
+    // ped skin: the game's F0 = 0.04 x (1 + fresnel), the material's specular
+    // factor x 100 in bits 16-23
+    if ((M.flags.w & 32u) != 0u && (M.flags.w & 256u) == 0u) {
+        f0 = vec3(0.04 * f32((M.flags.w >> 16u) & 255u) / 100.0);
+    }
     // Thin film (pearlescent paint): light mirrored at the top and at the
     // bottom of a film interferes, so the colour of the mirror image turns
     // with the viewing angle. The thickness is taken as micrometres. Only

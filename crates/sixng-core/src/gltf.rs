@@ -403,6 +403,12 @@ pub fn mesh_glb_with(name: &str, groups: &[NodeGroup], materials: &[Material], s
                     }
                 }
             }
+            // {"uri": …} metallic-roughness map (skin spec maps).
+            if let Some(uri) = mat["pbrMetallicRoughness"]["metallicRoughnessTexture"]["uri"].as_str().map(|u| u.to_string()) {
+                images.push(json!({"uri": uri}));
+                textures.push(json!({"source": images.len() - 1}));
+                mat["pbrMetallicRoughness"]["metallicRoughnessTexture"] = json!({"index": textures.len() - 1});
+            }
             // "emissiveTexture": "base" = light with the base-colour texture;
             // {"uri": …} = the material's own emissive map. With neither
             // texture nothing lights up (a flat white glow would be wrong).
