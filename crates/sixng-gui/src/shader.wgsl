@@ -881,6 +881,7 @@ struct VIn {
     @location(12) extra: vec4<f32>, // x skinned, y highlight, z tint code, w unused
     @location(13) tint: vec4<f32>,  // model tint palette colour (linear; white = none)
     @location(14) zone: vec4<u32>,  // x sticker zone, y model of an assembled vehicle
+    @location(15) uv23: vec4<f32>,  // third and fourth UV sets (stickers the game's livery layouts place)
     @builtin(vertex_index) vi: u32,
 };
 
@@ -900,6 +901,8 @@ struct VOut {
     @location(9) @interpolate(flat) zone: vec2<u32>,
     // a strand ribbon's own dither seed (a hash of its point), so overlapping strands keep different samples
     @location(10) @interpolate(flat) seed: u32,
+    // third and fourth UV sets
+    @location(11) uv23: vec4<f32>,
 };
 
 fn skin_matrix(v: VIn) -> mat4x4<f32> {
@@ -981,6 +984,7 @@ fn mesh_vertex(v: VIn) -> VOut {
     o.tan = vec4((m * vec4(v.tan.xyz, 0.0)).xyz, edge);
     o.uv0 = v.uv0;
     o.uv1 = uv1;
+    o.uv23 = v.uv23;
     o.col = v.col;
     o.extra = v.extra;
     // w: -1 on a mirrored instance (right-hand wheels): its triangles wind
@@ -1702,6 +1706,8 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         let dy0 = dpdy(i.uv0);
         let dx1 = dpdx(i.uv1);
         let dy1 = dpdy(i.uv1);
+        let dx23 = dpdx(i.uv23);
+        let dy23 = dpdy(i.uv23);
         let zb = i.zone.x & 255u;
         for (var k = 1u; k <= st_n; k++) {
             let fl = ST[k].flags;
@@ -1715,6 +1721,8 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             var dx = dx0;
             var dy = dy0;
             if (fl.z == 1u) { uv = i.uv1; dx = dx1; dy = dy1; }
+            else if (fl.z == 2u) { uv = i.uv23.xy; dx = dx23.xy; dy = dy23.xy; }
+            else if (fl.z == 3u) { uv = i.uv23.zw; dx = dx23.zw; dy = dy23.zw; }
             let p = vec2(dot(m.xy, uv), dot(m.zw, uv)) + o.xy;
             if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0) { continue; }
             let gx = vec2(dot(m.xy, dx), dot(m.zw, dx));

@@ -677,7 +677,7 @@ fn library(game_root: &Path, work: &Path) -> Result<Library> {
             for o in dump(PART_REF) {
                 // by member hash: `data` is not among the built-in field names, so
                 // by name these read only with the name dictionary loaded
-                if let (Some(n), Some(5), Some(p)) = (num(&o, NAME), get(&o, REF_TYPE).and_then(|t| t["tag"].as_u64()), num(&o, REF_DATA)) {
+                if let (Some(n), Some(5), Some(p)) = (num(&o, NAME), get(&o, REF_TYPE).and_then(|t| t.as_u64().or_else(|| t["tag"].as_u64())), num(&o, REF_DATA)) {
                     l.refs.insert(n as u32, p as u32);
                 }
             }
