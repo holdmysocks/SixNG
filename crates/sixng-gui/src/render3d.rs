@@ -739,6 +739,8 @@ pub struct Renderer3D {
     gd_bufs: Option<(wgpu::Buffer, wgpu::Buffer)>,
     /// Off: every model draws the old way (the map's A/B switch).
     pub gd_on: bool,
+    /// Shadow cascades on the path too (SIXNG_MAP_GPU_DRAWS=noshadow: the old way).
+    gd_shadows: bool,
     /// Last frame: sub-draws, indirect calls, instances copied, models drawn the old way.
     pub gd_stats: [u32; 4],
 }
@@ -1830,6 +1832,7 @@ impl Renderer3D {
             gd_pipes,
             gd_bufs: None,
             gd_on: true,
+            gd_shadows: std::env::var("SIXNG_MAP_GPU_DRAWS").map_or(true, |v| v != "noshadow"),
             gd_stats: [0; 4],
             shadow,
             shadow_bgs,
@@ -3135,7 +3138,7 @@ impl Renderer3D {
         if !self.gd_on || look.mode != 0 {
             return None;
         }
-        let plan = self.shadow_plan(cam, look, aspect);
+        let plan = self.shadow_plan(cam, look, aspect).filter(|_| self.gd_shadows);
         // (page, stencil, chunk): a page is the costly thing to set (wgpu tracks
         // each of its views every time), so each is set once per pass
         type Key = (usize, u32, usize);
@@ -3382,6 +3385,7 @@ impl Renderer3D {
             return;
         };
         // the models the GPU-driven lists do not draw
+        let gd = gd.filter(|_| self.gd_shadows);
         let models = gd.map_or(models, |f| &f.rest[..]);
         for i in 0..CASCADES {
             if !due[i] {
