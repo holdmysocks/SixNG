@@ -708,11 +708,15 @@ pub struct Options {
     /// Also export the inland water surfaces ([`inland_tiles`]); scans
     /// every map file of levels.rpf.
     pub inland: bool,
+    /// Also export pools, hot tubs, fountains, standing water and the other
+    /// small water bodies ([`pool_surfaces`]); scans every map file of
+    /// levels.rpf.
+    pub pools: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { fog_px: 32, height_px: 128, shore_px: 32, height_tiles: false, inland: false }
+        Options { fog_px: 32, height_px: 128, shore_px: 32, height_tiles: false, inland: false, pools: false }
     }
 }
 
@@ -1125,6 +1129,8 @@ pub fn export(ws: &crate::export::Workspace, out: Option<&std::path::Path>, o: &
     let height_check = hm.as_ref().map(|m| check_heights(&hgt, m));
     let inland = if o.inland { Some(inland_tiles(ws)?) } else { None };
     let inland_check = inland.as_ref().map(|t| check_inland(t, &hgt));
+    let pools = if o.pools { Some(pool_surfaces(ws)?) } else { None };
+    let pools_check = pools.as_ref().map(|(p, _)| check_pools(p, &hgt));
 
     let mut rep = json!({
         "grids": grids.iter().map(|(s, g)| { let mut j = g.to_json(); j["source"] = json!(s); j }).collect::<Vec<_>>(),
@@ -1240,6 +1246,9 @@ pub fn export(ws: &crate::export::Workspace, out: Option<&std::path::Path>, o: &
     write_json(&dir.join("shore/cells.json"), &sr)?;
     if let (Some(t), Some(c)) = (&inland, &inland_check) {
         rep["inland"] = write_inland(&dir.join("inland"), t, c, crate::ttpf::global(&ws.game))?;
+    }
+    if let (Some((p, unplaced)), Some(c)) = (&pools, &pools_check) {
+        rep["pools"] = write_pools(&dir.join("pools"), p, unplaced, c)?;
     }
     rep["out"] = json!(dir);
     Ok(summary(&rep))
@@ -1383,6 +1392,51 @@ fn height_texture_check(t: &InlandTile, set: &crate::ttpf::TtpfSet) -> Option<(f
     Some((hr, json!({"samples": err.len(), "median_error_m": at(0.5), "p95_error_m": at(0.95), "median_value": median_value, "wet_texel_share": wet})))
 }
 
+/// A drawable's LOD 0 mesh placed in world space.
+struct PlacedMesh {
+    positions: Vec<[f32; 3]>,
+    indices: Vec<u32>,
+    /// UV0 per vertex ([0, 0] where the mesh has none).
+    uvs: Vec<[f32; 2]>,
+    /// Indices drawn per shader.
+    used: std::collections::BTreeMap<u16, usize>,
+}
+
+/// The LOD 0 geometries of a drawable whose shader passes `keep` (all of
+/// them when it has no model table), placed by an entity at `p` with
+/// rotation `q` and scale (xy, z).
+fn placed_mesh(r: &crate::resource::Resource, p: [f32; 3], q: [f32; 4], sc: [f32; 2], keep: impl Fn(u16) -> bool) -> PlacedMesh {
+    let bufs = crate::drawable::find_buffers(r);
+    let geoms = crate::drawable::find_geometries(r, &bufs);
+    // LOD 0 geometries and the shader each draws with
+    let lod0: std::collections::HashMap<usize, u16> = crate::drawable::find_models(r, &geoms).iter().filter(|m| m.lod == 0 && !m.part).flat_map(|m| m.geometries.iter().copied().zip(m.shader_indices.iter().copied())).collect();
+    let mut out = PlacedMesh { positions: Vec::new(), indices: Vec::new(), uvs: Vec::new(), used: Default::default() };
+    let slice = |i: usize| {
+        let b = &bufs[i];
+        let end = (b.gfx_off + b.bytes).min(r.gfx.len() as u64) as usize;
+        &r.gfx[(b.gfx_off as usize).min(end)..end]
+    };
+    for (gi, g) in geoms.iter().enumerate() {
+        if !lod0.is_empty() && !lod0.get(&gi).is_some_and(|&si| keep(si)) {
+            continue;
+        }
+        let Some(h) = bufs[g.vertex_buffer].mesh_blob.as_ref() else { continue };
+        let m = crate::drawable::decode_mesh(slice(g.vertex_buffer), h, slice(g.index_buffer));
+        if let Some(&si) = lod0.get(&gi) {
+            *out.used.entry(si).or_default() += m.indices.len();
+        }
+        let uv0 = m.uvs.iter().find(|(slot, _)| *slot == 3).map(|(_, u)| u.as_slice()).unwrap_or(&[]);
+        out.uvs.extend((0..m.positions.len()).map(|i| uv0.get(i).copied().unwrap_or([0.0, 0.0])));
+        let base = out.positions.len() as u32;
+        out.indices.extend(m.indices.iter().map(|i| i + base));
+        out.positions.extend(m.positions.iter().map(|v| {
+            let w = crate::lights::rotate(q, [v[0] * sc[0], v[1] * sc[0], v[2] * sc[1]]);
+            [w[0] + p[0], w[1] + p[1], w[2] + p[2]]
+        }));
+    }
+    out
+}
+
 /// Every inland water surface placed on the map: the drawables of
 /// levels.rpf whose name gives an [`inland_kind`], placed by the map files'
 /// entities (not interior or group-local ones). Each is a tile of at most
@@ -1416,36 +1470,8 @@ pub fn inland_tiles(ws: &crate::export::Workspace) -> Result<Vec<InlandTile>> {
         .filter_map(|(arch, p, q, sc, file)| {
             let (name, kind, e) = &water[&arch];
             let r = crate::resource::Resource::load(&lv.path, e).ok()?;
-            let bufs = crate::drawable::find_buffers(&r);
-            let geoms = crate::drawable::find_geometries(&r, &bufs);
-            // LOD 0 geometries and the shader each draws with
-            let lod0: std::collections::HashMap<usize, u16> = crate::drawable::find_models(&r, &geoms).iter().filter(|m| m.lod == 0 && !m.part).flat_map(|m| m.geometries.iter().copied().zip(m.shader_indices.iter().copied())).collect();
-            let mut used: std::collections::BTreeMap<u16, usize> = Default::default();
-            let slice = |i: usize| {
-                let b = &bufs[i];
-                let end = (b.gfx_off + b.bytes).min(r.gfx.len() as u64) as usize;
-                &r.gfx[(b.gfx_off as usize).min(end)..end]
-            };
-            let (mut positions, mut indices, mut uvs) = (Vec::new(), Vec::new(), Vec::new());
-            for (gi, g) in geoms.iter().enumerate() {
-                if !lod0.is_empty() && !lod0.contains_key(&gi) {
-                    continue;
-                }
-                let Some(h) = bufs[g.vertex_buffer].mesh_blob.as_ref() else { continue };
-                let m = crate::drawable::decode_mesh(slice(g.vertex_buffer), h, slice(g.index_buffer));
-                if let Some(&si) = lod0.get(&gi) {
-                    *used.entry(si).or_default() += m.indices.len();
-                }
-                let uv0 = m.uvs.iter().find(|(slot, _)| *slot == 3).map(|(_, u)| u.as_slice()).unwrap_or(&[]);
-                uvs.extend((0..m.positions.len()).map(|i| uv0.get(i).copied().unwrap_or([0.0, 0.0])));
-                let base = positions.len() as u32;
-                indices.extend(m.indices.iter().map(|i| i + base));
-                positions.extend(m.positions.iter().map(|v| {
-                    let w = crate::lights::rotate(q, [v[0] * sc[0], v[1] * sc[0], v[2] * sc[1]]);
-                    [w[0] + p[0], w[1] + p[1], w[2] + p[2]]
-                }));
-            }
             let shaders = crate::drawable::find_shaders(&r);
+            let PlacedMesh { positions, indices, mut uvs, used } = placed_mesh(&r, p, q, sc, |_| true);
             // the shader drawing most triangles (the first one without a model table)
             let si = used.iter().max_by_key(|(_, n)| **n).map_or(0, |(i, _)| *i as usize);
             let sh = shaders.get(si);
@@ -1499,6 +1525,241 @@ pub fn check_inland(tiles: &[InlandTile], hgt: &Layer) -> Value {
         })
         .collect();
     json!({"method": "height map sampled on a 9 x 9 grid over each tile's box; surface = median vertex height", "kinds": kinds})
+}
+
+/// Kinds of small water body, from the drawable name (first match wins).
+pub const POOL_KINDS: &[(&str, &[&str])] = &[
+    ("hot tub", &["hottub", "hot_tub", "jacuzzi", "_spa_"]),
+    ("waterfall", &["waterfall"]),
+    ("fountain", &["fountain", "water_feature", "spout"]),
+    ("water effect", &["vfx_water"]),
+    ("standing water", &["standing_water", "puddle"]),
+    ("tank", &["tank_water"]),
+    ("ditch", &["ditch"]),
+    ("pond", &["pond"]),
+    ("pool", &["pool"]),
+    ("other water", &["water"]),
+];
+
+/// The kind of a small water body drawable from its name, or None for
+/// names that are not one: inland surfaces ([`inland_kind`]), LOD models,
+/// the pause-menu map tiles, water plants, scum and splash decals.
+pub fn pool_kind(name: &str) -> Option<&'static str> {
+    let n = name.to_ascii_lowercase();
+    if inland_kind(&n).is_some() || ["lod", "maptile_", "waterveg", "scum", "decal", "toilet", "tubes"].iter().any(|x| n.contains(x)) {
+        return None;
+    }
+    POOL_KINDS.iter().find(|(_, keys)| keys.iter().any(|k| n.contains(k))).map(|(k, _)| *k)
+}
+
+/// A water shader: the water surface, fountain and waterfall effects, or
+/// any shader whose render bucket is the water one (flag byte 4, 0x40).
+fn is_water_shader(s: &crate::drawable::Shader) -> bool {
+    ["7f3a6aa9", "97596162", "735d2de6"].contains(&s.name_hash.as_str()) || s.flags.get(4).is_some_and(|b| b & 0x40 != 0)
+}
+
+/// One placed small water body: the LOD 0 geometry of its water shaders,
+/// in world space.
+pub struct PoolSurface {
+    pub name: String,
+    pub kind: &'static str,
+    pub map_file: String,
+    pub position: [f32; 3],
+    pub rotation: [f32; 4],
+    pub scale: [f32; 2],
+    pub positions: Vec<[f32; 3]>,
+    pub indices: Vec<u32>,
+    pub uvs: Vec<[f32; 2]>,
+    /// The water shaders it draws with, most triangles first.
+    pub shaders: Vec<String>,
+}
+
+impl PoolSurface {
+    fn bbox(&self) -> [[f32; 3]; 2] {
+        let mut b = [[f32::MAX; 3], [f32::MIN; 3]];
+        for v in &self.positions {
+            for c in 0..3 {
+                b[0][c] = b[0][c].min(v[c]);
+                b[1][c] = b[1][c].max(v[c]);
+            }
+        }
+        b
+    }
+
+    /// Median vertex height: the surface.
+    fn surface_z(&self) -> f32 {
+        let mut z: Vec<f32> = self.positions.iter().map(|v| v[2]).collect();
+        z.sort_by(f32::total_cmp);
+        z.get(z.len() / 2).copied().unwrap_or(0.0)
+    }
+
+    /// Area of the triangles seen from above, m².
+    fn area(&self) -> f32 {
+        self.indices
+            .chunks(3)
+            .filter(|t| t.len() == 3)
+            .map(|t| {
+                let (a, b, c) = (self.positions[t[0] as usize], self.positions[t[1] as usize], self.positions[t[2] as usize]);
+                ((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1])).abs() / 2.0
+            })
+            .sum()
+    }
+}
+
+/// Number of named drawables per kind that no map file places outside an
+/// interior.
+pub type Unplaced = std::collections::BTreeMap<&'static str, usize>;
+
+/// Every pool, hot tub, fountain, waterfall, standing water and other small
+/// water body placed on the map by levels.rpf's map files (not interiors):
+/// drawables picked by [`pool_kind`], kept when a LOD 0 geometry draws with a
+/// water shader, and only those geometries.
+pub fn pool_surfaces(ws: &crate::export::Workspace) -> Result<(Vec<PoolSurface>, Unplaced)> {
+    use rayon::prelude::*;
+    let lv = ws.resolve("levels")?;
+    let ix = ws.load_index(&lv)?;
+    let mut cand: std::collections::HashMap<u32, (String, &'static str, &crate::scan::Entry)> = std::collections::HashMap::new();
+    for e in &ix.entries {
+        if let (Some(n), Some("dr")) = (&e.name, e.rtype.as_deref()) {
+            if let Some(k) = pool_kind(n) {
+                cand.insert(crate::meta7a::joaat(n), (n.clone(), k, e));
+            }
+        }
+    }
+    let metas: Vec<&crate::scan::Entry> = ix.entries.iter().filter(|e| e.sub == "7a").collect();
+    let scans = crate::export::scan_meta(&lv, &metas, false, std::sync::Arc::new(|_: &str, _: u64, _: u64| {}));
+    let mut placed = Vec::new();
+    for s in scans.iter().filter(|s| !s.group) {
+        for (i, &(arch, p, q, sxy, sz)) in s.ents.iter().enumerate() {
+            if !s.interior.contains(&i) && cand.contains_key(&arch) {
+                placed.push((arch, p, q, [sxy, sz], s.id.clone()));
+            }
+        }
+    }
+    let seen: std::collections::HashSet<u32> = placed.iter().map(|x| x.0).collect();
+    let mut unplaced = Unplaced::new();
+    for (h, (_, k, _)) in &cand {
+        if !seen.contains(h) {
+            *unplaced.entry(*k).or_default() += 1;
+        }
+    }
+    // each drawable is read once; its water shaders decide what is kept
+    type Loaded = Option<(crate::resource::Resource, Vec<crate::drawable::Shader>)>;
+    let loaded: std::collections::HashMap<u32, Loaded> = seen
+        .par_iter()
+        .map(|&h| {
+            let r = crate::resource::Resource::load(&lv.path, cand[&h].2).ok().map(|r| {
+                let sh = crate::drawable::find_shaders(&r);
+                (r, sh)
+            });
+            (h, r.filter(|(_, sh)| sh.iter().any(is_water_shader)))
+        })
+        .collect();
+    let mut out: Vec<PoolSurface> = placed
+        .into_par_iter()
+        .filter_map(|(arch, p, q, sc, file)| {
+            let (r, shaders) = loaded.get(&arch)?.as_ref()?;
+            let (name, kind, _) = &cand[&arch];
+            let PlacedMesh { positions, indices, mut uvs, used } = placed_mesh(r, p, q, sc, |si| shaders.get(si as usize).is_some_and(is_water_shader));
+            if indices.is_empty() {
+                return None;
+            }
+            if uvs.iter().all(|u| *u == [0.0, 0.0]) {
+                uvs.clear();
+            }
+            let mut by: Vec<(u16, usize)> = used.into_iter().collect();
+            by.sort_by(|a, b| b.1.cmp(&a.1));
+            let mut names: Vec<String> = Vec::new();
+            for s in by.iter().filter_map(|(si, _)| shaders.get(*si as usize)) {
+                let n = crate::names::shader(&s.name_hash).unwrap_or_else(|| s.name_hash.clone());
+                if !names.contains(&n) {
+                    names.push(n);
+                }
+            }
+            Some(PoolSurface { name: name.clone(), kind, map_file: file, position: p, rotation: q, scale: sc, positions, indices, uvs, shaders: names })
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name).then(a.map_file.cmp(&b.map_file)));
+    Ok((out, unplaced))
+}
+
+/// The water height map under each small water body: the median of the
+/// ground under its vertices.
+pub fn check_pools(pools: &[PoolSurface], hgt: &Layer) -> Vec<Option<f32>> {
+    let (m, _) = hgt.mosaic();
+    let b = hgt.grid.world_box();
+    let mpt = hgt.grid.tile / hgt.px as f32;
+    let ground = |x: f32, y: f32| -> Option<f32> {
+        let (c, r) = (((x - b[0]) / mpt).floor(), ((b[3] - y) / mpt).floor());
+        (c >= 0.0 && r >= 0.0 && (c as usize) < m.w && (r as usize) < m.h).then(|| height_m(m.at(c as usize, r as usize, 0)))
+    };
+    pools
+        .iter()
+        .map(|p| {
+            let mut g: Vec<f32> = p.positions.iter().filter_map(|v| ground(v[0], v[1])).collect();
+            g.sort_by(f32::total_cmp);
+            g.get(g.len() / 2).copied()
+        })
+        .collect()
+}
+
+/// `pools/pools.json` and `pools/pools.glb` (one node per kind, one
+/// primitive per placement, world space).
+fn write_pools(dir: &std::path::Path, pools: &[PoolSurface], unplaced: &Unplaced, ground: &[Option<f32>]) -> Result<Value> {
+    use crate::gltf::{Material, NodeGroup, TriPrim};
+    std::fs::create_dir_all(dir)?;
+    let pct = |mut v: Vec<f32>| -> Value {
+        v.sort_by(f32::total_cmp);
+        let at = |q: f32| v.get(((v.len().max(1) - 1) as f32 * q) as usize).copied();
+        json!({"p5": at(0.05), "median": at(0.5), "p95": at(0.95)})
+    };
+    let mut kinds: std::collections::BTreeMap<&str, Vec<usize>> = Default::default();
+    for (i, p) in pools.iter().enumerate() {
+        kinds.entry(p.kind).or_default().push(i);
+    }
+    let mut shaders: std::collections::BTreeMap<&str, usize> = Default::default();
+    for p in pools {
+        for s in &p.shaders {
+            *shaders.entry(s.as_str()).or_default() += 1;
+        }
+    }
+    let per_kind: serde_json::Map<String, Value> = kinds
+        .iter()
+        .map(|(k, ix)| {
+            let names: std::collections::HashSet<&str> = ix.iter().map(|&i| pools[i].name.as_str()).collect();
+            let above: Vec<f32> = ix.iter().filter_map(|&i| ground[i].map(|g| pools[i].surface_z() - g)).collect();
+            (k.to_string(), json!({"placements": ix.len(), "drawables": names.len(), "area_m2": pct(ix.iter().map(|&i| pools[i].area()).collect()),
+                "surface_above_ground_m": pct(above), "named_but_not_placed_outside_interiors": unplaced.get(k).copied().unwrap_or(0)}))
+        })
+        .collect();
+    let rows: Vec<Value> = pools
+        .iter()
+        .zip(ground)
+        .map(|(p, g)| json!({"name": p.name, "kind": p.kind, "map_file": p.map_file, "position": p.position, "rotation_world": p.rotation, "scale_xy_z": p.scale,
+            "bbox": p.bbox(), "surface_z": p.surface_z(), "area_m2": p.area(), "ground_under_median": g, "shaders": p.shaders,
+            "triangles": p.indices.len() / 3, "vertices": p.positions.len(), "uv0": !p.uvs.is_empty()}))
+        .collect();
+    let mut mats = Vec::new();
+    let mut groups = Vec::new();
+    for (k, ix) in &kinds {
+        mats.push(Material { name: k.to_string(), base_color_uri: None, normal_uri: None,
+            gltf: json!({"pbrMetallicRoughness": {"baseColorFactor": [0.2, 0.55, 0.75, 0.7], "metallicFactor": 0.0, "roughnessFactor": 0.05}, "alphaMode": "BLEND"}), extras: json!({"kind": k}) });
+        let mi = mats.len() - 1;
+        let prims = ix.iter().map(|&i| &pools[i]).map(|p| TriPrim {
+            name: p.name.clone(), positions: p.positions.clone(), normals: None, tangents: None, uvs: if p.uvs.is_empty() { vec![] } else { vec![p.uvs.clone()] },
+            colors: None, colors1: None, regions: None, tint: None, indices: p.indices.clone(), material: Some(mi),
+            joints: None, weights: None, joints1: None, weights1: None,
+        }).collect();
+        groups.push(NodeGroup { name: k.to_string(), prims });
+    }
+    crate::atomic::write(&dir.join("pools.glb"), crate::gltf::mesh_glb("pools", &groups, &mats, &[], json!({"coordinates": "world space"})))?;
+    let rep = json!({"placements": pools.len(), "drawables": pools.iter().map(|p| p.name.as_str()).collect::<std::collections::HashSet<_>>().len(), "kinds": per_kind, "shaders": shaders});
+    write_json(&dir.join("pools.json"), &json!({
+        "about": "Pools, hot tubs, fountains, waterfalls, standing water and other small water bodies placed by the map files of levels.rpf (not interiors): the LOD 0 geometry drawn with a water shader, in world space. Kinds come from the drawable names; 'water effect' is spray and splash meshes (vfx_water), not a surface.",
+        "coordinates": "RAGE world space, Z-up, metres; pools.glb is the same geometry in glTF Y-up (x, z, -y)",
+        "ground": "ground_under_median: the water height map under the vertices (median); surface_z: median vertex height",
+        "summary": rep, "pools": rows}))?;
+    Ok(rep)
 }
 
 /// `inland/inland.json` and `inland/inland.glb` (one node per kind, one
@@ -1601,6 +1862,23 @@ fn summary(rep: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_kinds_from_names() {
+        assert_eq!(pool_kind("nb_11_pool_water_01"), Some("pool"));
+        assert_eq!(pool_kind("nb_01_pool_water_16_hottub"), Some("hot tub"));
+        assert_eq!(pool_kind("lo_lr4_01_standing_water_26"), Some("standing water"));
+        assert_eq!(pool_kind("vi_01_am_e_fountain_e_cln"), Some("fountain"));
+        assert_eq!(pool_kind("ab_01_vfx_waterfall_02"), Some("waterfall"));
+        assert_eq!(pool_kind("vi_03_vfx_water_04"), Some("water effect"));
+        assert_eq!(pool_kind("fh_01_irrigditch_02_water"), Some("ditch"));
+        // inland surfaces, map tiles, plants and decals are not small water bodies
+        assert_eq!(pool_kind("lo_rvr_01_water_lo_rvr_01a"), None);
+        assert_eq!(pool_kind("maptile_3d01_water_std"), None);
+        assert_eq!(pool_kind("n10_w05_13_waterveg"), None);
+        assert_eq!(pool_kind("nb_13_vfx_water_decal_01"), None);
+        assert_eq!(pool_kind("lo_cnl_01_water_pool_d_slod"), None);
+    }
 
     #[test]
     fn inland_kinds_from_names() {
