@@ -4577,9 +4577,17 @@ impl ModelView {
                 ren.set_joints(rs, g, &skin);
             }
         }
-        // a character's hair, brows and beard ride on the head bone
+        // a character's hair, brows and beard ride on the head bone, scaled
+        // as the body shape scales the head (`head_shape`: how it moves
+        // BM_Head, which the scalp and the ponytail root hang from)
         if let Some(l) = self.loaded.as_ref().filter(|l| l.look.is_some()) {
             let head = l.model.joints.iter().position(|j| j.name == "SKEL_Head").and_then(|i| skin.get(i)).copied().unwrap_or(Mat4::IDENTITY);
+            let shaped = l.model.extras["head_shape"].as_array().filter(|a| a.len() == 16).map(|a| {
+                let mut c = [0f32; 16];
+                c.iter_mut().zip(a).for_each(|(c, v)| *c = v.as_f64().unwrap_or(0.0) as f32);
+                Mat4::from_cols_array(&c)
+            });
+            let head = shaped.map_or(head, |s| head * s);
             if self.hair_head != Some(head) || self.hair.gpu.len() != self.hair_head_n {
                 for g in self.hair.gpu.iter_mut() {
                     ren.set_instances(rs, g, &[crate::render3d::Instance::new(head, false)]);
@@ -5562,11 +5570,19 @@ fn load_parts(
     let shape = if fx.is_empty() { NEUTRAL_BODY } else { *BODY_SHAPE.lock().unwrap() };
     let mut posed: HashMap<u64, anyhow::Result<(glb::Model, Vec<PathBuf>, serde_json::Value)>> = HashMap::new();
     let mut field: Vec<([f32; 3], [f32; 3])> = Vec::new();
+    // how the shape moves BM_Head (head scale): head accessories and the
+    // strand hair follow it, not the skin offsets around them
+    let mut head_shape: Option<glam::Mat4> = None;
     if shape != NEUTRAL_BODY {
         for e in parts {
             let Some(f) = fx.get(&e.off).filter(|f| f.skeletal) else { continue };
             let mut r = export_load_shaped(a, e, cache, lod, &f.skins, &f.decorations, shape);
             if let Ok((m, _, _)) = &mut r {
+                if f.head || head_shape.is_none() {
+                    if let Some(s) = joint_skin(m, "BM_Head").filter(|s| !s.abs_diff_eq(glam::Mat4::IDENTITY, 1e-5)) {
+                        head_shape = Some(s);
+                    }
+                }
                 let before: Vec<[f32; 3]> = m.meshes.iter().flat_map(|me| me.verts.iter().map(|v| v.pos)).collect();
                 apply_pose(m);
                 if f.body || f.head {
@@ -5598,7 +5614,9 @@ fn load_parts(
                 if let Some(f) = f {
                     if !f.skeletal {
                         attached = place_attached(&mut m);
-                        if let Some(w) = &wrap {
+                        if let Some(s) = head_shape.filter(|_| on_head(&m)) {
+                            transform_part(&mut m, s);
+                        } else if let Some(w) = &wrap {
                             pre = Some(m.meshes.iter().map(|me| me.verts.iter().map(|v| v.pos).collect()).collect());
                             w.apply(&mut m);
                         }
@@ -5816,6 +5834,9 @@ fn load_parts(
         if rig_character(m, &rig_parts, &skin_meshes) {
             notes.push("Rig: every part is bound to the shared skeleton, so the Pose controls move the body with its clothes. A part's own helper bones follow the body bone they hang from (the game drives them with data that is not decoded), and the first four of a vertex's eight bone weights are used, so joints bend more simply than in the game.".to_string());
         }
+    }
+    if let (Some(m), Some(s)) = (&mut model, head_shape) {
+        m.extras["head_shape"] = serde_json::json!(s.to_cols_array());
     }
     if coloured > 0 {
         notes.push(format!("Clothing colours: {coloured} part(s) coloured from the outfit data: the item's garment preset with its fabric (weave under the colour gradient, then the trim and wash layers, baked into the garment's texture; one per sub-material, picked by the garment's materialid texture, or by the part number in its vertex colour where it has none), else the item's stored colour, else row tint 0 of its tint palette (for the generic palette only when it agrees with the item's colour tag), else the colour tag itself (one of 18 words such as navy or khaki, shown in a plain shade of ours). Second and third tints are not applied."));
@@ -7450,6 +7471,72 @@ fn apply_pose(m: &mut glb::Model) {
             sum += Vec3::from(v.pos);
             lo = lo.min(Vec3::from(v.pos));
             hi = hi.max(Vec3::from(v.pos));
+        }
+        me.centre = (sum / me.verts.len().max(1) as f32).to_array();
+    }
+    if lo.x <= hi.x {
+        m.bbox = [lo.to_array(), hi.to_array()];
+    }
+}
+
+/// Skin matrix (posed world * inverse bind) of a joint by name: how the
+/// pose a part's GLB stores moves that bone. `None` without that joint.
+fn joint_skin(m: &glb::Model, name: &str) -> Option<glam::Mat4> {
+    use glam::Mat4;
+    let i = m.joints.iter().position(|j| j.name == name)?;
+    let mut w = Mat4::from_cols_array(&m.joints[i].local);
+    let (mut k, mut depth) = (i, 0);
+    while let Some(p) = m.joints[k].parent.filter(|&p| p < m.joints.len() && p != k && depth < 256) {
+        w = Mat4::from_cols_array(&m.joints[p].local) * w;
+        k = p;
+        depth += 1;
+    }
+    Some(w * Mat4::from_cols_array(&m.joints[i].ibm))
+}
+
+/// Whether every bone a part's vertices use hangs under `SKEL_Head` (an
+/// earring, glasses): such a part follows the head's own shaping.
+fn on_head(m: &glb::Model) -> bool {
+    let under = |mut i: usize| {
+        for _ in 0..256 {
+            if m.joints[i].name == "SKEL_Head" {
+                return true;
+            }
+            match m.joints[i].parent.filter(|&p| p < m.joints.len() && p != i) {
+                Some(p) => i = p,
+                None => return false,
+            }
+        }
+        false
+    };
+    let mut any = false;
+    for v in m.meshes.iter().filter(|me| me.skinned).flat_map(|me| &me.verts) {
+        for k in 0..4 {
+            if v.weights[k] > 0 {
+                let j = v.joints[k] as usize;
+                if j >= m.joints.len() || !under(j) {
+                    return false;
+                }
+                any = true;
+            }
+        }
+    }
+    any
+}
+
+/// Move a part rigidly by a matrix (positions, normals, centres, bounds).
+fn transform_part(m: &mut glb::Model, s: glam::Mat4) {
+    use glam::Vec3;
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for me in &mut m.meshes {
+        let mut sum = Vec3::ZERO;
+        for v in &mut me.verts {
+            let p = s.transform_point3(Vec3::from(v.pos));
+            v.pos = p.to_array();
+            v.nrm = s.transform_vector3(Vec3::from(v.nrm)).normalize_or_zero().to_array();
+            sum += p;
+            lo = lo.min(p);
+            hi = hi.max(p);
         }
         me.centre = (sum / me.verts.len().max(1) as f32).to_array();
     }
