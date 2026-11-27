@@ -348,6 +348,8 @@ pub struct Map3D {
     pub world_tau: f32,
     /// Visible building placements per 128 m cell: (wanted, loaded).
     bld_ready: HashMap<(i32, i32), (u32, u32)>,
+    /// Frame of the last draw log (SIXNG_MAP_DRAWLOG).
+    draw_log_frame: u64,
     /// Models in range (on screen or not): kept loaded, not evicted first.
     keep: HashSet<u32>,
     last_fwd: Vec3,
@@ -626,6 +628,7 @@ impl Map3D {
             world: World::new(Path::new(work).join("map")),
             world_tau: 2.5,
             bld_ready: HashMap::new(),
+            draw_log_frame: 0,
             keep: HashSet::new(),
             last_fwd: Vec3::Z,
             tri_budget: 20_000_000,
@@ -3572,6 +3575,7 @@ impl Map3D {
             let line = format!("{line} | gpu ms/frame sky|shadows|main|post {}", crate::gpu_time::take_line());
             let line = format!("{line} | draws {} (shadow {}) | {} ({} placements) | {} fallbacks ({:?} draws, by level unlinked/linked {:?}) | wait: terrain idle {}, keep missing {}{}, inflight {}", self.stats.draws, self.renderer.as_ref().map_or(0, |r| r.shadow_draws), self.cells.summary(), self.stats.in_cells, self.stats.n_fb, self.renderer.as_ref().map_or([0, 0], |r| r.fb_draws), self.stats.fb_lvl, self.world.idle(), self.keep.iter().filter(|m| !self.cache.contains_key(m)).count(), if self.stats.capped { " (model cap full)" } else { "" }, self.stats.inflight);
             eprintln!("{line}");
+            self.draw_log();
         }
         if self.perf.near_s.is_none()
             && self.frame > 5
@@ -4015,6 +4019,58 @@ impl Map3D {
             miss / tot
         } else {
             0.0
+        }
+    }
+
+    /// SIXNG_MAP_DRAWLOG=1: with each tick line, the models with the most
+    /// draw calls per frame (main pass, then shadow pass) since the last
+    /// tick: name, draws, meshes, instances.
+    fn draw_log(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("SIXNG_MAP_DRAWLOG").is_ok_and(|v| v != "0")) {
+            return;
+        }
+        let frames = (self.frame - std::mem::replace(&mut self.draw_log_frame, self.frame)).max(1) as f32;
+        let Some(data) = self.data.clone() else {
+            return;
+        };
+        let mut rows: Vec<(u32, [u32; 2], usize, u32)> = self
+            .cache
+            .iter()
+            .filter_map(|(&m, s)| match s {
+                Slot::Ready { gm, .. } => Some((
+                    m,
+                    [gm.drawn[0].swap(0, Relaxed), gm.drawn[1].swap(0, Relaxed)],
+                    gm.meshes.len(),
+                    gm.n_instances,
+                )),
+                _ => None,
+            })
+            .collect();
+        for (k, what) in ["main", "shadow"].iter().enumerate() {
+            let total: u32 = rows.iter().map(|r| r.1[k]).sum();
+            rows.sort_by(|a, b| b.1[k].cmp(&a.1[k]));
+            let top: Vec<String> = rows
+                .iter()
+                .take(10)
+                .filter(|r| r.1[k] > 0)
+                .map(|r| {
+                    format!(
+                        "{} {:.0} ({} meshes, {} inst)",
+                        data.name(r.0),
+                        r.1[k] as f32 / frames,
+                        r.2,
+                        r.3
+                    )
+                })
+                .collect();
+            let models = rows.iter().filter(|r| r.1[k] > 0).count();
+            eprintln!(
+                "[map3d] draws {what}: {:.0}/frame over {models} models; top: {}",
+                total as f32 / frames,
+                top.join("; ")
+            );
         }
     }
 

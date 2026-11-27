@@ -476,7 +476,9 @@ struct Target {
 }
 
 pub struct GpuMesh {
-    /// Vertex and index data: byte ranges of buffers shared by the model's meshes.
+    /// Vertex and index data: byte ranges of buffers shared by the model's
+    /// meshes. The indices address the whole vertex buffer (draw with base
+    /// vertex 0 and the whole buffer bound).
     pub vb: wgpu::Buffer,
     pub ib: wgpu::Buffer,
     pub vb_range: std::ops::Range<u64>,
@@ -527,6 +529,9 @@ pub struct GpuModel {
     pub stencil: u32,
     /// Material names and shaders (inspection).
     pub mat_names: Vec<String>,
+    /// Draw calls recorded for this model (main, shadow), summed until the
+    /// map's draw log takes them.
+    pub drawn: [std::sync::atomic::AtomicU32; 2],
 }
 
 impl GpuModel {
@@ -586,6 +591,10 @@ impl GpuMesh {
     }
     pub fn islice(&self) -> wgpu::BufferSlice<'_> {
         self.ib.slice(self.ib_range.clone())
+    }
+    /// First index of this mesh in the shared index buffer.
+    pub fn first(&self) -> u32 {
+        (self.ib_range.start / 4) as u32
     }
     /// GPU bytes of this mesh's vertices and indices.
     pub fn bytes(&self) -> u64 {
@@ -2245,7 +2254,11 @@ impl Uploader {
             let (mut vo, mut io) = (0u64, 0u64);
             for me in &m.meshes {
                 let vbytes: &[u8] = bytemuck::cast_slice(&me.verts);
-                let ibytes: &[u8] = bytemuck::cast_slice(&me.indices);
+                // indices point into the whole shared vertex buffer (no base
+                // vertex), so neighbouring meshes can be drawn as one range
+                let v0 = (vo / vsz) as u32;
+                let abs: Vec<u32> = me.indices.iter().map(|&i| i + v0).collect();
+                let ibytes: &[u8] = bytemuck::cast_slice(&abs);
                 vmap.slice(vo as usize..vo as usize + vbytes.len())
                     .copy_from_slice(vbytes);
                 imap.slice(io as usize..io as usize + ibytes.len())
@@ -2318,6 +2331,7 @@ impl Uploader {
                 .iter()
                 .map(|mt| format!("{} [{}] {}", mt.name, mt.shader_hash, mt.class))
                 .collect(),
+            drawn: Default::default(),
         }
     }
 }
@@ -2660,11 +2674,10 @@ impl Renderer3D {
                     be.set_index_buffer(me.ib.slice(..), wgpu::IndexFormat::Uint32);
                     bound = Some(&me.vb);
                 }
-                let first = (me.ib_range.start / 4) as u32;
-                let base = (me.vb_range.start / std::mem::size_of::<glb::Vertex>() as u64) as i32;
+                let first = me.first();
                 let cnt = if me.strand_lod.is_some() { if eye { &me.n_draw } else { &me.n_shadow }.load(std::sync::atomic::Ordering::Relaxed).min(me.n_idx) } else { me.n_idx };
                 if cnt > 0 {
-                    be.draw_indexed(first..first + cnt, base, 0..gm.n_normal());
+                    be.draw_indexed(first..first + cnt, 0, 0..gm.n_normal());
                 }
             }
         }
@@ -2747,6 +2760,9 @@ impl Renderer3D {
             // validate: that is most of the CPU cost of a frame)
             let mut bound: Option<&wgpu::Buffer> = None;
             let mut mat = usize::MAX;
+            // pending run of indices: neighbouring meshes with the same
+            // material and buffers are one draw
+            let mut run: Option<std::ops::Range<u32>> = None;
             for me in gm.meshes.iter().filter(|m| m.visible && m.n_idx > 0) {
                 let blend = gm.mat_alpha[me.material] == 2
                     || matches!(gm.mat_class[me.material], 5 | 6 | 8);
@@ -2755,6 +2771,22 @@ impl Renderer3D {
                 }
                 if decal_bias && gm.mat_decal[me.material].is_some() {
                     continue;
+                }
+                // strand hair: the first strands the game's count rule keeps at this distance
+                let cnt = if me.strand_lod.is_some() { me.n_draw.load(std::sync::atomic::Ordering::Relaxed).min(me.n_idx) } else { me.n_idx };
+                if cnt == 0 {
+                    continue;
+                }
+                let first = me.first();
+                if let Some(r) = &mut run {
+                    if mat == me.material && bound == Some(&me.vb) && r.end == first && me.strand_lod.is_none() {
+                        r.end = first + cnt;
+                        continue;
+                    }
+                    be.draw_indexed(r.clone(), 0, range.clone());
+                    n += 1;
+                    gm.drawn[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    run = None;
                 }
                 if mat != me.material {
                     be.set_bind_group(1, Some(&gm.mat_bg[me.material]), &[]);
@@ -2765,15 +2797,18 @@ impl Renderer3D {
                     be.set_index_buffer(me.ib.slice(..), wgpu::IndexFormat::Uint32);
                     bound = Some(&me.vb);
                 }
-                let first = (me.ib_range.start / 4) as u32;
-                let base = (me.vb_range.start / std::mem::size_of::<glb::Vertex>() as u64) as i32;
-                // strand hair: the first strands the game's count rule keeps at this distance
-                let cnt = if me.strand_lod.is_some() { me.n_draw.load(std::sync::atomic::Ordering::Relaxed).min(me.n_idx) } else { me.n_idx };
-                if cnt == 0 {
-                    continue;
+                if me.strand_lod.is_some() {
+                    be.draw_indexed(first..first + cnt, 0, range.clone());
+                    n += 1;
+                    gm.drawn[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    run = Some(first..first + cnt);
                 }
-                be.draw_indexed(first..first + cnt, base, range.clone());
+            }
+            if let Some(r) = run {
+                be.draw_indexed(r, 0, range.clone());
                 n += 1;
+                gm.drawn[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
         n
@@ -2807,26 +2842,62 @@ impl Renderer3D {
             }
             be.set_vertex_buffer(1, Some(gm.instances.slice(..)));
             let mut bound: Option<&wgpu::Buffer> = None;
-            let mut mat = usize::MAX;
+            // the material bound now, and whether it is cut out
+            let mut mat: Option<(usize, bool)> = None;
+            // solid surfaces read the material only for its cut-out flag, so
+            // neighbouring solid meshes are one draw whatever their material
+            let mut run: Option<std::ops::Range<u32>> = None;
             for me in gm.meshes.iter().filter(|m| m.visible && m.n_idx > 0) {
                 let see_through = gm.mat_alpha[me.material] == 2
                     || matches!(gm.mat_class[me.material], 5 | 6 | 8);
                 if see_through || gm.mat_decal[me.material].is_some() {
                     continue;
                 }
-                if mat != me.material {
+                let cut = gm.mat_alpha[me.material] == 1;
+                let first = me.first();
+                if let Some(r) = &mut run {
+                    if !cut && bound == Some(&me.vb) && r.end == first {
+                        r.end = first + me.n_idx;
+                        continue;
+                    }
+                    be.draw_indexed(r.clone(), 0, range.clone());
+                    n += 1;
+                    gm.drawn[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    run = None;
+                }
+                // a cut-out mesh needs its own material, a solid one any
+                // solid material
+                let rebind = match mat {
+                    None => true,
+                    Some((m, c)) => {
+                        if cut {
+                            m != me.material
+                        } else {
+                            c
+                        }
+                    }
+                };
+                if rebind {
                     be.set_bind_group(1, Some(&gm.mat_bg[me.material]), &[]);
-                    mat = me.material;
+                    mat = Some((me.material, cut));
                 }
                 if bound != Some(&me.vb) {
                     be.set_vertex_buffer(0, Some(me.vb.slice(..)));
                     be.set_index_buffer(me.ib.slice(..), wgpu::IndexFormat::Uint32);
                     bound = Some(&me.vb);
                 }
-                let first = (me.ib_range.start / 4) as u32;
-                let base = (me.vb_range.start / std::mem::size_of::<glb::Vertex>() as u64) as i32;
-                be.draw_indexed(first..first + me.n_idx, base, range.clone());
+                if cut {
+                    be.draw_indexed(first..first + me.n_idx, 0, range.clone());
+                    n += 1;
+                    gm.drawn[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    run = Some(first..first + me.n_idx);
+                }
+            }
+            if let Some(r) = run {
+                be.draw_indexed(r, 0, range.clone());
                 n += 1;
+                gm.drawn[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
         n
@@ -3337,7 +3408,7 @@ impl Renderer3D {
                     pass.set_bind_group(0, &gm.frame_bg, &[]);
                     pass.set_vertex_buffer(1, gm.instances.slice(..));
                     pass.set_bind_group(1, &gm.mat_bg[me.material], &[]);
-                    pass.set_vertex_buffer(0, me.vslice());
+                    pass.set_vertex_buffer(0, me.vb.slice(..));
                     pass.set_index_buffer(me.islice(), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..me.n_idx, 0, 0..gm.n_normal());
                     draws += 1;
@@ -3390,7 +3461,7 @@ impl Renderer3D {
                     pass.set_bind_group(0, &gm.frame_bg, &[]);
                     pass.set_vertex_buffer(1, gm.instances.slice(..));
                     pass.set_bind_group(1, &gm.mat_bg[me.material], &[]);
-                    pass.set_vertex_buffer(0, me.vslice());
+                    pass.set_vertex_buffer(0, me.vb.slice(..));
                     pass.set_index_buffer(me.islice(), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..me.n_idx, 0, 0..gm.n_normal());
                     draws += 1;
