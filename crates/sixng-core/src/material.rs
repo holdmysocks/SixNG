@@ -117,6 +117,13 @@ pub const SHADER_SLOTS: &[(&str, &str, &str)] = &[
     // colour toward a wear ramp, scales metalness by 1 - wear, moves roughness
     // toward a block value); G modulates gloss. Metalness comes from another map.
     ("e68a4a98", "739e3d0d", "wear overlay amount (R) and gloss modulation (G), linear; not a metal mask"),
+    // ped skin (`ped_standard_skin`, `ped_standard_lod_skin`): the two spec
+    // maps of the wardrobe material asset (see `skinspec`). Not RMA; what the
+    // skin program does with each channel is not decoded.
+    ("210fbc6a", "c6f46e79", "skin spec map (speculartex) from the wardrobe material asset, linear; not roughness/metal/AO, channel use not decoded"),
+    ("210fbc6a", "739e3d0d", "skin detail spec map (speculartex2) from the wardrobe material asset, linear: R detail mask, G smooth field, B 0; channel use not decoded"),
+    ("8d69edab", "c6f46e79", "skin spec map (speculartex) from the wardrobe material asset, linear; not roughness/metal/AO, channel use not decoded"),
+    ("8d69edab", "739e3d0d", "skin detail spec map (speculartex2) from the wardrobe material asset, linear: R detail mask, G smooth field, B 0; channel use not decoded"),
 ];
 
 /// Slot role for a slot as one shader uses it, else the generic role.
