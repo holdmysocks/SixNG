@@ -283,10 +283,11 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
             None => unresolved.push(format!("{what}: model {} not found", e["model"].as_str().unwrap_or("?"))),
         }
     };
-    // (rims, tyres, brake discs and calipers are named by model: they go
-    // on the wheels, not on a bone)
-    let hex_name = |p: &str| p.len() == 8 && p.bytes().all(|b| b.is_ascii_hexdigit());
-    for p in part_names.iter().filter(|p| hex_name(p)) {
+    // Every part the vehicle has as a mod, by its name or its hash: a part
+    // whose name is known (`rhode_outboard`) is a mod like an unnamed one.
+    // Rims, tyres, brake discs and calipers are named by model and are not
+    // mods; they go on the wheels, not on a bone.
+    for p in part_names.iter() {
         let Some(m) = mods.get(&part_hash(p)) else { continue };
         let slot = m["slot"].as_str().unwrap_or("");
         // (brake slots: fitted at the wheels, per axle)
@@ -531,7 +532,6 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
         let part = |prefix: &str| part_names.iter().find(|p| p.starts_with(prefix)).map(|p| p.to_ascii_lowercase());
         let slot_models: Vec<(u32, String)> = part_names
             .iter()
-            .filter(|p| hex_name(p))
             .filter_map(|p| mods.get(&part_hash(p)))
             .filter_map(|m| {
                 let slot = hex32(&m["slot"]).filter(|s| BRAKE_SLOTS.contains(s) || RIM_LIGHT_SLOTS.contains(s))?;
