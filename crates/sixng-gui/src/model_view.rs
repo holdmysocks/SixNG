@@ -354,7 +354,7 @@ pub struct HairPick {
 /// coloured: its own colour or stored colours, or the same as another piece.
 #[derive(Clone, Debug)]
 pub struct HairPiece {
-    /// The item slot (alternative hair styles count as "hair").
+    /// The item slot (alternatives count as their piece: "other hair" as "hair").
     pub slot: String,
     /// Coloured as this other piece (which has its own colour); None: its own.
     pub link: Option<String>,
@@ -363,9 +363,10 @@ pub struct HairPiece {
     pub stored: bool,
 }
 
-/// The piece a hair item's slot belongs to.
+/// The piece a hair item's slot belongs to: an alternative ("other hair",
+/// "other beard") is coloured with its piece.
 fn piece_slot(slot: &str) -> &str {
-    if slot == "other hair" { "hair" } else { slot }
+    slot.strip_prefix("other ").unwrap_or(slot)
 }
 
 /// The hair colour of one hair item as the viewer draws it: the preset of
