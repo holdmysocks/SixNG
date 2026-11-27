@@ -750,6 +750,11 @@ enum Cmd {
         /// inland/inland.glb. Scans every map file of levels.rpf.
         #[arg(long)]
         inland: bool,
+        /// Also export pools, hot tubs, fountains, waterfalls, standing water
+        /// and other small water bodies placed in world space: pools/pools.json
+        /// and pools/pools.glb. Scans every map file of levels.rpf.
+        #[arg(long)]
+        pools: bool,
         #[arg(long, short)]
         out: Option<PathBuf>,
     },
@@ -2979,13 +2984,13 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             out.print(&json!({"ok": true, "result": res}));
         }
-        Cmd::Water { fog_px, height_px, shore_px, height_tiles, inland, out: po } => {
+        Cmd::Water { fog_px, height_px, shore_px, height_tiles, inland, pools, out: po } => {
             for (n, v, max) in [("--fog-px", *fog_px, 128), ("--height-px", *height_px, 512), ("--shore-px", *shore_px, 256)] {
                 if v == 0 || max % v != 0 {
                     anyhow::bail!("{n} {v}: must divide {max}");
                 }
             }
-            let o = sixng_core::water::Options { fog_px: *fog_px, height_px: *height_px, shore_px: *shore_px, height_tiles: *height_tiles, inland: *inland };
+            let o = sixng_core::water::Options { fog_px: *fog_px, height_px: *height_px, shore_px: *shore_px, height_tiles: *height_tiles, inland: *inland, pools: *pools };
             let r = sixng_core::water::export(&ws, po.as_deref(), &o)?;
             out.print(&json!({"ok": true, "result": r}));
         }
