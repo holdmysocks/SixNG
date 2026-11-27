@@ -712,11 +712,13 @@ pub struct Options {
     /// small water bodies ([`pool_surfaces`]); scans every map file of
     /// levels.rpf.
     pub pools: bool,
+    /// Also export the water textures bound at run time ([`DETAIL_TEXTURES`]).
+    pub detail: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { fog_px: 32, height_px: 128, shore_px: 32, height_tiles: false, inland: false, pools: false }
+        Options { fog_px: 32, height_px: 128, shore_px: 32, height_tiles: false, inland: false, pools: false, detail: false }
     }
 }
 
@@ -1250,6 +1252,9 @@ pub fn export(ws: &crate::export::Workspace, out: Option<&std::path::Path>, o: &
     if let (Some((p, unplaced)), Some(c)) = (&pools, &pools_check) {
         rep["pools"] = write_pools(&dir.join("pools"), p, unplaced, c)?;
     }
+    if o.detail {
+        rep["detail"] = write_detail(ws, &dir.join("detail"))?;
+    }
     rep["out"] = json!(dir);
     Ok(summary(&rep))
 }
@@ -1708,6 +1713,98 @@ pub fn pool_surfaces(ws: &crate::export::Workspace) -> Result<(Vec<PoolSurface>,
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name).then(a.map_file.cmp(&b.map_file)));
     Ok((out, unplaced))
+}
+
+/// Water textures in the global dictionaries, which the game probably binds
+/// at run time (the water drawables carry 4×4 placeholders for their detail
+/// slots): archive, texture name, what it is for. The uses come from the names and the content, not
+/// from shader code.
+pub const DETAIL_TEXTURES: &[(&str, &str, &str)] = &[
+    ("textures", "waterbump", "tiling water surface bump; data in green and alpha only"),
+    ("textures", "waternoise", "tiling water noise; data in green and alpha only"),
+    ("textures", "waterfoam", "tiling surface foam"),
+    ("textures", "bubblefoam", "tiling bubble foam"),
+    ("textures", "water_foam_height", "foam height"),
+    ("textures", "caustic", "underwater caustics"),
+    ("textures", "rainrippleuvoffset", "rain ripple UV offsets"),
+    ("textures", "ocean_sim_gaussian_noise", "gaussian noise seeding the ocean wave simulation (R32 float)"),
+    ("textures", "shore_wave_pixel_profile", "shore wave profile, per pixel"),
+    ("textures", "shore_wave_vertex_profile", "shore wave profile, per vertex"),
+    ("textures", "shore_wave_wavefront_profiles", "shore wave wavefront profiles"),
+    ("textures", "underwaterfog", "map-wide underwater fog (512 x 1056)"),
+    ("textures", "onoffshorewind", "map-wide onshore and offshore wind"),
+    ("textures", "puddle_control", "map-wide puddle control"),
+    ("textures", "puddle_layout", "tiling puddle layout"),
+    ("textures", "puddle_layout1", "tiling puddle layout"),
+    ("levels", "water_quality_control", "map-wide water quality (512 x 1056)"),
+    ("levels", "ocean_wetness_control", "map-wide ocean wetness"),
+    ("levels", "ocean_wave_control", "map-wide ocean wave strength (1024 x 2112)"),
+    ("levels", "ocean_roughness_control", "map-wide ocean roughness"),
+    ("levels", "mean_sea_level", "map-wide mean sea level (R16)"),
+];
+
+/// Every texture dictionary of an archive that holds one of `names`,
+/// whatever the index calls it (the index names a dictionary after one of
+/// its textures). Stored order.
+fn dicts_holding(archive: &std::path::Path, entries: &[crate::scan::Entry], names: &[&str]) -> Vec<(Dict, crate::scan::Entry)> {
+    use rayon::prelude::*;
+    let mut out: Vec<(Dict, crate::scan::Entry)> = entries
+        .par_iter()
+        // the height tiles are many and hold nothing else
+        .filter(|e| e.rtype.as_deref() == Some("txd") && e.name.as_deref() != Some("watersystemheightmap"))
+        .filter_map(|e| {
+            let r = Resource::load_sys(archive, e).ok()?;
+            let textures: Vec<TexInfo> = texture::find_textures(&r).into_iter().filter(|t| names.iter().any(|w| t.name.eq_ignore_ascii_case(w))).collect();
+            (!textures.is_empty()).then(|| (Dict { entry: e.id.clone(), off: e.off, textures }, e.clone()))
+        })
+        .collect();
+    out.sort_by_key(|d| d.0.off);
+    out
+}
+
+/// `detail/`: each of [`DETAIL_TEXTURES`] as an 8-bit RGBA PNG preview and
+/// a DDS of the stored mip 0, plus `detail/detail.json`.
+fn write_detail(ws: &crate::export::Workspace, dir: &std::path::Path) -> Result<Value> {
+    std::fs::create_dir_all(dir)?;
+    let mut rows = Vec::new();
+    for archive in ["textures", "levels"] {
+        let a = ws.resolve(archive)?;
+        let ix = ws.load_index(&a)?;
+        let names: Vec<&str> = DETAIL_TEXTURES.iter().filter(|d| d.0 == archive).map(|d| d.1).collect();
+        let dicts = dicts_holding(&a.path, &ix.entries, &names);
+        for &(_, name, about) in DETAIL_TEXTURES.iter().filter(|d| d.0 == archive) {
+            let Some((e, t)) = find_tex(&dicts, name) else {
+                rows.push(json!({"name": name, "archive": archive, "about": about, "error": "not found"}));
+                continue;
+            };
+            let copies = dicts.iter().filter(|(d, _)| d.tex(name).is_some()).count();
+            let res = (|| -> Result<Value> {
+                let r = Resource::load(&a.path, e)?;
+                let (fmt, lin) = texture::mip0_linear(&r, t, false)?;
+                let rgba = texture::to_rgba(fmt, &lin, t.width, t.height)?;
+                texture::save_png(&dir.join(format!("{name}.png")), &rgba, t.width, t.height)?;
+                texture::save_dds(&dir.join(format!("{name}.dds")), t, fmt, &lin)?;
+                Ok(json!({"png": format!("{name}.png"), "dds": format!("{name}.dds")}))
+            })();
+            let mut row = json!({"name": name, "archive": archive, "dictionary": e.id, "about": about, "width": t.width, "height": t.height,
+                "format": t.format, "mips_stored": t.mips, "swizzle": t.swizzle, "dictionaries_holding_it": copies});
+            match res {
+                Ok(v) => {
+                    row["png"] = v["png"].clone();
+                    row["dds"] = v["dds"].clone();
+                }
+                Err(err) => row["error"] = json!(format!("{err:#}")),
+            }
+            rows.push(row);
+        }
+    }
+    let written = rows.iter().filter(|r| r.get("png").is_some()).count();
+    write_json(&dir.join("detail.json"), &json!({
+        "about": "Water textures in the global dictionaries, probably bound at run time; the water drawables carry 4x4 placeholders for their detail slots. Uses come from the texture names and content.",
+        "png": "8-bit RGBA preview of mip 0 (float and 16-bit formats clamped to 0..1)",
+        "dds": "mip 0 as stored, untiled, DX10 header",
+        "textures": rows}))?;
+    Ok(json!({"textures": rows.len(), "written": written}))
 }
 
 /// The water height map under each small water body: the median of the
