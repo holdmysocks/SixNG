@@ -1316,7 +1316,7 @@ pub struct InlandTile {
     /// Store hashes of its flow texture and water height texture.
     pub flow: Option<u64>,
     pub height_tex: Option<u64>,
-    /// The tile's texture in the unnamed slot `e0548ad3` (BC7).
+    /// The tile's surface map (`watersurfacemaptexture`, BC7).
     pub tile_tex: Option<u64>,
 }
 
@@ -1365,8 +1365,8 @@ fn shader_json(s: &crate::drawable::Shader, set: &crate::ttpf::TtpfSet) -> Value
 /// height (0.5 on a flat tile), and 0 marks texels without water. Checked
 /// by sampling the texture under every surface vertex (nearest texel,
 /// texels of 0 skipped). Returns (H, check).
-/// The unnamed shader slot of the per-tile BC7 texture.
-const TILE_TEX_PARAM: &str = "e0548ad3";
+/// The shader slot of the per-tile BC7 texture (hash e0548ad3).
+const TILE_TEX_PARAM: &str = "watersurfacemaptexture";
 
 fn height_texture_check(t: &InlandTile, set: &crate::ttpf::TtpfSet) -> Option<(f32, Value)> {
     let (store, tx) = set.get(t.height_tex?)?;
@@ -2104,7 +2104,7 @@ fn write_inland(dir: &std::path::Path, tiles: &[InlandTile], check: &Value, set:
             json!({"name": t.name, "kind": kind_name(t.kind), "kind_code": t.kind, "map_file": t.map_file,
                 "position": t.position, "rotation_world": t.rotation, "scale_xy_z": t.scale, "bbox": t.bbox(),
                 "surface_z": z[2], "z_percentiles_0_5_50_95_100": z, "triangles": t.indices.len() / 3, "vertices": t.positions.len(),
-                "shading": {"shader": t.shader["shader"], "flow_texture": tex_json(t.flow), "water_height_texture": tex_json(t.height_tex), "tile_texture_e0548ad3": tex_json(t.tile_tex),
+                "shading": {"shader": t.shader["shader"], "flow_texture": tex_json(t.flow), "water_height_texture": tex_json(t.height_tex), "surface_map_texture": tex_json(t.tile_tex),
                     "water_height_scale_m": hc.as_ref().map(|h| h.0), "water_height_check": hc.as_ref().map(|h| h.1.clone()),
                     "ripple_scale": t.shader["constants"]["ripplescale"], "ripple_bumpiness": t.shader["constants"]["ripplebumpiness"], "uv0": !t.uvs.is_empty()},
                 "shader": t.shader})
@@ -2137,8 +2137,8 @@ fn write_inland(dir: &std::path::Path, tiles: &[InlandTile], check: &Value, set:
     write_json(&dir.join("inland.json"), &json!({
         "about": "Inland water surfaces (rivers, canals, creeks, reservoirs, ponds): the map's water drawables placed in world space, LOD 0. One tile per placement, at most 64 m across.",
         "coordinates": "RAGE world space, Z-up, metres; inland.glb is the same geometry in glTF Y-up (x, z, -y)",
-        "shading": "Every tile draws with the water_micro_geom shader. Its flow texture (BC3: flow direction in red and green around 128; 4 x 4 placeholder on still tiles) and water height texture (R16 float, 0 to 1: surface height = origin z + (2 v - 1) * water_height_scale_m, where the scale is the largest distance of a surface vertex from the origin's height; 0.5 on flat tiles; 0 where there is no water, a mask that covers the mesh and reaches a little under the banks) cover the tile's 64 m square: on the surface vertices UV0 is world x / 64 and -world y / 64 (u east, v south). Skirt vertices below the surface carry other UVs. `shader` lists every texture and constant of the shader; hex keys are parameter names not yet known.",
-        "tile_texture_e0548ad3": "BC7, the tile's 64 m square like the flow texture, usually 256 x 256 (4 x 4 placeholder on 6 tiles). Alpha is the mesh footprint, green the part where the surface lies above the ground (visible water), and red and blue rise with flow speed (probably foam or turbulence). The slot name is not known.",
+        "shading": "Every tile draws with the water_micro_geom shader. Its flow texture (BC3: flow direction in red and green around 128; 4 x 4 placeholder on still tiles) and water height texture (R16 float, 0 to 1: surface height = origin z + (2 v - 1) * water_height_scale_m, where the scale is the largest distance of a surface vertex from the origin's height; 0.5 on flat tiles; 0 where there is no water, a mask that covers the mesh and reaches a little under the banks) cover the tile's 64 m square: on the surface vertices UV0 is world x / 64 and -world y / 64 (u east, v south). Skirt vertices below the surface carry other UVs. `shader` lists every texture and constant of the shader; hex keys are parameter names not yet known. The flags useflowmap, useheighttexture and usesurfacemap hold the integer 1, which reads as 1.4e-45 as a float.",
+        "surface_map_texture": "watersurfacemaptexture (BC7), the tile's 64 m square like the flow texture, usually 256 x 256 (4 x 4 placeholder on 6 tiles). Alpha is the mesh footprint, green the part where the surface lies above the ground (visible water), and red and blue rise with flow speed (probably foam or turbulence). The constant usesurfacemap is 1 on every tile except the 6 placeholders, like useflowmap and useheighttexture.",
         "summary": rep, "tiles": rows}))?;
     Ok(rep)
 }
