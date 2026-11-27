@@ -14,8 +14,8 @@ use metal_rust::metal::{
     TextureUsage,
 };
 use metal_rust::metal4::{
-    ArgumentTable, ArgumentTableDescriptor, BlendState, BufferImageLayout, CommandQueue,
-    CommandAllocator, CompilerDescriptor, LibraryDescriptor, LibraryFunctionDescriptor,
+    ArgumentTable, ArgumentTableDescriptor, BlendState, BufferImageLayout, CommandAllocator,
+    CommandQueue, CompilerDescriptor, LibraryDescriptor, LibraryFunctionDescriptor,
     RecordingRenderEncoder,
     RenderPassDescriptor, RenderPipelineBuildDescriptor, RenderPipelineColorAttachmentDescriptor,
     RenderPipelineDescriptor, SubmittedCommandBuffers, TextureOriginSelection,
@@ -855,6 +855,28 @@ const MESH_SHADER: &str = r#"
     }
 "#;
 
+const MSAA_SAMPLE_COUNTS: [usize; 5] = [1, 2, 4, 8, 16];
+
+fn msaa_sample_count(level: u8) -> usize {
+    MSAA_SAMPLE_COUNTS[level.min(4) as usize]
+}
+
+fn supported_msaa_sample_count(device: &Device, level: u8) -> usize {
+    let requested = msaa_sample_count(level);
+    [16, 8, 4, 2, 1]
+        .into_iter()
+        .find(|&count| count <= requested && device.supports_texture_sample_count(count))
+        .unwrap_or(1)
+}
+
+fn effective_msaa_sample_count(temporal_upscaling: bool, requested_samples: usize) -> usize {
+    if temporal_upscaling {
+        1
+    } else {
+        requested_samples.max(1)
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex4 {
@@ -1169,12 +1191,14 @@ fn function_descriptor(
 fn create_mesh_pipeline(
     compiler: &metal_rust::metal4::Compiler,
     library: &Library,
+    sample_count: usize,
 ) -> anyhow::Result<metal_rust::metal::RenderPipelineState> {
     let vertex = function_descriptor(library, "mesh_vertex")?;
     let fragment = function_descriptor(library, "mesh_fragment")?;
     let descriptor = RenderPipelineDescriptor::new()?;
     descriptor.set_vertex_function_descriptor(Some(&vertex))?;
     descriptor.set_fragment_function_descriptor(Some(&fragment))?;
+    descriptor.set_raster_sample_count(sample_count)?;
 
     let color = RenderPipelineColorAttachmentDescriptor::new()?;
     color.set_pixel_format(PixelFormat::RGBA8_UNORM_SRGB)?;
@@ -1199,12 +1223,14 @@ fn create_mesh_pipeline(
 fn create_temporal_mesh_pipeline(
     compiler: &metal_rust::metal4::Compiler,
     library: &Library,
+    sample_count: usize,
 ) -> anyhow::Result<metal_rust::metal::RenderPipelineState> {
     let vertex = function_descriptor(library, "mesh_vertex")?;
     let fragment = function_descriptor(library, "temporal_mesh_fragment")?;
     let descriptor = RenderPipelineDescriptor::new()?;
     descriptor.set_vertex_function_descriptor(Some(&vertex))?;
     descriptor.set_fragment_function_descriptor(Some(&fragment))?;
+    descriptor.set_raster_sample_count(sample_count)?;
     let color = RenderPipelineColorAttachmentDescriptor::new()?;
     color.set_pixel_format(PixelFormat::RGBA16_FLOAT)?;
     descriptor
@@ -1227,6 +1253,7 @@ fn create_temporal_mesh_pipeline(
 fn create_line_pipeline(
     compiler: &metal_rust::metal4::Compiler,
     library: &Library,
+    sample_count: usize,
 ) -> anyhow::Result<metal_rust::metal::RenderPipelineState> {
     let vertex = function_descriptor(library, "line_vertex")?;
     let fragment = function_descriptor(library, "line_fragment")?;
@@ -1234,6 +1261,7 @@ fn create_line_pipeline(
     descriptor.set_vertex_function_descriptor(Some(&vertex))?;
     descriptor.set_fragment_function_descriptor(Some(&fragment))?;
     descriptor.set_input_primitive_topology(PrimitiveTopologyClass::PrimitiveTopologyClassLine)?;
+    descriptor.set_raster_sample_count(sample_count)?;
 
     let color = RenderPipelineColorAttachmentDescriptor::new()?;
     color.set_pixel_format(PixelFormat::RGBA8_UNORM_SRGB)?;
@@ -1400,12 +1428,15 @@ fn bind_mesh(
 struct Target {
     size: [u32; 2],
     display_size: [u32; 2],
+    sample_count: usize,
     color: Texture,
+    multisample_color: Option<Texture>,
     motion: Texture,
     upscale: Option<Texture>,
     prev_upscale: Option<Texture>,
     interpolated: Option<Texture>,
     depth: Texture,
+    multisample_depth: Option<Texture>,
     depth_resident: bool,
 }
 
@@ -1426,6 +1457,11 @@ pub struct Renderer3D4 {
     validated_model_caches: HashMap<PathBuf, (u64, std::time::SystemTime, u64, u64)>,
     pipeline: metal_rust::metal::RenderPipelineState,
     temporal_pipeline: metal_rust::metal::RenderPipelineState,
+    library: Library,
+    msaa_pipeline_cache: HashMap<(usize, bool), metal_rust::metal::RenderPipelineState>,
+    msaa_line_pipeline_cache: HashMap<usize, metal_rust::metal::RenderPipelineState>,
+    requested_msaa_level: u8,
+    active_sample_count: usize,
     line_pipeline: metal_rust::metal::RenderPipelineState,
     depth_state: metal_rust::metal::DepthStencilState,
     blend_depth_state: metal_rust::metal::DepthStencilState,
@@ -1454,6 +1490,78 @@ pub struct Renderer3D4 {
 }
 
 impl Renderer3D4 {
+    pub fn msaa_level(&self) -> u8 {
+        self.requested_msaa_level
+    }
+
+    pub fn msaa_sample_count(&self) -> usize {
+        self.active_sample_count
+    }
+
+    pub fn set_msaa_level(&mut self, level: u8) -> anyhow::Result<()> {
+        let requested_level = level.min(4);
+        let active_sample_count = effective_msaa_sample_count(
+            self.temporal_mode != TemporalUpscaleMode::Off,
+            supported_msaa_sample_count(&self.device, requested_level),
+        );
+        if self.requested_msaa_level == requested_level
+            && self.active_sample_count == active_sample_count
+        {
+            return Ok(());
+        }
+        self.drain_scene_frame_slots()?;
+        self.requested_msaa_level = requested_level;
+        self.active_sample_count = active_sample_count;
+        self.temporal_frame = 0;
+        self.prev_view_projection = Mat4::IDENTITY;
+        if let Some(size) = self.target.as_ref().map(|target| target.size) {
+            self.ensure_target(size)?;
+        }
+        Ok(())
+    }
+
+    fn mesh_pipeline(&mut self, temporal: bool) -> anyhow::Result<metal_rust::metal::RenderPipelineState> {
+        if self.active_sample_count == 1 {
+            return Ok(if temporal {
+                self.temporal_pipeline.clone()
+            } else {
+                self.pipeline.clone()
+            });
+        }
+        let key = (self.active_sample_count, temporal);
+        if let Some(pipeline) = self.msaa_pipeline_cache.get(&key) {
+            return Ok(pipeline.clone());
+        }
+        let pipeline = if temporal {
+            create_temporal_mesh_pipeline(
+                &self.compiler,
+                &self.library,
+                self.active_sample_count,
+            )?
+        } else {
+            create_mesh_pipeline(&self.compiler, &self.library, self.active_sample_count)?
+        };
+        self.msaa_pipeline_cache.insert(key, pipeline.clone());
+        Ok(pipeline)
+    }
+
+    fn line_pipeline(&mut self) -> anyhow::Result<metal_rust::metal::RenderPipelineState> {
+        if self.active_sample_count == 1 {
+            return Ok(self.line_pipeline.clone());
+        }
+        if let Some(pipeline) = self.msaa_line_pipeline_cache.get(&self.active_sample_count) {
+            return Ok(pipeline.clone());
+        }
+        let pipeline = create_line_pipeline(
+            &self.compiler,
+            &self.library,
+            self.active_sample_count,
+        )?;
+        self.msaa_line_pipeline_cache
+            .insert(self.active_sample_count, pipeline.clone());
+        Ok(pipeline)
+    }
+
     fn drain_scene_frame_slots(&mut self) -> anyhow::Result<()> {
         for slot in &mut self.scene_frame_slots {
             if let Some(pending) = slot.pending.take() {
@@ -1499,13 +1607,31 @@ impl Renderer3D4 {
 
     pub fn set_temporal_upscale_mode(&mut self, mode: TemporalUpscaleMode) {
         if self.temporal_mode != mode {
+            let old_sample_count = self.active_sample_count;
             self.temporal_mode = mode;
+            self.active_sample_count = effective_msaa_sample_count(
+                mode != TemporalUpscaleMode::Off,
+                supported_msaa_sample_count(&self.device, self.requested_msaa_level),
+            );
             self.temporal_frame = 0;
             self.prev_view_projection = Mat4::IDENTITY;
             if mode == TemporalUpscaleMode::Off {
                 self.frame_generation_mode = FrameGenerationMode::Off;
                 self.frame_generation_frame = 0;
                 self.previous_real_frame_time = None;
+            }
+            if old_sample_count != self.active_sample_count {
+                if let Err(error) = self.drain_scene_frame_slots() {
+                    eprintln!("[metal4-msaa] failed to drain before target rebuild: {error:#}");
+                    self.active_sample_count = old_sample_count;
+                    return;
+                }
+                if let Some(size) = self.target.as_ref().map(|target| target.size) {
+                    if let Err(error) = self.ensure_target(size) {
+                        eprintln!("[metal4-msaa] failed to rebuild target: {error:#}");
+                        self.active_sample_count = old_sample_count;
+                    }
+                }
             }
         }
     }
@@ -1531,9 +1657,9 @@ impl Renderer3D4 {
         let library_descriptor = LibraryDescriptor::new()?;
         library_descriptor.set_source(MESH_SHADER)?;
         let library = compiler.new_library(&library_descriptor)?;
-        let pipeline = create_mesh_pipeline(&compiler, &library)?;
-        let temporal_pipeline = create_temporal_mesh_pipeline(&compiler, &library)?;
-        let line_pipeline = create_line_pipeline(&compiler, &library)?;
+        let pipeline = create_mesh_pipeline(&compiler, &library, 1)?;
+        let temporal_pipeline = create_temporal_mesh_pipeline(&compiler, &library, 1)?;
+        let line_pipeline = create_line_pipeline(&compiler, &library, 1)?;
 
         let depth_descriptor = DepthStencilDescriptor::new()?;
         depth_descriptor
@@ -1605,6 +1731,11 @@ impl Renderer3D4 {
             validated_model_caches: HashMap::new(),
             pipeline,
             temporal_pipeline,
+            library,
+            msaa_pipeline_cache: HashMap::new(),
+            msaa_line_pipeline_cache: HashMap::new(),
+            requested_msaa_level: 0,
+            active_sample_count: 1,
             line_pipeline,
             depth_state,
             blend_depth_state,
@@ -2072,6 +2203,7 @@ impl Renderer3D4 {
             wear_mask: None,
             primer_mask: None,
             dust_mask: None,
+            base_uv: 0,
             ramp: None,
             parts: false,
             occlusion_only: false,
@@ -2557,27 +2689,41 @@ impl Renderer3D4 {
         if !line_vertices.is_empty() {
             self.ensure_line_buffer(bytemuck::cast_slice(&line_vertices))?;
         }
+        let mesh_pipeline = self.mesh_pipeline(self.temporal_mode != TemporalUpscaleMode::Off)?;
+        let line_pipeline = if under_count > 0 || top_count > 0 {
+            Some(self.line_pipeline()?)
+        } else {
+            None
+        };
         let target = self
             .target
             .as_ref()
             .context("MTL4 target was not created")?;
 
         let pass = RenderPassDescriptor::new()?;
-        pass.set_color_attachment(
-            0,
-            &target.color,
-            ClearColor::new(
-                look.clear[0] as f64,
-                look.clear[1] as f64,
-                look.clear[2] as f64,
-                1.0,
-            ),
-        )?;
+        let clear_color = ClearColor::new(
+            look.clear[0] as f64,
+            look.clear[1] as f64,
+            look.clear[2] as f64,
+            1.0,
+        );
+        if let Some(multisample_color) = &target.multisample_color {
+            pass.set_color_attachment_with_resolve(
+                0,
+                multisample_color,
+                &target.color,
+                clear_color,
+            )?;
+        } else {
+            pass.set_color_attachment(0, &target.color, clear_color)?;
+        }
         if self.temporal_mode != TemporalUpscaleMode::Off {
             pass.set_color_attachment(1, &target.motion, ClearColor::new(0.0, 0.0, 0.0, 1.0))?;
         }
         let depth_attachment = RenderPassDepthAttachmentDescriptor::new()?;
-        depth_attachment.set_texture(Some(&target.depth))?;
+        depth_attachment.set_texture(Some(
+            target.multisample_depth.as_ref().unwrap_or(&target.depth),
+        ))?;
         depth_attachment.set_load_action(LoadAction::LoadActionClear)?;
         depth_attachment.set_store_action(if self.temporal_mode == TemporalUpscaleMode::Off {
             StoreAction::StoreActionDontCare
@@ -2596,13 +2742,7 @@ impl Renderer3D4 {
         let mut draw_count = 0u32;
         {
             let encoder = command_buffer.render_encoder(&pass, None)?;
-            encoder.set_render_pipeline_state(
-                if self.temporal_mode == TemporalUpscaleMode::Off {
-                    &self.pipeline
-                } else {
-                    &self.temporal_pipeline
-                },
-            )?;
+            encoder.set_render_pipeline_state(&mesh_pipeline)?;
             encoder.set_depth_stencil_state(Some(&self.depth_state))?;
             encoder.set_argument_table(
                 Some(&self.argument_table),
@@ -2674,7 +2814,11 @@ impl Renderer3D4 {
                     .line_buffer
                     .as_ref()
                     .context("MTL4 line buffer was not created")?;
-                encoder.set_render_pipeline_state(&self.line_pipeline)?;
+                encoder.set_render_pipeline_state(
+                    line_pipeline
+                        .as_ref()
+                        .context("MTL4 line pipeline was not created")?,
+                )?;
                 encoder.set_depth_stencil_state(Some(&self.blend_depth_state))?;
                 self.argument_table.set_buffer(buffer, 0, 1)?;
                 encoder.draw_primitives(PrimitiveType::Line, 0, under_count)?;
@@ -2685,7 +2829,11 @@ impl Renderer3D4 {
                     .line_buffer
                     .as_ref()
                     .context("MTL4 line buffer was not created")?;
-                encoder.set_render_pipeline_state(&self.line_pipeline)?;
+                encoder.set_render_pipeline_state(
+                    line_pipeline
+                        .as_ref()
+                        .context("MTL4 line pipeline was not created")?,
+                )?;
                 encoder.set_depth_stencil_state(Some(&self.line_top_depth_state))?;
                 self.argument_table.set_buffer(
                     buffer,
@@ -2873,6 +3021,7 @@ impl Renderer3D4 {
         if self.target.as_ref().is_some_and(|target| {
             target.size == size
                 && target.display_size == display_size
+                && target.sample_count == self.active_sample_count
                 && target.prev_upscale.is_some()
                     == (self.frame_generation_mode != FrameGenerationMode::Off)
                 && target.interpolated.is_some()
@@ -2886,18 +3035,33 @@ impl Renderer3D4 {
         self.previous_real_frame_time = None;
         self.prev_view_projection = Mat4::IDENTITY;
 
+        let color_format = if self.temporal_mode == TemporalUpscaleMode::Off {
+            PixelFormat::RGBA8_UNORM_SRGB
+        } else {
+            PixelFormat::RGBA16_FLOAT
+        };
         let descriptor = TextureDescriptor::new_2d(
-            if self.temporal_mode == TemporalUpscaleMode::Off {
-                PixelFormat::RGBA8_UNORM_SRGB
-            } else {
-                PixelFormat::RGBA16_FLOAT
-            },
+            color_format,
             size[0] as usize,
             size[1] as usize,
             ResourceOptions::PRIVATE,
             TextureUsage::RENDER_TARGET.union(TextureUsage::SHADER_READ),
         )?;
         let color = self.device.new_texture(&descriptor)?;
+        let multisample_color = if self.active_sample_count > 1 {
+            let descriptor = TextureDescriptor::new_2d(
+                color_format,
+                size[0] as usize,
+                size[1] as usize,
+                ResourceOptions::PRIVATE,
+                TextureUsage::RENDER_TARGET.union(TextureUsage::SHADER_READ),
+            )?;
+            descriptor.set_texture_type(metal_rust::metal::TextureType::D2Multisample);
+            descriptor.set_sample_count(self.active_sample_count)?;
+            Some(self.device.new_texture(&descriptor)?)
+        } else {
+            None
+        };
         let motion_descriptor = TextureDescriptor::new_2d(
             PixelFormat::RG16_FLOAT,
             size[0] as usize,
@@ -2964,10 +3128,30 @@ impl Renderer3D4 {
             },
         )?;
         let depth = self.device.new_texture(&depth_descriptor)?;
+        let multisample_depth = if self.active_sample_count > 1 {
+            let descriptor = TextureDescriptor::new_2d(
+                PixelFormat::DEPTH32_FLOAT,
+                size[0] as usize,
+                size[1] as usize,
+                ResourceOptions::PRIVATE,
+                TextureUsage::RENDER_TARGET,
+            )?;
+            descriptor.set_texture_type(metal_rust::metal::TextureType::D2Multisample);
+            descriptor.set_sample_count(self.active_sample_count)?;
+            Some(self.device.new_texture(&descriptor)?)
+        } else {
+            None
+        };
         let mut allocations = vec![
             ResidencyAllocation::Texture(&color),
             ResidencyAllocation::Texture(&motion),
         ];
+        if let Some(texture) = &multisample_color {
+            allocations.push(ResidencyAllocation::Texture(texture));
+        }
+        if let Some(texture) = &multisample_depth {
+            allocations.push(ResidencyAllocation::Texture(texture));
+        }
         if self.temporal_mode != TemporalUpscaleMode::Off {
             allocations.push(ResidencyAllocation::Texture(&depth));
         }
@@ -2988,6 +3172,12 @@ impl Renderer3D4 {
                 ResidencyAllocation::Texture(&old.color),
                 ResidencyAllocation::Texture(&old.motion),
             ];
+            if let Some(texture) = &old.multisample_color {
+                removals.push(ResidencyAllocation::Texture(texture));
+            }
+            if let Some(texture) = &old.multisample_depth {
+                removals.push(ResidencyAllocation::Texture(texture));
+            }
             if old.depth_resident {
                 removals.push(ResidencyAllocation::Texture(&old.depth));
             }
@@ -3007,12 +3197,15 @@ impl Renderer3D4 {
         self.target = Some(Target {
             size,
             display_size,
+            sample_count: self.active_sample_count,
             color,
+            multisample_color,
             motion,
             upscale: upscale.clone(),
             prev_upscale: prev_upscale.clone(),
             interpolated: interpolated.clone(),
             depth,
+            multisample_depth,
             depth_resident,
         });
         if self.temporal_mode != TemporalUpscaleMode::Off {
@@ -3141,13 +3334,21 @@ impl Renderer3D4 {
             .context("MTL4 target was not created")?;
 
         let pass = RenderPassDescriptor::new()?;
-        pass.set_color_attachment(
-            0,
-            &target.color,
-            ClearColor::new(clear[0], clear[1], clear[2], clear[3]),
-        )?;
+        let clear_color = ClearColor::new(clear[0], clear[1], clear[2], clear[3]);
+        if let Some(multisample_color) = &target.multisample_color {
+            pass.set_color_attachment_with_resolve(
+                0,
+                multisample_color,
+                &target.color,
+                clear_color,
+            )?;
+        } else {
+            pass.set_color_attachment(0, &target.color, clear_color)?;
+        }
         let depth_attachment = RenderPassDepthAttachmentDescriptor::new()?;
-        depth_attachment.set_texture(Some(&target.depth))?;
+        depth_attachment.set_texture(Some(
+            target.multisample_depth.as_ref().unwrap_or(&target.depth),
+        ))?;
         depth_attachment.set_load_action(LoadAction::LoadActionClear)?;
         depth_attachment.set_store_action(StoreAction::StoreActionDontCare)?;
         depth_attachment.set_clear_depth(0.0)?;
@@ -3263,6 +3464,58 @@ impl Renderer3D4 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn msaa_level_maps_to_sample_count() {
+        assert_eq!(msaa_sample_count(0), 1);
+        assert_eq!(msaa_sample_count(1), 2);
+        assert_eq!(msaa_sample_count(2), 4);
+        assert_eq!(msaa_sample_count(3), 8);
+        assert_eq!(msaa_sample_count(4), 16);
+        assert_eq!(msaa_sample_count(u8::MAX), 16);
+    }
+
+    #[test]
+    fn msaa_temporal_fallback_keeps_single_sample_pipeline() {
+        assert_eq!(effective_msaa_sample_count(false, msaa_sample_count(4)), 16);
+        assert_eq!(effective_msaa_sample_count(true, msaa_sample_count(4)), 1);
+        assert_eq!(effective_msaa_sample_count(false, msaa_sample_count(2)), 4);
+        assert_eq!(effective_msaa_sample_count(false, msaa_sample_count(0)), 1);
+    }
+
+    #[test]
+    fn mtl4_msaa_resolve_round_trips_clear_color_when_available() -> anyhow::Result<()> {
+        let Some(device) = Device::system_default() else {
+            return Ok(());
+        };
+        if !device.supports_family(metal_rust::metal::GPUFamily::GPUFamilyMetal4)? {
+            return Ok(());
+        }
+        let queue = device.new_mtl4_command_queue()?;
+        let mut renderer = Renderer3D4::new(&device, &queue)?;
+        let clear = [0.25, 0.5, 0.75, 1.0];
+        let mut tested = Vec::new();
+        for level in 0..=4 {
+            let requested = msaa_sample_count(level);
+            if !device.supports_texture_sample_count(requested) && requested > 1 {
+                continue;
+            }
+            renderer.set_msaa_level(level)?;
+            assert_eq!(renderer.msaa_sample_count(), requested);
+            tested.push(requested);
+            let pixels = renderer.clear_and_readback([8, 8], clear)?;
+            assert_eq!(pixels.len(), 8 * 8 * 4);
+            for pixel in pixels.chunks_exact(4) {
+                assert!((pixel[0] as i16 - 137).abs() <= 2, "red: {pixel:?}");
+                assert!((pixel[1] as i16 - 188).abs() <= 2, "green: {pixel:?}");
+                assert!((pixel[2] as i16 - 225).abs() <= 2, "blue: {pixel:?}");
+                assert_eq!(pixel[3], 255);
+            }
+        }
+        eprintln!("[metal4-msaa-test] tested sample counts: {tested:?}");
+        Ok(())
+    }
+
     use std::path::PathBuf;
 
     fn triangle_model() -> glb::Model {
@@ -3306,6 +3559,7 @@ mod tests {
             wear_mask: None,
             primer_mask: None,
             dust_mask: None,
+            base_uv: 0,
             ramp: None,
                 parts: false,
                 occlusion_only: false,
@@ -3545,25 +3799,27 @@ mod tests {
                 col: [255, 0, 0, 255],
             },
         ];
-        renderer.render([32, 32], &camera, &look, &[&model], &[], &line)?;
-        let (_, _, pixels) = renderer
-            .read_back()?
-            .context("MTL4 renderer did not expose a rendered target")?;
-        let center = &pixels[(16 * 32 + 16) * 4..][..4];
-        assert!(
-            center[1] > center[0] + 30,
-            "expected sampled green triangle pixel, got {center:?}"
-        );
-        assert!(
-            center[1] > 100,
-            "expected rendered geometry at center, got {center:?}"
-        );
-        assert!(
-            pixels
-                .chunks_exact(4)
-                .any(|pixel| pixel[0] > 180 && pixel[1] < 80 && pixel[2] < 80),
-            "expected the MTL4 top-line overlay in the rendered image"
-        );
+        for level in 0..=4 {
+            let requested = msaa_sample_count(level);
+            if requested > 1 && !device.supports_texture_sample_count(requested) {
+                continue;
+            }
+            renderer.set_msaa_level(level)?;
+            renderer.render([32, 32], &camera, &look, &[&model], &[], &line)?;
+            let (_, _, pixels) = renderer
+                .read_back()?
+                .context("MTL4 renderer did not expose a rendered target")?;
+            let center = &pixels[(16 * 32 + 16) * 4..][..4];
+            assert!(
+                center[1] > center[0] + 30,
+                "expected sampled green triangle pixel at {requested} samples, got {center:?}"
+            );
+            assert!(
+                center[1] > 100,
+                "expected rendered geometry at {requested} samples, got {center:?}"
+            );
+            assert!(renderer.draws >= 1, "no draws at {requested} samples");
+        }
         Ok(())
     }
 }

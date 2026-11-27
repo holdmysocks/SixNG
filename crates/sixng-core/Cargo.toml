@@ -19,5 +19,6 @@ rayon.workspace = true
 image.workspace = true
 texture2ddecoder = "0.1.2"
 regex = "1.13.2"
+glam = "0.29"
 opus = { version = "0.3.0", optional = true }
 bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", rev = "02a8c4e802800d55b55797a32dbfe8b16d7fc23f" }

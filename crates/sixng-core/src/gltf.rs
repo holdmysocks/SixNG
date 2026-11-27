@@ -387,6 +387,11 @@ pub fn mesh_glb_with(name: &str, groups: &[NodeGroup], materials: &[Material], s
                     textures.last_mut().unwrap()["sampler"] = json!(1);
                 }
                 pbr["baseColorTexture"] = json!({"index": textures.len() - 1});
+                // `extras.base_uv`: the picture is laid out in another UV set
+                // (an upper body with its decorations, `peddeco::Space`)
+                if let Some(n) = m.extras["base_uv"].as_u64().filter(|&n| n != 0) {
+                    pbr["baseColorTexture"]["texCoord"] = json!(n);
+                }
             }
             let mut mat = json!({"name": m.name, "doubleSided": true, "pbrMetallicRoughness": pbr, "extras": m.extras});
             if let Some(uri) = &m.normal_uri {

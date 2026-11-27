@@ -132,6 +132,13 @@ pub struct Editor {
     done: Arc<Mutex<Vec<ThumbDone>>>,
     workers: bool,
     previews: HashMap<String, egui::TextureHandle>,
+    /// Where the Liveries window was drawn last (the picker opens beside it).
+    panel_rect: Option<egui::Rect>,
+    /// Pictures still being read (a scripted screenshot waits for them).
+    pub reading: usize,
+    /// Pictures whose stickers were first placed before their size was
+    /// known: they are placed again when the picture is read.
+    await_fit: std::collections::HashSet<String>,
     /// While a sticker is dragged: its centre minus the UV under the pointer.
     grab: Option<Vec2>,
     /// The model's meshes as they are drawn, for picking: the model, its
@@ -194,6 +201,9 @@ impl Default for Editor {
             done: Default::default(),
             workers: false,
             previews: HashMap::new(),
+            panel_rect: None,
+            reading: 0,
+            await_fit: Default::default(),
             grab: None,
             posed: Default::default(),
             auto_add: Vec::new(),
@@ -348,7 +358,7 @@ impl Editor {
     /// Still reading the sticker list or drawing thumbnails (a scripted
     /// screenshot waits for it).
     pub fn busy(&self) -> bool {
-        self.open && self.picker_open && (self.list.lock().map(|l| l.is_none()).unwrap_or(false) || self.thumbs.is_empty() || self.thumbs.values().any(|t| matches!(t, Thumb::Wait))) || self.scripting()
+        self.open && self.picker_open && (self.list.lock().map(|l| l.is_none()).unwrap_or(false) || self.thumbs.is_empty() || self.thumbs.values().any(|t| matches!(t, Thumb::Wait))) || self.scripting() || self.reading > 0
     }
 
     /// Scripted steps are still to run.
@@ -463,6 +473,9 @@ impl State {
         let Some(set) = self.zones.slot_of(&s.model).and_then(|slot| self.zones.set(slot, &s.zones, s.uv_set.min(1) as usize)) else { return };
         let pic = s.picture.clone();
         let aspect = self.picture_size(&pic, Path::new(env.game), env.cache).map_or(1.0, |sz| sz[0] as f32 / sz[1].max(1) as f32);
+        if self.picture_reading(&pic) {
+            self.ed.await_fit.insert(pic.key());
+        }
         let (c, size) = set.fit(aspect);
         let s = &mut self.livery.stickers[i];
         s.centre = c;
@@ -601,6 +614,23 @@ impl State {
 
     /// The Liveries window and, when asked for, the sticker picker.
     pub fn panel(&mut self, ctx: &egui::Context, within: egui::Rect, env: &Env) {
+        // pictures are read on threads of their own: look again shortly
+        // while one is out, and place the stickers that waited for their
+        // picture's shape (unless they were moved by hand since)
+        self.ed.reading = self.reading();
+        if self.ed.reading > 0 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+        }
+        for key in std::mem::take(&mut self.arrived) {
+            if self.ed.await_fit.remove(&key) {
+                for i in 0..self.livery.stickers.len() {
+                    let s = &self.livery.stickers[i];
+                    if s.fresh && !s.zones.is_empty() && s.game_uv.is_none() && s.picture.key() == key {
+                        self.fit(i, env);
+                    }
+                }
+            }
+        }
         // the undo history follows the livery whether the panel is open or not
         let (t, held) = ctx.input(|i| (i.time, i.pointer.any_down()));
         let vehicle = self.vehicle.clone();
@@ -632,9 +662,18 @@ impl State {
             return;
         }
         let mut open = true;
-        egui::Window::new("Liveries").open(&mut open).default_pos(within.left_top() + egui::vec2(12.0, 12.0)).default_size([340.0, (within.height() - 70.0).clamp(300.0, 760.0)]).constrain_to(within).resizable(true).show(ctx, |ui| {
+        // The panel may lie anywhere below the top bars, also over the side
+        // panels. Where the view is too narrow to show the vehicle beside
+        // it, it starts over the list to the left of the view.
+        let area = Self::window_area(ctx, within);
+        let beside = within.left() - 340.0 - 12.0;
+        let x = if within.width() < 900.0 && beside >= area.left() + 4.0 { beside } else { within.left() + 12.0 };
+        let shown = egui::Window::new("Liveries").open(&mut open).default_pos(egui::pos2(x, within.top() + 12.0)).default_size([340.0, (within.height() - 70.0).clamp(300.0, 760.0)]).constrain_to(area).resizable(true).show(ctx, |ui| {
             egui::ScrollArea::vertical().max_height((within.height() - 80.0).max(200.0)).show(ui, |ui| self.panel_body(ui, env));
         });
+        if let Some(r) = shown {
+            self.ed.panel_rect = Some(r.response.rect);
+        }
         self.ed.open = open;
         if self.ed.picker_open {
             self.picker(ctx, within, env);
@@ -879,6 +918,7 @@ impl State {
                 match (&pic, size) {
                     (Picture::Game(id), Some(sz)) => ui.label(format!("game texture {id}\n{} × {} px", sz[0], sz[1])),
                     (Picture::File(p), Some(sz)) => ui.label(format!("{}\n{} × {} px", p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), sz[0], sz[1])),
+                    (p, None) if self.picture_reading(p) => ui.weak(format!("{}: reading…", p.label())),
                     (p, None) => ui.colored_label(egui::Color32::from_rgb(230, 90, 70), format!("{}: {}", p.label(), self.picture_error(p).unwrap_or("not read"))),
                 };
                 ui.horizontal(|ui| {
@@ -1092,6 +1132,13 @@ impl State {
         Some(t)
     }
 
+    /// Where the Liveries windows may lie: the whole window below the top
+    /// bars (the view starts under them).
+    fn window_area(ctx: &egui::Context, within: egui::Rect) -> egui::Rect {
+        let screen = ctx.content_rect();
+        egui::Rect::from_min_max(egui::pos2(screen.left(), within.top()), screen.right_bottom())
+    }
+
     /// The picker of the game's sticker textures.
     fn picker(&mut self, ctx: &egui::Context, within: egui::Rect, env: &Env) {
         self.ed.start_list(env, ctx);
@@ -1100,7 +1147,18 @@ impl State {
         let mut open = true;
         let mut chosen: Option<GameSticker> = None;
         let title = if self.ed.picker_replace { "Game stickers: change the picture" } else { "Game stickers: add one" };
-        egui::Window::new(title).id(egui::Id::new("livery_picker")).open(&mut open).default_pos(within.left_top() + egui::vec2(370.0, 12.0)).default_size([500.0, 520.0]).constrain_to(within).show(ctx, |ui| {
+        // beside the Liveries panel, not on it: to its right where there
+        // is room, else to its left
+        let area = Self::window_area(ctx, within);
+        let panel = self.ed.panel_rect.unwrap_or(egui::Rect::from_min_size(within.left_top(), egui::vec2(352.0, 0.0)));
+        let x = if panel.right() + 8.0 + 500.0 <= area.right() {
+            panel.right() + 8.0
+        } else if panel.left() - 8.0 - 500.0 >= area.left() {
+            panel.left() - 8.0 - 500.0
+        } else {
+            within.left() + 370.0
+        };
+        egui::Window::new(title).id(egui::Id::new("livery_picker")).open(&mut open).default_pos(egui::pos2(x, within.top() + 12.0)).default_size([500.0, 520.0]).constrain_to(area).show(ctx, |ui| {
             let list = match list {
                 None => {
                     ui.horizontal(|ui| {
@@ -1201,6 +1259,12 @@ impl State {
     pub fn pointer(&mut self, ui: &egui::Ui, resp: &egui::Response, rect: egui::Rect, cam: &Camera, model: &glb::Model, env: &Env) -> bool {
         // scripted steps (checks without a mouse), one per frame
         if self.ed.busy() && (!self.ed.ready || self.zones.models.is_empty()) {
+            return false;
+        }
+        // (a scripted step waits for the pictures: a first placement takes
+        // the picture's shape)
+        if self.ed.scripting() && (self.reading() > 0 || !self.arrived.is_empty()) {
+            ui.ctx().request_repaint();
             return false;
         }
         if self.ed.auto_brand.is_some() {
@@ -1345,7 +1409,21 @@ impl State {
                 // Ctrl + wheel: size; Shift + wheel: width; Ctrl + Shift +
                 // wheel: height; Alt + wheel: rotation (a wheel with Shift
                 // held arrives as a sideways scroll on some systems)
-                let (scroll, ctrl, alt, shift) = ui.input(|i| (if i.smooth_scroll_delta.y != 0.0 { i.smooth_scroll_delta.y } else { i.smooth_scroll_delta.x }, i.modifiers.command, i.modifiers.alt, i.modifiers.shift));
+                // With Ctrl held egui takes the wheel as a zoom gesture and
+                // reports no scroll: the scroll is worked back from the zoom
+                // factor (egui's zoom is exp(scroll / 200)). The gesture
+                // runs on for some frames after the wheel has stopped, so
+                // it counts as Ctrl also when the key is up again (as does
+                // a pinch on a touchpad).
+                let (scroll, ctrl, alt, shift) = ui.input(|i| {
+                    let s = if i.smooth_scroll_delta.y != 0.0 { i.smooth_scroll_delta.y } else { i.smooth_scroll_delta.x };
+                    let zoom = if s == 0.0 { i.zoom_delta() } else { 1.0 };
+                    if zoom != 1.0 && zoom > 0.0 {
+                        (zoom.ln() * 200.0, true, i.modifiers.alt, i.modifiers.shift)
+                    } else {
+                        (s, i.modifiers.command, i.modifiers.alt, i.modifiers.shift)
+                    }
+                });
                 let mut used = self.ed.grab.is_some();
                 if resp.hovered() && scroll != 0.0 && (ctrl || alt || shift) {
                     let s = &mut self.livery.stickers[i];

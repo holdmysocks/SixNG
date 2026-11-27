@@ -9,7 +9,7 @@ struct Frame {
     sun_col: vec4<f32>,
     sky_top: vec4<f32>,   // w flake size of the body paint's coat
     sky_hor: vec4<f32>,   // w exposure
-    mode: vec4<u32>,      // x view mode, y packed channel order, z paint finish, w slot view
+    mode: vec4<u32>,      // x view mode, y packed channel order (bit 8: ped skin detail off), z paint finish, w slot view
     paint1: vec4<f32>,    // primary paint colour (linear), w the vehicle's own paint roughness
     paint2: vec4<f32>,    // pearl colour (linear), w pearl amount
     misc: vec4<f32>,      // x wetness, y emissive boost, z time, w ambient
@@ -23,7 +23,7 @@ struct Frame {
 
 struct Mat {
     base: vec4<f32>,
-    flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask, bit 12 = an emissive shader of another class (lit by its emissive map), bit 13 = the packed map is a vehicle material map, bit 14 = the emissive slot holds the part ramp image with the parts' surfaces, bit 5 = the packed map is ped skin's spec map (green = roughness) with the specular factor x 100 in bits 16-23, bit 6 = ped skin's engine detail bound (6 speculartex2, 7 / 8 the normal and control sheets; tiling in strand.yz, colour strength strand.w, normal strength tile.y), bit 7 = ped skin occlusion (strength tile.x); on skin tile.z = 1 + translucency bias when translucent (0 = none)
+    flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive, 64 base on the fourth UV set), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask, bit 12 = an emissive shader of another class (lit by its emissive map), bit 13 = the packed map is a vehicle material map, bit 14 = the emissive slot holds the part ramp image with the parts' surfaces, bit 5 = the packed map is ped skin's spec map (green = roughness) with the specular factor x 100 in bits 16-23, bit 6 = ped skin's engine detail bound (6 speculartex2, 7 / 8 the normal and control sheets; tiling in strand.yz, colour strength strand.w, normal strength tile.y), bit 7 = ped skin occlusion (strength tile.x); on skin tile.z = 1 + translucency bias when translucent (0 = none)
     tile: vec4<f32>,      // fabric detail tile: x UV scale, y rotation, z mean grey value, w bound
     emis: vec4<f32>,      // x emissive scale of the material (from the GLB's emissive strength), yzw the light's colour
     strand: vec4<f32>,    // x a strand piece's width factor this frame (stored over drawn strands; 1 otherwise)
@@ -792,10 +792,17 @@ fn map_finish_added(col0: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
 // them: the region from the min and max of the four nearest G texels (two
 // regions are averaged), at UV0 x the material's tiling (strand.yz).
 struct SkinDet { n: vec2<f32>, c: f32, mask: f32 };
+// The game samples a texture array, so a tile never sees its neighbours. In
+// the sheet the filter must stay inside the tile: one isotropic mip level
+// (the anisotropic footprint would reach across the edge) and the position
+// held half a texel of the coarser of the two blended levels from the edge,
+// or every tile repeat draws a line of the neighbouring tile.
 fn skin_tile(t: texture_2d<f32>, r: u32, p: vec2<f32>, gx: vec2<f32>, gy: vec2<f32>) -> vec4<f32> {
     let cell = vec2(f32(r & 3u), f32(r >> 2u));
-    let q = (cell + fract(p) * (254.0 / 256.0) + 1.0 / 256.0) * 0.25;
-    return textureSampleGrad(t, samp, q, gx * 0.25, gy * 0.25);
+    let lod = clamp(log2(max(max(length(gx), length(gy)) * 256.0, 1e-6)), 0.0, 8.0);
+    let h = 0.5 * exp2(ceil(lod)) / 256.0;
+    let q = (cell + clamp(fract(p), vec2(h), vec2(1.0 - h))) * 0.25;
+    return textureSampleLevel(t, samp, q, lod);
 }
 fn skin_detail(uv: vec2<f32>, gx: vec2<f32>, gy: vec2<f32>) -> SkinDet {
     let p = uv * M.strand.yz;
@@ -1647,7 +1654,9 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     // texels of the sub-material the tile belongs to
     var weave_w = 0.0;
     if ((has & 1u) != 0u) {
-        var bt = textureSample(t_base, samp, i.uv0);
+        // an upper body with its decorations is laid out in its fourth UV
+        // set (both arms apart; UV0 is mirrored)
+        var bt = textureSample(t_base, samp, select(i.uv0, i.uv23.zw, (has & 64u) != 0u));
         // tint mask (animal coats): only the green channel (shading) is a picture
         if ((M.flags.w & 512u) != 0u) { bt = vec4(vec3(bt.g), 1.0); }
         if (M.tile.w > 0.5 && M.tile.w < 1.5) { weave_w = bt.a; bt.a = 1.0; }
@@ -1659,9 +1668,10 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     var n = normalize(i.nrm);
     if (ff == (i.extra.w < 0.0)) { n = -n; }
     let tl = length(i.tan.xyz);
-    // ped skin's engine detail (both skin programs; the two per-ped engine
-    // scales on it taken as 1, the per-tile roughness term as 0)
-    let skin_det_on = (M.flags.w & 64u) != 0u && (M.flags.w & 256u) == 0u;
+    // ped skin's engine detail (both skin programs; the two per-ped scales
+    // on it are 1 up close, which the viewer takes: the strength fades out
+    // from 6 to 9 m from the camera; the per-tile roughness term as 0)
+    let skin_det_on = (M.flags.w & 64u) != 0u && (M.flags.w & 256u) == 0u && (F.mode.y & 256u) == 0u;
     let det_gx = dpdx(i.uv0 * M.strand.yz);
     let det_gy = dpdy(i.uv0 * M.strand.yz);
     var sd: SkinDet;
@@ -1709,10 +1719,10 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         // occlusion: lerp(1, B, the material's strength); diffuse ambient x
         // it, specular ambient x its fourth root (below), direct light not
         if ((M.flags.w & 128u) != 0u) { ao = mix(1.0, sp.b, clamp(M.tile.x, 0.0, 1.0)); }
-    } else if ((has & 4u) != 0u && F.mode.y < 3u) {
+    } else if ((has & 4u) != 0u && (F.mode.y & 255u) < 3u) {
         let p = textureSample(t_pk, samp, i.uv0);
-        if (F.mode.y == 0u) { rough = p.r; metal = p.g; ao = p.b; }
-        else if (F.mode.y == 1u) { ao = p.r; rough = p.g; metal = p.b; }
+        if ((F.mode.y & 255u) == 0u) { rough = p.r; metal = p.g; ao = p.b; }
+        else if ((F.mode.y & 255u) == 1u) { ao = p.r; rough = p.g; metal = p.b; }
         else { metal = p.r; rough = p.g; ao = p.b; }
         rough = clamp(rough, 0.04, 1.0);
     }

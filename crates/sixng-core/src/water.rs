@@ -1254,6 +1254,7 @@ pub fn export(ws: &crate::export::Workspace, out: Option<&std::path::Path>, o: &
     }
     if o.detail {
         rep["detail"] = write_detail(ws, &dir.join("detail"))?;
+        rep["ocean"] = write_ocean(ws, &dir.join("ocean"), &hgt, inland.as_deref())?;
     }
     rep["out"] = json!(dir);
     Ok(summary(&rep))
@@ -1767,6 +1768,168 @@ fn dicts_holding(archive: &std::path::Path, entries: &[crate::scan::Entry], name
         .collect();
     out.sort_by_key(|d| d.0.off);
     out
+}
+
+/// The map-wide ocean maps of levels.rpf's `water_quality_control`
+/// dictionary. They cover the water grid's world box, row 0 north, at
+/// 32 m (512 x 1056) or 16 m (1024 x 2112) per texel. Each entry is the
+/// texture name and what the export's check found in it.
+pub const OCEAN_MAPS: &[(&str, &str)] = &[
+    ("mean_sea_level", "water surface height, metres = (v / 65535 - 0.5) * 1600 like the water height map; 0 = no water (land)"),
+    ("water_quality_control", "red 255 on the sea and 0 on land and inland water; green about 40 on inland water only; blue and alpha constant"),
+    ("ocean_wave_control", "red and green rise from 0 at the coast to 255 beyond 5 km out (waves calmed near the shore); blue varies"),
+    ("ocean_roughness_control", "red and green centred on 128 near the coast (probably a direction), alpha above 0 within about 5 km of land; 128, 128, 0, 0 in the open sea"),
+    ("ocean_wetness_control", "almost constant (150, 160, 255, 255)"),
+];
+
+/// Distance bands from land for the channel means, metres.
+const OCEAN_BANDS: &[(f32, f32, &str)] = &[(0.0, 200.0, "sea, under 200 m from land"), (200.0, 1000.0, "sea, 200 m to 1 km"), (1000.0, 5000.0, "sea, 1 to 5 km"), (5000.0, f32::MAX, "sea, over 5 km")];
+
+/// Distance in metres from each texel to the nearest `land` texel
+/// (8-neighbour chamfer, two passes).
+fn distance_to(land: &[bool], w: usize, h: usize, texel_m: f32) -> Vec<f32> {
+    let mut d: Vec<f32> = land.iter().map(|&l| if l { 0.0 } else { f32::MAX }).collect();
+    let (a, b) = (texel_m, texel_m * std::f32::consts::SQRT_2);
+    for pass in 0..2 {
+        let rows: Vec<usize> = if pass == 0 { (0..h).collect() } else { (0..h).rev().collect() };
+        let cols: Vec<usize> = if pass == 0 { (0..w).collect() } else { (0..w).rev().collect() };
+        let s: isize = if pass == 0 { -1 } else { 1 };
+        for &y in &rows {
+            for &x in &cols {
+                let mut best = d[y * w + x];
+                for (dx, dy, c) in [(s, 0, a), (0, s, a), (s, s, b), (-s, s, b)] {
+                    let (nx, ny) = (x as isize + dx, y as isize + dy);
+                    if nx >= 0 && ny >= 0 && (nx as usize) < w && (ny as usize) < h {
+                        best = best.min(d[ny as usize * w + nx as usize] + c);
+                    }
+                }
+                d[y * w + x] = best;
+            }
+        }
+    }
+    d
+}
+
+/// `ocean/`: [`OCEAN_MAPS`] placed on the water grid, as PNGs (16-bit for
+/// the sea level) with `ocean/ocean.json`, checked against the water height
+/// map and, when exported, the inland surfaces.
+fn write_ocean(ws: &crate::export::Workspace, dir: &std::path::Path, hgt: &Layer, inland: Option<&[InlandTile]>) -> Result<Value> {
+    std::fs::create_dir_all(dir)?;
+    let lv = ws.resolve("levels")?;
+    let ix = ws.load_index(&lv)?;
+    let names: Vec<&str> = OCEAN_MAPS.iter().map(|m| m.0).collect();
+    let dicts = dicts_holding(&lv.path, &ix.entries, &names);
+    let wb = hgt.grid.world_box();
+    let (gw, gh) = (wb[2] - wb[0], wb[3] - wb[1]);
+    // the sea level map sets the land mask and the distance bands
+    let (e, t) = find_tex(&dicts, "mean_sea_level").ok_or_else(|| anyhow!("mean_sea_level not found in levels"))?;
+    let msl = load_texture(&lv.path, e, t)?;
+    let (w, h) = (msl.w, msl.h);
+    let texel_m = gw / w as f32;
+    let land: Vec<bool> = (0..w * h).map(|i| msl.px[i] == 0.0).collect();
+    let dist = distance_to(&land, w, h, texel_m);
+    let sea_v = {
+        let mut n: std::collections::HashMap<u32, usize> = Default::default();
+        for (i, &v) in msl.px.iter().enumerate() {
+            if !land[i] {
+                *n.entry((v * 65535.0).round() as u32).or_default() += 1;
+            }
+        }
+        n.into_iter().max_by_key(|x| x.1).map(|x| x.0).unwrap_or(0)
+    };
+    let is_sea = |i: usize| !land[i] && (msl.px[i] * 65535.0).round() as u32 == sea_v;
+    let band = |i: usize| -> Option<&str> {
+        if land[i] {
+            return Some("land");
+        }
+        if !is_sea(i) {
+            return Some("inland water");
+        }
+        OCEAN_BANDS.iter().find(|b| dist[i] >= b.0 && dist[i] < b.1).map(|b| b.2)
+    };
+    // land by the water height map: ground more than 5 m up at the texel centre
+    let (m, _) = hgt.mosaic();
+    let hb = hgt.grid.world_box();
+    let mpt = hgt.grid.tile / hgt.px as f32;
+    let ground = |x: f32, y: f32| -> Option<f32> {
+        let (c, r) = (((x - hb[0]) / mpt).floor(), ((hb[3] - y) / mpt).floor());
+        (c >= 0.0 && r >= 0.0 && (c as usize) < m.w && (r as usize) < m.h).then(|| height_m(m.at(c as usize, r as usize, 0)))
+    };
+    let centre = |c: usize, r: usize| (wb[0] + (c as f32 + 0.5) * texel_m, wb[3] - (r as f32 + 0.5) * texel_m);
+    let (mut agree, mut n) = (0usize, 0usize);
+    for r in 0..h {
+        for c in 0..w {
+            let (x, y) = centre(c, r);
+            if let Some(g) = ground(x, y) {
+                n += 1;
+                agree += usize::from((g > 5.0) == land[r * w + c]);
+            }
+        }
+    }
+    let inland_check = inland.map(|tiles| {
+        let mut err: Vec<f32> = Vec::new();
+        let mut dry = 0;
+        for t in tiles {
+            let b = t.bbox();
+            let (x, y) = ((b[0][0] + b[1][0]) / 2.0, (b[0][1] + b[1][1]) / 2.0);
+            let (c, r) = (((x - wb[0]) / texel_m).floor(), ((wb[3] - y) / texel_m).floor());
+            if c < 0.0 || r < 0.0 || c as usize >= w || r as usize >= h {
+                continue;
+            }
+            let i = r as usize * w + c as usize;
+            if land[i] {
+                dry += 1;
+            } else {
+                err.push(height_m(msl.px[i]) - t.z_percentiles()[2]);
+            }
+        }
+        let within = err.iter().filter(|e| e.abs() < 1.0).count();
+        err.sort_by(f32::total_cmp);
+        json!({"tiles": tiles.len(), "on_no_water_texel": dry, "compared": err.len(), "median_error_m": err.get(err.len() / 2), "within_1_m": within})
+    });
+    let mut maps = Vec::new();
+    for &(name, about) in OCEAN_MAPS {
+        let Some((e, t)) = find_tex(&dicts, name) else {
+            maps.push(json!({"name": name, "error": "not found"}));
+            continue;
+        };
+        let im = load_texture(&lv.path, e, t)?;
+        let file = format!("{name}.png");
+        if im.ch == 1 {
+            write_png16(&dir.join(&file), &im)?;
+        } else {
+            write_rgba8(&dir.join(&file), &im)?;
+        }
+        // channel means per band, the map sampled at the sea level texel
+        let (sx, sy) = (im.w / w, im.h / h);
+        let mut sums: std::collections::BTreeMap<&str, (Vec<f64>, usize)> = Default::default();
+        for r in 0..h {
+            for c in 0..w {
+                let Some(b) = band(r * w + c) else { continue };
+                let s = sums.entry(b).or_insert((vec![0.0; im.ch], 0));
+                for k in 0..im.ch {
+                    s.0[k] += im.at(c * sx, r * sy, k) as f64;
+                }
+                s.1 += 1;
+            }
+        }
+        let means: serde_json::Map<String, Value> = sums.iter().map(|(b, (s, k))| (b.to_string(), json!(s.iter().map(|v| ((v / *k as f64) * 10.0).round() / 10.0).collect::<Vec<_>>()))).collect();
+        maps.push(json!({"name": name, "png": file, "dictionary": e.id, "width": t.width, "height": t.height, "format": t.format,
+            "metres_per_texel": gw / t.width as f32, "aspect_matches_grid": (t.width as f32 / t.height as f32 - gw / gh).abs() < 0.01,
+            "about": about, "channel_means_by_band": means}));
+    }
+    let check = json!({"land_agrees_with_height_map": agree as f32 / n.max(1) as f32, "texels_compared": n,
+        "sea_value": sea_v, "sea_level_m": height_m(sea_v as f32 / 65535.0), "land_texels": land.iter().filter(|&&l| l).count(),
+        "inland_water_texels": (0..w * h).filter(|&i| !land[i] && !is_sea(i)).count(), "inland_surfaces": inland_check});
+    write_json(&dir.join("ocean.json"), &json!({
+        "about": "Map-wide ocean maps from levels.rpf, placed on the water grid. Uses come from the names and the checks, not from shader code.",
+        "world_box": {"min": [wb[0], wb[1]], "max": [wb[2], wb[3]]},
+        "texel_centre": "(min.x + (col + 0.5) * metres_per_texel, max.y - (row + 0.5) * metres_per_texel), row 0 north",
+        "png": "8-bit RGBA, or 16-bit greyscale for mean_sea_level (the stored value)",
+        "channel_means_by_band": "per channel, 0 to 255; 0 to 1 (the stored value) for mean_sea_level",
+        "bands": "land and inland water from mean_sea_level (0 = land; inland water = any value other than the sea's); sea bands by distance from land",
+        "check": check, "maps": maps}))?;
+    Ok(json!({"maps": maps.len(), "check": check}))
 }
 
 /// `detail/`: each of [`DETAIL_TEXTURES`] as an 8-bit RGBA PNG preview and

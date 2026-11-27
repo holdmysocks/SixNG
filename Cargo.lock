@@ -2131,7 +2131,7 @@ dependencies = [
 [[package]]
 name = "metal-rust"
 version = "1.0.0"
-source = "git+https://github.com/maple-quartz18/Metal-Rust.git?rev=e67e0fe6007f773a99debca0cfdb111cf49b792c#e67e0fe6007f773a99debca0cfdb111cf49b792c"
+source = "git+https://github.com/maple-quartz18/Metal-Rust.git?rev=0aa2a1f694adf1a7e3ba877cc799e114d639df16#0aa2a1f694adf1a7e3ba877cc799e114d639df16"
 dependencies = [
  "metal-rust-ffi",
  "raw-window-handle",
@@ -2140,7 +2140,7 @@ dependencies = [
 [[package]]
 name = "metal-rust-ffi"
 version = "1.0.0"
-source = "git+https://github.com/maple-quartz18/Metal-Rust.git?rev=e67e0fe6007f773a99debca0cfdb111cf49b792c#e67e0fe6007f773a99debca0cfdb111cf49b792c"
+source = "git+https://github.com/maple-quartz18/Metal-Rust.git?rev=0aa2a1f694adf1a7e3ba877cc799e114d639df16#0aa2a1f694adf1a7e3ba877cc799e114d639df16"
 dependencies = [
  "block2 0.6.2",
  "cc",
@@ -3459,6 +3459,7 @@ dependencies = [
  "anyhow",
  "bcpack-rs",
  "flate2",
+ "glam",
  "image",
  "opus",
  "rayon",

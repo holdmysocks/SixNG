@@ -1057,6 +1057,35 @@ impl App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
                     if let Some(renderer) = metal4_renderer.as_deref_mut() {
+                        let mut msaa = renderer.msaa_level();
+                        egui::ComboBox::from_id_salt("metal4-msaa")
+                            .selected_text(format!(
+                                "MSAA {} ({})",
+                                msaa,
+                                if msaa > 0 && renderer.msaa_sample_count() == 1 {
+                                    "1x fallback".to_string()
+                                } else if renderer.msaa_sample_count() == 1 {
+                                    "Off".to_string()
+                                } else {
+                                    format!("{}x", renderer.msaa_sample_count())
+                                }
+                            ))
+                            .show_ui(ui, |ui| {
+                                for (level, label) in [
+                                    (0, "Off"),
+                                    (1, "2x"),
+                                    (2, "4x"),
+                                    (3, "8x"),
+                                    (4, "16x"),
+                                ] {
+                                    ui.selectable_value(&mut msaa, level, label);
+                                }
+                            });
+                        if msaa != renderer.msaa_level() {
+                            if let Err(error) = renderer.set_msaa_level(msaa) {
+                                eprintln!("[metal4-msaa] failed to apply level {msaa}: {error:#}");
+                            }
+                        }
                         let mut mode = renderer.temporal_upscale_mode();
                         egui::ComboBox::from_id_salt("metalfx-temporal-mode")
                             .selected_text(match mode {
@@ -2093,6 +2122,10 @@ impl App {
             m.cam.pitch = v;
         }
         m.zoom_after_load = c.f("zoom");
+        // --skin-detail off: ped skin without the engine detail (also SIXNG_SKIN_DETAIL=0)
+        if let Some(v) = c.get("skin-detail") {
+            m.look.skin_detail = !matches!(v.to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no");
+        }
         // --body <weight>,<muscle>[,<breasts>,<butt>] (-1..1, 0..1, -1..1,
         // 0..1; missing values are 0) or a --body-shape spec
         // (gcweightbelly=0.5,gcbutt=1,...): body shape of characters, kept
