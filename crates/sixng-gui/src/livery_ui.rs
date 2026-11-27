@@ -822,6 +822,10 @@ impl State {
             ui.selectable_value(&mut s.uv_set, 0, "first");
             ui.selectable_value(&mut s.uv_set, 1, "second").on_hover_text("On box walls the second UV set is a flat unwrap at one scale. (The game's own layouts mostly use the third set, which only their placements read.)");
         });
+        if let Some(set) = set.as_ref().filter(|set| set.islands > 1 && set.main_share < 0.97) {
+            ui.label(egui::RichText::new(format!("These zones are unwrapped in {} pieces; the sticker is laid out on the largest ({:.0} % of their area).", set.islands, set.main_share * 100.0)).weak().small())
+                .on_hover_text("A panel's outer skin, its edges and its inner faces can lie apart in the texture. A sticker cannot run from one piece onto another.");
+        }
         ui.separator();
         // placement
         ui.label(egui::RichText::new("Place").strong());

@@ -186,6 +186,80 @@ pub struct Zone {
     /// unwrapped elsewhere stretch the box, not these).
     pub uv_sum: [Vec2; 2],
     pub uv_sq: [Vec2; 2],
+    /// Per UV set: the zone's share of each UV island it lies on.
+    pub islands: [Vec<Island>; 2],
+}
+
+/// A zone's share of one UV island: a patch of faces that hang together in
+/// the UV set. `id` numbers the island within the model slot and UV set, so
+/// neighbouring zones on one island (a wing and a door unwrapped as one
+/// piece) share it.
+#[derive(Clone, Copy, Debug)]
+pub struct Island {
+    pub id: u32,
+    /// Mapped surface area, square metres.
+    pub area: f32,
+    pub lo: Vec2,
+    pub hi: Vec2,
+    /// Area-weighted sums, as `Zone::uv_sum`, `uv_sq`, `du`, `dv`.
+    pub sum: Vec2,
+    pub sq: Vec2,
+    pub du: Vec3,
+    pub dv: Vec3,
+}
+
+impl Island {
+    fn new(id: u32) -> Island {
+        Island { id, area: 0.0, lo: Vec2::splat(f32::MAX), hi: Vec2::splat(f32::MIN), sum: Vec2::ZERO, sq: Vec2::ZERO, du: Vec3::ZERO, dv: Vec3::ZERO }
+    }
+
+    fn add(&mut self, o: &Island) {
+        self.area += o.area;
+        self.lo = self.lo.min(o.lo);
+        self.hi = self.hi.max(o.hi);
+        self.sum += o.sum;
+        self.sq += o.sq;
+        self.du += o.du;
+        self.dv += o.dv;
+    }
+}
+
+/// UV islands of a model: faces that share a UV point (in the same slot and
+/// UV set) are on one island.
+#[derive(Default)]
+struct Islands {
+    parent: Vec<u32>,
+    nodes: std::collections::HashMap<(u8, u8, i32, i32), u32>,
+}
+
+impl Islands {
+    fn node(&mut self, slot: u8, set: usize, uv: Vec2) -> u32 {
+        // a 4096th of the texture: split vertices of a seam hold the same
+        // numbers, and separate islands lie further apart than this
+        let key = (slot, set as u8, (uv.x * 4096.0).round() as i32, (uv.y * 4096.0).round() as i32);
+        let next = self.parent.len() as u32;
+        let n = *self.nodes.entry(key).or_insert(next);
+        if n == next {
+            self.parent.push(next);
+        }
+        n
+    }
+
+    fn find(&mut self, mut n: u32) -> u32 {
+        while self.parent[n as usize] != n {
+            let up = self.parent[self.parent[n as usize] as usize];
+            self.parent[n as usize] = up;
+            n = up;
+        }
+        n
+    }
+
+    fn join(&mut self, a: u32, b: u32) {
+        let (a, b) = (self.find(a), self.find(b));
+        if a != b {
+            self.parent[a.max(b) as usize] = a.min(b);
+        }
+    }
 }
 
 impl Zone {
@@ -225,6 +299,24 @@ impl Zones {
     /// (slot 1 first).
     pub fn of(m: &glb::Model, parts: &[String]) -> Zones {
         let mut zones: BTreeMap<(u8, u8), Zone> = BTreeMap::new();
+        // first the UV islands, over every face that can take a sticker
+        // (also the faces on a border between two zones: they tie the
+        // islands of neighbouring zones together)
+        let mut isl = Islands::default();
+        for me in &m.meshes {
+            for t in me.indices.chunks_exact(3) {
+                let v = [&me.verts[t[0] as usize], &me.verts[t[1] as usize], &me.verts[t[2] as usize]];
+                if v[0].zone[2] == 0 {
+                    continue;
+                }
+                for set in 0..2 {
+                    let slot = v[0].zone[1];
+                    let n = v.map(|q| isl.node(slot, set, Vec2::from(if set == 0 { q.uv0 } else { q.uv1 })));
+                    isl.join(n[0], n[1]);
+                    isl.join(n[0], n[2]);
+                }
+            }
+        }
         for me in &m.meshes {
             for t in me.indices.chunks_exact(3) {
                 let v = [&me.verts[t[0] as usize], &me.verts[t[1] as usize], &me.verts[t[2] as usize]];
@@ -256,14 +348,25 @@ impl Zones {
                         z.uv_hi[set] = z.uv_hi[set].max(q);
                     }
                     // [e1 e2] = [du dv] * [d1 d2]
-                    z.du[set] += (e1 * d2.y - e2 * d1.y) / det * area;
-                    z.dv[set] += (e2 * d1.x - e1 * d2.x) / det * area;
+                    let (du, dv) = ((e1 * d2.y - e2 * d1.y) / det * area, (e2 * d1.x - e1 * d2.x) / det * area);
+                    z.du[set] += du;
+                    z.dv[set] += dv;
                     z.uv_area[set] += area;
                     let c = (uv[0] + uv[1] + uv[2]) / 3.0;
                     // a triangle's own spread about its centre: (sum of squared corner offsets) / 12
                     let own = ((uv[0] - c) * (uv[0] - c) + (uv[1] - c) * (uv[1] - c) + (uv[2] - c) * (uv[2] - c)) / 12.0;
                     z.uv_sum[set] += c * area;
                     z.uv_sq[set] += (c * c + own) * area;
+                    let n = isl.node(key.0, set, uv[0]);
+                    let id = isl.find(n);
+                    let at = match z.islands[set].iter().position(|i| i.id == id) {
+                        Some(at) => at,
+                        None => {
+                            z.islands[set].push(Island::new(id));
+                            z.islands[set].len() - 1
+                        }
+                    };
+                    z.islands[set][at].add(&Island { id, area, lo: uv[0].min(uv[1]).min(uv[2]), hi: uv[0].max(uv[1]).max(uv[2]), sum: c * area, sq: (c * c + own) * area, du, dv });
                 }
             }
         }
@@ -294,36 +397,44 @@ impl Zones {
         };
         let chosen: Vec<&Zone> = zones.iter().filter_map(|z| self.zones.get(&(slot, *z))).filter(|z| z.uv_area[uv_set] > 0.0).collect();
         let solid = chosen.iter().any(|z| fill(z) >= 0.3);
-        let (mut sum, mut sq) = (Vec2::ZERO, Vec2::ZERO);
+        // The chosen zones' faces by UV island. A zone can be unwrapped in
+        // several pieces that lie apart in the texture (a rear quarter: the
+        // outer skin, the door shut, the arch lip); the mean of them all is
+        // a place between the pieces, on none of them.
+        let mut islands: Vec<Island> = Vec::new();
         for z in chosen {
             let a = z.uv_area[uv_set];
+            s.normal += z.normal;
+            s.area += z.area;
             if solid && fill(z) < 0.3 {
-                s.normal += z.normal;
-                s.area += z.area;
                 continue;
             }
-            sum += z.uv_sum[uv_set];
-            sq += z.uv_sq[uv_set];
-            s.normal += z.normal;
-            s.du += z.du[uv_set] * a;
-            s.dv += z.dv[uv_set] * a;
+            for i in &z.islands[uv_set] {
+                match islands.iter_mut().find(|o| o.id == i.id) {
+                    Some(o) => o.add(i),
+                    None => islands.push(*i),
+                }
+            }
             s.uv_lo = s.uv_lo.min(z.uv_lo[uv_set]);
             s.uv_hi = s.uv_hi.max(z.uv_hi[uv_set]);
-            s.area += z.area;
             w += a;
         }
-        if w <= 0.0 {
+        // the largest island is the panel; a sticker is laid out on it
+        let main = islands.iter().max_by(|a, b| a.area.total_cmp(&b.area))?;
+        if w <= 0.0 || main.area <= 0.0 {
             return None;
         }
-        s.du /= w;
-        s.dv /= w;
+        s.du = main.du / main.area;
+        s.dv = main.dv / main.area;
         s.normal = s.normal.normalize_or_zero();
+        s.islands = islands.len();
+        s.main_share = main.area / w;
         // the box of the bulk: mean +- sqrt(3) standard deviations (exactly
-        // the box of an evenly filled rectangle), inside the full box
-        let mean = sum / w;
-        let half = ((sq / w - mean * mean).max(Vec2::ZERO)).powf(0.5) * 3f32.sqrt();
-        s.fit_lo = (mean - half).max(s.uv_lo);
-        s.fit_hi = (mean + half).min(s.uv_hi);
+        // the box of an evenly filled rectangle), inside the island's box
+        let mean = main.sum / main.area;
+        let half = ((main.sq / main.area - mean * mean).max(Vec2::ZERO)).powf(0.5) * 3f32.sqrt();
+        s.fit_lo = (mean - half).max(main.lo);
+        s.fit_hi = (mean + half).min(main.hi);
         Some(s)
     }
 }
@@ -342,6 +453,11 @@ pub struct ZoneSet {
     pub fit_lo: Vec2,
     pub fit_hi: Vec2,
     pub area: f32,
+    /// How many UV islands the zones lie on, and the largest one's share
+    /// of their mapped area. The layout (`du`, `dv`, the fit box) is the
+    /// largest island's.
+    pub islands: usize,
+    pub main_share: f32,
 }
 
 impl ZoneSet {
@@ -734,7 +850,7 @@ impl Zones {
                     .values()
                     .filter(|z| z.slot as usize == slot)
                     .map(|z| {
-                        let set = |k: usize| serde_json::json!({"lo": z.uv_lo[k].to_array(), "hi": z.uv_hi[k].to_array(), "metres_per_unit": [z.du[k].length(), z.dv[k].length()], "mapped_area": z.uv_area[k]});
+                        let set = |k: usize| serde_json::json!({"lo": z.uv_lo[k].to_array(), "hi": z.uv_hi[k].to_array(), "metres_per_unit": [z.du[k].length(), z.dv[k].length()], "mapped_area": z.uv_area[k], "islands": z.islands[k].iter().map(|i| serde_json::json!({"area": i.area, "lo": i.lo.to_array(), "hi": i.hi.to_array()})).collect::<Vec<_>>()});
                         serde_json::json!({"zone": z.zone, "side": z.side(), "triangles": z.triangles, "area_m2": z.area, "centre": z.centre.to_array(), "normal": z.normal.normalize_or_zero().to_array(), "uv": [set(0), set(1)]})
                     })
                     .collect();
@@ -861,6 +977,47 @@ mod tests {
         assert!((c[0] - 0.5).abs() < 1e-4 && (c[1] - 0.5).abs() < 1e-4);
         // 80 % of 4 m wide is 3.2 m; at 4:1 that is 0.8 m high, which fits 2 m
         assert!((size[0] - 3.2).abs() < 1e-3 && (size[1] - 0.8).abs() < 1e-3, "{size:?}");
+    }
+
+    #[test]
+    fn a_first_placement_lies_on_the_largest_uv_island() {
+        // the wall on the left half of the texture, and a small strip of
+        // the same zone unwrapped far away, turned a quarter
+        let mut m = quad(3, false);
+        for v in &mut m.meshes[0].verts {
+            v.uv0[0] *= 0.5;
+        }
+        let v = |x: f32, y: f32, u: f32, w: f32| glb::Vertex { pos: [x, y, 0.0], nrm: [0.0, 0.0, 1.0], uv0: [u, w], uv1: [u, w], zone: [3, 0, 1, 0], ..Default::default() };
+        m.meshes[0].verts.extend([v(2.0, 0.0, 0.9, 0.9), v(2.5, 0.0, 0.9, 0.95), v(2.5, 2.0, 1.0, 0.95), v(2.0, 2.0, 1.0, 0.9)]);
+        m.meshes[0].indices.extend([4, 5, 6, 4, 6, 7]);
+        let z = Zones::of(&m, &[]);
+        assert_eq!(z.zones[&(0, 3)].islands[0].len(), 2);
+        let set = z.set(0, &[3], 0).unwrap();
+        assert_eq!(set.islands, 2);
+        assert!((set.main_share - 8.0 / 9.0).abs() < 1e-3, "{}", set.main_share);
+        let (c, size) = set.fit(4.0);
+        // the middle of the wall, not a place between the two pieces
+        assert!((c[0] - 0.25).abs() < 1e-4 && (c[1] - 0.5).abs() < 1e-4, "{c:?}");
+        // and the wall's own scale: 8 m per unit of U, 2 m per unit of V
+        assert!((set.scale().x - 8.0).abs() < 1e-3 && (set.scale().y - 2.0).abs() < 1e-3, "{:?}", set.scale());
+        assert!((size[0] - 3.2).abs() < 1e-3 && (size[1] - 0.8).abs() < 1e-3, "{size:?}");
+    }
+
+    #[test]
+    fn neighbouring_zones_on_one_island_are_fitted_together() {
+        // two zones side by side on one continuous unwrap
+        let mut m = quad(3, false);
+        let mut other = quad(4, false).meshes.remove(0);
+        for v in &mut other.verts {
+            v.pos[0] += 4.0;
+            v.uv0[0] += 1.0;
+        }
+        m.meshes.push(other);
+        let z = Zones::of(&m, &[]);
+        let set = z.set(0, &[3, 4], 0).unwrap();
+        assert_eq!(set.islands, 1);
+        let (c, _) = set.fit(4.0);
+        assert!((c[0] - 1.0).abs() < 1e-4, "{c:?}");
     }
 
     #[test]
