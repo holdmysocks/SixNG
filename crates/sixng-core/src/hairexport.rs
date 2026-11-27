@@ -18,12 +18,20 @@
 //! - `COLOR_0` (when the piece's colours are known, `HairColour`): the
 //!   strand's colour at that point, linear RGB.
 //!
+//! Before the strands are grown, the guides are settled as the viewer
+//! settles them (`Groom::settle_in`: gravity, rest lengths, the pull back
+//! to the stored shape), out of the body's colliders
+//! (`character_colliders`: the body bound's round pieces and boxes and
+//! those of the garments, as the viewer builds them) and, for scalp hair
+//! under a hat, inside its crown; the strands are then grown with the
+//! style pass damped near the colliders (`Groom::coat_with`).
+//!
 //! Each mesh's extras give `points_per_strand`, `strands`, the piece's slot,
 //! placeholder, bone and groom offset, and in a character export
 //! `head_mesh` and `head_uv_set`: the head mesh and which of its UV sets
 //! (`TEXCOORD_n`) the root UVs are coordinates in (`root_uv_set`).
 use crate::gltf::StrandPrim;
-use crate::groom::{Coat, Groom, Shell};
+use crate::groom::{Coat, Colliders, Cuboid, Groom, Shell, Taper};
 use serde_json::{json, Value};
 
 /// How much of the hair to write.
@@ -37,11 +45,14 @@ pub struct Options {
     pub points: usize,
     /// Also write each piece's guide strands, as `<piece>_guides`.
     pub guides: bool,
+    /// Settle the guides before growing the strands (`Groom::settle_in`),
+    /// as the viewer does; false keeps the stored guides.
+    pub settle: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { density: 1.0, max_strands: 0, points: 0, guides: true }
+        Options { density: 1.0, max_strands: 0, points: 0, guides: true, settle: true }
     }
 }
 
@@ -230,27 +241,36 @@ pub fn coat_uvs(g: &Groom, c: &Coat) -> Vec<[f32; 2]> {
 /// guides). Returns the pieces and a summary
 /// (strands written, stored, guides, points pressed).
 pub fn piece(g: &Groom, name: &str, o: &Options, colour: Option<&HairColour>, hat: Option<&Shell>, extras: Value) -> (Vec<StrandPrim>, Value) {
-    piece_with(g, name, o, colour, None, hat, extras)
+    piece_with(g, name, o, colour, None, None, hat, extras)
 }
 
 /// `piece`, with the grown strands' widths from the parameter ramps of
-/// their variants (`ramp_width`) when `params` is given.
-pub fn piece_with(g: &Groom, name: &str, o: &Options, colour: Option<&HairColour>, params: Option<&[crate::hairtone::ParamRamp; 4]>, hat: Option<&Shell>, extras: Value) -> (Vec<StrandPrim>, Value) {
+/// their variants (`ramp_width`) when `params` is given, and the guides
+/// settled out of `colliders` and the strands' style pass damped near them
+/// (`Groom::settle_in`, `Groom::coat_with`; with `o.settle`).
+#[allow(clippy::too_many_arguments)]
+pub fn piece_with(g: &Groom, name: &str, o: &Options, colour: Option<&HairColour>, params: Option<&[crate::hairtone::ParamRamp; 4]>, colliders: Option<&Colliders>, hat: Option<&Shell>, extras: Value) -> (Vec<StrandPrim>, Value) {
     let k = g.points_per_strand;
     let mut out = Vec::new();
     let mut pressed = 0;
+    let mut settled = false;
     let under;
-    let g = match hat {
-        Some(h) => {
-            let mut c = g.clone();
-            pressed += h.press_strands(&mut c.points, k, 0.003);
-            under = c;
-            &under
+    let g = if o.settle || hat.is_some() {
+        let mut c = g.clone();
+        // the guides as the viewer settles them: scalp hair under a hat inside its crown
+        if o.settle {
+            settled = c.settle_in(colliders, hat.and_then(|h| h.crown.as_ref()));
         }
-        None => g,
+        if let Some(h) = hat {
+            pressed += h.press_strands(&mut c.points, k, 0.003);
+        }
+        under = c;
+        &under
+    } else {
+        g
     };
     let sh = share(g, o);
-    let mut coat = g.coat(sh);
+    let mut coat = g.coat_with(sh, colliders);
     if let Some(h) = hat {
         pressed += h.press_strands(&mut coat.points, k, 0.003);
     }
@@ -270,7 +290,7 @@ pub fn piece_with(g: &Groom, name: &str, o: &Options, colour: Option<&HairColour
         out.push(prim(g, format!("{name}_guides"), k, &g.points, &g.root_uv, &[], &[], None, params, o, ex));
     }
     let summary = json!({"name": name, "written": if grown { coat.guides.len() } else { g.strands }, "stored": g.stored_strands(), "guides": g.strands,
-        "points_per_strand": if o.points >= 2 { o.points } else { k }, "grown": grown, "hat_pressed": hat.map(|_| pressed)});
+        "points_per_strand": if o.points >= 2 { o.points } else { k }, "grown": grown, "settled": settled, "colliders": colliders.is_some(), "hat_pressed": hat.map(|_| pressed)});
     (out, summary)
 }
 
@@ -437,7 +457,135 @@ pub fn hat_shell(b: &[u8], hats: &[String]) -> Option<Shell> {
             hi[a] = hi[a].max(p[a]);
         }
     }
-    Some(Shell::new([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, top - 0.10], &hat, &head).with_lining(tris))
+    Some(Shell::new([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, top - 0.10], &hat, &head).with_lining(tris).with_crown(&hat))
+}
+
+/// A GLB's JSON and binary chunk.
+fn glb_parts(b: &[u8]) -> Option<(Value, &[u8])> {
+    if b.len() < 20 || &b[0..4] != b"glTF" {
+        return None;
+    }
+    let jl = u32::from_le_bytes(b[12..16].try_into().ok()?) as usize;
+    let doc: Value = serde_json::from_slice(b.get(20..20 + jl)?).ok()?;
+    let bo = 20 + jl;
+    let bl = u32::from_le_bytes(b.get(bo..bo + 4)?.try_into().ok()?) as usize;
+    Some((doc, b.get(bo + 8..bo + 8 + bl)?))
+}
+
+/// Float accessor `i` of a GLB as its values in order.
+fn glb_floats(doc: &Value, bin: &[u8], i: &Value) -> Option<Vec<f32>> {
+    let a = &doc["accessors"][i.as_u64()? as usize];
+    if a["componentType"].as_u64()? != 5126 {
+        return None;
+    }
+    let w = match a["type"].as_str()? {
+        "SCALAR" => 1,
+        "VEC2" => 2,
+        "VEC3" => 3,
+        "VEC4" => 4,
+        "MAT4" => 16,
+        _ => return None,
+    };
+    let v = &doc["bufferViews"][a["bufferView"].as_u64()? as usize];
+    let off = (v["byteOffset"].as_u64().unwrap_or(0) + a["byteOffset"].as_u64().unwrap_or(0)) as usize;
+    let n = a["count"].as_u64()? as usize * w;
+    let raw = bin.get(off..off + n * 4)?;
+    Some(raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+}
+
+/// The joints of a model GLB the exporters wrote: per joint of its first
+/// skin, its node name and inverse bind matrix (glTF space, column-major).
+pub fn glb_joints(b: &[u8]) -> Vec<(String, [f32; 16])> {
+    let Some((doc, bin)) = glb_parts(b) else { return Vec::new() };
+    let skin = &doc["skins"][0];
+    let Some(joints) = skin["joints"].as_array() else { return Vec::new() };
+    let ibm = glb_floats(&doc, bin, &skin["inverseBindMatrices"]).unwrap_or_default();
+    joints
+        .iter()
+        .enumerate()
+        .filter_map(|(i, j)| {
+            let name = doc["nodes"][j.as_u64()? as usize]["name"].as_str()?.to_string();
+            let m: [f32; 16] = ibm.get(i * 16..i * 16 + 16).and_then(|s| s.try_into().ok()).unwrap_or([1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+            Some((name, m))
+        })
+        .collect()
+}
+
+/// The round pieces and boxes of the body bound `name` (`fragphys::body_pieces`)
+/// placed on the bind pose of `joints` (`glb_joints`: names and inverse
+/// bind matrices in glTF space), in RAGE model space (Z-up): the game frame
+/// of a joint is C^T W C, C the turn from Z-up to Y-up. Empty when there is
+/// no such bound.
+pub fn body_bound(a: &crate::game::ArchiveInfo, entries: &[crate::scan::Entry], name: &str, joints: &[(String, [f32; 16])]) -> (Vec<Taper>, Vec<Cuboid>) {
+    use glam::{Mat4, Vec3};
+    let Some(e) = entries.iter().find(|e| e.rtype.as_deref() == Some("ft") && e.name.as_deref() == Some(name)) else { return Default::default() };
+    let Ok(r) = crate::resource::Resource::load(&a.path, e) else { return Default::default() };
+    let c = Mat4::from_cols_array(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+    let bone: std::collections::HashMap<u32, Mat4> = joints.iter().map(|(n, ibm)| (crate::meta7a::joaat(n), c.transpose() * Mat4::from_cols_array(ibm).inverse() * c)).collect();
+    let (mut tapers, mut boxes) = (Vec::new(), Vec::new());
+    for p in crate::fragphys::body_pieces(&r) {
+        let Some(b) = bone.get(&p.bone_hash) else { continue };
+        let m = *b * Mat4::from_cols_array(&p.local);
+        if p.kind == 3 {
+            let [lo, hi] = p.bbox.map(Vec3::from);
+            let axes = [m.x_axis, m.y_axis, m.z_axis].map(|v| v.truncate());
+            let half: [f32; 3] = std::array::from_fn(|i| (hi[i] - lo[i]) / 2.0 * axes[i].length());
+            boxes.push(Cuboid { centre: m.transform_point3((lo + hi) / 2.0).into(), axes: axes.map(|v| v.normalize_or_zero().into()), half });
+        } else {
+            let h = p.length / 2.0;
+            tapers.push(Taper { a: m.transform_point3(Vec3::new(0.0, h, 0.0)).into(), b: m.transform_point3(Vec3::new(0.0, -h, 0.0)).into(), ra: p.r_pos, rb: p.r_neg });
+        }
+    }
+    (tapers, boxes)
+}
+
+/// The colliders a character's strand hair settles against, as the viewer
+/// builds them from a model GLB the exporters wrote (nodes named
+/// `<drawable>/<geometry>`): the round pieces and boxes of the body bound
+/// of its rig (`defaultfemale_fr1_000_bounds` for `_fr1_` parts,
+/// `defaultmale_mr1_000_bounds` for `_mr1_`) and of each worn drawable's
+/// own bound (`char_bipedbounds_<sex>_<drawable>`); without a body bound,
+/// the vertices of its meshes other than hair, eyes, teeth and the hats
+/// `hats` (lower case). Returns the colliders and a note of what they are.
+pub fn character_colliders(a: &crate::game::ArchiveInfo, entries: &[crate::scan::Entry], model: &[u8], hats: &[String]) -> Option<(Colliders, String)> {
+    let (doc, bin) = glb_parts(model)?;
+    let mut drawables: Vec<String> = Vec::new();
+    for n in doc["nodes"].as_array()?.iter().filter(|n| n["mesh"].is_u64()).filter_map(|n| n["name"].as_str()) {
+        let d = n.split('/').next().unwrap_or(n).to_ascii_lowercase();
+        if !drawables.contains(&d) {
+            drawables.push(d);
+        }
+    }
+    let rig = |k: &str| drawables.iter().any(|n| n.contains(k));
+    let bound = if rig("_fr1_") { Some(("defaultfemale_fr1_000_bounds", "female")) } else if rig("_mr1_") { Some(("defaultmale_mr1_000_bounds", "male")) } else { None };
+    let joints = glb_joints(model);
+    let (mut shapes, mut boxes) = bound.map(|(b, _)| body_bound(a, entries, b, &joints)).unwrap_or_default();
+    let mut worn = 0;
+    if let (Some((_, sex)), false) = (bound, shapes.is_empty()) {
+        for n in &drawables {
+            let (t, bx) = body_bound(a, entries, &format!("char_bipedbounds_{sex}_{n}"), &joints);
+            worn += usize::from(!t.is_empty() || !bx.is_empty());
+            shapes.extend(t);
+            boxes.extend(bx);
+        }
+    }
+    if !shapes.is_empty() {
+        let note = format!("{} round pieces and {} boxes of the body bound {} and of {worn} garment bounds", shapes.len(), boxes.len(), bound.map(|b| b.0).unwrap_or_default());
+        return Some((Colliders::shapes(shapes).with_boxes(boxes), note));
+    }
+    let hairy = ["hair", "brows", "beard", "lashes", "body hair", "eyes", "eyecaps", "teeth", "teeth accessory"];
+    let mut pts: Vec<[f32; 3]> = Vec::new();
+    for node in doc["nodes"].as_array()? {
+        let (Some(name), Some(mi)) = (node["name"].as_str(), node["mesh"].as_u64()) else { continue };
+        let d = name.split('/').next().unwrap_or(name).to_ascii_lowercase();
+        if hats.contains(&d) || hairy.contains(&crate::pedlook::slot_of(&d).as_str()) {
+            continue;
+        }
+        let Some(p) = doc["meshes"][mi as usize]["primitives"].get(0).and_then(|p| glb_floats(&doc, bin, &p["attributes"]["POSITION"])) else { continue };
+        // glTF Y-up back to RAGE Z-up: (x, y, z) -> (x, -z, y)
+        pts.extend(p.chunks_exact(3).map(|c| [c[0], -c[2], c[1]]));
+    }
+    (!pts.is_empty()).then(|| (Colliders::new(&pts), format!("the vertices of the model's {} meshes other than hair, eyes, teeth and hats (no body bound)", drawables.len())))
 }
 
 /// Which of the head's UV sets a groom's root UVs belong to: at every guide
@@ -537,7 +685,7 @@ mod tests {
         let taper = [0.0, 1.0, 0.33, 1.0, 0.66, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
         let ramp = |w: f32, a: [f32; 20]| crate::hairtone::ParamRamp { width: w, mul: [1.0; 3], curves: [a, flat, flat, flat] };
         let ps = [ramp(0.0002, taper), ramp(0.0001, flat), ramp(0.0001, flat), ramp(0.0001, flat)];
-        let (p, _) = piece_with(&g, "t", &Options { points: 3, guides: false, ..Default::default() }, None, Some(&ps), None, json!({}));
+        let (p, _) = piece_with(&g, "t", &Options { points: 3, guides: false, ..Default::default() }, None, Some(&ps), None, None, json!({}));
         let (var, wid) = (&p[0].attrs.iter().find(|a| a.0 == "_VARIANT").unwrap().1, &p[0].attrs.iter().find(|a| a.0 == "_WIDTH").unwrap().1);
         let s0 = (0..wid.len() / 3).find(|&s| var[s * 3] == 0.0).unwrap();
         assert!((wid[s0 * 3] - 0.0002).abs() < 1e-7 && wid[s0 * 3 + 2] < 0.00002, "{:?}", &wid[s0 * 3..s0 * 3 + 3]);

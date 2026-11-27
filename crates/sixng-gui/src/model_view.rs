@@ -5577,25 +5577,8 @@ fn split_parts(q: &str) -> (&str, Option<Vec<u64>>) {
 /// are the game's bone frames turned to Y-up (C M C^T), so the game frame
 /// is C^T W C.
 fn body_tapers(a: &sixng_core::game::ArchiveInfo, entries: &[sixng_core::scan::Entry], name: &str, joints: &[glb::Joint]) -> (Vec<sixng_core::groom::Taper>, Vec<sixng_core::groom::Cuboid>) {
-    let Some(e) = entries.iter().find(|e| e.rtype.as_deref() == Some("ft") && e.name.as_deref() == Some(name)) else { return Default::default() };
-    let Ok(r) = sixng_core::resource::Resource::load(&a.path, e) else { return Default::default() };
-    let c = Mat4::from_cols_array(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
-    let bone: HashMap<u32, Mat4> = joints.iter().map(|j| (sixng_core::meta7a::joaat(&j.name), c.transpose() * Mat4::from_cols_array(&j.ibm).inverse() * c)).collect();
-    let (mut tapers, mut boxes) = (Vec::new(), Vec::new());
-    for p in sixng_core::fragphys::body_pieces(&r) {
-        let Some(b) = bone.get(&p.bone_hash) else { continue };
-        let m = *b * Mat4::from_cols_array(&p.local);
-        if p.kind == 3 {
-            let [lo, hi] = p.bbox.map(Vec3::from);
-            let axes = [m.x_axis, m.y_axis, m.z_axis].map(|v| v.truncate());
-            let half: [f32; 3] = std::array::from_fn(|i| (hi[i] - lo[i]) / 2.0 * axes[i].length());
-            boxes.push(sixng_core::groom::Cuboid { centre: m.transform_point3((lo + hi) / 2.0).into(), axes: axes.map(|v| v.normalize_or_zero().into()), half });
-        } else {
-            let h = p.length / 2.0;
-            tapers.push(sixng_core::groom::Taper { a: m.transform_point3(Vec3::new(0.0, h, 0.0)).into(), b: m.transform_point3(Vec3::new(0.0, -h, 0.0)).into(), ra: p.r_pos, rb: p.r_neg });
-        }
-    }
-    (tapers, boxes)
+    let joints: Vec<(String, [f32; 16])> = joints.iter().map(|j| (j.name.clone(), j.ibm)).collect();
+    sixng_core::hairexport::body_bound(a, entries, name, &joints)
 }
 
 fn load_parts(

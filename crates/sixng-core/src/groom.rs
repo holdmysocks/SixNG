@@ -1911,7 +1911,7 @@ pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], o
                 (Some(hw), Some(c)) => g.coat_glb(&name, c, hw * 2.0, &[], extras),
                 // the grown strands with their root UV, width, clump and variant (`hairexport`)
                 (None, Some(_)) => {
-                    let o = crate::hairexport::Options { density: full.unwrap_or(1.0), guides: false, ..Default::default() };
+                    let o = crate::hairexport::Options { density: full.unwrap_or(1.0), guides: false, settle: false, ..Default::default() };
                     let mut ex = serde_json::json!({"source": e.id, "groom": format!("{:x}", e.off), "bones": info.bones});
                     crate::hairexport::tag_uv_set(&g, head, &mut ex);
                     let (prims, _) = crate::hairexport::piece(&g, &name, &o, None, None, ex);
