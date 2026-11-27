@@ -88,6 +88,17 @@ mod asset_id_tests {
     }
 }
 
+/// Member types decoded as one plain value (no pointer, array, map or
+/// embedded struct). Type codes are a family in the high nibble: 0x0_
+/// bool, struct (05), pointer (07), 64-bit id (08); 0x1_ integers s8, u8,
+/// s16, u16, s32, u32, s64, u64; 0x2_ f16, f32; 0x3_ vectors and matrices;
+/// 0x4_ strings and hashes; 0x5_ arrays; 0x6_ enums (60-62) and bit sets
+/// (63-68); 0x7_ maps. Checked against the executable's parser tables on
+/// every meta file.
+pub fn is_scalar_type(t: u8) -> bool {
+    matches!(t, 0x01 | 0x08 | 0x10..=0x17 | 0x20 | 0x21 | 0x30..=0x36 | 0x42 | 0x44 | 0x4a | 0x4d | 0x4f | 0x60..=0x65 | 0x68)
+}
+
 /// A half float (member type 0x20) as f32. Infinity and NaN read as f32::MAX.
 pub fn half(h: u16) -> f32 {
     let (s, e, f) = (if h & 0x8000 != 0 { -1.0f32 } else { 1.0 }, (h >> 10) & 0x1f, (h & 0x3ff) as f32);
@@ -264,25 +275,14 @@ impl<'a> Meta<'a> {
     pub fn scalars_by_hash(&self, hash: u32, o: usize, skip: &[u32]) -> BTreeMap<u32, serde_json::Value> {
         let mut out = BTreeMap::new();
         let Some(sd) = self.structs.get(&hash) else { return out };
-        let r = self.r;
         for m in &sd.members {
             if m.hash == 0x100 || skip.contains(&m.off) {
                 continue;
             }
-            let p = o + m.off as usize;
-            let f = |i: usize| serde_json::json!(r.f32(p + 4 * i));
-            let v = match m.ty {
-                0x10 => serde_json::json!(r.sys.get(p).map(|&x| x as i8)),
-                0x11 | 0x60 => serde_json::json!(r.sys.get(p).copied()),
-                0x12 => serde_json::json!(r.u16(p) as i16),
-                0x13 => serde_json::json!(r.u16(p)),
-                0x15 | 0x4a => serde_json::json!(r.u32(p)),
-                0x21 => f(0),
-                0x32 | 0x33 => serde_json::json!([f(0), f(1), f(2)]),
-                0x34 => serde_json::json!([f(0), f(1), f(2), f(3)]),
-                0x08 | 0x4f => serde_json::json!(format!("{:016x}", r.u64(p))),
-                _ => continue,
-            };
+            if !is_scalar_type(m.ty) {
+                continue;
+            }
+            let Some(v) = self.value(sd, m, o + m.off as usize, 0) else { continue };
             out.insert(m.hash, v);
         }
         out
@@ -295,9 +295,14 @@ impl<'a> Meta<'a> {
         match el.ty {
             0x01 | 0x10 | 0x11 | 0x60 => 1,
             0x12 | 0x13 => 2,
-            0x14 | 0x15 | 0x4a | 0x21 => 4,
-            0x31 | 0x32 | 0x33 | 0x34 => 16,
-            0x08 | 0x4f | 0x07 | 0x4d => 8,
+            0x20 | 0x61 => 2,
+            0x14 | 0x15 | 0x4a | 0x21 | 0x62 => 4,
+            0x32 => 12,
+            0x31 | 0x33 | 0x34 => 16,
+            0x35 => 48,
+            0x36 => 64,
+            0x08 | 0x4f | 0x07 | 0x4d | 0x16 | 0x17 | 0x30 | 0x42 => 8,
+            0x44 => 16,
             // An array of arrays: each element is a 16-byte array header.
             0x52 => 16,
             0x05 => self.structs.get(&el.extra).map(|x| x.size as usize).unwrap_or(0),
@@ -316,7 +321,16 @@ impl<'a> Meta<'a> {
             0x13 => json!(r.u16(p)),
             0x14 => json!(r.u32(p) as i32),
             0x15 | 0x4a => json!(r.u32(p)),
+            0x16 => json!(r.u64(p) as i64),
+            0x17 => json!(r.u64(p)),
             0x21 => f(0),
+            0x30 => json!([f(0), f(1)]),
+            // 3x3 and 3x4 matrices: three or four 16-byte columns.
+            0x35 => json!((0..3).map(|c| [r.f32(p + 16 * c), r.f32(p + 16 * c + 4), r.f32(p + 16 * c + 8)]).collect::<Vec<_>>()),
+            0x36 => json!((0..4).map(|c| [r.f32(p + 16 * c), r.f32(p + 16 * c + 4), r.f32(p + 16 * c + 8)]).collect::<Vec<_>>()),
+            // Enums: 8-, 16- and 32-bit values (0x60 is above, with u8).
+            0x61 => json!(r.u16(p)),
+            0x62 => json!(r.u32(p)),
             0x32 | 0x33 => json!([f(0), f(1), f(2)]),
             0x34 | 0x31 => json!([f(0), f(1), f(2), f(3)]),
             0x08 | 0x4f => json!(format!("{:016x}", r.u64(p))),
@@ -367,12 +381,16 @@ impl<'a> Meta<'a> {
             // Bit set / flags: `reference` bits, stored as 64-bit words, lowest
             // first. Printed as one hex number (16 digits per word, highest
             // word first), so a set of up to 64 bits is its single word.
-            0x65 => {
-                let words = (m.reference as usize).div_ceil(64).clamp(1, 16);
-                json!((0..words).rev().map(|w| format!("{:016x}", r.u64(p + 8 * w))).collect::<String>())
+            // 0x63, 0x64, 0x65 and 0x68 store the bits in 8-, 16-, 32- and
+            // 64-bit words (the member sizes in every meta file agree);
+            // `reference` 0 (one 256-bit set) takes 32 bytes.
+            0x63 | 0x64 | 0x65 | 0x68 => {
+                let wb = match m.ty { 0x63 => 1, 0x64 => 2, 0x65 => 4, _ => 8 };
+                let bits = if m.reference == 0 { 256 } else { m.reference as usize };
+                let words = bits.div_ceil(wb * 8).clamp(1, 64);
+                let bytes = r.sys.get(p..p + words * wb).unwrap_or(&[]);
+                json!(bytes.iter().rev().map(|b| format!("{b:02x}")).collect::<String>())
             }
-            // Tagged value (PSO, 16 bytes): u32 tag, then payload.
-            0x62 => json!({"tag": r.u32(p), "u32": [r.u32(p + 4), r.u32(p + 8), r.u32(p + 12)], "f32": [r.f32(p + 4), r.f32(p + 8), r.f32(p + 12)]}),
             // 64-bit hash (PSO).
             0x4d => json!(format!("{:016x}", r.u64(p))),
             // Array, count first (PSO): u32 count, u32 capacity, u64 pointer.
@@ -411,6 +429,17 @@ impl<'a> Meta<'a> {
             }
             // Half float (2 bytes).
             0x20 => json!(half(r.u16(p))),
+            // Strings: 0x42 a pointer to NUL-terminated text, 0x44 the same
+            // pointer followed by a u16 length (16 bytes).
+            0x42 | 0x44 => match self.ptr(r.u64(p)) {
+                Some((_, o)) => {
+                    let max = if m.ty == 0x44 { r.u16(p + 8) as usize } else { 4096 };
+                    let b = r.sys.get(o..(o + max.min(4096)).min(r.sys.len())).unwrap_or(&[]);
+                    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+                    json!(String::from_utf8_lossy(&b[..end]))
+                }
+                None => serde_json::Value::Null,
+            },
             _ => json!({"type": m.ty, "sub": m.sub, "hex": r.sys.get(p..p + 16).map(|b| b.iter().map(|x| format!("{x:02x}")).collect::<String>())}),
         })
     }
@@ -794,6 +823,36 @@ pub fn mlo_instances(m: &Meta) -> Vec<MloInstance> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn member_types_from_the_parser_tables() {
+        // one struct: u32 enum, 6-bit set (32-bit words), 40-bit set,
+        // 8-byte vec2, s32, a string pointer into block 2, then u64
+        let mut sys = vec![0u8; 0x80];
+        sys[0..4].copy_from_slice(&5u32.to_le_bytes());
+        sys[4..8].copy_from_slice(&0x2au32.to_le_bytes());
+        sys[8..16].copy_from_slice(&0x0000_0081_0000_0003u64.to_le_bytes());
+        sys[16..20].copy_from_slice(&1.5f32.to_le_bytes());
+        sys[20..24].copy_from_slice(&(-2.0f32).to_le_bytes());
+        sys[24..28].copy_from_slice(&(-7i32).to_le_bytes());
+        sys[32..40].copy_from_slice(&2u64.to_le_bytes());
+        sys[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+        sys[0x60..0x63].copy_from_slice(b"ab\0");
+        let r = Resource { sys, gfx: vec![], gfx_base: 0 };
+        let mem = |hash, off, ty, reference| Member { hash, off, ty, sub: 0, reference, extra: 0 };
+        let sd = StructDef { hash: 0x1234, size: 48, members: vec![mem(1, 0, 0x62, 0), mem(2, 4, 0x65, 6), mem(3, 8, 0x65, 40), mem(4, 16, 0x30, 0), mem(5, 24, 0x14, 0), mem(6, 32, 0x42, 0), mem(7, 40, 0x17, 0)] };
+        let m = Meta { r: &r, structs: [(0x1234, sd)].into_iter().collect(), blocks: vec![(0x1234, 48, 0), (0x10, 3, 0x60)], pso: false };
+        let v = m.scalars_by_hash(0x1234, 0, &[]);
+        assert_eq!(v[&1], serde_json::json!(5));
+        // a 6-bit set is one 32-bit word: the neighbouring field is not read
+        assert_eq!(v[&2], serde_json::json!("0000002a"));
+        assert_eq!(v[&3], serde_json::json!("0000008100000003"));
+        assert_eq!(v[&4], serde_json::json!([1.5, -2.0]));
+        assert_eq!(v[&5], serde_json::json!(-7));
+        assert_eq!(v[&6], serde_json::json!("ab"));
+        assert_eq!(v[&7], serde_json::json!(u64::MAX));
+        assert!(is_scalar_type(0x01) && !is_scalar_type(0x05) && !is_scalar_type(0x52));
+    }
 
     #[test]
     fn entity_lod_names() {
