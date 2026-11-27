@@ -63,6 +63,46 @@ pub struct Env<'a> {
     pub game: &'a str,
     pub work: &'a str,
     pub cache: &'a Path,
+    /// The vehicle's configuration shown (None: the user's own choice of parts).
+    pub config: Option<usize>,
+}
+
+/// Export the vehicle with its livery as one GLB: what `sixng vehicle
+/// --livery` does, for the viewer's configuration.
+fn export_glb(game: &str, work: &str, vehicle: &str, config: usize, livery: &Path, glb: &Path) -> anyhow::Result<String> {
+    use anyhow::{anyhow, Context};
+    let ws = sixng_core::export::Workspace::new(game, work);
+    let file = crate::vehicle_db::VehicleDb::path(work);
+    let all: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).with_context(|| format!("read {}", file.display()))?)?;
+    let v = all["vehicles"].as_array().into_iter().flatten().find(|v| v["model"].as_str().is_some_and(|m| m.eq_ignore_ascii_case(vehicle))).ok_or_else(|| anyhow!("no vehicle named {vehicle} in {}", file.display()))?;
+    let a = ws.resolve("levels")?;
+    let ix = ws.load_index(&a)?;
+    let dir = glb.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf();
+    let (decals, left) = sixng_core::vehlivery::prepare(&ws.game, livery, &dir)?;
+    let o = sixng_core::export::ExportOptions {
+        out: dir.clone(),
+        png: true,
+        dds: false,
+        raw: false,
+        force: true,
+        skip_embedded_textures: false,
+        body_shape: Vec::new(),
+        head_skin: 0,
+        paint: None,
+        tex_remap: Default::default(),
+        ped_tints: Default::default(),
+        part_skins: Default::default(),
+        part_decorations: Default::default(),
+        part_colours: Default::default(),
+        part_hidden: Default::default(),
+    };
+    let r = sixng_core::vehexport::export_vehicle(&a, &ix, v, config, &[], &[], true, &decals, glb, &o)?;
+    let on = r["livery"]["stickers"].as_array().map_or(0, |s| s.iter().filter(|s| s["on"].as_array().is_some_and(|o| !o.is_empty())).count());
+    let mut msg = format!("exported {} with {on} of {} sticker(s), configuration {}", glb.display(), decals.len() + left.len(), config + 1);
+    for l in left.iter().chain(r["livery"]["stickers"].as_array().into_iter().flatten().filter_map(|s| s["note"].as_str()).map(|n| n.to_string()).collect::<Vec<_>>().iter()) {
+        msg.push_str(&format!("\nleft out: {l}"));
+    }
+    Ok(msg)
 }
 
 /// The panel's own state.
@@ -105,6 +145,11 @@ pub struct Editor {
     pub auto_drag: Option<[f32; 2]>,
     /// `--livery-save`: save once the scripted steps are done.
     pub auto_save: bool,
+    /// `--livery-export FILE.glb`: then export the vehicle with the livery.
+    pub auto_export: Option<PathBuf>,
+    /// An export is running; its outcome when it is done.
+    exporting: bool,
+    exported: Arc<Mutex<Option<String>>>,
     /// `--livery-brand NAME`: put on the vehicle's game livery of this name
     /// (or name hash, or number in the list) first.
     pub auto_brand: Option<String>,
@@ -142,6 +187,9 @@ impl Default for Editor {
             auto_click: Vec::new(),
             auto_drag: None,
             auto_save: false,
+            auto_export: None,
+            exporting: false,
+            exported: Default::default(),
             auto_brand: None,
             brands: Default::default(),
             brands_started: false,
@@ -274,7 +322,7 @@ impl Editor {
 
     /// Scripted steps are still to run.
     fn scripting(&self) -> bool {
-        self.auto_select.is_some() || !self.auto_add.is_empty() || !self.auto_click.is_empty() || self.auto_drag.is_some() || self.auto_save || self.auto_brand.is_some()
+        self.auto_select.is_some() || !self.auto_add.is_empty() || !self.auto_click.is_empty() || self.auto_drag.is_some() || self.auto_save || self.auto_brand.is_some() || self.auto_export.is_some() || self.exporting
     }
 
     fn start_brands(&mut self, env: &Env, ctx: &egui::Context) {
@@ -478,6 +526,26 @@ impl State {
         self.changed();
     }
 
+    /// Export the vehicle with the stickers as they are now (saved or not)
+    /// to `glb`, on a thread; the outcome goes to the status line.
+    fn export_to(&mut self, glb: PathBuf, env: &Env, ctx: &egui::Context) {
+        // the stickers as shown, beside the GLB (also a record of what is on it)
+        let copy = glb.with_extension("livery.json");
+        if let Err(e) = livery::save(&copy, &self.livery) {
+            self.status = format!("not exported: {e:#}");
+            return;
+        }
+        self.ed.exporting = true;
+        self.status = format!("exporting {} …", glb.display());
+        let (game, work, vehicle, config) = (env.game.to_string(), env.work.to_string(), self.vehicle.clone(), env.config.unwrap_or(0));
+        let (out, ctx) = (self.ed.exported.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let r = export_glb(&game, &work, &vehicle, config, &copy, &glb).unwrap_or_else(|e| format!("not exported: {e:#}"));
+            *out.lock().unwrap() = Some(r);
+            ctx.request_repaint();
+        });
+    }
+
     fn save_to(&mut self, file: &Path) {
         match livery::save(file, &self.livery) {
             Ok(()) => {
@@ -570,6 +638,16 @@ impl State {
                 self.changed();
             }
             ui.menu_button("File", |ui| {
+                let hint = match env.config {
+                    Some(c) => format!("Write the vehicle (configuration {}) with these stickers as one GLB, for Blender and other programs. Each sticker is a mesh of its own, just above the surface, with its picture beside the file. The same as: sixng vehicle {} --config {c} --livery -o FILE.glb", c + 1, self.vehicle),
+                    None => "Write the vehicle with these stickers as one GLB. The parts are those of its first configuration: your own choice of parts is not carried over.".to_string(),
+                };
+                if ui.add_enabled(!self.ed.exporting && !self.livery.stickers.is_empty(), egui::Button::new("Export the vehicle as GLB…")).on_hover_text(hint).clicked() {
+                    if let Some(p) = rfd::FileDialog::new().add_filter("glTF binary", &["glb"]).set_file_name(format!("{}_livery.glb", self.vehicle)).save_file() {
+                        self.export_to(p, env, ui.ctx());
+                    }
+                    ui.close();
+                }
                 if ui.button("Save a copy…").clicked() {
                     if let Some(p) = rfd::FileDialog::new().add_filter("livery", &["json"]).set_file_name(format!("{}.json", self.vehicle)).save_file() {
                         let _ = livery::save(&p, &self.livery).map_err(|e| self.status = format!("not saved: {e:#}"));
@@ -595,6 +673,10 @@ impl State {
                 ui.label(egui::RichText::new("not saved").weak());
             }
         });
+        if let Some(r) = self.ed.exported.lock().ok().and_then(|mut e| e.take()) {
+            self.ed.exporting = false;
+            self.status = r;
+        }
         if !self.status.is_empty() {
             ui.label(egui::RichText::new(&self.status).small());
         }
@@ -822,6 +904,10 @@ impl State {
             ui.selectable_value(&mut s.uv_set, 0, "first");
             ui.selectable_value(&mut s.uv_set, 1, "second").on_hover_text("On box walls the second UV set is a flat unwrap at one scale. (The game's own layouts mostly use the third set, which only their placements read.)");
         });
+        if let Some(set) = set.as_ref().filter(|set| set.islands > 1 && set.main_share < 0.97) {
+            ui.label(egui::RichText::new(format!("These zones are unwrapped in {} pieces; the sticker is laid out on the largest ({:.0} % of their area).", set.islands, set.main_share * 100.0)).weak().small())
+                .on_hover_text("A panel's outer skin, its edges and its inner faces can lie apart in the texture. A sticker cannot run from one piece onto another.");
+        }
         ui.separator();
         // placement
         ui.label(egui::RichText::new("Place").strong());
@@ -1105,6 +1191,17 @@ impl State {
             self.ed.auto_save = false;
             let file = self.file(Path::new(env.work));
             self.save_to(&file);
+        }
+        if let Some(glb) = self.ed.auto_export.take() {
+            self.export_to(glb, env, ui.ctx());
+        }
+        // (with the panel closed nothing else collects the outcome)
+        if !self.ed.open {
+            if let Some(r) = self.ed.exported.lock().ok().and_then(|mut e| e.take()) {
+                self.ed.exporting = false;
+                eprintln!("{r}");
+                self.status = r;
+            }
         }
         let Some(i) = sel.filter(|_| self.ed.open && self.ed.tool != Tool::None) else {
             if self.highlight.hover.take().is_some() && self.ed.tool != Tool::None {

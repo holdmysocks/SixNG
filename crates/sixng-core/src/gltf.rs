@@ -382,6 +382,10 @@ pub fn mesh_glb_with(name: &str, groups: &[NodeGroup], materials: &[Material], s
             if let Some(uri) = &m.base_color_uri {
                 images.push(json!({"uri": uri}));
                 textures.push(json!({"source": images.len() - 1}));
+                // `extras.clamp`: the picture is not repeated (a sticker)
+                if m.extras["clamp"] == true {
+                    textures.last_mut().unwrap()["sampler"] = json!(1);
+                }
                 pbr["baseColorTexture"] = json!({"index": textures.len() - 1});
             }
             let mut mat = json!({"name": m.name, "doubleSided": true, "pbrMetallicRoughness": pbr, "extras": m.extras});
@@ -402,6 +406,12 @@ pub fn mesh_glb_with(name: &str, groups: &[NodeGroup], materials: &[Material], s
                         mat[k] = v.clone();
                     }
                 }
+            }
+            // {"uri": …} metallic-roughness map (skin spec maps).
+            if let Some(uri) = mat["pbrMetallicRoughness"]["metallicRoughnessTexture"]["uri"].as_str().map(|u| u.to_string()) {
+                images.push(json!({"uri": uri}));
+                textures.push(json!({"source": images.len() - 1}));
+                mat["pbrMetallicRoughness"]["metallicRoughnessTexture"] = json!({"index": textures.len() - 1});
             }
             // "emissiveTexture": "base" = light with the base-colour texture;
             // {"uri": …} = the material's own emissive map. With neither
@@ -611,9 +621,16 @@ pub fn mesh_glb_with(name: &str, groups: &[NodeGroup], materials: &[Material], s
     if !images.is_empty() {
         doc["images"] = json!(images);
         doc["textures"] = json!(textures);
+        let clamped = textures.iter().any(|t| t["sampler"] == 1);
+        doc["textures"] = json!(textures);
         doc["samplers"] = json!([{"wrapS": 10497, "wrapT": 10497}]);
+        if clamped {
+            doc["samplers"].as_array_mut().unwrap().push(json!({"wrapS": 33071, "wrapT": 33071}));
+        }
         for t in doc["textures"].as_array_mut().unwrap() {
-            t["sampler"] = json!(0);
+            if t["sampler"].is_null() {
+                t["sampler"] = json!(0);
+            }
         }
     }
     pack(&doc, b.bin)

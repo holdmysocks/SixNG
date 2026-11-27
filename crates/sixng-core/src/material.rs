@@ -224,8 +224,8 @@ pub fn paint_block() -> Value {
 pub const EMISSIVE_MULTIPLIER_PARAM: &str = "5eebed48";
 
 /// The colour of the light (float3, linear), the constant right after
-/// `emissivemultiplier` in the emissive shaders' buffer. Its name is not
-/// recovered. Neon tubes carry their colour here (light blue, red, green,
+/// `emissivemultiplier` in the emissive shaders' buffer:
+/// `emissivecolormultiplier` (found by joaat search, 2026-11-26). Neon tubes carry their colour here (light blue, red, green,
 /// yellow) over a white emissive map; LEDs with the colour in the map have
 /// white.
 pub const EMISSIVE_TINT_PARAM: &str = "7ab0fd74";

@@ -2054,6 +2054,7 @@ impl Uploader {
             ramp: None,
             parts: false,
             occlusion_only: false,
+            skin_spec: None,
             emissive_scale: 1.0,
             lit: false,
             emissive_tint: [1.0; 3],
@@ -2111,6 +2112,12 @@ impl Uploader {
                 | if mt.lit && mt.class != "emissive" { 0x1000 } else { 0 }
                 // bit 13: the packed map is a vehicle material map, blue = occlusion
                 | if mt.occlusion_only { 0x2000 } else { 0 }
+                // bit 5: the packed map is ped skin's spec map (green =
+                // roughness), with the specular factor x 100 in bits 16-23
+                | match (mt.skin_spec, mt.packed, mt.mr) {
+                    (Some(f), Some(_), None) => 0x20 | (((f.clamp(0.0, 2.55) * 100.0 + 0.5) as u32) << 16),
+                    _ => 0,
+                }
                 // bit 14: the emissive slot holds the part ramp image, whose
                 // rows 512.. are the parts' surfaces (low and high metalness
                 // and roughness)

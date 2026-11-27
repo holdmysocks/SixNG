@@ -121,6 +121,31 @@ pub const DERIVED: &[&str] = &[
     "tintmaskflags", "tintmaskheightopacity", "tintmaskmap", "tintmaskmetallic", "tintmaskmetallicopacity", "tintmaskopacity", "tintmaskrotation", "tintmaskroughness",
     "tintmaskroughnessopacity", "tintmaskscale", "tintmasktranslation", "tintmasktint", "translucencymapblendamount", "translucencymultiplier", "translucencyscale", "transmissionprofileflags",
     "transmissionroughness", "windscale",
+    // more material parameter and shader constant names (meet-in-the-middle joaat search over domain and game-name words, 2026-11-26).
+    // Each was checked beyond the hash: thinfilmior / thinfilmmaxthickness / thinfilmthicknessexponent / thinfilmuvset are the
+    // constants of every iridescence effect (the IOR one holds 1.19 to 1.70); tintpaletteselector is in exactly the 334 effects
+    // that bind tintpalettetex; hboheightscale / hboheightbias sit side by side; sheenfadealbedo is on 99.6 % of its library
+    // materials together with sheencolor; tintablepatterntranslation completes the tintablepattern family (per-layer, signed).
+    "tintablepatterntranslation", "thinfilmior", "thinfilmmaxthickness", "thinfilmthicknessexponent", "thinfilmuvset", "tintpaletteselector",
+    "hboheightscale", "hboheightbias", "translucency", "dustintensity", "sheenfadealbedo",
+    // shader constants, same search over every unnamed constant of the shader archive (2026-11-26): one- and two-word
+    // hits, and three-word ones that sit with their own family in the constant blocks (edgefade* / startfade* / endfade*
+    // and layermask* side by side in the waterfall shaders, heightblendmin / max, dirtuvscale / bias, the cloth* sheen trio
+    // next to the thin-film block) or name their shader's feature (bumpoffsetamount in standard_bumpoffset, windowopacity /
+    // windowframeparallax in standard_window, clearcoatuvscale in standard_clearcoat). emissivecolormultiplier is 7ab0fd74,
+    // the neon tube colour (material::EMISSIVE_TINT_PARAM).
+    "alphapower", "heightbias", "roughnessbias", "alphascale", "heightscale", "alphamin", "dirtfactor", "flakesize", "dirtroughness", "roughness",
+    "invertnormal", "edgesmoothness", "emissivecolormultiplier", "dirtintensity", "alphaoffset", "damagenormalintensity", "wetness", "tintbumpiness",
+    "uvscale", "emissivefalloff", "windowopacity", "opacity", "maxwetness", "intensity", "edgefadestart", "edgefadegradient", "edgefadecontrast",
+    "edgefadetiling", "startfadegradient", "startfadecontrast", "endfadegradient", "endfadecontrast", "layermaskgradient", "layermasktiling",
+    "heightblendmin", "heightblendmax", "clearcoatuvscale", "tangentuvscale", "roughnessvariationstrength", "normalvariationstrength",
+    "clothsheenblend", "clothfadealbedo", "clothsheencolor", "blendemissivemultiplier", "alphascalenormal", "normalmaptiling", "parallaxscalebias",
+    "dirtuvscale", "dirtuvbias", "maxdirtintensity", "maxmudintensity", "dirttilescale", "bumpoffsetamount", "decalblendmode", "thinfilmuvscale",
+    "thinfilmwetnessexponent", "glassscratchamount", "windowframeparallax", "emissivefresnelexponent",
+    // stem + word search on the same constants; each sits in a shader it fits (water, waterfall, flakes, fur, eye, liquid)
+    "edgefadenoisestrength", "endfadeposition", "startfadeposition", "layermaskdistortion", "layermaskposition", "flakecoverage",
+    "flakeorientation", "foamalbedo", "foamcolor", "foamdensity", "foammaptiling", "furlength", "furstiffness", "ripplebumpiness",
+    "ripplescale", "eyewetness", "scleracolorvalue", "wateredgerange", "waterfadegradient", "waterfadestart",
     // texture parameters of the minigame pack's water and interior shaders (joaat search, 2026-11-23)
     "watersurfacedetailtexture", "surfacedetailnormal0", "surfacedetailnormal1", "surfacedetailnormal2", "surfacedetailiridescence", "interiordiffusemaskmap", "interiorlayerdiffusemap",
     // shader constants of the 4-layer ground shaders (dictionary search, 2026-11-22)
