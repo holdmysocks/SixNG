@@ -1,7 +1,8 @@
 //! Custom liveries: stickers the user places on a vehicle by hand.
 //!
 //! A vehicle's panels are numbered: every vertex carries a **sticker zone**
-//! (the fourth byte of the model's second colour stream, GLB `_COLOR1`), and
+//! (the fourth byte of the model's second colour stream, GLB `_COLOR1`; on
+//! vehicle glass the first byte of `_COLOR0`), and
 //! the game's two-layer vehicle shader draws a sticker on the zones it is
 //! given where a transformed mesh UV lies between 0 and 1:
 //! `u = U*a + V*b + ou`, `v = U*c + V*d + ov`. The viewer draws stickers the

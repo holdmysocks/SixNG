@@ -220,11 +220,24 @@ fn mix_skin(j: [[u16; 4]; 3], wt: [[u8; 4]; 3], w: [f32; 3]) -> ([u16; 4], [u8; 
     (jo, wo)
 }
 
+/// Whether a vehicle shader keeps the sticker zone of a vertex in the first
+/// byte of the first colour stream (`_COLOR0`) rather than the fourth byte
+/// of the second (`_COLOR1`). The vehicle glass shaders
+/// (`standard_vehicle_glass`, `_crack`, `_windshield`) read the zone table
+/// like the body shaders, keyed by a flat vertex byte that the meshes fill
+/// from that stream: on the Buffalo, 93/94 are the windscreen halves, 97/98
+/// the rear screen's and 101-108 the side windows. Their `_COLOR1` byte 3
+/// holds 0-3 only.
+pub fn zone_in_colour0(shader: &str) -> bool {
+    shader.starts_with("standard_vehicle_glass")
+}
+
 /// The decal mesh of one sticker on the primitives of one model. `skip`:
 /// primitives that take no stickers (the model's own decal meshes, whose
-/// second colour stream is not a zone). `lift`: metres off the surface.
-/// None when the sticker covers nothing there.
-pub fn decal_prim(prims: &[TriPrim], skip: &dyn Fn(&TriPrim) -> bool, d: &Decal, lift: f32) -> Option<TriPrim> {
+/// second colour stream is not a zone). `glass`: primitives whose zone is
+/// in the first colour stream ([`zone_in_colour0`]). `lift`: metres off
+/// the surface. None when the sticker covers nothing there.
+pub fn decal_prim(prims: &[TriPrim], skip: &dyn Fn(&TriPrim) -> bool, glass: &dyn Fn(&TriPrim) -> bool, d: &Decal, lift: f32) -> Option<TriPrim> {
     let mut on = [false; 256];
     for z in &d.zones {
         on[*z as usize] = true;
@@ -234,7 +247,8 @@ pub fn decal_prim(prims: &[TriPrim], skip: &dyn Fn(&TriPrim) -> bool, d: &Decal,
     let mut skinned = true;
     let m = d.m;
     for p in prims {
-        let (Some(zone), Some(uv)) = (&p.colors1, p.uvs.get(d.uv_set)) else { continue };
+        let (stream, byte) = if glass(p) { (&p.colors, 0) } else { (&p.colors1, 3) };
+        let (Some(zone), Some(uv)) = (stream, p.uvs.get(d.uv_set)) else { continue };
         if skip(p) || uv.len() != p.positions.len() || zone.len() != p.positions.len() {
             continue;
         }
@@ -245,7 +259,7 @@ pub fn decal_prim(prims: &[TriPrim], skip: &dyn Fn(&TriPrim) -> bool, d: &Decal,
         for t in p.indices.chunks_exact(3) {
             let i = [t[0] as usize, t[1] as usize, t[2] as usize];
             // the zone of a face is its first corner's, as in the shader
-            if !on[zone[i[0]][3] as usize] {
+            if !on[zone[i[0]][byte] as usize] {
                 continue;
             }
             let at = i.map(|i| [uv[i][0] * m[0] + uv[i][1] * m[1] + m[4], uv[i][0] * m[2] + uv[i][1] * m[3] + m[5]]);
@@ -307,6 +321,8 @@ pub fn add(groups: &mut [NodeGroup], materials: &mut Vec<Material>, decals: &[De
     // the second colour stream too, but its bytes are not zones there
     let skip_at: Vec<bool> = materials.iter().map(|m| m.name.ends_with("389206d1")).collect();
     let skip = |p: &TriPrim| p.material.is_some_and(|m| skip_at.get(m).copied().unwrap_or(false));
+    let glass_at: Vec<bool> = materials.iter().map(|m| m.extras["shader_name"].as_str().or(m.extras["classification"]["shader"].as_str()).is_some_and(zone_in_colour0)).collect();
+    let glass = |p: &TriPrim| p.material.is_some_and(|m| glass_at.get(m).copied().unwrap_or(false));
     let mut reports = Vec::new();
     for (n, d) in decals.iter().enumerate() {
         let lift = LIFT + STEP * n as f32;
@@ -317,7 +333,7 @@ pub fn add(groups: &mut [NodeGroup], materials: &mut Vec<Material>, decals: &[De
             if !own {
                 continue;
             }
-            let Some(mut p) = decal_prim(&group.prims, &skip, d, lift) else { continue };
+            let Some(mut p) = decal_prim(&group.prims, &skip, &glass, d, lift) else { continue };
             let at = *material.get_or_insert_with(|| {
                 materials.push(Material {
                     name: format!("livery/{:02} {}", n + 1, d.name),
@@ -378,7 +394,7 @@ mod tests {
     fn a_sticker_is_cut_out_of_the_faces_under_it() {
         // 2 m x 1 m in the middle of the wall: U 0.25..0.75, V 0.25..0.75
         let d = Decal { name: "s".into(), model: String::new(), zones: vec![7, 8], uv_set: 1, m: [2.0, 0.0, 0.0, 2.0, -0.5, -0.5], uri: "s.png".into(), factor: [1.0; 4] };
-        let p = decal_prim(&[wall()], &|_| false, &d, 0.001).unwrap();
+        let p = decal_prim(&[wall()], &|_| false, &|_| false, &d, 0.001).unwrap();
         assert!((area(&p) - 2.0).abs() < 1e-4, "{}", area(&p));
         // inside the picture, lifted off the wall, skinned as the wall is
         assert!(p.uvs[0].iter().flatten().all(|x| (-1e-6..=1.0 + 1e-6).contains(x)));
@@ -389,13 +405,26 @@ mod tests {
         let k = p.uvs[0].iter().position(|t| t[0] < 1e-5 && t[1] < 1e-5).unwrap();
         assert!((p.positions[k][0] + 1.0).abs() < 1e-5 && (p.positions[k][2] - 1.5).abs() < 1e-5);
         // only on its zones: with zone 7 alone, the left half of it
-        let left = decal_prim(&[wall()], &|_| false, &Decal { zones: vec![7], ..d.clone() }, 0.001).unwrap();
+        let left = decal_prim(&[wall()], &|_| false, &|_| false, &Decal { zones: vec![7], ..d.clone() }, 0.001).unwrap();
         assert!((area(&left) - 1.0).abs() < 1e-4);
         assert!(left.positions.iter().all(|q| q[0] <= 1e-5));
         // and nothing on other zones or off the wall
-        assert!(decal_prim(&[wall()], &|_| false, &Decal { zones: vec![9], ..d.clone() }, 0.001).is_none());
-        assert!(decal_prim(&[wall()], &|_| false, &Decal { m: [2.0, 0.0, 0.0, 2.0, 5.0, 5.0], ..d.clone() }, 0.001).is_none());
-        assert!(decal_prim(&[wall()], &|_| true, &d, 0.001).is_none());
+        assert!(decal_prim(&[wall()], &|_| false, &|_| false, &Decal { zones: vec![9], ..d.clone() }, 0.001).is_none());
+        assert!(decal_prim(&[wall()], &|_| false, &|_| false, &Decal { m: [2.0, 0.0, 0.0, 2.0, 5.0, 5.0], ..d.clone() }, 0.001).is_none());
+        assert!(decal_prim(&[wall()], &|_| true, &|_| false, &d, 0.001).is_none());
+    }
+
+    #[test]
+    fn on_glass_the_zone_is_in_the_first_colour_stream() {
+        let d = Decal { name: "s".into(), model: String::new(), zones: vec![7, 8], uv_set: 1, m: [2.0, 0.0, 0.0, 2.0, -0.5, -0.5], uri: "s.png".into(), factor: [1.0; 4] };
+        // glass: the zones in _COLOR0 byte 0, _COLOR1 byte 3 holds a window index
+        let mut w = wall();
+        w.colors = w.colors1.as_ref().map(|c| c.iter().map(|z| [z[3], 13, 255, 255]).collect());
+        w.colors1 = w.colors1.map(|c| c.iter().map(|_| [255, 255, 0, 1]).collect());
+        assert!(decal_prim(&[w.clone()], &|_| false, &|_| false, &d, 0.001).is_none());
+        let p = decal_prim(&[w], &|_| false, &|_| true, &d, 0.001).unwrap();
+        assert!(!p.indices.is_empty());
+        assert!(zone_in_colour0("standard_vehicle_glass_windshield") && !zone_in_colour0("vehicle_paint_generic"));
     }
 
     #[test]

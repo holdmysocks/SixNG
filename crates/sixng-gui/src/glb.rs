@@ -21,7 +21,8 @@ pub struct Vertex {
     /// Tint palette colour (GLB COLOR_0, linear); white = no tint.
     pub tint: [u8; 4],
     /// Vehicle sticker zone: `[0]` the zone (fourth byte of the model's
-    /// second colour stream, GLB `_COLOR1`; 0 where the model has none),
+    /// second colour stream, GLB `_COLOR1`; on vehicle glass the first byte
+    /// of the first, `_COLOR0`; 0 where the model has none),
     /// `[1]` which model of an assembled vehicle the vertex came from
     /// (0 = the vehicle itself, 1.. = fitted parts), `[2]` 1 when the model
     /// has the stream (a mesh without it carries no stickers), `[3]` on
@@ -1201,6 +1202,21 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
         }
     }
     // meshes
+    // materials whose sticker zone is in `_COLOR0` byte 0 (vehicle glass)
+    let zone_in_col0: Vec<bool> = d.j["materials"]
+        .as_array()
+        .map(|ms| {
+            ms.iter()
+                .map(|m| {
+                    let ex = &m["extras"];
+                    ex["shader_name"]
+                        .as_str()
+                        .or(ex["classification"]["shader"].as_str())
+                        .is_some_and(sixng_core::vehlivery::zone_in_colour0)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let mut meshes = Vec::new();
     let mut lo = [f32::MAX; 3];
     let mut hi = [f32::MIN; 3];
@@ -1300,8 +1316,15 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             }
             if let Some(a) = at["_COLOR1"].as_u64() {
                 let c = d.u8x4(a as usize)?;
+                // vehicle glass keeps its zone in the first colour stream
+                let col0 = p["material"]
+                    .as_u64()
+                    .and_then(|m| zone_in_col0.get(m as usize).copied())
+                    .unwrap_or(false)
+                    && at["_COLOR0"].as_u64().is_some();
                 for i in 0..n.min(c.len()) {
-                    v[i].zone = [c[i][3], 0, 1, 0];
+                    let z = if col0 { v[i].col[0] } else { c[i][3] };
+                    v[i].zone = [z, 0, 1, 0];
                 }
             }
             if let Some(a) = at["_REGION"].as_u64() {
