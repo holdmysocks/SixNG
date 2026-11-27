@@ -477,9 +477,10 @@ mod tests {
         let c = &p[0];
         assert_eq!((c.k, c.positions.len(), c.uv.len()), (3, 150, 150));
         let clump = &c.attrs.iter().find(|a| a.0 == "_CLUMP").unwrap().1;
-        // 40 scattered strands, then 10 in two clumps
-        assert!(clump[..120].iter().all(|&x| x == 0.0) && clump[120..].iter().all(|&x| x == 1.0 || x == 2.0));
-        assert!(clump[120..].contains(&2.0));
+        // 40 scattered strands and 10 in two clumps (shuffled together), 3 points each
+        assert_eq!(clump.iter().filter(|&&x| x == 0.0).count(), 120);
+        assert_eq!(clump.iter().filter(|&&x| x == 1.0 || x == 2.0).count(), 30);
+        assert!(clump.contains(&2.0));
         // the cap
         let (p, s) = piece(&g, "t", &Options { max_strands: 10, guides: false, ..Default::default() }, None, None, json!({}));
         assert!(p[0].colour.is_empty());
