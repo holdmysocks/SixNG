@@ -359,6 +359,195 @@ fn trim_model_cache_dir(dir: &Path, cap: u64) -> anyhow::Result<()> {
     trim_texture_cache_entries(entries, cap, None)
 }
 
+/// 离线批量烘焙的结果统计。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BakeStats {
+    /// 扫描到的 .glb 文件数。
+    pub found: usize,
+    /// 新写入的 SXMTLIO2 缓存数。
+    pub baked: usize,
+    /// 跳过的文件数（加载失败、无几何、已存在缓存）。
+    pub skipped: usize,
+    /// 写入失败的文件数。
+    pub failed: usize,
+    /// 通过流式 CRC 校验的缓存文件数。
+    pub verified: usize,
+}
+
+/// 递归收集目录树下的 .glb 文件。跳过缓存目录，避免把生成物或贴图缓存当输入。
+fn collect_glbs(dir: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if name == GPU_MODEL_CACHE_DIR || name == crate::GUI_CACHE || name == "cache" {
+                continue;
+            }
+            collect_glbs(&path, out)?;
+        } else if path.extension().and_then(|s| s.to_str()) == Some("glb") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// 校验单个 SXMTLIO2 缓存文件：magic / version / 长度 + vertex/index 的流式 payload CRC。
+/// `model_cache_matches` 只校验 key_crc 与文件长度，这里补 payload CRC，防写入过程中的位翻转。
+/// 分块读取，避免大 buffer 全量驻留内存。
+fn verify_model_cache_file(path: &Path) -> anyhow::Result<()> {
+    let mut f = File::open(path)?;
+    let mut fixed = [0u8; GPU_MODEL_CACHE_FIXED_HEADER];
+    f.read_exact(&mut fixed)?;
+    anyhow::ensure!(&fixed[..8] == GPU_MODEL_CACHE_MAGIC, "bad magic in {}", path.display());
+    anyhow::ensure!(
+        u32::from_le_bytes(fixed[8..12].try_into()?) == 1,
+        "bad version in {}",
+        path.display()
+    );
+    let vlen = u64::from_le_bytes(fixed[12..20].try_into()?);
+    let ilen = u64::from_le_bytes(fixed[20..28].try_into()?);
+    let vcrc = u32::from_le_bytes(fixed[28..32].try_into()?);
+    let icrc = u32::from_le_bytes(fixed[32..36].try_into()?);
+    anyhow::ensure!(
+        f.metadata()?.len() == GPU_MODEL_CACHE_FIXED_HEADER as u64 + vlen + ilen,
+        "length mismatch in {}",
+        path.display()
+    );
+
+    let mut buf = [0u8; 64 * 1024];
+    let mut stream_crc = |len: u64| -> anyhow::Result<u32> {
+        let mut crc = !0u32;
+        let mut remaining = len;
+        while remaining > 0 {
+            let n = (remaining as usize).min(buf.len());
+            f.read_exact(&mut buf[..n])?;
+            crc = crc32_update(crc, &buf[..n]);
+            remaining -= n as u64;
+        }
+        Ok(crc ^ !0u32)
+    };
+    anyhow::ensure!(
+        stream_crc(vlen)? == vcrc,
+        "vertex CRC mismatch in {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        stream_crc(ilen)? == icrc,
+        "index CRC mismatch in {}",
+        path.display()
+    );
+    Ok(())
+}
+
+/// 流式校验缓存目录内所有 .buf 文件。
+fn verify_model_cache_dir(dir: &Path) -> anyhow::Result<usize> {
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut checked = 0usize;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("buf") {
+            continue;
+        }
+        verify_model_cache_file(&path)?;
+        checked += 1;
+    }
+    Ok(checked)
+}
+
+/// 离线批量烘焙：扫描 `work_root` 下所有 .glb，预生成 SXMTLIO2 缓存到
+/// `cache_root/metal_io_models_v2/`。复用运行时的 `build_vertex_index_bytes` /
+/// `model_identity` / `write_model_cache_entry`，保证缓存字节与运行时字节级一致。
+///
+/// 纯文件 IO，不依赖 Metal 设备；任何单个文件的失败都被记录并跳过，不中断整批。
+pub fn bake_model_cache_dir(work_root: &Path, cache_root: &Path) -> anyhow::Result<BakeStats> {
+    bake_model_cache_dir_with_progress(work_root, cache_root, &|_: &str| {})
+}
+
+/// 与 `bake_model_cache_dir` 相同，但把逐文件进度通过 `progress` 回调上报。
+/// GUI 的子进程用它把进度写进日志，供界面显示。
+pub fn bake_model_cache_dir_with_progress(
+    work_root: &Path,
+    cache_root: &Path,
+    progress: &dyn Fn(&str),
+) -> anyhow::Result<BakeStats> {
+    let model_cache_dir = cache_root.join(GPU_MODEL_CACHE_DIR);
+    fs::create_dir_all(&model_cache_dir)?;
+
+    let mut glbs = Vec::new();
+    collect_glbs(work_root, &mut glbs)?;
+    glbs.sort();
+
+    let mut stats = BakeStats {
+        found: glbs.len(),
+        ..BakeStats::default()
+    };
+    progress(&format!(
+        "found {} model(s) under {}",
+        glbs.len(),
+        work_root.display()
+    ));
+    for (index, path) in glbs.iter().enumerate() {
+        progress(&format!(
+            "baking {}/{}: {}",
+            index + 1,
+            glbs.len(),
+            path.file_name().and_then(|s| s.to_str()).unwrap_or("?")
+        ));
+        // out_root 用 work_root：贴图解析在里面，顶点/索引组装不依赖贴图，但走同一入口保证一致。
+        let model = match glb::load(path, work_root) {
+            Ok(model) => model,
+            Err(error) => {
+                eprintln!("[bake-model-cache] skip {} (load failed): {error:#}", path.display());
+                stats.skipped += 1;
+                continue;
+            }
+        };
+        let (vertex_bytes, index_bytes, _) = match build_vertex_index_bytes(&model) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("[bake-model-cache] skip {} (assemble failed): {error:#}", path.display());
+                stats.skipped += 1;
+                continue;
+            }
+        };
+        if vertex_bytes.is_empty() && index_bytes.is_empty() {
+            stats.skipped += 1;
+            continue;
+        }
+        let identity = model_identity(&model, &vertex_bytes, &index_bytes);
+        let cache_path = model_cache_path(&model_cache_dir, &identity);
+        if cache_path.exists() {
+            stats.skipped += 1;
+            continue;
+        }
+        let entry = CacheModelBuffers {
+            path: cache_path.clone(),
+            key: identity,
+            vertex: vertex_bytes,
+            index: index_bytes,
+        };
+        match write_model_cache_entry(&model_cache_dir, &entry) {
+            Ok(Some(_)) => stats.baked += 1,
+            Ok(None) => stats.skipped += 1,
+            Err(error) => {
+                eprintln!("[bake-model-cache] failed {}: {error:#}", path.display());
+                stats.failed += 1;
+            }
+        }
+    }
+
+    // 全量流式 CRC 校验写出的缓存（防写入过程中位翻转）。
+    stats.verified = verify_model_cache_dir(&model_cache_dir)?;
+    Ok(stats)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TemporalUpscaleMode {
     Off,
@@ -797,6 +986,118 @@ mod texture_cache_tests {
         assert!(!oldest.exists());
         assert!(retained.exists());
         assert!(protected.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod model_bake_tests {
+    use super::*;
+
+    fn test_dir() -> PathBuf {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("sixng-metal-io-bake-{nonce}-{id}"))
+    }
+
+    fn sample_entry(dir: &Path, key: &str) -> CacheModelBuffers {
+        CacheModelBuffers {
+            path: model_cache_path(dir, key),
+            key: key.into(),
+            vertex: (0u8..64).collect(),
+            index: (0u8..12).collect(),
+        }
+    }
+
+    #[test]
+    fn model_cache_header_round_trips_and_rejects_corruption() {
+        let dir = test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let entry = sample_entry(&dir, "identity");
+        let path = write_model_cache_entry(&dir, &entry).unwrap().unwrap();
+        let (off, vlen, ilen) = model_cache_matches(&path, "identity").unwrap();
+        assert_eq!((off, vlen, ilen), (48, 64, 12));
+        verify_model_cache_file(&path).unwrap();
+        // 已存在时幂等返回 None
+        assert!(write_model_cache_entry(&dir, &entry).unwrap().is_none());
+        // 篡改 payload，流式 CRC 必须报错
+        let mut bytes = fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 0xff;
+        fs::write(&path, bytes).unwrap();
+        assert!(verify_model_cache_file(&path).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn model_cache_rejects_identity_change() {
+        let dir = test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let entry = sample_entry(&dir, "identity-A");
+        let path = write_model_cache_entry(&dir, &entry).unwrap().unwrap();
+        assert!(model_cache_matches(&path, "identity-A").is_ok());
+        assert!(model_cache_matches(&path, "identity-B").is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn model_cache_rejects_bad_magic_and_version() {
+        let dir = test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let entry = sample_entry(&dir, "identity");
+        let path = write_model_cache_entry(&dir, &entry).unwrap().unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[0] = 0;
+        fs::write(&path, bytes).unwrap();
+        assert!(verify_model_cache_file(&path).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn verify_detects_index_payload_corruption() {
+        let dir = test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let entry = sample_entry(&dir, "identity");
+        let path = write_model_cache_entry(&dir, &entry).unwrap().unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        // index payload 从 48+64 开始，翻转第一个字节
+        let index_byte = GPU_MODEL_CACHE_FIXED_HEADER + 64;
+        bytes[index_byte] ^= 0xff;
+        fs::write(&path, bytes).unwrap();
+        assert!(verify_model_cache_file(&path).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn collect_glbs_skips_cache_dirs() {
+        let dir = test_dir();
+        fs::create_dir_all(dir.join("models")).unwrap();
+        fs::create_dir_all(dir.join(GPU_MODEL_CACHE_DIR)).unwrap();
+        fs::create_dir_all(dir.join("cache")).unwrap();
+        fs::write(dir.join("models/car.glb"), b"x").unwrap();
+        fs::write(dir.join("models/truck.glb"), b"x").unwrap();
+        fs::write(dir.join(GPU_MODEL_CACHE_DIR).join("stale.glb"), b"x").unwrap();
+        fs::write(dir.join("cache").join("stale.glb"), b"x").unwrap();
+        let mut glbs = Vec::new();
+        collect_glbs(&dir, &mut glbs).unwrap();
+        assert_eq!(glbs.len(), 2, "only the two models/*.glb should be collected");
+        assert!(glbs.iter().all(|p| p.parent().unwrap().ends_with("models")));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn verify_model_cache_dir_counts_only_buf() {
+        let dir = test_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let e1 = sample_entry(&dir, "a");
+        let e2 = sample_entry(&dir, "b");
+        write_model_cache_entry(&dir, &e1).unwrap().unwrap();
+        write_model_cache_entry(&dir, &e2).unwrap().unwrap();
+        fs::write(dir.join("notes.txt"), b"ignore me").unwrap();
+        assert_eq!(verify_model_cache_dir(&dir).unwrap(), 2);
         let _ = fs::remove_dir_all(dir);
     }
 }
