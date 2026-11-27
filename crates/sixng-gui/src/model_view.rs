@@ -6987,6 +6987,36 @@ impl Wrap {
     /// six, so where the skin swells unevenly (a belly at full weight) a
     /// garment is not left inside it.
     fn at(&self, p: [f32; 3], n: Option<[f32; 3]>) -> [f32; 3] {
+        let best = self.nearest(p);
+        if best.is_empty() {
+            return [0.0; 3];
+        }
+        let (mut o, mut wsum) = ([0f32; 3], 0f32);
+        for (d2, i) in &best {
+            let w = 1.0 / (d2 + 1e-5);
+            let d = self.pts[*i as usize].1;
+            for c in 0..3 {
+                o[c] += d[c] * w;
+            }
+            wsum += w;
+        }
+        let mut o = o.map(|x| x / wsum);
+        if let Some(n) = n.filter(|n| (n[0] * n[0] + n[1] * n[1] + n[2] * n[2] - 1.0).abs() < 0.1) {
+            let dot = |d: [f32; 3]| d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
+            let out = best.iter().map(|(_, i)| dot(self.pts[*i as usize].1)).fold(f32::MIN, f32::max);
+            let gap = out - dot(o);
+            if out > 0.0 && gap > 0.0 {
+                for c in 0..3 {
+                    o[c] += n[c] * gap;
+                }
+            }
+        }
+        o
+    }
+
+    /// The six nearest skin vertices (squared distance, index), nearest
+    /// first; searched up to about 30 cm away.
+    fn nearest(&self, p: [f32; 3]) -> Vec<(f32, u32)> {
         let k = Self::key(p);
         let mut best: Vec<(f32, u32)> = Vec::new();
         let mut r = 1;
@@ -7011,36 +7041,30 @@ impl Wrap {
             }
             r += if best.is_empty() { 2 } else { 1 };
         }
-        if best.is_empty() {
+        best.sort_by(|a, b| a.0.total_cmp(&b.0));
+        best.truncate(6);
+        best
+    }
+
+    /// For a part moved as one piece: how much further out than `rigid` the
+    /// skin under `p` swelled, along the way from the nearest skin vertex to
+    /// `p`; zero where it did not. A necklace on a neck thicker than the
+    /// neutral one is opened up by it, so it stays on the skin.
+    fn swell(&self, p: [f32; 3], rigid: [f32; 3]) -> [f32; 3] {
+        use glam::Vec3;
+        let Some(&(_, i)) = self.nearest(p).first() else { return [0.0; 3] };
+        let u = (Vec3::from(p) - Vec3::from(self.pts[i as usize].0)).normalize_or_zero();
+        if u == Vec3::ZERO {
             return [0.0; 3];
         }
-        best.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let (mut o, mut wsum) = ([0f32; 3], 0f32);
-        for (d2, i) in best.iter().take(6) {
-            let w = 1.0 / (d2 + 1e-5);
-            let d = self.pts[*i as usize].1;
-            for c in 0..3 {
-                o[c] += d[c] * w;
-            }
-            wsum += w;
-        }
-        let mut o = o.map(|x| x / wsum);
-        if let Some(n) = n.filter(|n| (n[0] * n[0] + n[1] * n[1] + n[2] * n[2] - 1.0).abs() < 0.1) {
-            let dot = |d: [f32; 3]| d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
-            let out = best.iter().take(6).map(|(_, i)| dot(self.pts[*i as usize].1)).fold(f32::MIN, f32::max);
-            let gap = out - dot(o);
-            if out > 0.0 && gap > 0.0 {
-                for c in 0..3 {
-                    o[c] += n[c] * gap;
-                }
-            }
-        }
-        o
+        let more = (Vec3::from(self.at(p, Some(u.to_array()))) - Vec3::from(rigid)).dot(u);
+        if more > 0.0 { (u * more).to_array() } else { [0.0; 3] }
     }
 
     /// Move a part with the skin. Small parts (a watch, glasses, a ring)
     /// move as one piece by the offset at their centre, so they keep their
-    /// shape; larger ones move point by point.
+    /// shape, and only go further out where the skin under them swelled
+    /// more (`swell`); larger ones move point by point.
     fn apply(&self, m: &mut glb::Model) {
         use glam::Vec3;
         let size = (Vec3::from(m.bbox[1]) - Vec3::from(m.bbox[0])).length();
@@ -7049,7 +7073,13 @@ impl Wrap {
         for me in &mut m.meshes {
             let mut sum = Vec3::ZERO;
             for v in &mut me.verts {
-                let o = rigid.unwrap_or_else(|| self.at(v.pos, Some(v.nrm)));
+                let o = match rigid {
+                    Some(r) => {
+                        let s = self.swell(v.pos, r);
+                        [r[0] + s[0], r[1] + s[1], r[2] + s[2]]
+                    }
+                    None => self.at(v.pos, Some(v.nrm)),
+                };
                 for c in 0..3 {
                     v.pos[c] += o[c];
                 }
