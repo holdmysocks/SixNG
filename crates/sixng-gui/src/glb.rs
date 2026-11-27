@@ -263,6 +263,10 @@ pub struct Material {
     /// The packed slot holds a vehicle layer's material map
     /// (`lyr0materialatex`): only its blue channel is used, as occlusion.
     pub occlusion_only: bool,
+    /// Ped skin (`ped_standard_skin`, `ped_standard_lod_skin`): the packed
+    /// slot holds the `speculartex` spec map, whose green is roughness, and
+    /// this is the specular factor (`1 + fresnel`; F0 = 0.04 x it).
+    pub skin_spec: Option<f32>,
     /// How much brighter (or dimmer) than the viewer's emissive level an
     /// emissive material lights, from the GLB's emissive strength
     /// (`emissive_scale`); 1 when the export does not say.
@@ -911,11 +915,29 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
         let mr = ex["classification"]["stand_in"].as_str().and_then(|_| {
             Some([pbr["metallicFactor"].as_f64()? as f32, pbr["roughnessFactor"].as_f64()? as f32])
         });
+        // Ped skin: its spec map (`speculartex`) is the packed map, read as
+        // the game's skin program reads it; `speculartex2` (detail strength
+        // and region for engine-wide atlases) is not.
+        let skin = matches!(ex["shader_name_hash"].as_str(), Some("210fbc6a" | "8d69edab"));
+        let mut skin_spec = None;
+        if skin && !opts.base_only {
+            if let Some(t) = tex_list.iter().find(|t| t["param_hash"] == "c6f46e79" && t["png"].is_string() && tiny_png(t).is_none()) {
+                packed = add_img(out_root.join(t["png"].as_str().unwrap()), false, &mut images);
+                if packed.is_some() {
+                    skin_spec = Some(
+                        m["extensions"]["KHR_materials_specular"]["specularFactor"]
+                            .as_f64()
+                            .or_else(|| ex["skin_spec"]["fresnel"].as_f64().map(|f| 1.0 + f))
+                            .unwrap_or(1.0) as f32,
+                    );
+                }
+            }
+        }
         for t in ex["textures"].as_array().cloned().unwrap_or_default() {
             let role = slot_role(&t);
             let (status, mip) = slot_status(&t);
             let png = t["png"].as_str().map(|s| s.to_string());
-            if role == "packed_rma" && packed.is_none() && !opts.base_only && tiny_png(&t).is_none()
+            if role == "packed_rma" && !skin && packed.is_none() && !opts.base_only && tiny_png(&t).is_none()
             {
                 if let Some(p) = &png {
                     packed = add_img(out_root.join(p), false, &mut images);
@@ -1025,6 +1047,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                 .and_then(|p| add_img(out_root.join(p), false, &mut images)),
             parts: ex["classification"]["stand_in"] == "parts",
             occlusion_only,
+            skin_spec,
             emissive_scale,
             lit,
             emissive_tint: emissive_tint(&m),

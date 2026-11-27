@@ -1942,6 +1942,14 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             x
         },
     }).collect();
+    // Skin: the decoded spec maps as glTF channels (`skinspec::apply_gltf`).
+    let mut mats = mats;
+    for (m, (s, st)) in mats.iter_mut().zip(info.shaders.iter().zip(shader_tex.iter())) {
+        if !is_hidden(s, st) {
+            let fresnel = s.constants.iter().find(|c| c.hash == crate::skinspec::FRESNEL_PARAM).and_then(|c| c.components()).and_then(|v| v.first().copied());
+            crate::skinspec::apply_gltf(&mut m.gltf, &mut m.extras, &s.name_hash, &st.entries, fresnel);
+        }
+    }
     if let (Some(o), Some(f)) = (part_looks.as_object_mut(), part_set.as_ref().and_then(|(_, parts)| crate::vehcolour::paint_finish(parts, mat_blend, &part_id_counts.borrow()))) {
         o.insert("paint_finish".into(), serde_json::json!({"metalness": f[0], "roughness": f[1]}));
     }
