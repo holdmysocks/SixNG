@@ -2225,9 +2225,10 @@ impl ModelView {
         egui::CollapsingHeader::new("Shape details").id_salt("body_details").show(ui, |ui| {
             egui::Grid::new("body_detail_grid").num_columns(2).show(ui, |ui| {
                 for k in BODY_DETAILS..shape.len() {
-                    let (name, _, neg) = sixng_core::bodyshape::CONTROLS[k];
-                    let lo = if neg.is_some() { -1.0 } else { 0.0 };
-                    ui.label(detail_label(name)).on_hover_text(format!("The game's {name} control ({lo}..1)."));
+                    let name = sixng_core::bodyshape::CONTROLS[k].0;
+                    let lo = sixng_core::bodyshape::control_min(name);
+                    let more = if name == "gcheadscale" { " The rig scales the head by 1 + v (x 2 at 1); below -0.5 the head shrinks out of sight (1 % at -1), so the slider stops at half size." } else { "" };
+                    ui.label(detail_label(name)).on_hover_text(format!("The game's {name} control ({lo}..1).{more}"));
                     released |= ui.add(egui::Slider::new(&mut shape[k], lo..=1.0)).drag_stopped();
                     ui.end_row();
                 }

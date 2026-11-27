@@ -442,17 +442,34 @@ pub const CONTROLS: &[(&str, u32, Option<u32>)] = &[
     ("gcbellyround", 0xa1aede2a, None),
     ("gchipwidth", 0x6c83d62b, None),
     ("gchipheight", 0xa64a2b22, Some(0xee16a69c)),
-    // negative side 5ebebbe7: set by no preset item; at 1 the rig scales
-    // the head to 0.01, the mirror of 9c978205 (2.0 at 1)
+    // the rig scales BM_Head by 1 + v on both sides: 2.0 at 1 (9c978205),
+    // 0.01 at -1 (5ebebbe7); no preset item sets either side. Values stop
+    // at HEAD_SCALE_MIN (`control_min`).
     ("gcheadscale", 0x9c978205, Some(0x5ebebbe7)),
     ("gcmusclebiceps", 0xc0fd5915, None),
     ("gcmuscletriceps", 0xa981e727, None),
 ];
 
+/// Lowest head scale (`gcheadscale`): the rig scales the head by 1 + v, so
+/// -1 shrinks it to 1 % (out of sight) and +1 doubles it. No preset sets
+/// head scale; the range stops at half size, as far below normal as +1 is
+/// above it (x 0.5 against x 2).
+pub const HEAD_SCALE_MIN: f32 = -0.5;
+
+/// Lowest value of a shape control: -1, or 0 for controls with no input
+/// for negative values (muscle, butt, belly roundness, hip width), and
+/// `HEAD_SCALE_MIN` for head scale.
+pub fn control_min(name: &str) -> f32 {
+    match CONTROLS.iter().find(|c| c.0 == name) {
+        _ if name == "gcheadscale" => HEAD_SCALE_MIN,
+        Some((_, _, None)) => 0.0,
+        _ => -1.0,
+    }
+}
+
 /// Parse "gcweightbelly=1,gcmusclechest=0.5" into control values. Names are
 /// case-insensitive; `allweight=v` / `allmuscle=v` set every weight / muscle
-/// control. Values are clamped to -1..1, or 0..1 for controls with no input
-/// for negative values (muscle, butt, belly roundness, hip width).
+/// control. Values are clamped to `control_min`..1.
 pub fn parse_spec(spec: &str) -> Result<Vec<(String, f32)>, String> {
     let mut out: Vec<(String, f32)> = Vec::new();
     for kv in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -466,9 +483,8 @@ pub fn parse_spec(spec: &str) -> Result<Vec<(String, f32)>, String> {
             _ => vec![CONTROLS.iter().find(|c| c.0 == k).map(|c| c.0).ok_or_else(|| format!("body shape: unknown control `{k}` (known: {}, allweight, allmuscle)", CONTROLS.iter().map(|c| c.0).collect::<Vec<_>>().join(", ")))?],
         };
         for n in names {
-            let lo = if CONTROLS.iter().any(|c| c.0 == n && c.2.is_none()) { 0.0 } else { -1.0 };
             out.retain(|x| x.0 != n);
-            out.push((n.to_string(), v.clamp(lo, 1.0)));
+            out.push((n.to_string(), v.clamp(control_min(n), 1.0)));
         }
     }
     Ok(out)
@@ -1025,7 +1041,12 @@ mod tests {
         assert_eq!(m.get(&0xf9dc7b4c), Some(&0.5));
         assert_eq!(m.get(&0x6c83d62b), Some(&0.9));
         assert!(!m.contains_key(&0x9c978205) || m[&0x9c978205] == 0.0);
-        assert_eq!(m.get(&0x5ebebbe7), Some(&1.0));
+        // head scale stops at half size: -1 would shrink the head to 1 %
+        assert_eq!(m.get(&0x5ebebbe7), Some(&-HEAD_SCALE_MIN));
+        assert_eq!(parse_spec("gcheadscale=-0.3").unwrap(), vec![("gcheadscale".to_string(), -0.3)]);
+        assert_eq!(control_min("gcheadscale"), HEAD_SCALE_MIN);
+        assert_eq!(control_min("gcmusclechest"), 0.0);
+        assert_eq!(control_min("gcweightbelly"), -1.0);
         let m = input_values(&parse_spec("gcmusclebiceps=-1").unwrap());
         assert!(!m.contains_key(&0xc0fd5915) || m[&0xc0fd5915] == 0.0);
     }
