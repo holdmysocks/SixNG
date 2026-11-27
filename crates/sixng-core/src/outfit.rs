@@ -887,6 +887,8 @@ pub fn export_outfit(a: &ArchiveInfo, parts: &[&Entry], name: &str, out: &Path, 
         }
     }
     let attached = attach_accessories(&mut joints, &groups);
+    // the head's jaw shape keys on the teeth, tongue and inner mouth
+    let jaw_keys = crate::jawkeys::follow_jaw(&mut groups, &joints);
     let mut anims = Vec::new();
     let mut clip_reports = Vec::new();
     for &(d, c) in clips {
@@ -946,6 +948,7 @@ pub fn export_outfit(a: &ArchiveInfo, parts: &[&Entry], name: &str, out: &Path, 
         "joint_roots": joints.iter().filter(|j| j.parent.is_none()).map(|j| j.name.clone()).collect::<Vec<_>>(),
         "unresolved_influences": unresolved,
         "attached": attached.iter().map(|(part, root, at)| serde_json::json!({"part": part, "root": root, "on": at})).collect::<Vec<_>>(),
+        "jaw_keys": jaw_keys,
         "clip": clip_report, "warnings": warnings,
     }))
 }
