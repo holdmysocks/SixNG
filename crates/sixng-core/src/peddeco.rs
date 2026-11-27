@@ -50,6 +50,20 @@
 //! names a record of the skin tone table in data.rpf (struct `27a7a4ef`,
 //! a linear colour).
 //!
+//! Upper body space: body-upper decorations are not placed in the part's
+//! UV0. That UV is mirrored (both arms share one UV island), so it cannot
+//! hold a tattoo on one arm only. The part's fourth UV set is the same
+//! layout at half width, one side at `u0 / 2` and the other at
+//! `0.5 + u0 / 2`, and the decorations are placed in that UV with `u`
+//! doubled, a space two units wide ([`Space`]). The evidence is the data:
+//! a record's mirrored pair of sleeves has one layer at `u` 0.37..0.60 and
+//! its mirror at 1.41..1.64; over the whole catalogue, 80 % of a
+//! body-upper layer's decal square lands on the upper body in this space
+//! (60 % in UV0, where a quarter of the layers land on no skin at all).
+//! The upper body is therefore baked into a texture laid out in its fourth
+//! UV set ([`uv3_layout`]), which the part's material then reads through
+//! that set. The legs are not mirrored and keep their UV0.
+//!
 //! Left out: mask decals on a layer with no ink, which the game colours at
 //! run time.
 
@@ -72,7 +86,7 @@ pub const SKIN_CATEGORIES: [(u32, &str); 3] = [(0x3817_131d, "body upper"), (0x4
 
 const VERSION: u32 = 5;
 /// Changes when the bake rule changes, so baked textures are made again.
-pub const BAKE_RULE: u32 = 6;
+pub const BAKE_RULE: u32 = 8;
 /// The skin tone record struct (`data.rpf`): a name, a linear colour.
 pub const SKIN_TONE: u32 = 0x27a7_a4ef;
 /// Wardrobe tag key whose item names the skin tone (a skin-tone item, or
@@ -280,6 +294,11 @@ pub fn skin_slot(category: u32) -> Option<&'static str> {
     SKIN_CATEGORIES.iter().find(|c| c.0 == category).map(|c| c.1)
 }
 
+/// The body-upper category: placed in the upper body's space ([`Space`]).
+pub fn is_body_upper(category: u32) -> bool {
+    skin_slot(category) == Some("body upper")
+}
+
 /// Part UV -> decal UV (None where the projective divisor vanishes).
 pub fn decal_uv(m: &[[f32; 3]; 3], u: f32, v: f32) -> Option<(f32, f32)> {
     let w = m[0][2] * u + m[1][2] * v + m[2][2];
@@ -308,6 +327,100 @@ impl Layer {
         let (zu, zv) = decal_uv(&self.zone, u, v)?;
         ((0.0..=1.0).contains(&zu) && (0.0..=1.0).contains(&zv)).then_some((zu, zv))
     }
+}
+
+/// Where a baked texture's UV lands in the decoration space its layers are
+/// placed in (see the module notes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Space {
+    /// The part's own UV (heads, and parts with no body layout).
+    Part,
+    /// The upper body, baked into a texture laid out in its fourth UV set:
+    /// placed at `(2u, v)`.
+    BodyUpper,
+}
+
+impl Space {
+    pub fn place(self, u: f32, v: f32) -> (f32, f32) {
+        match self {
+            Space::Part => (u, v),
+            Space::BodyUpper => (2.0 * u, v),
+        }
+    }
+}
+
+/// Whether a mesh's fourth UV set is its UV0 at half width, split by side
+/// (`u0 / 2` or `0.5 + u0 / 2`, same `v`): the upper body's layout. `uv` is
+/// (UV0, UV3) per vertex; true when nine in ten vertices follow it and some
+/// of them are on each side.
+pub fn is_split_layout(uv: &[([f32; 2], [f32; 2])]) -> bool {
+    let (mut fit, mut lo, mut hi) = (0usize, 0usize, 0usize);
+    for &(a, b) in uv {
+        if (b[1] - a[1]).abs() > 2e-3 {
+            continue;
+        }
+        if (b[0] - a[0] / 2.0).abs() < 2e-3 && a[0] > 0.01 {
+            fit += 1;
+            lo += 1;
+        } else if (b[0] - 0.5 - a[0] / 2.0).abs() < 2e-3 {
+            fit += 1;
+            hi += 1;
+        } else if (b[0] - a[0]).abs() < 2e-3 {
+            // a strip both layouts share (the waist)
+            fit += 1;
+        }
+    }
+    !uv.is_empty() && fit * 10 >= uv.len() * 9 && lo * 20 >= uv.len() && hi * 20 >= uv.len()
+}
+
+/// The upper body's colour texture laid out in its fourth UV set: twice
+/// the width of `base` (laid out in UV0), each texel the base colour at
+/// the UV0 of the surface there. `tris` are the mesh's triangles, each
+/// corner (UV0, UV3); a texel no triangle covers takes the half-width rule
+/// (`u0 = fract(2 u3)`).
+pub fn uv3_layout(base: &Image, tris: &[[([f32; 2], [f32; 2]); 3]]) -> Image {
+    let (w, h) = (base.w as usize * 2, base.h as usize);
+    let mut uv0: Vec<[f32; 2]> = (0..w * h)
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            let u3 = (x as f32 + 0.5) / w as f32;
+            [(2.0 * u3).fract(), (y as f32 + 0.5) / h as f32]
+        })
+        .collect();
+    for t in tris {
+        let p: [[f32; 2]; 3] = std::array::from_fn(|k| [t[k].1[0] * w as f32, t[k].1[1] * h as f32]);
+        let d = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) - (p[2][0] - p[0][0]) * (p[1][1] - p[0][1]);
+        if d.abs() < 1e-12 {
+            continue;
+        }
+        let x0 = p.iter().map(|q| q[0]).fold(f32::MAX, f32::min).floor().max(0.0) as usize;
+        let x1 = (p.iter().map(|q| q[0]).fold(f32::MIN, f32::max).ceil() as usize).min(w);
+        let y0 = p.iter().map(|q| q[1]).fold(f32::MAX, f32::min).floor().max(0.0) as usize;
+        let y1 = (p.iter().map(|q| q[1]).fold(f32::MIN, f32::max).ceil() as usize).min(h);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                let b1 = ((px - p[0][0]) * (p[2][1] - p[0][1]) - (p[2][0] - p[0][0]) * (py - p[0][1])) / d;
+                let b2 = ((p[1][0] - p[0][0]) * (py - p[0][1]) - (px - p[0][0]) * (p[1][1] - p[0][1])) / d;
+                let b0 = 1.0 - b1 - b2;
+                // texel centres inside the triangle; the rest keep the
+                // half-width rule, which holds away from the waist strip
+                if b0 < -1e-4 || b1 < -1e-4 || b2 < -1e-4 {
+                    continue;
+                }
+                let a = [t[0].0, t[1].0, t[2].0];
+                uv0[y * w + x] = [b0 * a[0][0] + b1 * a[1][0] + b2 * a[2][0], b0 * a[0][1] + b1 * a[1][1] + b2 * a[2][1]];
+            }
+        }
+    }
+    let mut rgba = vec![0u8; w * h * 4];
+    rgba.par_chunks_mut(4).zip(uv0.par_iter()).for_each(|(px, q)| {
+        let c = base.sample(q[0], q[1]);
+        for i in 0..4 {
+            px[i] = (c[i] * 255.0).round() as u8;
+        }
+    });
+    Image { w: w as u32, h: h as u32, rgba, srgb: base.srgb }
 }
 
 /// Inside the clip quad (every edge; see the module notes).
@@ -646,9 +759,21 @@ pub struct Skipped {
 /// Bake layers, in order, into a part's colour texture (sRGB RGBA8; its
 /// alpha is kept). `decal` gives a layer's first decal texture;
 /// `skin_tone` is the ped's skin tone word ([`Catalogue::skin_tone_word`]),
-/// which head makeup starts from. Makeup with no skin tone, uncoloured
+/// which head makeup starts from; `space` places the texture's UV in the
+/// decoration space ([`Space`]). Makeup with no skin tone, uncoloured
 /// masks and layers whose decal is missing are left out and counted.
-pub fn bake(skin: &mut Image, layers: &[&Layer], decal: &dyn Fn(u64) -> Option<std::sync::Arc<Image>>, skin_tone: Option<u32>) -> Skipped {
+impl Layer {
+    /// A whole sheet: neither the layer nor its record moves it, so it
+    /// covers the part's texture as laid out. A character's own tattoo
+    /// sheet on the upper body is one; it spans both sides of the fourth UV
+    /// set (its edges meet across the mesh's seams there, and not when it
+    /// is read through UV0 or on one side).
+    pub fn is_sheet(&self) -> bool {
+        self.uv == identity() && self.zone == identity()
+    }
+}
+
+pub fn bake(skin: &mut Image, layers: &[&Layer], decal: &dyn Fn(u64) -> Option<std::sync::Arc<Image>>, skin_tone: Option<u32>, space: Space) -> Skipped {
     let mut skipped = Skipped::default();
     let (w, h) = (skin.w as usize, skin.h as usize);
     for &l in layers {
@@ -672,10 +797,14 @@ pub fn bake(skin: &mut Image, layers: &[&Layer], decal: &dyn Fn(u64) -> Option<s
             continue;
         }
         let blend = l.blend();
+        // a whole sheet (no transform) is drawn in the part's own layout:
+        // on the upper body that is its fourth UV set, both sides
+        let space = if l.is_sheet() { Space::Part } else { space };
         skin.rgba.par_chunks_mut(4 * w).enumerate().for_each(|(y, row)| {
             let v = (y as f32 + 0.5) / h as f32;
             for x in 0..w {
-                let Some((u, v)) = l.zone_uv((x as f32 + 0.5) / w as f32, v) else { continue };
+                let (su, sv) = space.place((x as f32 + 0.5) / w as f32, v);
+                let Some((u, v)) = l.zone_uv(su, sv) else { continue };
                 if !inside_clip(&l.clip, u, v) {
                     continue;
                 }
@@ -874,20 +1003,20 @@ mod tests {
         l.opacity = 0.5;
         // only the left half: u -> u * 2
         l.uv = [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        assert_eq!(bake(&mut skin, &[&l], &|_| Some(d.clone()), None), Skipped::default());
+        assert_eq!(bake(&mut skin, &[&l], &|_| Some(d.clone()), None, Space::Part), Skipped::default());
         // black art at half coverage over white: linear 0.5 -> sRGB 188
         assert_eq!(&skin.rgba[..4], &[188, 188, 188, 200]);
         assert_eq!(&skin.rgba[4..], &[255, 255, 255, 200]);
-        assert_eq!(bake(&mut skin, &[&l], &|_| None, None), Skipped { missing: 1, ..Default::default() });
+        assert_eq!(bake(&mut skin, &[&l], &|_| None, None, Space::Part), Skipped { missing: 1, ..Default::default() });
         // a mask on a layer with no ink is left out
         let mask = std::sync::Arc::new(Image { w: 2, h: 1, rgba: vec![0, 128, 0, 255, 0, 120, 0, 200], srgb: false });
         l.colours = [0x004c_c382, 0, 0];
         assert!(mask.is_mask() && !d.is_mask());
-        assert_eq!(bake(&mut skin, &[&l], &|_| Some(mask.clone()), None), Skipped { uncoloured_masks: 1, ..Default::default() });
+        assert_eq!(bake(&mut skin, &[&l], &|_| Some(mask.clone()), None, Space::Part), Skipped { uncoloured_masks: 1, ..Default::default() });
         // makeup is left out, and the texture stays as it was
         l.colours = [0xff00_ff00, 0, 0];
         l.p3[0][3] = 1.0;
-        assert_eq!(bake(&mut skin, &[&l], &|_| Some(d.clone()), None), Skipped { makeup: 1, ..Default::default() });
+        assert_eq!(bake(&mut skin, &[&l], &|_| Some(d.clone()), None, Space::Part), Skipped { makeup: 1, ..Default::default() });
         assert_eq!(&skin.rgba[..4], &[188, 188, 188, 200]);
         // a black ink on the mask, multiplied: 188 x black at full coverage
         l.p3 = [[0.0; 4]; 3];
@@ -895,7 +1024,7 @@ mod tests {
         l.opacity = 1.0;
         l.flags = 0x0400_0000;
         let solid = std::sync::Arc::new(Image { w: 1, h: 1, rgba: vec![0, 127, 0, 255], srgb: false });
-        assert_eq!(bake(&mut skin, &[&l], &|_| Some(solid.clone()), None), Skipped::default());
+        assert_eq!(bake(&mut skin, &[&l], &|_| Some(solid.clone()), None, Space::Part), Skipped::default());
         assert_eq!(&skin.rgba[..4], &[0, 0, 0, 200]);
         assert_eq!(&skin.rgba[4..], &[255, 255, 255, 200]);
     }
@@ -934,8 +1063,8 @@ mod tests {
         let mut l = layer();
         l.colours = [0xff91_6610, 0, 0];
         l.p3[0] = [0.0, 0.0, 0.0, 1.0];
-        assert_eq!(bake(&mut skin, &[&l], &|_| Some(mask.clone()), None), Skipped { makeup: 1, ..Default::default() });
-        assert_eq!(bake(&mut skin, &[&l], &|_| Some(mask.clone()), Some(base)), Skipped::default());
+        assert_eq!(bake(&mut skin, &[&l], &|_| Some(mask.clone()), None, Space::Part), Skipped { makeup: 1, ..Default::default() });
+        assert_eq!(bake(&mut skin, &[&l], &|_| Some(mask.clone()), Some(base), Space::Part), Skipped::default());
         assert_ne!(skin.rgba, vec![255, 255, 255, 255]);
     }
 
@@ -979,5 +1108,72 @@ mod tests {
         assert_eq!(l.p3[0], [0.0, 0.0, 0.0, 0.5]);
         assert!(l.is_makeup());
         assert_eq!(skin_slot(d.category), Some("body upper"));
+    }
+
+    #[test]
+    fn a_whole_sheet_covers_both_sides_of_the_upper_body() {
+        // no transform: the sheet is the upper body's texture as laid out
+        // (UV3), both sides; moved at all, it is placed at (2u, v) and
+        // stops at the first side
+        let mut l = layer();
+        assert!(l.is_sheet());
+        let d = std::sync::Arc::new(Image { w: 1, h: 1, rgba: vec![0, 0, 0, 255], srgb: false });
+        let white = || Image { w: 4, h: 1, rgba: vec![255; 16], srgb: true };
+        let red = |s: &Image| s.rgba.chunks(4).map(|p| p[0]).collect::<Vec<_>>();
+        let mut sheet = white();
+        bake(&mut sheet, &[&l], &|_| Some(d.clone()), None, Space::BodyUpper);
+        assert_eq!(red(&sheet), [0, 0, 0, 0]);
+        l.uv[0][0] = 1.0001;
+        assert!(!l.is_sheet());
+        let mut moved = white();
+        bake(&mut moved, &[&l], &|_| Some(d.clone()), None, Space::BodyUpper);
+        assert_eq!(red(&moved), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn upper_body_space_holds_both_sides() {
+        assert_eq!(Space::Part.place(0.75, 0.5), (0.75, 0.5));
+        assert_eq!(Space::BodyUpper.place(0.75, 0.5), (1.5, 0.5));
+        // a full-colour layer on body u 1.25..1.75 (the second side): the
+        // upper body's texture (UV3 layout) takes it at u 0.625..0.875,
+        // a texture placed in its own UV never reaches it
+        let mut l = layer();
+        l.uv = [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-2.5, 0.0, 1.0]];
+        let d = std::sync::Arc::new(Image { w: 1, h: 1, rgba: vec![0, 0, 0, 255], srgb: false });
+        let white = || Image { w: 4, h: 1, rgba: vec![255; 16], srgb: true };
+        let mut up = white();
+        bake(&mut up, &[&l], &|_| Some(d.clone()), None, Space::BodyUpper);
+        assert_eq!(up.rgba.chunks(4).map(|p| p[0]).collect::<Vec<_>>(), [255, 255, 0, 0]);
+        let mut own = white();
+        bake(&mut own, &[&l], &|_| Some(d.clone()), None, Space::Part);
+        assert!(own.rgba.iter().all(|&b| b == 255));
+    }
+
+    #[test]
+    fn split_layout_is_uv0_at_half_width_by_side() {
+        let one = |u: f32, v: f32| [([u, v], [u / 2.0, v]), ([u, v], [0.5 + u / 2.0, v])];
+        let body: Vec<_> = (1..20).flat_map(|i| one(i as f32 / 20.0, 0.3)).collect();
+        assert!(is_split_layout(&body));
+        // legs and heads: the fourth set is UV0, or something else
+        let same: Vec<_> = (1..20).map(|i| ([i as f32 / 20.0, 0.3], [i as f32 / 20.0, 0.3])).collect();
+        assert!(!is_split_layout(&same));
+        let other: Vec<_> = (1..20).map(|i| ([i as f32 / 20.0, 0.3], [0.9, i as f32 / 20.0])).collect();
+        assert!(!is_split_layout(&other));
+    }
+
+    #[test]
+    fn uv3_layout_reads_the_base_at_each_texels_uv0() {
+        // base: red at u0 < 0.5, blue above
+        let base = Image { w: 2, h: 1, rgba: vec![255, 0, 0, 255, 0, 0, 255, 255], srgb: true };
+        let reds = |im: &Image| im.rgba.chunks(4).map(|p| p[0]).collect::<Vec<_>>();
+        // no triangles: the half-width rule, u0 = fract(2 u3)
+        let t = uv3_layout(&base, &[]);
+        assert_eq!((t.w, t.h), (4, 1));
+        assert_eq!(reds(&t), [255, 0, 255, 0]);
+        // a strip whose fourth UV is its UV0 (the waist): read in place
+        let c = |u: f32, v: f32| ([u, v], [u, v]);
+        let quad = [[c(0.0, 0.0), c(1.0, 0.0), c(1.0, 1.0)], [c(0.0, 0.0), c(1.0, 1.0), c(0.0, 1.0)]];
+        // (bilinear: u0 0.375 and 0.625 sit between the two base texels)
+        assert_eq!(reds(&uv3_layout(&base, &quad)), [255, 191, 64, 0]);
     }
 }

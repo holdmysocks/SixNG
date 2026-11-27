@@ -1528,6 +1528,15 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   when they follow on in the same model and material; opaque-mode decals,
   which write depth and do not blend, are kept together per model for
   this. The tick line counts these draws as "decal/see-through".
+- **Per-mesh culling** (since 2026-11-27): a model placed at most 8 times
+  (SLOD tiles, buildings, most city models) keeps its placements'
+  transforms on the CPU, and each of its meshes is tested on its own
+  bounding sphere: against the view's sides in the opaque and
+  coverage-fallback passes, and against each shadow cascade's box. A
+  mesh no placement shows is skipped. When culled meshes lie between two
+  that would have joined into one draw, the draw still spans them, so
+  the cull never turns one draw into two. The tick line shows the meshes
+  culled per frame as "meshes culled [main, fallbacks, shadows]".
 - **Map cells** (far placements merged per area): a placement more than
   0.3× the HD distance from the camera can be drawn from its cell instead
   of one by one (`SIXNG_CELLS_NEAR` sets another fraction). The cells are
