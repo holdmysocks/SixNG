@@ -155,6 +155,12 @@ pub const DERIVED: &[&str] = &[
     "furnoiseuvscale", "grassdecaluvscale", "grassnoisetilescale", "masktexturetex", "scrollspeedmultiplier", "shadowalpha",
     "specularcolortex", "terrainfresnel", "terraintranslucency", "tintoverride", "vertexdisplacementmultiplier",
     "wrinklebumpscale", "wrinklemultiplier", "dirtdiffuseintensity", "emissivedistortionstrength",
+    // known name + word search (2026-11-27); each sits next to the name it extends or in a parallel block
+    // (waterfall layer1/layer2 sets: tiling, offset, intensity, opacitythreshold, opacitycontrast)
+    "layer1tiling", "layer1offset", "layer1intensity", "layer1opacitythreshold", "layer1opacitycontrast",
+    "layer2tiling", "layer2offset", "layer2intensity", "layer2opacitythreshold", "layer2opacitycontrast",
+    "dirttintchannel", "furlengthjitter", "normalmaptiling2", "specularfresnelselector", "waterfadestartrandom",
+    "stickermetalness", "stickerroughness", "stickerbackopacity",
     // water_micro_geom (the inland water tiles): meet-in-the-middle joaat search over water and shader words (2026-11-27),
     // about 16 random hits expected over 45 hashes; kept only names that fit the value or a sibling. The three use* flags
     // are integer 1 on every tile and 0 on the 6 tiles whose flow, height and surface map textures are 4 x 4 placeholders;

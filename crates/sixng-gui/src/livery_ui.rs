@@ -38,6 +38,10 @@ pub struct GameSticker {
     /// sRGB.
     pub colours: [[u8; 3]; 3],
     pub aspect: u32,
+    /// Its texture is in none of the game's texture stores: there is no
+    /// picture to show or to place, so the picker leaves it out.
+    #[serde(default)]
+    pub missing: bool,
 }
 
 enum Thumb {
@@ -234,21 +238,21 @@ fn argb(hex: &str) -> [u8; 3] {
 /// The game's sticker records, from the viewer's cache or (once, about 20
 /// seconds) from the game files.
 fn read_list(game: &str, work: &str, cache: &Path) -> Result<Vec<GameSticker>, String> {
-    let file = cache.join("sticker_list_v1.json");
+    let file = cache.join("sticker_list_v2.json");
     if let Some(l) = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<Vec<GameSticker>>(&b).ok()) {
         return Ok(l);
     }
     let ws = sixng_core::export::Workspace::new(game, work);
     let all = sixng_core::vehstickers::sticker_list(&ws).map_err(|e| format!("{e:#}"))?;
+    let stores = sixng_core::ttpf::global(Path::new(game));
     let list: Vec<GameSticker> = all
         .iter()
         .filter_map(|s| {
             let texture = s["texture"].as_str()?.to_string();
-            if sixng_core::vehstickers::parse_texture_id(&texture).is_none_or(|id| id == 0) {
-                return None;
-            }
+            let id = sixng_core::vehstickers::parse_texture_id(&texture).filter(|id| *id != 0)?;
+            let missing = stores.get(id).is_none();
             let c = |k: usize| argb(s["colours"][k].as_str().unwrap_or("ffffffff"));
-            Some(GameSticker { sticker: s["sticker"].as_str()?.to_string(), texture, mask: s["mask"].as_bool().unwrap_or(false), colours: [c(0), c(1), c(2)], aspect: s["aspect"].as_u64().unwrap_or(0) as u32 })
+            Some(GameSticker { sticker: s["sticker"].as_str()?.to_string(), texture, mask: s["mask"].as_bool().unwrap_or(false), colours: [c(0), c(1), c(2)], aspect: s["aspect"].as_u64().unwrap_or(0) as u32, missing })
         })
         .collect();
     let _ = std::fs::create_dir_all(cache);
@@ -540,6 +544,11 @@ impl State {
         }
         let n = variants(brand);
         let which = if n > 1 { format!(", variant {} of {n}", variant % n + 1) } else { String::new() };
+        // a livery the viewer can place nothing of leaves the vehicle as it is
+        if s.is_empty() {
+            self.status = format!("{}{which}: none of its stickers can be placed, so the stickers on the vehicle were kept", brand["name"].as_str().or(brand["brand"].as_str()).unwrap_or("livery"));
+            return;
+        }
         self.status = format!("{}{which}: {} stickers placed by the game's layouts", brand["name"].as_str().or(brand["brand"].as_str()).unwrap_or("livery"), s.len());
         self.livery.stickers = s;
         self.ed.selected = None;
@@ -1192,12 +1201,14 @@ impl State {
                 self.ed.filtered = list
                     .iter()
                     .enumerate()
-                    .filter(|(_, s)| (key.0.is_empty() || s.texture.contains(&key.0) || s.sticker.contains(&key.0)) && (key.1 == 0 || (key.1 == 1) == s.mask) && key.2.is_none_or(|a| if a >= 4 { s.aspect >= 4 } else { s.aspect == a }))
+                    .filter(|(_, s)| !s.missing && (key.0.is_empty() || s.texture.contains(&key.0) || s.sticker.contains(&key.0)) && (key.1 == 0 || (key.1 == 1) == s.mask) && key.2.is_none_or(|a| if a >= 4 { s.aspect >= 4 } else { s.aspect == a }))
                     .map(|(i, _)| i)
                     .collect();
                 self.ed.filter_key = Some(key);
             }
-            ui.label(egui::RichText::new(format!("{} of {} sticker records. The game's files give them no names, so they are found by eye.", self.ed.filtered.len(), list.len())).small().weak());
+            let missing = list.iter().filter(|s| s.missing).count();
+            let left_out = if missing > 0 { format!(" {missing} more records name a texture that is in none of the game's texture stores and are left out.") } else { String::new() };
+            ui.label(egui::RichText::new(format!("{} of {} sticker records. The game's files give them no names, so they are found by eye.{left_out}", self.ed.filtered.len(), list.len() - missing)).small().weak());
             let cell = 112.0;
             let cols = ((ui.available_width() + 4.0) / (cell + 4.0)).floor().max(1.0) as usize;
             let rows = self.ed.filtered.len().div_ceil(cols);
