@@ -121,6 +121,13 @@ pub const DERIVED: &[&str] = &[
     "tintmaskflags", "tintmaskheightopacity", "tintmaskmap", "tintmaskmetallic", "tintmaskmetallicopacity", "tintmaskopacity", "tintmaskrotation", "tintmaskroughness",
     "tintmaskroughnessopacity", "tintmaskscale", "tintmasktranslation", "tintmasktint", "translucencymapblendamount", "translucencymultiplier", "translucencyscale", "transmissionprofileflags",
     "transmissionroughness", "windscale",
+    // more material parameter and shader constant names (meet-in-the-middle joaat search over domain and game-name words, 2026-11-26).
+    // Each was checked beyond the hash: thinfilmior / thinfilmmaxthickness / thinfilmthicknessexponent / thinfilmuvset are the
+    // constants of every iridescence effect (the IOR one holds 1.19 to 1.70); tintpaletteselector is in exactly the 334 effects
+    // that bind tintpalettetex; hboheightscale / hboheightbias sit side by side; sheenfadealbedo is on 99.6 % of its library
+    // materials together with sheencolor; tintablepatterntranslation completes the tintablepattern family (per-layer, signed).
+    "tintablepatterntranslation", "thinfilmior", "thinfilmmaxthickness", "thinfilmthicknessexponent", "thinfilmuvset", "tintpaletteselector",
+    "hboheightscale", "hboheightbias", "translucency", "dustintensity", "sheenfadealbedo",
     // texture parameters of the minigame pack's water and interior shaders (joaat search, 2026-11-23)
     "watersurfacedetailtexture", "surfacedetailnormal0", "surfacedetailnormal1", "surfacedetailnormal2", "surfacedetailiridescence", "interiordiffusemaskmap", "interiorlayerdiffusemap",
     // shader constants of the 4-layer ground shaders (dictionary search, 2026-11-22)
