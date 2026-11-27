@@ -9,7 +9,7 @@ use crate::glb;
 use crate::livery::{self, Picture, State, Sticker, MAX_IMAGES, MAX_STICKERS};
 use crate::render3d::Camera;
 use eframe::egui;
-use glam::{Vec2, Vec3};
+use glam::{Mat4, Vec2, Vec3};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -65,6 +65,9 @@ pub struct Env<'a> {
     pub cache: &'a Path,
     /// The vehicle's configuration shown (None: the user's own choice of parts).
     pub config: Option<usize>,
+    /// The joint matrices the vehicle is drawn with (doors open, a roof
+    /// down), for clicks on it. Empty: as stored.
+    pub skin: &'a [Mat4],
 }
 
 /// Export the vehicle with its livery as one GLB: what `sixng vehicle
@@ -131,8 +134,10 @@ pub struct Editor {
     previews: HashMap<String, egui::TextureHandle>,
     /// While a sticker is dragged: its centre minus the UV under the pointer.
     grab: Option<Vec2>,
-    /// Bounding boxes of the model's meshes, for picking.
-    boxes: (std::path::PathBuf, usize, Vec<[Vec3; 2]>),
+    /// The model's meshes as they are drawn, for picking: the model, its
+    /// triangle count and the pose (a hash of the joint matrices) they
+    /// were made for.
+    posed: (std::path::PathBuf, usize, u64, livery::Posed),
     /// Scripted checks (`--livery-click`, `--livery-drag`): a click that
     /// adds the zone at this place of the view (fractions of its width and
     /// height) to the chosen sticker, and a drag of the sticker to a place.
@@ -190,7 +195,7 @@ impl Default for Editor {
             workers: false,
             previews: HashMap::new(),
             grab: None,
-            boxes: Default::default(),
+            posed: Default::default(),
             auto_add: Vec::new(),
             auto_select: None,
             ready: false,
@@ -1239,7 +1244,7 @@ impl State {
         if let (Some(i), Some(c)) = (sel, self.ed.auto_click.first().copied()) {
             self.ed.auto_click.remove(0);
             let pos = rect.min + egui::vec2(rect.width() * c[0], rect.height() * c[1]);
-            match self.hit(pos, rect, cam, model) {
+            match self.hit(pos, rect, cam, model, env.skin) {
                 Some(h) => self.toggle_zone(i, h.slot, h.zone, env),
                 None => self.status = format!("scripted click at {c:?}: nothing there"),
             }
@@ -1250,7 +1255,7 @@ impl State {
             let pos = rect.min + egui::vec2(rect.width() * c[0], rect.height() * c[1]);
             let (zones, set) = (self.livery.stickers[i].zones.clone(), self.livery.stickers[i].uv_set.min(1) as usize);
             let slot = self.zones.slot_of(&self.livery.stickers[i].model);
-            match self.hit(pos, rect, cam, model).filter(|h| Some(h.slot) == slot && zones.contains(&h.zone)) {
+            match self.hit(pos, rect, cam, model, env.skin).filter(|h| Some(h.slot) == slot && zones.contains(&h.zone)) {
                 Some(h) => {
                     self.livery.stickers[i].fresh = false;
                     self.livery.stickers[i].centre = h.uv[set].to_array();
@@ -1302,7 +1307,7 @@ impl State {
             return false;
         };
         let pos = resp.hover_pos().or(resp.interact_pointer_pos());
-        let hit = pos.and_then(|p| self.hit(p, rect, cam, model));
+        let hit = pos.and_then(|p| self.hit(p, rect, cam, model, env.skin));
         match self.ed.tool {
             Tool::Zones => {
                 let hover = hit.map(|h| (h.slot, h.zone));
@@ -1364,21 +1369,18 @@ impl State {
     }
 
     /// What the view shows at a place of the viewport.
-    fn hit(&mut self, pos: egui::Pos2, rect: egui::Rect, cam: &Camera, model: &glb::Model) -> Option<livery::Hit> {
-        if self.ed.boxes.0 != model.path || self.ed.boxes.1 != model.triangles {
-            let boxes = model
-                .meshes
-                .iter()
-                .map(|me| {
-                    let mut b = [Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)];
-                    for v in &me.verts {
-                        b[0] = b[0].min(Vec3::from(v.pos));
-                        b[1] = b[1].max(Vec3::from(v.pos));
-                    }
-                    b
-                })
-                .collect();
-            self.ed.boxes = (model.path.clone(), model.triangles, boxes);
+    fn hit(&mut self, pos: egui::Pos2, rect: egui::Rect, cam: &Camera, model: &glb::Model, skin: &[Mat4]) -> Option<livery::Hit> {
+        // the meshes are posed anew only when a joint has moved
+        let pose = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for m in skin {
+                m.to_cols_array().map(f32::to_bits).hash(&mut h);
+            }
+            h.finish()
+        };
+        if self.ed.posed.0 != model.path || self.ed.posed.1 != model.triangles || self.ed.posed.2 != pose {
+            self.ed.posed = (model.path.clone(), model.triangles, pose, livery::Posed::of(model, skin));
         }
         let ndc = Vec2::new((pos.x - rect.min.x) / rect.width().max(1.0) * 2.0 - 1.0, 1.0 - (pos.y - rect.min.y) / rect.height().max(1.0) * 2.0);
         let inv = (cam.proj(rect.width() / rect.height().max(1.0)) * cam.view()).inverse();
@@ -1390,6 +1392,6 @@ impl State {
         if dir.dot(a.lerp(b, 0.5) - eye) < 0.0 {
             dir = -dir;
         }
-        livery::pick(model, eye, dir, Some(&self.ed.boxes.2))
+        livery::pick(model, eye, dir, Some(&self.ed.posed.3))
     }
 }

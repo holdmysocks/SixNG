@@ -24,7 +24,7 @@
 
 use crate::glb;
 use eframe::egui_wgpu::{self, wgpu};
-use glam::{Vec2, Vec3};
+use glam::{Mat4, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -985,22 +985,79 @@ fn ray_box(origin: Vec3, dir: Vec3, b: &[Vec3; 2]) -> bool {
     far >= near.max(0.0)
 }
 
-/// The nearest triangle with sticker zones a ray hits (bind pose). `boxes`: the
-/// meshes' bounding boxes, when the caller keeps them (meshes the ray
-/// misses are skipped).
-pub fn pick(m: &glb::Model, origin: Vec3, dir: Vec3, boxes: Option<&[[Vec3; 2]]>) -> Option<Hit> {
+/// Where a vertex is drawn: skinned by the joint matrices as the viewer's
+/// shader does it (a vertex without weights, or of a mesh that is not
+/// skinned, stays where it is stored).
+fn posed_vertex(v: &glb::Vertex, skinned: bool, skin: &[Mat4]) -> Vec3 {
+    let p = Vec3::from(v.pos);
+    if !skinned {
+        return p;
+    }
+    let (mut s, mut tw) = (Vec3::ZERO, 0.0);
+    for k in 0..4 {
+        let w = v.weights[k] as f32 / 255.0;
+        if let Some(m) = skin.get(v.joints[k] as usize).filter(|_| w > 0.0) {
+            s += m.transform_point3(p) * w;
+            tw += w;
+        }
+    }
+    if tw < 0.001 {
+        p
+    } else {
+        s / tw
+    }
+}
+
+/// The meshes with sticker zones as the view draws them: with doors, lids
+/// and whatever else the joints move where they are now.
+#[derive(Default)]
+pub struct Posed {
+    /// Per mesh the place of every vertex (empty: a mesh without zones).
+    pos: Vec<Vec<Vec3>>,
+    /// Per mesh the box around them.
+    boxes: Vec<[Vec3; 2]>,
+}
+
+impl Posed {
+    /// `skin`: the joint matrices drawn with (none: as stored).
+    pub fn of(m: &glb::Model, skin: &[Mat4]) -> Posed {
+        let mut p = Posed::default();
+        for me in &m.meshes {
+            let mut b = [Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)];
+            let mut pos = Vec::new();
+            if me.verts.first().is_some_and(|v| v.zone[2] != 0) {
+                pos.reserve(me.verts.len());
+                for v in &me.verts {
+                    let q = posed_vertex(v, me.skinned, skin);
+                    b = [b[0].min(q), b[1].max(q)];
+                    pos.push(q);
+                }
+            }
+            p.pos.push(pos);
+            p.boxes.push(b);
+        }
+        p
+    }
+}
+
+/// The nearest triangle with sticker zones a ray hits. `posed`: the meshes
+/// as they are drawn, when the caller keeps them (meshes the ray misses
+/// are skipped); without it the model as stored, doors shut.
+pub fn pick(m: &glb::Model, origin: Vec3, dir: Vec3, posed: Option<&Posed>) -> Option<Hit> {
     let mut best: Option<Hit> = None;
     for (mi, me) in m.meshes.iter().enumerate() {
         // a mesh without the zone stream carries no stickers: the ray
         // passes through it (bolts and trim in front of a wall)
-        if me.verts.first().is_none_or(|v| v.zone[2] == 0) || boxes.and_then(|b| b.get(mi)).is_some_and(|b| !ray_box(origin, dir, b)) {
+        if me.verts.first().is_none_or(|v| v.zone[2] == 0) || posed.and_then(|p| p.boxes.get(mi)).is_some_and(|b| !ray_box(origin, dir, b)) {
             continue;
         }
+        let at = posed.and_then(|p| p.pos.get(mi)).filter(|p| p.len() == me.verts.len());
+        let place = |i: u32| at.map_or_else(|| Vec3::from(me.verts[i as usize].pos), |p| p[i as usize]);
         for t in me.indices.chunks_exact(3) {
             let v = [&me.verts[t[0] as usize], &me.verts[t[1] as usize], &me.verts[t[2] as usize]];
-            let p0 = Vec3::from(v[0].pos);
-            let e1 = Vec3::from(v[1].pos) - p0;
-            let e2 = Vec3::from(v[2].pos) - p0;
+            let p0 = place(t[0]);
+            let e1 = place(t[1]) - p0;
+            let e2 = place(t[2]) - p0;
             let h = dir.cross(e2);
             let det = e1.dot(h);
             if det.abs() < 1e-12 {
@@ -1177,12 +1234,43 @@ mod tests {
     fn a_ray_finds_the_zone_and_uv() {
         let m = quad(9, false);
         let h = pick(&m, Vec3::new(1.0, 0.5, 5.0), Vec3::new(0.0, 0.0, -1.0), None).unwrap();
-        let boxes = [[Vec3::new(-2.0, 0.0, 0.0), Vec3::new(2.0, 2.0, 0.0)]];
+        let boxes = Posed::of(&m, &[]);
         assert!(pick(&m, Vec3::new(1.0, 0.5, 5.0), Vec3::new(0.0, 0.0, -1.0), Some(&boxes)).is_some());
         assert_eq!((h.slot, h.zone), (0, 9));
         assert!((h.uv[0].x - 0.75).abs() < 1e-4 && (h.uv[0].y - 0.75).abs() < 1e-4);
         assert!(pick(&m, Vec3::new(5.0, 0.5, 5.0), Vec3::new(0.0, 0.0, -1.0), None).is_none());
         assert!(pick(&m, Vec3::new(5.0, 0.5, 5.0), Vec3::new(0.0, 0.0, -1.0), Some(&boxes)).is_none());
+    }
+
+    #[test]
+    fn a_ray_finds_a_door_where_it_is_swung_to() {
+        // the wall is a door on joint 1, hinged at its left edge (x -2) and
+        // swung a quarter turn towards the viewer: it now lies in the
+        // plane x -2, from z 0 to z 4
+        let mut m = quad(9, false);
+        m.meshes[0].skinned = true;
+        for v in &mut m.meshes[0].verts {
+            v.joints = [1, 0, 0, 0];
+            v.weights = [255, 0, 0, 0];
+        }
+        let hinge = Vec3::new(-2.0, 0.0, 0.0);
+        let swing = Mat4::from_translation(hinge) * Mat4::from_rotation_y(-std::f32::consts::FRAC_PI_2) * Mat4::from_translation(-hinge);
+        let skin = [Mat4::IDENTITY, swing];
+        let open = Posed::of(&m, &skin);
+        let (from_front, from_side) = ((Vec3::new(1.0, 0.5, 5.0), Vec3::new(0.0, 0.0, -1.0)), (Vec3::new(-7.0, 0.5, 3.0), Vec3::new(1.0, 0.0, 0.0)));
+        // where the door was there is nothing now
+        assert!(pick(&m, from_front.0, from_front.1, Some(&open)).is_none());
+        // a ray from the side meets it 3 m out along the door: u 0.75
+        let h = pick(&m, from_side.0, from_side.1, Some(&open)).unwrap();
+        assert_eq!((h.slot, h.zone), (0, 9));
+        assert!((h.t - 5.0).abs() < 1e-3, "{}", h.t);
+        assert!((h.uv[0].x - 0.75).abs() < 1e-3 && (h.uv[0].y - 0.75).abs() < 1e-3, "{:?}", h.uv[0]);
+        // shut (no matrices, or the mesh not skinned) it is where it is stored
+        let shut = Posed::of(&m, &[]);
+        assert!(pick(&m, from_front.0, from_front.1, Some(&shut)).is_some());
+        assert!(pick(&m, from_side.0, from_side.1, Some(&shut)).is_none());
+        m.meshes[0].skinned = false;
+        assert!(pick(&m, from_front.0, from_front.1, Some(&Posed::of(&m, &skin))).is_some());
     }
 
     #[test]
