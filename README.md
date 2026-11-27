@@ -718,11 +718,20 @@ again**).
     occlusion texture (B copied to red, `<spec>_occ.png`) with that
     strength, and the viewer applies it as the game does. **Translucency**
     (`speculartex` R, minus constant `381999f3`) goes to a G-buffer target
-    of its own. The lighting turns it into a thickness through a profile
-    picked per entity and adds a Burley-style transmittance per light (the
-    formula is in `extras.skin_spec.translucency`). The profiles are loaded
-    data that is not found yet, so translucency is recorded but not shaded
-    and not mapped to a glTF extension. Both skin programs also scale F0
+    of its own. The lighting turns it into a thickness through a subsurface
+    profile and adds a Burley-style transmittance per light, next to the
+    diffuse light and with no N.L (the formula is in
+    `extras.skin_spec.translucency`). The profiles are a data.rpf PSO file
+    that only the table of contents reaches (`toc-extract`): ten records
+    of `name`, `scatterColor`, `scatterDistance`, a thickness range and an
+    exponent. Which profile a ped draws with is set at run time and is not
+    traced; ped skin takes `skin_default` (radii 1.5, 0.025 and 0.004 mm
+    for red, green and blue, thickness 0.5 to 40 mm, exponent 1.3), so
+    thin parts pass red light. Where a skin spec map has translucent
+    pixels, the GLB gets `KHR_materials_diffuse_transmission` from a baked
+    `<spec>_sss.png`: RGB the transmittance's colour, alpha the factor
+    (the term without its angle part). The viewer shades the per-light
+    term for the sun. Both skin programs also scale F0
     by a window on the albedo's brightness, `saturate((max(r, g, b) - lo)
     / (hi - lo))` on the linear albedo. The engine sets the bounds every
     frame from two constants, sRGB 5 and 20 (linear 0.0015 and 0.0070),

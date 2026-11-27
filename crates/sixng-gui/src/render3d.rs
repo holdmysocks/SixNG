@@ -2158,8 +2158,9 @@ impl Uploader {
                 tile: match (mt.detail, mt.ramp_u.zip(mt.ramp).filter(|_| mt.emissive.is_none()), mt.skin_detail.filter(|_| mt.skin_spec.is_some())) {
                     (Some(d), _, _) => [d.scale, d.rot, d.mean, 1.0],
                     (None, Some(_), _) => [0.0, 0.0, 0.0, 2.0],
-                    // ped skin (w stays 0): x occlusion strength, y detail normal strength
-                    (None, None, Some(s)) => [s.occlusion, s.strength[1], 0.0, 0.0],
+                    // ped skin (w stays 0): x occlusion strength, y detail normal
+                    // strength, z 1 + translucency bias (0 = no translucency)
+                    (None, None, Some(s)) => [s.occlusion, s.strength[1], s.translucency.map_or(0.0, |b| 1.0 + b.clamp(0.0, 1.0)), 0.0],
                     _ => [0.0; 4],
                 },
                 emis: [mt.emissive_scale, mt.emissive_tint[0], mt.emissive_tint[1], mt.emissive_tint[2]],
