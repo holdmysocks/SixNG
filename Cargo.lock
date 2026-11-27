@@ -3459,6 +3459,7 @@ dependencies = [
  "anyhow",
  "bcpack-rs",
  "flate2",
+ "glam",
  "image",
  "opus",
  "rayon",
