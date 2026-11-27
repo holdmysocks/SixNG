@@ -1044,6 +1044,11 @@ enum Cmd {
         /// With --hair: leave out the guide strands.
         #[arg(long)]
         hair_no_guides: bool,
+        /// With --hair: keep the guides as stored (by default they are
+        /// settled as the viewer settles them: gravity, rest lengths, out of
+        /// the body's colliders)
+        #[arg(long)]
+        hair_no_settle: bool,
     },
     /// The outfits of a character model, from the game's outfit list and the
     /// model's wardrobe resource (needs the `texture-users` index): per
@@ -1652,7 +1657,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 out.print(&json!({"ok": true, "results": v}));
             }
         }
-        Cmd::Outfit { character, out: glb, archive, parts, add, list, clip, anim_only, in_place, tex, body_shape, head_skin, tex_remap, tint, look, hair, hair_density, hair_max, hair_points, hair_slots, hair_style, hair_no_guides } => {
+        Cmd::Outfit { character, out: glb, archive, parts, add, list, clip, anim_only, in_place, tex, body_shape, head_skin, tex_remap, tint, look, hair, hair_density, hair_max, hair_points, hair_slots, hair_style, hair_no_guides, hair_no_settle } => {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
             let prefix = character.to_ascii_lowercase();
@@ -1931,7 +1936,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     pieces.extend(sixng_core::hairexport::placeholder_grooms(&ws.work, &a, &ix.entries, &re).map_err(|e| anyhow!(e))?);
                 }
                 let cat = sixng_core::groom::catalog_cached(&ws.work, &a, &ix.entries)?;
-                let o = sixng_core::hairexport::Options { density: *hair_density, max_strands: *hair_max, points: *hair_points, guides: !*hair_no_guides };
+                let o = sixng_core::hairexport::Options { density: *hair_density, max_strands: *hair_max, points: *hair_points, guides: !*hair_no_guides, settle: !*hair_no_settle };
                 let (mut prims, mut rows) = (Vec::new(), Vec::new());
                 // the head as written, to find which of its UV sets the root UVs are in
                 let model = std::fs::read(&glb).ok();
@@ -1939,6 +1944,8 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 // a hat of the outfit: the scalp hair is pressed under it, as in the viewer
                 let hats: Vec<String> = outfit_of.map(|of| of.parts.iter().filter(|p| p.slot == "hat").map(|p| p.drawable.to_ascii_lowercase()).collect()).unwrap_or_default();
                 let hat = model.as_deref().and_then(|b| sixng_core::hairexport::hat_shell(b, &hats));
+                // the body's colliders the guides settle against, as in the viewer
+                let colliders = model.as_deref().filter(|_| o.settle).and_then(|b| sixng_core::hairexport::character_colliders(&a, &ix.entries, b, &hats));
                 for (slot, placeholder, grooms, confidence) in &pieces {
                     for off in grooms {
                         let g = sixng_core::groom::load(&a, &ix.entries, *off)?;
@@ -1960,7 +1967,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                         if let (Some(n), Some(_)) = (pset, params) {
                             ex["param_set"] = json!(format!("{n:08x}"));
                         }
-                        let (p, mut sum) = sixng_core::hairexport::piece_with(&g, &name, &o, colour.as_ref().map(|c| &c.0), params, hat.as_ref().filter(|_| slot == "hair"), ex);
+                        let (p, mut sum) = sixng_core::hairexport::piece_with(&g, &name, &o, colour.as_ref().map(|c| &c.0), params, colliders.as_ref().map(|c| &c.0), hat.as_ref().filter(|_| slot == "hair"), ex);
                         sum["head_uv_set"] = json!(uv_set);
                         sum["colour_set"] = json!(colour.as_ref().map(|c| format!("{:08x}", c.1)));
                         sum["slot"] = json!(slot);
@@ -1974,7 +1981,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 let bytes = sixng_core::gltf::strands_glb(&format!("{prefix}_hair"), &prims, json!({"character": prefix, "coordinate_system": "model space (Z-up metres) converted to glTF Y-up (x, z, -y), as the model"}));
                 let size = bytes.len();
                 sixng_core::atomic::write(&file, bytes)?;
-                r["hair"] = json!({"file": file, "bytes": size, "pieces": rows});
+                r["hair"] = json!({"file": file, "bytes": size, "pieces": rows, "colliders": colliders.as_ref().map(|c| c.1.clone())});
             }
             r["seconds"] = t.elapsed().as_secs_f64().into();
             out.print(&json!({"ok": true, "result": r}));
