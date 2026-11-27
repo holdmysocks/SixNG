@@ -815,11 +815,18 @@ fn skin_tile(t: texture_2d<f32>, r: u32, p: vec2<f32>, gx: vec2<f32>, gy: vec2<f
     let q = (cell + clamp(fract(p), vec2(h), vec2(1.0 - h))) * 0.25;
     return textureSampleLevel(t, samp, q, lod);
 }
+// The region is the high nibble of the G byte. The maps store it about six
+// steps into its nibble (5, 23, 54 ... 214, 245), so rounding G x 16 put
+// the edge one or two steps above the stored value and the block
+// compression's noise flipped whole 4 x 4 blocks to the next region.
+fn skin_region(g: f32) -> u32 {
+    return min(u32(g * 255.0 + 0.5) >> 4u, 15u);
+}
 fn skin_detail(uv: vec2<f32>, gx: vec2<f32>, gy: vec2<f32>) -> SkinDet {
     let p = uv * M.strand.yz;
     let g = textureGather(1, t_wear, samp, uv);
-    let r0 = min(u32(16.0 * min(min(g.x, g.y), min(g.z, g.w)) + 0.5), 15u);
-    let r1 = min(u32(16.0 * max(max(g.x, g.y), max(g.z, g.w)) + 0.5), 15u);
+    let r0 = skin_region(min(min(g.x, g.y), min(g.z, g.w)));
+    let r1 = skin_region(max(max(g.x, g.y), max(g.z, g.w)));
     var nn = skin_tile(t_primer, r0, p, gx, gy).rg;
     var cc = skin_tile(t_dust, r0, p, gx, gy).r;
     if (r1 != r0) {
