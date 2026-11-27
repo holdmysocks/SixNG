@@ -41,6 +41,8 @@ mod jobs;
 mod library;
 mod mapbake;
 #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+mod modelbakejob;
+#[cfg(all(target_os = "macos", feature = "metal4-poc"))]
 mod metal4_app;
 #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
 mod metal4_egui;
@@ -224,21 +226,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
     if cli.has("bake-model-cache") {
         // 离线批量烘焙 SXMTLIO2 模型缓存：扫描 <work> 下 .glb，预生成 GPU-ready buffer。
-        // 用法：sixng-gui --bake-model-cache [--cache-root <dir>]
+        // 用法：sixng-gui --bake-model-cache [--cache-root <dir>] [--bake-log <file>]
         let work = PathBuf::from(default_work());
         let cache_root = cli
             .get("cache-root")
             .map(PathBuf::from)
             .unwrap_or_else(|| work.clone());
-        match render3d_metal4::bake_model_cache_dir(Path::new(&work), &cache_root) {
+        // GUI 子进程用 --bake-log 指向 <work>/model_cache_bake.log，逐行追加进度供界面显示。
+        let log_path = cli.get("bake-log").map(PathBuf::from);
+        let emit = |line: &str| {
+            eprintln!("[bake-model-cache] {line}");
+            if let Some(path) = &log_path {
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                {
+                    let _ = writeln!(f, "{line}");
+                }
+            }
+        };
+        match render3d_metal4::bake_model_cache_dir_with_progress(
+            Path::new(&work),
+            &cache_root,
+            &emit,
+        ) {
             Ok(stats) => {
-                eprintln!(
-                    "[bake-model-cache] found={} baked={} skipped={} failed={} verified={}",
+                emit(&format!(
+                    "DONE found={} baked={} skipped={} failed={} verified={}",
                     stats.found, stats.baked, stats.skipped, stats.failed, stats.verified
-                );
+                ));
             }
             Err(error) => {
-                eprintln!("[bake-model-cache] failed: {error:#}");
+                emit(&format!("FAILED: {error:#}"));
                 std::process::exit(1);
             }
         }
@@ -510,6 +531,8 @@ struct App {
     shot: Option<(PathBuf, u32, bool)>,
     map3d_start: Option<[f32; 3]>,
     bake: bakejob::BakeJob,
+    #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+    model_bake: modelbakejob::ModelBakeJob,
     settings_msg: String,
     library: library::Library,
     jobs: jobs::Jobs,
@@ -608,6 +631,8 @@ impl App {
             shot: None,
             map3d_start: None,
             bake: bakejob::BakeJob::default(),
+            #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+            model_bake: modelbakejob::ModelBakeJob::default(),
             settings_msg: String::new(),
             tab: Tab::Library,
             cli,
@@ -972,6 +997,11 @@ impl App {
                     self.map3d.reset_data();
                 }
             }
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
+        #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
+        if self.model_bake.running() {
+            let _ = self.model_bake.poll(&self.work);
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
         if self.jobs.active_count() > 0 {

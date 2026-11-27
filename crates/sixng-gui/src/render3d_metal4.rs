@@ -467,6 +467,16 @@ fn verify_model_cache_dir(dir: &Path) -> anyhow::Result<usize> {
 ///
 /// 纯文件 IO，不依赖 Metal 设备；任何单个文件的失败都被记录并跳过，不中断整批。
 pub fn bake_model_cache_dir(work_root: &Path, cache_root: &Path) -> anyhow::Result<BakeStats> {
+    bake_model_cache_dir_with_progress(work_root, cache_root, &|_: &str| {})
+}
+
+/// 与 `bake_model_cache_dir` 相同，但把逐文件进度通过 `progress` 回调上报。
+/// GUI 的子进程用它把进度写进日志，供界面显示。
+pub fn bake_model_cache_dir_with_progress(
+    work_root: &Path,
+    cache_root: &Path,
+    progress: &dyn Fn(&str),
+) -> anyhow::Result<BakeStats> {
     let model_cache_dir = cache_root.join(GPU_MODEL_CACHE_DIR);
     fs::create_dir_all(&model_cache_dir)?;
 
@@ -478,7 +488,18 @@ pub fn bake_model_cache_dir(work_root: &Path, cache_root: &Path) -> anyhow::Resu
         found: glbs.len(),
         ..BakeStats::default()
     };
-    for path in &glbs {
+    progress(&format!(
+        "found {} model(s) under {}",
+        glbs.len(),
+        work_root.display()
+    ));
+    for (index, path) in glbs.iter().enumerate() {
+        progress(&format!(
+            "baking {}/{}: {}",
+            index + 1,
+            glbs.len(),
+            path.file_name().and_then(|s| s.to_str()).unwrap_or("?")
+        ));
         // out_root 用 work_root：贴图解析在里面，顶点/索引组装不依赖贴图，但走同一入口保证一致。
         let model = match glb::load(path, work_root) {
             Ok(model) => model,
