@@ -1029,31 +1029,50 @@ fn tex_class(img: &glb::Image) -> crate::gpu_draw::Class {
     crate::gpu_draw::Class { format, w: *w, h: *h, mips }
 }
 
-/// Write an image's mip chain into `layer` of `t` (BC levels at their 4x4-block size).
-fn tex_write(queue: &wgpu::Queue, t: &wgpu::Texture, layer: u32, img: &glb::Image) {
-    let origin = |l: u32| wgpu::TexelCopyTextureInfo { texture: t, mip_level: l, origin: wgpu::Origin3d { x: 0, y: 0, z: layer }, aspect: wgpu::TextureAspect::All };
+/// The copies that upload an image's mip chain: level, bytes, layout,
+/// extent (BC levels at their 4x4-block size).
+fn tex_copies(img: &glb::Image) -> Vec<(u32, &[u8], wgpu::TexelCopyBufferLayout, wgpu::Extent3d)> {
     if let Some(bc) = &img.bc {
         let (w, h, _) = &img.mips[0];
         let bb = crate::bc::block_bytes(bc.alpha) as u32;
-        for (l, data) in bc.levels.iter().enumerate() {
-            let (mw, mh) = ((w >> l).max(1), (h >> l).max(1));
-            let (bw, bh) = (mw.div_ceil(4), mh.div_ceil(4));
-            queue.write_texture(
-                origin(l as u32),
-                data,
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bw * bb), rows_per_image: Some(bh) },
-                wgpu::Extent3d { width: bw * 4, height: bh * 4, depth_or_array_layers: 1 },
-            );
-        }
-        return;
+        return bc
+            .levels
+            .iter()
+            .enumerate()
+            .map(|(l, data)| {
+                let (mw, mh) = ((w >> l).max(1), (h >> l).max(1));
+                let (bw, bh) = (mw.div_ceil(4), mh.div_ceil(4));
+                (
+                    l as u32,
+                    &data[..],
+                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bw * bb), rows_per_image: Some(bh) },
+                    wgpu::Extent3d { width: bw * 4, height: bh * 4, depth_or_array_layers: 1 },
+                )
+            })
+            .collect();
     }
-    for (l, (mw, mh, px)) in img.mips.iter().enumerate() {
-        queue.write_texture(
-            origin(l as u32),
-            px,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * mw), rows_per_image: Some(*mh) },
-            wgpu::Extent3d { width: *mw, height: *mh, depth_or_array_layers: 1 },
-        );
+    img.mips
+        .iter()
+        .enumerate()
+        .map(|(l, (mw, mh, px))| {
+            (
+                l as u32,
+                &px[..],
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * mw), rows_per_image: Some(*mh) },
+                wgpu::Extent3d { width: *mw, height: *mh, depth_or_array_layers: 1 },
+            )
+        })
+        .collect()
+}
+
+fn tex_origin(t: &wgpu::Texture, l: u32, layer: u32) -> wgpu::TexelCopyTextureInfo<'_> {
+    wgpu::TexelCopyTextureInfo { texture: t, mip_level: l, origin: wgpu::Origin3d { x: 0, y: 0, z: layer }, aspect: wgpu::TextureAspect::All }
+}
+
+/// Write an image's mip chain into `layer` of `t`.
+fn tex_write(queue: &wgpu::Queue, t: &wgpu::Texture, layer: u32, img: &glb::Image) {
+    for (l, data, lay, ext) in tex_copies(img) {
+        queue.write_texture(tex_origin(t, l, layer), data, lay, ext);
     }
 }
 
@@ -1080,7 +1099,14 @@ pub fn tex_upload(device: &wgpu::Device, queue: &wgpu::Queue, img: &glb::Image, 
     crate::gpu_draw::watch::at(1, 10);
     if let Some((layer, t, l)) = gd.and_then(|g| g.layer(tex_class(img))) {
         crate::gpu_draw::watch::at(1, 11);
-        tex_write(queue, &t, l, img);
+        // written by the render thread before its next frame (see `Shared::defer`)
+        let copies: Vec<(u32, Vec<u8>, wgpu::TexelCopyBufferLayout, wgpu::Extent3d)> = tex_copies(img).into_iter().map(|(m, d, lay, ext)| (m, d.to_vec(), lay, ext)).collect();
+        let tw = t.clone();
+        gd.unwrap().defer(Box::new(move |q: &wgpu::Queue| {
+            for (m, d, lay, ext) in &copies {
+                q.write_texture(tex_origin(&tw, *m, l), d, *lay, *ext);
+            }
+        }));
         let view = t.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2),
             base_array_layer: l,

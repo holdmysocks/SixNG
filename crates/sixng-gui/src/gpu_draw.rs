@@ -41,8 +41,8 @@ const MAT_CAP: u64 = 1 << 16;
 /// frame recorded before the free may not be submitted yet).
 const HOLD_FRAMES: u64 = 3;
 /// Pool chunk sizes (bytes): vertices, indices, instances.
-const V_CHUNK: u64 = 64 << 20;
-const I_CHUNK: u64 = 32 << 20;
+const V_CHUNK: u64 = 32 << 20;
+const I_CHUNK: u64 = 16 << 20;
 const N_CHUNK: u64 = 4 << 20;
 /// Layers of one texture array at most, and its bytes at most.
 const MAX_LAYERS: u32 = 256;
@@ -132,6 +132,9 @@ pub fn opt(name: &str) -> bool {
     V.get_or_init(|| std::env::var("SIXNG_MAP_GPU_TABLE").unwrap_or_default()).split(',').any(|s| s.trim() == name)
 }
 
+/// A queued texture write (see Shared::defer).
+pub type Deferred = Box<dyn FnOnce(&wgpu::Queue) + Send>;
+
 /// The features the path needs.
 pub fn features() -> wgpu::Features {
     wgpu::Features::TEXTURE_BINDING_ARRAY
@@ -220,8 +223,16 @@ impl Pool {
         if n == 0 || n > self.cap {
             return None;
         }
-        for (c, ch) in self.chunks.iter_mut().enumerate() {
-            if let Some((_, f)) = ch {
+        // the fullest chunk with room: the emptier ones then drain as models
+        // leave, and go back to the device
+        let pick = self
+            .chunks
+            .iter()
+            .enumerate()
+            .filter_map(|(c, ch)| ch.as_ref().filter(|(_, f)| f.list.iter().any(|r| r.end - r.start >= n)).map(|(_, f)| (f.used(), c)))
+            .max();
+        if let Some((_, c)) = pick {
+            if let Some(Some((_, f))) = self.chunks.get_mut(c) {
                 if let Some(r) = f.alloc(n) {
                     return Some((c, r));
                 }
@@ -350,6 +361,8 @@ pub struct Shared {
     row: u64,
     max_layers: u32,
     inner: Mutex<Inner>,
+    /// Texture layer writes waiting for the render thread (see defer).
+    writes: Mutex<Vec<Deferred>>,
 }
 
 /// What a frame draws with.
@@ -610,6 +623,7 @@ impl Shared {
             mat_bytes,
             row,
             max_layers,
+            writes: Mutex::new(Vec::new()),
             inner: Mutex::new(Inner {
                 v,
                 i,
@@ -706,6 +720,13 @@ impl Shared {
         Some(Handle { shared: self.clone(), vc, v, ic, i, n: None, mid0: m.start as u32, n_mats: n_mats as u32, need, vb, ib })
     }
 
+    /// Queue a write into an array layer for the render thread, which runs
+    /// it before the next frame's passes: a model uploaded meanwhile is first
+    /// drawn in that frame, so it never shows an unwritten layer.
+    pub fn defer(&self, w: Deferred) {
+        self.writes.lock().unwrap_or_else(|e| e.into_inner()).push(w);
+    }
+
     /// Bytes of one table row (material uniform, then eight slots).
     pub fn row(&self) -> u64 {
         self.row
@@ -715,6 +736,12 @@ impl Shared {
     /// enough ago, give empty chunks back, rebuild the bind group when an
     /// array came, and return what the frame draws with.
     pub fn prepare(&self) -> Snapshot {
+        // the layer writes first, on this thread: writing an array while
+        // another thread submits a frame that binds it hangs both inside wgpu
+        let writes = std::mem::take(&mut *self.writes.lock().unwrap_or_else(|e| e.into_inner()));
+        for w in writes {
+            w(&self.queue);
+        }
         let mut g = self.lock(22);
         let g = &mut *g;
         g.frame += 1;
