@@ -27,6 +27,7 @@ struct Mat {
     tile: vec4<f32>,      // fabric detail tile: x UV scale, y rotation, z mean grey value, w bound
     emis: vec4<f32>,      // x emissive scale of the material (from the GLB's emissive strength), yzw the light's colour
     strand: vec4<f32>,    // x a strand piece's width factor this frame (stored over drawn strands; 1 otherwise)
+    glass: array<vec4<f32>, 4>, // ped glass transmission record: [σA, wA], [σB, wB], [d_base, d_max, p, h0], [k, t, d_mask, 1 = glass]
 };
 
 // rows of the part ramp image: 256 each of the first layer's palette rows,
@@ -562,6 +563,11 @@ const NO_BED: f32 = -9000.0;
 // pixel (m, from the scene's depth; below 0: not known). Set by the blended
 // draws' entry (fs_mesh_blend) for the map's water.
 var<private> scene_under: f32 = -1.0;
+
+// Ped glass (Mat.glass[3].w = 1): the share of the colour behind that the
+// glass lets through, per channel; set by mesh_colour, written as the second
+// blend source by the dual-source glass entry (glass.wgsl).
+var<private> glass_t: vec3<f32> = vec3(1.0);
 // `edge`: 0 to 1 on the coastline the caller knows (the terrain's land to
 // sea cells), where the sea surfs whatever the depth data says.
 fn water_shade(p: vec3<f32>, fp: f32, surf: f32, bed: f32, edge: f32) -> vec3<f32> {
@@ -2283,6 +2289,43 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     }
     // the game applies its horizon occlusion to the specular ambient only (never to diffuse ambient, never to hair)
     var col = direct * sh * ao_direct + kd * albedo * amb_d * ao + env_s * fr_v * ao_s + emissive;
+    // Ped glass (`ped_standard_muv_alpha`, the lens programs; shared notes 42es
+    // and its follow-ups). The game blends dual-source, dst' = RT0 + dst x RT1,
+    // with its material record (Mat.glass):
+    //   a0 = the tile's material map alpha x speculartex alpha (baked into the
+    //   base texture's alpha), alpha = sat(a0 / k), opaque o = sat((a0 - t) / (1 - t));
+    //   absorption s_c = sA_c (1 - b_c wA) + sB_c (1 + (b_c - 1) wB), b the base colour;
+    //   view path d1 = max(0, d_base + m d_mask), d0 = d1 (h0 < 0) or lerp(h0, d1, _COLOR0.a),
+    //   r = 1 / c (p > 0) or c, c = max(1e-4, |N.V|),
+    //   d = max(0, d0 + |p| (min(d_max, r d0) - d0)), T = exp(-s d);
+    //   RT1 = (1 - o)(1 - alpha + alpha T (1 - alpha F)), F the split-sum Fresnel;
+    //   RT0 = o x (the diffuse light) + alpha x (the specular light).
+    // Not traced, so left out: the fade factor (fully shown), the mask m
+    // (taken as 0; the lens's d_mask is 0), the light carried through in RT0 and the
+    // refraction pass. F and the light are the viewer's own (its F0 and its
+    // environment table, which has the game's split-sum form).
+    if (M.glass[3].w > 0.5) {
+        let g0 = M.glass[0];
+        let g1 = M.glass[1];
+        let g2 = M.glass[2];
+        let g3 = M.glass[3];
+        let a0 = base.a;
+        let ga = clamp(a0 / max(g3.x, 1e-4), 0.0, 1.0);
+        let go = clamp((a0 - g3.y) / max(1.0 - g3.y, 1e-4), 0.0, 1.0);
+        let sig = g0.xyz * (1.0 - albedo * g0.w) + g1.xyz * (1.0 + (albedo - 1.0) * g1.w);
+        let d1 = max(0.0, g2.x);
+        // h0 >= 0: lerp(h0, d1, the vertex colour's alpha) (follow-up 4: the
+        // shader's TC1.w is _COLOR0.a)
+        let d0 = select(mix(g2.w, d1, i.col.a), d1, g2.w < 0.0);
+        let c = max(1e-4, abs(dot(n, v)));
+        let rr = select(c, 1.0 / c, g2.z > 0.0);
+        let d = max(0.0, d0 + abs(g2.z) * (min(g2.y, rr * d0) - d0));
+        let tr = exp(-sig * d);
+        glass_t = (1.0 - go) * (1.0 - ga + ga * tr * (1.0 - ga * fr_v));
+        let diffuse = (kd * albedo / 3.14159 * sun_e(i.world) * ndl + kd * albedo / 3.14159 * local_e(i.world, n)) * sh * ao_direct + kd * albedo * amb_d * ao;
+        let specular = spec * sun_e(i.world) * ndl * sh * ao_direct + env_s * fr_v * ao_s;
+        col = go * diffuse + ga * specular;
+    }
     // Sheen (velvet, suede): fibres standing on the surface catch light
     // towards the silhouette. The reflectance is the share seen head-on;
     // the fade sets how fast it grows towards the edge.

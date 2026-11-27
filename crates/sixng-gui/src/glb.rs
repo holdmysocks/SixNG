@@ -309,6 +309,10 @@ pub struct Material {
     pub shader_hash: String,
     /// Decal layer order when the material is in the decal bucket.
     pub decal: Option<u8>,
+    /// Ped glass (`ped_standard_muv_alpha` lenses): the material library's
+    /// transmission record of the glass sub-material, drawn by the viewer's
+    /// tinted-glass blend. Set by the model view, not read from the GLB.
+    pub glass: Option<sixng_core::matlib::Transmission>,
 }
 
 pub struct Joint {
@@ -1137,6 +1141,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             gap: gap.into(),
             shader_hash: ex["shader_name_hash"].as_str().unwrap_or("").into(),
             decal,
+            glass: None,
         });
     }
     // skeleton
