@@ -529,6 +529,9 @@ pub struct GpuModel {
     pub stencil: u32,
     /// Material names and shaders (inspection).
     pub mat_names: Vec<String>,
+    /// Draw calls recorded for this model (main, shadow), summed until the
+    /// map's draw log takes them.
+    pub drawn: [std::sync::atomic::AtomicU32; 2],
 }
 
 impl GpuModel {
@@ -2303,6 +2306,7 @@ impl Uploader {
                 .iter()
                 .map(|mt| format!("{} [{}] {}", mt.name, mt.shader_hash, mt.class))
                 .collect(),
+            drawn: Default::default(),
         }
     }
 }
@@ -2756,6 +2760,7 @@ impl Renderer3D {
                     }
                     be.draw_indexed(r.clone(), 0, range.clone());
                     n += 1;
+                    gm.drawn[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     run = None;
                 }
                 if mat != me.material {
@@ -2770,6 +2775,7 @@ impl Renderer3D {
                 if me.strand_lod.is_some() {
                     be.draw_indexed(first..first + cnt, 0, range.clone());
                     n += 1;
+                    gm.drawn[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 } else {
                     run = Some(first..first + cnt);
                 }
@@ -2777,6 +2783,7 @@ impl Renderer3D {
             if let Some(r) = run {
                 be.draw_indexed(r, 0, range.clone());
                 n += 1;
+                gm.drawn[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
         n
@@ -2830,6 +2837,7 @@ impl Renderer3D {
                     }
                     be.draw_indexed(r.clone(), 0, range.clone());
                     n += 1;
+                    gm.drawn[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     run = None;
                 }
                 // a cut-out mesh needs its own material, a solid one any
@@ -2856,6 +2864,7 @@ impl Renderer3D {
                 if cut {
                     be.draw_indexed(first..first + me.n_idx, 0, range.clone());
                     n += 1;
+                    gm.drawn[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 } else {
                     run = Some(first..first + me.n_idx);
                 }
@@ -2863,6 +2872,7 @@ impl Renderer3D {
             if let Some(r) = run {
                 be.draw_indexed(r, 0, range.clone());
                 n += 1;
+                gm.drawn[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
         n

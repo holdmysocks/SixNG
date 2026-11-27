@@ -1458,7 +1458,9 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   buffer, so neighbouring meshes are drawn as one range. In the main pass
   that joins neighbouring meshes with the same material; in the sun
   shadow pass it joins all neighbouring solid meshes, whatever their
-  material (only cut-out ones need theirs).
+  material (only cut-out ones need theirs). `SIXNG_MAP_DRAWLOG=1` prints,
+  with each automation tick, the draw calls per frame of the main and
+  shadow passes and the ten models with the most.
 - **Map cells** (far placements merged per area): a placement more than
   0.3× the HD distance from the camera can be drawn from its cell instead
   of one by one (`SIXNG_CELLS_NEAR` sets another fraction). The cells are
