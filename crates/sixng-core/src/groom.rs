@@ -1087,9 +1087,10 @@ impl Groom {
     ///
     /// Every strand then gets the game's noise and curl
     /// (`hairgen::apply_style`, the groom's first curl group) on its grown
-    /// or walked points, with its own seed and length draw; the root
-    /// triangle's normal stands in for the game's twist vector. The style
-    /// record pass comes after it.
+    /// or walked points, with its own seed and length draw. Its frame axis
+    /// is a direction in the root's surface plane, as in the game (the
+    /// game's exact direction is not read; see `hairgen::apply_style`). The
+    /// style record pass comes after it.
     pub fn coat(&self, share: f32) -> Coat {
         self.coat_with(share, None)
     }
@@ -1179,6 +1180,18 @@ impl Groom {
             };
             self.styles[i].apply(pts, &axis, swap, &weight);
         };
+        // the noise and curl frame's in-plane root direction (`hairgen::apply_style`): square to the
+        // strand's heading in the root triangle's plane (its first segment, else the triangle's first
+        // edge), so it stays clear of the tangent where hair lies along the scalp
+        let plane_axis = |pts: &[[f32; 3]], t: [u32; 3]| {
+            let nr = normal(t);
+            let g0 = self.points[t[0] as usize * k];
+            let edge = unit(sub(self.points[t[1] as usize * k], g0), [1.0, 0.0, 0.0]);
+            let head = pts.get(1).map_or([0.0; 3], |p| sub(*p, pts[0]));
+            let in_plane = sub(head, scale(nr, dot(head, nr)));
+            let heading = unit(if dot(in_plane, in_plane) > 1e-12 { in_plane } else { sub(edge, scale(nr, dot(edge, nr))) }, edge);
+            unit(cross(nr, heading), heading)
+        };
         // scattered strands
         let density: Vec<u8> = self.tri_counts.iter().map(|q| q[0]).collect();
         let top = density.iter().copied().max().unwrap_or(0);
@@ -1192,7 +1205,8 @@ impl Groom {
                 let (d_len, _, d_var) = (draws.next(), draws.next(), draws.next());
                 let at = c.points.len();
                 c.points.extend(hairgen::grow(k, length(t, w, d_len), |j| blend(t, w, j)));
-                hairgen::apply_style(&mut c.points[at..], &curl, seed, d_len, normal(t));
+                let ax = plane_axis(&c.points[at..], t);
+                hairgen::apply_style(&mut c.points[at..], &curl, seed, d_len, ax);
                 style(&mut c.points[at..], normal(t), d_var, &[(t[0] as usize, w[0]), (t[1] as usize, w[1]), (t[2] as usize, w[2])], None);
                 c.normals.push(normal(t));
                 c.guides.push((t, w));
@@ -1275,7 +1289,7 @@ impl Groom {
                 let len = if self.lengths.len() == self.strands { hairgen::length(self.lengths[idx], d_len, self.length_var) } else { f32::MAX };
                 walk(&mut c.points, &centre, fa, fb, radius, tx, ty, len, nr);
                 let at = c.points.len() - k;
-                hairgen::apply_style(&mut c.points[at..], &curl, mseed, d_len, nr);
+                hairgen::apply_style(&mut c.points[at..], &curl, mseed, d_len, fb);
                 // the style frame starts on the root frame's axis, the same for every strand of guide idx (the
                 // generator carries it along from the root frame): the guide's strands curl together into one ringlet
                 style(&mut c.points[at..], nr, d_var, &[(idx, 1.0)], Some(fa));
@@ -1325,7 +1339,7 @@ impl Groom {
                     let len = length(t, b, d_len);
                     walk(&mut c.points, &centre, fa, fb, radius, tx, ty, len, nr);
                     let at = c.points.len() - k;
-                    hairgen::apply_style(&mut c.points[at..], &curl, mseed, d_len, nr);
+                    hairgen::apply_style(&mut c.points[at..], &curl, mseed, d_len, fb);
                     style(&mut c.points[at..], nr, d_var, &[(t[0] as usize, b[0]), (t[1] as usize, b[1]), (t[2] as usize, b[2])], None);
                     c.normals.push(nr);
                     c.guides.push((t, b));
@@ -1386,7 +1400,7 @@ impl Groom {
             "curl": self.curl,
             "curl_note": "system +0xF8 and +0x104: unread word, fade-in length, noise amplitude, curl radius, noise and curl frequency; the game's generator reads the first group for every strand, the second is not read by any known program",
             "taper_note": "16 width steps from root to tip, each / 255 of the strand width (inferred)",
-            "method": "per root triangle, c0 + c1 strands at random barycentric points; every point of a strand is the same barycentric blend of the three guide strands' points. Noise and curl from the groom's first style group (the root triangle normal stands in for the game's twist vector); clumping is not decoded",
+            "method": "per root triangle, c0 + c1 strands at random barycentric points; every point of a strand is the same barycentric blend of the three guide strands' points. Noise and curl from the groom's first style group (frame axis: an in-plane root direction standing in for the game's); clumping is not decoded",
         })
     }
 

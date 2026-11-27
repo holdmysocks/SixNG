@@ -28,6 +28,10 @@ pub struct Vertex {
     /// people the vertex's region for the hide masks of clothes (first byte
     /// of GLB `_REGION`; 0 = none).
     pub zone: [u8; 4],
+    /// The third and fourth UV sets (GLB `TEXCOORD_2`, `TEXCOORD_3`) as
+    /// half floats: u2, v2, u3, v3. The game's livery layouts may place
+    /// a sticker in any of the four sets.
+    pub uv23: [u16; 4],
 }
 
 /// How many of a strand piece's strands the game draws at a distance (its
@@ -1159,6 +1163,15 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                     }
                 }
             }
+            for (k, key) in ["TEXCOORD_2", "TEXCOORD_3"].iter().enumerate() {
+                if let Some(a) = at[*key].as_u64() {
+                    let (x, _) = d.floats(a as usize)?;
+                    for i in 0..n.min(x.len() / 2) {
+                        v[i].uv23[2 * k] = crate::atmo::f16_bits(x[2 * i]);
+                        v[i].uv23[2 * k + 1] = crate::atmo::f16_bits(x[2 * i + 1]);
+                    }
+                }
+            }
             if at
                 .as_object()
                 .map(|o| o.keys().any(|k| k == "TEXCOORD_2"))
@@ -1525,7 +1538,7 @@ mod tangent_tests {
     fn quad(uv: [[f32; 2]; 4]) -> Vec<Vertex> {
         // a wall facing +z: x right, y up
         let pos = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]];
-        (0..4).map(|i| Vertex { pos: pos[i], nrm: [0.0, 0.0, 1.0], tan: [0.0, 1.0, 0.0, 1.0], uv0: uv[i], uv1: [0.0; 2], col: [255; 4], joints: [0; 4], weights: [0; 4], tint: [255; 4], zone: [0; 4] }).collect()
+        (0..4).map(|i| Vertex { pos: pos[i], nrm: [0.0, 0.0, 1.0], tan: [0.0, 1.0, 0.0, 1.0], uv0: uv[i], uv1: [0.0; 2], col: [255; 4], joints: [0; 4], weights: [0; 4], tint: [255; 4], zone: [0; 4], uv23: [0; 4] }).collect()
     }
 
     /// cross(n, t) * w, the bitangent the shaders build.
