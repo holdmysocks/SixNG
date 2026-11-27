@@ -1919,12 +1919,14 @@ impl Uploader {
             },
             usage: wgpu::BufferUsages::STORAGE,
         });
+        // batches that draw at the same distance next to each other (see draw_cells)
+        let (indices, batches) = c.draw_order();
         let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("cell ib"),
-            contents: if c.indices.is_empty() {
+            contents: if indices.is_empty() {
                 &[0u8; 4]
             } else {
-                bytemuck::cast_slice(&c.indices)
+                bytemuck::cast_slice(&indices)
             },
             usage: wgpu::BufferUsages::INDEX,
         });
@@ -2008,7 +2010,7 @@ impl Uploader {
             inst,
             chunk_bg,
             _tex: tex,
-            batches: c.batches.clone(),
+            batches,
             groups: c.groups.clone(),
             bytes,
             has_fb: c.ents.iter().any(|e| e[5] > 0.5),
@@ -2989,11 +2991,27 @@ impl Renderer3D {
                 continue;
             }
             let mut bound = false;
+            let mut chunk = u16::MAX;
+            // pending range: batches of one chunk in drawing order (cells.rs
+            // `draw_order`) join into one draw, also across batches out of
+            // range that cost less than half the draw's indices (the vertex
+            // program drops their placements)
+            let mut run: Option<(u16, std::ops::Range<u32>)> = None;
+            let mut flush = |pass: &mut wgpu::RenderPass<'_>, run: Option<(u16, std::ops::Range<u32>)>, chunk: &mut u16| {
+                if let Some((ch, r)) = run {
+                    if *chunk != ch {
+                        pass.set_bind_group(1, &c.chunk_bg[ch as usize], &[]);
+                        *chunk = ch;
+                    }
+                    pass.draw_indexed(r, 0, 0..1);
+                    n += 1;
+                }
+            };
             for &bi in active {
                 let Some(b) = c.batches.get(bi as usize) else {
                     continue;
                 };
-                if b.pass != which || b.count == 0 {
+                if b.pass != which || b.count == 0 || b.chunk as usize >= c.chunk_bg.len() {
                     continue;
                 }
                 if !set {
@@ -3007,10 +3025,17 @@ impl Renderer3D {
                     pass.set_index_buffer(c.ib.slice(..), wgpu::IndexFormat::Uint32);
                     bound = true;
                 }
-                pass.set_bind_group(1, &c.chunk_bg[b.chunk as usize], &[]);
-                pass.draw_indexed(b.first..b.first + b.count, 0, 0..1);
-                n += 1;
+                if let Some((ch, r)) = &mut run {
+                    let joins = *ch == b.chunk && b.first >= r.end && (b.first - r.end) * 2 <= (r.end - r.start) + b.count;
+                    if joins {
+                        r.end = b.first + b.count;
+                        continue;
+                    }
+                }
+                flush(pass, run.take(), &mut chunk);
+                run = Some((b.chunk, b.first..b.first + b.count));
             }
+            flush(pass, run.take(), &mut chunk);
         }
         n
     }
