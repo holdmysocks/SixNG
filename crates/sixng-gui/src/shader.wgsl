@@ -46,10 +46,15 @@ struct Sticker {
     zones: array<u32, 8>, // one bit per sticker zone it lies on
     m: vec4<f32>,         // a, b, c, d: u = U*a + V*b + ou, v = U*c + V*d + ov
     o: vec4<f32>,         // ou, ov, opacity, picture layer (-1 = none)
-    flags: vec4<u32>,     // x: 1 drawn, 2 colour mask, 4 highlight its zones, 8 outline it; y: model of the vehicle; z: UV set; w: 1 = zone under the pointer
+    flags: vec4<u32>,     // x: 1 drawn, 2 colour mask, 4 highlight its zones, 8 outline it, 16 laid on flat; y: model of the vehicle; z: UV set; w: 1 = zone under the pointer
     c0: vec4<f32>,        // colour of the mask's red (or the picture's tint)
     c1: vec4<f32>,
     c2: vec4<f32>,
+    // laid on flat: u = pa.xyz . P + ou, v = pb.xyz . P + ov, with P the
+    // place on the model as stored, on faces that look along pn.xyz
+    pa: vec4<f32>,
+    pb: vec4<f32>,
+    pn: vec4<f32>,
 };
 
 @group(0) @binding(3) var<storage, read> ST: array<Sticker>;
@@ -810,11 +815,18 @@ fn skin_tile(t: texture_2d<f32>, r: u32, p: vec2<f32>, gx: vec2<f32>, gy: vec2<f
     let q = (cell + clamp(fract(p), vec2(h), vec2(1.0 - h))) * 0.25;
     return textureSampleLevel(t, samp, q, lod);
 }
+// The region is the high nibble of the G byte. The maps store it about six
+// steps into its nibble (5, 23, 54 ... 214, 245), so rounding G x 16 put
+// the edge one or two steps above the stored value and the block
+// compression's noise flipped whole 4 x 4 blocks to the next region.
+fn skin_region(g: f32) -> u32 {
+    return min(u32(g * 255.0 + 0.5) >> 4u, 15u);
+}
 fn skin_detail(uv: vec2<f32>, gx: vec2<f32>, gy: vec2<f32>) -> SkinDet {
     let p = uv * M.strand.yz;
     let g = textureGather(1, t_wear, samp, uv);
-    let r0 = min(u32(16.0 * min(min(g.x, g.y), min(g.z, g.w)) + 0.5), 15u);
-    let r1 = min(u32(16.0 * max(max(g.x, g.y), max(g.z, g.w)) + 0.5), 15u);
+    let r0 = skin_region(min(min(g.x, g.y), min(g.z, g.w)));
+    let r1 = skin_region(max(max(g.x, g.y), max(g.z, g.w)));
     var nn = skin_tile(t_primer, r0, p, gx, gy).rg;
     var cc = skin_tile(t_dust, r0, p, gx, gy).r;
     if (r1 != r0) {
@@ -946,6 +958,10 @@ struct VOut {
     @location(10) @interpolate(flat) seed: u32,
     // third and fourth UV sets
     @location(11) uv23: vec4<f32>,
+    // place and normal on the model as stored (before joints and
+    // instance): what a sticker laid on flat is projected in
+    @location(12) rest: vec3<f32>,
+    @location(13) rest_n: vec3<f32>,
 };
 
 fn skin_matrix(v: VIn) -> mat4x4<f32> {
@@ -1036,6 +1052,8 @@ fn mesh_vertex(v: VIn) -> VOut {
     o.extra.w = select(1.0, -1.0, det < 0.0);
     o.tint = v.tint;
     o.zone = v.zone.xy;
+    o.rest = v.pos;
+    o.rest_n = v.nrm;
     return o;
 }
 
@@ -1846,6 +1864,9 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         let dy1 = dpdy(i.uv1);
         let dx23 = dpdx(i.uv23);
         let dy23 = dpdy(i.uv23);
+        let dxr = dpdx(i.rest);
+        let dyr = dpdy(i.rest);
+        let rest_n = i.rest_n / max(length(i.rest_n), 0.000001);
         let zb = i.zone.x & 255u;
         for (var k = 1u; k <= st_n; k++) {
             let fl = ST[k].flags;
@@ -1861,10 +1882,20 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             if (fl.z == 1u) { uv = i.uv1; dx = dx1; dy = dy1; }
             else if (fl.z == 2u) { uv = i.uv23.xy; dx = dx23.xy; dy = dy23.xy; }
             else if (fl.z == 3u) { uv = i.uv23.zw; dx = dx23.zw; dy = dy23.zw; }
-            let p = vec2(dot(m.xy, uv), dot(m.zw, uv)) + o.xy;
+            var p = vec2(dot(m.xy, uv), dot(m.zw, uv)) + o.xy;
+            var gx = vec2(dot(m.xy, dx), dot(m.zw, dx));
+            var gy = vec2(dot(m.xy, dy), dot(m.zw, dy));
+            if ((fl.x & 16u) != 0u) {
+                // laid on flat: only faces that look the sticker's way
+                // (not the far side of the vehicle, not a panel's edges)
+                if (dot(rest_n, ST[k].pn.xyz) < 0.25) { continue; }
+                let pa = ST[k].pa.xyz;
+                let pb = ST[k].pb.xyz;
+                p = vec2(dot(pa, i.rest), dot(pb, i.rest)) + o.xy;
+                gx = vec2(dot(pa, dxr), dot(pb, dxr));
+                gy = vec2(dot(pa, dyr), dot(pb, dyr));
+            }
             if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0) { continue; }
-            let gx = vec2(dot(m.xy, dx), dot(m.zw, dx));
-            let gy = vec2(dot(m.xy, dy), dot(m.zw, dy));
             if (o.w >= 0.0) {
                 let t = textureSampleGrad(t_stick, samp_clamp, p, i32(o.w + 0.5), gx, gy);
                 var c = srgb_to_linear(t.rgb) * ST[k].c0.rgb;

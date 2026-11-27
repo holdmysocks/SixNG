@@ -2090,6 +2090,7 @@ impl App {
         m.livery.ed.auto_select = c.get("livery-select").and_then(|s| s.parse().ok());
         m.livery.ed.auto_add = c.get("livery-add").map(|s| s.split(',').map(str::to_string).collect()).unwrap_or_default();
         m.livery.ed.auto_click = c.get("livery-click").map(pairs).unwrap_or_default();
+        m.livery.ed.auto_flat = c.has("livery-flat");
         m.livery.ed.auto_drag = c.get("livery-drag").map(pairs).and_then(|v| v.first().copied());
         m.livery.ed.auto_save = c.has("livery-save");
         m.livery.ed.auto_undo = c.get("livery-undo").and_then(|s| s.parse().ok()).unwrap_or(0);
