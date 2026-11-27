@@ -54,9 +54,16 @@
 //! raw maps stay in the material extras (`skin_spec`).
 //!
 //! Not in the export: the detail-normal and detail-control atlases are
-//! engine-wide (no mesh binds them), and the studio program scales F0 by a
-//! window on the albedo's brightness whose bounds come from a per-frame
-//! buffer (runtime; taken as 1 here).
+//! engine-wide (no mesh binds them).
+//!
+//! Both skin programs scale F0 by a window on the albedo's brightness,
+//! `saturate((max(r, g, b) - lo) / (hi - lo))` on the linear albedo. The
+//! bounds are in the per-frame buffer (`6e8725e4` + 0x6c0 / 0x6c4); the
+//! engine fills them every frame from two constants, sRGB 5 and 20 out of
+//! 255, so lo = 0.0015176 and hi = 0.0069954 linear. Only near-black
+//! albedo loses its specular; on skin the factor is 1. glTF has no such
+//! rule, so the GLB keeps the factor as is and records the window in
+//! `extras.skin_spec.albedo_window`; the viewer applies it.
 
 use crate::meta7a::{field_name, Meta};
 use crate::resource::Resource;
@@ -243,6 +250,16 @@ pub fn get(game_root: &Path) -> Result<&'static SkinSpec, String> {
 
 /// The skin shaders: `ped_standard_skin`, `ped_standard_lod_skin`.
 pub const SKIN_SHADERS: [&str; 2] = ["210fbc6a", "8d69edab"];
+/// Lower bound of the engine's albedo window on skin F0 (sRGB 5 / 255, linear).
+pub const ALBEDO_LO: f32 = 0.0015176;
+/// Upper bound of the window (sRGB 20 / 255, linear).
+pub const ALBEDO_HI: f32 = 0.0069954;
+/// The window's factor on F0 for a linear albedo.
+pub fn albedo_window(rgb: [f32; 3]) -> f32 {
+    let m = rgb[0].max(rgb[1]).max(rgb[2]);
+    ((m - ALBEDO_LO) / (ALBEDO_HI - ALBEDO_LO)).clamp(0.0, 1.0)
+}
+
 /// The skin material's `fresnel` constant (`specularfresnel`).
 pub const FRESNEL_PARAM: &str = "b5fe3acb";
 
@@ -285,6 +302,7 @@ pub fn apply_gltf(g: &mut Value, extras: &mut Value, shader_hash: &str, entries:
         "speculartex2": slot_png(entries, SLOT_SPEC2),
         "fresnel": fresnel,
         "f0": 0.04 * specular_factor(f),
+        "albedo_window": {"lo": ALBEDO_LO, "hi": ALBEDO_HI, "srgb": [5, 20], "rule": "F0 *= saturate((max(r, g, b) of the linear albedo - lo) / (hi - lo))"},
         "channels": {
             "speculartex": "R translucency mask, G roughness, B occlusion",
             "speculartex2": "R detail strength, G skin region (G * 16) for the engine detail atlases"
@@ -310,6 +328,19 @@ mod tests {
     #[test]
     fn fresnel_hash() {
         assert_eq!(format!("{:08x}", crate::names::joaat_exact("fresnel")), FRESNEL_PARAM);
+    }
+
+    #[test]
+    fn albedo_window_bounds() {
+        fn lin(c: f32) -> f32 {
+            let c = c / 255.0;
+            if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+        }
+        assert!((lin(5.0) - ALBEDO_LO).abs() < 1e-6);
+        assert!((lin(20.0) - ALBEDO_HI).abs() < 1e-6);
+        assert_eq!(albedo_window([0.0, 0.0, 0.001]), 0.0);
+        assert_eq!(albedo_window([0.3, 0.2, 0.15]), 1.0);
+        assert!((albedo_window([0.0, 0.004, 0.0]) - 0.4532).abs() < 1e-3);
     }
 
     #[test]
