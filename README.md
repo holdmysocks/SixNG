@@ -1507,7 +1507,15 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   shadow pass it joins all neighbouring solid meshes, whatever their
   material (only cut-out ones need theirs). `SIXNG_MAP_DRAWLOG=1` prints,
   with each automation tick, the draw calls per frame of the main and
-  shadow passes and the ten models with the most.
+  shadow passes and the ten models with the most. Since 2026-11-27 the
+  meshes go into those buffers grouped by kind (solid, cut-out, decal,
+  see-through) and then by material, so a model's meshes of one material
+  follow on and draw as one call, and its solid meshes draw as one call in
+  the shadow passes. Decal and see-through meshes keep their order (by
+  layer, far to near), bind only what changed, and join the pending draw
+  when they follow on in the same model and material; opaque-mode decals,
+  which write depth and do not blend, are kept together per model for
+  this. The tick line counts these draws as "decal/see-through".
 - **Map cells** (far placements merged per area): a placement more than
   0.3× the HD distance from the camera can be drawn from its cell instead
   of one by one (`SIXNG_CELLS_NEAR` sets another fraction). The cells are
