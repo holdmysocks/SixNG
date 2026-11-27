@@ -594,6 +594,12 @@ enum Cmd {
         /// the output folder).
         #[arg(long)]
         data: Option<PathBuf>,
+        /// Put a livery on it: a livery file saved by the viewer's Liveries
+        /// panel. Without a file name, the one the viewer keeps for this
+        /// vehicle (<work>/liveries/<vehicle>.json). Each sticker becomes a
+        /// decal mesh with its picture beside the GLB.
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        livery: Option<PathBuf>,
         /// Archive with the vehicle models.
         #[arg(long, default_value = "levels")]
         archive: String,
@@ -2707,7 +2713,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let v = sixng_core::pso::export_handling(&a, &sel, &names, po)?;
             out.print(&json!({"ok": true, "archive": a.id, "stats": v, "seconds": t.elapsed().as_secs_f64()}));
         }
-        Cmd::Vehicle { name, out: glb, config, no_wheels, list, list_parts, with, without, data, archive, tex } => {
+        Cmd::Vehicle { name, out: glb, config, no_wheels, list, list_parts, with, without, data, livery, archive, tex } => {
             let t = Instant::now();
             let dir = glb.as_ref().and_then(|g| g.parent().map(|p| p.to_path_buf())).filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| PathBuf::from("."));
             let file = match data {
@@ -2737,7 +2743,20 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let parts = |l: &[String]| -> Result<Vec<u32>> { l.iter().map(|p| u32::from_str_radix(p.trim(), 16).map_err(|_| anyhow::anyhow!("{p} is not a part name (8 hex digits, see --list-parts)"))).collect() };
             let (with, without) = (parts(with)?, parts(without)?);
             let oa = OutArgs { out: dir.clone(), tex: tex.clone(), raw: false, force: true, no_embedded_textures: false, dry_run: false, body_shape: None, head_skin: 0, paint: None };
-            let mut r = sixng_core::vehexport::export_vehicle(&a, &ix, v, *config, &with, &without, !*no_wheels, glb, &oa.opts())?;
+            let (decals, left) = match livery {
+                Some(f) => {
+                    let f = if f.as_os_str().is_empty() { sixng_core::vehlivery::saved_file(&ws.work, &want) } else { f.clone() };
+                    if !f.is_file() {
+                        bail!("no livery file {} (save one in the viewer's Liveries panel, or name a file after --livery)", f.display());
+                    }
+                    sixng_core::vehlivery::prepare(&ws.game, &f, &dir)?
+                }
+                None => Default::default(),
+            };
+            let mut r = sixng_core::vehexport::export_vehicle(&a, &ix, v, *config, &with, &without, !*no_wheels, &decals, glb, &oa.opts())?;
+            if livery.is_some() {
+                r["livery"]["left_out"] = json!(left);
+            }
             r["seconds"] = t.elapsed().as_secs_f64().into();
             out.print(&json!({"ok": true, "result": r}));
         }

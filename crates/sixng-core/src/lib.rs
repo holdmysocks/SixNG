@@ -67,6 +67,7 @@ pub mod gfxfont;
 pub mod heightmap;
 pub mod ptfx;
 pub mod vehexport;
+pub mod vehlivery;
 pub mod vehicles;
 pub mod vehstickers;
 pub mod vehcolour;
