@@ -66,6 +66,52 @@ pub struct ArchLod {
     /// `timeFlags` of a time archetype (`CTimeArchetypeDef`); None for a
     /// plain archetype.
     pub time_flags: Option<u32>,
+    /// `assetType` (+0x84, `rage__fwArchetypeDef__eAssetType`), see
+    /// [`asset_type_name`]. None when read from an archetype_lod.jsonl
+    /// written before it was recorded.
+    pub asset_type: Option<u32>,
+    /// MapEntityType (+0xB0, enum `079525da`), see [`entity_type_name`].
+    pub entity_type: Option<u32>,
+}
+
+/// Name of an `assetType` value (`rage__fwArchetypeDef__eAssetType`, value
+/// names from the executable's enum table).
+pub fn asset_type_name(v: u32) -> &'static str {
+    match v {
+        0 => "UNINITIALIZED",
+        1 => "FRAGMENT",
+        2 => "DRAWABLE",
+        3 => "DRAWABLEDICTIONARY",
+        4 => "ASSETLESS",
+        _ => "unknown",
+    }
+}
+
+/// Name of a MapEntityType value (archetype +0xB0; the enum and its value
+/// names are from the executable's parser and enum tables, the member's
+/// own name is not known).
+pub fn entity_type_name(v: u32) -> &'static str {
+    match v {
+        0 => "UNINITIALIZED",
+        1 => "BUILDING",
+        2 => "ANIMATED_BUILDING",
+        3 => "DUMMY_OBJECT",
+        4 => "COMPOSITE_ENTITY",
+        5 => "INTERIOR_INSTANCE",
+        6 => "GRASS_BATCH",
+        7 => "PROP_BATCH",
+        _ => "unknown",
+    }
+}
+
+/// JSON for an archetype's kind: `asset_type` and `entity_type` (names),
+/// with the raw values. None when neither was recorded.
+pub fn kind_json(l: &ArchLod) -> Option<serde_json::Value> {
+    if l.asset_type.is_none() && l.entity_type.is_none() {
+        return None;
+    }
+    Some(json!({"asset_type": l.asset_type.map(asset_type_name), "asset_type_value": l.asset_type,
+        "entity_type": l.entity_type.map(entity_type_name), "entity_type_value": l.entity_type}))
 }
 
 /// Struct hash of `CTimeArchetypeDef` (a `CBaseArchetypeDef` plus
@@ -150,7 +196,7 @@ pub fn read_file(a: &ArchiveInfo, e: &Entry) -> Option<FileRec> {
         })
         .collect();
     let base = |o: usize, time_flags: Option<u32>| {
-        (r.u32(o + 0x74), ArchLod { lod_dist: r.f32(o + 0x38), hd_texture_dist: r.f32(o + 0x70), bs_radius: r.f32(o + 0x64), bs_centre: [r.f32(o + 0x58), r.f32(o + 0x5C), r.f32(o + 0x60)], flags: Some(r.u32(o + 0x68)), tuning_keys: [r.u64(o + 0x08), r.u64(o + 0x10), r.u64(o + 0x28)], time_flags })
+        (r.u32(o + 0x74), ArchLod { lod_dist: r.f32(o + 0x38), hd_texture_dist: r.f32(o + 0x70), bs_radius: r.f32(o + 0x64), bs_centre: [r.f32(o + 0x58), r.f32(o + 0x5C), r.f32(o + 0x60)], flags: Some(r.u32(o + 0x68)), tuning_keys: [r.u64(o + 0x08), r.u64(o + 0x10), r.u64(o + 0x28)], time_flags, asset_type: Some(r.u32(o + 0x84)), entity_type: Some(r.u32(o + 0xB0)) })
     };
     let archs = arch_o
         .iter()
@@ -243,6 +289,12 @@ pub fn build(ws: &Workspace, a: &ArchiveInfo, metas: &[&Entry], progress: Progre
             }
             if let Some(t) = time_json(l.time_flags) {
                 v["time"] = t;
+            }
+            if let Some(a) = l.asset_type {
+                v["asset_type"] = json!(a);
+            }
+            if let Some(t) = l.entity_type {
+                v["entity_type"] = json!(t);
             }
             writeln!(w, "{v}")?;
         }
@@ -520,7 +572,7 @@ pub fn load_archetype_lod_from(index_dir: &std::path::Path) -> HashMap<u32, Arch
         let f = |k: &str| v[k].as_f64().unwrap_or(-1.0) as f32;
         let c = |i: usize| v["bs_centre"][i].as_f64().unwrap_or(0.0) as f32;
         let k = |i: usize| v["tuning_keys"][i].as_str().and_then(|x| u64::from_str_radix(x, 16).ok()).unwrap_or(0);
-        m.insert(h, ArchLod { lod_dist: f("lod_dist"), hd_texture_dist: f("hd_texture_dist"), bs_radius: f("bs_radius"), bs_centre: [c(0), c(1), c(2)], flags: v["flags"].as_u64().map(|x| x as u32), tuning_keys: [k(0), k(1), k(2)], time_flags: v["time"]["time_flags"].as_str().and_then(|x| u32::from_str_radix(x, 16).ok()) });
+        m.insert(h, ArchLod { lod_dist: f("lod_dist"), hd_texture_dist: f("hd_texture_dist"), bs_radius: f("bs_radius"), bs_centre: [c(0), c(1), c(2)], flags: v["flags"].as_u64().map(|x| x as u32), tuning_keys: [k(0), k(1), k(2)], time_flags: v["time"]["time_flags"].as_str().and_then(|x| u32::from_str_radix(x, 16).ok()), asset_type: v["asset_type"].as_u64().map(|x| x as u32), entity_type: v["entity_type"].as_u64().map(|x| x as u32) });
     }
     m
 }
@@ -569,6 +621,18 @@ mod tests {
         assert!(time_hours(0).is_empty());
         assert_eq!(time_json(None), None);
         assert_eq!(time_json(Some(0xe0)).unwrap(), json!({"time_flags": "0000e0", "hours": [5, 6, 7]}));
+    }
+
+    #[test]
+    fn archetype_kind_names() {
+        let mut l = ArchLod { lod_dist: 1.0, hd_texture_dist: 1.0, bs_radius: 1.0, bs_centre: [0.0; 3], flags: None, tuning_keys: [0; 3], time_flags: None, asset_type: None, entity_type: None };
+        assert_eq!(kind_json(&l), None);
+        l.asset_type = Some(1);
+        l.entity_type = Some(5);
+        assert_eq!(kind_json(&l).unwrap(), json!({"asset_type": "FRAGMENT", "asset_type_value": 1, "entity_type": "INTERIOR_INSTANCE", "entity_type_value": 5}));
+        assert_eq!(asset_type_name(3), "DRAWABLEDICTIONARY");
+        assert_eq!(entity_type_name(7), "PROP_BATCH");
+        assert_eq!(entity_type_name(9), "unknown");
     }
 
     #[test]

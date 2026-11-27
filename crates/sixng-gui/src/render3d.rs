@@ -1128,7 +1128,7 @@ impl Renderer3D {
             bind_group_layouts: &[Some(&bgl_frame)],
             immediate_size: 0,
         });
-        let vattrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2, 4 => Float32x2, 5 => Unorm8x4, 6 => Uint16x4, 7 => Unorm8x4, 13 => Unorm8x4, 14 => Uint8x4];
+        let vattrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2, 4 => Float32x2, 5 => Unorm8x4, 6 => Uint16x4, 7 => Unorm8x4, 13 => Unorm8x4, 14 => Uint8x4, 15 => Float16x4];
         let iattrs = wgpu::vertex_attr_array![8 => Float32x4, 9 => Float32x4, 10 => Float32x4, 11 => Float32x4, 12 => Float32x4];
         let vbufs = [
             Some(wgpu::VertexBufferLayout {
