@@ -1035,6 +1035,12 @@ pub struct LookPart {
     /// GUID).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub state_guids: Vec<(String, String)>,
+    /// Decorations baked into this part's colour texture (hex names of
+    /// `peddeco` records), in the order the outfit's items list them: the
+    /// ones whose category is this part's item category, or for skin
+    /// categories the part in that slot (`peddeco::skin_slot`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decorations: Vec<String>,
 }
 
 /// The hair states to try, in order, under a piece of headwear, from the
@@ -1578,7 +1584,7 @@ fn look_stand_in(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) ->
                 let slot = slot_of(x);
                 let strands = is_strand_word(item_word(x));
                 o.parts.retain(|p| p.slot != slot);
-                o.parts.push(LookPart { strands, slot, drawable: (*x).clone(), item: String::new(), guid: strands.then(|| format!("{:016x}", crate::meta7a::asset_id(x))), tint: None, colour: None, colour_tag: None, hair_preset: None, layer_set: None, skin_from: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by: "own", category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, state_guids: vec![] });
+                o.parts.push(LookPart { decorations: vec![], strands, slot, drawable: (*x).clone(), item: String::new(), guid: strands.then(|| format!("{:016x}", crate::meta7a::asset_id(x))), tint: None, colour: None, colour_tag: None, hair_preset: None, layer_set: None, skin_from: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by: "own", category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, state_guids: vec![] });
             }
         }
         l.other_variations.clear();
@@ -1630,7 +1636,7 @@ fn look_stand_in_hair(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &st
     l.outfits.sort_by_key(|o| (!everyday(o), !wears(o)));
     for o in &mut l.outfits {
         o.parts.retain(|p| p.slot != "hair");
-        o.parts.push(LookPart { strands: true, slot: "hair".into(), drawable: hair.clone(), item: String::new(), guid: Some(format!("{:016x}", crate::meta7a::asset_id(&hair))), tint: None, colour: None, colour_tag: None, hair_preset: None, layer_set: None, skin_from: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by: "own", category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, state_guids: vec![] });
+        o.parts.push(LookPart { decorations: vec![], strands: true, slot: "hair".into(), drawable: hair.clone(), item: String::new(), guid: Some(format!("{:016x}", crate::meta7a::asset_id(&hair))), tint: None, colour: None, colour_tag: None, hair_preset: None, layer_set: None, skin_from: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by: "own", category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, state_guids: vec![] });
     }
     l.other_variations.clear();
     let who = model_names(&crate::export::game_root(a)).ok().and_then(|m| m.names.get(&h).cloned()).unwrap_or_else(|| format!("ped_0x{h:08x}"));
@@ -1847,7 +1853,7 @@ fn own_look(a: &ArchiveInfo, ix: &ArchiveIndex, model: &str) -> Option<Look> {
     let names: HashSet<String> = ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| e.name.as_ref().map(|n| n.to_ascii_lowercase())).collect();
     let exists = |n: &str| names.contains(n);
     let mut parts: Vec<LookPart> = Vec::new();
-    let plain = |slot: String, drawable: String, found_by: &'static str| LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: String::new(), guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, layer_set: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by, category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, skin_from: None, state_guids: vec![] };
+    let plain = |slot: String, drawable: String, found_by: &'static str| LookPart { decorations: vec![], strands: is_strand_word(item_word(&drawable)), slot, drawable, item: String::new(), guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, layer_set: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by, category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, skin_from: None, state_guids: vec![] };
     for o in opts.iter().filter(|o| o.default || is_strand_word(item_word(&o.name))) {
         let slot = slot_of(&o.name);
         // one hair, one beard …: the first of each
@@ -1949,7 +1955,26 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
     let assets = if needs_assets { asset_drawables(a, ix).ok() } else { None };
     let mut outfits = Vec::new();
     let mut other_variations = Vec::new();
+    // Skin decorations (tattoos, makeup, body marks): every item of the
+    // outfit's variations can list some, most of them items with no model of
+    // their own. Each goes on the part with its category's item category,
+    // else on the part in that category's slot (whole-body meshes added below
+    // included). Garment prints are not applied yet.
+    let decorations = crate::peddeco::get(&crate::export::game_root(a));
+    let assign_decorations = |parts: &mut Vec<LookPart>, cats: &HashMap<String, u32>, vs: &[&Variation]| {
+        let Some(cat) = decorations else { return };
+        let mut seen = HashSet::new();
+        for n in vs.iter().flat_map(|v| &v.parts).flat_map(|p| &p.decorations) {
+            let Some(d) = u32::from_str_radix(n, 16).ok().filter(|h| seen.insert(*h)).and_then(|h| cat.get(h)) else { continue };
+            let Some(slot) = crate::peddeco::skin_slot(d.category) else { continue };
+            let at = parts.iter().position(|p| cats.get(&p.drawable) == Some(&d.category)).or_else(|| parts.iter().position(|p| p.slot == slot));
+            if let Some(i) = at {
+                parts[i].decorations.push(n.clone());
+            }
+        }
+    };
     for (o, vs) in flat {
+        let mut cats: HashMap<String, u32> = HashMap::new();
         let listed = o.is_some();
         let mut parts: Vec<LookPart> = Vec::new();
         let mut unresolved = Vec::new();
@@ -2031,14 +2056,16 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
                     continue;
                 }
                 let slot_is_hair = slot == "hair";
-                parts.push(LookPart { strands: is_strand_word(item_word(&drawable)), slot, drawable, item: p.item.clone(), guid: p.guid.clone(), tint: p.tint.clone(), colour: p.colour, colour_tag: p.colour_tag, hair_preset: p.hair_preset.clone(), layer_set: p.layer_set.clone(), preset: p.preset.clone(), preset_colours: p.preset.as_deref().and_then(|h| presets?.colours(h)).map(|v| v.into_iter().map(|c| c.map(|c| [c[0], c[1], c[2]])).collect()).unwrap_or_default(), tex_remap: p.tex_remap.clone(), skins: p.skins.clone(), found_by, category: p.category.clone(), layer: p.layer.clone(), hides: p.hides.clone(), hides_sub: p.hides_sub.clone(), hair_state: None, skin_from: None, state_guids: if slot_is_hair { p.state_guids.clone() } else { vec![] } });
+                cats.insert(drawable.clone(), p.category_hash);
+                parts.push(LookPart { decorations: vec![], strands: is_strand_word(item_word(&drawable)), slot, drawable, item: p.item.clone(), guid: p.guid.clone(), tint: p.tint.clone(), colour: p.colour, colour_tag: p.colour_tag, hair_preset: p.hair_preset.clone(), layer_set: p.layer_set.clone(), preset: p.preset.clone(), preset_colours: p.preset.as_deref().and_then(|h| presets?.colours(h)).map(|v| v.into_iter().map(|c| c.map(|c| [c[0], c[1], c[2]])).collect()).unwrap_or_default(), tex_remap: p.tex_remap.clone(), skins: p.skins.clone(), found_by, category: p.category.clone(), layer: p.layer.clone(), hides: p.hides.clone(), hides_sub: p.hides_sub.clone(), hair_state: None, skin_from: None, state_guids: if slot_is_hair { p.state_guids.clone() } else { vec![] } });
             }
         }
-        let plain = |slot: &str, drawable: String, found_by: &'static str| LookPart { slot: slot.into(), drawable, item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, layer_set: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by, category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, skin_from: None, state_guids: vec![] };
+        let plain = |slot: &str, drawable: String, found_by: &'static str| LookPart { decorations: vec![], slot: slot.into(), drawable, item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, layer_set: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by, category: None, layer: None, hides: vec![], hides_sub: vec![], hair_state: None, skin_from: None, state_guids: vec![] };
         // another variation of the wardrobe: only what it holds itself
         if !listed {
             let main: Vec<String> = parts.iter().filter(|p| ["full", "outer", "top", "bottom"].contains(&p.slot.as_str())).map(|p| pretty(item_word(&p.drawable))).collect();
             let v = vs[0];
+            assign_decorations(&mut parts, &cats, &vs);
             if !parts.is_empty() || !unresolved.is_empty() || !not_shown.is_empty() {
                 other_variations.push(Outfit { id: v.id.clone(), outfit_type: String::new(), scale: 0.0, label: if main.is_empty() { format!("variation {}", v.id) } else { main.join(", ") }, body_shape, body_preset_items, parts, strand_colours, unresolved, not_shown, variations: vec![v.id.clone()] });
             }
@@ -2089,6 +2116,7 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
                 }
             }
         }
+        assign_decorations(&mut parts, &cats, &vs);
         let main: Vec<String> = parts.iter().filter(|p| ["full", "outer", "top", "bottom"].contains(&p.slot.as_str())).map(|p| pretty(item_word(&p.drawable))).collect();
         outfits.push(Outfit {
             id: format!("{:08x}", o.0),
@@ -2119,7 +2147,7 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
 mod tests {
     #[test]
     fn cull_twins_and_masks_follow_the_hide_masks() {
-        let part = |d: &str, layer: &str, hides: Vec<(&str, &str)>| LookPart { slot: "top".into(), drawable: d.into(), item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by: "x", category: None, layer: Some(layer.into()), hides: hides.into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(), hides_sub: vec![], hair_state: None, state_guids: vec![], layer_set: None, skin_from: None };
+        let part = |d: &str, layer: &str, hides: Vec<(&str, &str)>| LookPart { decorations: vec![], slot: "top".into(), drawable: d.into(), item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by: "x", category: None, layer: Some(layer.into()), hides: hides.into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(), hides_sub: vec![], hair_state: None, state_guids: vec![], layer_set: None, skin_from: None };
         let parts = vec![
             part("tshirt_mr1_000_full", "15793985", vec![]),
             part("shirt_mr1_000_full", "752a6eba", vec![("15793985", "0a00"), ("275822c4", "0001")]),
@@ -2248,7 +2276,7 @@ mod tests {
 
     #[test]
     fn choose_prefers_name_then_fit() {
-        let mut p = Part { item: "1".into(), category: None, name: None, drawable: None, tex_remap: vec![], tags: Default::default(), tint: None, named: None, guid: None, colour: None, colour_tag: None, hair_preset: None, layer_set: None, strand_colour: None, preset: None, state: String::new(), skins: vec![], candidates: Default::default(), layer: None, hides: vec![], hides_sub: vec![], state_guids: vec![] };
+        let mut p = Part { item: "1".into(), category: None, name: None, drawable: None, tex_remap: vec![], tags: Default::default(), tint: None, named: None, guid: None, colour: None, colour_tag: None, hair_preset: None, layer_set: None, strand_colour: None, preset: None, state: String::new(), skins: vec![], decorations: vec![], category_hash: 0, candidates: Default::default(), layer: None, hides: vec![], hides_sub: vec![], state_guids: vec![] };
         p.candidates.insert("hand_fc1_000_full".into(), 3);
         p.candidates.insert("hand_fr1_000_full".into(), 3);
         p.candidates.insert("hand_fr1_000_nude_cull".into(), 3);

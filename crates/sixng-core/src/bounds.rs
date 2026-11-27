@@ -452,6 +452,7 @@ impl Collision {
                 weights: None,
                 joints1: None,
                 weights1: None,
+                morphs: Vec::new(),
             });
         }
         mesh_glb(name, &[NodeGroup { name: name.to_string(), prims }], &mats, &[], extras)

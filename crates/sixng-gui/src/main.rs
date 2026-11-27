@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 mod accum;
 mod assemble;
+mod hairblur;
 mod atmo;
 mod bc;
 mod cells;
@@ -63,7 +64,7 @@ mod vehicle_db;
 /// `sixng-gui --model <id|regex|glb> [--lod N] [--mode N] [--slot N] [--rma N] [--wire] [--skeleton]
 ///  [--tod H] [--paint r,g,b] [--finish N] [--pearl A] [--spin R] [--door R] [--yaw R] [--pitch R] [--zoom F]
 ///  [--sector-grid [N]] (Map 2D / 3D: grid N of levels.rpf, default the world grid)
-///  [--no-tint] [--hair hex,hex] [--hair-width MM] [--full-set] [--size WxH] --screenshot out.png --exit`
+///  [--no-tint] [--expr face_039=1,…] [--hair hex,hex] [--hair-width MM] [--full-set] [--size WxH] --screenshot out.png --exit`
 #[derive(Default, Clone)]
 struct Cli {
     args: std::collections::HashMap<String, String>,
@@ -907,7 +908,7 @@ Optional layers not exported yet (the map works without them): {}.", opt.join(",
             body_shape,
             head_skin: self.head_skin,
             paint: None,
-            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default(), part_hidden: Default::default(),
+            tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_decorations: Default::default(), part_colours: Default::default(), part_hidden: Default::default(),
         };
         self.start_task(
             &format!("Extracting {} entries", idxs.len()),
@@ -1906,6 +1907,10 @@ impl App {
             if v.len() == 3 {
                 m.look.paint = [v[0], v[1], v[2]];
             }
+        }
+        // --expr name=weight,…: face expression shape keys (face_000 …) once the model loads
+        if let Some(e) = c.get("expr") {
+            m.expr_auto = e.split(',').filter_map(|kv| { let (k, v) = kv.split_once('=')?; Some((k.trim().to_string(), v.trim().parse().ok()?)) }).collect();
         }
         m.look.wire = c.has("wire");
         m.look.tint = !c.has("no-tint");

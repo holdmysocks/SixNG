@@ -1774,6 +1774,7 @@ impl Renderer3D4 {
             ramp: None,
             parts: false,
             occlusion_only: false,
+            skin_spec: None,
             emissive_scale: 1.0,
             lit: false,
             emissive_tint: [1.0; 3],
@@ -2972,7 +2973,7 @@ mod tests {
         };
         glb::Model {
             path: PathBuf::new(),
-            meshes: vec![glb::Mesh { strand_lod: None, region2: Vec::new(),
+            meshes: vec![glb::Mesh { strand_lod: None, region2: Vec::new(), morphs: Vec::new(),
                 name: "test triangle".into(),
                 verts: vec![
                     vertex([-1.0, -1.0, 0.0]),
@@ -3006,6 +3007,7 @@ mod tests {
             ramp: None,
                 parts: false,
                 occlusion_only: false,
+                skin_spec: None,
                 emissive_scale: 1.0,
                 lit: false,
                 emissive_tint: [1.0; 3],

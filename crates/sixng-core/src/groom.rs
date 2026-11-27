@@ -395,6 +395,8 @@ pub struct Shell {
     pub id: u64,
     /// The hat's own triangles, when known (`Shell::with_lining`).
     lining: Option<Lining>,
+    /// Per cell: the outermost head point in that direction (0: none).
+    scalp: Vec<f32>,
 }
 
 /// A hat's triangles, binned by their direction from the shell's centre
@@ -513,6 +515,8 @@ impl Lining {
 impl Shell {
     const W: usize = 72;
     const H: usize = 36;
+    /// How far hair may stand out of an opening the hat encloses (m).
+    const OPENING_BULGE: f32 = 0.01;
 
     fn cell(d: [f32; 3], r: f32) -> usize {
         let lon = d[1].atan2(d[0]);
@@ -593,15 +597,16 @@ impl Shell {
                 if v.is_empty() {
                     left = true;
                 } else {
-                    // no cloth here: the hair may lie on the scalp
-                    r[c] = (v.iter().sum::<f32>() / v.len() as f32).max(scalp[c] + 0.006);
+                    // no cloth here: the hair fills the opening and stands up to
+                    // `OPENING_BULGE` out of it, as hair does through a cap's strap gap
+                    r[c] = (v.iter().sum::<f32>() / v.len() as f32 + Self::OPENING_BULGE).max(scalp[c] + 0.006);
                 }
             }
             if !left {
                 break;
             }
         }
-        Shell { centre, r, id, lining: None }
+        Shell { centre, r, id, lining: None, scalp }
     }
 
     /// The same shell with the hat's own triangles (RAGE space), for
@@ -616,7 +621,8 @@ impl Shell {
     /// its root: where a segment crosses the hat, its far point goes back
     /// under the hat, `gap` inside it on the line from the centre (or,
     /// where the segment would still cross, `gap` short of the crossing
-    /// along the segment). The shell alone is coarse (5 degree cells,
+    /// along the segment; a point below the hat's edge is tucked in toward
+    /// the head instead, `tuck`). The shell alone is coarse (5 degree cells,
     /// blended out toward the hat's edges) and lets a few points through.
     /// Returns how many points moved.
     pub fn press_strands(&self, points: &mut [[f32; 3]], k: usize, gap: f32) -> usize {
@@ -634,6 +640,11 @@ impl Shell {
                         let q = [c[0] + (b[0] - c[0]) * f, c[1] + (b[1] - c[1]) * f, c[2] + (b[2] - c[2]) * f];
                         l.first_hit(c, a, q).is_none().then_some(q)
                     });
+                    // a point below the hat's edge (no hat behind it) that the
+                    // way to it from under the hat would cross: tucked in toward
+                    // the head until that way is clear, so the rest of the strand
+                    // still hangs below the edge instead of being pulled under
+                    let under = under.or_else(|| self.tuck(l, a, b, gap));
                     s[j] = under.unwrap_or_else(|| {
                         let len = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2) + (b[2] - a[2]).powi(2)).sqrt().max(1e-9);
                         let f = (t - gap / len).max(0.0);
@@ -643,6 +654,25 @@ impl Shell {
             }
         }
         before.iter().zip(points.iter()).filter(|(a, b)| a != b).count()
+    }
+
+    /// For `press_strands`: `b` on the line from the centre, as far out as
+    /// the segment from `a` to it does not cross the hat, and at least `gap`
+    /// over the head there. None where `b` lies behind the hat, the head is
+    /// not known in that direction, or no such point is found.
+    fn tuck(&self, l: &Lining, a: [f32; 3], b: [f32; 3], gap: f32) -> Option<[f32; 3]> {
+        let c = self.centre;
+        if l.first_hit(c, c, b).is_some() {
+            return None;
+        }
+        let d = [b[0] - c[0], b[1] - c[1], b[2] - c[2]];
+        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        let head = self.scalp[Self::cell(d, len.max(1e-9))];
+        if head <= 0.0 || len <= head + gap {
+            return None;
+        }
+        let lo = (head + gap) / len;
+        (1..=16).map(|i| 1.0 - (1.0 - lo) * i as f32 / 16.0).map(|f| [c[0] + d[0] * f, c[1] + d[1] * f, c[2] + d[2] * f]).find(|q| l.first_hit(c, a, *q).is_none())
     }
 
     /// Pull the points that lie beyond the hat to `gap` under it. Returns
@@ -1071,7 +1101,7 @@ impl Groom {
     /// Ribbon GLB with one plain material of colour `rgb` (linear).
     pub fn ribbon_glb(&self, name: &str, half_width: f32, rgb: [f32; 3], extras: serde_json::Value) -> Vec<u8> {
         let (positions, normals, uv, indices) = self.ribbons(half_width);
-        let prim = crate::gltf::TriPrim { name: name.to_string(), positions, normals: Some(normals), tangents: None, uvs: vec![uv], colors: None, colors1: None, regions: None, tint: None, indices, material: Some(0), joints: None, weights: None, joints1: None, weights1: None };
+        let prim = crate::gltf::TriPrim { name: name.to_string(), positions, normals: Some(normals), tangents: None, uvs: vec![uv], colors: None, colors1: None, regions: None, tint: None, indices, material: Some(0), joints: None, weights: None, joints1: None, weights1: None, morphs: Vec::new() };
         let mat = crate::gltf::Material {
             name: "hair".into(),
             base_color_uri: None,
@@ -1515,7 +1545,7 @@ impl Groom {
                 idx.extend_from_slice(&[v0, v0 + 1, v0 + 3, v0, v0 + 3, v0 + 2]);
             }
         }
-        let prim = crate::gltf::TriPrim { name: name.to_string(), positions: pos, normals: Some(nrm), tangents: Some(tan), uvs: if uv0.is_empty() { vec![] } else { vec![uv0, uv1] }, colors: None, colors1: None, regions: None, tint: Some(tint), indices: idx, material: Some(0), joints: None, weights: None, joints1: None, weights1: None };
+        let prim = crate::gltf::TriPrim { name: name.to_string(), positions: pos, normals: Some(nrm), tangents: Some(tan), uvs: if uv0.is_empty() { vec![] } else { vec![uv0, uv1] }, colors: None, colors1: None, regions: None, tint: Some(tint), indices: idx, material: Some(0), joints: None, weights: None, joints1: None, weights1: None, morphs: Vec::new() };
         let mat = crate::gltf::Material {
             name: "fur".into(),
             base_color_uri: None,
@@ -1533,7 +1563,7 @@ impl Groom {
         let (positions, normals, uv, indices) = self.ribbons(half_width);
         let per = self.points_per_strand * 4;
         let tint: Vec<[u8; 4]> = (0..positions.len()).map(|i| strand_rgb.get(i / per.max(1)).map_or([255; 4], |c| [c[0], c[1], c[2], 255])).collect();
-        let prim = crate::gltf::TriPrim { name: name.to_string(), positions, normals: Some(normals), tangents: None, uvs: vec![uv], colors: None, colors1: None, regions: None, tint: Some(tint), indices, material: Some(0), joints: None, weights: None, joints1: None, weights1: None };
+        let prim = crate::gltf::TriPrim { name: name.to_string(), positions, normals: Some(normals), tangents: None, uvs: vec![uv], colors: None, colors1: None, regions: None, tint: Some(tint), indices, material: Some(0), joints: None, weights: None, joints1: None, weights1: None, morphs: Vec::new() };
         let mat = crate::gltf::Material {
             name: "fur".into(),
             base_color_uri: None,
@@ -1969,6 +1999,41 @@ mod tests {
         let s = Shell::new([0.0, 0.0, 1.7], &holed, &[]);
         let mut through = [[0.14, 0.0, 1.75]];
         assert_eq!(s.press(&mut through, 0.003), 1);
+    }
+
+    #[test]
+    fn hair_below_the_hat_edge_keeps_hanging() {
+        // a dome of triangles, radius 10 cm, from its edge (z 1.7) to its pole,
+        // on a head of radius 9 cm
+        let at = |i: usize, j: usize| {
+            let (lat, lon) = ((i as f32 * 10.0).min(90.0).to_radians(), (j as f32 * 15.0).to_radians());
+            [0.1 * lat.cos() * lon.cos(), 0.1 * lat.cos() * lon.sin(), 1.7 + 0.1 * lat.sin()]
+        };
+        let mut tris = Vec::new();
+        for i in 0..9 {
+            for j in 0..24 {
+                tris.push([at(i, j), at(i, j + 1), at(i + 1, j + 1)]);
+                tris.push([at(i, j), at(i + 1, j + 1), at(i + 1, j)]);
+            }
+        }
+        let pts: Vec<[f32; 3]> = tris.iter().flatten().copied().collect();
+        let head: Vec<[f32; 3]> = (0..36).flat_map(|i| (0..72).map(move |j| {
+            let (lat, lon) = ((i as f32 * 5.0 - 87.5).to_radians(), (j as f32 * 5.0).to_radians());
+            [0.09 * lat.cos() * lon.cos(), 0.09 * lat.cos() * lon.sin(), 1.7 + 0.09 * lat.sin()]
+        })).collect();
+        let s = Shell::new([0.0, 0.0, 1.7], &pts, &head).with_lining(tris.clone());
+        // rooted under the hat, out through its side, then down below its edge
+        let mut strand = vec![[0.07, 0.0, 1.75], [0.11, 0.0, 1.72], [0.13, 0.0, 1.66], [0.13, 0.0, 1.6]];
+        s.press_strands(&mut strand, 4, 0.003);
+        // the tail still hangs below the edge, where it was
+        assert_eq!(strand[3], [0.13, 0.0, 1.6]);
+        assert!(strand[2][2] < 1.7, "{:?}", strand[2]);
+        let r = |p: [f32; 3]| (p[0] * p[0] + p[1] * p[1] + (p[2] - 1.7).powi(2)).sqrt();
+        assert!(r(strand[2]) >= 0.092, "{:?}", strand[2]);
+        let l = s.lining.as_ref().unwrap();
+        for w in strand.windows(2) {
+            assert!(l.first_hit(s.centre, w[0], w[1]).is_none(), "{w:?} crosses");
+        }
     }
 
     #[test]

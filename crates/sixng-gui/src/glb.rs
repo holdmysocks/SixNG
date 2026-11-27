@@ -187,6 +187,10 @@ pub struct Mesh {
     /// Per vertex, the second byte of the `_REGION` stream: a region in a second layer (on body skins,
     /// the waist strip the upper and lower halves both carry). Empty when the mesh has none.
     pub region2: Vec<u8>,
+    /// Morph targets (glTF `targets`, names from the mesh's
+    /// `extras.targetNames`): one position offset per vertex, glTF space.
+    /// On heads these are the face's expression shape keys.
+    pub morphs: Vec<(String, Vec<[f32; 3]>)>,
 }
 
 /// Close-up fabric weave of a clothing material (see `Material::detail`).
@@ -263,6 +267,10 @@ pub struct Material {
     /// The packed slot holds a vehicle layer's material map
     /// (`lyr0materialatex`): only its blue channel is used, as occlusion.
     pub occlusion_only: bool,
+    /// Ped skin (`ped_standard_skin`, `ped_standard_lod_skin`): the packed
+    /// slot holds the `speculartex` spec map, whose green is roughness, and
+    /// this is the specular factor (`1 + fresnel`; F0 = 0.04 x it).
+    pub skin_spec: Option<f32>,
     /// How much brighter (or dimmer) than the viewer's emissive level an
     /// emissive material lights, from the GLB's emissive strength
     /// (`emissive_scale`); 1 when the export does not say.
@@ -345,6 +353,39 @@ struct Doc<'a> {
 
 impl<'a> Doc<'a> {
     /// Raw elements of an accessor as f32 (normalised for u8/u16).
+    /// A VEC3 float accessor that may be sparse (how morph targets are
+    /// written): zeros, the sparse values put at their indices.
+    fn vec3_maybe_sparse(&self, acc: usize) -> Result<Vec<[f32; 3]>> {
+        let a = &self.j["accessors"][acc];
+        let n = a["count"].as_u64().ok_or_else(|| anyhow!("accessor count"))? as usize;
+        let mut out = if a.get("bufferView").is_some() {
+            let (f, _) = self.floats(acc)?;
+            f.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect()
+        } else {
+            vec![[0f32; 3]; n]
+        };
+        let sp = &a["sparse"];
+        if let Some(k) = sp["count"].as_u64() {
+            let view = |v: &Value| -> usize {
+                let bv = &self.j["bufferViews"][v["bufferView"].as_u64().unwrap_or(0) as usize];
+                bv["byteOffset"].as_u64().unwrap_or(0) as usize + v["byteOffset"].as_u64().unwrap_or(0) as usize
+            };
+            let (io, vo) = (view(&sp["indices"]), view(&sp["values"]));
+            let ict = sp["indices"]["componentType"].as_u64().unwrap_or(5125);
+            for j in 0..k as usize {
+                let i = match ict {
+                    5125 => u32::from_le_bytes(self.bin.get(io + 4 * j..io + 4 * j + 4).ok_or_else(|| anyhow!("sparse index"))?.try_into()?) as usize,
+                    5123 => u16::from_le_bytes(self.bin.get(io + 2 * j..io + 2 * j + 2).ok_or_else(|| anyhow!("sparse index"))?.try_into()?) as usize,
+                    _ => *self.bin.get(io + j).ok_or_else(|| anyhow!("sparse index"))? as usize,
+                };
+                if i < n && vo + 12 * j + 12 <= self.bin.len() {
+                    out[i] = [rd_f32(self.bin, vo + 12 * j), rd_f32(self.bin, vo + 12 * j + 4), rd_f32(self.bin, vo + 12 * j + 8)];
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn floats(&self, acc: usize) -> Result<(Vec<f32>, usize)> {
         let a = &self.j["accessors"][acc];
         let n = a["count"]
@@ -911,11 +952,29 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
         let mr = ex["classification"]["stand_in"].as_str().and_then(|_| {
             Some([pbr["metallicFactor"].as_f64()? as f32, pbr["roughnessFactor"].as_f64()? as f32])
         });
+        // Ped skin: its spec map (`speculartex`) is the packed map, read as
+        // the game's skin program reads it; `speculartex2` (detail strength
+        // and region for engine-wide atlases) is not.
+        let skin = matches!(ex["shader_name_hash"].as_str(), Some("210fbc6a" | "8d69edab"));
+        let mut skin_spec = None;
+        if skin && !opts.base_only {
+            if let Some(t) = tex_list.iter().find(|t| t["param_hash"] == "c6f46e79" && t["png"].is_string() && tiny_png(t).is_none()) {
+                packed = add_img(out_root.join(t["png"].as_str().unwrap()), false, &mut images);
+                if packed.is_some() {
+                    skin_spec = Some(
+                        m["extensions"]["KHR_materials_specular"]["specularFactor"]
+                            .as_f64()
+                            .or_else(|| ex["skin_spec"]["fresnel"].as_f64().map(|f| 1.0 + f))
+                            .unwrap_or(1.0) as f32,
+                    );
+                }
+            }
+        }
         for t in ex["textures"].as_array().cloned().unwrap_or_default() {
             let role = slot_role(&t);
             let (status, mip) = slot_status(&t);
             let png = t["png"].as_str().map(|s| s.to_string());
-            if role == "packed_rma" && packed.is_none() && !opts.base_only && tiny_png(&t).is_none()
+            if role == "packed_rma" && !skin && packed.is_none() && !opts.base_only && tiny_png(&t).is_none()
             {
                 if let Some(p) = &png {
                     packed = add_img(out_root.join(p), false, &mut images);
@@ -1025,6 +1084,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                 .and_then(|p| add_img(out_root.join(p), false, &mut images)),
             parts: ex["classification"]["stand_in"] == "parts",
             occlusion_only,
+            skin_spec,
             emissive_scale,
             lit,
             emissive_tint: emissive_tint(&m),
@@ -1273,7 +1333,18 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                     c[k] += x.pos[k] / n.max(1) as f32;
                 }
             }
-            meshes.push(Mesh { strand_lod: None, region2,
+            let names: Vec<String> = mesh["extras"]["targetNames"].as_array().map(|a| a.iter().map(|x| x.as_str().unwrap_or("").to_string()).collect()).unwrap_or_default();
+            let mut morphs = Vec::new();
+            for (k, t) in p["targets"].as_array().cloned().unwrap_or_default().iter().enumerate() {
+                let Some(a) = t["POSITION"].as_u64() else { continue };
+                let d3 = d.vec3_maybe_sparse(a as usize)?;
+                if d3.len() != n {
+                    continue;
+                }
+                let name = names.get(k).cloned().unwrap_or_else(|| format!("target {k}"));
+                morphs.push((name, d3));
+            }
+            meshes.push(Mesh { strand_lod: None, region2, morphs,
                 name: mesh["name"].as_str().unwrap_or("").into(),
                 verts: v,
                 indices,

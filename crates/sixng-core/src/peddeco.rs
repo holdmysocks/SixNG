@@ -1,0 +1,732 @@
+//! Ped decorations: tattoos, makeup, body marks and garment prints, and how
+//! they are baked into a part's colour texture.
+//!
+//! The catalogue is one PSO file of data.rpf. Its records (struct
+//! `40e79f52`, 224 bytes) are one decoration each:
+//! - `Name` (+4): the u32 hash a wardrobe item's tag `d9f1087b`
+//!   (decoration presets) lists;
+//! - `Category` (+108): the wardrobe item category of the part it goes on
+//!   (`3817131d` body upper, `44925bfd` body lower, `378ad10c` head, and
+//!   garment categories for prints);
+//! - layers (`ef888d7e`, +160, array of struct `77f0121d`, 320 bytes).
+//!
+//! A layer holds:
+//! - up to five decal textures (`5adaff50`, u64), which live in the stores
+//!   `data/ttdb/peds/decorations_*`;
+//! - three ink colours (`0d23ee2d`, ARGB);
+//! - a clip quad (`207eec03`, four edges `x0 y0 x1 y1` in the part's UV);
+//! - flags, opacity (`c88b9e6d`), saturation, a mode (0..5);
+//! - the UV transform (`8b424621`, a 3x3 matrix stored as three vec4 rows).
+//!
+//! Placement, from the game's bake shader (`PS_BakeDecorations`) and checked
+//! on a full-body decal: the part's UV `(u, v)`, as a row vector, times the
+//! matrix gives the decal UV. With `w = m02 u + m12 v + m22`, the decal UV is
+//! `((m00 u + m10 v + m20) / w, (m01 u + m11 v + m21) / w)`. A part pixel
+//! takes the layer only inside every edge of the clip quad: the shader drops
+//! it when `(u - x0)(y1 - y0) - (v - y0)(x1 - x0) < 0` for any edge.
+//!
+//! Colour: a decal is either full-colour art or a mask. In a mask, alpha
+//! is the line art, green a flat 0.5 and red / blue the regions of a second
+//! and third ink. Each ink word is hue, saturation, value and alpha bytes
+//! (`0xAAVVSSHH`); the game's CPU packer turns it into three linear colour
+//! stops ([`ink_stops`]) and the shader picks along them by the decal's
+//! green ([`shade`]), so a mask's flat 0.5 gives the ink itself. An ink
+//! with alpha 0 is off, and with ink 0 off the decal keeps its own colour.
+//! The result goes on the skin by the blend the flag bits select
+//! ([`Layer::blend`]), in linear light.
+//!
+//! Left out: head makeup ([`Layer::is_makeup`]), whose inks the game moves
+//! toward another colour by a lookup that is not decoded, and mask decals
+//! on a layer with no ink, which the game colours at run time.
+
+use crate::pso::Pso;
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::OnceLock;
+
+/// The decoration record struct (low 32 bits of the PSO struct hash).
+pub const RECORD: u32 = 0x40e7_9f52;
+/// The layer struct.
+pub const LAYER: u32 = 0x77f0_121d;
+/// Wardrobe tag key whose items are decoration names (`decorationpresets`).
+pub const TAG: u32 = 0xd9f1_087b;
+/// Decoration categories that go on skin, with the outfit slot that takes
+/// them when no part has that item category.
+pub const SKIN_CATEGORIES: [(u32, &str); 3] = [(0x3817_131d, "body upper"), (0x4492_5bfd, "body lower"), (0x378a_d10c, "head")];
+
+const VERSION: u32 = 2;
+/// Changes when the bake rule changes, so baked textures are made again.
+pub const BAKE_RULE: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Layer {
+    /// Decal textures (non-zero ones of the five, in order).
+    pub textures: Vec<u64>,
+    /// Ink words, `0xAAVVSSHH` (HSV and alpha; see [`ink_stops`]).
+    pub colours: [u32; 3],
+    /// Clip quad: four edges `[x0, y0, x1, y1]` in the part's UV
+    /// (`f32::MAX` coordinates: no clipping).
+    pub clip: [[f32; 4]; 4],
+    pub flags: u32,
+    pub opacity: f32,
+    pub saturation: f32,
+    /// 0..5: the game matches it against a field of the record it bakes
+    /// into (a target or slot index, not a blend mode).
+    pub mode: u32,
+    /// Part UV -> decal UV (rows; see the module notes).
+    pub uv: [[f32; 3]; 3],
+    /// Per ink: four values; a non-zero fourth marks head makeup (see
+    /// [`Layer::is_makeup`]).
+    #[serde(default)]
+    pub p3: [[f32; 4]; 3],
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Decoration {
+    pub name: u32,
+    pub category: u32,
+    pub layers: Vec<Layer>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Catalogue {
+    pub version: u32,
+    /// The data.rpf entry the records were read from.
+    pub source: String,
+    pub decorations: Vec<Decoration>,
+    #[serde(skip)]
+    by_name: HashMap<u32, usize>,
+}
+
+fn le32(d: &[u8], o: usize) -> u32 {
+    d.get(o..o + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
+}
+fn le64(d: &[u8], o: usize) -> u64 {
+    d.get(o..o + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()))
+}
+fn f32at(d: &[u8], o: usize) -> f32 {
+    f32::from_bits(le32(d, o))
+}
+
+/// Byte offset of a member of a PSO struct, by its name hash.
+fn member(p: &Pso, s: u32, name: u32) -> Option<usize> {
+    p.structs.get(&s)?.members.iter().find(|m| m.hash == name).map(|m| m.off as usize)
+}
+
+/// An array member (`u32 count`, then at +8 a pool pointer
+/// `(offset << 20) | block`): (count, byte offset of the first element).
+fn array(p: &Pso, at: usize) -> Option<(usize, usize)> {
+    let d = &p.res.sys;
+    let n = le32(d, at) as usize;
+    let ptr = le64(d, at + 8);
+    let (b, off) = ((ptr & 0xf_ffff) as usize, (ptr >> 20) as usize);
+    if n == 0 {
+        return Some((0, 0));
+    }
+    let &(_, len, o) = p.blocks.get(b.checked_sub(1)?)?;
+    (o != usize::MAX && off <= len as usize).then_some((n, o + off))
+}
+
+fn read_layer(p: &Pso, o: usize, m: &impl Fn(u32) -> Option<usize>) -> Option<Layer> {
+    let d = &p.res.sys;
+    let at = |h: u32| m(h).map(|x| o + x);
+    let tex = at(0x5ada_ff50)?;
+    let col = at(0x0d23_ee2d)?;
+    let clip = at(0x207e_ec03)?;
+    let uv = at(0x8b42_4621)?;
+    let p3 = at(0x6eea_8588);
+    Some(Layer {
+        textures: (0..5).map(|i| le64(d, tex + 8 * i)).filter(|&h| h != 0).collect(),
+        colours: std::array::from_fn(|i| le32(d, col + 4 * i)),
+        clip: std::array::from_fn(|i| std::array::from_fn(|k| f32at(d, clip + 16 * i + 4 * k))),
+        flags: at(0x4b62_1302).map_or(0, |x| le32(d, x)),
+        opacity: at(0xc88b_9e6d).map_or(1.0, |x| f32at(d, x)),
+        saturation: at(0x0d4d_d331).map_or(1.0, |x| f32at(d, x)),
+        mode: at(0x8765_2efd).map_or(0, |x| le32(d, x)),
+        uv: std::array::from_fn(|i| std::array::from_fn(|k| f32at(d, uv + 16 * i + 4 * k))),
+        p3: p3.map_or([[0.0; 4]; 3], |p| std::array::from_fn(|i| std::array::from_fn(|k| f32at(d, p + 16 * i + 4 * k)))),
+    })
+}
+
+impl Catalogue {
+    /// The decorations of a PSO file that holds the record struct.
+    pub fn from_pso(p: &Pso, source: &str) -> Option<Catalogue> {
+        let rm = |h: u32| member(p, RECORD, h);
+        let lm = |h: u32| member(p, LAYER, h);
+        let lsize = p.structs.get(&LAYER)?.size as usize;
+        let (name, cat, layers) = (rm(0xacec_22be)?, rm(0xb536_67be)?, rm(0xef88_8d7e)?);
+        let d = &p.res.sys;
+        let decorations: Vec<Decoration> = p
+            .meta()
+            .objects(RECORD)
+            .into_iter()
+            .map(|o| {
+                let ls = array(p, o + layers).map(|(n, b)| (0..n).filter_map(|i| read_layer(p, b + i * lsize, &lm)).collect()).unwrap_or_default();
+                Decoration { name: le32(d, o + name), category: le32(d, o + cat), layers: ls }
+            })
+            .collect();
+        (!decorations.is_empty()).then(|| Catalogue { version: VERSION, source: source.into(), decorations, by_name: HashMap::new() }.indexed())
+    }
+
+    fn indexed(mut self) -> Self {
+        self.by_name = self.decorations.iter().enumerate().map(|(i, d)| (d.name, i)).collect();
+        self
+    }
+
+    pub fn get(&self, name: u32) -> Option<&Decoration> {
+        self.by_name.get(&name).map(|&i| &self.decorations[i])
+    }
+
+    pub fn path(ws: &crate::export::Workspace) -> std::path::PathBuf {
+        ws.index_dir().join("ped_decorations.json")
+    }
+
+    pub fn load(ws: &crate::export::Workspace) -> Option<Catalogue> {
+        let c: Catalogue = serde_json::from_slice(&std::fs::read(Self::path(ws)).ok()?).ok()?;
+        (c.version == VERSION).then(|| c.indexed())
+    }
+
+    /// From the cache, else from data.rpf (its first PSO that holds the
+    /// record struct), cached.
+    pub fn load_or_build(ws: &crate::export::Workspace) -> Result<Catalogue, String> {
+        if let Some(c) = Self::load(ws) {
+            return Ok(c);
+        }
+        let a = ws.resolve("data").map_err(|e| format!("{e:#}"))?;
+        let aix = ws.load_index(&a).map_err(|e| format!("data.rpf index: {e:#}; index data.rpf first"))?;
+        let c = aix
+            .entries
+            .iter()
+            .filter(|e| e.kind == crate::classify::Kind::Pso)
+            .find_map(|e| {
+                let b = crate::scan::read_entry(&a.path, e).ok()?;
+                let p = crate::pso::parse(&b).filter(|p| p.structs.contains_key(&RECORD))?;
+                Catalogue::from_pso(&p, &e.id)
+            })
+            .ok_or("no ped decoration catalogue found in data.rpf")?;
+        if let Ok(b) = serde_json::to_vec(&c) {
+            let p = Self::path(ws);
+            if let Some(d) = p.parent() {
+                let _ = std::fs::create_dir_all(d);
+            }
+            let _ = crate::atomic::write(p, b);
+        }
+        Ok(c)
+    }
+}
+
+/// The catalogue of this install (built once per run; None without a work
+/// folder or data.rpf index).
+pub fn get(game_root: &Path) -> Option<&'static Catalogue> {
+    static C: OnceLock<Option<Catalogue>> = OnceLock::new();
+    C.get_or_init(|| {
+        let work = crate::names::work_dir()?;
+        Catalogue::load_or_build(&crate::export::Workspace::new(game_root, work)).ok()
+    })
+    .as_ref()
+}
+
+/// The outfit slot a skin decoration category goes on when no part has that
+/// item category.
+pub fn skin_slot(category: u32) -> Option<&'static str> {
+    SKIN_CATEGORIES.iter().find(|c| c.0 == category).map(|c| c.1)
+}
+
+/// Part UV -> decal UV (None where the projective divisor vanishes).
+pub fn decal_uv(m: &[[f32; 3]; 3], u: f32, v: f32) -> Option<(f32, f32)> {
+    let w = m[0][2] * u + m[1][2] * v + m[2][2];
+    if w.abs() < 1e-8 {
+        return None;
+    }
+    Some(((m[0][0] * u + m[1][0] * v + m[2][0]) / w, (m[0][1] * u + m[1][1] * v + m[2][1]) / w))
+}
+
+/// Inside the clip quad (every edge; see the module notes).
+pub fn inside_clip(q: &[[f32; 4]; 4], u: f32, v: f32) -> bool {
+    q.iter().all(|e| {
+        let [x0, y0, x1, y1] = e.map(f64::from);
+        (u as f64 - x0) * (y1 - y0) - (v as f64 - y0) * (x1 - x0) >= 0.0
+    })
+}
+
+fn srgb_to_lin(c: f32) -> f32 {
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+}
+fn lin_to_srgb(c: f32) -> f32 {
+    let c = c.clamp(0.0, 1.0);
+    if c <= 0.003_130_8 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
+}
+
+/// DXGI formats whose colour channels are sRGB-encoded: a sampler returns
+/// them in linear light, which is what the bake shader sees.
+pub fn dxgi_is_srgb(f: u32) -> bool {
+    matches!(f, 29 | 72 | 75 | 78 | 91 | 93 | 99)
+}
+
+/// The hue ramp of the game's HSV code (`h` 0..1): RGB 0..1.
+fn hue(h: f32) -> [f32; 3] {
+    [(6.0 * h - 3.0).abs() - 1.0, 2.0 - (6.0 * h - 2.0).abs(), 2.0 - (6.0 * h - 4.0).abs()].map(|x| x.clamp(0.0, 1.0))
+}
+
+/// An ink word's three colour stops, as the game's CPU packer makes them
+/// for the bake shader: linear RGB and alpha, each quantised to a byte and
+/// returned as byte / 255. None when the ink is off (alpha byte 0).
+///
+/// The word is `0xAAVVSSHH`: hue, saturation, value and alpha bytes, each
+/// / 255. With `ramp = hue(H)`, the stops in sRGB are
+/// - stop 0 (dark): `0.1 V x lerp(1, ramp, S)`, alpha 1;
+/// - stop 1 (the ink): `V x lerp(1, ramp, S)`, alpha A;
+/// - stop 2 (light): `(0.45 + 0.55 V) x lerp(1, ramp, 0.55 S)`, alpha 1;
+///
+/// and each channel goes to linear light before it is quantised
+/// (`trunc(x 255 + 0.5)`).
+pub fn ink_stops(w: u32) -> Option<[[f32; 4]; 3]> {
+    if w >> 24 == 0 {
+        return None;
+    }
+    let [h, s, v, a] = w.to_le_bytes().map(|b| b as f32 / 255.0);
+    let ramp = hue(h);
+    let stop = |val: f32, sat: f32, alpha: f32| -> [f32; 4] {
+        let q = |x: f32| (x.clamp(0.0, 1.0) * 255.0 + 0.5).trunc() / 255.0;
+        let c = ramp.map(|r| q(srgb_to_lin(val * (1.0 + (r - 1.0) * sat))));
+        [c[0], c[1], c[2], alpha]
+    };
+    Some([stop(0.1 * v, s, 1.0), stop(v, s, a), stop(0.45 + 0.55 * v, 0.55 * s, 1.0)])
+}
+
+/// The colour of a set of stops at gradient position `g`: stop 0 to 1 over
+/// the first half, 1 to 2 over the second.
+fn gradient(s: &[[f32; 4]; 3], g: f32) -> [f32; 3] {
+    let (a, b, t) = if g < 0.5 { (s[0], s[1], 2.0 * g) } else { (s[1], s[2], 2.0 * g - 1.0) };
+    std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
+}
+
+impl Layer {
+    /// The layer sets an ink: an ink word with a non-zero alpha byte.
+    pub fn uses_ink(&self) -> bool {
+        self.colours.iter().any(|c| c >> 24 != 0)
+    }
+
+    /// Head makeup: an ink whose `p3` row has a non-zero fourth value. The
+    /// game then moves that ink toward another colour (a palette lookup in
+    /// another colour space) that is not decoded, so such layers are not
+    /// baked.
+    pub fn is_makeup(&self) -> bool {
+        (0..3).any(|i| self.colours[i] >> 24 != 0 && self.p3[i][3] != 0.0)
+    }
+
+    /// The blend mode, from the flag bits the shader tests.
+    pub fn blend(&self) -> Blend {
+        if self.flags & 0x0400_0000 != 0 {
+            Blend::Multiply
+        } else if self.flags & 0x0800_0000 != 0 {
+            Blend::Screen
+        } else if self.flags & 0x1000_0000 != 0 {
+            Blend::Overlay
+        } else {
+            Blend::Normal
+        }
+    }
+}
+
+/// How a layer's colour combines with the texture under it (linear light).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Blend {
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+}
+
+impl Blend {
+    pub fn apply(self, base: f32, src: f32) -> f32 {
+        match self {
+            Blend::Normal => src,
+            Blend::Multiply => base * src,
+            Blend::Screen => 1.0 - (1.0 - base) * (1.0 - src),
+            Blend::Overlay => {
+                if base < 0.5 {
+                    2.0 * base * src
+                } else {
+                    1.0 - 2.0 * (1.0 - base) * (1.0 - src)
+                }
+            }
+        }
+    }
+}
+
+/// Saturation as the game's bake shader applies it (skipped at 1.0): the
+/// colour to HSV, the saturation scaled, back to RGB.
+pub fn saturate(c: [f32; 3], s: f32) -> [f32; 3] {
+    if s == 1.0 {
+        return c;
+    }
+    let mx = c[0].max(c[1]).max(c[2]);
+    let mn = c[0].min(c[1]).min(c[2]);
+    let d = mx - mn;
+    // hue in 0..1 (the shader's 6 x delta form)
+    let h = if d <= 0.0 {
+        0.0
+    } else if mx == c[0] {
+        ((c[1] - c[2]) / (6.0 * d)).rem_euclid(1.0)
+    } else if mx == c[1] {
+        (c[2] - c[0]) / (6.0 * d) + 1.0 / 3.0
+    } else {
+        (c[0] - c[1]) / (6.0 * d) + 2.0 / 3.0
+    };
+    let sat = d / (mx + 1e-10) * s;
+    hue(h).map(|x| ((x - 1.0) * sat + 1.0) * mx)
+}
+
+/// A layer's colour and coverage at one decal sample `t` (RGBA 0..1, as the
+/// shader samples it: colour in linear light for an sRGB decal). Returns
+/// (linear colour, coverage).
+///
+/// Ink 0 colours the whole decal: its gradient at the decal's green, times
+/// ink 0's alpha; with ink 0 off, the decal's own colour. Ink 1 then covers
+/// that by `alpha(ink 1) x red`, and ink 2 by `alpha(ink 2) x blue`, each
+/// with its own gradient at green. Saturation follows; coverage is the
+/// decal's alpha x the layer's opacity.
+pub fn shade(l: &Layer, t: [f32; 4]) -> ([f32; 3], f32) {
+    let inks = l.colours.map(ink_stops);
+    let mut c = match &inks[0] {
+        Some(s) => gradient(s, t[1]).map(|x| x * s[1][3]),
+        None => [t[0], t[1], t[2]],
+    };
+    for (ink, ch) in [(&inks[1], t[0]), (&inks[2], t[2])] {
+        if let Some(s) = ink {
+            let w = s[1][3] * ch;
+            let g = gradient(s, t[1]);
+            c = std::array::from_fn(|i| g[i] * w + c[i] * (1.0 - w));
+        }
+    }
+    (saturate(c, l.saturation), (t[3] * l.opacity).clamp(0.0, 1.0))
+}
+
+/// An RGBA8 image.
+pub struct Image {
+    pub w: u32,
+    pub h: u32,
+    pub rgba: Vec<u8>,
+    /// The colour channels are sRGB-encoded (an sRGB texture format).
+    pub srgb: bool,
+}
+
+impl Image {
+    /// A mask decal: where it covers (alpha over half), red and blue are
+    /// about 0 and green is flat, for most texels.
+    pub fn is_mask(&self) -> bool {
+        let (mut n, mut flat) = (0usize, 0usize);
+        for p in self.rgba.chunks_exact(4).filter(|p| p[3] > 127) {
+            n += 1;
+            if p[0] < 13 && p[2] < 13 && (100..=156).contains(&p[1]) {
+                flat += 1;
+            }
+        }
+        n > 0 && flat * 2 > n
+    }
+
+    /// Bilinear sample at UV (clamped to the edge texels), RGBA 0..1, as
+    /// the stored bytes.
+    pub fn sample(&self, u: f32, v: f32) -> [f32; 4] {
+        let (w, h) = (self.w as f32, self.h as f32);
+        let x = (u * w - 0.5).clamp(0.0, w - 1.0);
+        let y = (v * h - 0.5).clamp(0.0, h - 1.0);
+        let (x0, y0) = (x.floor() as u32, y.floor() as u32);
+        let (x1, y1) = ((x0 + 1).min(self.w - 1), (y0 + 1).min(self.h - 1));
+        let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+        let px = |x: u32, y: u32| -> [f32; 4] {
+            let o = 4 * (y as usize * self.w as usize + x as usize);
+            std::array::from_fn(|i| self.rgba[o + i] as f32 / 255.0)
+        };
+        let (a, b, c, d) = (px(x0, y0), px(x1, y0), px(x0, y1), px(x1, y1));
+        std::array::from_fn(|i| (a[i] * (1.0 - fx) + b[i] * fx) * (1.0 - fy) + (c[i] * (1.0 - fx) + d[i] * fx) * fy)
+    }
+
+    /// A sample as the shader sees it: colour in linear light for an sRGB
+    /// image (the sampler decodes it), the stored values otherwise.
+    pub fn shader_sample(&self, u: f32, v: f32) -> [f32; 4] {
+        let t = self.sample(u, v);
+        if self.srgb { [srgb_to_lin(t[0]), srgb_to_lin(t[1]), srgb_to_lin(t[2]), t[3]] } else { t }
+    }
+}
+
+/// What [`bake`] left out.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Skipped {
+    /// Layers whose decal texture is in no store.
+    pub missing: usize,
+    /// Head makeup layers ([`Layer::is_makeup`]).
+    pub makeup: usize,
+    /// Mask decals ([`Image::is_mask`]) on a layer with no ink: the game
+    /// colours them at run time, from code that is not decoded.
+    pub uncoloured_masks: usize,
+}
+
+/// Bake layers, in order, into a part's colour texture (sRGB RGBA8; its
+/// alpha is kept). `decal` gives a layer's first decal texture. Makeup
+/// layers, uncoloured masks and layers whose decal is missing are left out
+/// and counted.
+pub fn bake(skin: &mut Image, layers: &[&Layer], decal: &dyn Fn(u64) -> Option<std::sync::Arc<Image>>) -> Skipped {
+    let mut skipped = Skipped::default();
+    let (w, h) = (skin.w as usize, skin.h as usize);
+    for l in layers {
+        if l.is_makeup() {
+            skipped.makeup += 1;
+            continue;
+        }
+        let Some(t) = l.textures.first().and_then(|&x| decal(x)) else {
+            skipped.missing += 1;
+            continue;
+        };
+        if !l.uses_ink() && t.is_mask() {
+            skipped.uncoloured_masks += 1;
+            continue;
+        }
+        let blend = l.blend();
+        skin.rgba.par_chunks_mut(4 * w).enumerate().for_each(|(y, row)| {
+            let v = (y as f32 + 0.5) / h as f32;
+            for x in 0..w {
+                let u = (x as f32 + 0.5) / w as f32;
+                if !inside_clip(&l.clip, u, v) {
+                    continue;
+                }
+                let Some((du, dv)) = decal_uv(&l.uv, u, v) else { continue };
+                // outside the decal: nothing (its edges are clear in every
+                // decal checked, so this matches clamping too)
+                if !(0.0..=1.0).contains(&du) || !(0.0..=1.0).contains(&dv) {
+                    continue;
+                }
+                let (c, k) = shade(l, t.shader_sample(du, dv));
+                if k <= 0.0 {
+                    continue;
+                }
+                let p = &mut row[4 * x..4 * x + 3];
+                for i in 0..3 {
+                    let s = srgb_to_lin(p[i] as f32 / 255.0);
+                    let d = blend.apply(s, c[i].clamp(0.0, 1.0));
+                    p[i] = (lin_to_srgb(s + (d - s) * k) * 255.0).round() as u8;
+                }
+            }
+        });
+    }
+    skipped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layer() -> Layer {
+        let none = [0.0, f32::MAX, f32::MAX, f32::MAX];
+        Layer { textures: vec![1], colours: [0, 0, 0], clip: [none; 4], flags: 0, opacity: 1.0, saturation: 1.0, mode: 0, uv: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], p3: [[0.0; 4]; 3] }
+    }
+
+    #[test]
+    fn uv_is_a_row_vector_times_the_matrix() {
+        // scale 2 and move by (-0.5, 0.25)
+        let m = [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [-0.5, 0.25, 1.0]];
+        assert_eq!(decal_uv(&m, 0.25, 0.5), Some((0.0, 1.25)));
+        // the off-diagonal terms: u feeds v through m01, v feeds u through m10
+        let m = [[1.0, 0.5, 0.0], [0.25, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let (du, dv) = decal_uv(&m, 0.4, 0.8).unwrap();
+        assert!((du - 0.6).abs() < 1e-6 && (dv - 1.0).abs() < 1e-6);
+        // projective: divided by w = m02 u + m12 v + m22
+        let m = [[1.0, 0.0, 1.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        assert_eq!(decal_uv(&m, 1.0, 0.5), Some((0.5, 0.25)));
+    }
+
+    #[test]
+    fn clip_quad_edges() {
+        let l = layer();
+        // FLT_MAX edges (the common "no clip") keep everything
+        assert!(inside_clip(&l.clip, 0.3, 0.9));
+        // a box u 0.0128..0.98, v 0.127..0.738 from the data
+        let q = [[0.98056, 0.12671, 0.01285, 0.12671], [0.9958, 0.73771, 0.98056, 0.12671], [0.32992, 0.73771, 0.6391, 0.72856], [0.01285, 0.12671, 0.01285, 1.09442]];
+        assert!(inside_clip(&q, 0.5, 0.5));
+        assert!(!inside_clip(&q, 0.5, 0.05));
+        assert!(!inside_clip(&q, 0.5, 0.9));
+        assert!(!inside_clip(&q, 0.005, 0.5));
+        assert!(!inside_clip(&q, 0.999, 0.5));
+        // the degenerate edges (0,1)->(1,1) keep everything up to v = 1
+        assert!(inside_clip(&[[0.0, 1.0, 1.0, 1.0]; 4], 0.7, 0.2));
+    }
+
+    #[test]
+    fn full_colour_layers_keep_the_decal_colour() {
+        let mut l = layer();
+        l.opacity = 0.5;
+        let (c, k) = shade(&l, [1.0, 0.0, 0.5, 0.8]);
+        assert_eq!(c, [1.0, 0.0, 0.5]);
+        assert_eq!(k, 0.4);
+        // an ink word with alpha 0 is no ink
+        l.colours = [0x0084_aa6b, 0, 0];
+        assert!(!l.uses_ink());
+        assert_eq!(shade(&l, [1.0, 0.0, 0.5, 0.8]).0, [1.0, 0.0, 0.5]);
+        l.colours = [0xff43_8982, 0, 0];
+        assert!(l.uses_ink());
+    }
+
+    fn close(a: [f32; 3], b: [f32; 3], e: f32) -> bool {
+        a.iter().zip(b).all(|(x, y)| (x - y).abs() < e)
+    }
+
+    #[test]
+    fn ink_words_are_hsv() {
+        // white (V 1, S 0): stop 1 white, stop 0 at a tenth of the value,
+        // stop 2 white
+        let s = ink_stops(0xffff_0000).unwrap();
+        assert_eq!(s[1], [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(s[2], [1.0, 1.0, 1.0, 1.0]);
+        // 0.1 in sRGB is 0.0100 linear: byte 3
+        assert_eq!(s[0], [3.0 / 255.0, 3.0 / 255.0, 3.0 / 255.0, 1.0]);
+        // alpha 0: off
+        assert_eq!(ink_stops(0x00ff_0000), None);
+        // the common body ink: dark teal, sRGB about (0.12, 0.25, 0.26)
+        let s = ink_stops(0xff43_8982).unwrap();
+        let srgb = [0, 1, 2].map(|i| lin_to_srgb(s[1][i]));
+        assert!(close(srgb, [0.122, 0.255, 0.263], 0.015), "{srgb:?}");
+        // pure red at full value and saturation; the light stop is
+        // desaturated by 0.55
+        let s = ink_stops(0x80ff_ff00).unwrap();
+        assert_eq!(s[1], [1.0, 0.0, 0.0, 128.0 / 255.0]);
+        let light = [0, 1, 2].map(|i| lin_to_srgb(s[2][i]));
+        assert!(close(light, [1.0, 0.45, 0.45], 0.01), "{light:?}");
+    }
+
+    #[test]
+    fn inks_follow_the_mask_channels() {
+        let mut l = layer();
+        let red = ink_stops(0xffff_ff00).unwrap();
+        let green = ink_stops(0xffff_ff55).unwrap();
+        // green 0.5 picks stop 1 of ink 0
+        l.colours = [0xffff_ff00, 0, 0];
+        assert_eq!(shade(&l, [0.0, 0.5, 0.0, 1.0]).0, [red[1][0], red[1][1], red[1][2]]);
+        // green 0 and 1 pick the dark and light stops
+        assert_eq!(shade(&l, [0.0, 0.0, 0.0, 1.0]).0, [red[0][0], red[0][1], red[0][2]]);
+        assert_eq!(shade(&l, [0.0, 1.0, 0.0, 1.0]).0, [red[2][0], red[2][1], red[2][2]]);
+        // ink 1 covers by red, ink 2 by blue
+        l.colours = [0xffff_ff00, 0xffff_ff55, 0];
+        assert!(close(shade(&l, [1.0, 0.5, 0.0, 1.0]).0, [green[1][0], green[1][1], green[1][2]], 1e-6));
+        let half = shade(&l, [0.5, 0.5, 0.0, 1.0]).0;
+        assert!(close(half, std::array::from_fn(|i| (red[1][i] + green[1][i]) / 2.0), 1e-6));
+        l.colours = [0xffff_ff00, 0, 0xffff_ff55];
+        assert!(close(shade(&l, [0.0, 0.5, 1.0, 1.0]).0, [green[1][0], green[1][1], green[1][2]], 1e-6));
+        // ink 0 is scaled by its alpha
+        l.colours = [0x80ff_ff00, 0, 0];
+        assert!((shade(&l, [0.0, 0.5, 0.0, 1.0]).0[0] - 128.0 / 255.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn blend_modes_from_the_flags() {
+        let mut l = layer();
+        assert_eq!(l.blend(), Blend::Normal);
+        l.flags = 0x0400_0000 | 0x0800_0000;
+        assert_eq!(l.blend(), Blend::Multiply);
+        l.flags = 0x0800_0000;
+        assert_eq!(l.blend(), Blend::Screen);
+        l.flags = 0x1000_0000;
+        assert_eq!(l.blend(), Blend::Overlay);
+        assert_eq!(Blend::Multiply.apply(0.5, 0.5), 0.25);
+        assert_eq!(Blend::Screen.apply(0.5, 0.5), 0.75);
+        assert_eq!(Blend::Overlay.apply(0.25, 0.5), 0.25);
+        assert_eq!(Blend::Overlay.apply(0.75, 0.5), 0.75);
+        // makeup: an ink on with a non-zero fourth p3 value
+        l.colours = [0xff00_ff00, 0, 0];
+        assert!(!l.is_makeup());
+        l.p3[0][3] = 0.5;
+        assert!(l.is_makeup());
+        l.colours = [0, 0xff00_ff00, 0];
+        assert!(!l.is_makeup());
+    }
+
+    #[test]
+    fn saturation_scales_hsv_saturation() {
+        let c = [0.8, 0.4, 0.2];
+        assert_eq!(saturate(c, 1.0), c);
+        // none: grey at the value (the max channel)
+        let g = saturate(c, 0.0);
+        assert!(g.iter().all(|x| (x - 0.8).abs() < 1e-6));
+        // half: each channel halfway to the max, hue kept
+        let h = saturate(c, 0.5);
+        assert!((h[0] - 0.8).abs() < 1e-5 && (h[1] - 0.6).abs() < 1e-5 && (h[2] - 0.5).abs() < 1e-5, "{h:?}");
+    }
+
+    #[test]
+    fn bake_blends_in_linear_light() {
+        let mut skin = Image { w: 2, h: 1, rgba: vec![255, 255, 255, 200, 255, 255, 255, 200], srgb: true };
+        let d = std::sync::Arc::new(Image { w: 1, h: 1, rgba: vec![0, 0, 0, 255], srgb: true });
+        let mut l = layer();
+        l.opacity = 0.5;
+        // only the left half: u -> u * 2
+        l.uv = [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        assert_eq!(bake(&mut skin, &[&l], &|_| Some(d.clone())), Skipped::default());
+        // black art at half coverage over white: linear 0.5 -> sRGB 188
+        assert_eq!(&skin.rgba[..4], &[188, 188, 188, 200]);
+        assert_eq!(&skin.rgba[4..], &[255, 255, 255, 200]);
+        assert_eq!(bake(&mut skin, &[&l], &|_| None), Skipped { missing: 1, ..Default::default() });
+        // a mask on a layer with no ink is left out
+        let mask = std::sync::Arc::new(Image { w: 2, h: 1, rgba: vec![0, 128, 0, 255, 0, 120, 0, 200], srgb: false });
+        l.colours = [0x004c_c382, 0, 0];
+        assert!(mask.is_mask() && !d.is_mask());
+        assert_eq!(bake(&mut skin, &[&l], &|_| Some(mask.clone())), Skipped { uncoloured_masks: 1, ..Default::default() });
+        // makeup is left out, and the texture stays as it was
+        l.colours = [0xff00_ff00, 0, 0];
+        l.p3[0][3] = 1.0;
+        assert_eq!(bake(&mut skin, &[&l], &|_| Some(d.clone())), Skipped { makeup: 1, ..Default::default() });
+        assert_eq!(&skin.rgba[..4], &[188, 188, 188, 200]);
+        // a black ink on the mask, multiplied: 188 x black at full coverage
+        l.p3 = [[0.0; 4]; 3];
+        l.colours = [0xff00_0000, 0, 0];
+        l.opacity = 1.0;
+        l.flags = 0x0400_0000;
+        let solid = std::sync::Arc::new(Image { w: 1, h: 1, rgba: vec![0, 127, 0, 255], srgb: false });
+        assert_eq!(bake(&mut skin, &[&l], &|_| Some(solid.clone())), Skipped::default());
+        assert_eq!(&skin.rgba[..4], &[0, 0, 0, 200]);
+        assert_eq!(&skin.rgba[4..], &[255, 255, 255, 200]);
+    }
+
+    /// A record and its layer laid out as the game's PSO stores them.
+    #[test]
+    fn reads_records_from_a_pso() {
+        use crate::meta7a::{Member, StructDef};
+        let mut sys = vec![0u8; 0x40];
+        let rec_at = sys.len();
+        sys.resize(rec_at + 224, 0);
+        let lay_at = sys.len();
+        sys.resize(lay_at + 320, 0);
+        let put32 = |s: &mut Vec<u8>, o: usize, v: u32| s[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        put32(&mut sys, rec_at + 4, 0x6b3b_2e6f);
+        put32(&mut sys, rec_at + 108, 0x3817_131d);
+        put32(&mut sys, rec_at + 160, 1);
+        // pointer to block 2, offset 0
+        sys[rec_at + 168..rec_at + 176].copy_from_slice(&((0u64 << 20) | 2).to_le_bytes());
+        sys[lay_at + 8..lay_at + 16].copy_from_slice(&0x0742_adfc_36b5_6660u64.to_le_bytes());
+        put32(&mut sys, lay_at + 68, 0xff11_2233);
+        for (i, f) in [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.25, 0.5, 1.0, 0.0].iter().enumerate() {
+            put32(&mut sys, lay_at + 224 + 4 * i, f.to_bits());
+        }
+        put32(&mut sys, lay_at + 144 + 12, 0.5f32.to_bits());
+        put32(&mut sys, lay_at + 212, 0.75f32.to_bits());
+        put32(&mut sys, lay_at + 216, 1.0f32.to_bits());
+        put32(&mut sys, lay_at + 220, 4);
+        let m = |hash: u32, off: u32| Member { hash, off, ty: 0, sub: 0, reference: 0, extra: 0 };
+        let mut structs = HashMap::new();
+        structs.insert(RECORD, StructDef { hash: RECORD, size: 224, members: vec![m(0xacec_22be, 4), m(0xb536_67be, 108), m(0xef88_8d7e, 160)] });
+        structs.insert(LAYER, StructDef { hash: LAYER, size: 320, members: vec![m(0x5ada_ff50, 8), m(0x0d23_ee2d, 68), m(0x207e_ec03, 80), m(0x4b62_1302, 208), m(0xc88b_9e6d, 212), m(0x0d4d_d331, 216), m(0x8765_2efd, 220), m(0x8b42_4621, 224), m(0x6eea_8588, 144)] });
+        let p = Pso { res: crate::resource::Resource { sys, gfx: Vec::new(), gfx_base: 0 }, structs, struct64: HashMap::new(), blocks: vec![(RECORD, 224, rec_at), (LAYER, 320, lay_at)], root: None };
+        let c = Catalogue::from_pso(&p, "test").unwrap();
+        let d = c.get(0x6b3b_2e6f).unwrap();
+        assert_eq!(d.category, 0x3817_131d);
+        let l = &d.layers[0];
+        assert_eq!(l.textures, vec![0x0742_adfc_36b5_6660]);
+        assert_eq!(l.colours, [0xff11_2233, 0, 0]);
+        assert_eq!((l.opacity, l.mode), (0.75, 4));
+        assert_eq!(l.uv[2], [0.25, 0.5, 1.0]);
+        assert_eq!(l.p3[0], [0.0, 0.0, 0.0, 0.5]);
+        assert!(l.is_makeup());
+        assert_eq!(skin_slot(d.category), Some("body upper"));
+    }
+}

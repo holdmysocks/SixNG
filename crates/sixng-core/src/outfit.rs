@@ -708,7 +708,7 @@ mod tests {
         assert_eq!(m[0].parent, None);
         let mut p = TriPrim {
             name: "p".into(), positions: vec![[0.0; 3]; 2], normals: None, tangents: None, uvs: vec![], colors: None, colors1: None, regions: None, tint: None, indices: vec![], material: None,
-            joints: Some(vec![[0, 3, 2, 7], [1, 1, 1, 1]]), weights: Some(vec![[100, 100, 55, 0], [255, 0, 0, 0]]), joints1: None, weights1: None,
+            joints: Some(vec![[0, 3, 2, 7], [1, 1, 1, 1]]), weights: Some(vec![[100, 100, 55, 0], [255, 0, 0, 0]]), joints1: None, weights1: None, morphs: Vec::new(),
         };
         remap_joints(&mut p, &maps[1]);
         assert_eq!(p.joints.unwrap(), [[4, 3, 1, u16::MAX], [0, 0, 0, 0]]);
@@ -750,7 +750,7 @@ mod tests {
         let parts = outfit_parts(&ix, "player_story000_00");
         assert!(parts.len() >= 5, "{} parts", parts.len());
         let out = std::env::temp_dir().join("sixng_outfit_real").join("outfit.glb");
-        let o = ExportOptions { out: out.parent().unwrap().into(), png: false, dds: false, raw: false, force: true, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default(), part_hidden: Default::default() };
+        let o = ExportOptions { out: out.parent().unwrap().into(), png: false, dds: false, raw: false, force: true, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_decorations: Default::default(), part_colours: Default::default(), part_hidden: Default::default() };
         let r = export_outfit(&a, &parts, "player_story000_00", &out, &o, &[(&d, clip)], false, false).unwrap();
         println!("{}", serde_json::to_string_pretty(&r).unwrap());
         assert_eq!(r["unresolved_influences"], 0);

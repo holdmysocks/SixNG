@@ -385,6 +385,11 @@ pub struct ExportOptions {
     /// store is used; without one the head-skin table decides.
     #[serde(default)]
     pub part_skins: std::collections::HashMap<String, Vec<(u64, u64)>>,
+    /// Decorations (tattoos, makeup, body marks) to bake into a part's
+    /// colour texture, by lower-case drawable name: `peddeco` record names,
+    /// in order (`pedlook::LookPart::decorations`).
+    #[serde(default)]
+    pub part_decorations: std::collections::HashMap<String, Vec<u32>>,
     /// Ped clothing colours by lower-case drawable name: the base colour
     /// (sRGB) per sub-material of the item's garment preset (`pedlook`,
     /// `matlib`). Where a part has one it wins over `ped_tints`.
@@ -503,6 +508,8 @@ struct ShaderTextures {
     /// interior, lamp or mechanical bones (`NOT_BODY_BONES`), so it is not
     /// body paint. Set once the meshes are decoded.
     not_body: bool,
+    /// Ped skin: the decorations baked into the base colour (`peddeco`).
+    decorations: Option<serde_json::Value>,
 }
 
 /// Shader slot of the per-model tint palette.
@@ -1074,6 +1081,45 @@ fn emissive_strength(s: &crate::drawable::Shader) -> crate::material::EmissiveSt
 /// `emissive_strength` of a model.json material and of the GLB extras:
 /// null for materials that do not light (or whose emissive map did not
 /// decode).
+/// `speculartex2`: the map whose alpha masks the tint palette.
+const TINT_MASK: &str = "739e3d0d";
+/// Tint strength (name not recovered).
+const TINT_STRENGTH: &str = "381999f3";
+/// Second tint control (name not recovered): smooths the weight and blends
+/// toward `TINT_TARGET`.
+const TINT_SMOOTH: &str = "73511514";
+/// sRGB colour the second control blends toward (name not recovered).
+const TINT_TARGET: &str = "b1b16aaf";
+
+/// `tint_weight` of a material with a tint palette: how much of the palette
+/// colour the game applies at each pixel. Read in the deferred pixel shaders
+/// of prop_batch_dirt, standard, standard_dirt and standard_decal_blend
+/// (every effect that binds `speculartex2`, the palette and both controls
+/// lists the same three): the albedo is multiplied by lerp(1, palette, w)
+/// with w = 1 - (1 - speculartex2.a) * strength. Null without a palette;
+/// for other shaders (the two-layer ones use 381999f3 for something else)
+/// the status says the weight is not decoded.
+fn tint_weight_json(s: &crate::drawable::Shader, st: &ShaderTextures) -> serde_json::Value {
+    if st.tint_palette.is_none() {
+        return serde_json::Value::Null;
+    }
+    let get = |h: &str| s.constants.iter().find(|c| c.hash == h).and_then(|c| c.components()).map(|v| v.to_vec());
+    let mask = st.entries.iter().find(|e| e["param_hash"] == TINT_MASK);
+    let (Some(strength), Some(smooth), Some(mask)) = (get(TINT_STRENGTH), get(TINT_SMOOTH), mask) else {
+        return serde_json::json!({"status": "not decoded for this shader: the albedo is multiplied by the full palette colour here, which may be too strong"});
+    };
+    let (k, c) = (strength[0], smooth[0]);
+    serde_json::json!({
+        "status": "decoded",
+        "strength": k,
+        "smooth": c,
+        "smooth_target": get(TINT_TARGET).map(|v| v[..v.len().min(3)].to_vec()),
+        "mask": {"param_hash": TINT_MASK, "param_name": "speculartex2", "channel": "a", "png": mask["png"], "hash64": mask["hash64"]},
+        "full_palette": k == 0.0 && c == 0.0,
+        "formula": "a = mask alpha (speculartex2.a, first UV set); w = 1 - (1 - a) * strength; with smooth = s: w += s * (smoothstep(saturate(2 w)) - w); t = lerp(1, palette colour, w); t = lerp(t, linear(smooth_target), s * smoothstep(saturate(1 - 2 (1 - a) * strength))); albedo *= t. With strength 0 and smooth 0 the full palette colour applies; with strength 1 and smooth 0, w = a.",
+    })
+}
+
 fn emissive_strength_json(s: &crate::drawable::Shader, st: &ShaderTextures, c: &serde_json::Value) -> serde_json::Value {
     match lit_source(s, st, c) {
         Some(EmissiveSource::Map | EmissiveSource::ColourMap) => emissive_strength(s).json(),
@@ -1505,8 +1551,6 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                         v["wear_records_note"] = serde_json::Value::from("the game's wear records the parts reach (vehicle material library, as stored; links as 8 hex digits). Each part id's surface names a wear ladder and a detail set: ladder_by_look and detail_by_look give per look the index into ladders and details of each part id (256 x 2 hex digits, ff = none). A ladder lists six surfaces (materialPresets) and six wear presets (wearPresets, see presets: dustIntensity, rust, primer and control intensities). A preset names an age record (ageWearHash: in ages, or in age_ranges with minWear / maxWear), an edge record (7f1fe0a2, in edges) and two colour range records (879774bd, 02a27216, in colour_ranges). details: detailIndex0 / 1 are probably slices of the detail texture arrays (0cd27763, 7c0055b9), which no material binds. global: the library's shared dirt settings. levels_by_config (configuration key, as in configs) gives each part id's wear level and primer sets under that configuration (256 x 4 hex digits: level 0 to 5, then a bit mask; ffff = none); the level is the entry of its ladder's materialPresets and wearPresets. levels_default is the levels most configurations give. The configuration parts that set the levels sit in slots named wear, wear_interior, wear_engine, wear_wheels and six more. A dirt level and what the shader does with these values are not decoded; nothing here is applied to the GLB.");
                         v["primer"] = part_looks["primer"].clone();
                         v["wear_tint"] = part_looks["wear_tint"].clone();
-                        v["surface_tone"] = part_looks["surface_tone"].clone();
-                        v["surface_tone_note"] = serde_json::Value::from("per look, each part id's colour step amounts (256 x 12 hex digits, 0 to 255): sun bleach screen, albedo multiply and albedo screen of its surface's first layer (the 307f162c record its 2cc72f7c names), then of its second layer (174770cc). The game packs them into bytes 1 to 3 of surface record +28 (rva 0x37766a0); its paint shader darkens (multiply) or lightens (screen) the colour in HSV by the layer detail texture's green where the colour does not come from a palette row, and bleaches it toward white by the dust mask.");
                         v["wear_tint_note"] = serde_json::Value::from("per look, the colour of each part id's second layer (256 x 6 hex digits, sRGB red, green, blue): the colour of the colour record its surface names for the layer (5cffe5e0). The game packs it as that layer's tint (rva 0x37766a0, surface record +16, in linear); its paint shader shows the tint where the layer's palette weight is low and the palette row (wear) where it is high.");
                         v["primer_note"] = serde_json::Value::from("per look, the palette rows of each part id's primer (the game's second wear layer) for primer sets 0, 1 and 2 (256 x 12 hex digits: three rows as in rows, ffff = none). They are the part's colour record's primer entries of its surface's primerType; a set the record leaves empty takes set 0. A part's set is the first of a per-vehicle random order of 0, 1, 2 that its primerSets mask (levels_by_config) allows. The shader reads the row at the column the primer's summed mask gives through the wear preset's primerGradientStart / primerGradientEnd window. Not applied to the GLB.");
                         v["surfaces"] = part_looks["surfaces"].clone();
@@ -1532,8 +1576,12 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     m["parameters_not_read"] = unread.into();
                     m["emissive_source"] = emissive_source_json(s, st, &c);
                     m["emissive_strength"] = emissive_strength_json(s, st, &c);
+                    m["tint_weight"] = tint_weight_json(s, st);
                     if let Some(fb) = &st.fallback {
                         m["texture_fallback"] = fb.clone();
+                    }
+                    if let Some(d) = &st.decorations {
+                        m["decorations"] = d.clone();
                     }
                     if let Some(mut l) = crate::material::multilayer(s, &st.entries, || material_uv_fit(&lod_groups, si)) {
                         crate::material::four_layer_vertex_weights(&mut l, material_colours1(&lod_groups, si));
@@ -1551,7 +1599,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     }
                     m
                 }).collect::<Vec<_>>(),
-                "materials_note": "parameters: every constant value of the material, keyed by the parameter's name (its 8-digit hash where the name is not known; a repeated name gets the hash appended), with the type from the shader archive (a scalar as a number, a vector as its 2 to 4 components, int and bool as such); drawable.shaders[].constants has the same values with buffer and byte offset. parameters_not_read: parameters whose values lie outside the material's constant block. emissive_source: what lights an emissive material in the GLB (emissive_map, colour_map, or none when the shader's emissivetex did not decode), null for materials that do not light. emissive_strength: how bright a lit material is in the GLB, from its emissivemultiplier constant (multiplier, as read). strength = multiplier / 100 (the values read like nits; 1.0 = 100 nits), at most 100; up to 1 it is the GLB emissiveFactor, above 1 the factor is 1 and KHR_materials_emissive_strength holds the strength. tint: the light's colour (linear RGB, constant 7ab0fd74, its name not recovered; neon tubes have their colour here over a white emissive map), multiplied into the GLB emissiveFactor; null when the material has none. source: multiplier, capped (over 100), default (no multiplier: strength 1) or runtime (multiplier 0: a light the game switches on while it runs, kept lit at strength 1). Null for materials that do not light. Textures come from the data/ttdb/*.ttpf stores by 64-bit hash and are written once to <out>/textures/ttpf/<hash>.png. Roles are guessed from the shader parameter hash and the format (sRGB = colour, BC5 / known normal slots = normal map). classification.class is one of opaque/alpha/cutout/decal/glass/window/emissive/water/terrain_multilayer/car_paint, from the shader record flags and known shader families. shader_name and param_name are joaat names from <work>/names/names.json (`sixng names`), null when unknown. slot_role names the PBR map a known parameter slot holds.",
+                "materials_note": "parameters: every constant value of the material, keyed by the parameter's name (its 8-digit hash where the name is not known; a repeated name gets the hash appended), with the type from the shader archive (a scalar as a number, a vector as its 2 to 4 components, int and bool as such); drawable.shaders[].constants has the same values with buffer and byte offset. parameters_not_read: parameters whose values lie outside the material's constant block. emissive_source: what lights an emissive material in the GLB (emissive_map, colour_map, or none when the shader's emissivetex did not decode), null for materials that do not light. emissive_strength: how bright a lit material is in the GLB, from its emissivemultiplier constant (multiplier, as read). strength = multiplier / 100 (the values read like nits; 1.0 = 100 nits), at most 100; up to 1 it is the GLB emissiveFactor, above 1 the factor is 1 and KHR_materials_emissive_strength holds the strength. tint: the light's colour (linear RGB, constant 7ab0fd74, its name not recovered; neon tubes have their colour here over a white emissive map), multiplied into the GLB emissiveFactor; null when the material has none. source: multiplier, capped (over 100), default (no multiplier: strength 1) or runtime (multiplier 0: a light the game switches on while it runs, kept lit at strength 1). Null for materials that do not light. Textures come from the data/ttdb/*.ttpf stores by 64-bit hash and are written once to <out>/textures/ttpf/<hash>.png. Roles are guessed from the shader parameter hash and the format (sRGB = colour, BC5 / known normal slots = normal map). classification.class is one of opaque/alpha/cutout/decal/glass/window/emissive/water/terrain_multilayer/car_paint, from the shader record flags and known shader families. shader_name and param_name are joaat names from <work>/names/names.json (`sixng names`), null when unknown. slot_role names the PBR map a known parameter slot holds. tint_weight: for a material with a tint palette, how much of the palette colour the game applies per pixel (mask texture, strength, formula; see the record), null without a palette; COLOR_0 in the GLB holds the full palette colour.",
             });
             let mut j = j;
             if physics.is_some() || archetype.is_some() {
@@ -1649,6 +1697,9 @@ pub(crate) struct BuiltDrawable {
 pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &crate::drawable::DrawableInfo, dir: &Path, member: bool, o: &ExportOptions, item: &mut ExportedItem) -> BuiltDrawable {
     let head = head_skin_shaders(a, e, &info.shaders, o, item).or_else(|| part_skin_shaders(a, e, &info.shaders, item));
     let mut shader_tex = link_textures(a, head.as_ref().map_or(&info.shaders[..], |h| &h.0[..]), r, &info.embedded_textures, dir, o, e.name.as_deref());
+    if let Some(names) = e.name.as_deref().and_then(|n| o.part_decorations.get(&n.to_ascii_lowercase())).filter(|n| !n.is_empty() && o.png) {
+        bake_decorations(a, &mut shader_tex, names, dir, o);
+    }
     // Weapons: the `weapon` shader binds no colour map; a part's colours are
     // those of its layered-material preset, one per sub-material, and a
     // vertex names its sub-material in the green byte of the raw colour
@@ -1721,12 +1772,28 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         &r.gfx[(b.gfx_off as usize).min(end)..end]
     };
     let skin = ped_skin(a, e, r, info, o, item);
+    // Ped heads: the face network's expression shape keys (`facegraph`).
+    let face_nets = match e.name.as_deref() {
+        Some(n) if n.to_ascii_lowercase().contains("head") => crate::facegraph::nets_for_head(a, n),
+        _ => Vec::new(),
+    };
     // Triangle meshes: one primitive per geometry, grouped by model.
     let mut mesh_meta = Vec::new();
     let prims_of = |gi: usize, material: Option<usize>, mesh_meta: &mut Vec<serde_json::Value>| -> Option<crate::gltf::TriPrim> {
         let g = &info.geometries[gi];
         let h = info.buffers[g.vertex_buffer].mesh_blob.as_ref()?;
         let mut m = crate::drawable::decode_mesh(slice(g.vertex_buffer), h, slice(g.index_buffer));
+        let morphs = if face_nets.is_empty() {
+            Vec::new()
+        } else {
+            let blob = slice(g.vertex_buffer);
+            h.sections
+                .iter()
+                .find(|s| s.0 == 8 && s.2 == 0x8c)
+                .and_then(|s| crate::facegraph::vertex_map(blob.get(s.1 as usize..).unwrap_or(&[]), m.positions.len()))
+                .map(|map| crate::facegraph::morph_targets(&face_nets, &map))
+                .unwrap_or_default()
+        };
         // Ped clothing: joint index -> bone palette -> joint list.
         if let Some(map) = skin.geometry_map.get(&gi) {
             let remap = |js: &mut Vec<[u16; 4]>| js.iter_mut().flatten().for_each(|j| *j = map.get(*j as usize).copied().unwrap_or(u16::MAX));
@@ -1776,6 +1843,8 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             // bone that is in neither skeleton); their weight is moved
             // to the largest kept influence in the GLB.
             "unresolved_joints": skin_used.as_ref().map(|u| u.iter().filter(|&&i| i as usize >= skin.joints.len()).count()),
+            // ped heads: expression shape keys of the face network (morph targets)
+            "face_morphs": morphs.len(),
         }));
         // The placement tint of props (a palette embedded in the model,
         // picked by the vertex colours). Not on the vehicle shaders: their
@@ -1828,7 +1897,7 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         }
         Some(crate::gltf::TriPrim {
             name, positions: m.positions, normals: m.normals, tangents: m.tangents, uvs: m.uvs.into_iter().map(|u| u.1).collect(),
-            colors: m.colors, colors1: m.colors1, regions: m.regions, tint, indices: m.indices, material, joints: m.joints, weights: m.weights, joints1: m.joints1, weights1: m.weights1,
+            colors: m.colors, colors1: m.colors1, regions: m.regions, tint, indices: m.indices, material, joints: m.joints, weights: m.weights, joints1: m.joints1, weights1: m.weights1, morphs,
         })
     };
     let nlod = info.models.iter().filter(|m| !m.part).map(|m| m.lod + 1).max().unwrap_or(1);
@@ -1942,6 +2011,14 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             x
         },
     }).collect();
+    // Skin: the decoded spec maps as glTF channels (`skinspec::apply_gltf`).
+    let mut mats = mats;
+    for (m, (s, st)) in mats.iter_mut().zip(info.shaders.iter().zip(shader_tex.iter())) {
+        if !is_hidden(s, st) {
+            let fresnel = s.constants.iter().find(|c| c.hash == crate::skinspec::FRESNEL_PARAM).and_then(|c| c.components()).and_then(|v| v.first().copied());
+            crate::skinspec::apply_gltf(&mut m.gltf, &mut m.extras, &s.name_hash, &st.entries, fresnel);
+        }
+    }
     if let (Some(o), Some(f)) = (part_looks.as_object_mut(), part_set.as_ref().and_then(|(_, parts)| crate::vehcolour::paint_finish(parts, mat_blend, &part_id_counts.borrow()))) {
         o.insert("paint_finish".into(), serde_json::json!({"metalness": f[0], "roughness": f[1]}));
     }
@@ -1964,6 +2041,102 @@ struct SkinSetup {
     joints: Vec<crate::gltf::Joint>,
     /// geometry index -> (vertex joint index -> joint list index; u16::MAX = none)
     geometry_map: std::collections::HashMap<usize, Vec<u16>>,
+}
+
+/// Bake an outfit's decorations (tattoos, makeup, body marks; `peddeco`)
+/// into the base colour of each of a skin part's shaders that has one. The
+/// baked texture is written next to the plain one, named after it and the
+/// decoration list, and the material's `decorations` record says what went
+/// in and what did not.
+fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &[u32], dir: &Path, o: &ExportOptions) {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    let root = game_root(a);
+    let Some(cat) = crate::peddeco::get(&root) else {
+        for st in shader_tex.iter_mut().filter(|st| st.base.is_some()) {
+            st.decorations = Some(serde_json::json!({"names": names.iter().map(|n| format!("{n:08x}")).collect::<Vec<_>>(), "applied": false, "why": "the decoration catalogue (data.rpf) is not indexed"}));
+        }
+        return;
+    };
+    let set = crate::ttpf::global(&root);
+    let found: Vec<&crate::peddeco::Decoration> = names.iter().filter_map(|&n| cat.get(n)).collect();
+    let unknown: Vec<String> = names.iter().filter(|&&n| cat.get(n).is_none()).map(|n| format!("{n:08x}")).collect();
+    let layers: Vec<&crate::peddeco::Layer> = found.iter().flat_map(|d| &d.layers).collect();
+    // decal textures, decoded once per part
+    let cache: Mutex<HashMap<u64, Option<Arc<crate::peddeco::Image>>>> = Mutex::new(HashMap::new());
+    let decal = |h: u64| -> Option<Arc<crate::peddeco::Image>> {
+        if let Some(x) = cache.lock().unwrap().get(&h) {
+            return x.clone();
+        }
+        let img = set.get(h).and_then(|(store, tx)| {
+            let (data, skipped) = store.data_ex(tx).ok()?;
+            let mip = if skipped == 0 { 0 } else { store.best_mip(tx)? };
+            let (rgba, w, h) = crate::ttpf::decode_rgba(tx, &data, mip).ok()?;
+            Some(Arc::new(crate::peddeco::Image { w, h, rgba, srgb: crate::peddeco::dxgi_is_srgb(tx.dxgi_format) }))
+        });
+        cache.lock().unwrap().insert(h, img.clone());
+        img
+    };
+    // the same name for the same list, so a part shared by outfits keeps one file per list
+    let key = names.iter().fold((0xcbf2_9ce4_8422_2325u64 ^ crate::peddeco::BAKE_RULE as u64).wrapping_mul(0x100_0000_01b3), |h, &n| (h ^ n as u64).wrapping_mul(0x100_0000_01b3));
+    for st in shader_tex.iter_mut() {
+        let Some(base) = st.base.clone() else { continue };
+        let src = dir.join(&base);
+        let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let out = src.with_file_name(format!("{stem}_deco{key:016x}.png"));
+        let mut rec = serde_json::json!({
+            "names": names.iter().map(|n| format!("{n:08x}")).collect::<Vec<_>>(),
+            "categories": found.iter().map(|d| format!("{:08x}", d.category)).collect::<Vec<_>>(),
+            "layers": layers.len(),
+            "source": base,
+            "rule": "decal UV = part UV (row vector) x the layer matrix (projective), clipped by the layer's edge quad in part UV; colour = ink 0's gradient at decal green x ink 0 alpha (the decal's own colour when ink 0 is off), covered by ink 1 by alpha x red and ink 2 by alpha x blue, then the layer's saturation (HSV); coverage = decal alpha x opacity; blended (normal, multiply, screen or overlay by the flags) in linear light",
+            "ink_rule": "ink word 0xAAVVSSHH (HSV + alpha); stops in sRGB: 0.1V x lerp(1, hue, S), V x lerp(1, hue, S) with alpha A, (0.45 + 0.55V) x lerp(1, hue, 0.55S); each to linear and quantised to a byte; head makeup (an ink with a non-zero p3 w) and masks on layers with no ink are left out",
+        });
+        if !unknown.is_empty() {
+            rec["not_in_catalogue"] = unknown.clone().into();
+        }
+        if layers.iter().all(|l| l.is_makeup()) {
+            rec["makeup_layers_left_out"] = layers.len().into();
+            rec["applied"] = false.into();
+            st.decorations = Some(rec);
+            continue;
+        }
+        let cached = out.exists() && !(o.force && crate::ttpf::first_write_this_run(&out));
+        let made = if cached {
+            Ok(crate::peddeco::Skipped::default())
+        } else {
+            (|| -> anyhow::Result<crate::peddeco::Skipped> {
+                let img = image::open(&src)?.to_rgba8();
+                let (w, h) = img.dimensions();
+                let mut skin = crate::peddeco::Image { w, h, rgba: img.into_raw(), srgb: true };
+                let skipped = crate::peddeco::bake(&mut skin, &layers, &decal);
+                texture::save_png(&out, &skin.rgba, w, h)?;
+                Ok(skipped)
+            })()
+        };
+        let done = match made {
+            Ok(skipped) => {
+                if skipped.missing > 0 {
+                    rec["layers_without_decal"] = skipped.missing.into();
+                }
+                if !cached {
+                    rec["makeup_layers_left_out"] = skipped.makeup.into();
+                    rec["uncoloured_masks_left_out"] = skipped.uncoloured_masks.into();
+                }
+                true
+            }
+            Err(e) => {
+                rec["error"] = e.to_string().into();
+                false
+            }
+        };
+        rec["applied"] = done.into();
+        if done {
+            st.base = Some(format!("{}{}", base.strip_suffix(&format!("{stem}.png")).unwrap_or(""), out.file_name().unwrap().to_string_lossy()));
+            rec["png"] = rel(&o.out, &out).into();
+        }
+        st.decorations = Some(rec);
+    }
 }
 
 /// Ped heads bind no textures: add the face (albedo and normal map) chosen
@@ -1998,6 +2171,18 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
             // Body items list their colour texture twice, the first time
             // without a normal map: take the normal from the entry that has one.
             let nrm = list.iter().find(|s| s.0 == alb && s.1 != 0 && set.get(s.1).is_some()).map_or(nrm, |s| s.1);
+            // the spec maps of the item's material asset (`skinspec`), for
+            // the slots the shader has whose bound texture is in no store
+            let spec = crate::skinspec::get(&game_root(a)).ok().and_then(|t| t.of_albedo(alb));
+            let put_spec = |s: &mut crate::drawable::Shader| {
+                let Some(sp) = spec else { return };
+                for (slot, h) in [(crate::skinspec::SLOT_SPEC, sp.spec), (crate::skinspec::SLOT_SPEC2, sp.spec2)] {
+                    if h != 0 && set.get(h).is_some() && s.textures.iter().any(|t| t.param_hash == slot && !stored(t)) {
+                        s.textures.retain(|t| t.param_hash != slot);
+                        s.textures.push(tex(slot, h));
+                    }
+                }
+            };
             let sh = shaders
                 .iter()
                 .map(|s| {
@@ -2012,11 +2197,21 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
                             s.textures.push(tex("1e77bf4c", nrm));
                         }
                         s.textures.extend(extras(alb).iter().map(|&(k, h)| tex(&format!("{k:08x}"), h)));
+                        put_spec(&mut s);
                     }
                     s
                 })
                 .collect();
-            let rec = serde_json::json!({"source": "outfit item", "group": "", "index": 0, "count": 1, "albedo": format!("{alb:016x}"), "normal": format!("{nrm:016x}"), "extra_textures": extras_json(alb)});
+            let mut rec = serde_json::json!({"source": "outfit item", "group": "", "index": 0, "count": 1, "albedo": format!("{alb:016x}"), "normal": format!("{nrm:016x}"), "extra_textures": extras_json(alb)});
+            if let Some(sp) = spec {
+                rec["spec"] = serde_json::json!({
+                    "material": format!("{:016x}", sp.material),
+                    "speculartex": format!("{:016x}", sp.spec),
+                    "speculartex2": format!("{:016x}", sp.spec2),
+                    "in_game_files": [set.get(sp.spec).is_some(), set.get(sp.spec2).is_some()],
+                    "note": "the spec maps of the wardrobe state's material asset (skinspec), put in the shader's speculartex (c6f46e79) and speculartex2 (739e3d0d) slots where the mesh binds a texture that is in no store. Channels (skin pixel program): speculartex R translucency mask, G roughness, B occlusion; speculartex2 R detail strength mask, G skin region (high nibble) that picks the detail atlas layer. The maps are as stored."
+                });
+            }
             return Some((sh, rec));
         }
     }
@@ -2054,6 +2249,15 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
                     s.textures.push(tex("1e77bf4c", c.skin.normal));
                 }
                 s.textures.extend(extras(c.skin.albedo).iter().map(|&(k, h)| tex(&format!("{k:08x}"), h)));
+                // the face's material asset spec maps, over placeholders only
+                if let Some(sp) = crate::skinspec::get(&game_root(a)).ok().and_then(|t| t.of_albedo(c.skin.albedo)) {
+                    for (slot, h) in [(crate::skinspec::SLOT_SPEC, sp.spec), (crate::skinspec::SLOT_SPEC2, sp.spec2)] {
+                        if h != 0 && set.get(h).is_some() && s.textures.iter().any(|t| t.param_hash == slot && !stored(t)) {
+                            s.textures.retain(|t| t.param_hash != slot);
+                            s.textures.push(tex(slot, h));
+                        }
+                    }
+                }
             }
             s
         })
@@ -2489,9 +2693,6 @@ pub fn export_placements(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], ou
                     }
                     if let Some(t) = arch_lod.get(&en.archetype).and_then(|al| crate::lodlinks::time_json(al.time_flags)) {
                         j["time"] = t;
-                    }
-                    if let Some(k) = arch_lod.get(&en.archetype).and_then(crate::lodlinks::kind_json) {
-                        j["archetype_kind"] = k;
                     }
                 }
             }
@@ -3923,6 +4124,30 @@ mod dictionary_tests {
     }
 
     #[test]
+    fn tint_weight_reads_the_mask_and_strength() {
+        let shader = |consts: serde_json::Value| -> crate::drawable::Shader {
+            serde_json::from_value(serde_json::json!({"index": 0, "record_off": 0, "name_hash": "0badf00d", "param_hashes": [], "textures": [], "constants": consts})).unwrap()
+        };
+        let both = shader(serde_json::json!([
+            {"hash": TINT_STRENGTH, "desc": "00400003", "offset": 0, "values": [1.0, 0.0, 0.0, 0.0]},
+            {"hash": TINT_SMOOTH, "desc": "00400003", "offset": 4, "values": [0.0, 0.0, 0.0, 0.0]}
+        ]));
+        let st = |mask: bool| ShaderTextures {
+            tint_palette: Some(vec![[255, 255, 255, 255]]),
+            entries: if mask { vec![serde_json::json!({"param_hash": TINT_MASK, "png": "m.png", "hash64": "01"})] } else { vec![] },
+            ..Default::default()
+        };
+        let w = tint_weight_json(&both, &st(true));
+        assert_eq!(w["status"], "decoded");
+        assert_eq!(w["strength"], 1.0);
+        assert_eq!(w["mask"]["png"], "m.png");
+        assert_eq!(w["full_palette"], false);
+        // no mask (the two-layer shaders), or no palette
+        assert_ne!(tint_weight_json(&both, &st(false))["status"], "decoded");
+        assert!(tint_weight_json(&both, &ShaderTextures::default()).is_null());
+    }
+
+    #[test]
     fn material_file_names_what_is_known() {
         let shaders: Vec<crate::drawable::Shader> = serde_json::from_value(serde_json::json!([{
             "index": 0, "record_off": 0, "name_hash": "0badf00d", "param_hashes": [], "textures": [],
@@ -3960,7 +4185,7 @@ mod dictionary_tests {
         let group = || crate::gltf::NodeGroup { name: "member".into(), prims: vec![crate::gltf::TriPrim {
             name: "triangle".into(), positions: vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
             normals: None, tangents: None, uvs: vec![], colors: None, colors1: None, regions: None, tint: None, indices: vec![0, 1, 2],
-            material: None, joints: None, weights: None, joints1: None, weights1: None,
+            material: None, joints: None, weights: None, joints1: None, weights1: None, morphs: Vec::new(),
         }] };
         let mut groups = vec![vec![], vec![], vec![group()], vec![group()], vec![], vec![group()]];
         assert_eq!(lod_exports(&groups), [(2, "model.glb".into()), (3, "model_lod3.glb".into()), (5, "model_lod5.glb".into())]);
@@ -4023,7 +4248,7 @@ mod dictionary_tests {
         let a = ArchiveInfo { id: "levels.rpf".into(), path: work.join("levels.rpf"), size: archive.len() as u64, container: "rpf9".into() };
         crate::atomic::write(&a.path, archive).unwrap();
         let o = ExportOptions { out: work.join("out"), png: false, dds: false, raw: false,
-            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_colours: Default::default(), part_hidden: Default::default() };
+            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None, tex_remap: Default::default(), ped_tints: Default::default(), part_skins: Default::default(), part_decorations: Default::default(), part_colours: Default::default(), part_hidden: Default::default() };
         let dir = o.out.join("models/levels").join(export_base_name(&e));
         fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("model.json");
