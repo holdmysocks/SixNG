@@ -23,7 +23,7 @@ struct Frame {
 
 struct Mat {
     base: vec4<f32>,
-    flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask, bit 12 = an emissive shader of another class (lit by its emissive map), bit 13 = the packed map is a vehicle material map, bit 14 = the emissive slot holds the part ramp image with the parts' surfaces, bit 5 = the packed map is ped skin's spec map (green = roughness) with the specular factor x 100 in bits 16-23, bit 6 = ped skin's engine detail bound (6 speculartex2, 7 / 8 the normal and control sheets; tiling in strand.yz, colour strength strand.w, normal strength tile.y), bit 7 = ped skin occlusion (strength tile.x)
+    flags: vec4<u32>,     // x has-bits (1 base 2 normal 4 packed 8 emissive), y cls, z alpha (0 opaque 1 mask 2 blend), w gap in bits 0-1 (0 ok 1 low 2 flat), bit 8 = stand-in surface with metallic in bits 16-23 and roughness in bits 24-31, bit 9 = base texture is a tint mask, bit 12 = an emissive shader of another class (lit by its emissive map), bit 13 = the packed map is a vehicle material map, bit 14 = the emissive slot holds the part ramp image with the parts' surfaces, bit 5 = the packed map is ped skin's spec map (green = roughness) with the specular factor x 100 in bits 16-23, bit 6 = ped skin's engine detail bound (6 speculartex2, 7 / 8 the normal and control sheets; tiling in strand.yz, colour strength strand.w, normal strength tile.y), bit 7 = ped skin occlusion (strength tile.x); on skin tile.z = 1 + translucency bias when translucent (0 = none)
     tile: vec4<f32>,      // fabric detail tile: x UV scale, y rotation, z mean grey value, w bound
     emis: vec4<f32>,      // x emissive scale of the material (from the GLB's emissive strength), yzw the light's colour
     strand: vec4<f32>,    // x a strand piece's width factor this frame (stored over drawn strands; 1 otherwise)
@@ -1691,6 +1691,7 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     // its red and green: where a part's metalness and roughness lie between
     // the low and the high of its surface
     var mat_blend = vec2(0.5);
+    var sss_t = 0.0;
     if ((has & 4u) != 0u && (M.flags.w & 8192u) != 0u) {
         let mm = textureSample(t_pk, samp, i.uv0);
         mat_blend = mm.rg;
@@ -1699,11 +1700,12 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     } else if ((has & 4u) != 0u && (M.flags.w & 32u) != 0u) {
         // ped skin's spec map (`speculartex`): green is roughness, no metal,
         // as the game's studio skin program reads it (GGX alpha = roughness
-        // squared). Red (translucency) and blue (occlusion) feed only its
-        // deferred lighting pass, which is not decoded.
+        // squared). Red is the translucency (below), blue the occlusion.
         let sp = textureSample(t_pk, samp, i.uv0);
         rough = clamp(sp.g, 0.04, 1.0);
         metal = 0.0;
+        // translucency: saturate(R - bias), tile.z = 1 + bias
+        if (M.tile.z > 0.5) { sss_t = clamp(sp.r - (M.tile.z - 1.0), 0.0, 1.0); }
         // occlusion: lerp(1, B, the material's strength); diffuse ambient x
         // it, specular ambient x its fourth root (below), direct light not
         if ((M.flags.w & 128u) != 0u) { ao = mix(1.0, sp.b, clamp(M.tile.x, 0.0, 1.0)); }
@@ -2227,7 +2229,20 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     let Fr = f0 + (1.0 - f0) * pow(1.0 - max(dot(h, v), 0.0), 5.0);
     let spec = D * G * Fr / max(4.0 * ndl * ndv, 0.001);
     let kd = (1.0 - Fr) * (1.0 - metal);
-    let direct = (kd * albedo / 3.14159 + spec) * sun_e(i.world) * ndl + kd * albedo / 3.14159 * local_e(i.world, n);
+    var direct = (kd * albedo / 3.14159 + spec) * sun_e(i.world) * ndl + kd * albedo / 3.14159 * local_e(i.world, n);
+    // ped skin translucency, as the game's skin lighting adds it per light
+    // (here the sun) to the diffuse light, with no N.L: 0.17182 T (2 + 0.75 /
+    // (1.25 + L.V)^1.5), T = (e^3 + 3e) / 4, e = exp(-0.480898 s / d) per
+    // channel, thickness s = lo + (hi - lo)(1 - t)^p. Profile skin_default:
+    // d = 1.5, 0.0251, 0.0039 mm, lo 0.5 mm, hi 40 mm, p 1.3 (the one the
+    // export records; which profile a ped draws with is picked at run time).
+    if (sss_t > 0.0) {
+        let s_mm = 0.5 + 39.5 * pow(1.0 - sss_t, 1.3);
+        let e = exp(-0.480898 * s_mm / vec3(1.5, 1.5 * 0.0167474, 1.5 * 0.0025990));
+        let tr = 0.25 * (e * e * e + 3.0 * e);
+        let ph = 2.0 + 0.75 / pow(1.25 + dot(l, v), 1.5);
+        direct = direct + kd * albedo * (0.17182 * ph) * tr * sun_e(i.world);
+    }
     let amb_d = ambient(n);
     // The share of the surroundings a surface mirrors, as the game's standard lighting takes it: its
     // environment table at (N.V, roughness), r (F90 - F0) + g F0 with F90 = 1, times the multi-scatter
