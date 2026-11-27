@@ -1466,9 +1466,17 @@ pub fn merge(into: &mut Model, other: Model) {
         if let Some(d) = &mut m.detail {
             d.image += img0;
         }
-        for x in [&mut m.ramp_u, &mut m.ramp] {
+        for x in [&mut m.ramp_u, &mut m.ramp, &mut m.wear_mask, &mut m.primer_mask, &mut m.dust_mask] {
             if let Some(i) = x {
                 *i += img0;
+            }
+        }
+        // ped skin's engine detail: speculartex2 and the two tile sheets
+        if let Some(d) = &mut m.skin_detail {
+            for x in [&mut d.spec2, &mut d.normal, &mut d.control] {
+                if let Some(i) = x {
+                    *i += img0;
+                }
             }
         }
         into.materials.push(m);
