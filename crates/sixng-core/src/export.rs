@@ -1081,6 +1081,45 @@ fn emissive_strength(s: &crate::drawable::Shader) -> crate::material::EmissiveSt
 /// `emissive_strength` of a model.json material and of the GLB extras:
 /// null for materials that do not light (or whose emissive map did not
 /// decode).
+/// `speculartex2`: the map whose alpha masks the tint palette.
+const TINT_MASK: &str = "739e3d0d";
+/// Tint strength (name not recovered).
+const TINT_STRENGTH: &str = "381999f3";
+/// Second tint control (name not recovered): smooths the weight and blends
+/// toward `TINT_TARGET`.
+const TINT_SMOOTH: &str = "73511514";
+/// sRGB colour the second control blends toward (name not recovered).
+const TINT_TARGET: &str = "b1b16aaf";
+
+/// `tint_weight` of a material with a tint palette: how much of the palette
+/// colour the game applies at each pixel. Read in the deferred pixel shaders
+/// of prop_batch_dirt, standard, standard_dirt and standard_decal_blend
+/// (every effect that binds `speculartex2`, the palette and both controls
+/// lists the same three): the albedo is multiplied by lerp(1, palette, w)
+/// with w = 1 - (1 - speculartex2.a) * strength. Null without a palette;
+/// for other shaders (the two-layer ones use 381999f3 for something else)
+/// the status says the weight is not decoded.
+fn tint_weight_json(s: &crate::drawable::Shader, st: &ShaderTextures) -> serde_json::Value {
+    if st.tint_palette.is_none() {
+        return serde_json::Value::Null;
+    }
+    let get = |h: &str| s.constants.iter().find(|c| c.hash == h).and_then(|c| c.components()).map(|v| v.to_vec());
+    let mask = st.entries.iter().find(|e| e["param_hash"] == TINT_MASK);
+    let (Some(strength), Some(smooth), Some(mask)) = (get(TINT_STRENGTH), get(TINT_SMOOTH), mask) else {
+        return serde_json::json!({"status": "not decoded for this shader: the albedo is multiplied by the full palette colour here, which may be too strong"});
+    };
+    let (k, c) = (strength[0], smooth[0]);
+    serde_json::json!({
+        "status": "decoded",
+        "strength": k,
+        "smooth": c,
+        "smooth_target": get(TINT_TARGET).map(|v| v[..v.len().min(3)].to_vec()),
+        "mask": {"param_hash": TINT_MASK, "param_name": "speculartex2", "channel": "a", "png": mask["png"], "hash64": mask["hash64"]},
+        "full_palette": k == 0.0 && c == 0.0,
+        "formula": "a = mask alpha (speculartex2.a, first UV set); w = 1 - (1 - a) * strength; with smooth = s: w += s * (smoothstep(saturate(2 w)) - w); t = lerp(1, palette colour, w); t = lerp(t, linear(smooth_target), s * smoothstep(saturate(1 - 2 (1 - a) * strength))); albedo *= t. With strength 0 and smooth 0 the full palette colour applies; with strength 1 and smooth 0, w = a.",
+    })
+}
+
 fn emissive_strength_json(s: &crate::drawable::Shader, st: &ShaderTextures, c: &serde_json::Value) -> serde_json::Value {
     match lit_source(s, st, c) {
         Some(EmissiveSource::Map | EmissiveSource::ColourMap) => emissive_strength(s).json(),
@@ -1539,6 +1578,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     m["parameters_not_read"] = unread.into();
                     m["emissive_source"] = emissive_source_json(s, st, &c);
                     m["emissive_strength"] = emissive_strength_json(s, st, &c);
+                    m["tint_weight"] = tint_weight_json(s, st);
                     if let Some(fb) = &st.fallback {
                         m["texture_fallback"] = fb.clone();
                     }
@@ -1561,7 +1601,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     }
                     m
                 }).collect::<Vec<_>>(),
-                "materials_note": "parameters: every constant value of the material, keyed by the parameter's name (its 8-digit hash where the name is not known; a repeated name gets the hash appended), with the type from the shader archive (a scalar as a number, a vector as its 2 to 4 components, int and bool as such); drawable.shaders[].constants has the same values with buffer and byte offset. parameters_not_read: parameters whose values lie outside the material's constant block. emissive_source: what lights an emissive material in the GLB (emissive_map, colour_map, or none when the shader's emissivetex did not decode), null for materials that do not light. emissive_strength: how bright a lit material is in the GLB, from its emissivemultiplier constant (multiplier, as read). strength = multiplier / 100 (the values read like nits; 1.0 = 100 nits), at most 100; up to 1 it is the GLB emissiveFactor, above 1 the factor is 1 and KHR_materials_emissive_strength holds the strength. tint: the light's colour (linear RGB, constant 7ab0fd74, its name not recovered; neon tubes have their colour here over a white emissive map), multiplied into the GLB emissiveFactor; null when the material has none. source: multiplier, capped (over 100), default (no multiplier: strength 1) or runtime (multiplier 0: a light the game switches on while it runs, kept lit at strength 1). Null for materials that do not light. Textures come from the data/ttdb/*.ttpf stores by 64-bit hash and are written once to <out>/textures/ttpf/<hash>.png. Roles are guessed from the shader parameter hash and the format (sRGB = colour, BC5 / known normal slots = normal map). classification.class is one of opaque/alpha/cutout/decal/glass/window/emissive/water/terrain_multilayer/car_paint, from the shader record flags and known shader families. shader_name and param_name are joaat names from <work>/names/names.json (`sixng names`), null when unknown. slot_role names the PBR map a known parameter slot holds.",
+                "materials_note": "parameters: every constant value of the material, keyed by the parameter's name (its 8-digit hash where the name is not known; a repeated name gets the hash appended), with the type from the shader archive (a scalar as a number, a vector as its 2 to 4 components, int and bool as such); drawable.shaders[].constants has the same values with buffer and byte offset. parameters_not_read: parameters whose values lie outside the material's constant block. emissive_source: what lights an emissive material in the GLB (emissive_map, colour_map, or none when the shader's emissivetex did not decode), null for materials that do not light. emissive_strength: how bright a lit material is in the GLB, from its emissivemultiplier constant (multiplier, as read). strength = multiplier / 100 (the values read like nits; 1.0 = 100 nits), at most 100; up to 1 it is the GLB emissiveFactor, above 1 the factor is 1 and KHR_materials_emissive_strength holds the strength. tint: the light's colour (linear RGB, constant 7ab0fd74, its name not recovered; neon tubes have their colour here over a white emissive map), multiplied into the GLB emissiveFactor; null when the material has none. source: multiplier, capped (over 100), default (no multiplier: strength 1) or runtime (multiplier 0: a light the game switches on while it runs, kept lit at strength 1). Null for materials that do not light. Textures come from the data/ttdb/*.ttpf stores by 64-bit hash and are written once to <out>/textures/ttpf/<hash>.png. Roles are guessed from the shader parameter hash and the format (sRGB = colour, BC5 / known normal slots = normal map). classification.class is one of opaque/alpha/cutout/decal/glass/window/emissive/water/terrain_multilayer/car_paint, from the shader record flags and known shader families. shader_name and param_name are joaat names from <work>/names/names.json (`sixng names`), null when unknown. slot_role names the PBR map a known parameter slot holds. tint_weight: for a material with a tint palette, how much of the palette colour the game applies per pixel (mask texture, strength, formula; see the record), null without a palette; COLOR_0 in the GLB holds the full palette colour.",
             });
             let mut j = j;
             if physics.is_some() || archetype.is_some() {
@@ -4077,6 +4117,30 @@ mod dictionary_tests {
         assert_eq!(v["0badf00e"], serde_json::json!([1.0, 2.0, 3.0, 4.0]));
         assert_eq!(v["0badf00f"], 7);
         assert_eq!(unread, vec!["0badf010".to_string()]);
+    }
+
+    #[test]
+    fn tint_weight_reads_the_mask_and_strength() {
+        let shader = |consts: serde_json::Value| -> crate::drawable::Shader {
+            serde_json::from_value(serde_json::json!({"index": 0, "record_off": 0, "name_hash": "0badf00d", "param_hashes": [], "textures": [], "constants": consts})).unwrap()
+        };
+        let both = shader(serde_json::json!([
+            {"hash": TINT_STRENGTH, "desc": "00400003", "offset": 0, "values": [1.0, 0.0, 0.0, 0.0]},
+            {"hash": TINT_SMOOTH, "desc": "00400003", "offset": 4, "values": [0.0, 0.0, 0.0, 0.0]}
+        ]));
+        let st = |mask: bool| ShaderTextures {
+            tint_palette: Some(vec![[255, 255, 255, 255]]),
+            entries: if mask { vec![serde_json::json!({"param_hash": TINT_MASK, "png": "m.png", "hash64": "01"})] } else { vec![] },
+            ..Default::default()
+        };
+        let w = tint_weight_json(&both, &st(true));
+        assert_eq!(w["status"], "decoded");
+        assert_eq!(w["strength"], 1.0);
+        assert_eq!(w["mask"]["png"], "m.png");
+        assert_eq!(w["full_palette"], false);
+        // no mask (the two-layer shaders), or no palette
+        assert_ne!(tint_weight_json(&both, &st(false))["status"], "decoded");
+        assert!(tint_weight_json(&both, &ShaderTextures::default()).is_null());
     }
 
     #[test]
