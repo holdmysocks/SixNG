@@ -735,7 +735,7 @@ pub struct Renderer3D {
     /// tables, the opaque, fallback and shadow pipelines that read them,
     /// and the frame's instance and indirect buffers.
     gd: Option<std::sync::Arc<crate::gpu_draw::Shared>>,
-    gd_pipes: Option<[wgpu::RenderPipeline; 3]>,
+    gd_pipes: Option<[wgpu::RenderPipeline; 4]>,
     gd_bufs: Option<(wgpu::Buffer, wgpu::Buffer)>,
     /// Off: every model draws the old way (the map's A/B switch).
     pub gd_on: bool,
@@ -757,7 +757,9 @@ struct GdFrame<'a> {
     snap: crate::gpu_draw::Snapshot,
     main: Vec<GdList>,
     fb: Vec<GdList>,
+    /// Per cascade: cut-out casters (with their page), solid ones (material table only).
     shadow: [Vec<GdList>; crate::shadow::CASCADES],
+    shadow_solid: [Vec<GdList>; crate::shadow::CASCADES],
     /// Models it does not draw (the old path draws them).
     rest: Vec<&'a GpuModel>,
 }
@@ -1797,7 +1799,31 @@ impl Renderer3D {
                 multiview_mask: None,
                 cache: None,
             });
-            [opaque, fb, shadow]
+            // solid shadow casters: depth only, with the material table alone
+            // bound (no texture page to track in every cascade)
+            let lay_solid = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("solid shadow (gpu draws)"),
+                bind_group_layouts: &[Some(&bgl_frame), Some(&g.bgl_mats)],
+                immediate_size: 0,
+            });
+            let solid = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("solid shadow (gpu draws)"),
+                layout: Some(&lay_solid),
+                vertex: wgpu::VertexState { module: &m, entry_point: Some("vs_mesh"), compilation_options: Default::default(), buffers: &vbufs },
+                primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: crate::shadow::FMT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Greater),
+                    stencil: Default::default(),
+                    bias: wgpu::DepthBiasState { constant: 0, slope_scale: -2.0, clamp: 0.0 },
+                }),
+                multisample: Default::default(),
+                fragment: None,
+                multiview_mask: None,
+                cache: None,
+            });
+            [opaque, fb, shadow, solid]
         });
         Renderer3D {
             gd,
@@ -3110,10 +3136,13 @@ impl Renderer3D {
             return None;
         }
         let plan = self.shadow_plan(cam, look, aspect);
-        type Key = (u32, usize, usize);
+        // (page, stencil, chunk): a page is the costly thing to set (wgpu tracks
+        // each of its views every time), so each is set once per pass
+        type Key = (usize, u32, usize);
         let mut main: Vec<(Key, Args)> = Vec::new();
         let mut fb: Vec<(Key, Args)> = Vec::new();
         let mut shadow: [Vec<(Key, Args)>; CASCADES] = Default::default();
+        let mut solid: [Vec<(Key, Args)>; CASCADES] = Default::default();
         let mut inst: Vec<Instance> = Vec::new();
         let mut rest = Vec::new();
         // per model: runs of neighbouring meshes (first index, count, material)
@@ -3200,12 +3229,12 @@ impl Renderer3D {
             };
             if nn > 0 {
                 for r in &runs {
-                    main.push(((gm.stencil, h.chunk, h.page), args(r, block(r.2).1, nn)));
+                    main.push(((h.page, gm.stencil, h.chunk), args(r, block(r.2).1, nn)));
                 }
             }
             if fb_on {
                 for r in &runs {
-                    fb.push(((0, h.chunk, h.page), args(r, block(r.2).2, nall - nn)));
+                    fb.push(((h.page, 0, h.chunk), args(r, block(r.2).2, nall - nn)));
                 }
             }
             if let (Some((cs, due)), true) = (&plan, nn > 0) {
@@ -3220,7 +3249,12 @@ impl Renderer3D {
                         }
                     }
                     for r in &sruns {
-                        shadow[i].push(((0, h.chunk, h.page), args(r, block(r.2).1, nn)));
+                        let a = args(r, block(r.2).1, nn);
+                        if gm.mat_alpha[(r.2 - h.mid0) as usize] == 1 {
+                            shadow[i].push(((h.page, 0, h.chunk), a));
+                        } else {
+                            solid[i].push(((0, 0, h.chunk), a));
+                        }
                     }
                 }
             }
@@ -3235,8 +3269,8 @@ impl Renderer3D {
                 let at = all.len() as u32;
                 all.push(a);
                 match out.last_mut() {
-                    Some(l) if (l.stencil, l.chunk, l.page) == k => l.args.end = at + 1,
-                    _ => out.push(GdList { stencil: k.0, chunk: k.1, page: k.2, args: at..at + 1 }),
+                    Some(l) if (l.page, l.stencil, l.chunk) == k => l.args.end = at + 1,
+                    _ => out.push(GdList { page: k.0, stencil: k.1, chunk: k.2, args: at..at + 1 }),
                 }
             }
             out
@@ -3244,8 +3278,9 @@ impl Renderer3D {
         let main = lists(&mut main);
         let fb = lists(&mut fb);
         let shadow: [Vec<GdList>; CASCADES] = std::array::from_fn(|i| lists(&mut shadow[i]));
+        let shadow_solid: [Vec<GdList>; CASCADES] = std::array::from_fn(|i| lists(&mut solid[i]));
         drop(lists);
-        let lists_n = main.len() + fb.len() + shadow.iter().map(|s| s.len()).sum::<usize>();
+        let lists_n = main.len() + fb.len() + shadow.iter().chain(&shadow_solid).map(|s| s.len()).sum::<usize>();
         self.gd_stats = [all.len() as u32, lists_n as u32, inst.len() as u32, rest.len() as u32];
         if !all.is_empty() {
             let ib = (inst.len().max(1) * std::mem::size_of::<Instance>()) as u64;
@@ -3271,7 +3306,7 @@ impl Renderer3D {
             }
             queue.write_buffer(abuf, 0, bytemuck::cast_slice(&all));
         }
-        Some(GdFrame { snap, main, fb, shadow, rest })
+        Some(GdFrame { snap, main, fb, shadow, shadow_solid, rest })
     }
 
     /// Record one pass's GPU-driven lists: per chunk and page one indirect
@@ -3285,6 +3320,7 @@ impl Renderer3D {
         lists: &[GdList],
         bufs: &(wgpu::Buffer, wgpu::Buffer),
         stencil: bool,
+        group1: Option<&wgpu::BindGroup>,
     ) -> u32 {
         if lists.is_empty() {
             return 0;
@@ -3292,19 +3328,26 @@ impl Renderer3D {
         be.set_pipeline(pipe);
         be.set_bind_group(0, Some(frame_bg), &[]);
         be.set_vertex_buffer(1, bufs.0.slice(..));
+        // a fixed group 1 (the material table alone) in place of the pages
+        if let Some(g) = group1 {
+            be.set_bind_group(1, Some(g), &[]);
+        }
         let mut n = 0;
         let (mut sref, mut chunk, mut page) = (u32::MAX, usize::MAX, usize::MAX);
         for l in lists {
-            let (Some(Some(bg)), Some(Some((vb, ib)))) = (f.snap.bgs.get(l.page), f.snap.chunks.get(l.chunk)) else {
+            let Some(Some((vb, ib))) = f.snap.chunks.get(l.chunk) else {
                 continue;
             };
+            if group1.is_none() && l.page != page {
+                let Some(Some(bg)) = f.snap.bgs.get(l.page) else {
+                    continue;
+                };
+                be.set_bind_group(1, Some(bg), &[]);
+                page = l.page;
+            }
             if stencil && l.stencil != sref {
                 be.set_stencil_reference(l.stencil);
                 sref = l.stencil;
-            }
-            if l.page != page {
-                be.set_bind_group(1, Some(bg), &[]);
-                page = l.page;
             }
             if l.chunk != chunk {
                 be.set_vertex_buffer(0, vb.slice(..));
@@ -3365,7 +3408,8 @@ impl Renderer3D {
             });
             let bg = &self.shadow_bgs[i];
             if let (Some(f), Some(p), Some(b)) = (gd, &self.gd_pipes, &self.gd_bufs) {
-                self.shadow_draws += Self::record_gd(&mut pass, &p[2], bg, f, &f.shadow[i], b, false);
+                self.shadow_draws += Self::record_gd(&mut pass, &p[3], bg, f, &f.shadow_solid[i], b, false, Some(&f.snap.mats_bg));
+                self.shadow_draws += Self::record_gd(&mut pass, &p[2], bg, f, &f.shadow[i], b, false, None);
             }
             self.shadow_draws += Self::record_shadow(&self.pipe_shadow, bg, &mut pass, models, &c);
             // map cells stand in for placements far from the camera: none
@@ -3718,7 +3762,7 @@ impl Renderer3D {
             // the GPU-driven lists first, then the models they leave
             let rest = gdf.as_ref().map_or(models, |f| &f.rest[..]);
             if let (Some(f), Some(p), Some(b)) = (&gdf, &self.gd_pipes, &self.gd_bufs) {
-                draws += Self::record_gd(&mut pass, &p[0], &self.default_frame_bg, f, &f.main, b, true);
+                draws += Self::record_gd(&mut pass, &p[0], &self.default_frame_bg, f, &f.main, b, true, None);
             }
             draws += Self::record_opaque(
                 &self.pipe_opaque,
@@ -3742,7 +3786,7 @@ impl Renderer3D {
             // pixels still showing far field or sky
             let mut fm = 0;
             if let (Some(f), Some(p), Some(b)) = (&gdf, &self.gd_pipes, &self.gd_bufs) {
-                fm += Self::record_gd(&mut pass, &p[1], &self.default_frame_bg, f, &f.fb, b, true);
+                fm += Self::record_gd(&mut pass, &p[1], &self.default_frame_bg, f, &f.fb, b, true, None);
             }
             fm += Self::record_opaque(
                 &self.pipe_fb,

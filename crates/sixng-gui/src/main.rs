@@ -365,7 +365,7 @@ fn wgpu_options(no_vsync: bool, gpu: Option<String>) -> eframe::egui_wgpu::WgpuC
         c.device_descriptor = std::sync::Arc::new(move |adapter| {
             let mut d = base(adapter);
             d.required_features |= adapter.features()
-                & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::DEPTH32FLOAT_STENCIL8 | crate::gpu_time::features() | crate::gpu_draw::features());
+                & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::DEPTH32FLOAT_STENCIL8 | crate::gpu_time::features() | crate::gpu_draw::features() | crate::gpu_draw::optional_features());
             // the 3D map's GPU-driven draws bind its textures in pages (gpu_draw.rs)
             d.required_limits.max_binding_array_elements_per_shader_stage = d
                 .required_limits

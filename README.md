@@ -1516,7 +1516,10 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   coverage-fallback and shadow passes then draw everything in one buffer
   and page with one indirect call, each mesh run an entry in it. The
   instances are copied for each material, which the vertex program reads
-  from the copy. Skinned models, strand hair, see-through and decal
+  from the copy. wgpu tracks every texture of a page each time the page is
+  bound in a pass, so the lists go page by page, solid shadow casters are
+  drawn depth-only with the material table alone, and where the card can
+  bind a texture array partly a page binds only the slots in use. Skinned models, strand hair, see-through and decal
   surfaces, models with more than 4096 instance copies, and models whose
   page has not been rebuilt since they arrived (one page every ten frames
   at most) still draw one call per run. The tick line shows sub-draws,

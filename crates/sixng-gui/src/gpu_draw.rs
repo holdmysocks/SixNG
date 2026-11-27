@@ -107,6 +107,8 @@ struct Page {
     built: u64,
     built_frame: u64,
     bg: Option<wgpu::BindGroup>,
+    /// One past the highest slot handed out (what a partly bound page binds).
+    hi: u32,
 }
 
 enum Held {
@@ -130,8 +132,14 @@ pub struct Shared {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pub bgl: wgpu::BindGroupLayout,
+    /// The material table alone (solid shadow casters read no texture).
+    pub bgl_mats: wgpu::BindGroupLayout,
+    mats_bg: wgpu::BindGroup,
     mats: wgpu::Buffer,
     white: wgpu::TextureView,
+    /// Pages bind only their used slots (PARTIALLY_BOUND_BINDING_ARRAY): wgpu
+    /// tracks every bound view each time a page is set in a pass.
+    partial: bool,
     vcap: u64,
     icap: u64,
     inner: Mutex<Inner>,
@@ -143,6 +151,7 @@ pub struct Snapshot {
     pub built: Vec<u64>,
     pub bgs: Vec<Option<wgpu::BindGroup>>,
     pub chunks: Vec<Option<(wgpu::Buffer, wgpu::Buffer)>>,
+    pub mats_bg: wgpu::BindGroup,
 }
 
 impl Snapshot {
@@ -158,6 +167,11 @@ pub fn features() -> wgpu::Features {
     wgpu::Features::TEXTURE_BINDING_ARRAY
         | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
         | wgpu::Features::INDIRECT_FIRST_INSTANCE
+}
+
+/// Features the path uses when the device has them.
+pub fn optional_features() -> wgpu::Features {
+    wgpu::Features::PARTIALLY_BOUND_BINDING_ARRAY
 }
 
 /// A model's place in the shared tables; freed when the model is dropped.
@@ -261,6 +275,25 @@ impl Shared {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let bgl_mats = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gpu draw materials"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let mats_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gpu draw materials"),
+            layout: &bgl_mats,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: mats.as_entire_binding() }],
+        });
+        let partial = device.features().contains(optional_features());
         // chunk sizes: as large as the device allows, up to 256 MB of
         // vertices and 128 MB of indices
         let max = device.limits().max_buffer_size;
@@ -268,17 +301,21 @@ impl Shared {
         let vcap = (max.min(256 << 20) / vsz) * vsz;
         let icap = (max.min(128 << 20) / 4) * 4;
         eprintln!(
-            "[map3d] GPU-driven draws: on (pool chunks {} MB + {} MB, {} textures per page)",
+            "[map3d] GPU-driven draws: on (pool chunks {} MB + {} MB, {} textures per page{})",
             vcap >> 20,
             icap >> 20,
-            PAGE
+            PAGE,
+            if partial { ", partly bound" } else { "" }
         );
         Some(Arc::new(Shared {
             device: device.clone(),
             queue: queue.clone(),
             bgl,
+            bgl_mats,
+            mats_bg,
             mats,
             white: white.clone(),
+            partial,
             vcap,
             icap,
             inner: Mutex::new(Inner {
@@ -310,6 +347,7 @@ impl Shared {
                     built: 0,
                     built_frame: 0,
                     bg: None,
+                    hi: 1,
                 });
                 g.pages.len() - 1
             }
@@ -322,6 +360,7 @@ impl Shared {
             if let Some(v) = v {
                 let s = p.free.pop().unwrap();
                 p.views[s as usize] = Some(v.clone());
+                p.hi = p.hi.max(s + 1);
                 of_image[n] = s;
                 owned.push(s);
             }
@@ -454,7 +493,8 @@ impl Shared {
         if let Some(k) = pick {
             let t = std::time::Instant::now();
             let p = &g.pages[k];
-            let views: Vec<&wgpu::TextureView> = p.views.iter().map(|v| v.as_ref().unwrap_or(&self.white)).collect();
+            let n = if self.partial { p.hi as usize } else { PAGE as usize };
+            let views: Vec<&wgpu::TextureView> = p.views[..n].iter().map(|v| v.as_ref().unwrap_or(&self.white)).collect();
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("gpu draw page"),
                 layout: &self.bgl,
@@ -475,6 +515,7 @@ impl Shared {
             built: g.pages.iter().map(|p| p.built).collect(),
             bgs: g.pages.iter().map(|p| p.bg.clone()).collect(),
             chunks: g.chunks.iter().map(|c| c.as_ref().map(|c| (c.vb.clone(), c.ib.clone()))).collect(),
+            mats_bg: self.mats_bg.clone(),
         }
     }
 
