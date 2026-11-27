@@ -2803,6 +2803,17 @@ impl Map3D {
         }
         let tr = Instant::now();
         if let Some(rs) = render_state {
+            // the material table's pool: move a few models out of its
+            // emptiest chunk (needs them mutable, so before the frame's list)
+            if let Some(ren) = self.renderer.as_ref() {
+                ren.compact(
+                    rs,
+                    self.cache.values_mut().filter_map(|s| match s {
+                        Slot::Ready { gm, .. } => Some(gm),
+                        _ => None,
+                    }),
+                );
+            }
             let mut models: Vec<&GpuModel> = Vec::new();
             if self.show_terrain {
                 let ren = self.renderer.as_ref().unwrap();

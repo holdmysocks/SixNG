@@ -41,8 +41,9 @@ const MAT_CAP: u64 = 1 << 16;
 /// frame recorded before the free may not be submitted yet).
 const HOLD_FRAMES: u64 = 3;
 /// Pool chunk sizes (bytes): vertices, indices, instances.
-const V_CHUNK: u64 = 32 << 20;
-const I_CHUNK: u64 = 16 << 20;
+const G_CHUNK: u64 = 128 << 20;
+/// Bytes of a vertex.
+const VSZ: u64 = std::mem::size_of::<crate::glb::Vertex>() as u64;
 const N_CHUNK: u64 = 4 << 20;
 /// Layers of one texture array at most, and its bytes at most.
 const MAX_LAYERS: u32 = 256;
@@ -57,7 +58,7 @@ const FIRST_LAYERS: u32 = 4;
 pub mod watch {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-    pub const SITES: [&str; 30] = [
+    pub const SITES: [&str; 32] = [
         "-",
         "render: start",
         "render: table prepare",
@@ -88,6 +89,8 @@ pub mod watch {
         "map: loaded done",
         "map: remove model",
         "map: remove done",
+        "lock: compact_from",
+        "lock: relocate",
     ];
     /// Thread kinds: render, loader, other (drops, instance writes).
     pub static AT: [AtomicUsize; 3] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
@@ -126,7 +129,10 @@ pub mod watch {
 
 /// `SIXNG_MAP_GPU_TABLE`: a comma list of `nodraw` (pools and arrays
 /// filled, but every model drawn the old way), `noshadow` (the table skips
-/// the shadow cascades), `nomulti` (one indirect call per sub-draw).
+/// the shadow cascades), `nomulti` (one indirect call per sub-draw),
+/// `noarray` (textures stay in their own images, so nothing joins the
+/// pools) and `nopool` (textures go to the arrays, geometry stays in its
+/// own buffers and is drawn the old way).
 pub fn opt(name: &str) -> bool {
     static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     V.get_or_init(|| std::env::var("SIXNG_MAP_GPU_TABLE").unwrap_or_default()).split(',').any(|s| s.trim() == name)
@@ -172,14 +178,29 @@ impl Free {
     }
     /// First fit.
     fn alloc(&mut self, n: u64) -> Option<Range<u64>> {
-        let k = self.list.iter().position(|r| r.end - r.start >= n)?;
-        let r = &mut self.list[k];
-        let out = r.start..r.start + n;
-        r.start += n;
-        if r.start == r.end {
-            self.list.remove(k);
+        self.alloc_aligned(n, 1)
+    }
+    /// First fit, starting at a multiple of `align`.
+    fn alloc_aligned(&mut self, n: u64, align: u64) -> Option<Range<u64>> {
+        let fits = |r: &Range<u64>| r.start.next_multiple_of(align) + n <= r.end;
+        let k = self.list.iter().position(fits)?;
+        let r = self.list[k].clone();
+        let s = r.start.next_multiple_of(align);
+        let out = s..s + n;
+        // what is left before and after it
+        let mut rest = Vec::with_capacity(2);
+        if s > r.start {
+            rest.push(r.start..s);
         }
+        if out.end < r.end {
+            rest.push(out.end..r.end);
+        }
+        self.list.splice(k..k + 1, rest);
         Some(out)
+    }
+    /// Whether a range of `n` at a multiple of `align` fits.
+    fn fits(&self, n: u64, align: u64) -> bool {
+        self.list.iter().any(|r| r.start.next_multiple_of(align) + n <= r.end)
     }
     fn free(&mut self, r: Range<u64>) {
         if r.is_empty() {
@@ -220,33 +241,47 @@ impl Pool {
         Pool { label, usage, unit, cap: bytes.min(max) / unit, chunks: Vec::new() }
     }
     fn alloc(&mut self, device: &wgpu::Device, n: u64) -> Option<(usize, Range<u64>)> {
-        if n == 0 || n > self.cap {
+        self.alloc_in(device, n, 1, None, true)
+    }
+    /// `n` elements at a multiple of `align`, not in chunk `not`; a new
+    /// chunk when none has room and `grow`.
+    fn alloc_in(&mut self, device: &wgpu::Device, n: u64, align: u64, not: Option<usize>, grow: bool) -> Option<(usize, Range<u64>)> {
+        if n == 0 || n + align > self.cap {
             return None;
         }
         // the fullest chunk with room: the emptier ones then drain as models
-        // leave, and go back to the device
+        // leave (and as `compact` moves them), and go back to the device
         let pick = self
             .chunks
             .iter()
             .enumerate()
-            .filter_map(|(c, ch)| ch.as_ref().filter(|(_, f)| f.list.iter().any(|r| r.end - r.start >= n)).map(|(_, f)| (f.used(), c)))
+            .filter(|(c, _)| Some(*c) != not)
+            .filter_map(|(c, ch)| ch.as_ref().filter(|(_, f)| f.fits(n, align)).map(|(_, f)| (f.used(), c)))
             .max();
         if let Some((_, c)) = pick {
             if let Some(Some((_, f))) = self.chunks.get_mut(c) {
-                if let Some(r) = f.alloc(n) {
+                if let Some(r) = f.alloc_aligned(n, align) {
                     return Some((c, r));
                 }
             }
         }
+        if !grow {
+            return None;
+        }
+        let c = self.new_chunk(device);
+        let r = self.chunks[c].as_mut()?.1.alloc_aligned(n, align)?;
+        Some((c, r))
+    }
+    /// A new empty chunk.
+    fn new_chunk(&mut self, device: &wgpu::Device) -> usize {
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(self.label),
             size: self.cap * self.unit,
             usage: self.usage | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let mut f = Free::new(self.cap);
-        let r = f.alloc(n)?;
-        let c = match self.chunks.iter().position(|c| c.is_none()) {
+        let f = Free::new(self.cap);
+        match self.chunks.iter().position(|c| c.is_none()) {
             Some(c) => {
                 self.chunks[c] = Some((buf, f));
                 c
@@ -255,8 +290,7 @@ impl Pool {
                 self.chunks.push(Some((buf, f)));
                 self.chunks.len() - 1
             }
-        };
-        Some((c, r))
+        }
     }
     fn free(&mut self, c: usize, r: Range<u64>) {
         if let Some(Some((_, f))) = self.chunks.get_mut(c) {
@@ -285,6 +319,42 @@ impl Pool {
         let n = live.clone().count();
         (n, n as u64 * self.cap * self.unit, live.map(|c| c.1.used() * self.unit).sum())
     }
+}
+
+/// Room for a model's geometry in one chunk of the geometry pool: `nv`
+/// vertices (at a vertex boundary, so the chunk's first vertex index is
+/// exact) and `ni` indices. Fullest chunk first, not chunk `not`, a new one
+/// when none has room and `grow`.
+fn geo_alloc(p: &mut Pool, device: &wgpu::Device, nv: u64, ni: u64, not: Option<usize>, grow: bool) -> Option<(usize, Range<u64>, Range<u64>)> {
+    let (vu, a) = (nv * VSZ / 4, VSZ / 4);
+    if vu + a + ni > p.cap {
+        return None;
+    }
+    let mut order: Vec<(u64, usize)> = p
+        .chunks
+        .iter()
+        .enumerate()
+        .filter(|(c, _)| Some(*c) != not)
+        .filter_map(|(c, ch)| ch.as_ref().filter(|(_, f)| f.fits(vu, a) && f.fits(ni, 1)).map(|(_, f)| (f.used(), c)))
+        .collect();
+    order.sort_by(|x, y| y.cmp(x));
+    for (_, c) in order {
+        let f = &mut p.chunks[c].as_mut()?.1;
+        if let Some(v) = f.alloc_aligned(vu, a) {
+            if let Some(i) = f.alloc(ni) {
+                return Some((c, v, i));
+            }
+            f.free(v);
+        }
+    }
+    if !grow {
+        return None;
+    }
+    let c = p.new_chunk(device);
+    let f = &mut p.chunks[c].as_mut()?.1;
+    let v = f.alloc_aligned(vu, a)?;
+    let i = f.alloc(ni)?;
+    Some((c, v, i))
 }
 
 /// A class of textures that can share an array.
@@ -321,16 +391,15 @@ struct Arr {
 }
 
 enum Held {
-    V(usize, Range<u64>),
-    I(usize, Range<u64>),
+    G(usize, Range<u64>),
     N(usize, Range<u64>),
     Mats(Range<u64>),
     Layer(u32),
 }
 
 struct Inner {
-    v: Pool,
-    i: Pool,
+    /// Vertices and indices (one buffer serves as both), in 4-byte units.
+    g: Pool,
     n: Pool,
     mats: Free,
     arrays: Vec<Option<Arr>>,
@@ -343,6 +412,8 @@ struct Inner {
     bg: Option<wgpu::BindGroup>,
     /// Bind group rebuilds and their time (µs) since the stats were last taken.
     rebuilds: (u32, u64),
+    /// Models compact moved and their bytes, since the stats were last taken.
+    moved: (u32, u64),
 }
 
 /// The shared tables. Created with the map's renderer when the device can
@@ -370,8 +441,7 @@ pub struct Snapshot {
     pub built: u64,
     pub bg: Option<wgpu::BindGroup>,
     pub mats_bg: wgpu::BindGroup,
-    pub v: Vec<Option<wgpu::Buffer>>,
-    pub i: Vec<Option<wgpu::Buffer>>,
+    pub g: Vec<Option<wgpu::Buffer>>,
     pub n: Vec<Option<wgpu::Buffer>>,
 }
 
@@ -380,8 +450,7 @@ impl Snapshot {
         self.bg.is_some()
             && self.built >= h.need
             && h.n.is_some()
-            && self.v.get(h.vc).is_some_and(|b| b.is_some())
-            && self.i.get(h.ic).is_some_and(|b| b.is_some())
+            && self.g.get(h.gc).is_some_and(|b| b.is_some())
     }
 }
 
@@ -404,9 +473,9 @@ impl Drop for Layer {
 /// A model's place in the shared pools and table; freed when the model is dropped.
 pub struct Handle {
     shared: Arc<Shared>,
-    pub vc: usize,
+    /// Geometry chunk; vertex and index ranges in it (4-byte units).
+    pub gc: usize,
     v: Range<u64>,
-    pub ic: usize,
     i: Range<u64>,
     /// Instance chunk and range (None until the model has instances).
     pub n: Option<(usize, Range<u64>)>,
@@ -414,18 +483,18 @@ pub struct Handle {
     n_mats: u32,
     /// Bind group generation its textures need.
     pub need: u64,
-    pub vb: wgpu::Buffer,
-    pub ib: wgpu::Buffer,
+    /// The geometry chunk's buffer.
+    pub buf: wgpu::Buffer,
 }
 
 impl Handle {
-    /// First vertex of the model in its vertex chunk.
+    /// First vertex of the model in its chunk (its draws' base vertex).
     pub fn v_first(&self) -> u64 {
-        self.v.start
+        self.v.start * 4 / VSZ
     }
-    /// Byte offsets of its vertices and indices in their chunks.
+    /// Byte offsets of its vertices and indices in their chunk.
     pub fn v_bytes(&self) -> u64 {
-        self.v.start * self.shared.lock(17).v.unit
+        self.v.start * 4
     }
     pub fn i_bytes(&self) -> u64 {
         self.i.start * 4
@@ -434,6 +503,29 @@ impl Handle {
     pub fn n_first(&self) -> u32 {
         self.n.as_ref().map_or(0, |n| n.1.start as u32)
     }
+    /// Move the model's geometry out of its chunk into another one with
+    /// room (`compact`): the copies go into `enc`, and the old ranges are
+    /// held until frames recorded before the move are done. Returns the
+    /// byte shifts of its vertices and indices (new minus old); None when
+    /// no other chunk has room.
+    pub fn relocate(&mut self, enc: &mut wgpu::CommandEncoder) -> Option<(i64, i64)> {
+        let (nv, ni) = ((self.v.end - self.v.start) * 4 / VSZ, self.i.end - self.i.start);
+        let mut g = self.shared.lock(31);
+        let (gc, v, i) = geo_alloc(&mut g.g, &self.shared.device, nv, ni, Some(self.gc), false)?;
+        let buf = g.g.buf(gc)?;
+        let f = g.frame;
+        g.held.push((f, Held::G(self.gc, self.v.clone())));
+        g.held.push((f, Held::G(self.gc, self.i.clone())));
+        g.moved.0 += 1;
+        g.moved.1 += (nv * VSZ) + ni * 4;
+        drop(g);
+        enc.copy_buffer_to_buffer(&self.buf, self.v.start * 4, &buf, v.start * 4, (self.v.end - self.v.start) * 4);
+        enc.copy_buffer_to_buffer(&self.buf, self.i.start * 4, &buf, i.start * 4, ni * 4);
+        let shift = ((v.start as i64 - self.v.start as i64) * 4, (i.start as i64 - self.i.start as i64) * 4);
+        (self.gc, self.v, self.i, self.buf) = (gc, v, i, buf);
+        Some(shift)
+    }
+
     /// Rewrite the uniform part of material `k` (paint and other changes).
     pub fn write_mat(&self, k: usize, m: &[u8]) {
         if (k as u32) < self.n_mats && m.len() as u64 == self.shared.mat_bytes {
@@ -486,8 +578,8 @@ impl Drop for Handle {
     fn drop(&mut self) {
         let mut g = self.shared.lock(19);
         let f = g.frame;
-        g.held.push((f, Held::V(self.vc, std::mem::take(&mut self.v))));
-        g.held.push((f, Held::I(self.ic, std::mem::take(&mut self.i))));
+        g.held.push((f, Held::G(self.gc, std::mem::take(&mut self.v))));
+        g.held.push((f, Held::G(self.gc, std::mem::take(&mut self.i))));
         if let Some((c, r)) = self.n.take() {
             g.held.push((f, Held::N(c, r)));
         }
@@ -579,10 +671,9 @@ impl Shared {
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: mats.as_entire_binding() }],
         });
         let max = device.limits().max_buffer_size;
-        let vsz = std::mem::size_of::<crate::glb::Vertex>() as u64;
         let nsz = std::mem::size_of::<Instance>() as u64;
-        let v = Pool::new("pool vertices", wgpu::BufferUsages::VERTEX, vsz, V_CHUNK, max);
-        let i = Pool::new("pool indices", wgpu::BufferUsages::INDEX, 4, I_CHUNK, max);
+        // COPY_SRC: `compact` moves models between chunks
+        let g = Pool::new("pool geometry", wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_SRC, 4, G_CHUNK, max);
         let n = Pool::new("pool instances", wgpu::BufferUsages::VERTEX, nsz, N_CHUNK, max);
         // array 0: one white layer, the slot of every missing texture
         let white = device.create_texture(&wgpu::TextureDescriptor {
@@ -606,9 +697,8 @@ impl Shared {
         let max_layers = device.limits().max_texture_array_layers.min(MAX_LAYERS);
         watch::start();
         eprintln!(
-            "[map3d] GPU-driven draws: on (material table; pool chunks {} + {} + {} MB; texture arrays up to {} layers, {} arrays)",
-            v.cap * v.unit >> 20,
-            i.cap * i.unit >> 20,
+            "[map3d] GPU-driven draws: on (material table; pool chunks {} + {} MB; texture arrays up to {} layers, {} arrays)",
+            g.cap * g.unit >> 20,
             n.cap * n.unit >> 20,
             max_layers,
             ARRAYS
@@ -625,8 +715,7 @@ impl Shared {
             max_layers,
             writes: Mutex::new(Vec::new()),
             inner: Mutex::new(Inner {
-                v,
-                i,
+                g,
                 n,
                 mats: Free::new(MAT_CAP),
                 arrays: vec![Some(Arr { tex: white, view: wview, class: wclass, cap: 1, free: Vec::new(), gen: 1 })],
@@ -637,6 +726,7 @@ impl Shared {
                 built: 0,
                 bg: None,
                 rebuilds: (0, 0),
+                moved: (0, 0),
             }),
         }))
     }
@@ -705,19 +795,29 @@ impl Shared {
         }
         let mut g = self.lock(21);
         let m = g.mats.alloc(n_mats)?;
-        let Some((vc, v)) = g.v.alloc(&self.device, nv) else {
+        let Some((gc, v, i)) = geo_alloc(&mut g.g, &self.device, nv, ni, None, true) else {
             g.mats.free(m);
             return None;
         };
-        let Some((ic, i)) = g.i.alloc(&self.device, ni) else {
-            g.mats.free(m);
-            g.v.free(vc, v);
-            return None;
-        };
-        let (vb, ib) = (g.v.buf(vc).unwrap(), g.i.buf(ic).unwrap());
+        let buf = g.g.buf(gc).unwrap();
         drop(g);
         self.queue.write_buffer(&self.mats, m.start * self.row, rows);
-        Some(Handle { shared: self.clone(), vc, v, ic, i, n: None, mid0: m.start as u32, n_mats: n_mats as u32, need, vb, ib })
+        Some(Handle { shared: self.clone(), gc, v, i, n: None, mid0: m.start as u32, n_mats: n_mats as u32, need, buf })
+    }
+
+    /// The geometry chunk `compact` should empty: the least used one, when
+    /// the chunks hold more than one and a half chunks of free room and the
+    /// others have room for what it holds.
+    pub fn compact_from(&self) -> Option<usize> {
+        let g = self.lock(30);
+        let live: Vec<(usize, u64)> = g.g.chunks.iter().enumerate().filter_map(|(c, ch)| ch.as_ref().map(|(_, f)| (c, f.used()))).collect();
+        if live.len() < 2 {
+            return None;
+        }
+        let cap = g.g.cap;
+        let free: u64 = live.iter().map(|(_, u)| cap - u).sum();
+        let (c, u) = *live.iter().min_by_key(|(_, u)| *u)?;
+        (free * 2 > cap * 3 && free - (cap - u) > u + cap / 8).then_some(c)
     }
 
     /// Queue a write into an array layer for the render thread, which runs
@@ -753,8 +853,7 @@ impl Shared {
                 continue;
             }
             match h {
-                Held::V(c, r) => g.v.free(c, r),
-                Held::I(c, r) => g.i.free(c, r),
+                Held::G(c, r) => g.g.free(c, r),
                 Held::N(c, r) => g.n.free(c, r),
                 Held::Mats(r) => g.mats.free(r),
                 Held::Layer(s) => {
@@ -768,14 +867,13 @@ impl Shared {
             g.held
                 .iter()
                 .filter_map(|(_, h)| match (k, h) {
-                    (0, Held::V(c, _)) | (1, Held::I(c, _)) | (2, Held::N(c, _)) => Some(*c),
+                    (0, Held::G(c, _)) | (2, Held::N(c, _)) => Some(*c),
                     _ => None,
                 })
                 .collect()
         };
-        let (hv, hi, hn) = (held(0), held(1), held(2));
-        g.v.trim(&hv);
-        g.i.trim(&hi);
+        let (hg, hn) = (held(0), held(2));
+        g.g.trim(&hg);
         g.n.trim(&hn);
         if g.built != g.gen || g.bg.is_none() {
             let t = std::time::Instant::now();
@@ -794,15 +892,15 @@ impl Shared {
             g.rebuilds.0 += 1;
             g.rebuilds.1 += t.elapsed().as_micros() as u64;
         }
-        Snapshot { built: g.built, bg: g.bg.clone(), mats_bg: self.mats_bg.clone(), v: g.v.snapshot(), i: g.i.snapshot(), n: g.n.snapshot() }
+        Snapshot { built: g.built, bg: g.bg.clone(), mats_bg: self.mats_bg.clone(), g: g.g.snapshot(), n: g.n.snapshot() }
     }
 
     /// Pool and table use for the tick line.
     pub fn summary(&self) -> String {
         let mut g = self.lock(23);
-        let (vn, vb, vu) = g.v.stats();
-        let (inn, ib, iu) = g.i.stats();
+        let (gn, gb, gu) = g.g.stats();
         let (nn, nb, nu) = g.n.stats();
+        let moved = std::mem::take(&mut g.moved);
         let live: Vec<&Arr> = g.arrays.iter().skip(1).flatten().collect();
         let layers: u32 = live.iter().map(|a| a.cap).sum();
         let used: u32 = live.iter().map(|a| a.cap - a.free.len() as u32).sum();
@@ -813,9 +911,11 @@ impl Shared {
         drop(live);
         let r = std::mem::take(&mut g.rebuilds);
         format!(
-            "pool {vn}+{inn}+{nn} chunks {:.0}/{:.0} MB used, {} arrays ({} classes) {used}/{layers} layers {:.0}/{:.0} MB, {} materials, {} table rebuilds {:.1} ms",
-            mb(vu + iu + nu),
-            mb(vb + ib + nb),
+            "pool {gn}+{nn} chunks {:.0}/{:.0} MB used ({} models moved, {:.0} MB), {} arrays ({} classes) {used}/{layers} layers {:.0}/{:.0} MB, {} materials, {} table rebuilds {:.1} ms",
+            mb(gu + nu),
+            mb(gb + nb),
+            moved.0,
+            mb(moved.1),
             n_live,
             n_classes,
             mb(tex_used),

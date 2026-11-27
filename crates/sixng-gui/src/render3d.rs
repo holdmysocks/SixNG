@@ -531,6 +531,9 @@ pub struct GpuModel {
     /// The map's material table (gpu_draw.rs): the model's place in the
     /// shared pools and table; None: it draws the old way only.
     pub gd: Option<crate::gpu_draw::Handle>,
+    /// Base vertex of every draw of its meshes: a model in the shared pool
+    /// addresses its own vertices from its first one there (0: own buffers).
+    pub base_vertex: i32,
     pub joints_buf: wgpu::Buffer,
     pub frame_bg: wgpu::BindGroup,
     /// The model's own sticker records, once it has stickers (`set_stickers`).
@@ -849,8 +852,7 @@ pub struct Renderer3D {
 /// (and stencil value) one after another in the frame's indirect buffer.
 struct GdList {
     stencil: u32,
-    v: usize,
-    i: usize,
+    g: usize,
     n: usize,
     args: std::ops::Range<u32>,
 }
@@ -2191,7 +2193,7 @@ impl Uploader {
     /// Upload an image: into the map's shared texture arrays when it has
     /// them, else as a texture of its own.
     pub fn tex(&self, device: &wgpu::Device, queue: &wgpu::Queue, img: &glb::Image) -> Tex {
-        tex_upload(device, queue, img, self.gd.as_ref())
+        tex_upload(device, queue, img, self.gd.as_ref().filter(|_| !crate::gpu_draw::opt("noarray")))
     }
 
     /// Upload a map cell: geometry, origin and its BC3 texture arrays.
@@ -2535,7 +2537,7 @@ impl Uploader {
         // the map's material table: a static model without strand hair whose
         // textures are all in the shared arrays goes into the shared pools
         let pooled = m.joints.is_empty() && m.meshes.iter().all(|me| !me.skinned && me.strand_lod.is_none());
-        let gd = self.gd.as_ref().filter(|_| pooled && nv > 0 && ni > 0).and_then(|g| {
+        let gd = self.gd.as_ref().filter(|_| pooled && nv > 0 && ni > 0 && !crate::gpu_draw::opt("nopool")).and_then(|g| {
             let mut need = 0u64;
             let mut rows: Vec<u8> = Vec::with_capacity(mat_cpu.len() * g.row() as usize);
             for (u, src) in mat_cpu.iter().zip(&mat_src) {
@@ -2558,7 +2560,7 @@ impl Uploader {
         // rounded up to 4 bytes, as mapped buffers need. A pooled model's
         // are its ranges of the pool's chunks.
         let (vb, ib) = match &gd {
-            Some(h) => (h.vb.clone(), h.ib.clone()),
+            Some(h) => (h.buf.clone(), h.buf.clone()),
             None => (
                 device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("vb"),
@@ -2575,8 +2577,10 @@ impl Uploader {
                 }),
             ),
         };
-        // where the model starts in its buffers: bytes, and the first vertex
-        let (v_at, i_at, v_first) = gd.as_ref().map_or((0, 0, 0), |h| (h.v_bytes(), h.i_bytes(), h.v_first() as u32));
+        // where the model starts in its buffers (bytes); its indices count
+        // from its first vertex, which its draws pass as base vertex
+        let (v_at, i_at) = gd.as_ref().map_or((0, 0), |h| (h.v_bytes(), h.i_bytes()));
+        let base_vertex = gd.as_ref().map_or(0, |h| h.v_first() as i32);
         let mut slots: Vec<Option<GpuMesh>> = (0..m.meshes.len()).map(|_| None).collect();
         {
             let mut maps = gd.is_none().then(|| {
@@ -2592,9 +2596,9 @@ impl Uploader {
             for &k in &order {
                 let me = &m.meshes[k];
                 let vbytes: &[u8] = bytemuck::cast_slice(&me.verts);
-                // indices point into the whole shared vertex buffer (no base
-                // vertex), so neighbouring meshes can be drawn as one range
-                let v0 = v_first + (vo / vsz) as u32;
+                // indices count from the model's first vertex (not the
+                // mesh's), so neighbouring meshes can be drawn as one range
+                let v0 = (vo / vsz) as u32;
                 let abs: Vec<u32> = me.indices.iter().map(|&i| i + v0).collect();
                 let ibytes: &[u8] = bytemuck::cast_slice(&abs);
                 match &mut maps {
@@ -2685,6 +2689,7 @@ impl Uploader {
             mat_cpu,
             _textures: textures,
             gd,
+            base_vertex,
             joints_buf,
             frame_bg,
             sticker_buf: None,
@@ -3081,7 +3086,7 @@ impl Renderer3D {
                 let first = me.first();
                 let cnt = if me.strand_lod.is_some() { if eye { &me.n_draw } else { &me.n_shadow }.load(std::sync::atomic::Ordering::Relaxed).min(me.n_idx) } else { me.n_idx };
                 if cnt > 0 {
-                    be.draw_indexed(first..first + cnt, 0, 0..gm.n_normal());
+                    be.draw_indexed(first..first + cnt, gm.base_vertex, 0..gm.n_normal());
                 }
             }
         }
@@ -3111,7 +3116,7 @@ impl Renderer3D {
                 let cnt = me.n_draw.load(std::sync::atomic::Ordering::Relaxed).min(me.n_idx);
                 if cnt > 0 {
                     // the indices address the whole vertex buffer: no base vertex
-                    be.draw_indexed(first..first + cnt, 0, range.clone());
+                    be.draw_indexed(first..first + cnt, gm.base_vertex, range.clone());
                     n += 1;
                 }
             }
@@ -3135,6 +3140,7 @@ impl Renderer3D {
         let mut model = usize::MAX;
         let mut mat = usize::MAX;
         let mut inst = 0..0u32;
+        let mut base = 0i32;
         let mut run: Option<std::ops::Range<u32>> = None;
         // end of the hidden meshes that follow on from the run
         let mut reach = u32::MAX;
@@ -3154,7 +3160,7 @@ impl Renderer3D {
                     reach = r.end;
                     continue;
                 }
-                be.draw_indexed(r.clone(), 0, inst.clone());
+                be.draw_indexed(r.clone(), base, inst.clone());
                 n += 1;
             }
             if !same_pipe {
@@ -3169,6 +3175,7 @@ impl Renderer3D {
                 model = mi;
                 mat = usize::MAX;
                 inst = 0..gm.n_normal();
+                base = gm.base_vertex;
             }
             if mat != me.material {
                 be.set_bind_group(1, Some(&gm.mat_bg[me.material]), &[]);
@@ -3178,7 +3185,7 @@ impl Renderer3D {
             reach = first + me.n_idx;
         }
         if let Some(r) = run {
-            be.draw_indexed(r, 0, inst);
+            be.draw_indexed(r, base, inst);
             n += 1;
         }
         n
@@ -3275,7 +3282,7 @@ impl Renderer3D {
                         reach = r.end;
                         continue;
                     }
-                    be.draw_indexed(r.clone(), 0, range.clone());
+                    be.draw_indexed(r.clone(), gm.base_vertex, range.clone());
                     n += 1;
                     gm.drawn[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     run = None;
@@ -3290,7 +3297,7 @@ impl Renderer3D {
                     bound = Some(&me.vb);
                 }
                 if me.strand_lod.is_some() {
-                    be.draw_indexed(first..first + cnt, 0, range.clone());
+                    be.draw_indexed(first..first + cnt, gm.base_vertex, range.clone());
                     n += 1;
                     gm.drawn[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 } else {
@@ -3299,7 +3306,7 @@ impl Renderer3D {
                 }
             }
             if let Some(r) = run {
-                be.draw_indexed(r, 0, range.clone());
+                be.draw_indexed(r, gm.base_vertex, range.clone());
                 n += 1;
                 gm.drawn[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -3369,7 +3376,7 @@ impl Renderer3D {
                         reach = r.end;
                         continue;
                     }
-                    be.draw_indexed(r.clone(), 0, range.clone());
+                    be.draw_indexed(r.clone(), gm.base_vertex, range.clone());
                     n += 1;
                     gm.drawn[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     run = None;
@@ -3396,7 +3403,7 @@ impl Renderer3D {
                     bound = Some(&me.vb);
                 }
                 if cut {
-                    be.draw_indexed(first..first + me.n_idx, 0, range.clone());
+                    be.draw_indexed(first..first + me.n_idx, gm.base_vertex, range.clone());
                     n += 1;
                     gm.drawn[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 } else {
@@ -3405,13 +3412,58 @@ impl Renderer3D {
                 }
             }
             if let Some(r) = run {
-                be.draw_indexed(r, 0, range.clone());
+                be.draw_indexed(r, gm.base_vertex, range.clone());
                 n += 1;
                 gm.drawn[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
         MESH_CULLED[2].fetch_add(culled, std::sync::atomic::Ordering::Relaxed);
         n
+    }
+
+    /// Move models out of the emptiest chunk of the material table's
+    /// geometry pool into fuller ones, a few MB per frame, so the chunk
+    /// empties and goes back to the device: models come and go as the map
+    /// streams, and the holes they leave would otherwise keep every chunk
+    /// alive. Runs on the thread that renders, before the frame.
+    pub fn compact<'a>(&self, rs: &egui_wgpu::RenderState, models: impl Iterator<Item = &'a mut GpuModel>) {
+        const BUDGET: u64 = 8 << 20;
+        let Some(g) = &self.gd else {
+            return;
+        };
+        let Some(from) = g.compact_from() else {
+            return;
+        };
+        let mut enc = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pool compact") });
+        let mut moved = 0u64;
+        for gm in models {
+            if moved >= BUDGET {
+                break;
+            }
+            let Some(h) = gm.gd.as_mut().filter(|h| h.gc == from) else {
+                continue;
+            };
+            let Some((dv, di)) = h.relocate(&mut enc) else {
+                break;
+            };
+            let buf = h.buf.clone();
+            gm.base_vertex = h.v_first() as i32;
+            let shift = |r: &std::ops::Range<u64>, d: i64| (r.start as i64 + d) as u64..(r.end as i64 + d) as u64;
+            for me in &mut gm.meshes {
+                me.vb = buf.clone();
+                me.ib = buf.clone();
+                // an empty mesh keeps its stand-in range at the start
+                if me.n_idx == 0 {
+                    continue;
+                }
+                me.vb_range = shift(&me.vb_range, dv);
+                me.ib_range = shift(&me.ib_range, di);
+                moved += me.vb_range.end - me.vb_range.start + me.ib_range.end - me.ib_range.start;
+            }
+        }
+        if moved > 0 {
+            rs.queue.submit([enc.finish()]);
+        }
     }
 
     /// The material table's part of the tick line (empty when it is off).
@@ -3465,8 +3517,8 @@ impl Renderer3D {
             return None;
         }
         let plan = self.shadow_plan(cam, look, aspect).filter(|_| !crate::gpu_draw::opt("noshadow"));
-        // (stencil, vertex, index, instance chunk)
-        type Key = (u32, usize, usize, usize);
+        // (stencil, geometry chunk, instance chunk)
+        type Key = (u32, usize, usize);
         let mut main: Vec<(Key, Args)> = Vec::new();
         let mut fb: Vec<(Key, Args)> = Vec::new();
         let mut shadow: [Vec<(Key, Args)>; CASCADES] = Default::default();
@@ -3502,7 +3554,7 @@ impl Renderer3D {
                 index_count: r.1,
                 instance_count: n,
                 first_index: r.0,
-                base_vertex: 0,
+                base_vertex: gm.base_vertex,
                 first_instance,
             };
             // main pass and fallbacks: every drawn mesh the view may show
@@ -3523,7 +3575,7 @@ impl Renderer3D {
                 }
                 let (list, stencil) = if pass == 0 { (&mut main, gm.stencil) } else { (&mut fb, 0) };
                 for r in &runs {
-                    list.push(((stencil, h.vc, h.ic, nc), args(r, n0 + range.start, range.end - range.start)));
+                    list.push(((stencil, h.gc, nc), args(r, n0 + range.start, range.end - range.start)));
                 }
             }
             // shadow casters: solid and cut-out meshes apart (a solid one
@@ -3554,10 +3606,10 @@ impl Renderer3D {
                         push_run(to, me.first(), me.n_idx);
                     }
                     for r in &runs {
-                        solid[i].push(((0, h.vc, h.ic, nc), args(r, n0, nn)));
+                        solid[i].push(((0, h.gc, nc), args(r, n0, nn)));
                     }
                     for r in &cuts {
-                        shadow[i].push(((0, h.vc, h.ic, nc), args(r, n0, nn)));
+                        shadow[i].push(((0, h.gc, nc), args(r, n0, nn)));
                     }
                 }
             }
@@ -3575,8 +3627,8 @@ impl Renderer3D {
                 let at = all.len() as u32;
                 all.push(a);
                 match out.last_mut() {
-                    Some(l) if (l.stencil, l.v, l.i, l.n) == k => l.args.end = at + 1,
-                    _ => out.push(GdList { stencil: k.0, v: k.1, i: k.2, n: k.3, args: at..at + 1 }),
+                    Some(l) if (l.stencil, l.g, l.n) == k => l.args.end = at + 1,
+                    _ => out.push(GdList { stencil: k.0, g: k.1, n: k.2, args: at..at + 1 }),
                 }
             }
             out
@@ -3627,27 +3679,26 @@ impl Renderer3D {
         be.set_bind_group(0, Some(frame_bg), &[]);
         be.set_bind_group(1, Some(bg), &[]);
         let mut n = 0;
-        let (mut sref, mut v, mut i, mut nb) = (u32::MAX, usize::MAX, usize::MAX, usize::MAX);
+        let (mut sref, mut gc, mut nb) = (u32::MAX, usize::MAX, usize::MAX);
         for l in lists {
-            let (Some(Some(vb)), Some(Some(ib)), Some(Some(inb))) = (f.snap.v.get(l.v), f.snap.i.get(l.i), f.snap.n.get(l.n)) else {
+            let (Some(Some(gb)), Some(Some(inb))) = (f.snap.g.get(l.g), f.snap.n.get(l.n)) else {
                 continue;
             };
             if stencil && l.stencil != sref {
                 be.set_stencil_reference(l.stencil);
                 sref = l.stencil;
             }
-            if l.v != v {
-                be.set_vertex_buffer(0, Some(vb.slice(..)));
-                v = l.v;
+            // one buffer holds the chunk's vertices and indices
+            if l.g != gc {
+                be.set_vertex_buffer(0, Some(gb.slice(..)));
+                be.set_index_buffer(gb.slice(..), wgpu::IndexFormat::Uint32);
+                gc = l.g;
             }
             if l.n != nb {
                 be.set_vertex_buffer(1, Some(inb.slice(..)));
                 nb = l.n;
             }
-            if l.i != i {
-                be.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                i = l.i;
-            }
+
             if crate::gpu_draw::opt("nomulti") {
                 for k in l.args.clone() {
                     be.draw_indexed_indirect(args, k as u64 * crate::gpu_draw::ARGS);
