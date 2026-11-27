@@ -474,7 +474,7 @@ pub fn export_vehicle<'x>(a: &ArchiveInfo, ix: &'x ArchiveIndex, vehicle: &Value
     // wheels: rim and tyre on every wheel bone
     let mut wheel_report = Value::Null;
     // boats get no wheels, whatever bones they have (vehicle types 9 and 10)
-    let boat = matches!(vehicle["model_info"]["type"]["tag"].as_u64(), Some(9) | Some(10));
+    let boat = { let t = &vehicle["model_info"]["type"]; matches!(t.as_u64().or_else(|| t["tag"].as_u64()), Some(9) | Some(10)) };
     if boat {
         wheel_report = json!({"wheels": 0, "note": "a boat (vehicle type 9 or 10): no wheels are fitted"});
     }

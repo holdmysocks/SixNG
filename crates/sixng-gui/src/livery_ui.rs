@@ -2,7 +2,8 @@
 //! vehicle by hand (see `livery`). A list of placed stickers; for the
 //! chosen one its picture, the zones it lies on (clicked on the model or
 //! ticked in a list), position, size, rotation and colours; a picker for
-//! the game's sticker textures; save and load per vehicle.
+//! the game's sticker textures; save and load per vehicle. The game's own
+//! liveries of the vehicle (its brands) can be put on as they are.
 
 use crate::glb;
 use crate::livery::{self, Picture, State, Sticker, MAX_IMAGES, MAX_STICKERS};
@@ -54,6 +55,9 @@ struct ThumbJob {
 
 type ThumbDone = (String, Result<(Vec<u8>, [usize; 2], [u32; 2]), String>);
 
+/// The game's liveries: vehicle name hash (8 hex digits) -> its brands.
+type Brands = std::collections::BTreeMap<String, Vec<serde_json::Value>>;
+
 /// Where the game, the work folder and the viewer's cache are.
 pub struct Env<'a> {
     pub game: &'a str,
@@ -101,6 +105,11 @@ pub struct Editor {
     pub auto_drag: Option<[f32; 2]>,
     /// `--livery-save`: save once the scripted steps are done.
     pub auto_save: bool,
+    /// `--livery-brand NAME`: put on the vehicle's game livery of this name
+    /// (or name hash, or number in the list) first.
+    pub auto_brand: Option<String>,
+    brands: Arc<Mutex<Option<Result<Arc<Brands>, String>>>>,
+    brands_started: bool,
 }
 
 impl Default for Editor {
@@ -133,6 +142,9 @@ impl Default for Editor {
             auto_click: Vec::new(),
             auto_drag: None,
             auto_save: false,
+            auto_brand: None,
+            brands: Default::default(),
+            brands_started: false,
         }
     }
 }
@@ -165,6 +177,56 @@ fn read_list(game: &str, work: &str, cache: &Path) -> Result<Vec<GameSticker>, S
     let _ = std::fs::create_dir_all(cache);
     let _ = sixng_core::atomic::write(&file, serde_json::to_vec(&list).unwrap_or_default());
     Ok(list)
+}
+
+/// The game's liveries of every vehicle, from the viewer's cache or (once)
+/// from the game files.
+fn read_brands(game: &str, work: &str, cache: &Path) -> Result<Brands, String> {
+    let file = cache.join("vehicle_liveries_f3.json");
+    if let Some(b) = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<Brands>(&b).ok()) {
+        return Ok(b);
+    }
+    let ws = sixng_core::export::Workspace::new(game, work);
+    let (b, _) = sixng_core::vehstickers::liveries(&ws, &HashMap::new()).map_err(|e| format!("{e:#}"))?;
+    let _ = std::fs::create_dir_all(cache);
+    let _ = sixng_core::atomic::write(&file, serde_json::to_vec(&b).unwrap_or_default());
+    Ok(b)
+}
+
+/// The brands of a vehicle (`vehicle_key`): looked up by its model name's
+/// hash, without a `_hi` ending.
+fn brands_of<'b>(all: &'b Brands, vehicle: &str) -> &'b [serde_json::Value] {
+    let base = vehicle.strip_suffix("_hi").unwrap_or(vehicle);
+    [vehicle, base].iter().find_map(|n| all.get(&format!("{:08x}", sixng_core::meta7a::joaat(n)))).map_or(&[], |v| v.as_slice())
+}
+
+/// A brand's stickers as placements with the game's own transform. The
+/// layout's UV mode k (1..4) picks the mesh's UV set k - 1, as the paint
+/// shader does.
+fn brand_stickers(brand: &serde_json::Value) -> Vec<Sticker> {
+    let title = brand["name"].as_str().or(brand["brand"].as_str()).unwrap_or("").to_string();
+    brand["stickers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let texture = e["texture"].as_str().filter(|t| sixng_core::vehstickers::parse_texture_id(t).is_some_and(|id| id != 0))?;
+            let uv: Vec<f32> = e["uv"].as_array()?.iter().filter_map(|x| x.as_f64().map(|x| x as f32)).collect();
+            let l = &e["layout"];
+            let mut s = Sticker::new(Picture::Game(texture.to_string()));
+            s.name = format!("{title} {}", e["sticker"].as_str().unwrap_or(""));
+            s.zones = l["zones"].as_array()?.iter().filter_map(|z| z.as_u64().map(|z| z as u8)).collect();
+            s.uv_set = l["uv_mode"].as_u64().unwrap_or(1).clamp(1, 4) as u8 - 1;
+            s.mask = e["mask"].as_bool().unwrap_or(false);
+            if let Some(c) = e["colours"].as_array().filter(|c| c.len() == 3) {
+                s.colours = std::array::from_fn(|k| argb(c[k].as_str().unwrap_or("ffffffff")));
+            }
+            s.game_uv = Some(<[f32; 6]>::try_from(uv).ok()?);
+            s.fresh = false;
+            Some(s)
+        })
+        .take(MAX_STICKERS)
+        .collect()
 }
 
 /// A picture as it will look on the vehicle, over a dark checker: a colour
@@ -209,7 +271,25 @@ impl Editor {
 
     /// Scripted steps are still to run.
     fn scripting(&self) -> bool {
-        self.auto_select.is_some() || !self.auto_add.is_empty() || !self.auto_click.is_empty() || self.auto_drag.is_some() || self.auto_save
+        self.auto_select.is_some() || !self.auto_add.is_empty() || !self.auto_click.is_empty() || self.auto_drag.is_some() || self.auto_save || self.auto_brand.is_some()
+    }
+
+    fn start_brands(&mut self, env: &Env, ctx: &egui::Context) {
+        if self.brands_started {
+            return;
+        }
+        self.brands_started = true;
+        let (game, work, cache, slot, ctx) = (env.game.to_string(), env.work.to_string(), env.cache.to_path_buf(), self.brands.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let r = read_brands(&game, &work, &cache).map(Arc::new);
+            *slot.lock().unwrap() = Some(r);
+            ctx.request_repaint();
+        });
+    }
+
+    /// The game's liveries once read (None while reading).
+    fn brands(&self) -> Option<Result<Arc<Brands>, String>> {
+        self.brands.lock().ok().and_then(|b| b.clone())
     }
 
     fn start_list(&mut self, env: &Env, ctx: &egui::Context) {
@@ -340,6 +420,32 @@ impl State {
         self.changed();
     }
 
+    /// Put on one of the game's liveries: its stickers replace the placed
+    /// ones (saved only when you save).
+    fn put_on_brand(&mut self, brand: &serde_json::Value) {
+        let mut s = brand_stickers(brand);
+        // A layout names zones only; they may lie on a fitted part (a truck
+        // box), so each sticker goes on the model holding most of them.
+        // Zones 0, 63 and 255 are on nearly every model and do not count.
+        for st in &mut s {
+            let mut best: Option<(usize, usize)> = None;
+            for slot in 0..self.zones.models.len() {
+                let n = st.zones.iter().filter(|z| !matches!(**z, 0 | 63 | 255) && self.zones.zones.contains_key(&(slot as u8, **z))).count();
+                if n > 0 && best.map_or(true, |(_, b)| n > b) {
+                    best = Some((slot, n));
+                }
+            }
+            if let Some(m) = best.and_then(|(slot, _)| self.zones.models.get(slot)) {
+                st.model = m.clone();
+            }
+        }
+        self.status = format!("{}: {} stickers placed by the game's layouts", brand["name"].as_str().or(brand["brand"].as_str()).unwrap_or("livery"), s.len());
+        self.livery.stickers = s;
+        self.ed.selected = None;
+        self.ed.tool = Tool::None;
+        self.changed();
+    }
+
     /// Add the zone to sticker `i`, or take it off. A zone of another model
     /// moves the sticker to that model.
     fn toggle_zone(&mut self, i: usize, slot: u8, zone: u8, env: &Env) {
@@ -414,6 +520,33 @@ impl State {
                     self.add(Picture::File(p), name, false, None, env);
                 }
             }
+            let menu = ui.menu_button("Game livery", |ui| {
+                self.ed.start_brands(env, ui.ctx());
+                match self.ed.brands() {
+                    None => {
+                        ui.label("Reading the game's liveries (once, about a minute)…");
+                    }
+                    Some(Err(e)) => {
+                        ui.colored_label(egui::Color32::from_rgb(230, 90, 70), e);
+                    }
+                    Some(Ok(all)) => {
+                        let list = brands_of(&all, &self.vehicle);
+                        if list.is_empty() {
+                            ui.label("The game has no livery for this vehicle.");
+                        }
+                        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                            for b in list {
+                                let n = b["stickers"].as_array().map_or(0, |s| s.len());
+                                if ui.button(format!("{} ({n})", b["name"].as_str().or(b["brand"].as_str()).unwrap_or("?"))).clicked() {
+                                    self.put_on_brand(b);
+                                    ui.close();
+                                }
+                            }
+                        });
+                    }
+                }
+            });
+            menu.response.on_hover_text("Put on one of the game's own liveries of this vehicle (its brands): their stickers replace the placed ones, where the game's layouts put them");
         });
         ui.horizontal_wrapped(|ui| {
             let unsaved = self.unsaved();
@@ -597,6 +730,22 @@ impl State {
             });
         });
         ui.separator();
+        // a sticker of the game's livery keeps the game's placement until
+        // it is placed by hand
+        if self.livery.stickers[i].game_uv.is_some() {
+            if matches!(self.ed.tool, Tool::Move | Tool::Zones) {
+                self.ed.tool = Tool::None;
+            }
+            ui.label(egui::RichText::new("Placed by the game's livery layout").strong()).on_hover_text("The game's own transform: the layout's position, rotation about the middle and size, on the layout's panels. The game also scales and turns each sticker by a random amount per vehicle; the middle of those ranges is used.");
+            if ui.button("Place by hand").on_hover_text("Move, size and turn this sticker yourself from here on (it starts in the middle of its panels)").clicked() {
+                let s = &mut self.livery.stickers[i];
+                s.game_uv = None;
+                // hand placing measures the zones in the first two UV sets
+                s.uv_set = s.uv_set.min(1);
+                self.fit(i, env);
+            }
+            return;
+        }
         // where
         ui.label(egui::RichText::new("Panels").strong());
         ui.horizontal_wrapped(|ui| {
@@ -664,7 +813,7 @@ impl State {
             ui.label("UV set");
             let s = &mut self.livery.stickers[i];
             ui.selectable_value(&mut s.uv_set, 0, "first");
-            ui.selectable_value(&mut s.uv_set, 1, "second").on_hover_text("The game places most of its stickers in the second UV set: on box walls it is a flat unwrap at one scale.");
+            ui.selectable_value(&mut s.uv_set, 1, "second").on_hover_text("On box walls the second UV set is a flat unwrap at one scale. (The game's own layouts mostly use the third set, which only their placements read.)");
         });
         ui.separator();
         // placement
@@ -884,6 +1033,25 @@ impl State {
     pub fn pointer(&mut self, ui: &egui::Ui, resp: &egui::Response, rect: egui::Rect, cam: &Camera, model: &glb::Model, env: &Env) -> bool {
         // scripted steps (checks without a mouse), one per frame
         if self.ed.busy() && (!self.ed.ready || self.zones.models.is_empty()) {
+            return false;
+        }
+        if self.ed.auto_brand.is_some() {
+            self.ed.start_brands(env, ui.ctx());
+            let Some(all) = self.ed.brands() else { return false };
+            let want = self.ed.auto_brand.take().unwrap_or_default();
+            let all = match all {
+                Ok(a) => a,
+                Err(e) => {
+                    self.status = format!("game liveries not read: {e}");
+                    return false;
+                }
+            };
+            let list = brands_of(&all, &self.vehicle).to_vec();
+            let hit = list.iter().find(|b| b["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(&want)) || b["brand"].as_str() == Some(want.as_str())).or_else(|| want.parse::<usize>().ok().and_then(|k| list.get(k)));
+            match hit {
+                Some(b) => self.put_on_brand(&b.clone()),
+                None => self.status = format!("no game livery {want} for {}", self.vehicle),
+            }
             return false;
         }
         if let Some(k) = self.ed.auto_select.take() {

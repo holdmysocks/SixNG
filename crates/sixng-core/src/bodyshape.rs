@@ -442,7 +442,9 @@ pub const CONTROLS: &[(&str, u32, Option<u32>)] = &[
     ("gcbellyround", 0xa1aede2a, None),
     ("gchipwidth", 0x6c83d62b, None),
     ("gchipheight", 0xa64a2b22, Some(0xee16a69c)),
-    ("gcheadscale", 0x9c978205, None),
+    // negative side 5ebebbe7: set by no preset item; at 1 the rig scales
+    // the head to 0.01, the mirror of 9c978205 (2.0 at 1)
+    ("gcheadscale", 0x9c978205, Some(0x5ebebbe7)),
     ("gcmusclebiceps", 0xc0fd5915, None),
     ("gcmuscletriceps", 0xa981e727, None),
 ];
@@ -450,7 +452,7 @@ pub const CONTROLS: &[(&str, u32, Option<u32>)] = &[
 /// Parse "gcweightbelly=1,gcmusclechest=0.5" into control values. Names are
 /// case-insensitive; `allweight=v` / `allmuscle=v` set every weight / muscle
 /// control. Values are clamped to -1..1, or 0..1 for controls with no input
-/// for negative values (muscle, butt, belly roundness, hip width, head scale).
+/// for negative values (muscle, butt, belly roundness, hip width).
 pub fn parse_spec(spec: &str) -> Result<Vec<(String, f32)>, String> {
     let mut out: Vec<(String, f32)> = Vec::new();
     for kv in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -1008,6 +1010,9 @@ mod tests {
         assert_eq!(m.get(&0xf9dc7b4c), Some(&0.5));
         assert_eq!(m.get(&0x6c83d62b), Some(&0.9));
         assert!(!m.contains_key(&0x9c978205) || m[&0x9c978205] == 0.0);
+        assert_eq!(m.get(&0x5ebebbe7), Some(&1.0));
+        let m = input_values(&parse_spec("gcmusclebiceps=-1").unwrap());
+        assert!(!m.contains_key(&0xc0fd5915) || m[&0xc0fd5915] == 0.0);
     }
 
     #[test]
