@@ -3678,7 +3678,10 @@ impl ModelView {
             return false;
         }
         let cache = self.cache_dir();
-        self.livery.ed.ready = !self.loading && self.idle_for_model() && self.frames_since_load >= 3;
+        // (and once the wheels shown are in: a tyre takes stickers too)
+        let want_wheels = self.wheels_on && !self.veh_no_wheels && !self.mounts().is_empty();
+        let wheels_in = !want_wheels || (!self.wheel_loading && !self.wheel_src.is_empty() && self.wheels.len() == self.wheel_src.len() && self.wheel_key == format!("{}|{}", self.wheel_rim, self.wheel_tyre));
+        self.livery.ed.ready = !self.loading && wheels_in && self.idle_for_model() && self.frames_since_load >= 3;
         // clicks land on the vehicle as it is drawn: doors open, a roof down
         let skin = if self.livery.ed.open { self.joint_mats().1 } else { Vec::new() };
         let Some(l) = &self.loaded else { return false };
@@ -3696,7 +3699,15 @@ impl ModelView {
         let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
         let parts: Vec<String> = l.info["assembled_from"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
         let key = crate::livery::vehicle_key(&crate::vehicle_db::model_key(&l.source));
-        self.livery.sync(rs, ren, g, &l.model, &key, &parts, Path::new(&self.game), Path::new(&self.work), &cache);
+        // the fitted rim and tyre, drawn apart from the vehicle: a tyre's
+        // sidewall takes stickers too (the names in the order they load)
+        let names: Vec<String> = self.wheel_key.split('|').filter(|n| !n.is_empty()).map(str::to_string).collect();
+        let mut wheels: Vec<(&glb::Model, String, &mut GpuModel)> = if self.wheels.len() == self.wheel_src.len() && names.len() == self.wheel_src.len() && self.wheels_on && !self.veh_no_wheels {
+            self.wheel_src.iter().zip(names).zip(self.wheels.iter_mut()).map(|((s, n), g)| (&s.model, n, g)).collect()
+        } else {
+            Vec::new()
+        };
+        self.livery.sync(rs, ren, g, &l.model, &key, &parts, &mut wheels, Path::new(&self.game), Path::new(&self.work), &cache);
     }
 
     fn update_wheels(&mut self, rs: &egui_wgpu::RenderState, ctx: &egui::Context) {
