@@ -986,7 +986,7 @@ const COAT_STRANDS: usize = 90_000;
 
 /// Parameter set (fibre widths, roughness, translucency) per hair slot for a piece whose hair asset
 /// is not known (each asset names its own, `hairsets`): the sets one character's assets name.
-const DEFAULT_PARAMSETS: [(&str, &str); 3] = [("hair", "Long_HighGloss_000"), ("brows", "Eyebrows_MidGloss_000"), ("lashes", "Eyelashes_HighGloss_002")];
+use sixng_core::hairexport::DEFAULT_PARAMSETS;
 /// Skin samples: position (RAGE model space) and linear colour.
 pub type SkinColours = Arc<Vec<([f32; 3], [u8; 3])>>;
 
