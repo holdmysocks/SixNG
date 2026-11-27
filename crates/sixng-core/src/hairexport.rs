@@ -451,7 +451,7 @@ mod tests {
         let head = HeadUvs { name: "h".into(), pos: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], sets: vec![vec![[0.9, 0.9], [0.1, 0.5], [0.5, 0.1]], vec![[0.2, 0.3], [0.4, 0.3], [0.2, 0.6]]] };
         // guide roots in RAGE space: glTF (x, y, z) is RAGE (x, -z, y)
         let pts = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.1], [1.0, 0.0, 0.0], [1.0, 0.0, 0.1], [0.0, 0.0, 1.0], [0.0, 0.0, 1.1]];
-        let g = Groom { tint_weight: 1.0, strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![[0.2, 0.3], [0.4, 0.3], [0.2, 0.6]], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0003, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![], twist: vec![], curl: Default::default() };
+        let g = Groom { tint_weight: 1.0, strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![[0.2, 0.3], [0.4, 0.3], [0.2, 0.6]], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![], width: 0.0003, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![], twist: vec![], curl: Default::default(), sim: None };
         assert_eq!(root_uv_set(&g, &head), Some((1, 0.0)));
         // no set close enough
         let far = Groom { root_uv: vec![[0.7, 0.7]; 3], ..g.clone() };
@@ -470,7 +470,7 @@ mod tests {
     #[test]
     fn piece_writes_grown_strands_with_their_attributes() {
         let pts = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.1], [1.0, 0.0, 0.0], [1.0, 0.0, 0.1], [0.0, 1.0, 0.0], [0.0, 1.0, 0.1]];
-        let g = Groom { tint_weight: 1.0, strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![[40, 10, 2, 0]], width: 0.0003, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![], twist: vec![], curl: Default::default() };
+        let g = Groom { tint_weight: 1.0, strands: 3, points_per_strand: 2, points: pts, w: vec![0.0; 6], roots: vec![[0, 1, 2]], lengths: vec![], root_uv: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None, tri_counts: vec![[40, 10, 2, 0]], width: 0.0003, taper: [255; 16], pick_steps: vec![], seed: 0, length_var: [0.0, 1.0], head: vec![], corners: vec![], clump_scale: [1.0; 2], styles: vec![], clump_type: 0, guide_tri: vec![], twist: vec![], curl: Default::default(), sim: None };
         let (p, s) = piece(&g, "t", &Options { points: 3, ..Default::default() }, None, None, json!({}));
         assert_eq!(p.len(), 2);
         assert_eq!((s["written"].as_u64(), s["guides"].as_u64()), (Some(50), Some(3)));

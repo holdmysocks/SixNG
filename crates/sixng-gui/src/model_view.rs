@@ -1483,6 +1483,13 @@ impl ModelView {
                 let mut drawn = 0;
                 let mut out = Vec::new();
                 for (off, mut g) in grooms {
+                    // the guides as the game's strand simulation settles them on a still character (gravity,
+                    // rest lengths, the pull back to the stored shape, the body's colliders); research:
+                    // SIXNG_HAIR_NO_SIM=1 keeps the stored guides
+                    if coat_on && std::env::var_os("SIXNG_HAIR_NO_SIM").is_none() {
+                        let settled = g.settle(collide.as_deref());
+                        if std::env::var("SIXNG_DEBUG_HAIR").is_ok() { eprintln!("coat {off:x}: settled {settled}"); }
+                    }
                     // scalp hair stays under the hat (3 mm inside its lining)
                     if let Some(h) = hat.as_ref().filter(|_| under_hat.contains(&off)) {
                         h.press_strands(&mut g.points, g.points_per_strand, 0.003);
