@@ -769,7 +769,7 @@ pub fn map_file(r: &Resource, names: &HashMap<u32, (String, String)>) -> Option<
                 flags: r.u32(o + 0x48),
                 hash64: format!("{:016x}", r.u64(o + 8)),
                 guid: format!("{:016x}", r.u64(o + 0x20)),
-                tint_row: fields.get("3c852527").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                tint_row: fields.get(&field_name(0x3c85_2527)).or_else(|| fields.get("3c852527")).and_then(|v| v.as_u64()).unwrap_or(0) as u32,
                 lod: entity_lod(&fields),
                 fields,
             }
