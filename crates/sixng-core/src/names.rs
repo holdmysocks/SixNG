@@ -168,6 +168,10 @@ pub const DERIVED: &[&str] = &[
     // words split from the shader programs' entry-point names added to the search vocabulary (2026-11-27):
     // standard_flipbook's five consecutive constants, and a side-by-side pair in 55 prop batch shaders
     "flipbookrows", "flipbookcols", "flipbookcount", "flipbookfreq", "flipbookphase", "regiontintamount", "regiontintintensity",
+    // constants the exporters read (2026-11-28): the uber shaders' per-layer UV transforms (uv0scalebias, uv1scalebias,
+    // uvset, side by side), and the two-layer prop blend mask: its texture (controltexturetex), UV pick (controluvset)
+    // and channel weights (controlfilter), adjacent in the same 60 effects
+    "uv0scalebias", "uv1scalebias", "uvset", "controltexturetex", "controluvset", "controlfilter",
     // water_micro_geom (the inland water tiles): meet-in-the-middle joaat search over water and shader words (2026-11-27),
     // about 16 random hits expected over 45 hashes; kept only names that fit the value or a sibling. The three use* flags
     // are integer 1 on every tile and 0 on the 6 tiles whose flow, height and surface map textures are 4 x 4 placeholders;
