@@ -134,8 +134,9 @@ pub mod watch {
 /// pools) and `nopool` (textures go to the arrays, geometry stays in its
 /// own buffers and is drawn the old way), `shadowold` (the table's models
 /// cast their shadows the old way), `vsfull` (each program loads the
-/// whole material row, as before) and `shadowfull` (shadow casters with
-/// the full mesh vertex program, not the short one).
+/// whole material row, as before), `shadowfull` (shadow casters with the
+/// full mesh vertex program, not the short one) and `nolate` (the table's
+/// models' decals and see-through surfaces drawn the old way).
 pub fn opt(name: &str) -> bool {
     static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     V.get_or_init(|| std::env::var("SIXNG_MAP_GPU_TABLE").unwrap_or_default()).split(',').any(|s| s.trim() == name)
@@ -1085,6 +1086,10 @@ fn shader_with(common: &str, src: &str, full: bool) -> Option<String> {
         && rep(
             "fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {",
             "fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {\n    bl_set(i.mid);",
+        )
+        && rep(
+            "fn fs_mesh_blend(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {",
+            "fn fs_mesh_blend(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {\n    bl_set(i.mid);",
         )
         && rep(
             "fn fs_shadow(i: VOut) {",
