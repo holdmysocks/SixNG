@@ -662,6 +662,12 @@ const BODY_BREASTS: usize = 25;
 /// shown under "Shape details".
 const BODY_DETAILS: usize = 26;
 
+/// A body shape as `--body-shape` takes it: every control, `name=value`,
+/// comma separated.
+pub(crate) fn body_shape_spec(shape: &BodyShape) -> String {
+    sixng_core::bodyshape::CONTROLS.iter().zip(shape).map(|(c, v)| format!("{}={v}", c.0)).collect::<Vec<_>>().join(",")
+}
+
 /// Slider label of a shape control (`gcbreastheight` -> `breast height`).
 fn detail_label(name: &str) -> String {
     let n = name.trim_start_matches("gc").trim_start_matches('_');
@@ -2123,6 +2129,55 @@ impl ModelView {
                 )
                 .collect(),
         )
+    }
+
+    /// The outfit-list state of the character `id` (`<archive>#outfit:<prefix>`),
+    /// when the viewer shows it.
+    fn look_of(&self, id: &str) -> Option<&LookInfo> {
+        self.loaded.as_ref().filter(|l| l.base.split("#look=").next() == Some(id)).and_then(|l| l.look.as_ref())
+    }
+
+    /// Whether the viewer shows the character `id` with its outfit list.
+    pub fn shows_look_of(&self, id: &str) -> bool {
+        self.look_of(id).is_some()
+    }
+
+    /// The export of a character (`<archive>#outfit:<prefix>`) as the viewer
+    /// shows it: `sixng outfit`, one rigged GLB under `<out_root>/characters`.
+    /// The outfit is the one picked in the Character panel when the viewer
+    /// shows this character, else the first of the game's outfit list (the
+    /// viewer's default too). The body shape is the panel's when the viewer
+    /// shows it, else the outfit's own preset (the export's default). A
+    /// character the game lists no outfit for exports its own default parts.
+    /// Returns the file name and the job arguments.
+    pub(crate) fn outfit_export(&self, id: &str, out_root: &str) -> Option<(String, Vec<String>)> {
+        let (archive, prefix) = id.split_once("#outfit:")?;
+        let prefix = prefix.split('#').next().unwrap_or(prefix);
+        let shown = self.look_of(id);
+        let look = match shown {
+            Some(li) => Some(li.current),
+            None => {
+                let ws = Workspace::new(&self.game, &self.work);
+                index_for(&ws, archive, &self.indexes)
+                    .ok()
+                    .and_then(|(a, ix)| sixng_core::pedlook::look(&ws.game, &a, &ix, prefix).ok())
+                    .filter(|l| !l.outfits.is_empty())
+                    .map(|_| 0)
+            }
+        };
+        let file = match look {
+            Some(k) => format!("{prefix}_outfit{}.glb", k + 1),
+            None => format!("{prefix}.glb"),
+        };
+        let out = Path::new(out_root).join("characters").join(&file);
+        let mut args: Vec<String> = vec!["outfit".into(), prefix.into(), "--archive".into(), archive.into(), "-o".into(), out.display().to_string(), "--tex".into(), "both".into()];
+        if let Some(k) = look {
+            args.extend(["--look".into(), k.to_string()]);
+        }
+        if shown.is_some() {
+            args.extend(["--body-shape".into(), body_shape_spec(&self.body_shape_shown)]);
+        }
+        Some((file, args))
     }
 
     /// Character panel: the outfit of the game's outfit list, the body shape
@@ -10002,6 +10057,21 @@ fn srgb32(c: [f32; 3]) -> egui::Color32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_viewer_body_shape_reaches_the_export_whole() {
+        let mut shape = super::NEUTRAL_BODY;
+        shape[1] = 0.8;
+        shape[super::BODY_BUTT] = 0.25;
+        shape[shape.len() - 1] = 0.5;
+        shape[0] = -0.5;
+        let spec = super::body_shape_spec(&shape);
+        let parsed = sixng_core::bodyshape::parse_spec(&spec).unwrap();
+        assert_eq!(parsed.len(), shape.len());
+        for ((name, v), (c, want)) in parsed.iter().zip(sixng_core::bodyshape::CONTROLS.iter().zip(shape)) {
+            assert_eq!((name.as_str(), *v), (c.0, want));
+        }
+    }
+
     #[test]
     fn a_tint_data_map_is_told_from_a_colour_map() {
         use super::packed_tint_map;
