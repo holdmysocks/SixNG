@@ -3532,6 +3532,10 @@ impl Renderer3D {
         };
         let mut runs: Vec<(u32, u32)> = Vec::new();
         let mut cuts: Vec<(u32, u32)> = Vec::new();
+        // timing switches: cut-out casters drawn as solid ones (no alpha
+        // test), shadow sub-draws kept in model order (not grouped by chunk)
+        let nocut = crate::gpu_draw::opt("shadownocut");
+        let model_order = crate::gpu_draw::opt("shadowmodel");
         for &gm in models {
             let Some(h) = gm.gd.as_ref().filter(|h| snap.ready(h)) else {
                 rest.push(gm);
@@ -3602,7 +3606,7 @@ impl Renderer3D {
                                 continue;
                             }
                         }
-                        let to = if kind(me) == 1 { &mut cuts } else { &mut runs };
+                        let to = if kind(me) == 1 && !nocut { &mut cuts } else { &mut runs };
                         push_run(to, me.first(), me.n_idx);
                     }
                     for r in &runs {
@@ -3620,8 +3624,10 @@ impl Renderer3D {
         // per pass: the sub-draws of one set of chunks one after another (a
         // stable sort keeps the models' order inside each)
         let mut all: Vec<Args> = Vec::new();
-        let mut lists = |v: &mut Vec<(Key, Args)>| -> Vec<GdList> {
-            v.sort_by_key(|(k, _)| *k);
+        let mut lists = |v: &mut Vec<(Key, Args)>, sort: bool| -> Vec<GdList> {
+            if sort {
+                v.sort_by_key(|(k, _)| *k);
+            }
             let mut out: Vec<GdList> = Vec::new();
             for (k, a) in v.drain(..) {
                 let at = all.len() as u32;
@@ -3633,10 +3639,10 @@ impl Renderer3D {
             }
             out
         };
-        let main = lists(&mut main);
-        let fb = lists(&mut fb);
-        let shadow: [Vec<GdList>; CASCADES] = std::array::from_fn(|i| lists(&mut shadow[i]));
-        let shadow_solid: [Vec<GdList>; CASCADES] = std::array::from_fn(|i| lists(&mut solid[i]));
+        let main = lists(&mut main, true);
+        let fb = lists(&mut fb, true);
+        let shadow: [Vec<GdList>; CASCADES] = std::array::from_fn(|i| lists(&mut shadow[i], !model_order));
+        let shadow_solid: [Vec<GdList>; CASCADES] = std::array::from_fn(|i| lists(&mut solid[i], !model_order));
         drop(lists);
         let calls = main.len() + fb.len() + shadow.iter().chain(&shadow_solid).map(|s| s.len()).sum::<usize>();
         self.gd_stats = [all.len() as u32, calls as u32, rest.len() as u32, on.len() as u32];
