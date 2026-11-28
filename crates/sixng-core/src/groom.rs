@@ -346,14 +346,27 @@ impl Colliders {
 
     /// The point pushed out of the body bound's shapes and boxes onto their
     /// surface (unchanged outside them, or with only surface points).
-    pub fn push_out(&self, mut p: [f32; 3]) -> [f32; 3] {
+    pub fn push_out(&self, p: [f32; 3]) -> [f32; 3] {
+        self.push_out_to(p, 0.0)
+    }
+
+    /// Distance from `p` to the nearest shape or box surface (negative
+    /// inside; `f32::MAX` with only surface points).
+    pub fn dist(&self, p: [f32; 3]) -> f32 {
+        self.shapes.iter().map(|t| t.dist(p)).chain(self.boxes.iter().map(|b| b.dist(p))).fold(f32::MAX, f32::min)
+    }
+
+    /// `push_out`, but only until the point is `floor` (<= 0) from the
+    /// surface: a point may stay that deep inside.
+    pub fn push_out_to(&self, mut p: [f32; 3], floor: f32) -> [f32; 3] {
         if self.shapes.is_empty() && self.boxes.is_empty() {
             return p;
         }
-        let dist = |q: [f32; 3]| self.shapes.iter().map(|t| t.dist(q)).chain(self.boxes.iter().map(|b| b.dist(q))).fold(f32::MAX, f32::min);
+        let floor = floor.min(0.0);
+        let dist = |q: [f32; 3]| self.dist(q);
         // a few rounds: a point pushed out of one shape can end in another
         for _ in 0..4 {
-            let d = dist(p);
+            let d = dist(p) - floor;
             if d >= 0.0 {
                 break;
             }
@@ -994,7 +1007,8 @@ impl Groom {
     /// most; read from its programs by the shader archive work): each guide
     /// hangs from its root under gravity, held to its rest lengths, bent
     /// back toward its stored segment angles and pulled back toward its
-    /// stored shape, and is pushed out of the body's colliders. The stored
+    /// stored shape, and is pushed out of the body's colliders (no further
+    /// than the depth its stored point has in them: viewer rule). The stored
     /// guides stand in for the game's poses A and B (the guides skinned to
     /// the current pose); the viewer draws the bind pose, so they are the
     /// same.
@@ -1065,8 +1079,15 @@ impl Groom {
             let l = len(a);
             if l > 1.0e-9 { scale(a, 1.0 / l) } else { or }
         };
-        let out = |p: [f32; 3]| colliders.map_or(p, |c| c.push_out(p));
         let pose = self.points.clone();
+        // A point is pushed out of the colliders only as far as where the
+        // groom stores it: the stored guides are the look the hair is made
+        // for. Scalp hair rests on the body bound's head capsule (median
+        // 0.9 mm inside it over the 843 simulated scalp grooms), but face
+        // pieces (sideburns, flyaways, beards) rest well inside it (median
+        // 19 mm over 1,343), so pushing them onto it lifts them off the skin.
+        let rest: Vec<f32> = colliders.map_or_else(Vec::new, |c| pose.iter().map(|p| c.dist(*p).min(0.0)).collect());
+        let out = |i: usize, p: [f32; 3]| colliders.map_or(p, |c| c.push_out_to(p, rest[i]));
         for s in 0..self.strands {
             let at = s * k;
             let b = &pose[at..at + k];
@@ -1083,7 +1104,7 @@ impl Groom {
             let mut x = b.to_vec();
             for j in 1..k {
                 let dir = unit(add(sub(b[j], b[j - 1]), scale(G, c(j) * a(j))), [0.0, 0.0, -1.0]);
-                x[j] = out(add(x[j - 1], scale(dir, l(j))));
+                x[j] = out(at + j, add(x[j - 1], scale(dir, l(j))));
             }
             let mut v = vec![[0.0f32; 3]; k];
             // the root's entry is the whole strand: the look-ahead fades as the remaining length runs out
@@ -1094,7 +1115,7 @@ impl Groom {
                     v[j] = scale(add(v[j], scale(G, DT * 0.5)), damp);
                     let p = add(start[j], scale(v[j], DT));
                     let p = add(p, scale(sub(b[j], p), f(j, len(sub(p, b[j])))));
-                    x[j] = out(p);
+                    x[j] = out(at + j, p);
                 }
                 let mut remaining = total;
                 for j in 1..k {
@@ -2065,6 +2086,25 @@ mod tests {
         let p = c.push_out([0.05, 0.0, 0.0]);
         assert!((p[0] - 0.1).abs() < 1.0e-3 && p[1].abs() < 1.0e-3 && p[2].abs() < 1.0e-3, "{p:?}");
         assert_eq!(c.push_out([0.2, 0.0, 0.0]), [0.2, 0.0, 0.0]);
+        // with a floor, only to that depth
+        let p = c.push_out_to([0.02, 0.0, 0.0], -0.03);
+        assert!((p[0] - 0.07).abs() < 1.0e-3, "{p:?}");
+    }
+
+    #[test]
+    fn a_guide_stored_inside_a_collider_stays_where_it_is_stored() {
+        // a stiff guide lying through a sphere (as a sideburn lies inside the head capsule)
+        let mut g = hanging(6, 0.001, 0.0, false);
+        let c = Colliders::shapes(vec![Taper { a: [0.05, 0.0, -0.03], b: [0.05, 0.0, -0.03], ra: 0.05, rb: 0.05 }]);
+        assert!(g.settle(Some(&c)));
+        assert!(g.points.iter().all(|p| p[2].abs() < 0.003), "{:?}", g.points);
+        // a soft one still does not fall in deeper than it is stored
+        let mut g = hanging(6, 100.0, 10.0, false);
+        let before = g.points.clone();
+        assert!(g.settle(Some(&c)));
+        for (p, b) in g.points.iter().zip(&before) {
+            assert!(c.dist(*p) >= c.dist(*b).min(0.0) - 1.0e-4, "{p:?} from {b:?}");
+        }
     }
     #[test]
     fn full_strand_set_follows_the_stored_counts() {
