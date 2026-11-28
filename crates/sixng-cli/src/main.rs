@@ -1166,8 +1166,10 @@ enum Cmd {
         limit: usize,
         /// List the master timelines instead of the scenes: each master's
         /// slots (start, end, scene, section), its state machine (each
-        /// state's start times and transitions, with the target's start
-        /// and the kinds of condition) and its audio bank.
+        /// state's start times and transitions, with the target's start,
+        /// the kinds of condition and the string tests: variable and
+        /// value, by name where known), its start transitions (which pick
+        /// the state it starts in) and its audio bank.
         #[arg(long)]
         masters: bool,
     },
