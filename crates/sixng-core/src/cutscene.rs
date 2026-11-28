@@ -87,7 +87,7 @@ pub fn mission_ids<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> 
     v
 }
 /// Bumped when the cached catalog's layout or contents change.
-pub const CATALOG_VERSION: u32 = 8;
+pub const CATALOG_VERSION: u32 = 9;
 
 /// Struct and member hashes of the scene files.
 pub mod hashes {
@@ -134,6 +134,15 @@ pub mod hashes {
     pub const STATE_STARTS: u32 = 0x32c6_9aae;
     /// `transitions` of a state: an array of `rage__fwDataFsmStateTransition`.
     pub const STATE_TRANSITIONS: u32 = 0xb0fc_1c4f;
+    /// The scene's state machine: member `e6cae80a` of the scene record
+    /// (`1ebddb5b`) is the machine (`a2f97c23`, embedded), whose member
+    /// `c500427b` is an array of transitions with no source state: the
+    /// start transitions, which pick the state the scene starts in. Every
+    /// state no transition leads to is the target of one.
+    pub const SCENE: u32 = 0x1ebd_db5b;
+    pub const SCENE_FSM: u32 = 0xe6ca_e80a;
+    pub const FSM: u32 = 0xa2f9_7c23;
+    pub const FSM_START: u32 = 0xc500_427b;
     pub const TRANSITION: u32 = 0x891b_2a0f;
     /// `toState`: the state the transition leads to.
     pub const TRANSITION_TO: u32 = 0x2f6e_2b9a;
@@ -143,8 +152,15 @@ pub mod hashes {
     /// transition's own source state, so it reads "when this state ends".
     pub const CONDITION_STATE: u32 = 0x5743_9252;
     pub const CONDITION_STATE_ID: u32 = 0xf82a_367d;
-    /// A condition on an entity's value (`entityName`, `value`): a branch.
+    /// `fwAnimSceneConditionString`: a branch on a string variable. Its
+    /// `entityName` is the key of a `STRING_DATA` entity in the id map and
+    /// its `value` the joaat (lower case) of the string it must equal
+    /// (`invert`: must differ; a fourth member, `9a04f49a`, is 0 in every
+    /// file).
     pub const CONDITION_ENTITY: u32 = 0xd5f7_c394;
+    /// `fwAnimSceneStringData`: a scene's string variable (`value` 0 in the
+    /// files: the script sets it).
+    pub const STRING_DATA: u32 = 0x21e2_cf99;
     /// `fwAnimSceneSubtitleEventData`: a subtitle line of a scene, with
     /// `TextLabelName` (the text label), `Speaker` (joaat of the speaker's
     /// character name), `startTime` and `endTime` (seconds into the scene).
@@ -507,6 +523,9 @@ pub struct SceneFile {
     /// The master's state machine ([`master_states`]); masters only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fsm: Vec<FsmState>,
+    /// Its start transitions ([`master_start`]): which state it starts in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fsm_start: Vec<FsmTransition>,
     /// Subtitle events ([`subtitle_events`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subtitles: Vec<SubtitleEvent>,
@@ -523,6 +542,61 @@ pub struct FsmTransition {
     /// Conditions on an entity's value (branches), and all conditions.
     pub entity_conditions: usize,
     pub conditions: usize,
+    /// What the entity conditions test ([`string_tests`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tests: Vec<StringTest>,
+}
+
+/// A string-variable test of a transition: the variable (`entityName`)
+/// must equal (`invert`: differ from) the string whose joaat is `value`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StringTest {
+    pub variable: u32,
+    pub value: u32,
+    pub invert: bool,
+}
+
+/// The string tests ([`hashes::CONDITION_ENTITY`]) anywhere in a
+/// transition's condition set, in file order.
+pub fn string_tests(conds: &serde_json::Value) -> Vec<StringTest> {
+    // a member by name, or by its hash where the dictionary does not name it
+    let key = |n: &'static str| (n, crate::meta7a::field_name(crate::names::joaat_exact(n)));
+    let (var, val, inv) = (key("entityName"), key("value"), key("invert"));
+    let mut out = Vec::new();
+    let mut todo = vec![conds];
+    while let Some(v) = todo.pop() {
+        match v {
+            serde_json::Value::Object(o) => {
+                if o.get("_struct").and_then(|v| v.as_str()).and_then(|v| u32::from_str_radix(v, 16).ok()) == Some(hashes::CONDITION_ENTITY) {
+                    let get = |k: &(&str, String)| o.get(k.0).or_else(|| o.get(&k.1));
+                    let u = |k: &(&str, String)| get(k).and_then(|v| v.as_u64()).and_then(|v| u32::try_from(v).ok());
+                    if let (Some(variable), Some(value)) = (u(&var), u(&val)) {
+                        out.push(StringTest { variable, value, invert: get(&inv).and_then(|v| v.as_bool()).unwrap_or(false) });
+                    }
+                }
+                let mut kids: Vec<&serde_json::Value> = o.values().collect();
+                kids.reverse();
+                todo.extend(kids);
+            }
+            serde_json::Value::Array(a) => todo.extend(a.iter().rev()),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Names of the string variables and values seen in the masters' tests
+/// (joaat of the lower-case name), beside the name dictionary.
+const STRING_NAMES: [&str; 14] = ["s_choice", "s_relationship", "yes", "no", "low", "medium", "high", "normal", "multi", "good", "neutral", "kill", "jason", "lucia"];
+
+/// A string variable's or value's name, else its hash (hex).
+pub fn string_name(h: u32) -> String {
+    STRING_NAMES
+        .iter()
+        .find(|n| joaat(n) == h)
+        .map(|n| n.to_string())
+        .or_else(|| crate::names::lookup(h, crate::names::Ctx::Audio))
+        .unwrap_or_else(|| format!("{h:08x}"))
 }
 
 /// A state of a master's state machine.
@@ -652,8 +726,8 @@ pub fn scene_file(id: &str, m: &Meta) -> Option<SceneFile> {
     let mut audio: Vec<String> = m.objects(AUDIO).into_iter().filter_map(|o| m.member_value(AUDIO, o, AUDIO_NAME)?.as_str().filter(|s| !s.is_empty()).map(String::from)).collect();
     audio.sort();
     audio.dedup();
-    let fsm = if timeline.is_empty() { Vec::new() } else { master_states(m) };
-    Some(SceneFile { id: id.to_string(), states, objects, audio, timeline, fsm, subtitles: subtitle_events(m) })
+    let (fsm, fsm_start) = if timeline.is_empty() { (Vec::new(), Vec::new()) } else { (master_states(m), master_start(m)) };
+    Some(SceneFile { id: id.to_string(), states, objects, audio, timeline, fsm, fsm_start, subtitles: subtitle_events(m) })
 }
 
 /// A timeline item: a section reference or a composite.
@@ -780,31 +854,54 @@ pub fn master_states(m: &Meta) -> Vec<FsmState> {
         }
     }
     let Some((name_off, _)) = member_off(m, STATE, joaat("name")) else { return Vec::new() };
-    let tr_member = m.structs.get(&STATE).and_then(|sd| sd.members.iter().find(|x| x.hash == STATE_TRANSITIONS && x.ty == 0x5c).map(|x| x.off as usize));
-    let tr_size = m.structs.get(&TRANSITION).map_or(0, |sd| sd.size as usize);
-    let to_off = member_off(m, TRANSITION, TRANSITION_TO).map(|x| x.0);
+    let tr_member = array_member(m, STATE, STATE_TRANSITIONS);
     let mut out = Vec::new();
     for o in m.objects(STATE) {
         let name = m.r.u32(o + name_off);
         if name == 0 {
             continue;
         }
-        let mut transitions = Vec::new();
-        if let (Some(a), Some(to_off)) = (tr_member, to_off) {
-            let n = m.r.u32(o + a) as usize;
-            if let Some((_, base)) = m.ptr(m.r.u64(o + a + 8)).filter(|_| tr_size > 0 && n < 10_000) {
-                for i in 0..n {
-                    let t = base + i * tr_size;
-                    let (on_end, entity_conditions, conditions) = m.member_value(TRANSITION, t, TRANSITION_CONDITIONS).map_or((false, 0, 0), |c| count_conditions(&c, name));
-                    transitions.push(FsmTransition { to: m.r.u32(t + to_off), on_end, entity_conditions, conditions });
-                }
-            }
-        }
+        let transitions = tr_member.map(|a| transitions_at(m, o + a, name)).unwrap_or_default();
         out.push(FsmState { name, starts: starts_of.get(&name).cloned().unwrap_or_default(), transitions });
     }
     out.sort_by_key(|x| x.name);
     out.dedup_by_key(|x| x.name);
     out
+}
+
+/// The offset of an array member (`0x5c`) of a struct.
+fn array_member(m: &Meta, s: u32, h: u32) -> Option<usize> {
+    m.structs.get(&s)?.members.iter().find(|x| x.hash == h && x.ty == 0x5c).map(|x| x.off as usize)
+}
+
+/// The transitions of the array at `at` (count, then pointer), their
+/// conditions read with `source` as the source state (0: none).
+fn transitions_at(m: &Meta, at: usize, source: u32) -> Vec<FsmTransition> {
+    use hashes::*;
+    let tr_size = m.structs.get(&TRANSITION).map_or(0, |sd| sd.size as usize);
+    let (Some(to_off), n) = (member_off(m, TRANSITION, TRANSITION_TO).map(|x| x.0), m.r.u32(at) as usize) else { return Vec::new() };
+    let Some((_, base)) = m.ptr(m.r.u64(at + 8)).filter(|_| tr_size > 0 && n < 10_000) else { return Vec::new() };
+    (0..n)
+        .map(|i| {
+            let t = base + i * tr_size;
+            let conds = m.member_value(TRANSITION, t, TRANSITION_CONDITIONS);
+            let (on_end, entity_conditions, conditions) = conds.as_ref().map_or((false, 0, 0), |c| count_conditions(c, source));
+            let tests = conds.as_ref().map(string_tests).unwrap_or_default();
+            FsmTransition { to: m.r.u32(t + to_off), on_end: on_end && source != 0, entity_conditions, conditions, tests }
+        })
+        .collect()
+}
+
+/// The start transitions of a master's state machine ([`hashes::FSM_START`]),
+/// in file order: the first whose conditions hold picks the start state;
+/// one without conditions is the default.
+pub fn master_start(m: &Meta) -> Vec<FsmTransition> {
+    use hashes::*;
+    let (Some((fsm, ty)), Some(start)) = (member_off(m, SCENE, SCENE_FSM), array_member(m, FSM, FSM_START)) else { return Vec::new() };
+    if ty != 0x05 {
+        return Vec::new();
+    }
+    m.objects(SCENE).into_iter().flat_map(|o| transitions_at(m, o + fsm + start, 0)).collect()
 }
 
 /// Scan one archive: every scene clip dictionary (unnamed objects whose
@@ -1406,6 +1503,18 @@ pub struct MasterTransition {
     pub on_end: bool,
     pub entity_conditions: usize,
     pub conditions: usize,
+    /// The string tests, with names where known.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tests: Vec<MasterTest>,
+}
+
+/// A string test in a report: variable and value by name, else hash.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct MasterTest {
+    pub variable: String,
+    pub value: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub invert: bool,
 }
 
 /// A state in a report: its name, the starts it plays and its transitions.
@@ -1429,6 +1538,10 @@ pub struct Master {
     pub bank: Option<SceneAudio>,
     pub slots: Vec<MasterSlot>,
     pub states: Vec<MasterStateView>,
+    /// The start transitions, in order: the first whose tests hold picks
+    /// the state the master starts in.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub start: Vec<MasterTransition>,
 }
 
 /// Totals of the masters' state machines.
@@ -1440,6 +1553,15 @@ pub struct FsmTotals {
     pub transitions: usize,
     pub on_end: usize,
     pub with_entity_conditions: usize,
+    /// Start transitions, and those with string tests.
+    pub start_transitions: usize,
+    pub start_with_tests: usize,
+    /// String tests (of transitions and start transitions), the distinct
+    /// variables they test, and the tests whose variable and value both
+    /// have a name.
+    pub string_tests: usize,
+    pub string_variables: usize,
+    pub string_tests_named: usize,
     /// Transitions placed by the earliest start of both states: to a
     /// later state, to the next later start, to an earlier one, and those
     /// with a state that plays no start.
@@ -1463,7 +1585,21 @@ fn state_starts(f: &SceneFile) -> HashMap<u32, f32> {
 /// Totals over the masters of a catalog.
 pub fn fsm_totals(c: &Catalog) -> FsmTotals {
     let mut t = FsmTotals::default();
+    let mut variables = std::collections::HashSet::new();
+    let named = |h: u32| string_name(h) != format!("{h:08x}");
+    let mut count = |tests: &[StringTest], t: &mut FsmTotals| {
+        for x in tests {
+            t.string_tests += 1;
+            t.string_tests_named += (named(x.variable) && named(x.value)) as usize;
+            variables.insert(x.variable);
+        }
+    };
     for f in c.files.iter().filter(|f| !f.timeline.is_empty()) {
+        for tr in &f.fsm_start {
+            t.start_transitions += 1;
+            t.start_with_tests += !tr.tests.is_empty() as usize;
+            count(&tr.tests, &mut t);
+        }
         let first = state_starts(f);
         let mut later: Vec<f32> = first.values().copied().collect();
         later.sort_by(|a, b| a.total_cmp(b));
@@ -1475,6 +1611,7 @@ pub fn fsm_totals(c: &Catalog) -> FsmTotals {
                 t.transitions += 1;
                 t.on_end += tr.on_end as usize;
                 t.with_entity_conditions += (tr.entity_conditions > 0) as usize;
+                count(&tr.tests, &mut t);
                 match (first.get(&st.name), first.get(&tr.to)) {
                     (Some(a), Some(b)) if b > a => {
                         t.forward += 1;
@@ -1487,6 +1624,7 @@ pub fn fsm_totals(c: &Catalog) -> FsmTotals {
             }
         }
     }
+    t.string_variables = variables.len();
     t
 }
 
@@ -1510,6 +1648,14 @@ pub fn masters(c: &Catalog, all: &[Scene], banks: Option<&AudioBanks>) -> Vec<Ma
                 section: format!("{:08x}", x.section),
             })
             .collect();
+        let view = |tr: &FsmTransition| MasterTransition {
+            to: format!("{:08x}", tr.to),
+            to_start: first.get(&tr.to).copied(),
+            on_end: tr.on_end,
+            entity_conditions: tr.entity_conditions,
+            conditions: tr.conditions,
+            tests: tr.tests.iter().map(|x| MasterTest { variable: string_name(x.variable), value: string_name(x.value), invert: x.invert }).collect(),
+        };
         let states = f
             .fsm
             .iter()
@@ -1517,16 +1663,12 @@ pub fn masters(c: &Catalog, all: &[Scene], banks: Option<&AudioBanks>) -> Vec<Ma
                 let mut starts: Vec<f32> = st.starts.iter().filter_map(|k| at.get(k).copied()).collect();
                 starts.sort_by(|a, b| a.total_cmp(b));
                 starts.dedup();
-                let transitions = st
-                    .transitions
-                    .iter()
-                    .map(|tr| MasterTransition { to: format!("{:08x}", tr.to), to_start: first.get(&tr.to).copied(), on_end: tr.on_end, entity_conditions: tr.entity_conditions, conditions: tr.conditions })
-                    .collect();
+                let transitions = st.transitions.iter().map(view).collect();
                 MasterStateView { name: format!("{:08x}", st.name), starts, transitions }
             })
             .collect();
         let bank = banks.and_then(|b| f.audio.iter().find_map(|n| b.find_audio_name(n)));
-        out.push(Master { id: f.id.clone(), audio: f.audio.clone(), bank, slots, states });
+        out.push(Master { id: f.id.clone(), audio: f.audio.clone(), bank, slots, states, start: f.fsm_start.iter().map(view).collect() });
     }
     out
 }
@@ -1659,6 +1801,7 @@ mod tests {
             audio: vec!["test_scene_audio".into()],
             timeline: vec![],
             fsm: vec![],
+            fsm_start: vec![],
             subtitles: vec![SubtitleEvent { label: "TEST_SCENE_2".into(), speaker: joaat("lucia"), start: 3.0, end: 4.0, sections: vec![] }, SubtitleEvent { label: "TEST_SCENE_1".into(), speaker: joaat("boss"), start: 1.0, end: 2.0, sections: vec![] }],
         };
         // the second scene's own file: a line of section 2 (placed in the master at 12.5 s,
@@ -1670,10 +1813,11 @@ mod tests {
             audio: vec![],
             timeline: vec![],
             fsm: vec![],
+            fsm_start: vec![],
             subtitles: vec![SubtitleEvent { label: "OTHER_1".into(), speaker: 0x1234, start: 0.5, end: 1.5, sections: vec![2, 9] }, SubtitleEvent { label: "OTHER_2".into(), speaker: 0x1234, start: 0.25, end: 1.0, sections: vec![9] }],
         };
         // a master timeline that places the second scene's section 2 at 12.5 s
-        let master = SceneFile { id: "a.rpf@40".into(), states: vec![joaat("test_master")], objects: vec![], audio: vec!["tst_test_master".into()], timeline: vec![Slot { key: 11, also: vec![], start: 2.5, scene: 5, section: 1 }, Slot { key: 12, also: vec![], start: 12.5, scene: joaat("other_scene_p1_t01"), section: 2 }, Slot { key: 13, also: vec![14], start: 20.0, scene: 6, section: 3 }], fsm: test_fsm(), subtitles: vec![] };
+        let master = SceneFile { id: "a.rpf@40".into(), states: vec![joaat("test_master")], objects: vec![], audio: vec!["tst_test_master".into()], timeline: vec![Slot { key: 11, also: vec![], start: 2.5, scene: 5, section: 1 }, Slot { key: 12, also: vec![], start: 12.5, scene: joaat("other_scene_p1_t01"), section: 2 }, Slot { key: 13, also: vec![14], start: 20.0, scene: 6, section: 3 }], fsm: test_fsm(), fsm_start: test_start(), subtitles: vec![] };
         // a second scene without a scene file of its own
         let d2 = SceneDict { name: "cin@other_scene_p1_t01".into(), id: "a.rpf@30".into(), clips: ["boss", "boss_face", "ib_phone"].map(String::from).to_vec(), sections: 0, section_ids: vec![], adopted_sections: 0, streamed: vec![], unjoined: vec![], windows_streamed: 0, windows_missing: 0 };
         Catalog { version: CATALOG_VERSION, archive: "a.rpf".into(), dicts: vec![d, d2], files: vec![f, master, f2] }
@@ -1695,11 +1839,25 @@ mod tests {
         assert_eq!(audio_base_name("x1"), "x1");
     }
 
+    /// Start in 300 when `s_choice` is `yes`, else in 100.
+    fn test_start() -> Vec<FsmTransition> {
+        vec![
+            FsmTransition { to: 300, on_end: false, entity_conditions: 1, conditions: 1, tests: vec![StringTest { variable: joaat("s_choice"), value: joaat("yes"), invert: false }] },
+            FsmTransition { to: 100, on_end: false, entity_conditions: 0, conditions: 0, tests: vec![] },
+        ]
+    }
+
     /// Three states: 100 plays the first start and leads on to 200 when it
     /// ends, or to 300 on a branch; 200 plays the second start and leads
     /// back to 100; 300 plays the last and ends. 400 plays nothing.
     fn test_fsm() -> Vec<FsmState> {
-        let tr = |to, on_end, entity| FsmTransition { to, on_end, entity_conditions: entity, conditions: on_end as usize + entity };
+        let tr = |to, on_end, entity: usize| FsmTransition {
+            to,
+            on_end,
+            entity_conditions: entity,
+            conditions: on_end as usize + entity,
+            tests: (0..entity).map(|_| StringTest { variable: joaat("s_relationship"), value: if to == 300 { joaat("high") } else { 0x1234 }, invert: to != 300 }).collect(),
+        };
         vec![
             FsmState { name: 100, starts: vec![11], transitions: vec![tr(200, true, 0), tr(300, true, 1)] },
             FsmState { name: 200, starts: vec![12], transitions: vec![tr(100, true, 0), tr(400, false, 1)] },
@@ -1741,7 +1899,7 @@ mod tests {
     fn masters_report_states_and_transitions() {
         let c = catalog();
         let t = fsm_totals(&c);
-        assert_eq!(t, FsmTotals { states: 5, end_states: 3, transitions: 4, on_end: 3, with_entity_conditions: 2, forward: 2, to_next_start: 1, backward: 1, unplaced: 1 });
+        assert_eq!(t, FsmTotals { states: 5, end_states: 3, transitions: 4, on_end: 3, with_entity_conditions: 2, start_transitions: 2, start_with_tests: 1, string_tests: 3, string_variables: 2, string_tests_named: 2, forward: 2, to_next_start: 1, backward: 1, unplaced: 1 });
         let all = scenes(&c, &Models::default());
         let ms = masters(&c, &all, None);
         assert_eq!(ms.len(), 1);
@@ -1751,6 +1909,12 @@ mod tests {
         let s100 = &m.states[0];
         assert_eq!((s100.name.as_str(), s100.starts.clone()), ("00000064", vec![2.5]));
         assert_eq!(s100.transitions.iter().map(|x| (x.to.as_str(), x.to_start)).collect::<Vec<_>>(), vec![("000000c8", Some(12.5)), ("0000012c", Some(20.0))]);
+        // the branch to 300 tests a named variable and value; an unknown value keeps its hash
+        assert_eq!(s100.transitions[1].tests, vec![MasterTest { variable: "s_relationship".into(), value: "high".into(), invert: false }]);
+        assert_eq!(m.states[1].transitions[1].tests, vec![MasterTest { variable: "s_relationship".into(), value: "00001234".into(), invert: true }]);
+        // the start transitions in order, with the start of their target
+        assert_eq!(m.start.iter().map(|x| (x.to.as_str(), x.to_start, x.tests.len())).collect::<Vec<_>>(), vec![("0000012c", Some(20.0), 1), ("00000064", Some(2.5), 0)]);
+        assert_eq!(m.start[0].tests, vec![MasterTest { variable: "s_choice".into(), value: "yes".into(), invert: false }]);
         // a listed key with no slot is left out of the starts; a repeat key finds its slot
         assert_eq!(m.states[2].starts, vec![20.0]);
         assert_eq!(m.states[4].starts, vec![20.0]);
@@ -1771,6 +1935,8 @@ mod tests {
             ]
         });
         assert_eq!(count_conditions(&c, 7), (true, 2, 4));
+        // both string tests, the nested one too; a missing invert reads as false
+        assert_eq!(string_tests(&c), vec![StringTest { variable: 1, value: 2, invert: false }, StringTest { variable: 3, value: 4, invert: false }]);
         // a state condition naming another state is not "on end"
         assert_eq!(count_conditions(&c, 8), (false, 2, 4));
         assert_eq!(count_conditions(&serde_json::json!({"_struct": "4b852c44", "conditions": []}), 7), (false, 0, 0));

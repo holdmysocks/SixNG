@@ -1096,10 +1096,17 @@ again**).
   scenes): a master's states are keys of its id map, and each state's
   item lists the start-map keys it plays. A transition leads to
   another state (`toState`); its conditions either name its own source
-  state ("when this state ends") or test an entity's value (a branch).
+  state ("when this state ends") or test a string variable (a branch:
+  `fwAnimSceneConditionString`, the variable named by `entityName`, a
+  string entity of the scene whose value the script sets, must equal
+  the string whose joaat is `value`, or differ from it with `invert`).
+  The machine also has start transitions, which have no source state:
+  the first whose tests hold picks the state the master starts in.
   `--masters` gives each master's slots (start, end, scene, section),
   its states with their start times and transitions (the target's
-  start, `on_end`, the number of value tests) and its bank;
+  start, `on_end`, the number of value tests and the tests: variable
+  and value by name where the dictionary has one, else the hash), its
+  start transitions (`start`) and its bank;
   `master_timelines.state_machines` counts them.
   Measured on the story pack's 139 masters: 929 states (256 end
   states) and 797 transitions; 760 have a "when this state ends"
@@ -1108,7 +1115,16 @@ again**).
   later start, the others skip ahead over alternatives) and 37 back.
   Where one scene fills several slots of a master, its slots mostly
   belong to states on one path (each slot a different section, played
-  in turn); only a few are alternatives on separate branches.
+  in turn); only a few are alternatives on separate branches. Every
+  master has start transitions: 293 in all, 78 without conditions (the
+  default) and 214 with string tests. Every state that no transition
+  leads to (256) is the target of a start transition. The masters hold
+  695 string tests (277 on transitions, 418 on start transitions) over
+  21 variables. The commonest check which player character plays
+  (`jason` / `lucia`, 153), a relationship level (`s_relationship`:
+  `low`, `medium`, `high`, 121) and a yes/no choice (36); one variable
+  has 89 values (vehicle models and places such as `Office`). 122
+  tests have both the variable and the value named.
   **Subtitles**: a scene file's subtitle events
   (`fwAnimSceneSubtitleEventData`) give the text label, the speaker (joaat
   of the character name) and the start and end in their section. Each scene
@@ -1127,8 +1143,9 @@ again**).
   their text and 9,395 a speaker name, and the links agree on the
   speaker for 11,860 (43 differ). 3,176 lines are on a bank clock (the
   others are in scenes no master places).
-  Not decoded: movie events (their movie names are empty in this copy)
-  and what the entity conditions test.
+  Not decoded: which movie file a movie event plays. Its name
+  (`binkName`) is empty in this copy, and its 64-bit id (71 distinct)
+  matches no name or file of `movies.rpf`.
 - **Story names** (`sixng story-names [--tags]`): arc and mission names
   for the scenes. The story pack's protected ambient-rule files (read
   through the table of contents, so Windows x64 with the game executable)
