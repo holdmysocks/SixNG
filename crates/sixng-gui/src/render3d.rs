@@ -3749,19 +3749,12 @@ impl Renderer3D {
                 }
             }
             // by layer order (terrain blend layers 0, other decals 1), then
-            // opaque before blended, then far to near. Opaque ones of the
-            // table's models go first, by geometry chunk, so they form long
-            // runs of its sub-draws: their order matters only within a model
-            // (`lateexact`: the plain order, for A/B runs)
-            let exact = crate::gpu_draw::opt("lateexact");
-            let chunk = |e: &(u8, bool, f32, usize, usize, &GpuModel, &GpuMesh, bool)| match (&e.5.gd, e.1 || exact) {
-                (Some(h), false) => h.gc,
-                _ => usize::MAX,
-            };
+            // opaque before blended, then far to near (grouping the table's
+            // opaque ones by chunk was tried: they are few, and it split the
+            // blended runs further)
             dl.sort_by(|a, b| {
                 a.0.cmp(&b.0)
                     .then(a.1.cmp(&b.1))
-                    .then(chunk(a).cmp(&chunk(b)))
                     .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
                     .then(a.3.cmp(&b.3))
                     .then(a.4.cmp(&b.4))
