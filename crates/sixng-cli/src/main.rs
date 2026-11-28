@@ -1159,6 +1159,12 @@ enum Cmd {
         /// At most this many scenes (0 = all).
         #[arg(long, default_value_t = 0)]
         limit: usize,
+        /// List the master timelines instead of the scenes: each master's
+        /// slots (start, end, scene, section), its state machine (each
+        /// state's start times and transitions, with the target's start
+        /// and the kinds of condition) and its audio bank.
+        #[arg(long)]
+        masters: bool,
     },
     /// Build the Scenes dialogue index from verified local occurrences and GXT tables.
     SceneDialogue {
@@ -2149,7 +2155,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             out.print(&v);
         }
-        Cmd::Cutscenes { scene, name, cast, archive, rescan, summary, limit } => {
+        Cmd::Cutscenes { scene, name, cast, archive, rescan, summary, limit, masters: list_masters } => {
             use sixng_core::cutscene;
             let t = Instant::now();
             let c = cutscene::catalog(&ws, archive, *rescan, pr.clone())?;
@@ -2209,9 +2215,14 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 "slots_on_catalogued_scenes": masters.iter().flat_map(|f| &f.timeline).filter(|sl| hashes.contains(&sl.scene)).count(),
                 "with_audio_name": masters.iter().filter(|f| !f.audio.is_empty()).count(),
                 "with_audio_bank": banks.as_ref().map(|b| masters.iter().filter(|f| f.audio.iter().any(|n| b.find_audio_name(n).is_some())).count()),
+                "state_machines": cutscene::fsm_totals(&c),
             });
             let mut o = json!({"ok": true, "archive": c.archive, "dictionaries": c.dicts.len(), "scene_files": c.files.len(), "totals": totals, "master_timelines": masters_json, "seconds": t.elapsed().as_secs_f64()});
-            if !*summary {
+            if *list_masters {
+                let ms = cutscene::masters(&c, &all, banks.as_ref());
+                let take = if *limit == 0 { ms.len() } else { *limit };
+                o["masters"] = json!(ms.iter().take(take).collect::<Vec<_>>());
+            } else if !*summary {
                 let take = if *limit == 0 { sel.len() } else { *limit };
                 o["scenes"] = json!(sel.iter().take(take).collect::<Vec<_>>());
             }

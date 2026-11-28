@@ -87,7 +87,7 @@ pub fn mission_ids<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> 
     v
 }
 /// Bumped when the cached catalog's layout or contents change.
-pub const CATALOG_VERSION: u32 = 5;
+pub const CATALOG_VERSION: u32 = 6;
 
 /// Struct and member hashes of the scene files.
 pub mod hashes {
@@ -127,12 +127,37 @@ pub mod hashes {
     /// streams are `joaat("<name>.<channel>") & 0x1FFFFFFF`.
     pub const AUDIO: u32 = 0xdb64_6fb2;
     pub const AUDIO_NAME: u32 = 0x52c0_9a55;
+    // The master's state machine: its states (`STATE`) are keys of the id
+    // map, whose item (`STATE_ITEM`) lists the start-map keys the state
+    // plays (`STATE_STARTS`).
+    pub const STATE_ITEM: u32 = 0xa90b_7f7e;
+    pub const STATE_STARTS: u32 = 0x32c6_9aae;
+    /// `transitions` of a state: an array of `rage__fwDataFsmStateTransition`.
+    pub const STATE_TRANSITIONS: u32 = 0xb0fc_1c4f;
+    pub const TRANSITION: u32 = 0x891b_2a0f;
+    /// `toState`: the state the transition leads to.
+    pub const TRANSITION_TO: u32 = 0x2f6e_2b9a;
+    /// `conditionSet`.
+    pub const TRANSITION_CONDITIONS: u32 = 0x60aa_e83b;
+    /// A condition naming a state (`f82a367d`): nearly always the
+    /// transition's own source state, so it reads "when this state ends".
+    pub const CONDITION_STATE: u32 = 0x5743_9252;
+    pub const CONDITION_STATE_ID: u32 = 0xf82a_367d;
+    /// A condition on an entity's value (`entityName`, `value`): a branch.
+    pub const CONDITION_ENTITY: u32 = 0xd5f7_c394;
 }
 
 /// One slot of a master timeline: a scene section that starts `start`
 /// seconds into the master.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Slot {
+    /// The start-map key (the id the master's states list).
+    #[serde(default)]
+    pub key: u32,
+    /// Other start-map keys with the same slot (a file can hold the start
+    /// map twice, under other keys).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also: Vec<u32>,
     pub start: f32,
     /// joaat of the scene name (`sceneId`).
     pub scene: u32,
@@ -381,6 +406,32 @@ pub struct SceneFile {
     /// The master timeline, by start time ([`timeline`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub timeline: Vec<Slot>,
+    /// The master's state machine ([`master_states`]); masters only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fsm: Vec<FsmState>,
+}
+
+/// A transition of a master's state machine.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FsmTransition {
+    /// The state it leads to (`toState`).
+    pub to: u32,
+    /// It has a condition naming its own source state ("when this state
+    /// ends").
+    pub on_end: bool,
+    /// Conditions on an entity's value (branches), and all conditions.
+    pub entity_conditions: usize,
+    pub conditions: usize,
+}
+
+/// A state of a master's state machine.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FsmState {
+    /// The state's name hash: a key of the id map.
+    pub name: u32,
+    /// The start-map keys it plays ([`Slot::key`]).
+    pub starts: Vec<u32>,
+    pub transitions: Vec<FsmTransition>,
 }
 
 /// Everything read from one archive, cached as JSON in the index folder.
@@ -500,7 +551,8 @@ pub fn scene_file(id: &str, m: &Meta) -> Option<SceneFile> {
     let mut audio: Vec<String> = m.objects(AUDIO).into_iter().filter_map(|o| m.member_value(AUDIO, o, AUDIO_NAME)?.as_str().filter(|s| !s.is_empty()).map(String::from)).collect();
     audio.sort();
     audio.dedup();
-    Some(SceneFile { id: id.to_string(), states, objects, audio, timeline })
+    let fsm = if timeline.is_empty() { Vec::new() } else { master_states(m) };
+    Some(SceneFile { id: id.to_string(), states, objects, audio, timeline, fsm })
 }
 
 /// A timeline item: a section reference or a composite.
@@ -527,13 +579,23 @@ pub fn resolve_timeline(starts: &[(u32, f32)], ids: &HashMap<u32, TimelineItem>)
             }
         }
         if let Some(TimelineItem::Reference { scene, section }) = it {
-            out.push(Slot { start, scene: *scene, section: *section });
+            out.push(Slot { key, also: Vec::new(), start, scene: *scene, section: *section });
         }
     }
-    out.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.scene.cmp(&b.scene)).then(a.section.cmp(&b.section)));
-    // a file can hold the start map twice
-    out.dedup();
-    out
+    out.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.scene.cmp(&b.scene)).then(a.section.cmp(&b.section)).then(a.key.cmp(&b.key)));
+    // a file can hold the start map twice: one slot, the other keys kept
+    let mut merged: Vec<Slot> = Vec::with_capacity(out.len());
+    for sl in out {
+        match merged.last_mut() {
+            Some(p) if p.start == sl.start && p.scene == sl.scene && p.section == sl.section => {
+                if sl.key != p.key && !p.also.contains(&sl.key) {
+                    p.also.push(sl.key);
+                }
+            }
+            _ => merged.push(sl),
+        }
+    }
+    merged
 }
 
 /// The master timeline of a scene file: its start-time map's entries
@@ -565,6 +627,83 @@ pub fn timeline(m: &Meta) -> Vec<Slot> {
         }
     }
     resolve_timeline(&starts, &ids)
+}
+
+/// Count a transition's conditions: (names its source state, entity value
+/// tests, all). `conds` is its condition set as [`Meta::member_value`]
+/// decodes it; every object below it with a `_struct` is one condition,
+/// except condition lists (objects holding only arrays).
+pub fn count_conditions(conds: &serde_json::Value, source: u32) -> (bool, usize, usize) {
+    use hashes::*;
+    let state_key = crate::meta7a::field_name(CONDITION_STATE_ID);
+    let (mut on_end, mut entity, mut all) = (false, 0, 0);
+    let mut todo: Vec<(&serde_json::Value, bool)> = vec![(conds, true)];
+    while let Some((v, top)) = todo.pop() {
+        match v {
+            serde_json::Value::Object(o) => {
+                let st = o.get("_struct").and_then(|v| v.as_str()).and_then(|v| u32::from_str_radix(v, 16).ok());
+                let list = o.iter().filter(|(k, _)| *k != "_struct").all(|(_, v)| v.is_array());
+                match st {
+                    _ if top => {}
+                    Some(CONDITION_STATE) => {
+                        all += 1;
+                        on_end |= o.get(&state_key).and_then(|v| v.as_u64()) == Some(source as u64);
+                    }
+                    Some(CONDITION_ENTITY) => {
+                        all += 1;
+                        entity += 1;
+                    }
+                    Some(_) if !list => all += 1,
+                    _ => {}
+                }
+                todo.extend(o.values().map(|x| (x, false)));
+            }
+            serde_json::Value::Array(a) => todo.extend(a.iter().map(|x| (x, false))),
+            _ => {}
+        }
+    }
+    (on_end, entity, all)
+}
+
+/// The state machine of a master: each state (`STATE`) with the start keys
+/// its id-map item lists and its transitions ([`count_conditions`]).
+/// Sorted by state name.
+pub fn master_states(m: &Meta) -> Vec<FsmState> {
+    use hashes::*;
+    let mut starts_of: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (key, h, p) in map_entries(m) {
+        if h == STATE_ITEM {
+            if let Some(serde_json::Value::Array(a)) = m.member_value(h, p, STATE_STARTS) {
+                starts_of.entry(key).or_insert_with(|| a.iter().filter_map(|v| v.as_u64()).map(|x| x as u32).collect());
+            }
+        }
+    }
+    let Some((name_off, _)) = member_off(m, STATE, joaat("name")) else { return Vec::new() };
+    let tr_member = m.structs.get(&STATE).and_then(|sd| sd.members.iter().find(|x| x.hash == STATE_TRANSITIONS && x.ty == 0x5c).map(|x| x.off as usize));
+    let tr_size = m.structs.get(&TRANSITION).map_or(0, |sd| sd.size as usize);
+    let to_off = member_off(m, TRANSITION, TRANSITION_TO).map(|x| x.0);
+    let mut out = Vec::new();
+    for o in m.objects(STATE) {
+        let name = m.r.u32(o + name_off);
+        if name == 0 {
+            continue;
+        }
+        let mut transitions = Vec::new();
+        if let (Some(a), Some(to_off)) = (tr_member, to_off) {
+            let n = m.r.u32(o + a) as usize;
+            if let Some((_, base)) = m.ptr(m.r.u64(o + a + 8)).filter(|_| tr_size > 0 && n < 10_000) {
+                for i in 0..n {
+                    let t = base + i * tr_size;
+                    let (on_end, entity_conditions, conditions) = m.member_value(TRANSITION, t, TRANSITION_CONDITIONS).map_or((false, 0, 0), |c| count_conditions(&c, name));
+                    transitions.push(FsmTransition { to: m.r.u32(t + to_off), on_end, entity_conditions, conditions });
+                }
+            }
+        }
+        out.push(FsmState { name, starts: starts_of.get(&name).cloned().unwrap_or_default(), transitions });
+    }
+    out.sort_by_key(|x| x.name);
+    out.dedup_by_key(|x| x.name);
+    out
 }
 
 /// Scan one archive: every scene clip dictionary (unnamed objects whose
@@ -1050,6 +1189,156 @@ pub fn attach_audio(all: &mut [Scene], c: &Catalog, banks: &AudioBanks) {
     }
 }
 
+/// One slot of a master in a report: the scene by name when it is
+/// catalogued, else its hash.
+#[derive(Clone, Debug, Serialize)]
+pub struct MasterSlot {
+    /// Start-map key (hex).
+    pub key: String,
+    pub start: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<f32>,
+    pub scene: String,
+    /// `sectionId` (hex).
+    pub section: String,
+}
+
+/// A transition in a report, with the target state's start.
+#[derive(Clone, Debug, Serialize)]
+pub struct MasterTransition {
+    /// `toState` (hex).
+    pub to: String,
+    /// The target state's earliest start, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_start: Option<f32>,
+    pub on_end: bool,
+    pub entity_conditions: usize,
+    pub conditions: usize,
+}
+
+/// A state in a report: its name, the starts it plays and its transitions.
+#[derive(Clone, Debug, Serialize)]
+pub struct MasterStateView {
+    /// Name hash (hex).
+    pub name: String,
+    /// The start times of the slots it plays, sorted.
+    pub starts: Vec<f32>,
+    pub transitions: Vec<MasterTransition>,
+}
+
+/// A master timeline with its state machine, for reports.
+#[derive(Clone, Debug, Serialize)]
+pub struct Master {
+    /// Scene file (entry id).
+    pub id: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub audio: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bank: Option<SceneAudio>,
+    pub slots: Vec<MasterSlot>,
+    pub states: Vec<MasterStateView>,
+}
+
+/// Totals of the masters' state machines.
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+pub struct FsmTotals {
+    pub states: usize,
+    /// States with no transition (where a master ends).
+    pub end_states: usize,
+    pub transitions: usize,
+    pub on_end: usize,
+    pub with_entity_conditions: usize,
+    /// Transitions placed by the earliest start of both states: to a
+    /// later state, to the next later start, to an earlier one, and those
+    /// with a state that plays no start.
+    pub forward: usize,
+    pub to_next_start: usize,
+    pub backward: usize,
+    pub unplaced: usize,
+}
+
+/// The start time of each start-map key of a master.
+fn key_starts(f: &SceneFile) -> HashMap<u32, f32> {
+    f.timeline.iter().flat_map(|x| std::iter::once(x.key).chain(x.also.iter().copied()).map(move |k| (k, x.start))).collect()
+}
+
+/// The earliest start of each state of a master.
+fn state_starts(f: &SceneFile) -> HashMap<u32, f32> {
+    let at = key_starts(f);
+    f.fsm.iter().filter_map(|st| st.starts.iter().filter_map(|k| at.get(k).copied()).min_by(|a, b| a.total_cmp(b)).map(|t| (st.name, t))).collect()
+}
+
+/// Totals over the masters of a catalog.
+pub fn fsm_totals(c: &Catalog) -> FsmTotals {
+    let mut t = FsmTotals::default();
+    for f in c.files.iter().filter(|f| !f.timeline.is_empty()) {
+        let first = state_starts(f);
+        let mut later: Vec<f32> = first.values().copied().collect();
+        later.sort_by(|a, b| a.total_cmp(b));
+        later.dedup();
+        for st in &f.fsm {
+            t.states += 1;
+            t.end_states += st.transitions.is_empty() as usize;
+            for tr in &st.transitions {
+                t.transitions += 1;
+                t.on_end += tr.on_end as usize;
+                t.with_entity_conditions += (tr.entity_conditions > 0) as usize;
+                match (first.get(&st.name), first.get(&tr.to)) {
+                    (Some(a), Some(b)) if b > a => {
+                        t.forward += 1;
+                        t.to_next_start += (later.iter().find(|&&x| x > *a) == Some(b)) as usize;
+                    }
+                    (Some(a), Some(b)) if b < a => t.backward += 1,
+                    (Some(_), Some(_)) => {}
+                    _ => t.unplaced += 1,
+                }
+            }
+        }
+    }
+    t
+}
+
+/// The masters of a catalog for reports: slots with scene names from
+/// `all`, states with the start times they play, and the bank of the
+/// master's audio names when `banks` is given.
+pub fn masters(c: &Catalog, all: &[Scene], banks: Option<&AudioBanks>) -> Vec<Master> {
+    let names: HashMap<u32, &str> = all.iter().map(|s| (joaat(&s.name), s.name.as_str())).collect();
+    let mut out = Vec::new();
+    for f in c.files.iter().filter(|f| !f.timeline.is_empty()) {
+        let at = key_starts(f);
+        let first = state_starts(f);
+        let slots = f
+            .timeline
+            .iter()
+            .map(|x| MasterSlot {
+                key: format!("{:08x}", x.key),
+                start: x.start,
+                end: f.timeline.iter().map(|y| y.start).find(|&y| y > x.start),
+                scene: names.get(&x.scene).map_or_else(|| format!("{:08x}", x.scene), |n| n.to_string()),
+                section: format!("{:08x}", x.section),
+            })
+            .collect();
+        let states = f
+            .fsm
+            .iter()
+            .map(|st| {
+                let mut starts: Vec<f32> = st.starts.iter().filter_map(|k| at.get(k).copied()).collect();
+                starts.sort_by(|a, b| a.total_cmp(b));
+                starts.dedup();
+                let transitions = st
+                    .transitions
+                    .iter()
+                    .map(|tr| MasterTransition { to: format!("{:08x}", tr.to), to_start: first.get(&tr.to).copied(), on_end: tr.on_end, entity_conditions: tr.entity_conditions, conditions: tr.conditions })
+                    .collect();
+                MasterStateView { name: format!("{:08x}", st.name), starts, transitions }
+            })
+            .collect();
+        let bank = banks.and_then(|b| f.audio.iter().find_map(|n| b.find_audio_name(n)));
+        out.push(Master { id: f.id.clone(), audio: f.audio.clone(), bank, slots, states });
+    }
+    out
+}
+
 /// The dictionary entry id of a scene clip dictionary by name (`cin@<scene>`),
 /// from a catalog.
 pub fn dictionary_id<'a>(c: &'a Catalog, name: &str) -> Option<&'a str> {
@@ -1177,9 +1466,10 @@ mod tests {
             ],
             audio: vec!["test_scene_audio".into()],
             timeline: vec![],
+            fsm: vec![],
         };
         // a master timeline that places the second scene's section 2 at 12.5 s
-        let master = SceneFile { id: "a.rpf@40".into(), states: vec![joaat("test_master")], objects: vec![], audio: vec!["tst_test_master".into()], timeline: vec![Slot { start: 2.5, scene: 5, section: 1 }, Slot { start: 12.5, scene: joaat("other_scene_p1_t01"), section: 2 }, Slot { start: 20.0, scene: 6, section: 3 }] };
+        let master = SceneFile { id: "a.rpf@40".into(), states: vec![joaat("test_master")], objects: vec![], audio: vec!["tst_test_master".into()], timeline: vec![Slot { key: 11, also: vec![], start: 2.5, scene: 5, section: 1 }, Slot { key: 12, also: vec![], start: 12.5, scene: joaat("other_scene_p1_t01"), section: 2 }, Slot { key: 13, also: vec![14], start: 20.0, scene: 6, section: 3 }], fsm: test_fsm() };
         // a second scene without a scene file of its own
         let d2 = SceneDict { name: "cin@other_scene_p1_t01".into(), id: "a.rpf@30".into(), clips: ["boss", "boss_face", "ib_phone"].map(String::from).to_vec(), sections: 0, section_ids: vec![], adopted_sections: 0, streamed: vec![], unjoined: vec![], windows_streamed: 0, windows_missing: 0 };
         Catalog { version: CATALOG_VERSION, archive: "a.rpf".into(), dicts: vec![d, d2], files: vec![f, master] }
@@ -1201,11 +1491,67 @@ mod tests {
         assert_eq!(audio_base_name("x1"), "x1");
     }
 
+    /// Three states: 100 plays the first start and leads on to 200 when it
+    /// ends, or to 300 on a branch; 200 plays the second start and leads
+    /// back to 100; 300 plays the last and ends. 400 plays nothing.
+    fn test_fsm() -> Vec<FsmState> {
+        let tr = |to, on_end, entity| FsmTransition { to, on_end, entity_conditions: entity, conditions: on_end as usize + entity };
+        vec![
+            FsmState { name: 100, starts: vec![11], transitions: vec![tr(200, true, 0), tr(300, true, 1)] },
+            FsmState { name: 200, starts: vec![12], transitions: vec![tr(100, true, 0), tr(400, false, 1)] },
+            FsmState { name: 300, starts: vec![13, 99], transitions: vec![] },
+            FsmState { name: 400, starts: vec![], transitions: vec![] },
+            // a state listing only the repeat key of the last slot
+            FsmState { name: 500, starts: vec![14], transitions: vec![] },
+        ]
+    }
+
+    #[test]
+    fn masters_report_states_and_transitions() {
+        let c = catalog();
+        let t = fsm_totals(&c);
+        assert_eq!(t, FsmTotals { states: 5, end_states: 3, transitions: 4, on_end: 3, with_entity_conditions: 2, forward: 2, to_next_start: 1, backward: 1, unplaced: 1 });
+        let all = scenes(&c, &Models::default());
+        let ms = masters(&c, &all, None);
+        assert_eq!(ms.len(), 1);
+        let m = &ms[0];
+        assert_eq!(m.slots.iter().map(|x| x.scene.as_str()).collect::<Vec<_>>(), vec!["00000005", "other_scene_p1_t01", "00000006"]);
+        assert_eq!((m.slots[1].key.as_str(), m.slots[1].end), ("0000000c", Some(20.0)));
+        let s100 = &m.states[0];
+        assert_eq!((s100.name.as_str(), s100.starts.clone()), ("00000064", vec![2.5]));
+        assert_eq!(s100.transitions.iter().map(|x| (x.to.as_str(), x.to_start)).collect::<Vec<_>>(), vec![("000000c8", Some(12.5)), ("0000012c", Some(20.0))]);
+        // a listed key with no slot is left out of the starts; a repeat key finds its slot
+        assert_eq!(m.states[2].starts, vec![20.0]);
+        assert_eq!(m.states[4].starts, vec![20.0]);
+    }
+
+    #[test]
+    fn transition_conditions_are_counted() {
+        let key = crate::meta7a::field_name(hashes::CONDITION_STATE_ID);
+        let mut first = serde_json::json!({"_struct": "57439252", "invert": false});
+        first[key.as_str()] = serde_json::json!(7);
+        let c = serde_json::json!({
+            "_struct": "4b852c44",
+            "conditions": [
+                first,
+                {"_struct": "d5f7c394", "entityName": 1, "value": 2, "invert": false},
+                // a nested condition list: its members count, the list does not
+                {"_struct": "262073c2", "conditions": [{"_struct": "d5f7c394", "entityName": 3, "value": 4}, {"_struct": "0ca33eea", "x": 1}]}
+            ]
+        });
+        assert_eq!(count_conditions(&c, 7), (true, 2, 4));
+        // a state condition naming another state is not "on end"
+        assert_eq!(count_conditions(&c, 8), (false, 2, 4));
+        assert_eq!(count_conditions(&serde_json::json!({"_struct": "4b852c44", "conditions": []}), 7), (false, 0, 0));
+    }
+
     #[test]
     fn timelines_resolve_through_composites() {
         use TimelineItem::*;
         let ids: HashMap<u32, TimelineItem> = [
             (1, Reference { scene: 100, section: 7 }),
+            // a second key for the same section (a repeated start map)
+            (7, Reference { scene: 100, section: 7 }),
             // composite with its own id
             (2, Composite { id: Some(1), sections: vec![] }),
             // composite whose id is missing: the first listed id in the map
@@ -1216,9 +1562,10 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let starts = [(3, 30.0), (1, 10.0), (2, 20.0), (4, 40.0), (6, 50.0), (1, 10.0)];
+        let starts = [(3, 30.0), (1, 10.0), (2, 20.0), (4, 40.0), (6, 50.0), (1, 10.0), (7, 10.0)];
         let got = resolve_timeline(&starts, &ids);
         assert_eq!(got.iter().map(|s| (s.start, s.scene, s.section)).collect::<Vec<_>>(), vec![(10.0, 100, 7), (20.0, 100, 7), (30.0, 100, 7)]);
+        assert_eq!((got[0].key, got[0].also.clone()), (1, vec![7]));
     }
 
     fn audio_index(banks: &[(u64, &[u32])]) -> crate::audio::AudioIndex {
