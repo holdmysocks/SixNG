@@ -1130,6 +1130,14 @@ enum Cmd {
     /// caches the result in <work>/index/<archive>.cutscenes.json. Models
     /// resolve against the names of every indexed archive. A scene's clips
     /// play on a character with `outfit <character> --clip cin@<scene>`.
+    /// With the archive's audio index (`sixng audio`), each scene also gets
+    /// its audio bank: the one bank holding two or more of the streams
+    /// `joaat("<name>.<channel>") & 0x1FFFFFFF` (channels c, l, r, ad, ls,
+    /// rs, music.l, music.r) for the scene name, the name without its `_pN`
+    /// / `_tNN` / `_xN` suffixes, an audio name in its scene files, or the
+    /// bank of the master timelines placing it. Scenes
+    /// placed in a master timeline list the master, the start time, the
+    /// section and the master's own audio bank.
     Cutscenes {
         /// One scene in full (name, `cin@` optional).
         scene: Option<String>,
@@ -2146,7 +2154,12 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let t = Instant::now();
             let c = cutscene::catalog(&ws, archive, *rescan, pr.clone())?;
             let models = cutscene::Models::of_workspace(&ws);
-            let all = cutscene::scenes(&c, &models);
+            let mut all = cutscene::scenes(&c, &models);
+            // audio banks from the archive's audio index, when it has one
+            let aix = sixng_core::audio::index_path(&ws.work, &c.archive).is_file().then(|| sixng_core::audio::load_index(&ws.work, &c.archive)).transpose()?;
+            if let Some(ix) = &aix {
+                cutscene::attach_audio(&mut all, &c, &cutscene::AudioBanks::new(ix));
+            }
             let re = name.as_deref().map(|n| regex::RegexBuilder::new(n).case_insensitive(true).build()).transpose()?;
             let cre = cast.as_deref().map(|n| regex::RegexBuilder::new(n).case_insensitive(true).build()).transpose()?;
             let sel: Vec<&cutscene::Scene> = match scene {
@@ -2180,8 +2193,24 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 "scenes_with_missing_windows": sel.iter().filter(|s| s.windows_missing > 0).count(),
                 "set_models": sel.iter().map(|s| s.set_models.len()).sum::<usize>(),
                 "set_models_unresolved": sel.iter().map(|s| s.set_models_unresolved.len()).sum::<usize>(),
+                "audio_index": aix.is_some(),
+                "with_audio_bank": sel.iter().filter(|s| s.audio.is_some()).count(),
+                "audio_bank_by": {"scene_name": sel.iter().filter(|s| s.audio.as_ref().is_some_and(|a| a.source == "scene name")).count(), "audio_name": sel.iter().filter(|s| s.audio.as_ref().is_some_and(|a| a.source == "audio name")).count(), "master_timeline": sel.iter().filter(|s| s.audio.as_ref().is_some_and(|a| a.source == "master timeline")).count()},
+                "placed_in_master": sel.iter().filter(|s| !s.placements.is_empty()).count(),
+                "placements": sel.iter().map(|s| s.placements.len()).sum::<usize>(),
             });
-            let mut o = json!({"ok": true, "archive": c.archive, "dictionaries": c.dicts.len(), "scene_files": c.files.len(), "totals": totals, "seconds": t.elapsed().as_secs_f64()});
+            // master timelines of the archive: slots, those on a catalogued scene, and masters with an audio bank
+            let hashes: std::collections::HashSet<u32> = all.iter().map(|s| sixng_core::meta7a::joaat(&s.name)).collect();
+            let masters: Vec<&cutscene::SceneFile> = c.files.iter().filter(|f| !f.timeline.is_empty()).collect();
+            let banks = aix.as_ref().map(cutscene::AudioBanks::new);
+            let masters_json = json!({
+                "masters": masters.len(),
+                "slots": masters.iter().map(|f| f.timeline.len()).sum::<usize>(),
+                "slots_on_catalogued_scenes": masters.iter().flat_map(|f| &f.timeline).filter(|sl| hashes.contains(&sl.scene)).count(),
+                "with_audio_name": masters.iter().filter(|f| !f.audio.is_empty()).count(),
+                "with_audio_bank": banks.as_ref().map(|b| masters.iter().filter(|f| f.audio.iter().any(|n| b.find_audio_name(n).is_some())).count()),
+            });
+            let mut o = json!({"ok": true, "archive": c.archive, "dictionaries": c.dicts.len(), "scene_files": c.files.len(), "totals": totals, "master_timelines": masters_json, "seconds": t.elapsed().as_secs_f64()});
             if !*summary {
                 let take = if *limit == 0 { sel.len() } else { *limit };
                 o["scenes"] = json!(sel.iter().take(take).collect::<Vec<_>>());

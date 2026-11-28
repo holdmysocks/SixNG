@@ -1015,6 +1015,13 @@ fn rewrite_tex_calls(s: &str, names: &[(&str, &str)]) -> String {
     out
 }
 
+/// No stickers on the map: this piece of the mesh shader and what the map's
+/// renderer puts in its place, which leaves the stickers' part out of the
+/// pixel program. With it the main pass took about a tenth longer although
+/// the list is empty there and the part never runs (measured: the sticker
+/// laid on flat alone added 0.5 ms to 4.4 ms).
+pub const NO_STICKERS: (&str, &str) = ("let st_n = min(ST[0].flags.x, arrayLength(&ST) - 1u);", "let st_n = 0u;");
+
 /// The map shader for GPU-driven draws: the material group becomes the
 /// shared table and the texture arrays, read through the material index
 /// (the instance's first material plus the vertex's own). None (and the
@@ -1087,11 +1094,7 @@ fn shader_with(common: &str, src: &str, full: bool) -> Option<String> {
                 "fn fs_shadow(i: VOut) {\n    M.base = MATS[i.mid].m.base;\n    M.flags = MATS[i.mid].m.flags;\n    TI0.x = MATS[i.mid].t0.x;"
             },
         )
-        // no stickers on the map: the pixel program without their part.
-        // With it the main pass took about a tenth longer although the
-        // list is empty there and the part never runs (measured: the
-        // sticker laid on flat alone added 0.5 ms to 4.4 ms).
-        && rep("let st_n = min(ST[0].flags.x, arrayLength(&ST) - 1u);", "let st_n = 0u;");
+        && rep(NO_STICKERS.0, NO_STICKERS.1);
     if !ok {
         return None;
     }
@@ -1112,15 +1115,15 @@ fn shader_with(common: &str, src: &str, full: bool) -> Option<String> {
     for (name, to) in slots {
         s = replace_ident(&s, name, to);
     }
-    // the material now comes from a table indexed per pixel, so naga's
-    // uniformity check would reject the texture reads under its branches;
-    // the index is the same over a draw, which is what the check guards
     // The shadow casters' vertex program: a table model has no joints and
     // no strands, so its place is the instance's matrix times the vertex;
     // the cut-out test needs only the base UV and the material index.
     s.push_str(
         "\n@vertex\nfn vs_shadow_t(v: VIn) -> VOut {\n    var o: VOut;\n    let w = mat4x4<f32>(v.m0, v.m1, v.m2, v.m3) * vec4(v.pos, 1.0);\n    o.clip = F.view_proj * w;\n    o.uv0 = v.uv0;\n    o.mid = u32(v.extra.w + 0.5) + v.joints.w;\n    return o;\n}\n",
     );
+    // the material now comes from a table indexed per pixel, so naga's
+    // uniformity check would reject the texture reads under its branches;
+    // the index is the same over a draw, which is what the check guards
     Some(format!(
         "enable wgpu_binding_array;\ndiagnostic(off, derivative_uniformity);\n{}\n{}",
         common.replace("\r\n", "\n"),
@@ -1203,6 +1206,8 @@ mod tests {
 
     #[test]
     fn map_shader_parses_and_validates() {
+        // the map's own renderer takes the same piece out of the shared shader, without a check of its own
+        assert_eq!(include_str!("shader.wgsl").matches(NO_STICKERS.0).count(), 1);
         for full in [false, true] {
             let src = shader_with(include_str!("atmo_common.wgsl"), include_str!("shader.wgsl"), full).expect("transform");
             let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&src)));

@@ -1612,6 +1612,26 @@ pub struct PoolSurface {
     pub uvs: Vec<[f32; 2]>,
     /// The water shaders it draws with, most triangles first.
     pub shaders: Vec<String>,
+    /// Set when an interior places it: position and rotation are then the
+    /// entity's in interior space, and the geometry goes through the
+    /// interior instance to world space.
+    pub interior: Option<PoolInterior>,
+}
+
+/// The interior instance that places a [`PoolSurface`].
+pub struct PoolInterior {
+    /// joaat of the interior archetype name.
+    pub archetype: u32,
+    /// The interior archetype file that lists the entity.
+    pub interior_file: String,
+    /// The map file with the interior instance, and the instance's index in it.
+    pub instance_map: String,
+    pub instance: usize,
+    /// The instance's world position and rotation (x, y, z, w, applied as stored).
+    pub instance_position: [f32; 3],
+    pub instance_rotation: [f32; 4],
+    /// The entity belongs to an entity set (an optional interior state).
+    pub entity_set: bool,
 }
 
 impl PoolSurface {
@@ -1646,14 +1666,16 @@ impl PoolSurface {
     }
 }
 
-/// Number of named drawables per kind that no map file places outside an
-/// interior.
+/// Number of named drawables per kind that neither a map file nor a placed
+/// interior places.
 pub type Unplaced = std::collections::BTreeMap<&'static str, usize>;
 
 /// Every pool, hot tub, fountain, waterfall, standing water and other small
-/// water body placed on the map by levels.rpf's map files (not interiors):
-/// drawables picked by [`pool_kind`], kept when a LOD 0 geometry draws with a
-/// water shader, and only those geometries.
+/// water body placed on the map by levels.rpf's map files, directly or
+/// inside an interior instance (each instance places its interior's
+/// entities, entity sets included): drawables picked by [`pool_kind`], kept
+/// when a LOD 0 geometry draws with a water shader, and only those
+/// geometries.
 pub fn pool_surfaces(ws: &crate::export::Workspace) -> Result<(Vec<PoolSurface>, Unplaced)> {
     use rayon::prelude::*;
     let lv = ws.resolve("levels")?;
@@ -1668,11 +1690,32 @@ pub fn pool_surfaces(ws: &crate::export::Workspace) -> Result<(Vec<PoolSurface>,
     }
     let metas: Vec<&crate::scan::Entry> = ix.entries.iter().filter(|e| e.sub == "7a").collect();
     let scans = crate::export::scan_meta(&lv, &metas, false, std::sync::Arc::new(|_: &str, _: u64, _: u64| {}));
-    let mut placed = Vec::new();
+    let mut placed: Vec<(u32, [f32; 3], [f32; 4], [f32; 2], String, Option<PoolInterior>)> = Vec::new();
     for s in scans.iter().filter(|s| !s.group) {
         for (i, &(arch, p, q, sxy, sz)) in s.ents.iter().enumerate() {
             if !s.interior.contains(&i) && cand.contains_key(&arch) {
-                placed.push((arch, p, q, [sxy, sz], s.id.clone()));
+                placed.push((arch, p, q, [sxy, sz], s.id.clone(), None));
+            }
+        }
+    }
+    // interiors: the first file that defines each archetype, as `sixng interiors` does
+    let mut by_mlo: std::collections::HashMap<u32, (&crate::export::MetaScan, &crate::meta7a::Mlo)> = std::collections::HashMap::new();
+    for s in &scans {
+        for m in &s.mlos {
+            by_mlo.entry(m.name).or_insert((s, m));
+        }
+    }
+    for s in scans.iter().filter(|s| !s.group) {
+        for (ii, inst) in s.instances.iter().enumerate() {
+            let Some((isc, mlo)) = by_mlo.get(&inst.archetype) else { continue };
+            let sets: std::collections::HashSet<usize> = mlo.set_entities.iter().copied().collect();
+            for &ei in mlo.entities.iter().chain(&mlo.set_entities) {
+                let Some(&(arch, p, q, sxy, sz)) = isc.ents.get(ei) else { continue };
+                if cand.contains_key(&arch) {
+                    let pi = PoolInterior { archetype: inst.archetype, interior_file: isc.id.clone(), instance_map: s.id.clone(), instance: ii,
+                        instance_position: inst.position, instance_rotation: inst.rotation_world, entity_set: sets.contains(&ei) && !mlo.entities.contains(&ei) };
+                    placed.push((arch, p, q, [sxy, sz], isc.id.clone(), Some(pi)));
+                }
             }
         }
     }
@@ -1697,10 +1740,16 @@ pub fn pool_surfaces(ws: &crate::export::Workspace) -> Result<(Vec<PoolSurface>,
         .collect();
     let mut out: Vec<PoolSurface> = placed
         .into_par_iter()
-        .filter_map(|(arch, p, q, sc, file)| {
+        .filter_map(|(arch, p, q, sc, file, interior)| {
             let (r, shaders) = loaded.get(&arch)?.as_ref()?;
             let (name, kind, _) = &cand[&arch];
-            let PlacedMesh { positions, indices, mut uvs, used } = placed_mesh(r, p, q, sc, |si| shaders.get(si as usize).is_some_and(is_water_shader));
+            let PlacedMesh { mut positions, indices, mut uvs, used } = placed_mesh(r, p, q, sc, |si| shaders.get(si as usize).is_some_and(is_water_shader));
+            if let Some(pi) = &interior {
+                for v in &mut positions {
+                    let w = crate::lights::rotate(pi.instance_rotation, *v);
+                    *v = [w[0] + pi.instance_position[0], w[1] + pi.instance_position[1], w[2] + pi.instance_position[2]];
+                }
+            }
             if indices.is_empty() {
                 return None;
             }
@@ -1716,10 +1765,11 @@ pub fn pool_surfaces(ws: &crate::export::Workspace) -> Result<(Vec<PoolSurface>,
                     names.push(n);
                 }
             }
-            Some(PoolSurface { name: name.clone(), kind, map_file: file, position: p, rotation: q, scale: sc, positions, indices, uvs, shaders: names })
+            Some(PoolSurface { name: name.clone(), kind, map_file: file, position: p, rotation: q, scale: sc, positions, indices, uvs, shaders: names, interior })
         })
         .collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name).then(a.map_file.cmp(&b.map_file)));
+    let key = |p: &PoolSurface| p.interior.as_ref().map(|i| (i.instance_map.clone(), i.instance));
+    out.sort_by(|a, b| a.name.cmp(&b.name).then(a.map_file.cmp(&b.map_file)).then(key(a).cmp(&key(b))).then(a.position.map(f32::to_bits).cmp(&b.position.map(f32::to_bits))));
     Ok((out, unplaced))
 }
 
@@ -2023,15 +2073,24 @@ fn write_pools(dir: &std::path::Path, pools: &[PoolSurface], unplaced: &Unplaced
             let names: std::collections::HashSet<&str> = ix.iter().map(|&i| pools[i].name.as_str()).collect();
             let above: Vec<f32> = ix.iter().filter_map(|&i| ground[i].map(|g| pools[i].surface_z() - g)).collect();
             (k.to_string(), json!({"placements": ix.len(), "drawables": names.len(), "area_m2": pct(ix.iter().map(|&i| pools[i].area()).collect()),
-                "surface_above_ground_m": pct(above), "named_but_not_placed_outside_interiors": unplaced.get(k).copied().unwrap_or(0)}))
+                "surface_above_ground_m": pct(above), "in_interiors": ix.iter().filter(|&&i| pools[i].interior.is_some()).count(),
+                "named_but_not_placed": unplaced.get(k).copied().unwrap_or(0)}))
         })
         .collect();
     let rows: Vec<Value> = pools
         .iter()
         .zip(ground)
-        .map(|(p, g)| json!({"name": p.name, "kind": p.kind, "map_file": p.map_file, "position": p.position, "rotation_world": p.rotation, "scale_xy_z": p.scale,
-            "bbox": p.bbox(), "surface_z": p.surface_z(), "area_m2": p.area(), "ground_under_median": g, "shaders": p.shaders,
-            "triangles": p.indices.len() / 3, "vertices": p.positions.len(), "uv0": !p.uvs.is_empty()}))
+        .map(|(p, g)| {
+            let mut v = json!({"name": p.name, "kind": p.kind, "map_file": p.map_file, "position": p.position, "rotation_world": p.rotation, "scale_xy_z": p.scale,
+                "bbox": p.bbox(), "surface_z": p.surface_z(), "area_m2": p.area(), "ground_under_median": g, "shaders": p.shaders,
+                "triangles": p.indices.len() / 3, "vertices": p.positions.len(), "uv0": !p.uvs.is_empty()});
+            if let Some(i) = &p.interior {
+                v["interior"] = json!({"archetype": crate::names::lookup(i.archetype, crate::names::Ctx::Field).unwrap_or_else(|| format!("{:08x}", i.archetype)),
+                    "archetype_hash": format!("{:08x}", i.archetype), "instance_map": i.instance_map, "instance": i.instance,
+                    "instance_position": i.instance_position, "instance_rotation": i.instance_rotation, "entity_set": i.entity_set});
+            }
+            v
+        })
         .collect();
     let mut mats = Vec::new();
     let mut groups = Vec::new();
@@ -2047,11 +2106,11 @@ fn write_pools(dir: &std::path::Path, pools: &[PoolSurface], unplaced: &Unplaced
         groups.push(NodeGroup { name: k.to_string(), prims });
     }
     crate::atomic::write(&dir.join("pools.glb"), crate::gltf::mesh_glb("pools", &groups, &mats, &[], json!({"coordinates": "world space"})))?;
-    let rep = json!({"placements": pools.len(), "drawables": pools.iter().map(|p| p.name.as_str()).collect::<std::collections::HashSet<_>>().len(), "kinds": per_kind, "shaders": shaders});
+    let rep = json!({"placements": pools.len(), "in_interiors": pools.iter().filter(|p| p.interior.is_some()).count(), "drawables": pools.iter().map(|p| p.name.as_str()).collect::<std::collections::HashSet<_>>().len(), "kinds": per_kind, "shaders": shaders});
     write_json(&dir.join("pools.json"), &json!({
-        "about": "Pools, hot tubs, fountains, waterfalls, standing water and other small water bodies placed by the map files of levels.rpf (not interiors): the LOD 0 geometry drawn with a water shader, in world space. Kinds come from the drawable names; 'water effect' is spray and splash meshes (vfx_water), not a surface.",
+        "about": "Pools, hot tubs, fountains, waterfalls, standing water and other small water bodies placed by the map files of levels.rpf, directly or inside a placed interior: the LOD 0 geometry drawn with a water shader, in world space. Rows with `interior` come from an interior instance: map_file is then the interior archetype file, position and rotation_world are the entity's in interior space, and the geometry and bbox are in world space through the instance (instance_position, then instance_rotation applied as stored). entity_set marks entities that only an entity set (an optional interior state) holds. An interior placed several times gives one row per instance. Kinds come from the drawable names; 'water effect' is spray and splash meshes (vfx_water), not a surface.",
         "coordinates": "RAGE world space, Z-up, metres; pools.glb is the same geometry in glTF Y-up (x, z, -y)",
-        "ground": "ground_under_median: the water height map under the vertices (median); surface_z: median vertex height",
+        "ground": "ground_under_median: the water height map under the vertices (median); surface_z: median vertex height. Interiors can lie below the ground the height map holds",
         "summary": rep, "pools": rows}))?;
     Ok(rep)
 }

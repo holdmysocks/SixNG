@@ -1146,7 +1146,12 @@ impl Renderer3D {
         let color_fmt = if hdr { crate::atmo::HDR_FMT } else { COLOR_FMT };
         let shadow = crate::shadow::ShadowGpu::new(device, hdr, std::mem::size_of::<FrameU>() as u64);
         let atmo = crate::atmo::Atmosphere::new(device, &rs.queue, &shadow);
-        let shader_src = format!("{}\n{}", include_str!("atmo_common.wgsl"), include_str!("shader.wgsl"));
+        let mut shader_src = format!("{}\n{}", include_str!("atmo_common.wgsl"), include_str!("shader.wgsl"));
+        if hdr {
+            // the map's renderer: no stickers there (see NO_STICKERS)
+            let (from, to) = crate::gpu_draw::NO_STICKERS;
+            shader_src = shader_src.replace(from, to);
+        }
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sixng shader"),
             source: wgpu::ShaderSource::Wgsl(shader_src.into()),
