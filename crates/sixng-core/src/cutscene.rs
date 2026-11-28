@@ -87,7 +87,7 @@ pub fn mission_ids<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> 
     v
 }
 /// Bumped when the cached catalog's layout or contents change.
-pub const CATALOG_VERSION: u32 = 7;
+pub const CATALOG_VERSION: u32 = 8;
 
 /// Struct and member hashes of the scene files.
 pub mod hashes {
@@ -153,6 +153,14 @@ pub mod hashes {
     pub const SUBTITLE_SPEAKER: u32 = 0x97bf_dfda;
     pub const EVENT_START: u32 = 0x929d_b78d;
     pub const EVENT_END: u32 = 0x2b30_c60b;
+    /// `fwAnimSceneSectionData`: one layer of a composite section, holding
+    /// an event list (`fwAnimSceneEventListData`, member `events`: pointers
+    /// to the events). The sections a composite lists play together from
+    /// the composite's start, so their event times count from there.
+    pub const SECTION: u32 = 0x64e8_ac67;
+    pub const SECTION_EVENTS: u32 = 0xdb01_2f3b;
+    pub const EVENT_LIST: u32 = 0xeed7_e46f;
+    pub const EVENT_LIST_EVENTS: u32 = 0xdb01_2f3b;
 }
 
 /// A subtitle event of a scene file.
@@ -164,19 +172,72 @@ pub struct SubtitleEvent {
     pub speaker: u32,
     pub start: f32,
     pub end: f32,
+    /// Id-map keys the event plays under: its section and the composite
+    /// sections that list that section. A master slot's `sectionId` names
+    /// one of them, and the event's times count from that slot's start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sections: Vec<u32>,
 }
 
-/// The subtitle events of a scene file, by start time. Events without a
+/// The objects a section's event list points to: (struct hash, offset).
+fn section_events(m: &Meta, sec: usize) -> Vec<(u32, usize)> {
+    use hashes::*;
+    let Some((list_off, _)) = member_off(m, SECTION, SECTION_EVENTS) else { return Vec::new() };
+    let Some(arr) = m.structs.get(&EVENT_LIST).and_then(|sd| sd.members.iter().find(|x| x.hash == EVENT_LIST_EVENTS && x.ty == 0x5c)).map(|x| x.off as usize) else { return Vec::new() };
+    let a = sec + list_off + arr;
+    let n = m.r.u32(a) as usize;
+    let Some((_, base)) = m.ptr(m.r.u64(a + 8)).filter(|_| n < 100_000) else { return Vec::new() };
+    (0..n).filter_map(|i| m.ptr(m.r.u64(base + 8 * i))).collect()
+}
+
+/// Event offset -> the id-map keys it plays under: the section whose event
+/// list holds it and every composite that lists that section.
+fn event_sections(m: &Meta) -> HashMap<usize, Vec<u32>> {
+    use hashes::*;
+    let entries = map_entries(m);
+    let mut by_section: HashMap<u32, Vec<usize>> = HashMap::new();
+    for &(key, h, p) in &entries {
+        if h == SECTION {
+            by_section.entry(key).or_insert_with(|| section_events(m, p).into_iter().map(|x| x.1).collect());
+        }
+    }
+    let mut out: HashMap<usize, Vec<u32>> = HashMap::new();
+    for (key, evs) in &by_section {
+        for &o in evs {
+            out.entry(o).or_default().push(*key);
+        }
+    }
+    for &(key, h, p) in &entries {
+        if h != COMPOSITE {
+            continue;
+        }
+        let Some(serde_json::Value::Array(a)) = m.member_value(h, p, COMPOSITE_SECTIONS) else { continue };
+        for sec in a.iter().filter_map(|v| v.as_u64()).map(|x| x as u32) {
+            for &o in by_section.get(&sec).into_iter().flatten() {
+                out.entry(o).or_default().push(key);
+            }
+        }
+    }
+    for v in out.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+    out
+}
+
+/// The subtitle events of a scene file, by start time, each with the
+/// sections it plays under ([`SubtitleEvent::sections`]). Events without a
 /// label are left out.
 pub fn subtitle_events(m: &Meta) -> Vec<SubtitleEvent> {
     use hashes::*;
     let (Some(sp), Some(st), Some(en)) = (member_off(m, SUBTITLE, SUBTITLE_SPEAKER), member_off(m, SUBTITLE, EVENT_START), member_off(m, SUBTITLE, EVENT_END)) else { return Vec::new() };
+    let secs = event_sections(m);
     let mut out: Vec<SubtitleEvent> = m
         .objects(SUBTITLE)
         .into_iter()
         .filter_map(|o| {
             let label = m.member_value(SUBTITLE, o, SUBTITLE_LABEL)?.as_str().filter(|x| !x.is_empty())?.to_string();
-            Some(SubtitleEvent { label, speaker: m.r.u32(o + sp.0), start: m.r.f32(o + st.0), end: m.r.f32(o + en.0) })
+            Some(SubtitleEvent { label, speaker: m.r.u32(o + sp.0), start: m.r.f32(o + st.0), end: m.r.f32(o + en.0), sections: secs.get(&o).cloned().unwrap_or_default() })
         })
         .collect();
     out.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.label.cmp(&b.label)));
@@ -1047,6 +1108,14 @@ pub struct Scene {
     pub subtitles: Vec<SceneSubtitle>,
 }
 
+/// A line's time on a master's audio bank clock.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct BankTime {
+    /// The master (scene file entry id).
+    pub master: String,
+    pub time: f32,
+}
+
 /// A subtitle line of a scene.
 #[derive(Clone, Debug, Serialize)]
 pub struct SceneSubtitle {
@@ -1056,11 +1125,10 @@ pub struct SceneSubtitle {
     /// Seconds into the scene.
     pub start: f32,
     pub end: f32,
-    /// The start on the audio bank clock of the one master that places the
-    /// scene (its placement's `bank_time` plus `start`); none for scenes
-    /// placed in no master or in several slots.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bank_time: Option<f32>,
+    /// Where the line plays on master bank clocks: for each slot whose
+    /// section the line plays under, the slot's `bank_time` plus `start`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bank_times: Vec<BankTime>,
     /// Text from the dialogue links.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
@@ -1216,16 +1284,33 @@ pub fn scenes(c: &Catalog, models: &Models) -> Vec<Scene> {
             set_models_unresolved: set_unres,
             audio: None,
             subtitles: {
-                let pl = placed.get(&joaat(scene));
-                let base = pl.filter(|v| v.len() == 1).map(|v| v[0].bank_time);
+                let pl: &[Placement] = placed.get(&joaat(scene)).map_or(&[], |v| v.as_slice());
                 let mut v: Vec<SceneSubtitle> = files
                     .iter()
                     .filter(|f| f.timeline.is_empty())
                     .flat_map(|f| &f.subtitles)
-                    .map(|e| SceneSubtitle { label: e.label.clone(), speaker: format!("{:08x}", e.speaker), start: e.start, end: e.end, bank_time: base.map(|b| b + e.start), text: None, speaker_agrees: None })
+                    .map(|e| {
+                        let bank_times = pl
+                            .iter()
+                            .filter(|p| u32::from_str_radix(&p.section, 16).is_ok_and(|x| e.sections.contains(&x)))
+                            .map(|p| BankTime { master: p.master.clone(), time: p.bank_time + e.start })
+                            .collect();
+                        SceneSubtitle { label: e.label.clone(), speaker: format!("{:08x}", e.speaker), start: e.start, end: e.end, bank_times, text: None, speaker_agrees: None }
+                    })
                     .collect();
                 v.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.label.cmp(&b.label)));
-                v.dedup_by(|a, b| a.label == b.label && a.start == b.start);
+                // the same line in two files (a scene and its variant): one line, all its times
+                v.dedup_by(|a, b| {
+                    let same = a.label == b.label && a.start == b.start;
+                    if same {
+                        b.bank_times.append(&mut a.bank_times);
+                    }
+                    same
+                });
+                for x in &mut v {
+                    x.bank_times.sort_by(|a, b| a.master.cmp(&b.master).then(a.time.total_cmp(&b.time)));
+                    x.bank_times.dedup();
+                }
                 v
             },
             placements: placed.get(&joaat(scene)).cloned().unwrap_or_default(),
@@ -1574,10 +1659,19 @@ mod tests {
             audio: vec!["test_scene_audio".into()],
             timeline: vec![],
             fsm: vec![],
-            subtitles: vec![SubtitleEvent { label: "TEST_SCENE_2".into(), speaker: joaat("lucia"), start: 3.0, end: 4.0 }, SubtitleEvent { label: "TEST_SCENE_1".into(), speaker: joaat("boss"), start: 1.0, end: 2.0 }],
+            subtitles: vec![SubtitleEvent { label: "TEST_SCENE_2".into(), speaker: joaat("lucia"), start: 3.0, end: 4.0, sections: vec![] }, SubtitleEvent { label: "TEST_SCENE_1".into(), speaker: joaat("boss"), start: 1.0, end: 2.0, sections: vec![] }],
         };
-        // the second scene's own file: one line (placed in the master at 12.5 s, bank time 10 s)
-        let f2 = SceneFile { id: "a.rpf@50".into(), states: vec![joaat("other_scene_p1_t01")], objects: vec![], audio: vec![], timeline: vec![], fsm: vec![], subtitles: vec![SubtitleEvent { label: "OTHER_1".into(), speaker: 0x1234, start: 0.5, end: 1.5 }] };
+        // the second scene's own file: a line of section 2 (placed in the master at 12.5 s,
+        // bank time 10 s) and one of a section no slot plays
+        let f2 = SceneFile {
+            id: "a.rpf@50".into(),
+            states: vec![joaat("other_scene_p1_t01")],
+            objects: vec![],
+            audio: vec![],
+            timeline: vec![],
+            fsm: vec![],
+            subtitles: vec![SubtitleEvent { label: "OTHER_1".into(), speaker: 0x1234, start: 0.5, end: 1.5, sections: vec![2, 9] }, SubtitleEvent { label: "OTHER_2".into(), speaker: 0x1234, start: 0.25, end: 1.0, sections: vec![9] }],
+        };
         // a master timeline that places the second scene's section 2 at 12.5 s
         let master = SceneFile { id: "a.rpf@40".into(), states: vec![joaat("test_master")], objects: vec![], audio: vec!["tst_test_master".into()], timeline: vec![Slot { key: 11, also: vec![], start: 2.5, scene: 5, section: 1 }, Slot { key: 12, also: vec![], start: 12.5, scene: joaat("other_scene_p1_t01"), section: 2 }, Slot { key: 13, also: vec![14], start: 20.0, scene: 6, section: 3 }], fsm: test_fsm(), subtitles: vec![] };
         // a second scene without a scene file of its own
@@ -1622,9 +1716,10 @@ mod tests {
         let c = catalog();
         let mut all = scenes(&c, &Models::default());
         let s = &all[0];
-        assert_eq!(s.subtitles.iter().map(|x| (x.label.as_str(), x.start, x.bank_time)).collect::<Vec<_>>(), vec![("TEST_SCENE_1", 1.0, None), ("TEST_SCENE_2", 3.0, None)]);
-        // placed once in the master: on its bank clock
-        assert_eq!(all[1].subtitles.iter().map(|x| (x.label.as_str(), x.bank_time)).collect::<Vec<_>>(), vec![("OTHER_1", Some(10.5))]);
+        assert_eq!(s.subtitles.iter().map(|x| (x.label.as_str(), x.start, x.bank_times.len())).collect::<Vec<_>>(), vec![("TEST_SCENE_1", 1.0, 0), ("TEST_SCENE_2", 3.0, 0)]);
+        // a line of the slot's section is on the master's bank clock; the other is not
+        let bt = BankTime { master: "a.rpf@40".into(), time: 10.5 };
+        assert_eq!(all[1].subtitles.iter().map(|x| (x.label.as_str(), x.bank_times.clone())).collect::<Vec<_>>(), vec![("OTHER_2", vec![]), ("OTHER_1", vec![bt])]);
         let link = |label: &str, sp: Option<(&str, u32)>, text: &str| DialogueLink { subtitle_key: joaat(label), speaker: sp.map(|(l, h)| Speaker { label: l.into(), hash: Some(h) }), audio: None, text: Some(text.into()), mission: None, scene: None };
         let links = DialogueLinks {
             schema_version: 0,
@@ -1639,7 +1734,7 @@ mod tests {
         let v: Vec<_> = all[0].subtitles.iter().map(|x| (x.speaker.as_str(), x.text.as_deref(), x.speaker_agrees)).collect();
         assert_eq!(v, vec![("boss", Some("Hello."), Some(true)), ("lucia", Some("Bye."), Some(false))]);
         // a label the links lack keeps its hash and has no text
-        assert_eq!((all[1].subtitles[0].speaker.as_str(), all[1].subtitles[0].text.as_deref()), ("00001234", None));
+        assert_eq!((all[1].subtitles[1].speaker.as_str(), all[1].subtitles[1].text.as_deref()), ("00001234", None));
     }
 
     #[test]
