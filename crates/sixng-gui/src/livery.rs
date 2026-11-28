@@ -704,9 +704,14 @@ impl ZoneSet {
     }
 
     /// The reverse of `point` for a place on or off the panel: the UV point
-    /// it stands over, seen along the panel's normal.
-    pub fn uv_at(&self, p: Vec3) -> Vec2 {
-        let (right, down) = self.axes();
+    /// it stands over, seen along the panel's normal, or from `from` when
+    /// that is a side of the vehicle (the way a flat sticker projected
+    /// from that side sees it, so its middle comes to lie over `p`).
+    pub fn uv_at(&self, p: Vec3, from: Side) -> Vec2 {
+        let det_of = |(right, down): (Vec3, Vec3)| right.dot(self.du) * down.dot(self.dv) - right.dot(self.dv) * down.dot(self.du);
+        // a side the panel is seen edge-on from: along the panel's normal
+        let own = self.axes();
+        let (right, down) = from.normal().map(axes_of).filter(|ax| det_of(*ax).abs() > 0.05 * det_of(own).abs()).unwrap_or(own);
         let (a, b, c, d) = (right.dot(self.du), right.dot(self.dv), down.dot(self.du), down.dot(self.dv));
         let det = a * d - b * c;
         if det.abs() < 1e-9 {
@@ -1394,7 +1399,7 @@ mod tests {
                 let flat = Vec2::new(p[0] * at.x + p[1] * at.y + p[2] * at.z + p[3], p[4] * at.x + p[5] * at.y + p[6] * at.z + p[7]);
                 assert!((by_uv - flat).length() < 1e-4, "{by_uv} {flat}");
                 // and a place on the model gives its UV point back
-                assert!((set.uv_at(at) - Vec2::new(u, v)).length() < 1e-4);
+                assert!((set.uv_at(at, Side::Panels) - Vec2::new(u, v)).length() < 1e-4);
             }
             // from a side: it looks that way whatever the wall does, the
             // picture upright (up the vehicle is up the picture) and its
@@ -1411,6 +1416,18 @@ mod tests {
                     assert!((b.y + s.rotation.to_radians().cos() / s.size[1]).abs() < 1e-4, "{side:?} {b}");
                 }
                 assert_eq!(Side::parse(&format!("{side:?}").to_lowercase()), Some(side));
+                // a place on the model taken as the centre: the picture's
+                // middle lies over it (not from a side the wall is edge-on to)
+                let at = Vec3::new(0.7, 0.4, 0.3);
+                let mut t = s.clone();
+                t.centre = set.uv_at(at, side).to_array();
+                let q = set.projection(&t);
+                let mid = Vec2::new(q[0] * at.x + q[1] * at.y + q[2] * at.z + q[3], q[4] * at.x + q[5] * at.y + q[6] * at.z + q[7]);
+                if side == Side::Back || side == Side::Front {
+                    assert!((mid - Vec2::splat(0.5)).length() < 1e-4, "{side:?} {mid}");
+                } else {
+                    assert_eq!(t.centre, set.uv_at(at, Side::Panels).to_array());
+                }
             }
             s.from = Side::Panels;
             // one record on the wall, one more per other model it lies on

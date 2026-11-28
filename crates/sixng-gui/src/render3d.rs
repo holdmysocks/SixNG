@@ -869,6 +869,8 @@ struct GdFrame<'a> {
     rest: Vec<&'a GpuModel>,
     /// Models it draws, whose decals the old path still draws.
     on: Vec<&'a GpuModel>,
+    /// Triangles (times instances) of its shadow casters (`SHADOW_TRIS`).
+    tris: u64,
 }
 
 /// A map cell on the GPU (see cells.rs).
@@ -1964,6 +1966,9 @@ impl Renderer3D {
             };
             let opaque = main("opaque (material table)", depth_st(&st_write), None);
             let fb = main("fallback (material table)", depth_st(&st_fb), Some(wgpu::Face::Back));
+            // shadow casters: the short vertex program (`shadowfull`: the
+            // mesh one, for A/B runs)
+            let vs_shadow = if crate::gpu_draw::opt("shadowfull") { "vs_mesh" } else { "vs_shadow_t" };
             let shadow_ds = || {
                 Some(wgpu::DepthStencilState {
                     format: crate::shadow::FMT,
@@ -1976,7 +1981,7 @@ impl Renderer3D {
             let shadow = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("shadow (material table)"),
                 layout: Some(&lay),
-                vertex: wgpu::VertexState { module: &m, entry_point: Some("vs_mesh"), compilation_options: Default::default(), buffers: &vbufs },
+                vertex: wgpu::VertexState { module: &m, entry_point: Some(vs_shadow), compilation_options: Default::default(), buffers: &vbufs },
                 primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
                 depth_stencil: shadow_ds(),
                 multisample: Default::default(),
@@ -1993,7 +1998,7 @@ impl Renderer3D {
             let solid = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("solid shadow (material table)"),
                 layout: Some(&lay_solid),
-                vertex: wgpu::VertexState { module: &m, entry_point: Some("vs_mesh"), compilation_options: Default::default(), buffers: &vbufs },
+                vertex: wgpu::VertexState { module: &m, entry_point: Some(vs_shadow), compilation_options: Default::default(), buffers: &vbufs },
                 primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default() },
                 depth_stencil: shadow_ds(),
                 multisample: Default::default(),
@@ -2175,6 +2180,10 @@ pub fn has_pixels(i: &glb::Image) -> bool {
 
 /// Render timing totals (µs): pass recording (incl. pass end), encoder
 /// finish, submit; then frames.
+/// Triangles (times instances) of the model shadow casters drawn this
+/// frame, the table's and the old path's (map cells not counted).
+pub static SHADOW_TRIS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub static RTIME: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
@@ -2408,12 +2417,14 @@ impl Uploader {
         });
         let mut mat_bytes = vec![0u8; (MAT_STRIDE as usize) * mats.len()];
         for (k, mt) in mats.iter().enumerate() {
-            // bit 6: the base colour is laid out in the fourth UV set
+            // bits 6 and 7: the base colour is laid out in the fourth or the
+            // second UV set
             let has = (mt.base.is_some() as u32)
                 | ((mt.normal.is_some() as u32) << 1)
                 | ((mt.packed.is_some() as u32) << 2)
                 | ((mt.emissive.is_some() as u32) << 3)
-                | (((mt.base_uv == 3) as u32) << 6);
+                | (((mt.base_uv == 3) as u32) << 6)
+                | (((mt.base_uv == 1) as u32) << 7);
             let alpha = match mt.alpha_mode.as_str() {
                 "MASK" => 1,
                 "BLEND" => 2,
@@ -3382,6 +3393,7 @@ impl Renderer3D {
                         continue;
                     }
                     be.draw_indexed(r.clone(), gm.base_vertex, range.clone());
+                    SHADOW_TRIS.fetch_add((r.len() / 3 * range.len()) as u64, std::sync::atomic::Ordering::Relaxed);
                     n += 1;
                     gm.drawn[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     run = None;
@@ -3409,6 +3421,7 @@ impl Renderer3D {
                 }
                 if cut {
                     be.draw_indexed(first..first + me.n_idx, gm.base_vertex, range.clone());
+                    SHADOW_TRIS.fetch_add((me.n_idx as usize / 3 * range.len()) as u64, std::sync::atomic::Ordering::Relaxed);
                     n += 1;
                     gm.drawn[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 } else {
@@ -3417,6 +3430,7 @@ impl Renderer3D {
                 }
             }
             if let Some(r) = run {
+                SHADOW_TRIS.fetch_add((r.len() / 3 * range.len()) as u64, std::sync::atomic::Ordering::Relaxed);
                 be.draw_indexed(r, gm.base_vertex, range.clone());
                 n += 1;
                 gm.drawn[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3521,7 +3535,7 @@ impl Renderer3D {
         if look.mode != 0 || crate::gpu_draw::opt("nodraw") {
             return None;
         }
-        let plan = self.shadow_plan(cam, look, aspect).filter(|_| !crate::gpu_draw::opt("noshadow"));
+        let plan = self.shadow_plan(cam, look, aspect).filter(|_| !crate::gpu_draw::opt("noshadow") && !crate::gpu_draw::opt("shadowold"));
         // (stencil, geometry chunk, instance chunk)
         type Key = (u32, usize, usize);
         let mut main: Vec<(Key, Args)> = Vec::new();
@@ -3530,6 +3544,7 @@ impl Renderer3D {
         let mut solid: [Vec<(Key, Args)>; CASCADES] = Default::default();
         let (mut rest, mut on) = (Vec::new(), Vec::new());
         let mut culled = [0u32; 3];
+        let mut tris = 0u64;
         // runs of index ranges: (first index, count)
         let push_run = |runs: &mut Vec<(u32, u32)>, first: u32, n: u32| match runs.last_mut() {
             Some(r) if r.0 + r.1 == first => r.1 += n,
@@ -3611,9 +3626,11 @@ impl Renderer3D {
                         push_run(to, me.first(), me.n_idx);
                     }
                     for r in &runs {
+                        tris += (r.1 / 3) as u64 * nn as u64;
                         solid[i].push(((0, h.gc, nc), args(r, n0, nn)));
                     }
                     for r in &cuts {
+                        tris += (r.1 / 3) as u64 * nn as u64;
                         shadow[i].push(((0, h.gc, nc), args(r, n0, nn)));
                     }
                 }
@@ -3657,7 +3674,7 @@ impl Renderer3D {
             }
             queue.write_buffer(self.gd_args.as_ref().unwrap(), 0, bytemuck::cast_slice(&all));
         }
-        Some(GdFrame { snap, main, fb, shadow, shadow_solid, rest, on })
+        Some(GdFrame { snap, main, fb, shadow, shadow_solid, rest, on, tris })
     }
 
     /// Record one pass's material-table lists: one indirect call per set of
@@ -3732,13 +3749,15 @@ impl Renderer3D {
     ) {
         use crate::shadow::{ShadowU, CASCADES};
         self.shadow_draws = 0;
+        SHADOW_TRIS.store(gd.map_or(0, |f| f.tris), std::sync::atomic::Ordering::Relaxed);
         let Some((cs, due)) = self.shadow_plan(cam, look, aspect) else {
             self.shadow.drawn = [None; CASCADES];
             queue.write_buffer(&self.shadow.ub, 0, bytemuck::bytes_of(&ShadowU::default()));
             return;
         };
-        // the models the material table does not draw
-        let models = gd.map_or(models, |f| &f.rest[..]);
+        // the models the material table does not draw (`shadowold`: the old
+        // way draws every model's shadow, for A/B runs)
+        let models = if crate::gpu_draw::opt("shadowold") { models } else { gd.map_or(models, |f| &f.rest[..]) };
         for i in 0..CASCADES {
             if !due[i] {
                 continue;
