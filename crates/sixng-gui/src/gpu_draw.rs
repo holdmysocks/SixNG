@@ -134,10 +134,8 @@ pub mod watch {
 /// pools) and `nopool` (textures go to the arrays, geometry stays in its
 /// own buffers and is drawn the old way), `shadowold` (the table's models
 /// cast their shadows the old way), `vsfull` (each program loads the
-/// whole material row, as before), and for timing only `shadownocut`
-/// (cut-out casters without their alpha test), `shadowmodel` (shadow
-/// sub-draws in model order, not grouped by chunk) and `shadowfull` (shadow
-/// casters with the full mesh vertex program, not the short one).
+/// whole material row, as before) and `shadowfull` (shadow casters with
+/// the full mesh vertex program, not the short one).
 pub fn opt(name: &str) -> bool {
     static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     V.get_or_init(|| std::env::var("SIXNG_MAP_GPU_TABLE").unwrap_or_default()).split(',').any(|s| s.trim() == name)
