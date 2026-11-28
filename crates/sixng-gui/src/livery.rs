@@ -129,6 +129,9 @@ pub struct Sticker {
     /// centre is the place on the model the UV centre stands for.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub flat: bool,
+    /// The side a flat sticker is projected from.
+    #[serde(default, skip_serializing_if = "Side::is_panels")]
+    pub from: Side,
     /// Zones of other models a flat sticker lies on as well.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub also: Vec<Also>,
@@ -151,7 +154,7 @@ pub struct Also {
 
 impl Sticker {
     pub fn new(picture: Picture) -> Sticker {
-        Sticker { name: String::new(), picture, model: String::new(), zones: Vec::new(), uv_set: 1, centre: [0.5, 0.5], size: [1.0, 1.0], rotation: 0.0, mirror: false, mask: false, colours: white3(), opacity: 1.0, visible: true, shader_uv: None, game_uv: None, flat: false, also: Vec::new(), projection: None, fresh: true }
+        Sticker { name: String::new(), picture, model: String::new(), zones: Vec::new(), uv_set: 1, centre: [0.5, 0.5], size: [1.0, 1.0], rotation: 0.0, mirror: false, mask: false, colours: white3(), opacity: 1.0, visible: true, shader_uv: None, game_uv: None, flat: false, from: Side::Panels, also: Vec::new(), projection: None, fresh: true }
     }
 }
 
@@ -602,16 +605,72 @@ pub struct ZoneSet {
     pub anchor_uv: Vec2,
 }
 
+/// The side of the vehicle a flat sticker is projected from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Side {
+    /// Along the normal of the sticker's own panels.
+    #[default]
+    Panels,
+    Left,
+    Right,
+    Top,
+    Front,
+    Back,
+}
+
+impl Side {
+    pub const ALL: [Side; 6] = [Side::Panels, Side::Left, Side::Right, Side::Top, Side::Front, Side::Back];
+
+    pub fn is_panels(&self) -> bool {
+        *self == Side::Panels
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Side::Panels => "its panels",
+            Side::Left => "the left",
+            Side::Right => "the right",
+            Side::Top => "the top",
+            Side::Front => "the front",
+            Side::Back => "the back",
+        }
+    }
+
+    /// From its name in the livery file (also what `--livery-from` takes).
+    pub fn parse(s: &str) -> Option<Side> {
+        Side::ALL.into_iter().find(|x| format!("{x:?}").eq_ignore_ascii_case(s.trim()))
+    }
+
+    /// The way the side looks, in the vehicle's space as the viewer shows
+    /// it (Y up, the front towards -Z, the left towards -X).
+    pub fn normal(self) -> Option<Vec3> {
+        match self {
+            Side::Panels => None,
+            Side::Left => Some(Vec3::NEG_X),
+            Side::Right => Some(Vec3::X),
+            Side::Top => Some(Vec3::Y),
+            Side::Front => Some(Vec3::NEG_Z),
+            Side::Back => Some(Vec3::Z),
+        }
+    }
+}
+
+/// "To the right" and "down" on a surface that looks along `n`, as seen
+/// from outside: a picture laid along them reads upright.
+fn axes_of(n: Vec3) -> (Vec3, Vec3) {
+    // on a roof or bonnet "up" is towards the front of the vehicle
+    let up = if n.y.abs() > 0.9 { Vec3::new(0.0, 0.0, -1.0) } else { Vec3::Y };
+    let right = up.cross(n).normalize_or_zero();
+    let down = right.cross(n).normalize_or_zero();
+    (right, down)
+}
+
 impl ZoneSet {
     /// The panel's "to the right" and "down" as seen from outside (unit
     /// vectors in the surface): a picture laid along them reads upright.
     pub fn axes(&self) -> (Vec3, Vec3) {
-        let n = if self.normal.length_squared() > 0.0 { self.normal } else { self.du.cross(self.dv).normalize_or_zero() };
-        // on a roof or bonnet "up" is towards the front of the vehicle
-        let up = if n.y.abs() > 0.9 { Vec3::new(0.0, 0.0, -1.0) } else { Vec3::Y };
-        let right = up.cross(n).normalize_or_zero();
-        let down = right.cross(n).normalize_or_zero();
-        (right, down)
+        axes_of(if self.normal.length_squared() > 0.0 { self.normal } else { self.du.cross(self.dv).normalize_or_zero() })
     }
 
     /// Metres per UV unit along U and V.
@@ -660,9 +719,15 @@ impl ZoneSet {
     /// A flat sticker's numbers: with P a place on the model (the vehicle's
     /// space as stored, doors shut), `u = A·P + ou`, `v = B·P + ov`, and N
     /// the direction the faces under it look in. `[A, ou, B, ov, N]`. On a
-    /// flat panel this draws what `shader_uv` draws.
+    /// flat panel this draws what `shader_uv` draws. With a side chosen
+    /// (`Sticker::from`) N is that side's and the picture stands upright
+    /// as seen from it; its middle is still the place the centre stands
+    /// for on the panels.
     pub fn projection(&self, s: &Sticker) -> [f32; 11] {
-        let (right, down) = self.axes();
+        let (right, down) = match s.from.normal() {
+            Some(n) => axes_of(n),
+            None => self.axes(),
+        };
         let (sin, cos) = s.rotation.to_radians().sin_cos();
         let mut r = right * cos - down * sin;
         let d = down * cos + right * sin;
@@ -674,7 +739,7 @@ impl ZoneSet {
         let c = self.point(Vec2::from(s.centre));
         // the way the panel looks, square to the picture
         let n = right.cross(down).normalize_or_zero();
-        let n = if n.dot(self.normal) >= 0.0 { n } else { -n };
+        let n = if n.dot(s.from.normal().unwrap_or(self.normal)) >= 0.0 { n } else { -n };
         [a.x, a.y, a.z, 0.5 - a.dot(c), b.x, b.y, b.z, 0.5 - b.dot(c), n.x, n.y, n.z]
     }
 
@@ -1331,6 +1396,23 @@ mod tests {
                 // and a place on the model gives its UV point back
                 assert!((set.uv_at(at) - Vec2::new(u, v)).length() < 1e-4);
             }
+            // from a side: it looks that way whatever the wall does, the
+            // picture upright (up the vehicle is up the picture) and its
+            // middle where the centre is on the wall
+            for side in [Side::Left, Side::Right, Side::Top, Side::Front, Side::Back] {
+                s.from = side;
+                let q = set.projection(&s);
+                let (a, b, n) = (Vec3::new(q[0], q[1], q[2]), Vec3::new(q[4], q[5], q[6]), Vec3::new(q[8], q[9], q[10]));
+                assert!((n - side.normal().unwrap()).length() < 1e-5);
+                assert!(a.dot(n).abs() < 1e-5 && b.dot(n).abs() < 1e-5 && a.dot(b).abs() < 1e-5);
+                let c = set.point(Vec2::from(s.centre));
+                assert!((a.dot(c) + q[3] - 0.5).abs() < 1e-4 && (b.dot(c) + q[7] - 0.5).abs() < 1e-4);
+                if side != Side::Top {
+                    assert!((b.y + s.rotation.to_radians().cos() / s.size[1]).abs() < 1e-4, "{side:?} {b}");
+                }
+                assert_eq!(Side::parse(&format!("{side:?}").to_lowercase()), Some(side));
+            }
+            s.from = Side::Panels;
             // one record on the wall, one more per other model it lies on
             s.flat = true;
             s.also = vec![Also { model: "box".into(), zones: vec![2, 40] }, Also { model: "not fitted".into(), zones: vec![1] }];

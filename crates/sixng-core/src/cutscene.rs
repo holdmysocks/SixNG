@@ -87,7 +87,7 @@ pub fn mission_ids<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> 
     v
 }
 /// Bumped when the cached catalog's layout or contents change.
-pub const CATALOG_VERSION: u32 = 4;
+pub const CATALOG_VERSION: u32 = 5;
 
 /// Struct and member hashes of the scene files.
 pub mod hashes {
@@ -106,6 +106,185 @@ pub mod hashes {
     /// Hash-map entry members: `Key` (u32) and `Item` (embedded or pointer).
     pub const ENTRY_KEY: u32 = 0x6098_a50e;
     pub const ENTRY_ITEM: u32 = 0x063f_a3f2;
+    // The master timeline of a scene file (struct and member names from
+    // vihook's par_names.txt, issue #516). The start-time map's items are
+    // `START` (`Offset`, f32 seconds) under the same keys as the id map,
+    // whose items are references to a scene section or composites that
+    // point on to one.
+    pub const START: u32 = 0x0f53_4235;
+    pub const START_OFFSET: u32 = 0x9132_2c71;
+    /// `fwAnimSceneReferenceSectionData`: one section of a scene, `sceneId` (joaat of the scene
+    /// name) and `sectionId`.
+    pub const REFERENCE: u32 = 0x7f09_852f;
+    pub const REFERENCE_SCENE: u32 = 0xfafe_97a5;
+    pub const REFERENCE_SECTION: u32 = 0x1a43_c2eb;
+    /// `fwAnimSceneCompositeSectionData`: the id of the entry it plays (`9a3e57d2`), else its
+    /// `sectionIds` (`379a4935`).
+    pub const COMPOSITE: u32 = 0xc8d5_1b9e;
+    pub const COMPOSITE_ID: u32 = 0x9a3e_57d2;
+    pub const COMPOSITE_SECTIONS: u32 = 0x379a_4935;
+    /// The scene's audio: member `52c09a55` holds the audio name, whose
+    /// streams are `joaat("<name>.<channel>") & 0x1FFFFFFF`.
+    pub const AUDIO: u32 = 0xdb64_6fb2;
+    pub const AUDIO_NAME: u32 = 0x52c0_9a55;
+}
+
+/// One slot of a master timeline: a scene section that starts `start`
+/// seconds into the master.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Slot {
+    pub start: f32,
+    /// joaat of the scene name (`sceneId`).
+    pub scene: u32,
+    /// `sectionId`.
+    pub section: u32,
+}
+
+/// Channels of a cutscene audio bank, in the order reports list them.
+pub const AUDIO_CHANNELS: [&str; 8] = ["c", "l", "r", "ad", "ls", "rs", "music.l", "music.r"];
+
+/// Stream id of one channel of a cutscene's audio: the low 29 bits of
+/// `joaat("<name>.<channel>")` (lower case).
+pub fn audio_stream_id(name: &str, channel: &str) -> u32 {
+    joaat(&format!("{name}.{channel}")) & 0x1FFF_FFFF
+}
+
+/// A scene name without its part, take and variant suffixes
+/// (`_p1`, `_p0l`, `_t05`, `_x1`): the name its audio bank is hashed from.
+pub fn audio_base_name(scene: &str) -> &str {
+    let mut s = scene;
+    for (lead, rest_ok) in [('x', false), ('t', false), ('p', true)] {
+        if let Some((head, last)) = s.rsplit_once('_') {
+            let mut b = last.bytes();
+            let ok = b.next() == Some(lead as u8) && {
+                let tail = &last[1..];
+                let digits = tail.bytes().take_while(|c| c.is_ascii_digit()).count();
+                digits > 0 && (if rest_ok { tail[digits..].bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) } else { digits == tail.len() })
+            };
+            if ok && !head.is_empty() {
+                s = head;
+            }
+        }
+    }
+    s
+}
+
+/// One channel of a cutscene audio bank.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct AudioChannel {
+    pub channel: &'static str,
+    /// Stream id (hex).
+    pub stream: String,
+    pub seconds: f64,
+}
+
+/// The audio bank of a scene.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct SceneAudio {
+    /// The name the stream ids are hashed from.
+    pub name: String,
+    /// "scene name" (the scene's own name without suffixes), "audio name"
+    /// (named by a scene file's audio record) or "master timeline" (the
+    /// bank of the masters that place the scene).
+    pub source: &'static str,
+    pub archive: String,
+    /// Bank offset in the archive (hex).
+    pub bank: String,
+    pub channels: Vec<AudioChannel>,
+}
+
+/// Stream ids of an audio index, for finding cutscene banks.
+pub struct AudioBanks<'a> {
+    ix: &'a crate::audio::AudioIndex,
+    by_id: HashMap<u32, Vec<usize>>,
+}
+
+impl<'a> AudioBanks<'a> {
+    pub fn new(ix: &'a crate::audio::AudioIndex) -> Self {
+        let mut by_id: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, b) in ix.banks.iter().enumerate() {
+            for s in &b.streams {
+                let v = by_id.entry(s.id).or_default();
+                if v.last() != Some(&i) {
+                    v.push(i);
+                }
+            }
+        }
+        AudioBanks { ix, by_id }
+    }
+
+    /// The one bank that holds at least two channels of `name`. A single
+    /// channel id is left alone (a chance match on 29 bits is likely
+    /// among a few hundred thousand streams), as are names whose channels
+    /// are split over several banks that each hold two or more.
+    pub fn find(&self, name: &str, source: &'static str) -> Option<SceneAudio> {
+        let lower = name.to_ascii_lowercase();
+        let mut per: BTreeMap<usize, Vec<(&'static str, u32)>> = BTreeMap::new();
+        for ch in AUDIO_CHANNELS {
+            let id = audio_stream_id(&lower, ch);
+            for &b in self.by_id.get(&id).into_iter().flatten() {
+                per.entry(b).or_default().push((ch, id));
+            }
+        }
+        let mut hits = per.into_iter().filter(|x| x.1.len() >= 2);
+        let (b, chans) = hits.next()?;
+        if hits.next().is_some() {
+            return None;
+        }
+        let bank = &self.ix.banks[b];
+        let channels = chans
+            .into_iter()
+            .map(|(channel, id)| AudioChannel { channel, stream: format!("{id:08x}"), seconds: bank.streams.iter().find(|s| s.id == id).map_or(0.0, |s| s.seconds()) })
+            .collect();
+        Some(SceneAudio { name: name.to_string(), source, archive: self.ix.archive.clone(), bank: format!("{:x}", bank.off), channels })
+    }
+
+    /// The bank of a scene file's audio name (`<mission>_<scene>`, such as
+    /// `air_tail_air_tail_int`): the name lower-cased, then without one
+    /// leading word after another, until a name has banks with two or more
+    /// channels ([`AudioBanks::find`] then decides).
+    pub fn find_audio_name(&self, name: &str) -> Option<SceneAudio> {
+        let lower = name.to_ascii_lowercase();
+        let mut cand = lower.as_str();
+        loop {
+            if self.has_channels(cand) {
+                return self.find(cand, "audio name");
+            }
+            cand = cand.split_once('_')?.1;
+        }
+    }
+
+    fn has_channels(&self, name: &str) -> bool {
+        let mut per: HashMap<usize, usize> = HashMap::new();
+        AUDIO_CHANNELS.iter().any(|ch| {
+            self.by_id.get(&audio_stream_id(name, ch)).into_iter().flatten().any(|&b| {
+                let n = per.entry(b).or_default();
+                *n += 1;
+                *n >= 2
+            })
+        })
+    }
+}
+
+/// Where a scene section plays in a master timeline.
+#[derive(Clone, Debug, Serialize)]
+pub struct Placement {
+    /// Scene file (entry id) with the master timeline.
+    pub master: String,
+    /// The master's audio names.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub master_audio: Vec<String>,
+    /// Seconds into the master.
+    pub start: f32,
+    /// The next later start in the master, where this slot ends (none for
+    /// the last).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<f32>,
+    /// `start` on the master's audio bank clock: minus the master's
+    /// earliest start.
+    pub bank_time: f32,
+    /// `sectionId` (hex).
+    pub section: String,
 }
 
 /// A scene clip dictionary name split up: `cin@air_beach_ext_p1_t05_x1-3`
@@ -196,6 +375,12 @@ pub struct SceneFile {
     /// joaat of the scene names (the state names).
     pub states: Vec<u32>,
     pub objects: Vec<FileObject>,
+    /// Audio names of the file's audio records (`AUDIO`), sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audio: Vec<String>,
+    /// The master timeline, by start time ([`timeline`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub timeline: Vec<Slot>,
 }
 
 /// Everything read from one archive, cached as JSON in the index folder.
@@ -276,8 +461,9 @@ fn member_off(m: &Meta, s: u32, h: u32) -> Option<(usize, u8)> {
     m.structs.get(&s)?.members.iter().find(|x| x.hash == h).map(|x| (x.off as usize, x.ty))
 }
 
-/// Read a scene file: its state names and its ped, object and camera
-/// entries. None when the resource has no state machine states or none of
+/// Read a scene file: its state names, its ped, object and camera
+/// entries, its audio names and its master timeline. None when the
+/// resource has no state machine states, or neither a timeline nor any of
 /// the three object kinds.
 pub fn scene_file(id: &str, m: &Meta) -> Option<SceneFile> {
     use hashes::*;
@@ -285,7 +471,9 @@ pub fn scene_file(id: &str, m: &Meta) -> Option<SceneFile> {
     let mut states: Vec<u32> = m.objects(STATE).into_iter().map(|o| m.r.u32(o + name.0)).filter(|&h| h != 0).collect();
     states.sort_unstable();
     states.dedup();
-    if states.is_empty() || ![PED, OBJECT, CAMERA].iter().any(|s| m.structs.contains_key(s)) {
+    // master timelines often have no object records of their own
+    let timeline = timeline(m);
+    if states.is_empty() || (timeline.is_empty() && ![PED, OBJECT, CAMERA].iter().any(|s| m.structs.contains_key(s))) {
         return None;
     }
     let ped_model = member_off(m, PED, PED_MODEL);
@@ -309,7 +497,74 @@ pub fn scene_file(id: &str, m: &Meta) -> Option<SceneFile> {
     }
     objects.sort_by_key(|o| (o.key, o.kind.clone()));
     objects.dedup();
-    Some(SceneFile { id: id.to_string(), states, objects })
+    let mut audio: Vec<String> = m.objects(AUDIO).into_iter().filter_map(|o| m.member_value(AUDIO, o, AUDIO_NAME)?.as_str().filter(|s| !s.is_empty()).map(String::from)).collect();
+    audio.sort();
+    audio.dedup();
+    Some(SceneFile { id: id.to_string(), states, objects, audio, timeline })
+}
+
+/// A timeline item: a section reference or a composite.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TimelineItem {
+    Reference { scene: u32, section: u32 },
+    Composite { id: Option<u32>, sections: Vec<u32> },
+}
+
+/// Resolve start times against the id map: each start's key is followed
+/// through composites (their own id, else the first of their listed ids
+/// that is in the map) to a section reference, at most 8 steps. Starts
+/// that end nowhere are dropped. Sorted by start time, without repeats.
+pub fn resolve_timeline(starts: &[(u32, f32)], ids: &HashMap<u32, TimelineItem>) -> Vec<Slot> {
+    let mut out = Vec::new();
+    for &(key, start) in starts {
+        let mut it = ids.get(&key);
+        for _ in 0..8 {
+            match it {
+                Some(TimelineItem::Composite { id, sections }) => {
+                    it = id.and_then(|i| ids.get(&i)).or_else(|| sections.iter().find_map(|s| ids.get(s)));
+                }
+                _ => break,
+            }
+        }
+        if let Some(TimelineItem::Reference { scene, section }) = it {
+            out.push(Slot { start, scene: *scene, section: *section });
+        }
+    }
+    out.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.scene.cmp(&b.scene)).then(a.section.cmp(&b.section)));
+    // a file can hold the start map twice
+    out.dedup();
+    out
+}
+
+/// The master timeline of a scene file: its start-time map's entries
+/// resolved against its id map ([`resolve_timeline`]). Empty for files
+/// without one.
+pub fn timeline(m: &Meta) -> Vec<Slot> {
+    use hashes::*;
+    let Some((off, _)) = member_off(m, START, START_OFFSET) else { return Vec::new() };
+    let u32_of = |v: serde_json::Value| v.as_u64().map(|x| x as u32);
+    let mut starts = Vec::new();
+    let mut ids: HashMap<u32, TimelineItem> = HashMap::new();
+    for (key, h, p) in map_entries(m) {
+        match h {
+            START => starts.push((key, m.r.f32(p + off))),
+            REFERENCE => {
+                let scene = m.member_value(h, p, REFERENCE_SCENE).and_then(u32_of).unwrap_or(0);
+                let section = m.member_value(h, p, REFERENCE_SECTION).and_then(u32_of).unwrap_or(0);
+                ids.entry(key).or_insert(TimelineItem::Reference { scene, section });
+            }
+            COMPOSITE => {
+                let id = m.member_value(h, p, COMPOSITE_ID).and_then(u32_of).filter(|&x| x != 0);
+                let sections = match m.member_value(h, p, COMPOSITE_SECTIONS) {
+                    Some(serde_json::Value::Array(a)) => a.into_iter().filter_map(u32_of).collect(),
+                    _ => Vec::new(),
+                };
+                ids.entry(key).or_insert(TimelineItem::Composite { id, sections });
+            }
+            _ => {}
+        }
+    }
+    resolve_timeline(&starts, &ids)
 }
 
 /// Scan one archive: every scene clip dictionary (unnamed objects whose
@@ -396,7 +651,8 @@ pub fn scan(a: &ArchiveInfo, ix: &ArchiveIndex, progress: crate::export::Progres
     }
     // keep only scene files that name at least one of the scenes
     let scene_hashes: HashSet<u32> = dicts.iter().filter_map(|d| parse_dict_name(&d.name)).flat_map(|(s, _)| [joaat(s), joaat(parent_scene(s))]).collect();
-    files.retain(|f| f.states.iter().any(|h| scene_hashes.contains(h)));
+    // (and master timelines, which place them)
+    files.retain(|f| !f.timeline.is_empty() || f.states.iter().any(|h| scene_hashes.contains(h)));
     dicts.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
     files.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(Catalog { version: CATALOG_VERSION, archive: a.id.clone(), dicts, files })
@@ -596,6 +852,16 @@ pub struct Scene {
     /// spawns or controls): resolved names, then the ids that did not resolve.
     pub set_models: Vec<String>,
     pub set_models_unresolved: Vec<String>,
+    /// The scene's audio bank, when an audio index was given ([`attach_audio`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<SceneAudio>,
+    /// Where the scene's sections play in master timelines.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub placements: Vec<Placement>,
+    /// The audio bank of each master in `placements` (master entry id ->
+    /// bank), when an audio index was given.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub master_audio: BTreeMap<String, SceneAudio>,
 }
 
 /// Build the scene list of a catalog.
@@ -631,6 +897,15 @@ pub fn scenes(c: &Catalog, models: &Models) -> Vec<Scene> {
         }
     }
     let model_name = |id: u64| models.name(id).map(|s| s.to_string()).or_else(|| by_id.get(&id).cloned());
+    // scene hash -> its slots in master timelines
+    let mut placed: HashMap<u32, Vec<Placement>> = HashMap::new();
+    for f in &c.files {
+        let first = f.timeline.first().map_or(0.0, |x| x.start);
+        for sl in &f.timeline {
+            let end = f.timeline.iter().map(|x| x.start).find(|&x| x > sl.start);
+            placed.entry(sl.scene).or_default().push(Placement { master: f.id.clone(), master_audio: f.audio.clone(), start: sl.start, end, bank_time: sl.start - first, section: format!("{:08x}", sl.section) });
+        }
+    }
     let mut out = Vec::new();
     for d in &c.dicts {
         let Some((scene, _)) = parse_dict_name(&d.name) else { continue };
@@ -733,9 +1008,46 @@ pub fn scenes(c: &Catalog, models: &Models) -> Vec<Scene> {
             other,
             set_models,
             set_models_unresolved: set_unres,
+            audio: None,
+            placements: placed.get(&joaat(scene)).cloned().unwrap_or_default(),
+            master_audio: BTreeMap::new(),
         });
     }
     out
+}
+
+/// Find each scene's audio bank: by the scene's own name, then without its
+/// suffixes ([`audio_base_name`]), then by the audio names of its scene
+/// files ([`AudioBanks::find_audio_name`]), then the bank of the master
+/// timelines that place it (when they agree); and the bank of each master
+/// that places it, by the master's audio names. The first name with one
+/// bank wins.
+pub fn attach_audio(all: &mut [Scene], c: &Catalog, banks: &AudioBanks) {
+    let files: HashMap<&str, &SceneFile> = c.files.iter().map(|f| (f.id.as_str(), f)).collect();
+    let by_names = |names: &[String]| names.iter().find_map(|n| banks.find_audio_name(n));
+    for s in all.iter_mut() {
+        let base = audio_base_name(&s.name).to_string();
+        s.audio = banks.find(&s.name, "scene name").or_else(|| banks.find(&base, "scene name")).or_else(|| {
+            let names: Vec<String> = s.scene_files.iter().filter_map(|f| files.get(f.as_str())).flat_map(|f| f.audio.iter().cloned()).collect();
+            by_names(&names)
+        });
+        for p in &s.placements {
+            if !s.master_audio.contains_key(&p.master) {
+                if let Some(a) = by_names(&p.master_audio) {
+                    s.master_audio.insert(p.master.clone(), a);
+                }
+            }
+        }
+        // else the bank of the masters that place it, when they share one
+        if s.audio.is_none() {
+            let mut v = s.master_audio.values();
+            if let Some(first) = v.next() {
+                if v.all(|a| a.bank == first.bank) {
+                    s.audio = Some(SceneAudio { source: "master timeline", ..first.clone() });
+                }
+            }
+        }
+    }
 }
 
 /// The dictionary entry id of a scene clip dictionary by name (`cin@<scene>`),
@@ -863,10 +1175,98 @@ mod tests {
                 FileObject { key: 7, kind: "object".into(), model: Some(asset_id("prop_table_01a")) },
                 FileObject { key: 8, kind: "object".into(), model: Some(0x1234) },
             ],
+            audio: vec!["test_scene_audio".into()],
+            timeline: vec![],
         };
+        // a master timeline that places the second scene's section 2 at 12.5 s
+        let master = SceneFile { id: "a.rpf@40".into(), states: vec![joaat("test_master")], objects: vec![], audio: vec!["tst_test_master".into()], timeline: vec![Slot { start: 2.5, scene: 5, section: 1 }, Slot { start: 12.5, scene: joaat("other_scene_p1_t01"), section: 2 }, Slot { start: 20.0, scene: 6, section: 3 }] };
         // a second scene without a scene file of its own
         let d2 = SceneDict { name: "cin@other_scene_p1_t01".into(), id: "a.rpf@30".into(), clips: ["boss", "boss_face", "ib_phone"].map(String::from).to_vec(), sections: 0, section_ids: vec![], adopted_sections: 0, streamed: vec![], unjoined: vec![], windows_streamed: 0, windows_missing: 0 };
-        Catalog { version: CATALOG_VERSION, archive: "a.rpf".into(), dicts: vec![d, d2], files: vec![f] }
+        Catalog { version: CATALOG_VERSION, archive: "a.rpf".into(), dicts: vec![d, d2], files: vec![f, master] }
+    }
+
+    #[test]
+    fn audio_stream_ids_and_base_names() {
+        // the issue's test vector
+        let ids: Vec<u32> = ["c", "l", "r", "ad"].iter().map(|c| audio_stream_id("air_tail_int", c)).collect();
+        assert_eq!(ids, vec![0x106b_5e4b, 0x045b_8607, 0x1f3e_fbbf, 0x1673_5206]);
+        assert_eq!(audio_stream_id("AIR_TAIL_INT", "c"), 0x106b_5e4b);
+        assert_eq!(audio_base_name("air_beach_ext_p1_t05_x1"), "air_beach_ext");
+        assert_eq!(audio_base_name("mtl_mont_int_p0l_t01"), "mtl_mont_int");
+        assert_eq!(audio_base_name("abc_mcs2_t10"), "abc_mcs2");
+        assert_eq!(audio_base_name("abc_int"), "abc_int");
+        // only whole suffix words: `_part` and `_tx` stay
+        assert_eq!(audio_base_name("abc_part"), "abc_part");
+        assert_eq!(audio_base_name("abc_tx"), "abc_tx");
+        assert_eq!(audio_base_name("x1"), "x1");
+    }
+
+    #[test]
+    fn timelines_resolve_through_composites() {
+        use TimelineItem::*;
+        let ids: HashMap<u32, TimelineItem> = [
+            (1, Reference { scene: 100, section: 7 }),
+            // composite with its own id
+            (2, Composite { id: Some(1), sections: vec![] }),
+            // composite whose id is missing: the first listed id in the map
+            (3, Composite { id: Some(99), sections: vec![98, 2] }),
+            // a loop ends nowhere
+            (4, Composite { id: Some(5), sections: vec![] }),
+            (5, Composite { id: Some(4), sections: vec![] }),
+        ]
+        .into_iter()
+        .collect();
+        let starts = [(3, 30.0), (1, 10.0), (2, 20.0), (4, 40.0), (6, 50.0), (1, 10.0)];
+        let got = resolve_timeline(&starts, &ids);
+        assert_eq!(got.iter().map(|s| (s.start, s.scene, s.section)).collect::<Vec<_>>(), vec![(10.0, 100, 7), (20.0, 100, 7), (30.0, 100, 7)]);
+    }
+
+    fn audio_index(banks: &[(u64, &[u32])]) -> crate::audio::AudioIndex {
+        let stream = |id: u32| crate::audio::Stream { id, chunks: vec![], data: (0, 16), samples: 96000, rate: 48000, codec: 0, channels: 1, layout: "blocks".into() };
+        crate::audio::AudioIndex {
+            version: 0,
+            archive: "a.rpf".into(),
+            archive_size: 0,
+            banks: banks.iter().map(|(off, ids)| crate::audio::Bank { off: *off, size: 0, flags: 0, streams: ids.iter().map(|&i| stream(i)).collect(), names: Default::default() }).collect(),
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    fn scenes_find_their_audio_banks_and_placements() {
+        let id = audio_stream_id;
+        let ix = audio_index(&[
+            // the first scene's bank, by its name without suffixes
+            (0x1000, &[id("test_scene", "c"), id("test_scene", "l"), id("test_scene", "ad"), 77]),
+            // the master's bank, by its audio name
+            (0x2000, &[id("test_master", "l"), id("test_master", "r")]),
+            // one channel of the second scene alone: a possible chance match, not a bank
+            (0x3000, &[id("other_scene", "c")]),
+            // a name with two banks of two channels each: left unresolved
+            (0x4000, &[id("test_scene_audio", "c"), id("test_scene_audio", "l")]),
+            (0x5000, &[id("test_scene_audio", "r"), id("test_scene_audio", "ad")]),
+        ]);
+        let banks = AudioBanks::new(&ix);
+        assert!(banks.find("other_scene", "scene name").is_none());
+        assert!(banks.find("test_scene_audio", "audio name").is_none());
+        let c = catalog();
+        let mut all = scenes(&c, &Models::default());
+        attach_audio(&mut all, &c, &banks);
+        let a = all[0].audio.as_ref().unwrap();
+        assert_eq!((a.name.as_str(), a.source, a.bank.as_str()), ("test_scene", "scene name", "1000"));
+        assert_eq!(a.channels.iter().map(|x| x.channel).collect::<Vec<_>>(), vec!["c", "l", "ad"]);
+        assert_eq!((a.channels[0].stream.clone(), a.channels[0].seconds), (format!("{:08x}", id("test_scene", "c")), 2.0));
+        assert!(all[0].placements.is_empty());
+        let o = &all[1];
+        // no bank by its own names: the bank of the master that places it
+        let oa = o.audio.as_ref().unwrap();
+        assert_eq!((oa.name.as_str(), oa.source, oa.bank.as_str()), ("test_master", "master timeline", "2000"));
+        assert_eq!(o.placements.len(), 1);
+        let p = &o.placements[0];
+        assert_eq!((p.master.as_str(), p.start, p.end, p.bank_time, p.section.as_str()), ("a.rpf@40", 12.5, Some(20.0), 10.0, "00000002"));
+        // the master's audio name `<mission>_<scene>` resolves without its first word
+        let m = &o.master_audio["a.rpf@40"];
+        assert_eq!((m.name.as_str(), m.source, m.bank.as_str()), ("test_master", "audio name", "2000"));
     }
 
     #[test]

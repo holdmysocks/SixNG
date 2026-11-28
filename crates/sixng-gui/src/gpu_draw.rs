@@ -1012,6 +1012,13 @@ fn rewrite_tex_calls(s: &str, names: &[(&str, &str)]) -> String {
     out
 }
 
+/// No stickers on the map: this piece of the mesh shader and what the map's
+/// renderer puts in its place, which leaves the stickers' part out of the
+/// pixel program. With it the main pass took about a tenth longer although
+/// the list is empty there and the part never runs (measured: the sticker
+/// laid on flat alone added 0.5 ms to 4.4 ms).
+pub const NO_STICKERS: (&str, &str) = ("let st_n = min(ST[0].flags.x, arrayLength(&ST) - 1u);", "let st_n = 0u;");
+
 /// The map shader for GPU-driven draws: the material group becomes the
 /// shared table and the texture arrays, read through the material index
 /// (the instance's first material plus the vertex's own). None (and the
@@ -1064,11 +1071,7 @@ pub fn shader(common: &str, src: &str) -> Option<String> {
             "fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {\n    bl_set(i.mid);",
         )
         && rep("fn fs_shadow(i: VOut) {", "fn fs_shadow(i: VOut) {\n    bl_set(i.mid);")
-        // no stickers on the map: the pixel program without their part.
-        // With it the main pass took about a tenth longer although the
-        // list is empty there and the part never runs (measured: the
-        // sticker laid on flat alone added 0.5 ms to 4.4 ms).
-        && rep("let st_n = min(ST[0].flags.x, arrayLength(&ST) - 1u);", "let st_n = 0u;");
+        && rep(NO_STICKERS.0, NO_STICKERS.1);
     if !ok {
         return None;
     }
@@ -1174,6 +1177,8 @@ mod tests {
 
     #[test]
     fn map_shader_parses_and_validates() {
+        // the map's own renderer takes the same piece out of the shared shader, without a check of its own
+        assert_eq!(include_str!("shader.wgsl").matches(NO_STICKERS.0).count(), 1);
         let src = shader(include_str!("atmo_common.wgsl"), include_str!("shader.wgsl")).expect("transform");
         let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&src)));
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())

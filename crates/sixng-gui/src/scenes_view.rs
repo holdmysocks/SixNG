@@ -682,6 +682,9 @@ mod tests {
             other: vec![],
             set_models: vec![],
             set_models_unresolved: vec![],
+            audio: None,
+            placements: vec![],
+            master_audio: Default::default(),
         }
     }
 
