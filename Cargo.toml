@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sixng-core", "crates/sixng-cli", "crates/sixng-gui"]
+members = ["crates/sixng-core", "crates/sixng-cli", "crates/sixng-gui", "crates/egui-mtl4"]
 
 [workspace.package]
 version = "0.14.0"

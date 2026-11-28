@@ -45,8 +45,6 @@ mod mapbake;
 mod modelbakejob;
 #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
 mod metal4_app;
-#[cfg(all(target_os = "macos", feature = "metal4-poc"))]
-mod metal4_egui;
 mod model_picker;
 mod model_view;
 mod pages;
