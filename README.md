@@ -1064,8 +1064,36 @@ again**).
   streamed windows find their animation, so every character cast entry
   plays in full. Six section dictionaries are named after a longer name
   with no scene of its own (`cin@mtl_mont_int_p0l_t01fixme-<N>`); they
-  join the scene whose name starts theirs. Not
-  decoded: the scene files' timing, events and state transitions.
+  join the scene whose name starts theirs.
+  **Audio banks and master timelines** (issue #516): with the story
+  pack's audio index (`sixng audio` on `pack/story000/story000.rpf`), each scene
+  gets its audio bank. A cutscene bank's streams are
+  `joaat("<name>.<channel>") & 0x1FFFFFFF` for the channels `c`, `l`,
+  `r`, `ad`, `ls`, `rs`, `music.l` and `music.r` (`air_tail_int.c` is
+  `106b5e4b`). The name is the scene name, the scene name without its
+  `_pN` / `_tNN` / `_xN` suffixes, or the audio name in a scene file
+  (`<mission>_<scene>`, tried without one leading word after another). A
+  bank counts only when it holds two or more of the name's channels and
+  no other bank does; a scene with none takes the bank of the masters
+  that place it. Scene files with a master timeline (a start-time
+  map whose ids resolve through the id map, directly or through
+  composite sections, to scene sections) place scene sections on the
+  master's clock: each scene lists its `placements` (master, start, end,
+  section and `bank_time`, the start minus the master's earliest start)
+  and the master's own bank (`master_audio`). `master_timelines` in the
+  report counts the masters, their slots and the masters with a bank.
+  Measured on the story pack: **1,942 of 2,824 scenes get a bank** (1,753
+  by scene name, 15 by audio name, 174 from their master), 443 banks in
+  all, each holding `c`, `l`, `r` and `ad` and some also `ls` / `rs` and
+  the music pair. The same rule on salted names matches no bank. **139
+  master timelines** place 1,246 slots, all on catalogued scenes (709
+  scenes); 129 masters have a bank. The longest master runs 69 slots
+  over 877 s. Twelve more masters are in
+  `pack/story000_restofworld/story000_restofworld.rpf`, which this
+  command does not read by default. Which slot applies when one child
+  state fills two slots, and where a movie starts, are not established.
+  Not decoded: the scene files' events (subtitle and movie events) and
+  state transitions.
 - **Story names** (`sixng story-names [--tags]`): arc and mission names
   for the scenes. The story pack's protected ambient-rule files (read
   through the table of contents, so Windows x64 with the game executable)
