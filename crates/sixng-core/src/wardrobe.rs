@@ -124,8 +124,8 @@ pub struct Part {
     /// Asset GUID of every state along the chain that names one: state name
     /// (hex) -> GUID. A hair item has `base`, `hairhidden` and often
     /// `hathairalt`, `helmethairalt`, `beaniehairalt`, `maskhairalt`,
-    /// `bandanahairalt`, `hoodiehairalt`: the hair asset worn under that
-    /// headwear.
+    /// `bandanahairalt`, `hoodiehairalt`, `capbackwardshairalt`,
+    /// `visorhairalt`: the hair asset worn under that headwear.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub state_guids: Vec<(String, String)>,
 }
