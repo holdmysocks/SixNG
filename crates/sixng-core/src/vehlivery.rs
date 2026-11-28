@@ -342,8 +342,9 @@ pub fn decal_prim(prims: &[TriPrim], skip: &dyn Fn(&TriPrim) -> bool, d: &Decal,
 }
 
 /// Add the stickers to the groups of a vehicle export. `groups[0]` is the
-/// vehicle itself; a fitted part's group has its model's name. Returns one
-/// report per sticker.
+/// vehicle itself; a fitted part's group has its model's name, a wheel's
+/// its model's name and bone (`tyre_car_001_hi@wheel_lf`: a sticker for
+/// the tyre goes on all four). Returns one report per sticker.
 pub fn add(groups: &mut [NodeGroup], materials: &mut Vec<Material>, decals: &[Decal]) -> Vec<Value> {
     // the model's own decal meshes (bolts, markers; shader 389206d1) have
     // the second colour stream too, but its bytes are not zones there
@@ -355,7 +356,14 @@ pub fn add(groups: &mut [NodeGroup], materials: &mut Vec<Material>, decals: &[De
         let mut placed = Vec::new();
         let mut material = None;
         for (g, group) in groups.iter_mut().enumerate() {
-            let is = |model: &str| if model.is_empty() { g == 0 } else { group.name.eq_ignore_ascii_case(model) };
+            let is = |model: &str| {
+                if model.is_empty() {
+                    return g == 0;
+                }
+                let name = group.name.to_ascii_lowercase();
+                let model = model.to_ascii_lowercase();
+                name == model || name.strip_prefix(&model).is_some_and(|r| r.starts_with('@'))
+            };
             // a flat sticker's other models take its zones there
             let other;
             let d = if is(&d.model) {
@@ -454,6 +462,12 @@ mod tests {
         let d = |model: &str| Decal { name: "s".into(), model: model.into(), zones: vec![7], uv_set: 1, m: [2.0, 0.0, 0.0, 2.0, -0.5, -0.5], uri: "s.png".into(), factor: [1.0, 1.0, 1.0, 0.5], flat: None, also: Vec::new() };
         let r = add(&mut groups, &mut mats, &[d(""), d("box_hi"), d("other")]);
         assert_eq!((groups[0].prims.len(), groups[1].prims.len(), mats.len()), (2, 2, 2));
+        // a wheel model's sticker goes on each wheel that has it, not on a
+        // model whose name only starts the same
+        let mut wheels = vec![NodeGroup { name: "truck".into(), prims: vec![wall()] }, NodeGroup { name: "tyre_a_hi@wheel_lf".into(), prims: vec![wall()] }, NodeGroup { name: "tyre_a_hi@wheel_rf".into(), prims: vec![wall()] }, NodeGroup { name: "tyre_a_hi_x".into(), prims: vec![wall()] }];
+        let w = add(&mut wheels, &mut Vec::new(), &[d("tyre_a_hi")]);
+        assert_eq!(wheels.iter().map(|g| g.prims.len()).collect::<Vec<_>>(), [1, 2, 2, 1]);
+        assert_eq!(w[0]["on"].as_array().unwrap().len(), 2);
         assert_eq!(groups[1].prims[1].material, Some(1));
         assert_eq!(r[0]["on"][0]["model"], "truck");
         assert_eq!(r[1]["on"][0]["model"], "box_hi");
