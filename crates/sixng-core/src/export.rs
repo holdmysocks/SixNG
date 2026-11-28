@@ -1962,9 +1962,9 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
     // mechanical bones are not body paint (see `classify_shader`).
     let mut shader_tex = shader_tex;
     // decorations, once the meshes are decoded: the upper body bakes into a
-    // texture laid out in its fourth UV set (`peddeco::Space`)
+    // texture laid out in its second UV set (`peddeco::Space`)
     if let Some(names) = e.name.as_deref().and_then(|n| o.part_decorations.get(&n.to_ascii_lowercase())).filter(|n| !n.is_empty() && o.png) {
-        bake_decorations(a, &mut shader_tex, names, dir, o, &|si| decoration_triangles(&lod_groups, si));
+        bake_decorations(a, &mut shader_tex, names, dir, o, &|si, set| decoration_triangles(&lod_groups, si, set));
     }
     for (si, st) in shader_tex.iter_mut().enumerate() {
         let mut bones: Vec<&str> = mesh_meta.iter().filter(|m| m["shader_index"] == si).flat_map(|m| m["bones"].as_array().into_iter().flatten()).filter_map(|b| b.as_str()).collect();
@@ -2095,21 +2095,21 @@ struct SkinSetup {
 /// baked texture is written next to the plain one, named after it and the
 /// decoration list, and the material's `decorations` record says what went
 /// in and what did not.
-/// The first LOD's triangles of a shader's meshes, each corner (UV0, UV3);
-/// none when the meshes have no fourth UV set.
-fn decoration_triangles(lod_groups: &[Vec<crate::gltf::NodeGroup>], shader: usize) -> Vec<[([f32; 2], [f32; 2]); 3]> {
+/// The first LOD's triangles of a shader's meshes, each corner (UV0, UV
+/// set `set`); none when the meshes have no such set.
+fn decoration_triangles(lod_groups: &[Vec<crate::gltf::NodeGroup>], shader: usize, set: usize) -> Vec<[([f32; 2], [f32; 2]); 3]> {
     let lod = lod_groups.iter().find(|g| g.iter().any(|n| !n.prims.is_empty()));
     let mut out = Vec::new();
     for p in lod.into_iter().flatten().flat_map(|n| &n.prims).filter(|p| p.material == Some(shader)) {
-        let (Some(u0), Some(u3)) = (p.uvs.first(), p.uvs.get(3)) else { continue };
+        let (Some(u0), Some(uk)) = (p.uvs.first(), p.uvs.get(set)) else { continue };
         for t in p.indices.chunks_exact(3) {
-            out.push(std::array::from_fn(|k| (u0[t[k] as usize], u3[t[k] as usize])));
+            out.push(std::array::from_fn(|k| (u0[t[k] as usize], uk[t[k] as usize])));
         }
     }
     out
 }
 
-fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &[u32], dir: &Path, o: &ExportOptions, triangles: &dyn Fn(usize) -> Vec<[([f32; 2], [f32; 2]); 3]>) {
+fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &[u32], dir: &Path, o: &ExportOptions, triangles: &dyn Fn(usize, usize) -> Vec<[([f32; 2], [f32; 2]); 3]>) {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     let root = game_root(a);
@@ -2149,11 +2149,12 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
         let src = dir.join(&base);
         let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         // body-upper decorations on a part whose fourth UV set is UV0 at
-        // half width, by side (the upper body): bake into that set's layout
-        let tris = if body { triangles(si) } else { Vec::new() };
+        // half width, by side (the upper body): bake into the layout of its
+        // second set, which gives each side its own islands
+        let tris = if body { triangles(si, 3) } else { Vec::new() };
         let corners: Vec<([f32; 2], [f32; 2])> = tris.iter().flatten().copied().collect();
         let space = if body && crate::peddeco::is_split_layout(&corners) { crate::peddeco::Space::BodyUpper } else { crate::peddeco::Space::Part };
-        let out = src.with_file_name(format!("{stem}_deco{key:016x}{}.png", if space == crate::peddeco::Space::BodyUpper { "_uv3" } else { "" }));
+        let out = src.with_file_name(format!("{stem}_deco{key:016x}{}.png", if space == crate::peddeco::Space::BodyUpper { "_uv1" } else { "" }));
         let mut rec = serde_json::json!({
             "names": names.iter().map(|n| format!("{n:08x}")).collect::<Vec<_>>(),
             "categories": found.iter().map(|d| format!("{:08x}", d.category)).collect::<Vec<_>>(),
@@ -2165,7 +2166,7 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
             "skin_tone": format!("{:08x}", if o.skin_tone == 0 { crate::peddeco::DEFAULT_SKIN_TONE } else { o.skin_tone }),
             "space": match space {
                 crate::peddeco::Space::Part => "part UV0",
-                crate::peddeco::Space::BodyUpper => "upper body space (2 u3, v3): the texture is laid out in TEXCOORD_3 (twice the plain texture's width), and the material reads it there",
+                crate::peddeco::Space::BodyUpper => "upper body space (2 u1, v1): the texture is laid out in TEXCOORD_1 (twice the plain texture's width), and the material reads it there; gutters take the nearest covered texel's skin",
             },
         });
         if !unknown.is_empty() {
@@ -2186,7 +2187,7 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
                 let (w, h) = img.dimensions();
                 let mut skin = crate::peddeco::Image { w, h, rgba: img.into_raw(), srgb: true };
                 if space == crate::peddeco::Space::BodyUpper {
-                    skin = crate::peddeco::uv3_layout(&skin, &tris);
+                    skin = crate::peddeco::uv_layout(&skin, &triangles(si, 1));
                 }
                 let skipped = crate::peddeco::bake(&mut skin, &layers, &decal, tone, space);
                 texture::save_png(&out, &skin.rgba, skin.w, skin.h)?;
@@ -2214,7 +2215,7 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
             st.base = Some(format!("{}{}", base.strip_suffix(&format!("{stem}.png")).unwrap_or(""), out.file_name().unwrap().to_string_lossy()));
             rec["png"] = rel(&o.out, &out).into();
             if space == crate::peddeco::Space::BodyUpper {
-                st.base_uv = 3;
+                st.base_uv = 1;
             }
         }
         st.decorations = Some(rec);

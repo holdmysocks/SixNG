@@ -2408,12 +2408,14 @@ impl Uploader {
         });
         let mut mat_bytes = vec![0u8; (MAT_STRIDE as usize) * mats.len()];
         for (k, mt) in mats.iter().enumerate() {
-            // bit 6: the base colour is laid out in the fourth UV set
+            // bits 6 and 7: the base colour is laid out in the fourth or the
+            // second UV set
             let has = (mt.base.is_some() as u32)
                 | ((mt.normal.is_some() as u32) << 1)
                 | ((mt.packed.is_some() as u32) << 2)
                 | ((mt.emissive.is_some() as u32) << 3)
-                | (((mt.base_uv == 3) as u32) << 6);
+                | (((mt.base_uv == 3) as u32) << 6)
+                | (((mt.base_uv == 1) as u32) << 7);
             let alpha = match mt.alpha_mode.as_str() {
                 "MASK" => 1,
                 "BLEND" => 2,
