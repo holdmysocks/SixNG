@@ -135,8 +135,9 @@ pub mod watch {
 /// own buffers and is drawn the old way), `shadowold` (the table's models
 /// cast their shadows the old way), `vsfull` (each program loads the
 /// whole material row, as before), and for timing only `shadownocut`
-/// (cut-out casters without their alpha test) and `shadowmodel` (shadow
-/// sub-draws in model order, not grouped by chunk).
+/// (cut-out casters without their alpha test), `shadowmodel` (shadow
+/// sub-draws in model order, not grouped by chunk) and `shadowfull` (shadow
+/// casters with the full mesh vertex program, not the short one).
 pub fn opt(name: &str) -> bool {
     static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     V.get_or_init(|| std::env::var("SIXNG_MAP_GPU_TABLE").unwrap_or_default()).split(',').any(|s| s.trim() == name)
@@ -1116,6 +1117,12 @@ fn shader_with(common: &str, src: &str, full: bool) -> Option<String> {
     // the material now comes from a table indexed per pixel, so naga's
     // uniformity check would reject the texture reads under its branches;
     // the index is the same over a draw, which is what the check guards
+    // The shadow casters' vertex program: a table model has no joints and
+    // no strands, so its place is the instance's matrix times the vertex;
+    // the cut-out test needs only the base UV and the material index.
+    s.push_str(
+        "\n@vertex\nfn vs_shadow_t(v: VIn) -> VOut {\n    var o: VOut;\n    let w = mat4x4<f32>(v.m0, v.m1, v.m2, v.m3) * vec4(v.pos, 1.0);\n    o.clip = F.view_proj * w;\n    o.uv0 = v.uv0;\n    o.mid = u32(v.extra.w + 0.5) + v.joints.w;\n    return o;\n}\n",
+    );
     Some(format!(
         "enable wgpu_binding_array;\ndiagnostic(off, derivative_uniformity);\n{}\n{}",
         common.replace("\r\n", "\n"),

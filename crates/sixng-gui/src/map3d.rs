@@ -3724,14 +3724,15 @@ impl Map3D {
                 let v: Vec<f32> = self.perf.frame_ms.iter().copied().collect();
                 let (mean, p99, worst) = frame_summary(&v);
                 self.perf_log(&format!(
-                    "shot: last {} frames mean {:.1} ms ({:.0} fps), p99 {:.1}, worst {:.1} | shadows {} ({} draws)",
+                    "shot: last {} frames mean {:.1} ms ({:.0} fps), p99 {:.1}, worst {:.1} | shadows {} ({} draws, {}k model triangles)",
                     v.len(),
                     mean,
                     1000.0 / mean.max(0.01),
                     p99,
                     worst,
                     if self.renderer.as_ref().is_some_and(|r| r.shadows) { "on" } else { "off" },
-                    self.renderer.as_ref().map_or(0, |r| r.shadow_draws)
+                    self.renderer.as_ref().map_or(0, |r| r.shadow_draws),
+                    crate::render3d::SHADOW_TRIS.load(std::sync::atomic::Ordering::Relaxed) / 1000
                 ));
                 if let Some(data) = self.data.clone() {
                     for f in std::mem::take(&mut self.auto.picks) {
