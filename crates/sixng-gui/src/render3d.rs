@@ -3516,7 +3516,7 @@ impl Renderer3D {
         if look.mode != 0 || crate::gpu_draw::opt("nodraw") {
             return None;
         }
-        let plan = self.shadow_plan(cam, look, aspect).filter(|_| !crate::gpu_draw::opt("noshadow"));
+        let plan = self.shadow_plan(cam, look, aspect).filter(|_| !crate::gpu_draw::opt("noshadow") && !crate::gpu_draw::opt("shadowold"));
         // (stencil, geometry chunk, instance chunk)
         type Key = (u32, usize, usize);
         let mut main: Vec<(Key, Args)> = Vec::new();
@@ -3732,8 +3732,9 @@ impl Renderer3D {
             queue.write_buffer(&self.shadow.ub, 0, bytemuck::bytes_of(&ShadowU::default()));
             return;
         };
-        // the models the material table does not draw
-        let models = gd.map_or(models, |f| &f.rest[..]);
+        // the models the material table does not draw (`shadowold`: the old
+        // way draws every model's shadow, for A/B runs)
+        let models = if crate::gpu_draw::opt("shadowold") { models } else { gd.map_or(models, |f| &f.rest[..]) };
         for i in 0..CASCADES {
             if !due[i] {
                 continue;
