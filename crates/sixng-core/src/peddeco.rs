@@ -52,16 +52,20 @@
 //!
 //! Upper body space: body-upper decorations are not placed in the part's
 //! UV0. That UV is mirrored (both arms share one UV island), so it cannot
-//! hold a tattoo on one arm only. The part's fourth UV set is the same
-//! layout at half width, one side at `u0 / 2` and the other at
-//! `0.5 + u0 / 2`, and the decorations are placed in that UV with `u`
-//! doubled, a space two units wide ([`Space`]). The evidence is the data:
-//! a record's mirrored pair of sleeves has one layer at `u` 0.37..0.60 and
-//! its mirror at 1.41..1.64; over the whole catalogue, 80 % of a
-//! body-upper layer's decal square lands on the upper body in this space
-//! (60 % in UV0, where a quarter of the layers land on no skin at all).
-//! The upper body is therefore baked into a texture laid out in its fourth
-//! UV set ([`uv3_layout`]), which the part's material then reads through
+//! hold a tattoo on one arm only. They are placed in the part's second UV
+//! set, which gives each side its own islands, with `u` doubled: a space
+//! two units wide ([`Space`]). The evidence is the data: a record's
+//! mirrored pair of sleeves has one layer at `u` 0.37..0.60 and its mirror
+//! at 1.41..1.64; a whole-sheet record's picture follows the second set's
+//! island outlines (Viper's chest piece, portrait and lettering each sit
+//! inside one island), and sampled at both sides of every seam of the mesh
+//! it changes four to five times less than in the fourth set (mean jump
+//! 0.022 against 0.097, linear RGB); over the whole catalogue, 81 % of a
+//! body-upper layer's decal centre lands on the upper body in the second
+//! set (78 % in the fourth, 59 % in UV0). The fourth set, UV0 at half
+//! width by side, only marks a mesh as an upper body ([`is_split_layout`]).
+//! The upper body is therefore baked into a texture laid out in its second
+//! UV set ([`uv_layout`]), which the part's material then reads through
 //! that set. The legs are not mirrored and keep their UV0.
 //!
 //! Left out: mask decals on a layer with no ink, which the game colours at
@@ -86,7 +90,7 @@ pub const SKIN_CATEGORIES: [(u32, &str); 3] = [(0x3817_131d, "body upper"), (0x4
 
 const VERSION: u32 = 5;
 /// Changes when the bake rule changes, so baked textures are made again.
-pub const BAKE_RULE: u32 = 9;
+pub const BAKE_RULE: u32 = 10;
 /// The skin tone record struct (`data.rpf`): a name, a linear colour.
 pub const SKIN_TONE: u32 = 0x27a7_a4ef;
 /// Wardrobe tag key whose item names the skin tone (a skin-tone item, or
@@ -335,7 +339,7 @@ impl Layer {
 pub enum Space {
     /// The part's own UV (heads, and parts with no body layout).
     Part,
-    /// The upper body, baked into a texture laid out in its fourth UV set:
+    /// The upper body, baked into a texture laid out in its second UV set:
     /// placed at `(2u, v)`.
     BodyUpper,
 }
@@ -373,20 +377,23 @@ pub fn is_split_layout(uv: &[([f32; 2], [f32; 2])]) -> bool {
     !uv.is_empty() && fit * 10 >= uv.len() * 9 && lo * 20 >= uv.len() && hi * 20 >= uv.len()
 }
 
-/// The upper body's colour texture laid out in its fourth UV set: twice
-/// the width of `base` (laid out in UV0), each texel the base colour at
-/// the UV0 of the surface there. `tris` are the mesh's triangles, each
-/// corner (UV0, UV3); a texel no triangle covers takes the half-width rule
-/// (`u0 = fract(2 u3)`).
-pub fn uv3_layout(base: &Image, tris: &[[([f32; 2], [f32; 2]); 3]]) -> Image {
+/// The upper body's colour texture laid out in another of its UV sets (the
+/// second, [`Space::BodyUpper`]): twice the width of `base` (laid out in
+/// UV0), each texel the base colour at the UV0 of the surface there.
+/// `tris` are the mesh's triangles, each corner (UV0, the layout's UV).
+/// A texel no triangle covers (a gutter) takes the UV0 of the nearest
+/// covered one, so filtering at an island's edge reads the same skin;
+/// with no triangles at all, the half-width rule (`u0 = fract(2 u)`).
+pub fn uv_layout(base: &Image, tris: &[[([f32; 2], [f32; 2]); 3]]) -> Image {
     let (w, h) = (base.w as usize * 2, base.h as usize);
     let mut uv0: Vec<[f32; 2]> = (0..w * h)
         .map(|i| {
             let (x, y) = (i % w, i / w);
-            let u3 = (x as f32 + 0.5) / w as f32;
-            [(2.0 * u3).fract(), (y as f32 + 0.5) / h as f32]
+            let u = (x as f32 + 0.5) / w as f32;
+            [(2.0 * u).fract(), (y as f32 + 0.5) / h as f32]
         })
         .collect();
+    let mut covered = vec![false; w * h];
     for t in tris {
         let p: [[f32; 2]; 3] = std::array::from_fn(|k| [t[k].1[0] * w as f32, t[k].1[1] * h as f32]);
         let d = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) - (p[2][0] - p[0][0]) * (p[1][1] - p[0][1]);
@@ -394,22 +401,36 @@ pub fn uv3_layout(base: &Image, tris: &[[([f32; 2], [f32; 2]); 3]]) -> Image {
             continue;
         }
         let x0 = p.iter().map(|q| q[0]).fold(f32::MAX, f32::min).floor().max(0.0) as usize;
-        let x1 = (p.iter().map(|q| q[0]).fold(f32::MIN, f32::max).ceil() as usize).min(w);
+        let x1 = (p.iter().map(|q| q[0]).fold(f32::MIN, f32::max).ceil().max(0.0) as usize).min(w);
         let y0 = p.iter().map(|q| q[1]).fold(f32::MAX, f32::min).floor().max(0.0) as usize;
-        let y1 = (p.iter().map(|q| q[1]).fold(f32::MIN, f32::max).ceil() as usize).min(h);
+        let y1 = (p.iter().map(|q| q[1]).fold(f32::MIN, f32::max).ceil().max(0.0) as usize).min(h);
         for y in y0..y1 {
             for x in x0..x1 {
                 let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
                 let b1 = ((px - p[0][0]) * (p[2][1] - p[0][1]) - (p[2][0] - p[0][0]) * (py - p[0][1])) / d;
                 let b2 = ((p[1][0] - p[0][0]) * (py - p[0][1]) - (px - p[0][0]) * (p[1][1] - p[0][1])) / d;
                 let b0 = 1.0 - b1 - b2;
-                // texel centres inside the triangle; the rest keep the
-                // half-width rule, which holds away from the waist strip
+                // texel centres inside the triangle
                 if b0 < -1e-4 || b1 < -1e-4 || b2 < -1e-4 {
                     continue;
                 }
                 let a = [t[0].0, t[1].0, t[2].0];
                 uv0[y * w + x] = [b0 * a[0][0] + b1 * a[1][0] + b2 * a[2][0], b0 * a[0][1] + b1 * a[1][1] + b2 * a[2][1]];
+                covered[y * w + x] = true;
+            }
+        }
+    }
+    // gutters: breadth-first from the covered texels, each taking the UV0
+    // of the neighbour it was reached from
+    let mut queue: std::collections::VecDeque<usize> = (0..w * h).filter(|&i| covered[i]).collect();
+    while let Some(i) = queue.pop_front() {
+        let (x, y) = (i % w, i / w);
+        let near = [(x > 0).then(|| i - 1), (x + 1 < w).then(|| i + 1), (y > 0).then(|| i - w), (y + 1 < h).then(|| i + w)];
+        for j in near.into_iter().flatten() {
+            if !covered[j] {
+                covered[j] = true;
+                uv0[j] = uv0[i];
+                queue.push_back(j);
             }
         }
     }
@@ -805,9 +826,9 @@ impl Layer {
 
     /// A whole sheet: neither the layer nor its record moves it, so it
     /// covers the part's texture as laid out. A character's own tattoo
-    /// sheet on the upper body is one; it spans both sides of the fourth UV
+    /// sheet on the upper body is one; it spans both sides of the second UV
     /// set (its edges meet across the mesh's seams there, and not when it
-    /// is read through UV0 or on one side).
+    /// is read through UV0, the fourth set or on one side).
     pub fn is_sheet(&self) -> bool {
         self.uv == identity() && self.zone == identity()
     }
@@ -840,7 +861,7 @@ pub fn bake(skin: &mut Image, layers: &[(&Layer, Option<&Layer>)], decal: &dyn F
         }
         let blend = l.blend();
         // a whole sheet (no transform) is drawn in the part's own layout:
-        // on the upper body that is its fourth UV set, both sides
+        // on the upper body that is its second UV set, both sides
         let space = if l.is_sheet() { Space::Part } else { space };
         skin.rgba.par_chunks_mut(4 * w).enumerate().for_each(|(y, row)| {
             let v = (y as f32 + 0.5) / h as f32;
@@ -1248,18 +1269,32 @@ mod tests {
     }
 
     #[test]
-    fn uv3_layout_reads_the_base_at_each_texels_uv0() {
+    fn uv_layout_reads_the_base_at_each_texels_uv0() {
         // base: red at u0 < 0.5, blue above
         let base = Image { w: 2, h: 1, rgba: vec![255, 0, 0, 255, 0, 0, 255, 255], srgb: true };
         let reds = |im: &Image| im.rgba.chunks(4).map(|p| p[0]).collect::<Vec<_>>();
-        // no triangles: the half-width rule, u0 = fract(2 u3)
-        let t = uv3_layout(&base, &[]);
+        // no triangles: the half-width rule, u0 = fract(2 u)
+        let t = uv_layout(&base, &[]);
         assert_eq!((t.w, t.h), (4, 1));
         assert_eq!(reds(&t), [255, 0, 255, 0]);
-        // a strip whose fourth UV is its UV0 (the waist): read in place
+        // a strip whose layout UV is its UV0: read in place
         let c = |u: f32, v: f32| ([u, v], [u, v]);
         let quad = [[c(0.0, 0.0), c(1.0, 0.0), c(1.0, 1.0)], [c(0.0, 0.0), c(1.0, 1.0), c(0.0, 1.0)]];
         // (bilinear: u0 0.375 and 0.625 sit between the two base texels)
-        assert_eq!(reds(&uv3_layout(&base, &quad)), [255, 191, 64, 0]);
+        assert_eq!(reds(&uv_layout(&base, &quad)), [255, 191, 64, 0]);
+    }
+
+    #[test]
+    fn a_gutter_takes_the_nearest_covered_texels_uv0() {
+        // base: red at u0 < 0.5, blue above; an island in the layout's
+        // left half (u 0..0.5) that reads the base's right half (blue)
+        let base = Image { w: 4, h: 1, rgba: [[255, 0, 0, 255], [255, 0, 0, 255], [0, 0, 255, 255], [0, 0, 255, 255]].concat(), srgb: true };
+        let c = |u0: f32, u: f32, v: f32| ([u0, v], [u, v]);
+        let quad = [[c(0.75, 0.0, 0.0), c(1.0, 0.5, 0.0), c(1.0, 0.5, 1.0)], [c(0.75, 0.0, 0.0), c(1.0, 0.5, 1.0), c(0.75, 0.0, 1.0)]];
+        let t = uv_layout(&base, &quad);
+        assert_eq!(t.w, 8);
+        // the island and every gutter texel right of it are blue; the
+        // half-width rule would have read red at u 0.5..0.75
+        assert!(t.rgba.chunks(4).all(|p| p[0] == 0 && p[2] == 255), "{:?}", t.rgba);
     }
 }

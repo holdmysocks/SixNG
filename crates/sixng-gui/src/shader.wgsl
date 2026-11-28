@@ -1678,9 +1678,9 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     // texels of the sub-material the tile belongs to
     var weave_w = 0.0;
     if ((has & 1u) != 0u) {
-        // an upper body with its decorations is laid out in its fourth UV
-        // set (both arms apart; UV0 is mirrored)
-        var bt = textureSample(t_base, samp, select(i.uv0, i.uv23.zw, (has & 64u) != 0u));
+        // an upper body with its decorations is laid out in its second UV
+        // set (both arms apart; UV0 is mirrored); bit 6 picks the fourth
+        var bt = textureSample(t_base, samp, select(select(i.uv0, i.uv23.zw, (has & 64u) != 0u), i.uv1, (has & 128u) != 0u));
         // tint mask (animal coats): only the green channel (shading) is a picture
         if ((M.flags.w & 512u) != 0u) { bt = vec4(vec3(bt.g), 1.0); }
         if (M.tile.w > 0.5 && M.tile.w < 1.5) { weave_w = bt.a; bt.a = 1.0; }
