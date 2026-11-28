@@ -1156,6 +1156,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui-mtl4"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "egui",
+ "metal-rust",
+]
+
+[[package]]
 name = "egui-wgpu"
 version = "0.36.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3440,7 +3450,7 @@ checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 
 [[package]]
 name = "sixng-cli"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3454,7 +3464,7 @@ dependencies = [
 
 [[package]]
 name = "sixng-core"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "bcpack-rs",
@@ -3471,11 +3481,12 @@ dependencies = [
 
 [[package]]
 name = "sixng-gui"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "bytemuck",
  "eframe",
+ "egui-mtl4",
  "egui-winit",
  "flate2",
  "glam",

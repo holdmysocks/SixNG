@@ -1,12 +1,32 @@
+#![allow(dead_code)]
+
 #[cfg(target_os = "macos")]
 #[path = "../src/bc.rs"]
 mod bc;
 #[cfg(target_os = "macos")]
+#[path = "../src/accum.rs"]
+mod accum;
+#[cfg(target_os = "macos")]
+#[path = "../src/atmo.rs"]
+mod atmo;
+#[cfg(target_os = "macos")]
 #[path = "../src/cells.rs"]
 mod cells;
 #[cfg(target_os = "macos")]
+#[path = "../src/hairblur.rs"]
+mod hairblur;
+#[cfg(target_os = "macos")]
 #[path = "../src/glb.rs"]
 mod glb;
+#[cfg(target_os = "macos")]
+#[path = "../src/gpu_time.rs"]
+mod gpu_time;
+#[cfg(target_os = "macos")]
+#[path = "../src/gpu_draw.rs"]
+mod gpu_draw;
+#[cfg(target_os = "macos")]
+#[path = "../src/lights.rs"]
+mod lights;
 #[cfg(target_os = "macos")]
 #[path = "../src/mapbake.rs"]
 mod mapbake;
@@ -17,11 +37,11 @@ mod frame_presentation_mtl4;
 #[path = "../src/metal4_app.rs"]
 mod metal4_app;
 #[cfg(target_os = "macos")]
-#[path = "../src/metal4_egui.rs"]
-mod metal4_egui;
-#[cfg(target_os = "macos")]
 #[path = "../src/render3d.rs"]
 mod render3d;
+#[cfg(target_os = "macos")]
+#[path = "../src/shadow.rs"]
+mod shadow;
 #[cfg(target_os = "macos")]
 mod livery {
     pub const MAX_STICKERS: usize = 16;
@@ -38,6 +58,8 @@ mod livery {
 }
 #[cfg(target_os = "macos")]
 pub(crate) const METAL4_BUILD: bool = true;
+#[cfg(target_os = "macos")]
+pub(crate) const GUI_CACHE: &str = "gui_cache_v4";
 #[cfg(target_os = "macos")]
 #[path = "../src/render3d_metal4.rs"]
 mod render3d_metal4;

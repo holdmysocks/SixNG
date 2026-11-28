@@ -341,7 +341,12 @@ impl Jobs {
             .iter()
             .position(|a| a == "--out" || a == "-o")
             .and_then(|i| args.get(i + 1))
-            .map(PathBuf::from);
+            .map(PathBuf::from)
+            // an output file (`outfit -o x.glb`): its folder
+            .map(|p| match p.extension().is_some_and(|e| e.eq_ignore_ascii_case("glb")) {
+                true => p.parent().map(Path::to_path_buf).unwrap_or(p),
+                false => p,
+            });
         self.jobs.push(Job {
             id,
             label: label.into(),

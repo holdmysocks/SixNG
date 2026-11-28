@@ -21,7 +21,8 @@ pub struct Vertex {
     /// Tint palette colour (GLB COLOR_0, linear); white = no tint.
     pub tint: [u8; 4],
     /// Vehicle sticker zone: `[0]` the zone (fourth byte of the model's
-    /// second colour stream, GLB `_COLOR1`; 0 where the model has none),
+    /// second colour stream, GLB `_COLOR1`; on vehicle glass the first byte
+    /// of the first, `_COLOR0`; 0 where the model has none),
     /// `[1]` which model of an assembled vehicle the vertex came from
     /// (0 = the vehicle itself, 1.. = fitted parts), `[2]` 1 when the model
     /// has the stream (a mesh without it carries no stickers), `[3]` on
@@ -584,7 +585,13 @@ fn slot_status(t: &Value) -> (String, u32) {
     } else if st.contains("BCPack") {
         ("flat".into(), 0)
     } else if st.contains("not in any") {
-        ("missing".into(), 0)
+        // a reference to a texture the engine itself binds while the game
+        // runs (the export names its stand-in), not one lost from the install
+        if t["texture_fallback"]["source"].as_str().is_some_and(|s| s.starts_with("engine default")) {
+            ("engine default (run time)".into(), 0)
+        } else {
+            ("missing".into(), 0)
+        }
     } else {
         ("other".into(), 0)
     }
@@ -1206,6 +1213,21 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
         }
     }
     // meshes
+    // materials whose sticker zone is in `_COLOR0` byte 0 (vehicle glass)
+    let zone_in_col0: Vec<bool> = d.j["materials"]
+        .as_array()
+        .map(|ms| {
+            ms.iter()
+                .map(|m| {
+                    let ex = &m["extras"];
+                    ex["shader_name"]
+                        .as_str()
+                        .or(ex["classification"]["shader"].as_str())
+                        .is_some_and(sixng_core::vehlivery::zone_in_colour0)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let mut meshes = Vec::new();
     let mut lo = [f32::MAX; 3];
     let mut hi = [f32::MIN; 3];
@@ -1305,8 +1327,15 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             }
             if let Some(a) = at["_COLOR1"].as_u64() {
                 let c = d.u8x4(a as usize)?;
+                // vehicle glass keeps its zone in the first colour stream
+                let col0 = p["material"]
+                    .as_u64()
+                    .and_then(|m| zone_in_col0.get(m as usize).copied())
+                    .unwrap_or(false)
+                    && at["_COLOR0"].as_u64().is_some();
                 for i in 0..n.min(c.len()) {
-                    v[i].zone = [c[i][3], 0, 1, 0];
+                    let z = if col0 { v[i].col[0] } else { c[i][3] };
+                    v[i].zone = [z, 0, 1, 0];
                 }
             }
             if let Some(a) = at["_REGION"].as_u64() {
@@ -1811,5 +1840,19 @@ mod merge_tests {
         let d = m.skin_detail.unwrap();
         assert_eq!((d.spec2, d.normal, d.control), (Some(8), Some(9), Some(10)));
         assert_eq!(a.images.len(), 11);
+    }
+}
+
+#[cfg(test)]
+mod slot_status_tests {
+    use super::*;
+
+    #[test]
+    fn an_engine_default_slot_is_not_missing() {
+        let engine = serde_json::json!({"status": "not in any ttpf store", "texture_fallback": {"source": "engine default texture (white; vehicle paint slot)"}});
+        assert_eq!(slot_status(&engine).0, "engine default (run time)");
+        let lost = serde_json::json!({"status": "not in any ttpf store", "texture_fallback": {"source": "typical value of this slot (median over decoded textures in it)"}});
+        assert_eq!(slot_status(&lost).0, "missing");
+        assert_eq!(slot_status(&serde_json::json!({"status": "not in any ttpf store"})).0, "missing");
     }
 }

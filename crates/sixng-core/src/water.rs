@@ -1318,6 +1318,8 @@ pub struct InlandTile {
     pub height_tex: Option<u64>,
     /// The tile's surface map (`watersurfacemaptexture`, BC7).
     pub tile_tex: Option<u64>,
+    /// The drawable's stored bbox (model space, min and max).
+    pub bounds: Option<[[f32; 3]; 2]>,
 }
 
 impl InlandTile {
@@ -1361,10 +1363,13 @@ fn shader_json(s: &crate::drawable::Shader, set: &crate::ttpf::TtpfSet) -> Value
 
 /// How a tile's water height texture reads. A texel holds the surface
 /// height relative to the placing entity: `z = origin z + (2 v - 1) H`,
-/// where `H` is the largest distance of a surface vertex from the origin's
-/// height (0.5 on a flat tile), and 0 marks texels without water. Checked
-/// by sampling the texture under every surface vertex (nearest texel,
-/// texels of 0 skipped). Returns (H, check).
+/// where `H` is the top of the drawable's stored bbox (model z, times the
+/// entity's z scale), and 0 marks texels without water. `H` equals the
+/// largest distance of a surface vertex from the origin's height on every
+/// sloped tile; on flat tiles it is under 1 cm, so the texture's values
+/// there only span millimetres. Without a bbox, the vertex distance is
+/// used. Checked by sampling the texture under every surface vertex
+/// (nearest texel, texels of 0 skipped). Returns (H, check).
 /// The shader slot of the per-tile BC7 texture (hash e0548ad3).
 const TILE_TEX_PARAM: &str = "watersurfacemaptexture";
 
@@ -1377,7 +1382,10 @@ fn height_texture_check(t: &InlandTile, set: &crate::ttpf::TtpfSet) -> Option<(f
     let surface = t.z_percentiles()[2] - 0.05;
     let e = t.position[2];
     let top: Vec<usize> = (0..t.positions.len()).filter(|&i| t.positions[i][2] >= surface).collect();
-    let hr = top.iter().map(|&i| (t.positions[i][2] - e).abs()).fold(0.0f32, f32::max);
+    let hv = top.iter().map(|&i| (t.positions[i][2] - e).abs()).fold(0.0f32, f32::max);
+    // flat tiles store a top a hair below 0 (about -0.00005 m)
+    let hb = t.bounds.map(|b| b[1][2] * t.scale[1]).filter(|h| h.is_finite() && *h > -0.01).map(|h| h.max(0.0));
+    let hr = hb.unwrap_or(hv);
     let mut vals = Vec::new();
     let mut err: Vec<f32> = top
         .iter()
@@ -1400,7 +1408,7 @@ fn height_texture_check(t: &InlandTile, set: &crate::ttpf::TtpfSet) -> Option<(f
     let wet = (0..(w * h) as usize).filter(|&k| f[k * ch as usize] > 0.0).count() as f32 / (w * h) as f32;
     vals.sort_by(f32::total_cmp);
     let median_value = vals.get(vals.len().saturating_sub(1) / 2).copied();
-    Some((hr, json!({"samples": err.len(), "median_error_m": at(0.5), "p95_error_m": at(0.95), "median_value": median_value, "wet_texel_share": wet})))
+    Some((hr, json!({"scale_from": if hb.is_some() { "bounds" } else { "vertices" }, "vertex_distance_m": hv, "samples": err.len(), "median_error_m": at(0.5), "p95_error_m": at(0.95), "median_value": median_value, "wet_texel_share": wet})))
 }
 
 /// A drawable's LOD 0 mesh placed in world space.
@@ -1493,7 +1501,8 @@ pub fn inland_tiles(ws: &crate::export::Workspace) -> Result<Vec<InlandTile>> {
                 uvs.clear();
             }
             (!indices.is_empty()).then(|| InlandTile { name: name.clone(), kind, map_file: file, position: p, rotation: q, scale: sc, positions, indices, uvs,
-                shader: sh.map_or(Value::Null, |s| shader_json(s, set)), flow: tex("flowtexture"), height_tex: tex("waterheighttexture"), tile_tex: tex(TILE_TEX_PARAM) })
+                shader: sh.map_or(Value::Null, |s| shader_json(s, set)), flow: tex("flowtexture"), height_tex: tex("waterheighttexture"), tile_tex: tex(TILE_TEX_PARAM),
+                bounds: crate::drawable::drawable_bounds(&r) })
         })
         .collect();
     tiles.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1612,6 +1621,26 @@ pub struct PoolSurface {
     pub uvs: Vec<[f32; 2]>,
     /// The water shaders it draws with, most triangles first.
     pub shaders: Vec<String>,
+    /// Set when an interior places it: position and rotation are then the
+    /// entity's in interior space, and the geometry goes through the
+    /// interior instance to world space.
+    pub interior: Option<PoolInterior>,
+}
+
+/// The interior instance that places a [`PoolSurface`].
+pub struct PoolInterior {
+    /// joaat of the interior archetype name.
+    pub archetype: u32,
+    /// The interior archetype file that lists the entity.
+    pub interior_file: String,
+    /// The map file with the interior instance, and the instance's index in it.
+    pub instance_map: String,
+    pub instance: usize,
+    /// The instance's world position and rotation (x, y, z, w, applied as stored).
+    pub instance_position: [f32; 3],
+    pub instance_rotation: [f32; 4],
+    /// The entity belongs to an entity set (an optional interior state).
+    pub entity_set: bool,
 }
 
 impl PoolSurface {
@@ -1646,14 +1675,16 @@ impl PoolSurface {
     }
 }
 
-/// Number of named drawables per kind that no map file places outside an
-/// interior.
+/// Number of named drawables per kind that neither a map file nor a placed
+/// interior places.
 pub type Unplaced = std::collections::BTreeMap<&'static str, usize>;
 
 /// Every pool, hot tub, fountain, waterfall, standing water and other small
-/// water body placed on the map by levels.rpf's map files (not interiors):
-/// drawables picked by [`pool_kind`], kept when a LOD 0 geometry draws with a
-/// water shader, and only those geometries.
+/// water body placed on the map by levels.rpf's map files, directly or
+/// inside an interior instance (each instance places its interior's
+/// entities, entity sets included): drawables picked by [`pool_kind`], kept
+/// when a LOD 0 geometry draws with a water shader, and only those
+/// geometries.
 pub fn pool_surfaces(ws: &crate::export::Workspace) -> Result<(Vec<PoolSurface>, Unplaced)> {
     use rayon::prelude::*;
     let lv = ws.resolve("levels")?;
@@ -1668,11 +1699,32 @@ pub fn pool_surfaces(ws: &crate::export::Workspace) -> Result<(Vec<PoolSurface>,
     }
     let metas: Vec<&crate::scan::Entry> = ix.entries.iter().filter(|e| e.sub == "7a").collect();
     let scans = crate::export::scan_meta(&lv, &metas, false, std::sync::Arc::new(|_: &str, _: u64, _: u64| {}));
-    let mut placed = Vec::new();
+    let mut placed: Vec<(u32, [f32; 3], [f32; 4], [f32; 2], String, Option<PoolInterior>)> = Vec::new();
     for s in scans.iter().filter(|s| !s.group) {
         for (i, &(arch, p, q, sxy, sz)) in s.ents.iter().enumerate() {
             if !s.interior.contains(&i) && cand.contains_key(&arch) {
-                placed.push((arch, p, q, [sxy, sz], s.id.clone()));
+                placed.push((arch, p, q, [sxy, sz], s.id.clone(), None));
+            }
+        }
+    }
+    // interiors: the first file that defines each archetype, as `sixng interiors` does
+    let mut by_mlo: std::collections::HashMap<u32, (&crate::export::MetaScan, &crate::meta7a::Mlo)> = std::collections::HashMap::new();
+    for s in &scans {
+        for m in &s.mlos {
+            by_mlo.entry(m.name).or_insert((s, m));
+        }
+    }
+    for s in scans.iter().filter(|s| !s.group) {
+        for (ii, inst) in s.instances.iter().enumerate() {
+            let Some((isc, mlo)) = by_mlo.get(&inst.archetype) else { continue };
+            let sets: std::collections::HashSet<usize> = mlo.set_entities.iter().copied().collect();
+            for &ei in mlo.entities.iter().chain(&mlo.set_entities) {
+                let Some(&(arch, p, q, sxy, sz)) = isc.ents.get(ei) else { continue };
+                if cand.contains_key(&arch) {
+                    let pi = PoolInterior { archetype: inst.archetype, interior_file: isc.id.clone(), instance_map: s.id.clone(), instance: ii,
+                        instance_position: inst.position, instance_rotation: inst.rotation_world, entity_set: sets.contains(&ei) && !mlo.entities.contains(&ei) };
+                    placed.push((arch, p, q, [sxy, sz], isc.id.clone(), Some(pi)));
+                }
             }
         }
     }
@@ -1697,10 +1749,16 @@ pub fn pool_surfaces(ws: &crate::export::Workspace) -> Result<(Vec<PoolSurface>,
         .collect();
     let mut out: Vec<PoolSurface> = placed
         .into_par_iter()
-        .filter_map(|(arch, p, q, sc, file)| {
+        .filter_map(|(arch, p, q, sc, file, interior)| {
             let (r, shaders) = loaded.get(&arch)?.as_ref()?;
             let (name, kind, _) = &cand[&arch];
-            let PlacedMesh { positions, indices, mut uvs, used } = placed_mesh(r, p, q, sc, |si| shaders.get(si as usize).is_some_and(is_water_shader));
+            let PlacedMesh { mut positions, indices, mut uvs, used } = placed_mesh(r, p, q, sc, |si| shaders.get(si as usize).is_some_and(is_water_shader));
+            if let Some(pi) = &interior {
+                for v in &mut positions {
+                    let w = crate::lights::rotate(pi.instance_rotation, *v);
+                    *v = [w[0] + pi.instance_position[0], w[1] + pi.instance_position[1], w[2] + pi.instance_position[2]];
+                }
+            }
             if indices.is_empty() {
                 return None;
             }
@@ -1716,10 +1774,11 @@ pub fn pool_surfaces(ws: &crate::export::Workspace) -> Result<(Vec<PoolSurface>,
                     names.push(n);
                 }
             }
-            Some(PoolSurface { name: name.clone(), kind, map_file: file, position: p, rotation: q, scale: sc, positions, indices, uvs, shaders: names })
+            Some(PoolSurface { name: name.clone(), kind, map_file: file, position: p, rotation: q, scale: sc, positions, indices, uvs, shaders: names, interior })
         })
         .collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name).then(a.map_file.cmp(&b.map_file)));
+    let key = |p: &PoolSurface| p.interior.as_ref().map(|i| (i.instance_map.clone(), i.instance));
+    out.sort_by(|a, b| a.name.cmp(&b.name).then(a.map_file.cmp(&b.map_file)).then(key(a).cmp(&key(b))).then(a.position.map(f32::to_bits).cmp(&b.position.map(f32::to_bits))));
     Ok((out, unplaced))
 }
 
@@ -2023,15 +2082,24 @@ fn write_pools(dir: &std::path::Path, pools: &[PoolSurface], unplaced: &Unplaced
             let names: std::collections::HashSet<&str> = ix.iter().map(|&i| pools[i].name.as_str()).collect();
             let above: Vec<f32> = ix.iter().filter_map(|&i| ground[i].map(|g| pools[i].surface_z() - g)).collect();
             (k.to_string(), json!({"placements": ix.len(), "drawables": names.len(), "area_m2": pct(ix.iter().map(|&i| pools[i].area()).collect()),
-                "surface_above_ground_m": pct(above), "named_but_not_placed_outside_interiors": unplaced.get(k).copied().unwrap_or(0)}))
+                "surface_above_ground_m": pct(above), "in_interiors": ix.iter().filter(|&&i| pools[i].interior.is_some()).count(),
+                "named_but_not_placed": unplaced.get(k).copied().unwrap_or(0)}))
         })
         .collect();
     let rows: Vec<Value> = pools
         .iter()
         .zip(ground)
-        .map(|(p, g)| json!({"name": p.name, "kind": p.kind, "map_file": p.map_file, "position": p.position, "rotation_world": p.rotation, "scale_xy_z": p.scale,
-            "bbox": p.bbox(), "surface_z": p.surface_z(), "area_m2": p.area(), "ground_under_median": g, "shaders": p.shaders,
-            "triangles": p.indices.len() / 3, "vertices": p.positions.len(), "uv0": !p.uvs.is_empty()}))
+        .map(|(p, g)| {
+            let mut v = json!({"name": p.name, "kind": p.kind, "map_file": p.map_file, "position": p.position, "rotation_world": p.rotation, "scale_xy_z": p.scale,
+                "bbox": p.bbox(), "surface_z": p.surface_z(), "area_m2": p.area(), "ground_under_median": g, "shaders": p.shaders,
+                "triangles": p.indices.len() / 3, "vertices": p.positions.len(), "uv0": !p.uvs.is_empty()});
+            if let Some(i) = &p.interior {
+                v["interior"] = json!({"archetype": crate::names::lookup(i.archetype, crate::names::Ctx::Field).unwrap_or_else(|| format!("{:08x}", i.archetype)),
+                    "archetype_hash": format!("{:08x}", i.archetype), "instance_map": i.instance_map, "instance": i.instance,
+                    "instance_position": i.instance_position, "instance_rotation": i.instance_rotation, "entity_set": i.entity_set});
+            }
+            v
+        })
         .collect();
     let mut mats = Vec::new();
     let mut groups = Vec::new();
@@ -2047,11 +2115,11 @@ fn write_pools(dir: &std::path::Path, pools: &[PoolSurface], unplaced: &Unplaced
         groups.push(NodeGroup { name: k.to_string(), prims });
     }
     crate::atomic::write(&dir.join("pools.glb"), crate::gltf::mesh_glb("pools", &groups, &mats, &[], json!({"coordinates": "world space"})))?;
-    let rep = json!({"placements": pools.len(), "drawables": pools.iter().map(|p| p.name.as_str()).collect::<std::collections::HashSet<_>>().len(), "kinds": per_kind, "shaders": shaders});
+    let rep = json!({"placements": pools.len(), "in_interiors": pools.iter().filter(|p| p.interior.is_some()).count(), "drawables": pools.iter().map(|p| p.name.as_str()).collect::<std::collections::HashSet<_>>().len(), "kinds": per_kind, "shaders": shaders});
     write_json(&dir.join("pools.json"), &json!({
-        "about": "Pools, hot tubs, fountains, waterfalls, standing water and other small water bodies placed by the map files of levels.rpf (not interiors): the LOD 0 geometry drawn with a water shader, in world space. Kinds come from the drawable names; 'water effect' is spray and splash meshes (vfx_water), not a surface.",
+        "about": "Pools, hot tubs, fountains, waterfalls, standing water and other small water bodies placed by the map files of levels.rpf, directly or inside a placed interior: the LOD 0 geometry drawn with a water shader, in world space. Rows with `interior` come from an interior instance: map_file is then the interior archetype file, position and rotation_world are the entity's in interior space, and the geometry and bbox are in world space through the instance (instance_position, then instance_rotation applied as stored). entity_set marks entities that only an entity set (an optional interior state) holds. An interior placed several times gives one row per instance. Kinds come from the drawable names; 'water effect' is spray and splash meshes (vfx_water), not a surface.",
         "coordinates": "RAGE world space, Z-up, metres; pools.glb is the same geometry in glTF Y-up (x, z, -y)",
-        "ground": "ground_under_median: the water height map under the vertices (median); surface_z: median vertex height",
+        "ground": "ground_under_median: the water height map under the vertices (median); surface_z: median vertex height. Interiors can lie below the ground the height map holds",
         "summary": rep, "pools": rows}))?;
     Ok(rep)
 }
@@ -2103,7 +2171,7 @@ fn write_inland(dir: &std::path::Path, tiles: &[InlandTile], check: &Value, set:
             let z = t.z_percentiles();
             json!({"name": t.name, "kind": kind_name(t.kind), "kind_code": t.kind, "map_file": t.map_file,
                 "position": t.position, "rotation_world": t.rotation, "scale_xy_z": t.scale, "bbox": t.bbox(),
-                "surface_z": z[2], "z_percentiles_0_5_50_95_100": z, "triangles": t.indices.len() / 3, "vertices": t.positions.len(),
+                "surface_z": z[2], "z_percentiles_0_5_50_95_100": z, "model_bounds": t.bounds, "triangles": t.indices.len() / 3, "vertices": t.positions.len(),
                 "shading": {"shader": t.shader["shader"], "flow_texture": tex_json(t.flow), "water_height_texture": tex_json(t.height_tex), "surface_map_texture": tex_json(t.tile_tex),
                     "water_height_scale_m": hc.as_ref().map(|h| h.0), "water_height_check": hc.as_ref().map(|h| h.1.clone()),
                     "ripple_scale": t.shader["constants"]["ripplescale"], "ripple_bumpiness": t.shader["constants"]["ripplebumpiness"], "uv0": !t.uvs.is_empty()},
@@ -2137,7 +2205,7 @@ fn write_inland(dir: &std::path::Path, tiles: &[InlandTile], check: &Value, set:
     write_json(&dir.join("inland.json"), &json!({
         "about": "Inland water surfaces (rivers, canals, creeks, reservoirs, ponds): the map's water drawables placed in world space, LOD 0. One tile per placement, at most 64 m across.",
         "coordinates": "RAGE world space, Z-up, metres; inland.glb is the same geometry in glTF Y-up (x, z, -y)",
-        "shading": "Every tile draws with the water_micro_geom shader. Its flow texture (BC3: flow direction in red and green around 128; 4 x 4 placeholder on still tiles) and water height texture (R16 float, 0 to 1: surface height = origin z + (2 v - 1) * water_height_scale_m, where the scale is the largest distance of a surface vertex from the origin's height; 0.5 on flat tiles; 0 where there is no water, a mask that covers the mesh and reaches a little under the banks) cover the tile's 64 m square: on the surface vertices UV0 is world x / 64 and -world y / 64 (u east, v south). Skirt vertices below the surface carry other UVs. `shader` lists every texture and constant of the shader; hex keys are parameter names not yet known. The flags useflowmap, useheighttexture and usesurfacemap hold the integer 1, which reads as 1.4e-45 as a float.",
+        "shading": "Every tile draws with the water_micro_geom shader. Its flow texture (BC3: flow direction in red and green around 128; 4 x 4 placeholder on still tiles) and water height texture (R16 float, 0 to 1: surface height = origin z + (2 v - 1) * water_height_scale_m, where the scale is the top of the drawable's stored bbox (model_bounds max z, times the z scale), equal to the largest distance of a surface vertex from the origin's height on every sloped tile and under 1 cm on flat ones, whose varying values therefore span only millimetres; the bbox bottom is minus the scale and the unnamed constant 02596957, the depth of the skirt below the surface; 0 where there is no water, a mask that covers the mesh and reaches a little under the banks) cover the tile's 64 m square: on the surface vertices UV0 is world x / 64 and -world y / 64 (u east, v south). Skirt vertices below the surface carry other UVs. `shader` lists every texture and constant of the shader; hex keys are parameter names not yet known. The flags useflowmap, useheighttexture and usesurfacemap hold the integer 1, which reads as 1.4e-45 as a float.",
         "surface_map_texture": "watersurfacemaptexture (BC7), the tile's 64 m square like the flow texture, usually 256 x 256 (4 x 4 placeholder on 6 tiles). Alpha is the mesh footprint, green the part where the surface lies above the ground (visible water), and red and blue rise with flow speed (probably foam or turbulence). The constant usesurfacemap is 1 on every tile except the 6 placeholders, like useflowmap and useheighttexture.",
         "summary": rep, "tiles": rows}))?;
     Ok(rep)

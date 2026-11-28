@@ -165,12 +165,17 @@ The optional macOS Metal 4 prototype uses the Apache-2.0-licensed
 `metal-rust` and `metal-rust-ffi` 1.0.0 crates published from
 https://github.com/gamesir-labs/Metal-Rust. Cargo patches those crates to
 `maple-quartz18/Metal-Rust` revision
-`618787057460de02dfe130f13d1c9aaa376aebd9`; the fork adds checked MTL4
-color-attachment setup, retained function-descriptor access, typed drawable
-signaling, CAMetalLayer pointer access, and a CPU-visible buffer read helper.
+`0aa2a1f694adf1a7e3ba877cc799e114d639df16`; the fork adds checked MTL4
+multisample color resolve setup, retained function-descriptor access, typed
+drawable signaling, CAMetalLayer pointer access, and a CPU-visible buffer read
+helper.
 Corresponding FFI wrappers and tests are included in that fork. The published
 crates remain the versioned dependency baseline; no binding sources are
 vendored in this repository.
+
+The experimental egui painter is provided as the workspace package
+`egui-mtl4` under `crates/egui-mtl4`. It was extracted from SixNG and remains
+GPL-3.0-only; it is not covered by Metal-Rust's Apache-2.0 license.
 
 ## gta6-namehash
 

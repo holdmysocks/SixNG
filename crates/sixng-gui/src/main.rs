@@ -45,8 +45,6 @@ mod mapbake;
 mod modelbakejob;
 #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
 mod metal4_app;
-#[cfg(all(target_os = "macos", feature = "metal4-poc"))]
-mod metal4_egui;
 mod model_picker;
 mod model_view;
 mod pages;
@@ -2091,6 +2089,7 @@ impl App {
         m.livery.ed.auto_add = c.get("livery-add").map(|s| s.split(',').map(str::to_string).collect()).unwrap_or_default();
         m.livery.ed.auto_click = c.get("livery-click").map(pairs).unwrap_or_default();
         m.livery.ed.auto_flat = c.has("livery-flat");
+        m.livery.ed.auto_from = c.get("livery-from").and_then(crate::livery::Side::parse);
         m.livery.ed.auto_drag = c.get("livery-drag").map(pairs).and_then(|v| v.first().copied());
         m.livery.ed.auto_save = c.has("livery-save");
         m.livery.ed.auto_undo = c.get("livery-undo").and_then(|s| s.parse().ok()).unwrap_or(0);

@@ -1068,6 +1068,20 @@ pub fn hair_states_under(word: &str) -> &'static [&'static str] {
     }
 }
 
+/// `hair_states_under`, with the state the outfit asks of the headwear
+/// item (hex joaat): a cap worn backwards (cap state `hatcapbackwards`)
+/// first asks the hair for `capbackwardshairalt`. Both names are joaat
+/// matches of the state hashes (1465a09b, b411d8df); that one picks the
+/// other is read from the names.
+pub fn hair_states_worn(word: &str, state: Option<&str>) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    if state.is_some_and(|s| u32::from_str_radix(s, 16).ok() == Some(joaat("hatcapbackwards"))) {
+        v.push("capbackwardshairalt");
+    }
+    v.extend_from_slice(hair_states_under(word));
+    v
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Outfit {
     /// Variation id (hex).
@@ -1986,6 +2000,8 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
     };
     for (o, vs) in flat {
         let mut cats: HashMap<String, u32> = HashMap::new();
+        // the item state the outfit asks of each part (hex)
+        let mut worn_states: HashMap<String, String> = HashMap::new();
         let listed = o.is_some();
         let mut parts: Vec<LookPart> = Vec::new();
         let mut unresolved = Vec::new();
@@ -2068,6 +2084,7 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
                 }
                 let slot_is_hair = slot == "hair";
                 cats.insert(drawable.clone(), p.category_hash);
+                worn_states.insert(drawable.clone(), p.state.clone());
                 parts.push(LookPart { decorations: vec![], skin_tone: None, strands: is_strand_word(item_word(&drawable)), slot, drawable, item: p.item.clone(), guid: p.guid.clone(), tint: p.tint.clone(), colour: p.colour, colour_tag: p.colour_tag, hair_preset: p.hair_preset.clone(), layer_set: p.layer_set.clone(), preset: p.preset.clone(), preset_colours: p.preset.as_deref().and_then(|h| presets?.colours(h)).map(|v| v.into_iter().map(|c| c.map(|c| [c[0], c[1], c[2]])).collect()).unwrap_or_default(), tex_remap: p.tex_remap.clone(), skins: p.skins.clone(), found_by, category: p.category.clone(), layer: p.layer.clone(), hides: p.hides.clone(), hides_sub: p.hides_sub.clone(), hair_state: None, skin_from: None, state_guids: if slot_is_hair { p.state_guids.clone() } else { vec![] } });
             }
         }
@@ -2111,7 +2128,7 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
         }
         // Headwear: the hair item's state for it names the hair asset worn
         // under it (a flattened or shortened one, or the hidden one).
-        let wanted: Vec<(&'static str, String)> = parts.iter().flat_map(|p| hair_states_under(item_word(&p.drawable)).iter().map(|s| (*s, p.drawable.clone()))).collect();
+        let wanted: Vec<(&'static str, String)> = parts.iter().flat_map(|p| hair_states_worn(item_word(&p.drawable), worn_states.get(&p.drawable).map(String::as_str)).into_iter().map(|s| (s, p.drawable.clone()))).collect();
         for h in parts.iter_mut().filter(|p| p.slot == "hair") {
             let found = wanted.iter().find_map(|(s, by)| {
                 let key = format!("{:08x}", joaat(s));
@@ -2164,6 +2181,17 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_cap_worn_backwards_asks_for_the_backwards_hair_first() {
+        use super::{hair_states_worn, joaat};
+        // the state names are the joaat matches of the hashes the data holds
+        assert_eq!(joaat("hatcapbackwards"), 0x1465_a09b);
+        assert_eq!(joaat("capbackwardshairalt"), 0xb411_d8df);
+        assert_eq!(hair_states_worn("hatcapcasual", Some("1465a09b")), ["capbackwardshairalt", "hathairalt"]);
+        assert_eq!(hair_states_worn("hatcapcasual", Some("44e21c90")), ["hathairalt"]);
+        assert_eq!(hair_states_worn("tshirt", None), Vec::<&str>::new());
+    }
+
+    #[test]
     fn cull_twins_and_masks_follow_the_hide_masks() {
         let part = |d: &str, layer: &str, hides: Vec<(&str, &str)>| LookPart { decorations: vec![], skin_tone: None, slot: "top".into(), drawable: d.into(), item: String::new(), strands: false, guid: None, tint: None, colour: None, colour_tag: None, hair_preset: None, preset_colours: vec![], preset: None, tex_remap: vec![], skins: vec![], found_by: "x", category: None, layer: Some(layer.into()), hides: hides.into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(), hides_sub: vec![], hair_state: None, state_guids: vec![], layer_set: None, skin_from: None };
         let parts = vec![
@@ -2214,7 +2242,7 @@ mod tests {
         use crate::meta7a::asset_id;
         let d = SceneDict { name: "cin@x_p1_t01".into(), id: "a.rpf@10".into(), clips: ["boss_face", "guard2", "lucia"].map(String::from).to_vec(), sections: 0, section_ids: vec![], adopted_sections: 0, streamed: vec![], unjoined: vec![], windows_streamed: 0, windows_missing: 0 };
         // the scene file records the boss's model; the guard's is not recorded
-        let f = SceneFile { id: "a.rpf@20".into(), states: vec![], objects: vec![FileObject { key: joaat("boss"), kind: "ped".into(), model: Some(asset_id("cs_boss")) }] };
+        let f = SceneFile { id: "a.rpf@20".into(), states: vec![], objects: vec![FileObject { key: joaat("boss"), kind: "ped".into(), model: Some(asset_id("cs_boss")) }], audio: vec![], timeline: vec![], fsm: vec![], fsm_start: vec![], subtitles: vec![] };
         let c = Catalog { version: CATALOG_VERSION, archive: "a.rpf".into(), dicts: vec![d], files: vec![f] };
         let listed: HashSet<u32> = ["cs_boss", "cs_guard", "player_story000_00"].iter().map(|n| joaat(n)).collect();
         let (mut names, mut uncertain) = (BTreeMap::new(), std::collections::BTreeSet::new());

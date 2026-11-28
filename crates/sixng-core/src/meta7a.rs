@@ -964,6 +964,7 @@ mod tests {
         assert_eq!(enum_value_name(0x391d_8bab, 10), Some("RC_CarPark"));
         // the key enum follows the Windows virtual-key codes; pad buttons sit at 0x20000
         assert_eq!(enum_value_name(0xacc0_e29b, 112), Some("KEY_F1"));
+        assert_eq!(enum_value_name(0xce56_6a0f, 156), Some("INPUT_VEH_MOVE_UP_ONLY"));
         assert_eq!(enum_value_name(0xacc0_e29b, 0x2_0009), Some("L3"));
         // data file types
         assert_eq!(enum_value_name(0x3ff1_9213, 6), Some("HANDLING_FILE"));

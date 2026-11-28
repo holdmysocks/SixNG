@@ -515,8 +515,8 @@ pub fn multilayer(s: &crate::drawable::Shader, entries: &[Value], fit: impl FnOn
 
 /// Material constants of the two-layer blend: `blendsoftness`,
 /// `blendintensity`, `blendoffset`, the blend mask's channel weights
-/// (59eb15c5), the mask invert switch (f208e5ee), the mask UV pick
-/// (f50070cc), the instance-value switch (d969fac9) and the layer-2
+/// (59eb15c5, `controlfilter`), the mask invert switch (f208e5ee), the mask UV pick
+/// (f50070cc, `controluvset`), the instance-value switch (d969fac9) and the layer-2
 /// colour-alpha switch (d6de9e14).
 pub const TWO_LAYER_BLEND: [(&str, &str); 8] = [
     ("cbc6c5b3", "blendsoftness"),
@@ -795,9 +795,9 @@ pub fn four_layer_vertex_weights(l: &mut Value, colours1: impl Iterator<Item = [
 
 /// Each layer's UV of a 4-layer material from the material's own constants,
 /// as the shader code applies them (read in two deferred pixel programs,
-/// `standard_uber_4lyr` and `…_dpm_dm_hbb`): `724bed95[k] == 1` gives layer
-/// k the first UV set times `4344d2cc.xy` plus `.zw`, anything else the
-/// second set times `9ecaaa1e.xy` plus `.zw`. Replaces the assumed values
+/// `standard_uber_4lyr` and `…_dpm_dm_hbb`): `724bed95[k] == 1` (`uvset`) gives layer
+/// k the first UV set times `4344d2cc.xy` plus `.zw` (`uv0scalebias`), anything else the
+/// second set times `9ecaaa1e.xy` plus `.zw` (`uv1scalebias`). Replaces the assumed values
 /// in `layers` and the recommendation; nothing changes when a constant is
 /// missing.
 fn four_layer_uv(l: &mut Value, consts: &[crate::drawable::ShaderConst]) {
@@ -1173,7 +1173,7 @@ mod paint_tests {
         let k = |hash: &str, count: u8, v: [f32; 4]| crate::drawable::ShaderConst { hash: hash.into(), desc: String::new(), offset: 0, values: Some(v), buffer: 7, count, ty: None };
         let p = four_layer_params(&[k("4344d2cc", 4, [128.0, 128.0, 0.0, 0.0]), k("0f0f0f0f", 4, [1.0, 0.7, 0.2, 1.0]), k("0e0e0e0e", 1, [3.0, 0.0, 0.0, 0.0])]);
         assert_eq!((p["per_layer"][1]["0f0f0f0f"].as_f64().map(|x| (x * 10.0).round()), p["per_layer"][0].as_object().map(|o| o.len())), (Some(7.0), Some(1)));
-        assert_eq!((p["material"]["4344d2cc"][0].as_f64(), p["material"]["0e0e0e0e"].as_f64()), (Some(128.0), Some(3.0)));
+        assert_eq!((p["material"]["uv0scalebias (4344d2cc)"][0].as_f64(), p["material"]["0e0e0e0e"].as_f64()), (Some(128.0), Some(3.0)));
         assert_eq!((l["weights"]["channels"]["remainder"].as_str(), l["confidence"]["layer3_remainder"].as_str()), (Some("layer3"), Some("high (shader code)")));
         assert!(l["weights"]["vertex_override"].as_str().unwrap().contains("COLOR_1") && l["data_map_channels"]["a"].as_str().unwrap().starts_with("tint mask"));
         assert_eq!(l["macro"]["tint"]["png"], "t16.png");
