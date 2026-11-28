@@ -52,7 +52,7 @@ mod macos {
         device: Device,
         layer: Layer,
         queue: metal_rust::metal4::CommandQueue,
-        painter: super::super::metal4_egui::Painter,
+        painter: egui_mtl4::Painter,
         scene: crate::render3d_metal4::Renderer3D4,
         residency: ResidencySet,
         size: PhysicalSize<u32>,
@@ -84,7 +84,10 @@ mod macos {
             let queue = device.new_mtl4_command_queue()?;
             let residency = layer.residency_set()?;
             queue.add_residency_set(&residency)?;
-            let painter = super::super::metal4_egui::Painter::new(&device)?;
+            let mut painter = egui_mtl4::Painter::new(&device)?;
+            painter.set_linear_texture_ids([egui::TextureId::User(
+                crate::render3d_metal4::MAP_TEXTURE_ID,
+            )]);
             let scene = crate::render3d_metal4::Renderer3D4::new(&device, &queue)?;
             let refresh_rate = window
                 .current_monitor()

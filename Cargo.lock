@@ -1156,6 +1156,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui-mtl4"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "egui",
+ "metal-rust",
+]
+
+[[package]]
 name = "egui-wgpu"
 version = "0.36.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3476,6 +3486,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "eframe",
+ "egui-mtl4",
  "egui-winit",
  "flate2",
  "glam",

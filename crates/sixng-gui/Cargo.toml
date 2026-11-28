@@ -7,7 +7,7 @@ license.workspace = true
 [features]
 default = ["opus-decode"]
 opus-decode = ["sixng-core/opus-decode"]
-metal4-poc = ["dep:metal-rust"]
+metal4-poc = ["dep:metal-rust", "dep:egui-mtl4"]
 
 [[example]]
 name = "metal4_window"
@@ -32,6 +32,7 @@ rfd = "0.15"
 regex = "1.13.2"
 serde_json.workspace = true
 rodio = { version = "0.20", default-features = false }
+egui-mtl4 = { path = "../egui-mtl4", optional = true }
 
 [dev-dependencies]
 # shader checks in unit tests (the version wgpu uses)
