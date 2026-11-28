@@ -90,7 +90,7 @@ pub const SKIN_CATEGORIES: [(u32, &str); 3] = [(0x3817_131d, "body upper"), (0x4
 
 const VERSION: u32 = 5;
 /// Changes when the bake rule changes, so baked textures are made again.
-pub const BAKE_RULE: u32 = 11;
+pub const BAKE_RULE: u32 = 12;
 /// The skin tone record struct (`data.rpf`): a name, a linear colour.
 pub const SKIN_TONE: u32 = 0x27a7_a4ef;
 /// Wardrobe tag key whose item names the skin tone (a skin-tone item, or
@@ -836,27 +836,53 @@ impl Layer {
 
 /// Region flag (shader record +0x50): a record with a layer that has it
 /// draws every layer limited to the part's mesh coverage, from a mask the
-/// bake renders first by drawing the part's own mesh into it. The bake
-/// mesh shader (`MSNC_VS_BakeDecorations`) sets its TEXCOORD1.z to 1 at a
-/// vertex whose four mask texels `(x-1, y-1), (x-1, y), (x, y+1),
-/// (x+1, y+1)` all lie on the mesh, else 0; the pixel shader starts a
-/// layer's coverage at `min(opacity, z)`.
-///
-/// Left out: flag 0x40, which (in a record without 0x2) has the shader take
-/// z from a vertex colour channel picked by the layer's group. Its result
-/// on the characters checked is doubtful, so it is not applied.
+/// bake renders first by drawing the part's own mesh into it.
 pub const REGION_MASK: u32 = 0x2;
+/// Region flag: a record with a layer that has it (and none with
+/// [`REGION_MASK`]) scales every layer by one vertex colour channel, picked
+/// by the layer's mode ([`Layer::mode`]): 0-3 are `_COLOR0` rgba, 4-7
+/// `_COLOR1` rgba, 8 and up none.
+pub const REGION_VERTEX: u32 = 0x40;
 
-/// Whether a record's layers are limited to the mesh ([`REGION_MASK`]).
-pub fn has_region_mask(layers: &[Layer]) -> bool {
-    layers.iter().any(|l| l.flags & REGION_MASK != 0)
+/// How the bake caps a record's coverage. The game's job builder
+/// (one job per record) copies each PSO layer's flags into its shader
+/// record at +0x50 and its mode at +0x54; the draw makes one pass per mode
+/// and hands it to the bake mesh shader (`MSNC_VS_BakeDecorations`, cbuffer
+/// +112), which scans every layer of the record once per draw: any layer
+/// with [`REGION_MASK`] picks the mask test, else any with
+/// [`REGION_VERTEX`] the vertex channel. The shader writes the result as
+/// TEXCOORD1.z, and the pixel shader starts a layer's coverage at
+/// `min(opacity, z)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Region {
+    /// [`REGION_MASK`]: z = 1 at a vertex whose four mask texels
+    /// `(x-1, y-1), (x-1, y), (x, y+1), (x+1, y+1)` all lie on the mesh, else 0.
+    Mask,
+    /// [`REGION_VERTEX`]: z = the vertex's colour channel / 255 (8-bit
+    /// unorm, channels in stored order).
+    Vertex,
+}
+
+impl Region {
+    /// The cap a record's layers get, if any.
+    pub fn of(layers: &[Layer]) -> Option<Region> {
+        if layers.iter().any(|l| l.flags & REGION_MASK != 0) {
+            Some(Region::Mask)
+        } else if layers.iter().any(|l| l.flags & REGION_VERTEX != 0) {
+            Some(Region::Vertex)
+        } else {
+            None
+        }
+    }
 }
 
 /// A triangle corner of the part being baked: where it lies in the baked
-/// texture (0..1, in the texture's own layout).
+/// texture (0..1, in the texture's own layout) and its two vertex colour
+/// streams (`_COLOR0` rgba then `_COLOR1` rgba, as stored).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Corner {
     pub at: [f32; 2],
+    pub colours: [u8; 8],
 }
 
 /// Texels whose centres a triangle covers, with the barycentric weights.
@@ -883,19 +909,26 @@ fn raster(w: usize, h: usize, t: &[Corner; 3], mut f: impl FnMut(usize, [f32; 3]
     }
 }
 
-/// The per-texel cap ([`REGION_MASK`]) over a `w` x `h` baked texture,
-/// 0..255: each vertex's value interpolated over the part's triangles.
-/// Texels no triangle covers (the gutters, which the game fills afterwards
-/// by dilating) take the value of the nearest covered texel.
-pub fn region_cap(w: usize, h: usize, tris: &[[Corner; 3]]) -> Vec<u8> {
+/// The per-texel cap ([`Region`]) of a mode's layers over a `w` x `h`
+/// baked texture, 0..255: each vertex's value interpolated over the part's
+/// triangles. Texels no triangle covers (the gutters, which the game fills
+/// afterwards by dilating) take the value of the nearest covered texel.
+pub fn region_cap(w: usize, h: usize, tris: &[[Corner; 3]], region: Region, mode: u32) -> Vec<u8> {
     let mut covered = vec![false; w * h];
-    for t in tris {
-        raster(w, h, t, |i, _| covered[i] = true);
+    if region == Region::Mask {
+        for t in tris {
+            raster(w, h, t, |i, _| covered[i] = true);
+        }
     }
     let on = |x: i64, y: i64| x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h && covered[y as usize * w + x as usize];
     let value = |c: &Corner| -> f32 {
-        let (x, y) = ((c.at[0] * w as f32).floor() as i64, (c.at[1] * h as f32).floor() as i64);
-        (on(x - 1, y - 1) && on(x - 1, y) && on(x, y + 1) && on(x + 1, y + 1)) as u8 as f32
+        match region {
+            Region::Vertex => c.colours.get(mode as usize).map_or(1.0, |&b| b as f32 / 255.0),
+            Region::Mask => {
+                let (x, y) = ((c.at[0] * w as f32).floor() as i64, (c.at[1] * h as f32).floor() as i64);
+                (on(x - 1, y - 1) && on(x - 1, y) && on(x, y + 1) && on(x + 1, y + 1)) as u8 as f32
+            }
+        }
     };
     let mut cap = vec![0.0f32; w * h];
     let mut hit = vec![false; w * h];
@@ -1025,31 +1058,49 @@ mod tests {
         Layer { textures: vec![1], colours: [0, 0, 0], clip: [none; 4], flags: 0, opacity: 1.0, saturation: 1.0, mode: 0, uv: identity(), p3: [[0.0; 4]; 3], zone: identity() }
     }
 
-    fn corner(u: f32, v: f32) -> Corner {
-        Corner { at: [u, v] }
+    fn corner(u: f32, v: f32, colours: [u8; 8]) -> Corner {
+        Corner { at: [u, v], colours }
     }
 
     #[test]
-    fn the_region_flag_marks_the_record() {
+    fn region_flags_pick_the_record_cap() {
         let mut a = layer();
         let mut b = layer();
-        b.flags = 0x40;
-        assert!(!has_region_mask(&[a.clone(), b.clone()]));
+        assert_eq!(Region::of(&[a.clone(), b.clone()]), None);
+        b.flags = REGION_VERTEX;
+        assert_eq!(Region::of(&[a.clone(), b.clone()]), Some(Region::Vertex));
+        // the mask wins when both are in the record
         a.flags = REGION_MASK;
-        assert!(has_region_mask(&[a, b]));
+        assert_eq!(Region::of(&[a, b]), Some(Region::Mask));
+    }
+
+    #[test]
+    fn a_vertex_cap_interpolates_the_modes_channel() {
+        // one triangle over the whole 4 x 4 texture's lower-left half; channel
+        // 2 (_COLOR0.b) is 0 at (0, 0) and 255 elsewhere, channel 4 255
+        let t = [corner(0.0, 0.0, [0, 0, 0, 255, 255, 0, 0, 0]), corner(1.0, 0.0, [0, 0, 255, 255, 255, 0, 0, 0]), corner(0.0, 1.0, [0, 0, 255, 255, 255, 0, 0, 0])];
+        let c = region_cap(4, 4, &[t], Region::Vertex, 2);
+        // texel (0, 0) centre (0.125, 0.125): 1 - 0.75 of the way from the corner
+        assert_eq!(c[0], (0.25f32 * 255.0).round() as u8);
+        assert!(c[1] > c[0]);
+        assert_eq!(region_cap(4, 4, &[t], Region::Vertex, 4), vec![255; 16]);
+        // a mode past the eight channels has no cap
+        assert_eq!(region_cap(4, 4, &[t], Region::Vertex, 9), vec![255; 16]);
+        // a gutter texel (3, 3) takes its covered neighbours' value
+        assert!(c[15] > 0);
     }
 
     #[test]
     fn a_mask_cap_is_one_where_the_mesh_covers_the_vertex() {
-        let full = [corner(0.0, 0.0), corner(1.0, 0.0), corner(0.0, 1.0)];
-        let other = [corner(1.0, 0.0), corner(1.0, 1.0), corner(0.0, 1.0)];
+        let full = [corner(0.0, 0.0, [255; 8]), corner(1.0, 0.0, [255; 8]), corner(0.0, 1.0, [255; 8])];
+        let other = [corner(1.0, 0.0, [255; 8]), corner(1.0, 1.0, [255; 8]), corner(0.0, 1.0, [255; 8])];
         // the whole square covered: the small triangle's vertices see four
         // covered texels each (texel (3, 3) lies in it)
-        let small = [corner(0.4, 0.4), corner(0.6, 0.4), corner(0.4, 0.6)];
-        let c = region_cap(8, 8, &[full, other, small]);
+        let small = [corner(0.4, 0.4, [255; 8]), corner(0.6, 0.4, [255; 8]), corner(0.4, 0.6, [255; 8])];
+        let c = region_cap(8, 8, &[full, other, small], Region::Mask, 0);
         assert_eq!(c[3 * 8 + 3], 255);
         // a vertex at the texture's corner has texels off the texture: 0
-        let c = region_cap(8, 8, &[full]);
+        let c = region_cap(8, 8, &[full], Region::Mask, 0);
         assert_eq!(c[0], 0);
     }
 
