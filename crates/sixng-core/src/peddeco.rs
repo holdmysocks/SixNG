@@ -90,7 +90,7 @@ pub const SKIN_CATEGORIES: [(u32, &str); 3] = [(0x3817_131d, "body upper"), (0x4
 
 const VERSION: u32 = 5;
 /// Changes when the bake rule changes, so baked textures are made again.
-pub const BAKE_RULE: u32 = 10;
+pub const BAKE_RULE: u32 = 11;
 /// The skin tone record struct (`data.rpf`): a name, a linear colour.
 pub const SKIN_TONE: u32 = 0x27a7_a4ef;
 /// Wardrobe tag key whose item names the skin tone (a skin-tone item, or
@@ -834,10 +834,121 @@ impl Layer {
     }
 }
 
+/// Region flag (shader record +0x50): a record with a layer that has it
+/// draws every layer limited to the part's mesh coverage, from a mask the
+/// bake renders first by drawing the part's own mesh into it. The bake
+/// mesh shader (`MSNC_VS_BakeDecorations`) sets its TEXCOORD1.z to 1 at a
+/// vertex whose four mask texels `(x-1, y-1), (x-1, y), (x, y+1),
+/// (x+1, y+1)` all lie on the mesh, else 0; the pixel shader starts a
+/// layer's coverage at `min(opacity, z)`.
+///
+/// Left out: flag 0x40, which (in a record without 0x2) has the shader take
+/// z from a vertex colour channel picked by the layer's group. Its result
+/// on the characters checked is doubtful, so it is not applied.
+pub const REGION_MASK: u32 = 0x2;
+
+/// Whether a record's layers are limited to the mesh ([`REGION_MASK`]).
+pub fn has_region_mask(layers: &[Layer]) -> bool {
+    layers.iter().any(|l| l.flags & REGION_MASK != 0)
+}
+
+/// A triangle corner of the part being baked: where it lies in the baked
+/// texture (0..1, in the texture's own layout).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Corner {
+    pub at: [f32; 2],
+}
+
+/// Texels whose centres a triangle covers, with the barycentric weights.
+fn raster(w: usize, h: usize, t: &[Corner; 3], mut f: impl FnMut(usize, [f32; 3])) {
+    let p: [[f32; 2]; 3] = std::array::from_fn(|k| [t[k].at[0] * w as f32, t[k].at[1] * h as f32]);
+    let d = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) - (p[2][0] - p[0][0]) * (p[1][1] - p[0][1]);
+    if d.abs() < 1e-12 {
+        return;
+    }
+    let lo = |i: usize| p.iter().map(|q| q[i]).fold(f32::MAX, f32::min);
+    let hi = |i: usize| p.iter().map(|q| q[i]).fold(f32::MIN, f32::max);
+    let (x0, x1) = ((lo(0) - 0.5).floor().max(0.0) as usize, ((hi(0) - 0.5).ceil().max(0.0) as usize).min(w.saturating_sub(1)));
+    let (y0, y1) = ((lo(1) - 0.5).floor().max(0.0) as usize, ((hi(1) - 0.5).ceil().max(0.0) as usize).min(h.saturating_sub(1)));
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let (cx, cy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let b1 = ((cx - p[0][0]) * (p[2][1] - p[0][1]) - (p[2][0] - p[0][0]) * (cy - p[0][1])) / d;
+            let b2 = ((p[1][0] - p[0][0]) * (cy - p[0][1]) - (cx - p[0][0]) * (p[1][1] - p[0][1])) / d;
+            let b0 = 1.0 - b1 - b2;
+            if b0 >= -1e-5 && b1 >= -1e-5 && b2 >= -1e-5 {
+                f(y * w + x, [b0, b1, b2]);
+            }
+        }
+    }
+}
+
+/// The per-texel cap ([`REGION_MASK`]) over a `w` x `h` baked texture,
+/// 0..255: each vertex's value interpolated over the part's triangles.
+/// Texels no triangle covers (the gutters, which the game fills afterwards
+/// by dilating) take the value of the nearest covered texel.
+pub fn region_cap(w: usize, h: usize, tris: &[[Corner; 3]]) -> Vec<u8> {
+    let mut covered = vec![false; w * h];
+    for t in tris {
+        raster(w, h, t, |i, _| covered[i] = true);
+    }
+    let on = |x: i64, y: i64| x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h && covered[y as usize * w + x as usize];
+    let value = |c: &Corner| -> f32 {
+        let (x, y) = ((c.at[0] * w as f32).floor() as i64, (c.at[1] * h as f32).floor() as i64);
+        (on(x - 1, y - 1) && on(x - 1, y) && on(x, y + 1) && on(x + 1, y + 1)) as u8 as f32
+    };
+    let mut cap = vec![0.0f32; w * h];
+    let mut hit = vec![false; w * h];
+    for t in tris {
+        let z = [value(&t[0]), value(&t[1]), value(&t[2])];
+        raster(w, h, t, |i, b| {
+            cap[i] = (b[0] * z[0] + b[1] * z[1] + b[2] * z[2]).clamp(0.0, 1.0);
+            hit[i] = true;
+        });
+    }
+    // gutters: grow the covered values outwards, then 1 where none reached
+    for _ in 0..16 {
+        let (was, prev) = (hit.clone(), cap.clone());
+        let mut grew = false;
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                if was[i] {
+                    continue;
+                }
+                let (mut sum, mut n) = (0.0, 0);
+                for (a, b) in [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)] {
+                    if a < w && b < h && was[b * w + a] {
+                        sum += prev[b * w + a];
+                        n += 1;
+                    }
+                }
+                if n > 0 {
+                    cap[i] = sum / n as f32;
+                    hit[i] = true;
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    cap.iter().zip(&hit).map(|(&c, &h)| if h { (c * 255.0).round() as u8 } else { 255 }).collect()
+}
+
 pub fn bake(skin: &mut Image, layers: &[(&Layer, Option<&Layer>)], decal: &dyn Fn(u64) -> Option<std::sync::Arc<Image>>, skin_tone: Option<u32>, space: Space) -> Skipped {
+    bake_capped(skin, layers, &[], decal, skin_tone, space)
+}
+
+/// [`bake`] with a per-texel coverage cap for each layer (`caps[i]` for
+/// `layers[i]`, from [`region_cap`] at the skin's size; a missing entry or
+/// `None` is no cap).
+pub fn bake_capped(skin: &mut Image, layers: &[(&Layer, Option<&Layer>)], caps: &[Option<&[u8]>], decal: &dyn Fn(u64) -> Option<std::sync::Arc<Image>>, skin_tone: Option<u32>, space: Space) -> Skipped {
     let mut skipped = Skipped::default();
     let (w, h) = (skin.w as usize, skin.h as usize);
-    for &(l, mask) in layers {
+    for (li, &(l, mask)) in layers.iter().enumerate() {
+        let cap = caps.get(li).copied().flatten().filter(|c| c.len() == w * h);
         // a mask whose decal is missing leaves the layer whole
         let mask = mask.and_then(|m| Some((m, m.textures.first().and_then(|&x| decal(x))?)));
         let made;
@@ -882,6 +993,14 @@ pub fn bake(skin: &mut Image, layers: &[(&Layer, Option<&Layer>)], decal: &dyn F
                 if let Some((m, mt)) = &mask {
                     k *= m.mask_factor(mt, u, v);
                 }
+                // the shader starts the coverage at min(opacity, z), not
+                // at the opacity
+                if let Some(cap) = cap {
+                    let z = cap[y * w + x] as f32 / 255.0;
+                    if l.opacity > 0.0 && z < l.opacity {
+                        k *= z / l.opacity;
+                    }
+                }
                 if k <= 0.0 {
                     continue;
                 }
@@ -904,6 +1023,50 @@ mod tests {
     fn layer() -> Layer {
         let none = [0.0, f32::MAX, f32::MAX, f32::MAX];
         Layer { textures: vec![1], colours: [0, 0, 0], clip: [none; 4], flags: 0, opacity: 1.0, saturation: 1.0, mode: 0, uv: identity(), p3: [[0.0; 4]; 3], zone: identity() }
+    }
+
+    fn corner(u: f32, v: f32) -> Corner {
+        Corner { at: [u, v] }
+    }
+
+    #[test]
+    fn the_region_flag_marks_the_record() {
+        let mut a = layer();
+        let mut b = layer();
+        b.flags = 0x40;
+        assert!(!has_region_mask(&[a.clone(), b.clone()]));
+        a.flags = REGION_MASK;
+        assert!(has_region_mask(&[a, b]));
+    }
+
+    #[test]
+    fn a_mask_cap_is_one_where_the_mesh_covers_the_vertex() {
+        let full = [corner(0.0, 0.0), corner(1.0, 0.0), corner(0.0, 1.0)];
+        let other = [corner(1.0, 0.0), corner(1.0, 1.0), corner(0.0, 1.0)];
+        // the whole square covered: the small triangle's vertices see four
+        // covered texels each (texel (3, 3) lies in it)
+        let small = [corner(0.4, 0.4), corner(0.6, 0.4), corner(0.4, 0.6)];
+        let c = region_cap(8, 8, &[full, other, small]);
+        assert_eq!(c[3 * 8 + 3], 255);
+        // a vertex at the texture's corner has texels off the texture: 0
+        let c = region_cap(8, 8, &[full]);
+        assert_eq!(c[0], 0);
+    }
+
+    #[test]
+    fn a_cap_lowers_the_opacity_only_below_it() {
+        let mut l = layer();
+        l.opacity = 0.5;
+        let d = std::sync::Arc::new(Image { w: 1, h: 1, rgba: vec![0, 0, 0, 255], srgb: true });
+        let base = || Image { w: 2, h: 1, rgba: vec![255; 8], srgb: true };
+        let cap = vec![255u8, 64];
+        let mut skin = base();
+        bake_capped(&mut skin, &[(&l, None)], &[Some(&cap)], &|_| Some(d.clone()), None, Space::Part);
+        let mut plain = base();
+        bake(&mut plain, &[(&l, None)], &|_| Some(d.clone()), None, Space::Part);
+        // cap 1 >= opacity 0.5: as without a cap; cap 0.25 < 0.5: half the coverage
+        assert_eq!(skin.rgba[..4], plain.rgba[..4]);
+        assert!(skin.rgba[4] > plain.rgba[4]);
     }
 
     #[test]

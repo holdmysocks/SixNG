@@ -1964,7 +1964,7 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
     // decorations, once the meshes are decoded: the upper body bakes into a
     // texture laid out in its second UV set (`peddeco::Space`)
     if let Some(names) = e.name.as_deref().and_then(|n| o.part_decorations.get(&n.to_ascii_lowercase())).filter(|n| !n.is_empty() && o.png) {
-        bake_decorations(a, &mut shader_tex, names, dir, o, &|si, set| decoration_triangles(&lod_groups, si, set));
+        bake_decorations(a, &mut shader_tex, names, dir, o, &|si, set| decoration_triangles(&lod_groups, si, set), &|si, set| decoration_corners(&lod_groups, si, set));
     }
     for (si, st) in shader_tex.iter_mut().enumerate() {
         let mut bones: Vec<&str> = mesh_meta.iter().filter(|m| m["shader_index"] == si).flat_map(|m| m["bones"].as_array().into_iter().flatten()).filter_map(|b| b.as_str()).collect();
@@ -2109,7 +2109,21 @@ fn decoration_triangles(lod_groups: &[Vec<crate::gltf::NodeGroup>], shader: usiz
     out
 }
 
-fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &[u32], dir: &Path, o: &ExportOptions, triangles: &dyn Fn(usize, usize) -> Vec<[([f32; 2], [f32; 2]); 3]>) {
+/// A shader's triangle corners for the bake's region caps, placed in UV
+/// set `set` (the layout the texture is baked in).
+fn decoration_corners(lod_groups: &[Vec<crate::gltf::NodeGroup>], shader: usize, set: usize) -> Vec<[crate::peddeco::Corner; 3]> {
+    let lod = lod_groups.iter().find(|g| g.iter().any(|n| !n.prims.is_empty()));
+    let mut out = Vec::new();
+    for p in lod.into_iter().flatten().flat_map(|n| &n.prims).filter(|p| p.material == Some(shader)) {
+        let Some(at) = p.uvs.get(set) else { continue };
+        for t in p.indices.chunks_exact(3) {
+            out.push(std::array::from_fn(|k| crate::peddeco::Corner { at: at[t[k] as usize] }));
+        }
+    }
+    out
+}
+
+fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &[u32], dir: &Path, o: &ExportOptions, triangles: &dyn Fn(usize, usize) -> Vec<[([f32; 2], [f32; 2]); 3]>, region_corners: &dyn Fn(usize, usize) -> Vec<[crate::peddeco::Corner; 3]>) {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     let root = game_root(a);
@@ -2123,6 +2137,12 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
     let found: Vec<&crate::peddeco::Decoration> = names.iter().filter_map(|&n| cat.get(n)).collect();
     let unknown: Vec<String> = names.iter().filter(|&&n| cat.get(n).is_none()).map(|n| format!("{n:08x}")).collect();
     let layers: Vec<(&crate::peddeco::Layer, Option<&crate::peddeco::Layer>)> = found.iter().flat_map(|d| crate::peddeco::masked(&d.layers)).collect();
+    // each drawn layer: whether its record limits it to the mesh
+    let regions: Vec<bool> = found.iter().flat_map(|d| {
+        let r = crate::peddeco::has_region_mask(&d.layers);
+        crate::peddeco::masked(&d.layers).into_iter().map(move |_| r)
+    }).collect();
+    let capped = regions.iter().filter(|&&r| r).count();
     // decal textures, decoded once per part
     let cache: Mutex<HashMap<u64, Option<Arc<crate::peddeco::Image>>>> = Mutex::new(HashMap::new());
     let decal = |h: u64| -> Option<Arc<crate::peddeco::Image>> {
@@ -2162,6 +2182,7 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
             "source": base,
             "rule": "decal UV = part UV (row vector) x the layer matrix (projective), clipped by the layer's edge quad in part UV; colour = ink 0's gradient at decal green x ink 0 alpha (the decal's own colour when ink 0 is off), covered by ink 1 by alpha x red and ink 2 by alpha x blue, then the layer's saturation (HSV); coverage = decal alpha x opacity; blended (normal, multiply, screen or overlay by the flags) in linear light",
             "ink_rule": "ink word 0xAAVVSSHH (HSV + alpha); stops in sRGB: 0.1V x lerp(1, hue, S), V x lerp(1, hue, S) with alpha A, (0.45 + 0.55V) x lerp(1, hue, 0.55S); each to linear and quantised to a byte; a layer with flag 0x4 is a mask on the layer before it in its record (its decal alpha a, inverted with flag 0x80000000, scales that layer's coverage by 1 - (1 - a) x opacity; it is not drawn itself); other mask decals on layers with no ink are left out",
+            "region_rule": "a record with a layer flagged 0x2 limits every layer to the part's mesh coverage: z = 1 at a vertex whose mask texels (x-1, y-1), (x-1, y), (x, y+1), (x+1, y+1) all lie on the mesh, else 0, interpolated over the triangles; coverage starts at min(opacity, z). Flag 0x40 (a vertex colour channel as z) is not applied",
             "makeup_rule": "an ink whose p3 row (dL, da, db, w) has w != 0 is first moved w of the way (in sRGB) toward the skin tone shifted by (dL, da, db) in CIELAB (D65), then repacked as HSV",
             "skin_tone": format!("{:08x}", if o.skin_tone == 0 { crate::peddeco::DEFAULT_SKIN_TONE } else { o.skin_tone }),
             "space": match space {
@@ -2169,6 +2190,9 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
                 crate::peddeco::Space::BodyUpper => "upper body space (2 u1, v1): the texture is laid out in TEXCOORD_1 (twice the plain texture's width), and the material reads it there; gutters take the nearest covered texel's skin",
             },
         });
+        if capped > 0 {
+            rec["region_capped_layers"] = capped.into();
+        }
         if !unknown.is_empty() {
             rec["not_in_catalogue"] = unknown.clone().into();
         }
@@ -2189,7 +2213,12 @@ fn bake_decorations(a: &ArchiveInfo, shader_tex: &mut [ShaderTextures], names: &
                 if space == crate::peddeco::Space::BodyUpper {
                     skin = crate::peddeco::uv_layout(&skin, &triangles(si, 1));
                 }
-                let skipped = crate::peddeco::bake(&mut skin, &layers, &decal, tone, space);
+                let cap: Option<Vec<u8>> = (capped > 0).then(|| {
+                    let tris = region_corners(si, if space == crate::peddeco::Space::BodyUpper { 1 } else { 0 });
+                    crate::peddeco::region_cap(skin.w as usize, skin.h as usize, &tris)
+                });
+                let per_layer: Vec<Option<&[u8]>> = regions.iter().map(|&r| if r { cap.as_deref() } else { None }).collect();
+                let skipped = crate::peddeco::bake_capped(&mut skin, &layers, &per_layer, &decal, tone, space);
                 texture::save_png(&out, &skin.rgba, skin.w, skin.h)?;
                 Ok(skipped)
             })()
