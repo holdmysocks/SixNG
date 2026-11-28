@@ -38,6 +38,10 @@ pub struct GameSticker {
     /// sRGB.
     pub colours: [[u8; 3]; 3],
     pub aspect: u32,
+    /// Its texture is in none of the game's texture stores: there is no
+    /// picture to show or to place, so the picker leaves it out.
+    #[serde(default)]
+    pub missing: bool,
 }
 
 enum Thumb {
@@ -132,6 +136,8 @@ pub struct Editor {
     done: Arc<Mutex<Vec<ThumbDone>>>,
     workers: bool,
     previews: HashMap<String, egui::TextureHandle>,
+    /// Where the Liveries window was drawn last (the picker opens beside it).
+    panel_rect: Option<egui::Rect>,
     /// Pictures still being read (a scripted screenshot waits for them).
     pub reading: usize,
     /// Pictures whose stickers were first placed before their size was
@@ -154,6 +160,11 @@ pub struct Editor {
     /// The vehicle is complete, so the scripted steps may run.
     pub ready: bool,
     pub auto_click: Vec<[f32; 2]>,
+    /// `--livery-flat`: lay the chosen sticker on flat once it has zones
+    /// (before the next scripted click, which may then add another model's).
+    pub auto_flat: bool,
+    /// `--livery-from SIDE`: with `--livery-flat`, the side it is projected from.
+    pub auto_from: Option<livery::Side>,
     pub auto_drag: Option<[f32; 2]>,
     /// `--livery-undo N`, `--livery-redo N`: after the other scripted steps,
     /// undo N steps, then redo N (before a scripted save).
@@ -199,6 +210,7 @@ impl Default for Editor {
             done: Default::default(),
             workers: false,
             previews: HashMap::new(),
+            panel_rect: None,
             reading: 0,
             await_fit: Default::default(),
             grab: None,
@@ -207,6 +219,8 @@ impl Default for Editor {
             auto_select: None,
             ready: false,
             auto_click: Vec::new(),
+            auto_flat: false,
+            auto_from: None,
             auto_drag: None,
             auto_save: false,
             auto_undo: 0,
@@ -231,21 +245,21 @@ fn argb(hex: &str) -> [u8; 3] {
 /// The game's sticker records, from the viewer's cache or (once, about 20
 /// seconds) from the game files.
 fn read_list(game: &str, work: &str, cache: &Path) -> Result<Vec<GameSticker>, String> {
-    let file = cache.join("sticker_list_v1.json");
+    let file = cache.join("sticker_list_v2.json");
     if let Some(l) = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<Vec<GameSticker>>(&b).ok()) {
         return Ok(l);
     }
     let ws = sixng_core::export::Workspace::new(game, work);
     let all = sixng_core::vehstickers::sticker_list(&ws).map_err(|e| format!("{e:#}"))?;
+    let stores = sixng_core::ttpf::global(Path::new(game));
     let list: Vec<GameSticker> = all
         .iter()
         .filter_map(|s| {
             let texture = s["texture"].as_str()?.to_string();
-            if sixng_core::vehstickers::parse_texture_id(&texture).is_none_or(|id| id == 0) {
-                return None;
-            }
+            let id = sixng_core::vehstickers::parse_texture_id(&texture).filter(|id| *id != 0)?;
+            let missing = stores.get(id).is_none();
             let c = |k: usize| argb(s["colours"][k].as_str().unwrap_or("ffffffff"));
-            Some(GameSticker { sticker: s["sticker"].as_str()?.to_string(), texture, mask: s["mask"].as_bool().unwrap_or(false), colours: [c(0), c(1), c(2)], aspect: s["aspect"].as_u64().unwrap_or(0) as u32 })
+            Some(GameSticker { sticker: s["sticker"].as_str()?.to_string(), texture, mask: s["mask"].as_bool().unwrap_or(false), colours: [c(0), c(1), c(2)], aspect: s["aspect"].as_u64().unwrap_or(0) as u32, missing })
         })
         .collect();
     let _ = std::fs::create_dir_all(cache);
@@ -257,13 +271,27 @@ fn read_list(game: &str, work: &str, cache: &Path) -> Result<Vec<GameSticker>, S
 /// from the game files.
 fn read_brands(game: &str, work: &str, cache: &Path) -> Result<Brands, String> {
     let file = cache.join("vehicle_liveries_f4.json");
-    if let Some(b) = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<Brands>(&b).ok()) {
-        return Ok(b);
+    let mut b = match std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<Brands>(&b).ok()) {
+        Some(b) => b,
+        None => {
+            let ws = sixng_core::export::Workspace::new(game, work);
+            let (b, _) = sixng_core::vehstickers::liveries(&ws, &HashMap::new()).map_err(|e| format!("{e:#}"))?;
+            let _ = std::fs::create_dir_all(cache);
+            let _ = sixng_core::atomic::write(&file, serde_json::to_vec(&b).unwrap_or_default());
+            b
+        }
+    };
+    // a model whose records are filed under its handlingId (guardiantx2's
+    // under guardian): its liveries are those of that hash
+    if let Ok(db) = crate::vehicle_db::shared(game, work) {
+        for (model, v) in db.iter() {
+            let Some(from) = v.records_from else { continue };
+            let own = format!("{:08x}", sixng_core::meta7a::joaat(model));
+            if let Some(list) = b.get(&format!("{from:08x}")).filter(|_| !b.contains_key(&own)).cloned() {
+                b.insert(own, list);
+            }
+        }
     }
-    let ws = sixng_core::export::Workspace::new(game, work);
-    let (b, _) = sixng_core::vehstickers::liveries(&ws, &HashMap::new()).map_err(|e| format!("{e:#}"))?;
-    let _ = std::fs::create_dir_all(cache);
-    let _ = sixng_core::atomic::write(&file, serde_json::to_vec(&b).unwrap_or_default());
     Ok(b)
 }
 
@@ -497,6 +525,9 @@ impl State {
             s.model = from.model.clone();
             s.zones = from.zones.clone();
             s.uv_set = from.uv_set;
+            s.flat = from.flat;
+            s.from = from.from;
+            s.also = from.also.clone();
         }
         let has_zones = !s.zones.is_empty();
         self.livery.stickers.push(s);
@@ -537,6 +568,11 @@ impl State {
         }
         let n = variants(brand);
         let which = if n > 1 { format!(", variant {} of {n}", variant % n + 1) } else { String::new() };
+        // a livery the viewer can place nothing of leaves the vehicle as it is
+        if s.is_empty() {
+            self.status = format!("{}{which}: none of its stickers can be placed, so the stickers on the vehicle were kept", brand["name"].as_str().or(brand["brand"].as_str()).unwrap_or("livery"));
+            return;
+        }
         self.status = format!("{}{which}: {} stickers placed by the game's layouts", brand["name"].as_str().or(brand["brand"].as_str()).unwrap_or("livery"), s.len());
         self.livery.stickers = s;
         self.ed.selected = None;
@@ -545,13 +581,37 @@ impl State {
     }
 
     /// Add the zone to sticker `i`, or take it off. A zone of another model
-    /// moves the sticker to that model.
+    /// moves the sticker to that model; a flat sticker that has zones takes
+    /// it as well instead (`Sticker::also`).
     fn toggle_zone(&mut self, i: usize, slot: u8, zone: u8, env: &Env) {
         let Some(model) = self.zones.models.get(slot as usize).cloned() else { return };
         let Some(s) = self.livery.stickers.get_mut(i) else { return };
+        if s.model != model && s.flat && !s.zones.is_empty() {
+            let at = match s.also.iter().position(|a| a.model == model) {
+                Some(at) => at,
+                None => {
+                    s.also.push(livery::Also { model, zones: Vec::new() });
+                    s.also.len() - 1
+                }
+            };
+            let z = &mut s.also[at].zones;
+            match z.iter().position(|z| *z == zone) {
+                Some(k) => {
+                    z.remove(k);
+                }
+                None => {
+                    z.push(zone);
+                    z.sort_unstable();
+                }
+            }
+            s.also.retain(|a| !a.zones.is_empty());
+            self.changed();
+            return;
+        }
         if s.model != model {
             s.model = model;
             s.zones.clear();
+            s.also.clear();
         }
         let first = s.zones.is_empty() || s.fresh;
         match s.zones.iter().position(|z| *z == zone) {
@@ -659,9 +719,18 @@ impl State {
             return;
         }
         let mut open = true;
-        egui::Window::new("Liveries").open(&mut open).default_pos(within.left_top() + egui::vec2(12.0, 12.0)).default_size([340.0, (within.height() - 70.0).clamp(300.0, 760.0)]).constrain_to(within).resizable(true).show(ctx, |ui| {
+        // The panel may lie anywhere below the top bars, also over the side
+        // panels. Where the view is too narrow to show the vehicle beside
+        // it, it starts over the list to the left of the view.
+        let area = Self::window_area(ctx, within);
+        let beside = within.left() - 340.0 - 12.0;
+        let x = if within.width() < 900.0 && beside >= area.left() + 4.0 { beside } else { within.left() + 12.0 };
+        let shown = egui::Window::new("Liveries").open(&mut open).default_pos(egui::pos2(x, within.top() + 12.0)).default_size([340.0, (within.height() - 70.0).clamp(300.0, 760.0)]).constrain_to(area).resizable(true).show(ctx, |ui| {
             egui::ScrollArea::vertical().max_height((within.height() - 80.0).max(200.0)).show(ui, |ui| self.panel_body(ui, env));
         });
+        if let Some(r) = shown {
+            self.ed.panel_rect = Some(r.response.rect);
+        }
         self.ed.open = open;
         if self.ed.picker_open {
             self.picker(ctx, within, env);
@@ -963,6 +1032,7 @@ impl State {
                     let s = &mut self.livery.stickers[i];
                     s.model = m.clone();
                     s.zones.clear();
+                    s.also.clear();
                 }
             }
         })
@@ -970,6 +1040,23 @@ impl State {
         .on_hover_text("Zones are numbered per model: the vehicle itself and each fitted part (a box, a bed) have their own.");
         if self.zones.slot_of(&cur).is_none() {
             ui.colored_label(egui::Color32::from_rgb(230, 170, 60), format!("{} is not fitted now, so this sticker is not drawn.", model_label(&cur)));
+        }
+        {
+            let s = &mut self.livery.stickers[i];
+            if ui.checkbox(&mut s.flat, "lay it on flat (across panels and models)").on_hover_text("Off: the sticker follows the panels' texture layout, as the game's own stickers do; it stays on one model and on one unwrapped piece of it.\nOn: the picture is projected straight onto the vehicle from the side its panels face. It then runs across panel pieces, and onto panels of other models: with this on, click panels of another model (the box behind the cab) to add them. On a curved panel the picture is stretched where the surface turns away. The game has no such sticker; it is the viewer's own.").changed() && !s.flat {
+                s.also.clear();
+            }
+            if s.flat {
+                egui::ComboBox::from_label("projected from").selected_text(s.from.label()).show_ui(ui, |ui| {
+                    for side in livery::Side::ALL {
+                        ui.selectable_value(&mut s.from, side, side.label());
+                    }
+                }).response.on_hover_text("The direction the picture is projected onto the vehicle from.\nIts panels: square to the panels the sticker lies on (their mean direction).\nA side of the vehicle: straight from that side, with the picture upright as seen from there, whatever way the panels lean. For a sticker along the whole side of a body whose panels curve or lean.\nOnly faces that look towards that side take the picture.");
+            }
+            for a in &s.also {
+                let fitted = self.zones.slot_of(&a.model).is_some();
+                ui.label(egui::RichText::new(format!("also on {}: zones {}{}", model_label(&a.model), a.zones.iter().map(|z| z.to_string()).collect::<Vec<_>>().join(", "), if fitted { "" } else { " (not fitted now)" })).small());
+            }
         }
         let zs = self.livery.stickers[i].zones.clone();
         ui.label(if zs.is_empty() { "zones: none yet".to_string() } else { format!("zones: {}", zs.iter().map(|z| z.to_string()).collect::<Vec<_>>().join(", ")) });
@@ -1120,6 +1207,13 @@ impl State {
         Some(t)
     }
 
+    /// Where the Liveries windows may lie: the whole window below the top
+    /// bars (the view starts under them).
+    fn window_area(ctx: &egui::Context, within: egui::Rect) -> egui::Rect {
+        let screen = ctx.content_rect();
+        egui::Rect::from_min_max(egui::pos2(screen.left(), within.top()), screen.right_bottom())
+    }
+
     /// The picker of the game's sticker textures.
     fn picker(&mut self, ctx: &egui::Context, within: egui::Rect, env: &Env) {
         self.ed.start_list(env, ctx);
@@ -1128,7 +1222,18 @@ impl State {
         let mut open = true;
         let mut chosen: Option<GameSticker> = None;
         let title = if self.ed.picker_replace { "Game stickers: change the picture" } else { "Game stickers: add one" };
-        egui::Window::new(title).id(egui::Id::new("livery_picker")).open(&mut open).default_pos(within.left_top() + egui::vec2(370.0, 12.0)).default_size([500.0, 520.0]).constrain_to(within).show(ctx, |ui| {
+        // beside the Liveries panel, not on it: to its right where there
+        // is room, else to its left
+        let area = Self::window_area(ctx, within);
+        let panel = self.ed.panel_rect.unwrap_or(egui::Rect::from_min_size(within.left_top(), egui::vec2(352.0, 0.0)));
+        let x = if panel.right() + 8.0 + 500.0 <= area.right() {
+            panel.right() + 8.0
+        } else if panel.left() - 8.0 - 500.0 >= area.left() {
+            panel.left() - 8.0 - 500.0
+        } else {
+            within.left() + 370.0
+        };
+        egui::Window::new(title).id(egui::Id::new("livery_picker")).open(&mut open).default_pos(egui::pos2(x, within.top() + 12.0)).default_size([500.0, 520.0]).constrain_to(area).show(ctx, |ui| {
             let list = match list {
                 None => {
                     ui.horizontal(|ui| {
@@ -1162,12 +1267,14 @@ impl State {
                 self.ed.filtered = list
                     .iter()
                     .enumerate()
-                    .filter(|(_, s)| (key.0.is_empty() || s.texture.contains(&key.0) || s.sticker.contains(&key.0)) && (key.1 == 0 || (key.1 == 1) == s.mask) && key.2.is_none_or(|a| if a >= 4 { s.aspect >= 4 } else { s.aspect == a }))
+                    .filter(|(_, s)| !s.missing && (key.0.is_empty() || s.texture.contains(&key.0) || s.sticker.contains(&key.0)) && (key.1 == 0 || (key.1 == 1) == s.mask) && key.2.is_none_or(|a| if a >= 4 { s.aspect >= 4 } else { s.aspect == a }))
                     .map(|(i, _)| i)
                     .collect();
                 self.ed.filter_key = Some(key);
             }
-            ui.label(egui::RichText::new(format!("{} of {} sticker records. The game's files give them no names, so they are found by eye.", self.ed.filtered.len(), list.len())).small().weak());
+            let missing = list.iter().filter(|s| s.missing).count();
+            let left_out = if missing > 0 { format!(" {missing} more records name a texture that is in none of the game's texture stores and are left out.") } else { String::new() };
+            ui.label(egui::RichText::new(format!("{} of {} sticker records. The game's files give them no names, so they are found by eye.{left_out}", self.ed.filtered.len(), list.len() - missing)).small().weak());
             let cell = 112.0;
             let cols = ((ui.available_width() + 4.0) / (cell + 4.0)).floor().max(1.0) as usize;
             let rows = self.ed.filtered.len().div_ceil(cols);
@@ -1275,6 +1382,15 @@ impl State {
             return false;
         }
         let sel = self.ed.selected.filter(|i| *i < self.livery.stickers.len());
+        if let Some(s) = sel.filter(|_| self.ed.auto_flat).map(|i| &mut self.livery.stickers[i]).filter(|s| !s.zones.is_empty()) {
+            s.flat = true;
+            if let Some(side) = self.ed.auto_from.take() {
+                s.from = side;
+            }
+            self.ed.auto_flat = false;
+            self.changed();
+            return false;
+        }
         if let (Some(i), Some(c)) = (sel, self.ed.auto_click.first().copied()) {
             self.ed.auto_click.remove(0);
             let pos = rect.min + egui::vec2(rect.width() * c[0], rect.height() * c[1]);
@@ -1287,12 +1403,14 @@ impl State {
         if let (Some(i), Some(c)) = (sel, self.ed.auto_drag) {
             self.ed.auto_drag = None;
             let pos = rect.min + egui::vec2(rect.width() * c[0], rect.height() * c[1]);
-            let (zones, set) = (self.livery.stickers[i].zones.clone(), self.livery.stickers[i].uv_set.min(1) as usize);
-            let slot = self.zones.slot_of(&self.livery.stickers[i].model);
-            match self.hit(pos, rect, cam, model, env.skin).filter(|h| Some(h.slot) == slot && zones.contains(&h.zone)) {
-                Some(h) => {
+            let hit = self.hit(pos, rect, cam, model, env.skin);
+            if let Some(h) = &hit {
+                eprintln!("[livery] scripted drag to {c:?}: zone {} at {:.3?} on the model", h.zone, h.pos.to_array());
+            }
+            match hit.and_then(|h| self.place_of(i, &h)) {
+                Some(uv) => {
                     self.livery.stickers[i].fresh = false;
-                    self.livery.stickers[i].centre = h.uv[set].to_array();
+                    self.livery.stickers[i].centre = uv.to_array();
                     self.changed();
                 }
                 None => self.status = format!("scripted drag to {c:?}: not on the sticker's zones"),
@@ -1358,18 +1476,15 @@ impl State {
                 if self.highlight.hover.take().is_some() {
                     self.changed();
                 }
-                let s = &self.livery.stickers[i];
-                let set = s.uv_set.min(1) as usize;
-                let slot = self.zones.slot_of(&s.model);
-                let on = hit.filter(|h| Some(h.slot) == slot && s.zones.contains(&h.zone));
+                let on = hit.and_then(|h| self.place_of(i, &h));
                 if resp.drag_started_by(egui::PointerButton::Primary) {
-                    self.ed.grab = on.map(|h| Vec2::from(s.centre) - h.uv[set]);
+                    self.ed.grab = on.map(|uv| Vec2::from(self.livery.stickers[i].centre) - uv);
                 }
                 if resp.drag_stopped() || !ui.input(|i| i.pointer.primary_down()) {
                     self.ed.grab = None;
                 }
-                if let (Some(g), Some(h), true) = (self.ed.grab, on, resp.dragged_by(egui::PointerButton::Primary)) {
-                    let c = (h.uv[set] + g).to_array();
+                if let (Some(g), Some(uv), true) = (self.ed.grab, on, resp.dragged_by(egui::PointerButton::Primary)) {
+                    let c = (uv + g).to_array();
                     if self.livery.stickers[i].centre != c {
                         self.livery.stickers[i].centre = c;
                         self.livery.stickers[i].fresh = false;
@@ -1379,7 +1494,21 @@ impl State {
                 // Ctrl + wheel: size; Shift + wheel: width; Ctrl + Shift +
                 // wheel: height; Alt + wheel: rotation (a wheel with Shift
                 // held arrives as a sideways scroll on some systems)
-                let (scroll, ctrl, alt, shift) = ui.input(|i| (if i.smooth_scroll_delta.y != 0.0 { i.smooth_scroll_delta.y } else { i.smooth_scroll_delta.x }, i.modifiers.command, i.modifiers.alt, i.modifiers.shift));
+                // With Ctrl held egui takes the wheel as a zoom gesture and
+                // reports no scroll: the scroll is worked back from the zoom
+                // factor (egui's zoom is exp(scroll / 200)). The gesture
+                // runs on for some frames after the wheel has stopped, so
+                // it counts as Ctrl also when the key is up again (as does
+                // a pinch on a touchpad).
+                let (scroll, ctrl, alt, shift) = ui.input(|i| {
+                    let s = if i.smooth_scroll_delta.y != 0.0 { i.smooth_scroll_delta.y } else { i.smooth_scroll_delta.x };
+                    let zoom = if s == 0.0 { i.zoom_delta() } else { 1.0 };
+                    if zoom != 1.0 && zoom > 0.0 {
+                        (zoom.ln() * 200.0, true, i.modifiers.alt, i.modifiers.shift)
+                    } else {
+                        (s, i.modifiers.command, i.modifiers.alt, i.modifiers.shift)
+                    }
+                });
                 let mut used = self.ed.grab.is_some();
                 if resp.hovered() && scroll != 0.0 && (ctrl || alt || shift) {
                     let s = &mut self.livery.stickers[i];
@@ -1400,6 +1529,24 @@ impl State {
             }
             Tool::None => false,
         }
+    }
+
+    /// The place in sticker `i`'s UV set a hit on the model stands for, when
+    /// the hit is on the sticker's zones. A flat sticker: the place on the
+    /// model, seen along its panels' normal (also on its other models).
+    fn place_of(&self, i: usize, h: &livery::Hit) -> Option<Vec2> {
+        let s = self.livery.stickers.get(i)?;
+        let slot = self.zones.slot_of(&s.model)?;
+        let set = s.uv_set.min(1) as usize;
+        let own = h.slot == slot && s.zones.contains(&h.zone);
+        if !s.flat {
+            return own.then(|| h.uv[set]);
+        }
+        let other = self.zones.models.get(h.slot as usize).is_some_and(|m| s.also.iter().any(|a| a.model == *m && a.zones.contains(&h.zone)));
+        if !own && !other {
+            return None;
+        }
+        Some(self.zones.set(slot, &s.zones, set)?.uv_at(h.pos, s.from))
     }
 
     /// What the view shows at a place of the viewport.

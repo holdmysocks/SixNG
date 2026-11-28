@@ -155,6 +155,36 @@ pub const DERIVED: &[&str] = &[
     "furnoiseuvscale", "grassdecaluvscale", "grassnoisetilescale", "masktexturetex", "scrollspeedmultiplier", "shadowalpha",
     "specularcolortex", "terrainfresnel", "terraintranslucency", "tintoverride", "vertexdisplacementmultiplier",
     "wrinklebumpscale", "wrinklemultiplier", "dirtdiffuseintensity", "emissivedistortionstrength",
+    // known name + word search (2026-11-27); each sits next to the name it extends or in a parallel block
+    // (waterfall layer1/layer2 sets: tiling, offset, intensity, opacitythreshold, opacitycontrast)
+    "layer1tiling", "layer1offset", "layer1intensity", "layer1opacitythreshold", "layer1opacitycontrast",
+    "layer2tiling", "layer2offset", "layer2intensity", "layer2opacitythreshold", "layer2opacitycontrast",
+    "dirttintchannel", "furlengthjitter", "normalmaptiling2", "specularfresnelselector", "waterfadestartrandom",
+    "stickermetalness", "stickerroughness", "stickerbackopacity",
+    // neighbour-stem search (2026-11-27): each constant tried as a prefix of a named neighbour + word (+ suffix),
+    // about 0.14 random hits expected over all of them
+    "vertexdisplacementnoisetiling", "tintroughnessmod", "grassdecallayer", "grassdecaluvoffset", "verttintblendamount",
+    "tangentuvset", "clearcoatuvset", "heightfilter",
+    // words split from the shader programs' entry-point names added to the search vocabulary (2026-11-27):
+    // standard_flipbook's five consecutive constants, and a side-by-side pair in 55 prop batch shaders
+    "flipbookrows", "flipbookcols", "flipbookcount", "flipbookfreq", "flipbookphase", "regiontintamount", "regiontintintensity",
+    // constants the exporters read (2026-11-28): the uber shaders' per-layer UV transforms (uv0scalebias, uv1scalebias,
+    // uvset, side by side), and the two-layer prop blend mask: its texture (controltexturetex), UV pick (controluvset)
+    // and channel weights (controlfilter), adjacent in the same 60 effects
+    "uv0scalebias", "uv1scalebias", "uvset", "controltexturetex", "controluvset", "controlfilter",
+    // names carried over from the previous engine generation's shaders (2026-11-28), hashed directly against the
+    // unnamed constants (a list of about 370, ~0 random hits expected), and fur + two words (~0.2 expected)
+    "umglobalparams", "usetessellation", "specularintensitymult", "specularfalloffmult", "diffuse2specmod", "reflectivepower",
+    "bumpselfshadowamount", "furattencoef", "furselfshadowmin", "furminlayers", "furmaxlayers", "furwetstiffness",
+    // water_micro_geom (the inland water tiles): meet-in-the-middle joaat search over water and shader words (2026-11-27),
+    // about 16 random hits expected over 45 hashes; kept only names that fit the value or a sibling. The three use* flags
+    // are integer 1 on every tile and 0 on the 6 tiles whose flow, height and surface map textures are 4 x 4 placeholders;
+    // watersurfacemaptexture is the per-tile BC7 texture that usesurfacemap switches on; surfacedetailfadenear / far are
+    // 500 and 1500 side by side; surfacedetailtintcoloura / b and surfacedetailtintmultiplier are float4 ones next to
+    // the surface detail textures, which usesurfacedetailmap (0) leaves off; microgeomcontrol is 0, 1 or 4
+    "useflowmap", "useheighttexture", "usesurfacemap", "watersurfacemaptexture", "usesurfacedetailmap", "surfacedetailfadenear",
+    "surfacedetailfadefar", "surfacedetailtintcoloura", "surfacedetailtintcolourb", "surfacedetailtintmultiplier", "surfacedetailcontrol",
+    "microgeomcontrol",
     // texture parameters of the minigame pack's water and interior shaders (joaat search, 2026-11-23)
     "watersurfacedetailtexture", "surfacedetailnormal0", "surfacedetailnormal1", "surfacedetailnormal2", "surfacedetailiridescence", "interiordiffusemaskmap", "interiorlayerdiffusemap",
     // shader constants of the 4-layer ground shaders (dictionary search, 2026-11-22)

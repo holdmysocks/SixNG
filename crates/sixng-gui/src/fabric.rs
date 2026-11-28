@@ -97,6 +97,10 @@ struct Sub {
     stops: Option<[[f32; 3]; 3]>,
     alpha: f32,
     tile: Option<Arc<Tex>>,
+    /// The tile's material map alpha: how much of the glass shader's opacity
+    /// the texel has (`ped_standard_muv_alpha` multiplies it by the
+    /// speculartex alpha).
+    cover: Option<Arc<Tex>>,
     scale: f32,
     rot: (f32, f32),
     layers: Vec<Layer>,
@@ -174,6 +178,7 @@ pub fn fabric(game: &Path, preset: u32) -> Option<Arc<Fabric>> {
                 stops: Some(matlib::stops([c[0], c[1], c[2]])),
                 alpha: c[3] as f32 / 255.0,
                 tile: tile.as_ref().and_then(|t| texture(game, &t.material_map, 1)),
+                cover: tile.as_ref().and_then(|t| texture(game, &t.material_map, 3)),
                 scale,
                 rot: sc(tile.as_ref().and_then(|t| t.rotation)),
                 layers,
@@ -183,6 +188,12 @@ pub fn fabric(game: &Path, preset: u32) -> Option<Arc<Fabric>> {
     })();
     cache.lock().unwrap().insert(preset, f.clone());
     f
+}
+
+/// The transmission record of sub-material `sub` of a garment preset (the
+/// glass shader's per-sub-material values), when the library is at hand.
+pub fn transmission(game: &Path, preset: u32, sub: usize) -> Option<matlib::Transmission> {
+    library(game)?.transmission(preset, sub)
 }
 
 fn gradient(stops: &[[f32; 3]; 3], g: f32) -> [f32; 3] {
@@ -228,6 +239,16 @@ impl Fabric {
         }
         Some(c)
     }
+
+    /// The tile's material map alpha of sub-material `s` at tiling UV `uv`
+    /// (0..1); None when the sub-material has no tile.
+    fn cover(&self, s: usize, uv: [f32; 2], foot: f32) -> Option<f32> {
+        let sub = self.subs.get(s)?;
+        let t = sub.cover.as_ref()?;
+        let p = [uv[0] * sub.scale, uv[1] * sub.scale];
+        let (sn, cs) = sub.rot;
+        Some(t.sample(p[0] * cs - p[1] * sn, p[0] * sn + p[1] * cs, foot * sub.scale.abs()))
+    }
 }
 
 /// Bake the fabric into base image `image` of `m`, shared by the materials
@@ -235,13 +256,18 @@ impl Fabric {
 /// on plain cloth), which stays multiplied in. `ids` gives the sub-material
 /// per texel at a size (the garment's `materialid` texture); without it the
 /// sub-material is the part number in the raw vertex colour's green byte.
+/// The materials in `by_vertex` have no `materialid` texture of their own
+/// (a lens that shares its frame's texture): their texels take the vertex's
+/// part number even where the frame's map has one. The texels of the
+/// materials in `glass` (lenses) take the tile's material map alpha as
+/// their alpha: the glass shader's opacity (a0).
 /// None (and nothing changed) when no triangle maps into the texture.
 ///
 /// With `detail` the weave of the garment's main sub-material (the one with
 /// a tile that covers most texels) is left to the shader: its texels are
 /// baked at the tile's mean value and marked with alpha 255, all others get
 /// alpha 0, and the sub-material is returned.
-pub fn bake(m: &mut glb::Model, mats: &[usize], image: usize, fab: &Fabric, ids: &dyn Fn(u32, u32) -> Option<Vec<u8>>, detail: bool) -> Option<Option<usize>> {
+pub fn bake(m: &mut glb::Model, mats: &[usize], by_vertex: &[usize], glass: &[usize], image: usize, fab: &Fabric, ids: &dyn Fn(u32, u32) -> Option<Vec<u8>>, detail: bool) -> Option<Option<usize>> {
     let (sw, sh) = (m.images[image].mips[0].0, m.images[image].mips[0].1);
     if sw == 0 || sh == 0 {
         return None;
@@ -255,7 +281,13 @@ pub fn bake(m: &mut glb::Model, mats: &[usize], image: usize, fab: &Fabric, ids:
     let mut uv = vec![[0f32; 2]; n];
     let mut foot = vec![0f32; n];
     let mut sub = vec![255u8; n];
+    // texels whose sub-material is the vertex's part number (`by_vertex`)
+    let mut own = vec![false; n];
+    // texels of the `glass` materials
+    let mut clear = vec![false; n];
     for me in m.meshes.iter().filter(|me| me.material.is_some_and(|k| mats.contains(&k)) && me.uv_sets >= 2) {
+        let per_vertex = me.material.is_some_and(|k| by_vertex.contains(&k));
+        let is_glass = me.material.is_some_and(|k| glass.contains(&k));
         for t in me.indices.chunks_exact(3) {
             let v = [&me.verts[t[0] as usize], &me.verts[t[1] as usize], &me.verts[t[2] as usize]];
             let p = v.map(|v| [v.uv0[0] * w as f32, v.uv0[1] * h as f32]);
@@ -290,6 +322,8 @@ pub fn bake(m: &mut glb::Model, mats: &[usize], image: usize, fab: &Fabric, ids:
                     uv[k] = [0, 1].map(|i| v[0].uv1[i] + (v[1].uv1[i] - v[0].uv1[i]) * b1 + (v[2].uv1[i] - v[0].uv1[i]) * b2);
                     foot[k] = f;
                     sub[k] = s;
+                    own[k] = per_vertex;
+                    clear[k] = is_glass;
                 }
             }
         }
@@ -309,7 +343,7 @@ pub fn bake(m: &mut glb::Model, mats: &[usize], image: usize, fab: &Fabric, ids:
                 for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                     let j = ((y + dy).rem_euclid(h as i64) * w as i64 + (x + dx).rem_euclid(w as i64)) as usize;
                     if prev[j] != 255 {
-                        (uv[k], foot[k], sub[k]) = (uv[j], foot[j], prev[j]);
+                        (uv[k], foot[k], sub[k], own[k], clear[k]) = (uv[j], foot[j], prev[j], own[j], clear[j]);
                         break;
                     }
                 }
@@ -317,7 +351,8 @@ pub fn bake(m: &mut glb::Model, mats: &[usize], image: usize, fab: &Fabric, ids:
         }
     }
     let sub_at = |k: usize| match (&ids, sub[k]) {
-        (Some(v), _) => v[k] as usize,
+        (Some(v), _) if !own[k] => v[k] as usize,
+        (Some(_), s) => s as usize,
         (None, 255) => 0,
         (None, s) => s as usize,
     };
@@ -343,7 +378,15 @@ pub fn bake(m: &mut glb::Model, mats: &[usize], image: usize, fab: &Fabric, ids:
             for i in 0..3 {
                 row[x * 4 + i] = (srgb(c[i]) * g * 255.0).min(255.0) as u8;
             }
-            row[x * 4 + 3] = if main.is_none() || (flat && sub[k] != 255) { 255 } else { 0 };
+            row[x * 4 + 3] = if clear[k] {
+                // the glass shader's a0 = this x the speculartex alpha (255 on
+                // the lenses looked at; the export does not keep it)
+                fab.cover(s, uv[k], foot[k]).map_or(255, |a| (a * 255.0 + 0.5) as u8)
+            } else if main.is_none() || (flat && sub[k] != 255) {
+                255
+            } else {
+                0
+            };
         }
     });
     m.images[image].mips = glb::mip_chain(w, h, px);

@@ -25,27 +25,27 @@ struct Turn {
 }
 
 #[derive(Deserialize)]
-struct AudioTarget {
-    archive: String,
-    bank_offset: u64,
-    stream_index: usize,
-    stream_id: u32,
-    stem: Option<StemWindow>,
+pub(crate) struct AudioTarget {
+    pub(crate) archive: String,
+    pub(crate) bank_offset: u64,
+    pub(crate) stream_index: usize,
+    pub(crate) stream_id: u32,
+    pub(crate) stem: Option<StemWindow>,
 }
 
 #[derive(Deserialize)]
-struct TextTable {
-    strings: HashMap<String, String>,
+pub(crate) struct TextTable {
+    pub(crate) strings: HashMap<String, String>,
 }
 
-struct AudioSource {
-    archive: ArchiveInfo,
-    index: AudioIndex,
+pub(crate) struct AudioSource {
+    pub(crate) archive: ArchiveInfo,
+    pub(crate) index: AudioIndex,
     banks: HashMap<u64, usize>,
 }
 
 impl AudioSource {
-    fn open(work: &Path, archive: &ArchiveInfo) -> Result<Self> {
+    pub(crate) fn open(work: &Path, archive: &ArchiveInfo) -> Result<Self> {
         let index = audio::load_index(work, &archive.id)?;
         ensure!(index.archive == archive.id && index.archive_size == archive.size,
             "audio index does not match the archive");
@@ -54,7 +54,7 @@ impl AudioSource {
         Ok(Self { archive: archive.clone(), index, banks })
     }
 
-    fn resolve(&self, target: &AudioTarget) -> Result<Value> {
+    pub(crate) fn resolve(&self, target: &AudioTarget) -> Result<Value> {
         let &bank_index = self.banks.get(&target.bank_offset).context("bank not indexed")?;
         let bank = &self.index.banks[bank_index];
         let stream = bank.streams.get(target.stream_index).context("stream not indexed")?;
@@ -81,7 +81,7 @@ impl AudioSource {
     }
 }
 
-fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
+pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     serde_json::from_reader(BufReader::new(file)).with_context(|| format!("read {}", path.display()))
 }

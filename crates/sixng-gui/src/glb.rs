@@ -310,6 +310,10 @@ pub struct Material {
     pub shader_hash: String,
     /// Decal layer order when the material is in the decal bucket.
     pub decal: Option<u8>,
+    /// Ped glass (`ped_standard_muv_alpha` lenses): the material library's
+    /// transmission record of the glass sub-material, drawn by the viewer's
+    /// tinted-glass blend. Set by the model view, not read from the GLB.
+    pub glass: Option<sixng_core::matlib::Transmission>,
 }
 
 pub struct Joint {
@@ -1138,6 +1142,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             gap: gap.into(),
             shader_hash: ex["shader_name_hash"].as_str().unwrap_or("").into(),
             decal,
+            glass: None,
         });
     }
     // skeleton
@@ -1484,9 +1489,17 @@ pub fn merge(into: &mut Model, other: Model) {
         if let Some(d) = &mut m.detail {
             d.image += img0;
         }
-        for x in [&mut m.ramp_u, &mut m.ramp] {
+        for x in [&mut m.ramp_u, &mut m.ramp, &mut m.wear_mask, &mut m.primer_mask, &mut m.dust_mask] {
             if let Some(i) = x {
                 *i += img0;
+            }
+        }
+        // ped skin's engine detail: speculartex2 and the two tile sheets
+        if let Some(d) = &mut m.skin_detail {
+            for x in [&mut d.spec2, &mut d.normal, &mut d.control] {
+                if let Some(i) = x {
+                    *i += img0;
+                }
             }
         }
         into.materials.push(m);
@@ -1749,5 +1762,77 @@ mod emissive_tests {
         assert!(lights("emissive", &plain));
         assert!(!lights("cutout", &plain));
         assert!(!lights("alpha", &serde_json::json!({"emissiveTexture": "base"})));
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    fn img() -> Image {
+        Image { key: String::new(), mips: vec![(1, 1, vec![0; 4])], srgb: false, bc: None }
+    }
+
+    fn model(images: usize, mat: Material) -> Model {
+        Model {
+            path: Default::default(),
+            meshes: vec![],
+            materials: vec![mat],
+            joints: vec![],
+            images: (0..images).map(|_| img()).collect(),
+            bbox: [[0.0; 3]; 2],
+            triangles: 0,
+            vertices: 0,
+            extras: Value::Null,
+        }
+    }
+
+    fn mat() -> Material {
+        Material {
+            name: String::new(),
+            class: "opaque".into(),
+            alpha_mode: "OPAQUE".into(),
+            base_factor: [1.0; 4],
+            base: Some(0),
+            normal: None,
+            packed: Some(1),
+            emissive: None,
+            mr: None,
+            tint_mask: false,
+            ped_shade: false,
+            detail: None,
+            ramp_u: None,
+            wear_mask: Some(2),
+            primer_mask: Some(3),
+            dust_mask: Some(4),
+            base_uv: 0,
+            ramp: None,
+            parts: false,
+            occlusion_only: false,
+            skin_spec: Some(1.0),
+            skin_detail: Some(SkinDetail { spec2: Some(5), normal: Some(6), control: Some(7), uv_scale: [36.0; 2], strength: [0.5; 2], occlusion: 0.0, translucency: None }),
+            emissive_scale: 1.0,
+            lit: false,
+            emissive_tint: [1.0; 3],
+            slots: vec![],
+            gap: "ok".into(),
+            shader_hash: String::new(),
+            decal: None,
+            glass: None,
+        }
+    }
+
+    /// A merged part keeps its own images: the skin detail maps and the
+    /// vehicle masks move with the other indices.
+    #[test]
+    fn merge_shifts_every_image_index() {
+        let mut a = model(3, mat());
+        merge(&mut a, model(8, mat()));
+        let m = &a.materials[1];
+        assert_eq!((m.base, m.packed), (Some(3), Some(4)));
+        assert_eq!((m.wear_mask, m.primer_mask, m.dust_mask), (Some(5), Some(6), Some(7)));
+        let d = m.skin_detail.unwrap();
+        assert_eq!((d.spec2, d.normal, d.control), (Some(8), Some(9), Some(10)));
+        assert_eq!(a.images.len(), 11);
     }
 }

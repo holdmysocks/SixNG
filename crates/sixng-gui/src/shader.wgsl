@@ -9,7 +9,7 @@ struct Frame {
     sun_col: vec4<f32>,
     sky_top: vec4<f32>,   // w flake size of the body paint's coat
     sky_hor: vec4<f32>,   // w exposure
-    mode: vec4<u32>,      // x view mode, y packed channel order, z paint finish, w slot view
+    mode: vec4<u32>,      // x view mode, y packed channel order (bit 8: ped skin detail off), z paint finish, w slot view
     paint1: vec4<f32>,    // primary paint colour (linear), w the vehicle's own paint roughness
     paint2: vec4<f32>,    // pearl colour (linear), w pearl amount
     misc: vec4<f32>,      // x wetness, y emissive boost, z time, w ambient
@@ -27,6 +27,7 @@ struct Mat {
     tile: vec4<f32>,      // fabric detail tile: x UV scale, y rotation, z mean grey value, w bound
     emis: vec4<f32>,      // x emissive scale of the material (from the GLB's emissive strength), yzw the light's colour
     strand: vec4<f32>,    // x a strand piece's width factor this frame (stored over drawn strands; 1 otherwise)
+    glass: array<vec4<f32>, 4>, // ped glass transmission record: [σA, wA], [σB, wB], [d_base, d_max, p, h0], [k, t, d_mask, 1 = glass]
 };
 
 // rows of the part ramp image: 256 each of the first layer's palette rows,
@@ -45,10 +46,15 @@ struct Sticker {
     zones: array<u32, 8>, // one bit per sticker zone it lies on
     m: vec4<f32>,         // a, b, c, d: u = U*a + V*b + ou, v = U*c + V*d + ov
     o: vec4<f32>,         // ou, ov, opacity, picture layer (-1 = none)
-    flags: vec4<u32>,     // x: 1 drawn, 2 colour mask, 4 highlight its zones, 8 outline it; y: model of the vehicle; z: UV set; w: 1 = zone under the pointer
+    flags: vec4<u32>,     // x: 1 drawn, 2 colour mask, 4 highlight its zones, 8 outline it, 16 laid on flat; y: model of the vehicle; z: UV set; w: 1 = zone under the pointer
     c0: vec4<f32>,        // colour of the mask's red (or the picture's tint)
     c1: vec4<f32>,
     c2: vec4<f32>,
+    // laid on flat: u = pa.xyz . P + ou, v = pb.xyz . P + ov, with P the
+    // place on the model as stored, on faces that look along pn.xyz
+    pa: vec4<f32>,
+    pb: vec4<f32>,
+    pn: vec4<f32>,
 };
 
 @group(0) @binding(3) var<storage, read> ST: array<Sticker>;
@@ -562,6 +568,11 @@ const NO_BED: f32 = -9000.0;
 // pixel (m, from the scene's depth; below 0: not known). Set by the blended
 // draws' entry (fs_mesh_blend) for the map's water.
 var<private> scene_under: f32 = -1.0;
+
+// Ped glass (Mat.glass[3].w = 1): the share of the colour behind that the
+// glass lets through, per channel; set by mesh_colour, written as the second
+// blend source by the dual-source glass entry (glass.wgsl).
+var<private> glass_t: vec3<f32> = vec3(1.0);
 // `edge`: 0 to 1 on the coastline the caller knows (the terrain's land to
 // sea cells), where the sea surfs whatever the depth data says.
 fn water_shade(p: vec3<f32>, fp: f32, surf: f32, bed: f32, edge: f32) -> vec3<f32> {
@@ -792,16 +803,30 @@ fn map_finish_added(col0: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
 // them: the region from the min and max of the four nearest G texels (two
 // regions are averaged), at UV0 x the material's tiling (strand.yz).
 struct SkinDet { n: vec2<f32>, c: f32, mask: f32 };
+// The game samples a texture array, so a tile never sees its neighbours. In
+// the sheet the filter must stay inside the tile: one isotropic mip level
+// (the anisotropic footprint would reach across the edge) and the position
+// held half a texel of the coarser of the two blended levels from the edge,
+// or every tile repeat draws a line of the neighbouring tile.
 fn skin_tile(t: texture_2d<f32>, r: u32, p: vec2<f32>, gx: vec2<f32>, gy: vec2<f32>) -> vec4<f32> {
     let cell = vec2(f32(r & 3u), f32(r >> 2u));
-    let q = (cell + fract(p) * (254.0 / 256.0) + 1.0 / 256.0) * 0.25;
-    return textureSampleGrad(t, samp, q, gx * 0.25, gy * 0.25);
+    let lod = clamp(log2(max(max(length(gx), length(gy)) * 256.0, 1e-6)), 0.0, 8.0);
+    let h = 0.5 * exp2(ceil(lod)) / 256.0;
+    let q = (cell + clamp(fract(p), vec2(h), vec2(1.0 - h))) * 0.25;
+    return textureSampleLevel(t, samp, q, lod);
+}
+// The region is the high nibble of the G byte. The maps store it about six
+// steps into its nibble (5, 23, 54 ... 214, 245), so rounding G x 16 put
+// the edge one or two steps above the stored value and the block
+// compression's noise flipped whole 4 x 4 blocks to the next region.
+fn skin_region(g: f32) -> u32 {
+    return min(u32(g * 255.0 + 0.5) >> 4u, 15u);
 }
 fn skin_detail(uv: vec2<f32>, gx: vec2<f32>, gy: vec2<f32>) -> SkinDet {
     let p = uv * M.strand.yz;
     let g = textureGather(1, t_wear, samp, uv);
-    let r0 = min(u32(16.0 * min(min(g.x, g.y), min(g.z, g.w)) + 0.5), 15u);
-    let r1 = min(u32(16.0 * max(max(g.x, g.y), max(g.z, g.w)) + 0.5), 15u);
+    let r0 = skin_region(min(min(g.x, g.y), min(g.z, g.w)));
+    let r1 = skin_region(max(max(g.x, g.y), max(g.z, g.w)));
     var nn = skin_tile(t_primer, r0, p, gx, gy).rg;
     var cc = skin_tile(t_dust, r0, p, gx, gy).r;
     if (r1 != r0) {
@@ -933,6 +958,10 @@ struct VOut {
     @location(10) @interpolate(flat) seed: u32,
     // third and fourth UV sets
     @location(11) uv23: vec4<f32>,
+    // place and normal on the model as stored (before joints and
+    // instance): what a sticker laid on flat is projected in
+    @location(12) rest: vec3<f32>,
+    @location(13) rest_n: vec3<f32>,
 };
 
 fn skin_matrix(v: VIn) -> mat4x4<f32> {
@@ -1023,6 +1052,8 @@ fn mesh_vertex(v: VIn) -> VOut {
     o.extra.w = select(1.0, -1.0, det < 0.0);
     o.tint = v.tint;
     o.zone = v.zone.xy;
+    o.rest = v.pos;
+    o.rest_n = v.nrm;
     return o;
 }
 
@@ -1647,9 +1678,9 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     // texels of the sub-material the tile belongs to
     var weave_w = 0.0;
     if ((has & 1u) != 0u) {
-        // an upper body with its decorations is laid out in its fourth UV
-        // set (both arms apart; UV0 is mirrored)
-        var bt = textureSample(t_base, samp, select(i.uv0, i.uv23.zw, (has & 64u) != 0u));
+        // an upper body with its decorations is laid out in its second UV
+        // set (both arms apart; UV0 is mirrored); bit 6 picks the fourth
+        var bt = textureSample(t_base, samp, select(select(i.uv0, i.uv23.zw, (has & 64u) != 0u), i.uv1, (has & 128u) != 0u));
         // tint mask (animal coats): only the green channel (shading) is a picture
         if ((M.flags.w & 512u) != 0u) { bt = vec4(vec3(bt.g), 1.0); }
         if (M.tile.w > 0.5 && M.tile.w < 1.5) { weave_w = bt.a; bt.a = 1.0; }
@@ -1664,7 +1695,7 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     // ped skin's engine detail (both skin programs; the two per-ped scales
     // on it are 1 up close, which the viewer takes: the strength fades out
     // from 6 to 9 m from the camera; the per-tile roughness term as 0)
-    let skin_det_on = (M.flags.w & 64u) != 0u && (M.flags.w & 256u) == 0u;
+    let skin_det_on = (M.flags.w & 64u) != 0u && (M.flags.w & 256u) == 0u && (F.mode.y & 256u) == 0u;
     let det_gx = dpdx(i.uv0 * M.strand.yz);
     let det_gy = dpdy(i.uv0 * M.strand.yz);
     var sd: SkinDet;
@@ -1712,10 +1743,10 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         // occlusion: lerp(1, B, the material's strength); diffuse ambient x
         // it, specular ambient x its fourth root (below), direct light not
         if ((M.flags.w & 128u) != 0u) { ao = mix(1.0, sp.b, clamp(M.tile.x, 0.0, 1.0)); }
-    } else if ((has & 4u) != 0u && F.mode.y < 3u) {
+    } else if ((has & 4u) != 0u && (F.mode.y & 255u) < 3u) {
         let p = textureSample(t_pk, samp, i.uv0);
-        if (F.mode.y == 0u) { rough = p.r; metal = p.g; ao = p.b; }
-        else if (F.mode.y == 1u) { ao = p.r; rough = p.g; metal = p.b; }
+        if ((F.mode.y & 255u) == 0u) { rough = p.r; metal = p.g; ao = p.b; }
+        else if ((F.mode.y & 255u) == 1u) { ao = p.r; rough = p.g; metal = p.b; }
         else { metal = p.r; rough = p.g; ao = p.b; }
         rough = clamp(rough, 0.04, 1.0);
     }
@@ -1833,6 +1864,9 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
         let dy1 = dpdy(i.uv1);
         let dx23 = dpdx(i.uv23);
         let dy23 = dpdy(i.uv23);
+        let dxr = dpdx(i.rest);
+        let dyr = dpdy(i.rest);
+        let rest_n = i.rest_n / max(length(i.rest_n), 0.000001);
         let zb = i.zone.x & 255u;
         for (var k = 1u; k <= st_n; k++) {
             let fl = ST[k].flags;
@@ -1848,10 +1882,20 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
             if (fl.z == 1u) { uv = i.uv1; dx = dx1; dy = dy1; }
             else if (fl.z == 2u) { uv = i.uv23.xy; dx = dx23.xy; dy = dy23.xy; }
             else if (fl.z == 3u) { uv = i.uv23.zw; dx = dx23.zw; dy = dy23.zw; }
-            let p = vec2(dot(m.xy, uv), dot(m.zw, uv)) + o.xy;
+            var p = vec2(dot(m.xy, uv), dot(m.zw, uv)) + o.xy;
+            var gx = vec2(dot(m.xy, dx), dot(m.zw, dx));
+            var gy = vec2(dot(m.xy, dy), dot(m.zw, dy));
+            if ((fl.x & 16u) != 0u) {
+                // laid on flat: only faces that look the sticker's way
+                // (not the far side of the vehicle, not a panel's edges)
+                if (dot(rest_n, ST[k].pn.xyz) < 0.25) { continue; }
+                let pa = ST[k].pa.xyz;
+                let pb = ST[k].pb.xyz;
+                p = vec2(dot(pa, i.rest), dot(pb, i.rest)) + o.xy;
+                gx = vec2(dot(pa, dxr), dot(pb, dxr));
+                gy = vec2(dot(pa, dyr), dot(pb, dyr));
+            }
             if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0) { continue; }
-            let gx = vec2(dot(m.xy, dx), dot(m.zw, dx));
-            let gy = vec2(dot(m.xy, dy), dot(m.zw, dy));
             if (o.w >= 0.0) {
                 let t = textureSampleGrad(t_stick, samp_clamp, p, i32(o.w + 0.5), gx, gy);
                 var c = srgb_to_linear(t.rgb) * ST[k].c0.rgb;
@@ -2276,6 +2320,43 @@ fn mesh_colour(i: VOut, ff: bool) -> vec4<f32> {
     }
     // the game applies its horizon occlusion to the specular ambient only (never to diffuse ambient, never to hair)
     var col = direct * sh * ao_direct + kd * albedo * amb_d * ao + env_s * fr_v * ao_s + emissive;
+    // Ped glass (`ped_standard_muv_alpha`, the lens programs; shared notes 42es
+    // and its follow-ups). The game blends dual-source, dst' = RT0 + dst x RT1,
+    // with its material record (Mat.glass):
+    //   a0 = the tile's material map alpha x speculartex alpha (baked into the
+    //   base texture's alpha), alpha = sat(a0 / k), opaque o = sat((a0 - t) / (1 - t));
+    //   absorption s_c = sA_c (1 - b_c wA) + sB_c (1 + (b_c - 1) wB), b the base colour;
+    //   view path d1 = max(0, d_base + m d_mask), d0 = d1 (h0 < 0) or lerp(h0, d1, _COLOR0.a),
+    //   r = 1 / c (p > 0) or c, c = max(1e-4, |N.V|),
+    //   d = max(0, d0 + |p| (min(d_max, r d0) - d0)), T = exp(-s d);
+    //   RT1 = (1 - o)(1 - alpha + alpha T (1 - alpha F)), F the split-sum Fresnel;
+    //   RT0 = o x (the diffuse light) + alpha x (the specular light).
+    // Not traced, so left out: the fade factor (fully shown), the mask m
+    // (taken as 0; the lens's d_mask is 0), the light carried through in RT0 and the
+    // refraction pass. F and the light are the viewer's own (its F0 and its
+    // environment table, which has the game's split-sum form).
+    if (M.glass[3].w > 0.5) {
+        let g0 = M.glass[0];
+        let g1 = M.glass[1];
+        let g2 = M.glass[2];
+        let g3 = M.glass[3];
+        let a0 = base.a;
+        let ga = clamp(a0 / max(g3.x, 1e-4), 0.0, 1.0);
+        let go = clamp((a0 - g3.y) / max(1.0 - g3.y, 1e-4), 0.0, 1.0);
+        let sig = g0.xyz * (1.0 - albedo * g0.w) + g1.xyz * (1.0 + (albedo - 1.0) * g1.w);
+        let d1 = max(0.0, g2.x);
+        // h0 >= 0: lerp(h0, d1, the vertex colour's alpha) (follow-up 4: the
+        // shader's TC1.w is _COLOR0.a)
+        let d0 = select(mix(g2.w, d1, i.col.a), d1, g2.w < 0.0);
+        let c = max(1e-4, abs(dot(n, v)));
+        let rr = select(c, 1.0 / c, g2.z > 0.0);
+        let d = max(0.0, d0 + abs(g2.z) * (min(g2.y, rr * d0) - d0));
+        let tr = exp(-sig * d);
+        glass_t = (1.0 - go) * (1.0 - ga + ga * tr * (1.0 - ga * fr_v));
+        let diffuse = (kd * albedo / 3.14159 * sun_e(i.world) * ndl + kd * albedo / 3.14159 * local_e(i.world, n)) * sh * ao_direct + kd * albedo * amb_d * ao;
+        let specular = spec * sun_e(i.world) * ndl * sh * ao_direct + env_s * fr_v * ao_s;
+        col = go * diffuse + ga * specular;
+    }
     // Sheen (velvet, suede): fibres standing on the surface catch light
     // towards the silhouette. The reflectance is the share seen head-on;
     // the fade sets how fast it grows towards the edge.

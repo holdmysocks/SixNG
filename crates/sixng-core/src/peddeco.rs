@@ -52,16 +52,20 @@
 //!
 //! Upper body space: body-upper decorations are not placed in the part's
 //! UV0. That UV is mirrored (both arms share one UV island), so it cannot
-//! hold a tattoo on one arm only. The part's fourth UV set is the same
-//! layout at half width, one side at `u0 / 2` and the other at
-//! `0.5 + u0 / 2`, and the decorations are placed in that UV with `u`
-//! doubled, a space two units wide ([`Space`]). The evidence is the data:
-//! a record's mirrored pair of sleeves has one layer at `u` 0.37..0.60 and
-//! its mirror at 1.41..1.64; over the whole catalogue, 80 % of a
-//! body-upper layer's decal square lands on the upper body in this space
-//! (60 % in UV0, where a quarter of the layers land on no skin at all).
-//! The upper body is therefore baked into a texture laid out in its fourth
-//! UV set ([`uv3_layout`]), which the part's material then reads through
+//! hold a tattoo on one arm only. They are placed in the part's second UV
+//! set, which gives each side its own islands, with `u` doubled: a space
+//! two units wide ([`Space`]). The evidence is the data: a record's
+//! mirrored pair of sleeves has one layer at `u` 0.37..0.60 and its mirror
+//! at 1.41..1.64; a whole-sheet record's picture follows the second set's
+//! island outlines (Viper's chest piece, portrait and lettering each sit
+//! inside one island), and sampled at both sides of every seam of the mesh
+//! it changes four to five times less than in the fourth set (mean jump
+//! 0.022 against 0.097, linear RGB); over the whole catalogue, 81 % of a
+//! body-upper layer's decal centre lands on the upper body in the second
+//! set (78 % in the fourth, 59 % in UV0). The fourth set, UV0 at half
+//! width by side, only marks a mesh as an upper body ([`is_split_layout`]).
+//! The upper body is therefore baked into a texture laid out in its second
+//! UV set ([`uv_layout`]), which the part's material then reads through
 //! that set. The legs are not mirrored and keep their UV0.
 //!
 //! Left out: mask decals on a layer with no ink, which the game colours at
@@ -86,7 +90,7 @@ pub const SKIN_CATEGORIES: [(u32, &str); 3] = [(0x3817_131d, "body upper"), (0x4
 
 const VERSION: u32 = 5;
 /// Changes when the bake rule changes, so baked textures are made again.
-pub const BAKE_RULE: u32 = 8;
+pub const BAKE_RULE: u32 = 12;
 /// The skin tone record struct (`data.rpf`): a name, a linear colour.
 pub const SKIN_TONE: u32 = 0x27a7_a4ef;
 /// Wardrobe tag key whose item names the skin tone (a skin-tone item, or
@@ -335,7 +339,7 @@ impl Layer {
 pub enum Space {
     /// The part's own UV (heads, and parts with no body layout).
     Part,
-    /// The upper body, baked into a texture laid out in its fourth UV set:
+    /// The upper body, baked into a texture laid out in its second UV set:
     /// placed at `(2u, v)`.
     BodyUpper,
 }
@@ -373,20 +377,23 @@ pub fn is_split_layout(uv: &[([f32; 2], [f32; 2])]) -> bool {
     !uv.is_empty() && fit * 10 >= uv.len() * 9 && lo * 20 >= uv.len() && hi * 20 >= uv.len()
 }
 
-/// The upper body's colour texture laid out in its fourth UV set: twice
-/// the width of `base` (laid out in UV0), each texel the base colour at
-/// the UV0 of the surface there. `tris` are the mesh's triangles, each
-/// corner (UV0, UV3); a texel no triangle covers takes the half-width rule
-/// (`u0 = fract(2 u3)`).
-pub fn uv3_layout(base: &Image, tris: &[[([f32; 2], [f32; 2]); 3]]) -> Image {
+/// The upper body's colour texture laid out in another of its UV sets (the
+/// second, [`Space::BodyUpper`]): twice the width of `base` (laid out in
+/// UV0), each texel the base colour at the UV0 of the surface there.
+/// `tris` are the mesh's triangles, each corner (UV0, the layout's UV).
+/// A texel no triangle covers (a gutter) takes the UV0 of the nearest
+/// covered one, so filtering at an island's edge reads the same skin;
+/// with no triangles at all, the half-width rule (`u0 = fract(2 u)`).
+pub fn uv_layout(base: &Image, tris: &[[([f32; 2], [f32; 2]); 3]]) -> Image {
     let (w, h) = (base.w as usize * 2, base.h as usize);
     let mut uv0: Vec<[f32; 2]> = (0..w * h)
         .map(|i| {
             let (x, y) = (i % w, i / w);
-            let u3 = (x as f32 + 0.5) / w as f32;
-            [(2.0 * u3).fract(), (y as f32 + 0.5) / h as f32]
+            let u = (x as f32 + 0.5) / w as f32;
+            [(2.0 * u).fract(), (y as f32 + 0.5) / h as f32]
         })
         .collect();
+    let mut covered = vec![false; w * h];
     for t in tris {
         let p: [[f32; 2]; 3] = std::array::from_fn(|k| [t[k].1[0] * w as f32, t[k].1[1] * h as f32]);
         let d = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) - (p[2][0] - p[0][0]) * (p[1][1] - p[0][1]);
@@ -394,22 +401,36 @@ pub fn uv3_layout(base: &Image, tris: &[[([f32; 2], [f32; 2]); 3]]) -> Image {
             continue;
         }
         let x0 = p.iter().map(|q| q[0]).fold(f32::MAX, f32::min).floor().max(0.0) as usize;
-        let x1 = (p.iter().map(|q| q[0]).fold(f32::MIN, f32::max).ceil() as usize).min(w);
+        let x1 = (p.iter().map(|q| q[0]).fold(f32::MIN, f32::max).ceil().max(0.0) as usize).min(w);
         let y0 = p.iter().map(|q| q[1]).fold(f32::MAX, f32::min).floor().max(0.0) as usize;
-        let y1 = (p.iter().map(|q| q[1]).fold(f32::MIN, f32::max).ceil() as usize).min(h);
+        let y1 = (p.iter().map(|q| q[1]).fold(f32::MIN, f32::max).ceil().max(0.0) as usize).min(h);
         for y in y0..y1 {
             for x in x0..x1 {
                 let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
                 let b1 = ((px - p[0][0]) * (p[2][1] - p[0][1]) - (p[2][0] - p[0][0]) * (py - p[0][1])) / d;
                 let b2 = ((p[1][0] - p[0][0]) * (py - p[0][1]) - (px - p[0][0]) * (p[1][1] - p[0][1])) / d;
                 let b0 = 1.0 - b1 - b2;
-                // texel centres inside the triangle; the rest keep the
-                // half-width rule, which holds away from the waist strip
+                // texel centres inside the triangle
                 if b0 < -1e-4 || b1 < -1e-4 || b2 < -1e-4 {
                     continue;
                 }
                 let a = [t[0].0, t[1].0, t[2].0];
                 uv0[y * w + x] = [b0 * a[0][0] + b1 * a[1][0] + b2 * a[2][0], b0 * a[0][1] + b1 * a[1][1] + b2 * a[2][1]];
+                covered[y * w + x] = true;
+            }
+        }
+    }
+    // gutters: breadth-first from the covered texels, each taking the UV0
+    // of the neighbour it was reached from
+    let mut queue: std::collections::VecDeque<usize> = (0..w * h).filter(|&i| covered[i]).collect();
+    while let Some(i) = queue.pop_front() {
+        let (x, y) = (i % w, i / w);
+        let near = [(x > 0).then(|| i - 1), (x + 1 < w).then(|| i + 1), (y > 0).then(|| i - w), (y + 1 < h).then(|| i + w)];
+        for j in near.into_iter().flatten() {
+            if !covered[j] {
+                covered[j] = true;
+                uv0[j] = uv0[i];
+                queue.push_back(j);
             }
         }
     }
@@ -751,8 +772,8 @@ pub struct Skipped {
     /// Head makeup layers ([`Layer::is_makeup`]) baked with no skin tone
     /// to start from.
     pub makeup: usize,
-    /// Mask decals ([`Image::is_mask`]) on a layer with no ink: the game
-    /// colours them at run time, from code that is not decoded.
+    /// Mask decals ([`Image::is_mask`]) on a layer with no ink that is not
+    /// itself a mask ([`MASK`]): how the game colours them is not decoded.
     pub uncoloured_masks: usize,
 }
 
@@ -762,21 +783,207 @@ pub struct Skipped {
 /// which head makeup starts from; `space` places the texture's UV in the
 /// decoration space ([`Space`]). Makeup with no skin tone, uncoloured
 /// masks and layers whose decal is missing are left out and counted.
+/// Layer flag: the layer is a mask on the layer before it in its record
+/// (`PS_BakeDecorations`: after drawing a layer's coverage, the shader looks
+/// at the next layer; if it has this bit, its decal's alpha `a` at its own
+/// UV scales the coverage by `1 - (1 - a) x opacity`, and the loop goes on
+/// after it, so a mask is never drawn itself).
+pub const MASK: u32 = 0x4;
+/// Mask flag: the mask's alpha is inverted (`1 - a`): it cuts out.
+pub const MASK_INVERTED: u32 = 0x8000_0000;
+
+/// A record's layers as the bake shader draws them: each layer with the
+/// mask that follows it, mask layers left out. A mask that opens a record
+/// has no layer before it and is drawn as a layer.
+pub fn masked(layers: &[Layer]) -> Vec<(&Layer, Option<&Layer>)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < layers.len() {
+        let mask = layers.get(i + 1).filter(|m| m.masks_previous());
+        out.push((&layers[i], mask));
+        i += 1 + mask.is_some() as usize;
+    }
+    out
+}
+
 impl Layer {
+    /// A mask on the layer before it ([`MASK`]).
+    pub fn masks_previous(&self) -> bool {
+        self.flags & MASK != 0
+    }
+
+    /// How much of the masked layer shows at record-space UV `(u, v)`:
+    /// `1 - (1 - a) x opacity`, `a` the mask decal's alpha there (clamped
+    /// to its edge texels; inverted with [`MASK_INVERTED`]).
+    pub fn mask_factor(&self, t: &Image, u: f32, v: f32) -> f32 {
+        let Some((du, dv)) = decal_uv(&self.uv, u, v) else { return 1.0 };
+        let mut a = t.shader_sample(du.clamp(0.0, 1.0), dv.clamp(0.0, 1.0))[3];
+        if self.flags & MASK_INVERTED != 0 {
+            a = 1.0 - a;
+        }
+        1.0 - (1.0 - a) * self.opacity
+    }
+
     /// A whole sheet: neither the layer nor its record moves it, so it
     /// covers the part's texture as laid out. A character's own tattoo
-    /// sheet on the upper body is one; it spans both sides of the fourth UV
+    /// sheet on the upper body is one; it spans both sides of the second UV
     /// set (its edges meet across the mesh's seams there, and not when it
-    /// is read through UV0 or on one side).
+    /// is read through UV0, the fourth set or on one side).
     pub fn is_sheet(&self) -> bool {
         self.uv == identity() && self.zone == identity()
     }
 }
 
-pub fn bake(skin: &mut Image, layers: &[&Layer], decal: &dyn Fn(u64) -> Option<std::sync::Arc<Image>>, skin_tone: Option<u32>, space: Space) -> Skipped {
+/// Region flag (shader record +0x50): a record with a layer that has it
+/// draws every layer limited to the part's mesh coverage, from a mask the
+/// bake renders first by drawing the part's own mesh into it.
+pub const REGION_MASK: u32 = 0x2;
+/// Region flag: a record with a layer that has it (and none with
+/// [`REGION_MASK`]) scales every layer by one vertex colour channel, picked
+/// by the layer's mode ([`Layer::mode`]): 0-3 are `_COLOR0` rgba, 4-7
+/// `_COLOR1` rgba, 8 and up none.
+pub const REGION_VERTEX: u32 = 0x40;
+
+/// How the bake caps a record's coverage. The game's job builder
+/// (one job per record) copies each PSO layer's flags into its shader
+/// record at +0x50 and its mode at +0x54; the draw makes one pass per mode
+/// and hands it to the bake mesh shader (`MSNC_VS_BakeDecorations`, cbuffer
+/// +112), which scans every layer of the record once per draw: any layer
+/// with [`REGION_MASK`] picks the mask test, else any with
+/// [`REGION_VERTEX`] the vertex channel. The shader writes the result as
+/// TEXCOORD1.z, and the pixel shader starts a layer's coverage at
+/// `min(opacity, z)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Region {
+    /// [`REGION_MASK`]: z = 1 at a vertex whose four mask texels
+    /// `(x-1, y-1), (x-1, y), (x, y+1), (x+1, y+1)` all lie on the mesh, else 0.
+    Mask,
+    /// [`REGION_VERTEX`]: z = the vertex's colour channel / 255 (8-bit
+    /// unorm, channels in stored order).
+    Vertex,
+}
+
+impl Region {
+    /// The cap a record's layers get, if any.
+    pub fn of(layers: &[Layer]) -> Option<Region> {
+        if layers.iter().any(|l| l.flags & REGION_MASK != 0) {
+            Some(Region::Mask)
+        } else if layers.iter().any(|l| l.flags & REGION_VERTEX != 0) {
+            Some(Region::Vertex)
+        } else {
+            None
+        }
+    }
+}
+
+/// A triangle corner of the part being baked: where it lies in the baked
+/// texture (0..1, in the texture's own layout) and its two vertex colour
+/// streams (`_COLOR0` rgba then `_COLOR1` rgba, as stored).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Corner {
+    pub at: [f32; 2],
+    pub colours: [u8; 8],
+}
+
+/// Texels whose centres a triangle covers, with the barycentric weights.
+fn raster(w: usize, h: usize, t: &[Corner; 3], mut f: impl FnMut(usize, [f32; 3])) {
+    let p: [[f32; 2]; 3] = std::array::from_fn(|k| [t[k].at[0] * w as f32, t[k].at[1] * h as f32]);
+    let d = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) - (p[2][0] - p[0][0]) * (p[1][1] - p[0][1]);
+    if d.abs() < 1e-12 {
+        return;
+    }
+    let lo = |i: usize| p.iter().map(|q| q[i]).fold(f32::MAX, f32::min);
+    let hi = |i: usize| p.iter().map(|q| q[i]).fold(f32::MIN, f32::max);
+    let (x0, x1) = ((lo(0) - 0.5).floor().max(0.0) as usize, ((hi(0) - 0.5).ceil().max(0.0) as usize).min(w.saturating_sub(1)));
+    let (y0, y1) = ((lo(1) - 0.5).floor().max(0.0) as usize, ((hi(1) - 0.5).ceil().max(0.0) as usize).min(h.saturating_sub(1)));
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let (cx, cy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let b1 = ((cx - p[0][0]) * (p[2][1] - p[0][1]) - (p[2][0] - p[0][0]) * (cy - p[0][1])) / d;
+            let b2 = ((p[1][0] - p[0][0]) * (cy - p[0][1]) - (cx - p[0][0]) * (p[1][1] - p[0][1])) / d;
+            let b0 = 1.0 - b1 - b2;
+            if b0 >= -1e-5 && b1 >= -1e-5 && b2 >= -1e-5 {
+                f(y * w + x, [b0, b1, b2]);
+            }
+        }
+    }
+}
+
+/// The per-texel cap ([`Region`]) of a mode's layers over a `w` x `h`
+/// baked texture, 0..255: each vertex's value interpolated over the part's
+/// triangles. Texels no triangle covers (the gutters, which the game fills
+/// afterwards by dilating) take the value of the nearest covered texel.
+pub fn region_cap(w: usize, h: usize, tris: &[[Corner; 3]], region: Region, mode: u32) -> Vec<u8> {
+    let mut covered = vec![false; w * h];
+    if region == Region::Mask {
+        for t in tris {
+            raster(w, h, t, |i, _| covered[i] = true);
+        }
+    }
+    let on = |x: i64, y: i64| x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h && covered[y as usize * w + x as usize];
+    let value = |c: &Corner| -> f32 {
+        match region {
+            Region::Vertex => c.colours.get(mode as usize).map_or(1.0, |&b| b as f32 / 255.0),
+            Region::Mask => {
+                let (x, y) = ((c.at[0] * w as f32).floor() as i64, (c.at[1] * h as f32).floor() as i64);
+                (on(x - 1, y - 1) && on(x - 1, y) && on(x, y + 1) && on(x + 1, y + 1)) as u8 as f32
+            }
+        }
+    };
+    let mut cap = vec![0.0f32; w * h];
+    let mut hit = vec![false; w * h];
+    for t in tris {
+        let z = [value(&t[0]), value(&t[1]), value(&t[2])];
+        raster(w, h, t, |i, b| {
+            cap[i] = (b[0] * z[0] + b[1] * z[1] + b[2] * z[2]).clamp(0.0, 1.0);
+            hit[i] = true;
+        });
+    }
+    // gutters: grow the covered values outwards, then 1 where none reached
+    for _ in 0..16 {
+        let (was, prev) = (hit.clone(), cap.clone());
+        let mut grew = false;
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                if was[i] {
+                    continue;
+                }
+                let (mut sum, mut n) = (0.0, 0);
+                for (a, b) in [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)] {
+                    if a < w && b < h && was[b * w + a] {
+                        sum += prev[b * w + a];
+                        n += 1;
+                    }
+                }
+                if n > 0 {
+                    cap[i] = sum / n as f32;
+                    hit[i] = true;
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    cap.iter().zip(&hit).map(|(&c, &h)| if h { (c * 255.0).round() as u8 } else { 255 }).collect()
+}
+
+pub fn bake(skin: &mut Image, layers: &[(&Layer, Option<&Layer>)], decal: &dyn Fn(u64) -> Option<std::sync::Arc<Image>>, skin_tone: Option<u32>, space: Space) -> Skipped {
+    bake_capped(skin, layers, &[], decal, skin_tone, space)
+}
+
+/// [`bake`] with a per-texel coverage cap for each layer (`caps[i]` for
+/// `layers[i]`, from [`region_cap`] at the skin's size; a missing entry or
+/// `None` is no cap).
+pub fn bake_capped(skin: &mut Image, layers: &[(&Layer, Option<&Layer>)], caps: &[Option<&[u8]>], decal: &dyn Fn(u64) -> Option<std::sync::Arc<Image>>, skin_tone: Option<u32>, space: Space) -> Skipped {
     let mut skipped = Skipped::default();
     let (w, h) = (skin.w as usize, skin.h as usize);
-    for &l in layers {
+    for (li, &(l, mask)) in layers.iter().enumerate() {
+        let cap = caps.get(li).copied().flatten().filter(|c| c.len() == w * h);
+        // a mask whose decal is missing leaves the layer whole
+        let mask = mask.and_then(|m| Some((m, m.textures.first().and_then(|&x| decal(x))?)));
         let made;
         let l = if l.is_makeup() {
             let Some(base) = skin_tone else {
@@ -798,7 +1005,7 @@ pub fn bake(skin: &mut Image, layers: &[&Layer], decal: &dyn Fn(u64) -> Option<s
         }
         let blend = l.blend();
         // a whole sheet (no transform) is drawn in the part's own layout:
-        // on the upper body that is its fourth UV set, both sides
+        // on the upper body that is its second UV set, both sides
         let space = if l.is_sheet() { Space::Part } else { space };
         skin.rgba.par_chunks_mut(4 * w).enumerate().for_each(|(y, row)| {
             let v = (y as f32 + 0.5) / h as f32;
@@ -815,7 +1022,18 @@ pub fn bake(skin: &mut Image, layers: &[&Layer], decal: &dyn Fn(u64) -> Option<s
                 if !(0.0..=1.0).contains(&du) || !(0.0..=1.0).contains(&dv) {
                     continue;
                 }
-                let (c, k) = shade(l, t.shader_sample(du, dv));
+                let (c, mut k) = shade(l, t.shader_sample(du, dv));
+                if let Some((m, mt)) = &mask {
+                    k *= m.mask_factor(mt, u, v);
+                }
+                // the shader starts the coverage at min(opacity, z), not
+                // at the opacity
+                if let Some(cap) = cap {
+                    let z = cap[y * w + x] as f32 / 255.0;
+                    if l.opacity > 0.0 && z < l.opacity {
+                        k *= z / l.opacity;
+                    }
+                }
                 if k <= 0.0 {
                     continue;
                 }
@@ -838,6 +1056,68 @@ mod tests {
     fn layer() -> Layer {
         let none = [0.0, f32::MAX, f32::MAX, f32::MAX];
         Layer { textures: vec![1], colours: [0, 0, 0], clip: [none; 4], flags: 0, opacity: 1.0, saturation: 1.0, mode: 0, uv: identity(), p3: [[0.0; 4]; 3], zone: identity() }
+    }
+
+    fn corner(u: f32, v: f32, colours: [u8; 8]) -> Corner {
+        Corner { at: [u, v], colours }
+    }
+
+    #[test]
+    fn region_flags_pick_the_record_cap() {
+        let mut a = layer();
+        let mut b = layer();
+        assert_eq!(Region::of(&[a.clone(), b.clone()]), None);
+        b.flags = REGION_VERTEX;
+        assert_eq!(Region::of(&[a.clone(), b.clone()]), Some(Region::Vertex));
+        // the mask wins when both are in the record
+        a.flags = REGION_MASK;
+        assert_eq!(Region::of(&[a, b]), Some(Region::Mask));
+    }
+
+    #[test]
+    fn a_vertex_cap_interpolates_the_modes_channel() {
+        // one triangle over the whole 4 x 4 texture's lower-left half; channel
+        // 2 (_COLOR0.b) is 0 at (0, 0) and 255 elsewhere, channel 4 255
+        let t = [corner(0.0, 0.0, [0, 0, 0, 255, 255, 0, 0, 0]), corner(1.0, 0.0, [0, 0, 255, 255, 255, 0, 0, 0]), corner(0.0, 1.0, [0, 0, 255, 255, 255, 0, 0, 0])];
+        let c = region_cap(4, 4, &[t], Region::Vertex, 2);
+        // texel (0, 0) centre (0.125, 0.125): 1 - 0.75 of the way from the corner
+        assert_eq!(c[0], (0.25f32 * 255.0).round() as u8);
+        assert!(c[1] > c[0]);
+        assert_eq!(region_cap(4, 4, &[t], Region::Vertex, 4), vec![255; 16]);
+        // a mode past the eight channels has no cap
+        assert_eq!(region_cap(4, 4, &[t], Region::Vertex, 9), vec![255; 16]);
+        // a gutter texel (3, 3) takes its covered neighbours' value
+        assert!(c[15] > 0);
+    }
+
+    #[test]
+    fn a_mask_cap_is_one_where_the_mesh_covers_the_vertex() {
+        let full = [corner(0.0, 0.0, [255; 8]), corner(1.0, 0.0, [255; 8]), corner(0.0, 1.0, [255; 8])];
+        let other = [corner(1.0, 0.0, [255; 8]), corner(1.0, 1.0, [255; 8]), corner(0.0, 1.0, [255; 8])];
+        // the whole square covered: the small triangle's vertices see four
+        // covered texels each (texel (3, 3) lies in it)
+        let small = [corner(0.4, 0.4, [255; 8]), corner(0.6, 0.4, [255; 8]), corner(0.4, 0.6, [255; 8])];
+        let c = region_cap(8, 8, &[full, other, small], Region::Mask, 0);
+        assert_eq!(c[3 * 8 + 3], 255);
+        // a vertex at the texture's corner has texels off the texture: 0
+        let c = region_cap(8, 8, &[full], Region::Mask, 0);
+        assert_eq!(c[0], 0);
+    }
+
+    #[test]
+    fn a_cap_lowers_the_opacity_only_below_it() {
+        let mut l = layer();
+        l.opacity = 0.5;
+        let d = std::sync::Arc::new(Image { w: 1, h: 1, rgba: vec![0, 0, 0, 255], srgb: true });
+        let base = || Image { w: 2, h: 1, rgba: vec![255; 8], srgb: true };
+        let cap = vec![255u8, 64];
+        let mut skin = base();
+        bake_capped(&mut skin, &[(&l, None)], &[Some(&cap)], &|_| Some(d.clone()), None, Space::Part);
+        let mut plain = base();
+        bake(&mut plain, &[(&l, None)], &|_| Some(d.clone()), None, Space::Part);
+        // cap 1 >= opacity 0.5: as without a cap; cap 0.25 < 0.5: half the coverage
+        assert_eq!(skin.rgba[..4], plain.rgba[..4]);
+        assert!(skin.rgba[4] > plain.rgba[4]);
     }
 
     #[test]
@@ -1003,20 +1283,20 @@ mod tests {
         l.opacity = 0.5;
         // only the left half: u -> u * 2
         l.uv = [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        assert_eq!(bake(&mut skin, &[&l], &|_| Some(d.clone()), None, Space::Part), Skipped::default());
+        assert_eq!(bake(&mut skin, &[(&l, None)], &|_| Some(d.clone()), None, Space::Part), Skipped::default());
         // black art at half coverage over white: linear 0.5 -> sRGB 188
         assert_eq!(&skin.rgba[..4], &[188, 188, 188, 200]);
         assert_eq!(&skin.rgba[4..], &[255, 255, 255, 200]);
-        assert_eq!(bake(&mut skin, &[&l], &|_| None, None, Space::Part), Skipped { missing: 1, ..Default::default() });
+        assert_eq!(bake(&mut skin, &[(&l, None)], &|_| None, None, Space::Part), Skipped { missing: 1, ..Default::default() });
         // a mask on a layer with no ink is left out
         let mask = std::sync::Arc::new(Image { w: 2, h: 1, rgba: vec![0, 128, 0, 255, 0, 120, 0, 200], srgb: false });
         l.colours = [0x004c_c382, 0, 0];
         assert!(mask.is_mask() && !d.is_mask());
-        assert_eq!(bake(&mut skin, &[&l], &|_| Some(mask.clone()), None, Space::Part), Skipped { uncoloured_masks: 1, ..Default::default() });
+        assert_eq!(bake(&mut skin, &[(&l, None)], &|_| Some(mask.clone()), None, Space::Part), Skipped { uncoloured_masks: 1, ..Default::default() });
         // makeup is left out, and the texture stays as it was
         l.colours = [0xff00_ff00, 0, 0];
         l.p3[0][3] = 1.0;
-        assert_eq!(bake(&mut skin, &[&l], &|_| Some(d.clone()), None, Space::Part), Skipped { makeup: 1, ..Default::default() });
+        assert_eq!(bake(&mut skin, &[(&l, None)], &|_| Some(d.clone()), None, Space::Part), Skipped { makeup: 1, ..Default::default() });
         assert_eq!(&skin.rgba[..4], &[188, 188, 188, 200]);
         // a black ink on the mask, multiplied: 188 x black at full coverage
         l.p3 = [[0.0; 4]; 3];
@@ -1024,7 +1304,7 @@ mod tests {
         l.opacity = 1.0;
         l.flags = 0x0400_0000;
         let solid = std::sync::Arc::new(Image { w: 1, h: 1, rgba: vec![0, 127, 0, 255], srgb: false });
-        assert_eq!(bake(&mut skin, &[&l], &|_| Some(solid.clone()), None, Space::Part), Skipped::default());
+        assert_eq!(bake(&mut skin, &[(&l, None)], &|_| Some(solid.clone()), None, Space::Part), Skipped::default());
         assert_eq!(&skin.rgba[..4], &[0, 0, 0, 200]);
         assert_eq!(&skin.rgba[4..], &[255, 255, 255, 200]);
     }
@@ -1063,8 +1343,8 @@ mod tests {
         let mut l = layer();
         l.colours = [0xff91_6610, 0, 0];
         l.p3[0] = [0.0, 0.0, 0.0, 1.0];
-        assert_eq!(bake(&mut skin, &[&l], &|_| Some(mask.clone()), None, Space::Part), Skipped { makeup: 1, ..Default::default() });
-        assert_eq!(bake(&mut skin, &[&l], &|_| Some(mask.clone()), Some(base), Space::Part), Skipped::default());
+        assert_eq!(bake(&mut skin, &[(&l, None)], &|_| Some(mask.clone()), None, Space::Part), Skipped { makeup: 1, ..Default::default() });
+        assert_eq!(bake(&mut skin, &[(&l, None)], &|_| Some(mask.clone()), Some(base), Space::Part), Skipped::default());
         assert_ne!(skin.rgba, vec![255, 255, 255, 255]);
     }
 
@@ -1111,6 +1391,47 @@ mod tests {
     }
 
     #[test]
+    fn a_mask_goes_with_the_layer_before_it() {
+        let a = layer();
+        let mut m = layer();
+        m.flags = MASK;
+        let b = layer();
+        let ls = [a.clone(), m.clone(), b.clone(), m.clone()];
+        let got = masked(&ls);
+        assert_eq!(got.len(), 2);
+        assert!(got[0].1.is_some() && got[1].1.is_some());
+        // a mask opening a record is drawn as a layer
+        let got = masked(std::slice::from_ref(&m));
+        assert_eq!((got.len(), got[0].1.is_some()), (1, false));
+    }
+
+    #[test]
+    fn a_mask_scales_the_coverage_by_its_alpha() {
+        // the mask decal: left texel clear, right texel opaque
+        let mt = Image { w: 2, h: 1, rgba: vec![0, 0, 0, 0, 0, 0, 0, 255], srgb: false };
+        let mut m = layer();
+        m.flags = MASK;
+        m.opacity = 0.5;
+        let (lo, hi) = (m.mask_factor(&mt, 0.0, 0.5), m.mask_factor(&mt, 1.0, 0.5));
+        assert!((lo - 0.5).abs() < 1e-6 && (hi - 1.0).abs() < 1e-6, "{lo} {hi}");
+        m.flags |= MASK_INVERTED;
+        let (lo, hi) = (m.mask_factor(&mt, 0.0, 0.5), m.mask_factor(&mt, 1.0, 0.5));
+        assert!((lo - 1.0).abs() < 1e-6 && (hi - 0.5).abs() < 1e-6, "{lo} {hi}");
+        // baked: a black layer over white skin, masked by a full-opacity
+        // mask whose decal is clear on the left half
+        m.flags = MASK;
+        m.opacity = 1.0;
+        m.textures = vec![2];
+        let l = layer();
+        let black = std::sync::Arc::new(Image { w: 1, h: 1, rgba: vec![0, 0, 0, 255], srgb: false });
+        let mt = std::sync::Arc::new(mt);
+        let mut skin = Image { w: 4, h: 1, rgba: vec![255; 16], srgb: true };
+        bake(&mut skin, &[(&l, Some(&m))], &|h| Some(if h == 2 { mt.clone() } else { black.clone() }), None, Space::Part);
+        let red: Vec<u8> = skin.rgba.chunks(4).map(|p| p[0]).collect();
+        assert_eq!((red[0], red[3]), (255, 0), "{red:?}");
+    }
+
+    #[test]
     fn a_whole_sheet_covers_both_sides_of_the_upper_body() {
         // no transform: the sheet is the upper body's texture as laid out
         // (UV3), both sides; moved at all, it is placed at (2u, v) and
@@ -1121,12 +1442,12 @@ mod tests {
         let white = || Image { w: 4, h: 1, rgba: vec![255; 16], srgb: true };
         let red = |s: &Image| s.rgba.chunks(4).map(|p| p[0]).collect::<Vec<_>>();
         let mut sheet = white();
-        bake(&mut sheet, &[&l], &|_| Some(d.clone()), None, Space::BodyUpper);
+        bake(&mut sheet, &[(&l, None)], &|_| Some(d.clone()), None, Space::BodyUpper);
         assert_eq!(red(&sheet), [0, 0, 0, 0]);
         l.uv[0][0] = 1.0001;
         assert!(!l.is_sheet());
         let mut moved = white();
-        bake(&mut moved, &[&l], &|_| Some(d.clone()), None, Space::BodyUpper);
+        bake(&mut moved, &[(&l, None)], &|_| Some(d.clone()), None, Space::BodyUpper);
         assert_eq!(red(&moved), [0, 0, 255, 255]);
     }
 
@@ -1142,10 +1463,10 @@ mod tests {
         let d = std::sync::Arc::new(Image { w: 1, h: 1, rgba: vec![0, 0, 0, 255], srgb: false });
         let white = || Image { w: 4, h: 1, rgba: vec![255; 16], srgb: true };
         let mut up = white();
-        bake(&mut up, &[&l], &|_| Some(d.clone()), None, Space::BodyUpper);
+        bake(&mut up, &[(&l, None)], &|_| Some(d.clone()), None, Space::BodyUpper);
         assert_eq!(up.rgba.chunks(4).map(|p| p[0]).collect::<Vec<_>>(), [255, 255, 0, 0]);
         let mut own = white();
-        bake(&mut own, &[&l], &|_| Some(d.clone()), None, Space::Part);
+        bake(&mut own, &[(&l, None)], &|_| Some(d.clone()), None, Space::Part);
         assert!(own.rgba.iter().all(|&b| b == 255));
     }
 
@@ -1162,18 +1483,32 @@ mod tests {
     }
 
     #[test]
-    fn uv3_layout_reads_the_base_at_each_texels_uv0() {
+    fn uv_layout_reads_the_base_at_each_texels_uv0() {
         // base: red at u0 < 0.5, blue above
         let base = Image { w: 2, h: 1, rgba: vec![255, 0, 0, 255, 0, 0, 255, 255], srgb: true };
         let reds = |im: &Image| im.rgba.chunks(4).map(|p| p[0]).collect::<Vec<_>>();
-        // no triangles: the half-width rule, u0 = fract(2 u3)
-        let t = uv3_layout(&base, &[]);
+        // no triangles: the half-width rule, u0 = fract(2 u)
+        let t = uv_layout(&base, &[]);
         assert_eq!((t.w, t.h), (4, 1));
         assert_eq!(reds(&t), [255, 0, 255, 0]);
-        // a strip whose fourth UV is its UV0 (the waist): read in place
+        // a strip whose layout UV is its UV0: read in place
         let c = |u: f32, v: f32| ([u, v], [u, v]);
         let quad = [[c(0.0, 0.0), c(1.0, 0.0), c(1.0, 1.0)], [c(0.0, 0.0), c(1.0, 1.0), c(0.0, 1.0)]];
         // (bilinear: u0 0.375 and 0.625 sit between the two base texels)
-        assert_eq!(reds(&uv3_layout(&base, &quad)), [255, 191, 64, 0]);
+        assert_eq!(reds(&uv_layout(&base, &quad)), [255, 191, 64, 0]);
+    }
+
+    #[test]
+    fn a_gutter_takes_the_nearest_covered_texels_uv0() {
+        // base: red at u0 < 0.5, blue above; an island in the layout's
+        // left half (u 0..0.5) that reads the base's right half (blue)
+        let base = Image { w: 4, h: 1, rgba: [[255, 0, 0, 255], [255, 0, 0, 255], [0, 0, 255, 255], [0, 0, 255, 255]].concat(), srgb: true };
+        let c = |u0: f32, u: f32, v: f32| ([u0, v], [u, v]);
+        let quad = [[c(0.75, 0.0, 0.0), c(1.0, 0.5, 0.0), c(1.0, 0.5, 1.0)], [c(0.75, 0.0, 0.0), c(1.0, 0.5, 1.0), c(0.75, 0.0, 1.0)]];
+        let t = uv_layout(&base, &quad);
+        assert_eq!(t.w, 8);
+        // the island and every gutter texel right of it are blue; the
+        // half-width rule would have read red at u 0.5..0.75
+        assert!(t.rgba.chunks(4).all(|p| p[0] == 0 && p[2] == 255), "{:?}", t.rgba);
     }
 }

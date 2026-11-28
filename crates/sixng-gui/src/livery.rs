@@ -18,6 +18,13 @@
 //! a fitted box or bed, other fitted parts), so a placement names its model
 //! as well (`Vertex::zone[1]`; "" = the vehicle itself).
 //!
+//! A sticker can instead be laid on **flat** (`Sticker::flat`): its picture
+//! is projected straight onto the vehicle along the panel's normal, in the
+//! vehicle's own space, wherever the chosen zones face that way. Such a
+//! sticker does not follow the UV layout, so it runs across the pieces a
+//! panel is unwrapped in and onto zones of other models (`Sticker::also`:
+//! from the cab onto a fitted box). The game has no such layer.
+//!
 //! The game's own liveries (brands) are not drawn: the rule that turns a
 //! brand's layout numbers into a place on the panel is not decoded.
 //!
@@ -118,14 +125,37 @@ pub struct Sticker {
     /// placement above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub game_uv: Option<[f32; 6]>,
+    /// Laid on flat: projected along the normal of its zones instead of
+    /// through their UV layout. The placement above still says where: its
+    /// centre is the place on the model the UV centre stands for.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub flat: bool,
+    /// The side a flat sticker is projected from.
+    #[serde(default, skip_serializing_if = "Side::is_panels")]
+    pub from: Side,
+    /// Zones of other models a flat sticker lies on as well.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also: Vec<Also>,
+    /// The numbers a flat sticker was drawn with when this was saved (see
+    /// `ZoneSet::projection`), in the vehicle's space as the viewer shows it
+    /// (metres, Y up): written for reference, recomputed on load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<[f32; 11]>,
     /// Not placed by hand yet: it is fitted again when its zones change.
     #[serde(skip)]
     pub fresh: bool,
 }
 
+/// Zones of one more model under a flat sticker.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Also {
+    pub model: String,
+    pub zones: Vec<u8>,
+}
+
 impl Sticker {
     pub fn new(picture: Picture) -> Sticker {
-        Sticker { name: String::new(), picture, model: String::new(), zones: Vec::new(), uv_set: 1, centre: [0.5, 0.5], size: [1.0, 1.0], rotation: 0.0, mirror: false, mask: false, colours: white3(), opacity: 1.0, visible: true, shader_uv: None, game_uv: None, fresh: true }
+        Sticker { name: String::new(), picture, model: String::new(), zones: Vec::new(), uv_set: 1, centre: [0.5, 0.5], size: [1.0, 1.0], rotation: 0.0, mirror: false, mask: false, colours: white3(), opacity: 1.0, visible: true, shader_uv: None, game_uv: None, flat: false, from: Side::Panels, also: Vec::new(), projection: None, fresh: true }
     }
 }
 
@@ -193,6 +223,7 @@ impl History {
         let mut l = l.clone();
         for s in &mut l.stickers {
             s.shader_uv = None;
+            s.projection = None;
         }
         l
     }
@@ -312,11 +343,13 @@ pub struct Island {
     pub sq: Vec2,
     pub du: Vec3,
     pub dv: Vec3,
+    /// Area-weighted sum of the faces' centres on the model.
+    pub pos: Vec3,
 }
 
 impl Island {
     fn new(id: u32) -> Island {
-        Island { id, area: 0.0, lo: Vec2::splat(f32::MAX), hi: Vec2::splat(f32::MIN), sum: Vec2::ZERO, sq: Vec2::ZERO, du: Vec3::ZERO, dv: Vec3::ZERO }
+        Island { id, area: 0.0, lo: Vec2::splat(f32::MAX), hi: Vec2::splat(f32::MIN), sum: Vec2::ZERO, sq: Vec2::ZERO, du: Vec3::ZERO, dv: Vec3::ZERO, pos: Vec3::ZERO }
     }
 
     fn add(&mut self, o: &Island) {
@@ -327,6 +360,7 @@ impl Island {
         self.sq += o.sq;
         self.du += o.du;
         self.dv += o.dv;
+        self.pos += o.pos;
     }
 }
 
@@ -403,30 +437,39 @@ impl Zones {
 
     /// Survey a loaded model. `parts`: the fitted part names in slot order
     /// (slot 1 first).
+    #[cfg(test)]
     pub fn of(m: &glb::Model, parts: &[String]) -> Zones {
+        Zones::of_with(m, &[], parts)
+    }
+
+    /// Survey a loaded model and models drawn apart from it (the wheels),
+    /// each of those under the slot given with it. `parts` names every
+    /// slot from 1 on, theirs too.
+    pub fn of_with(m: &glb::Model, extra: &[(&glb::Model, u8)], parts: &[String]) -> Zones {
+        let meshes: Vec<(&glb::Mesh, Option<u8>)> = m.meshes.iter().map(|me| (me, None)).chain(extra.iter().flat_map(|(x, slot)| x.meshes.iter().map(move |me| (me, Some(*slot))))).collect();
         let mut zones: BTreeMap<(u8, u8), Zone> = BTreeMap::new();
         // first the UV islands, over every face that can take a sticker
         // (also the faces on a border between two zones: they tie the
         // islands of neighbouring zones together)
         let mut isl = Islands::default();
-        for me in &m.meshes {
+        for (me, over) in &meshes {
             for t in me.indices.chunks_exact(3) {
                 let v = [&me.verts[t[0] as usize], &me.verts[t[1] as usize], &me.verts[t[2] as usize]];
                 if v[0].zone[2] == 0 {
                     continue;
                 }
                 for set in 0..2 {
-                    let slot = v[0].zone[1];
+                    let slot = over.unwrap_or(v[0].zone[1]);
                     let n = v.map(|q| isl.node(slot, set, Vec2::from(if set == 0 { q.uv0 } else { q.uv1 })));
                     isl.join(n[0], n[1]);
                     isl.join(n[0], n[2]);
                 }
             }
         }
-        for me in &m.meshes {
+        for (me, over) in &meshes {
             for t in me.indices.chunks_exact(3) {
                 let v = [&me.verts[t[0] as usize], &me.verts[t[1] as usize], &me.verts[t[2] as usize]];
-                let key = (v[0].zone[1], v[0].zone[0]);
+                let key = (over.unwrap_or(v[0].zone[1]), v[0].zone[0]);
                 if v[0].zone[2] == 0 || v[1].zone[0] != key.1 || v[2].zone[0] != key.1 {
                     continue;
                 }
@@ -472,7 +515,7 @@ impl Zones {
                             z.islands[set].len() - 1
                         }
                     };
-                    z.islands[set][at].add(&Island { id, area, lo: uv[0].min(uv[1]).min(uv[2]), hi: uv[0].max(uv[1]).max(uv[2]), sum: c * area, sq: (c * c + own) * area, du, dv });
+                    z.islands[set][at].add(&Island { id, area, lo: uv[0].min(uv[1]).min(uv[2]), hi: uv[0].max(uv[1]).max(uv[2]), sum: c * area, sq: (c * c + own) * area, du, dv, pos: (p[0] + p[1] + p[2]) / 3.0 * area });
                 }
             }
         }
@@ -538,6 +581,8 @@ impl Zones {
         // the box of the bulk: mean +- sqrt(3) standard deviations (exactly
         // the box of an evenly filled rectangle), inside the island's box
         let mean = main.sum / main.area;
+        s.anchor = main.pos / main.area;
+        s.anchor_uv = mean;
         let half = ((main.sq / main.area - mean * mean).max(Vec2::ZERO)).powf(0.5) * 3f32.sqrt();
         s.fit_lo = (mean - half).max(main.lo);
         s.fit_hi = (mean + half).min(main.hi);
@@ -564,18 +609,78 @@ pub struct ZoneSet {
     /// largest island's.
     pub islands: usize,
     pub main_share: f32,
+    /// A place on the model and the UV point that lies there: the middle
+    /// of the largest island's faces, on the model and in the UV set.
+    pub anchor: Vec3,
+    pub anchor_uv: Vec2,
+}
+
+/// The side of the vehicle a flat sticker is projected from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Side {
+    /// Along the normal of the sticker's own panels.
+    #[default]
+    Panels,
+    Left,
+    Right,
+    Top,
+    Front,
+    Back,
+}
+
+impl Side {
+    pub const ALL: [Side; 6] = [Side::Panels, Side::Left, Side::Right, Side::Top, Side::Front, Side::Back];
+
+    pub fn is_panels(&self) -> bool {
+        *self == Side::Panels
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Side::Panels => "its panels",
+            Side::Left => "the left",
+            Side::Right => "the right",
+            Side::Top => "the top",
+            Side::Front => "the front",
+            Side::Back => "the back",
+        }
+    }
+
+    /// From its name in the livery file (also what `--livery-from` takes).
+    pub fn parse(s: &str) -> Option<Side> {
+        Side::ALL.into_iter().find(|x| format!("{x:?}").eq_ignore_ascii_case(s.trim()))
+    }
+
+    /// The way the side looks, in the vehicle's space as the viewer shows
+    /// it (Y up, the front towards -Z, the left towards -X).
+    pub fn normal(self) -> Option<Vec3> {
+        match self {
+            Side::Panels => None,
+            Side::Left => Some(Vec3::NEG_X),
+            Side::Right => Some(Vec3::X),
+            Side::Top => Some(Vec3::Y),
+            Side::Front => Some(Vec3::NEG_Z),
+            Side::Back => Some(Vec3::Z),
+        }
+    }
+}
+
+/// "To the right" and "down" on a surface that looks along `n`, as seen
+/// from outside: a picture laid along them reads upright.
+fn axes_of(n: Vec3) -> (Vec3, Vec3) {
+    // on a roof or bonnet "up" is towards the front of the vehicle
+    let up = if n.y.abs() > 0.9 { Vec3::new(0.0, 0.0, -1.0) } else { Vec3::Y };
+    let right = up.cross(n).normalize_or_zero();
+    let down = right.cross(n).normalize_or_zero();
+    (right, down)
 }
 
 impl ZoneSet {
     /// The panel's "to the right" and "down" as seen from outside (unit
     /// vectors in the surface): a picture laid along them reads upright.
     pub fn axes(&self) -> (Vec3, Vec3) {
-        let n = if self.normal.length_squared() > 0.0 { self.normal } else { self.du.cross(self.dv).normalize_or_zero() };
-        // on a roof or bonnet "up" is towards the front of the vehicle
-        let up = if n.y.abs() > 0.9 { Vec3::new(0.0, 0.0, -1.0) } else { Vec3::Y };
-        let right = up.cross(n).normalize_or_zero();
-        let down = right.cross(n).normalize_or_zero();
-        (right, down)
+        axes_of(if self.normal.length_squared() > 0.0 { self.normal } else { self.du.cross(self.dv).normalize_or_zero() })
     }
 
     /// Metres per UV unit along U and V.
@@ -600,6 +705,57 @@ impl ZoneSet {
         let ou = 0.5 - (a * s.centre[0] + b * s.centre[1]);
         let ov = 0.5 - (c * s.centre[0] + e * s.centre[1]);
         [a, b, c, e, ou, ov]
+    }
+
+    /// Where a UV point lies on the model, taking the panel as flat.
+    pub fn point(&self, uv: Vec2) -> Vec3 {
+        let d = uv - self.anchor_uv;
+        self.anchor + self.du * d.x + self.dv * d.y
+    }
+
+    /// The reverse of `point` for a place on or off the panel: the UV point
+    /// it stands over, seen along the panel's normal, or from `from` when
+    /// that is a side of the vehicle (the way a flat sticker projected
+    /// from that side sees it, so its middle comes to lie over `p`).
+    pub fn uv_at(&self, p: Vec3, from: Side) -> Vec2 {
+        let det_of = |(right, down): (Vec3, Vec3)| right.dot(self.du) * down.dot(self.dv) - right.dot(self.dv) * down.dot(self.du);
+        // a side the panel is seen edge-on from: along the panel's normal
+        let own = self.axes();
+        let (right, down) = from.normal().map(axes_of).filter(|ax| det_of(*ax).abs() > 0.05 * det_of(own).abs()).unwrap_or(own);
+        let (a, b, c, d) = (right.dot(self.du), right.dot(self.dv), down.dot(self.du), down.dot(self.dv));
+        let det = a * d - b * c;
+        if det.abs() < 1e-9 {
+            return self.anchor_uv;
+        }
+        let q = Vec2::new(right.dot(p - self.anchor), down.dot(p - self.anchor));
+        self.anchor_uv + Vec2::new(q.x * d - q.y * b, q.y * a - q.x * c) / det
+    }
+
+    /// A flat sticker's numbers: with P a place on the model (the vehicle's
+    /// space as stored, doors shut), `u = A·P + ou`, `v = B·P + ov`, and N
+    /// the direction the faces under it look in. `[A, ou, B, ov, N]`. On a
+    /// flat panel this draws what `shader_uv` draws. With a side chosen
+    /// (`Sticker::from`) N is that side's and the picture stands upright
+    /// as seen from it; its middle is still the place the centre stands
+    /// for on the panels.
+    pub fn projection(&self, s: &Sticker) -> [f32; 11] {
+        let (right, down) = match s.from.normal() {
+            Some(n) => axes_of(n),
+            None => self.axes(),
+        };
+        let (sin, cos) = s.rotation.to_radians().sin_cos();
+        let mut r = right * cos - down * sin;
+        let d = down * cos + right * sin;
+        if s.mirror {
+            r = -r;
+        }
+        let a = r / s.size[0].max(1e-4);
+        let b = d / s.size[1].max(1e-4);
+        let c = self.point(Vec2::from(s.centre));
+        // the way the panel looks, square to the picture
+        let n = right.cross(down).normalize_or_zero();
+        let n = if n.dot(s.from.normal().unwrap_or(self.normal)) >= 0.0 { n } else { -n };
+        [a.x, a.y, a.z, 0.5 - a.dot(c), b.x, b.y, b.z, 0.5 - b.dot(c), n.x, n.y, n.z]
     }
 
     /// The middle of the zones (of the box of their bulk).
@@ -665,10 +821,15 @@ pub struct Record {
     /// ou, ov, opacity, texture layer (-1 = none)
     pub o: [f32; 4],
     /// x: 1 drawn, 2 colour mask, 4 highlight the zones, 8 outline the
-    /// sticker; y: model slot; z: UV set; in the first record (the header)
+    /// sticker, 16 laid on flat (`pa`, `pb`, `pn` instead of `m`); y: model slot; z: UV set; in the first record (the header)
     /// x is the number of records after it
     pub flags: [u32; 4],
     pub c: [[f32; 4]; 3],
+    /// A flat sticker: A, B and N of `ZoneSet::projection` (w unused; ou
+    /// and ov are in `o`).
+    pub pa: [f32; 4],
+    pub pb: [f32; 4],
+    pub pn: [f32; 4],
 }
 
 fn lin(c: [u8; 3]) -> [f32; 4] {
@@ -710,14 +871,19 @@ pub fn records(l: &mut Livery, zones: &Zones, layer_of: &dyn Fn(&Picture) -> Opt
         }
         let selected = hl.selected == Some(i);
         let Some(slot) = zones.slot_of(&s.model) else { continue };
+        let mut flat = None;
         let uv = match s.game_uv {
             Some(m) => m,
             None => {
                 let Some(set) = zones.set(slot, &s.zones, s.uv_set.min(1) as usize) else { continue };
+                if s.flat {
+                    flat = Some(set.projection(s));
+                }
                 set.shader_uv(s)
             }
         };
         s.shader_uv = Some(uv);
+        s.projection = flat;
         if !s.visible && !selected {
             continue;
         }
@@ -732,7 +898,7 @@ pub fn records(l: &mut Livery, zones: &Zones, layer_of: &dyn Fn(&Picture) -> Opt
                 flags |= 4;
             }
         }
-        out.push(Record {
+        let mut rec = Record {
             zones: zone_bits(&s.zones),
             m: [uv[0], uv[1], uv[2], uv[3]],
             o: [uv[4], uv[5], s.opacity.clamp(0.0, 1.0), layer.map_or(-1.0, |l| l as f32)],
@@ -740,12 +906,44 @@ pub fn records(l: &mut Livery, zones: &Zones, layer_of: &dyn Fn(&Picture) -> Opt
             // placing measures the zones in the first two)
             flags: [flags, slot as u32, s.uv_set.min(if s.game_uv.is_some() { 3 } else { 1 }) as u32, 0],
             c: s.colours.map(lin),
-        });
+            ..Default::default()
+        };
+        if let Some(p) = flat {
+            rec.flags[0] |= 16;
+            rec.o[0] = p[3];
+            rec.o[1] = p[7];
+            rec.pa = [p[0], p[1], p[2], 0.0];
+            rec.pb = [p[4], p[5], p[6], 0.0];
+            rec.pn = [p[8], p[9], p[10], 0.0];
+        }
+        out.push(rec);
+        // a flat sticker's zones on other models: the same picture in the
+        // same place, one record per model
+        if flat.is_some() {
+            for a in &s.also {
+                let Some(slot) = zones.slot_of(&a.model).filter(|_| !a.zones.is_empty() && out.len() <= MAX_STICKERS) else { continue };
+                let mut r = rec;
+                r.zones = zone_bits(&a.zones);
+                r.flags[1] = slot as u32;
+                out.push(r);
+            }
+        }
     }
     if let Some((slot, zone)) = hl.hover {
         out.push(Record { zones: zone_bits(&[zone]), o: [0.0, 0.0, 0.0, -1.0], flags: [1 | 4, slot as u32, 0, 1], ..Default::default() });
     }
     out[0].flags[0] = (out.len() - 1) as u32;
+    out
+}
+
+/// The records for a model drawn apart from the vehicle (a wheel), whose
+/// vertices are all in slot 0: the ones for `slot` are moved to 0, all
+/// others to a slot no vertex has.
+pub fn records_for_slot(recs: &[Record], slot: u8) -> Vec<Record> {
+    let mut out = recs.to_vec();
+    for r in out.iter_mut().skip(1) {
+        r.flags[1] = if r.flags[1] == slot as u32 { 0 } else { u32::MAX };
+    }
     out
 }
 
@@ -820,11 +1018,12 @@ pub struct State {
     /// `--livery FILE`: open this file for the next vehicle instead of its
     /// saved one.
     pub open_once: Option<PathBuf>,
-    /// `--livery-info FILE`: write the zones of the next vehicle there.
+    /// `--livery-info FILE`: write the zones of the vehicle there (the last
+    /// table, wheels included).
     pub info_once: Option<PathBuf>,
     /// The vehicle the livery belongs to (`vehicle_key`).
     pub vehicle: String,
-    zones_key: (PathBuf, usize, usize),
+    zones_key: (PathBuf, usize, usize, Vec<String>),
     pub zones: Zones,
     /// Pictures read so far, by `Picture::key`; an error text for the ones
     /// that could not be read.
@@ -937,7 +1136,11 @@ impl State {
     /// the loaded vehicle; does nothing while nothing changed. `parts`: the
     /// fitted part names in slot order.
     #[allow(clippy::too_many_arguments)]
-    pub fn sync(&mut self, rs: &egui_wgpu::RenderState, ren: &crate::render3d::Renderer3D, gpu: &mut crate::render3d::GpuModel, model: &glb::Model, vehicle: &str, parts: &[String], game: &Path, work: &Path, cache: &Path) {
+    /// `wheels`: the wheel models drawn apart from the vehicle (rim and
+    /// tyre), each with its name and its model on the GPU. Their zones
+    /// come after the fitted parts' (a tyre's sidewall lettering, zones
+    /// 226 and 227).
+    pub fn sync(&mut self, rs: &egui_wgpu::RenderState, ren: &crate::render3d::Renderer3D, gpu: &mut crate::render3d::GpuModel, model: &glb::Model, vehicle: &str, parts: &[String], wheels: &mut [(&glb::Model, String, &mut crate::render3d::GpuModel)], game: &Path, work: &Path, cache: &Path) {
         if vehicle != self.vehicle {
             self.vehicle = vehicle.to_string();
             let file = self.open_once.take().unwrap_or_else(|| file_for(work, vehicle));
@@ -960,12 +1163,16 @@ impl State {
             self.highlight = Highlight::default();
             self.dirty = true;
         }
-        let key = (model.path.clone(), model.triangles, model.vertices);
+        let wheel_names: Vec<String> = wheels.iter().map(|w| w.1.clone()).collect();
+        let key = (model.path.clone(), model.triangles, model.vertices, wheel_names.clone());
         if key != self.zones_key {
-            self.zones = Zones::of(model, parts);
+            let extra: Vec<(&glb::Model, u8)> = wheels.iter().enumerate().map(|(i, w)| (w.0, (parts.len() + 1 + i).min(255) as u8)).collect();
+            let all: Vec<String> = parts.iter().cloned().chain(wheel_names).collect();
+            self.zones = Zones::of_with(model, &extra, &all);
             self.zones_key = key;
             self.dirty = true;
-            if let Some(f) = self.info_once.take() {
+            // (written again as the table changes: the wheels come in later)
+            if let Some(f) = &self.info_once {
                 let _ = sixng_core::atomic::write(f, serde_json::to_vec_pretty(&self.zones.describe()).unwrap_or_default());
             }
         }
@@ -975,7 +1182,9 @@ impl State {
         }
         self.ed.reading = self.reading.len();
         let nothing = self.livery.stickers.is_empty() && self.highlight == Highlight::default();
-        if !self.dirty && (gpu.sticker_buf.is_some() || nothing) {
+        // a wheel uploaded again (another rim) has no stickers yet
+        let fresh_wheel = wheels.iter().any(|w| w.2.sticker_buf.is_none());
+        if !self.dirty && (nothing || (gpu.sticker_buf.is_some() && !fresh_wheel)) {
             return;
         }
         // the pictures of the stickers shown, as layers
@@ -1002,6 +1211,10 @@ impl State {
         let on_gpu = &self.on_gpu;
         let recs = records(&mut self.livery, &self.zones, &|p| on_gpu.iter().position(|k| *k == p.key()).map(|i| i as u32), &self.highlight);
         ren.set_stickers(rs, gpu, &recs, self.view.as_ref());
+        for (i, w) in wheels.iter_mut().enumerate() {
+            let slot = (parts.len() + 1 + i).min(255) as u8;
+            ren.set_stickers(rs, w.2, &records_for_slot(&recs, slot), self.view.as_ref());
+        }
         self.dirty = false;
     }
 }
@@ -1035,6 +1248,8 @@ impl Zones {
 #[derive(Clone, Copy, Debug)]
 pub struct Hit {
     pub t: f32,
+    /// The place on the model as stored (doors shut).
+    pub pos: Vec3,
     pub slot: u8,
     pub zone: u8,
     pub uv: [Vec2; 2],
@@ -1148,7 +1363,8 @@ pub fn pick(m: &glb::Model, origin: Vec3, dir: Vec3, posed: Option<&Posed>) -> O
                 let g = |v: &glb::Vertex| Vec2::from(if k == 0 { v.uv0 } else { v.uv1 });
                 g(v[0]) * w + g(v[1]) * a + g(v[2]) * b
             };
-            best = Some(Hit { t: dist, slot: v[0].zone[1], zone: v[0].zone[0], uv: [uv(0), uv(1)] });
+            let pos = Vec3::from(v[0].pos) * w + Vec3::from(v[1].pos) * a + Vec3::from(v[2].pos) * b;
+            best = Some(Hit { t: dist, pos, slot: v[0].zone[1], zone: v[0].zone[0], uv: [uv(0), uv(1)] });
         }
     }
     best
@@ -1157,6 +1373,16 @@ pub fn pick(m: &glb::Model, origin: Vec3, dir: Vec3, posed: Option<&Posed>) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wheel_takes_only_its_own_records() {
+        let rec = |slot: u32| Record { flags: [1, slot, 0, 0], ..Default::default() };
+        let recs = vec![Record { flags: [3, 0, 0, 0], ..Default::default() }, rec(0), rec(4), rec(5)];
+        let w = records_for_slot(&recs, 4);
+        // the header stays; the wheel's own record moves to slot 0
+        assert_eq!(w.iter().map(|r| r.flags[1]).collect::<Vec<_>>(), [0, u32::MAX, 0, u32::MAX]);
+        assert_eq!(w[0].flags[0], 3);
+    }
 
     fn quad(zone: u8, flip_u: bool) -> glb::Model {
         // a 4 m x 2 m wall in the XY plane facing +Z; UV 0..1 across it,
@@ -1193,6 +1419,73 @@ mod tests {
             assert!(a.abs() < 1e-4 && b.abs() < 1e-4, "{a} {b}");
             let (a, b) = at(1.0, 0.5);
             assert!((a - 1.0).abs() < 1e-4 && (b - 1.0).abs() < 1e-4, "{a} {b}");
+        }
+    }
+
+    #[test]
+    fn a_flat_sticker_lies_where_the_same_placement_lies_and_runs_onto_other_models() {
+        for flip in [false, true] {
+            let z = Zones::of(&quad(7, flip), &["box".to_string()]);
+            let set = z.set(0, &[7], 1).unwrap();
+            let mut s = Sticker::new(Picture::Game("0".into()));
+            s.zones = vec![7];
+            s.centre = [0.3, 0.6];
+            s.size = [2.0, 1.0];
+            s.rotation = 20.0;
+            let m = set.shader_uv(&s);
+            let p = set.projection(&s);
+            // it looks the way the wall looks
+            assert!((Vec3::new(p[8], p[9], p[10]) - Vec3::Z).length() < 1e-4);
+            for (x, y) in [(-1.0f32, 1.5f32), (1.0, 0.5), (0.3, 0.2), (5.0, -1.0)] {
+                let u = (x + 2.0) / 4.0;
+                let (u, v) = (if flip { 1.0 - u } else { u }, 1.0 - y / 2.0);
+                let by_uv = Vec2::new(u * m[0] + v * m[1] + m[4], u * m[2] + v * m[3] + m[5]);
+                // (a place off the wall's plane, as on a model further out)
+                let at = Vec3::new(x, y, 0.4);
+                let flat = Vec2::new(p[0] * at.x + p[1] * at.y + p[2] * at.z + p[3], p[4] * at.x + p[5] * at.y + p[6] * at.z + p[7]);
+                assert!((by_uv - flat).length() < 1e-4, "{by_uv} {flat}");
+                // and a place on the model gives its UV point back
+                assert!((set.uv_at(at, Side::Panels) - Vec2::new(u, v)).length() < 1e-4);
+            }
+            // from a side: it looks that way whatever the wall does, the
+            // picture upright (up the vehicle is up the picture) and its
+            // middle where the centre is on the wall
+            for side in [Side::Left, Side::Right, Side::Top, Side::Front, Side::Back] {
+                s.from = side;
+                let q = set.projection(&s);
+                let (a, b, n) = (Vec3::new(q[0], q[1], q[2]), Vec3::new(q[4], q[5], q[6]), Vec3::new(q[8], q[9], q[10]));
+                assert!((n - side.normal().unwrap()).length() < 1e-5);
+                assert!(a.dot(n).abs() < 1e-5 && b.dot(n).abs() < 1e-5 && a.dot(b).abs() < 1e-5);
+                let c = set.point(Vec2::from(s.centre));
+                assert!((a.dot(c) + q[3] - 0.5).abs() < 1e-4 && (b.dot(c) + q[7] - 0.5).abs() < 1e-4);
+                if side != Side::Top {
+                    assert!((b.y + s.rotation.to_radians().cos() / s.size[1]).abs() < 1e-4, "{side:?} {b}");
+                }
+                assert_eq!(Side::parse(&format!("{side:?}").to_lowercase()), Some(side));
+                // a place on the model taken as the centre: the picture's
+                // middle lies over it (not from a side the wall is edge-on to)
+                let at = Vec3::new(0.7, 0.4, 0.3);
+                let mut t = s.clone();
+                t.centre = set.uv_at(at, side).to_array();
+                let q = set.projection(&t);
+                let mid = Vec2::new(q[0] * at.x + q[1] * at.y + q[2] * at.z + q[3], q[4] * at.x + q[5] * at.y + q[6] * at.z + q[7]);
+                if side == Side::Back || side == Side::Front {
+                    assert!((mid - Vec2::splat(0.5)).length() < 1e-4, "{side:?} {mid}");
+                } else {
+                    assert_eq!(t.centre, set.uv_at(at, Side::Panels).to_array());
+                }
+            }
+            s.from = Side::Panels;
+            // one record on the wall, one more per other model it lies on
+            s.flat = true;
+            s.also = vec![Also { model: "box".into(), zones: vec![2, 40] }, Also { model: "not fitted".into(), zones: vec![1] }];
+            let mut l = Livery { stickers: vec![s], ..Default::default() };
+            let r = records(&mut l, &z, &|_| Some(0), &Highlight::default());
+            assert_eq!((r.len(), r[0].flags[0]), (3, 2));
+            assert_eq!((r[1].flags[0] & 16, r[1].flags[1], r[2].flags[0] & 16, r[2].flags[1]), (16, 0, 16, 1));
+            assert_eq!(r[2].zones, zone_bits(&[2, 40]));
+            assert_eq!((r[1].pa, r[1].o[0]), (r[2].pa, p[3]));
+            assert_eq!(l.stickers[0].projection, Some(p));
         }
     }
 

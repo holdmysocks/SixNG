@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/sixng-core", "crates/sixng-cli", "crates/sixng-gui"]
 
 [workspace.package]
-version = "0.12.0"
+version = "0.14.0"
 edition = "2021"
 license = "GPL-3.0-only"
 
@@ -19,8 +19,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # Keep the published 1.0.0 API as the baseline. This fork revision carries the
 # audited Metal 4 fixes and MTL4FX Temporal Scaler API until they are released upstream.
 [patch.crates-io]
-metal-rust = { git = "https://github.com/maple-quartz18/Metal-Rust.git", rev = "e67e0fe6007f773a99debca0cfdb111cf49b792c" }
-metal-rust-ffi = { git = "https://github.com/maple-quartz18/Metal-Rust.git", rev = "e67e0fe6007f773a99debca0cfdb111cf49b792c" }
+metal-rust = { git = "https://github.com/maple-quartz18/Metal-Rust.git", rev = "0aa2a1f694adf1a7e3ba877cc799e114d639df16" }
+metal-rust-ffi = { git = "https://github.com/maple-quartz18/Metal-Rust.git", rev = "0aa2a1f694adf1a7e3ba877cc799e114d639df16" }
 
 [profile.release]
 opt-level = 3

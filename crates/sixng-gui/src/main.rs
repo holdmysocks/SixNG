@@ -18,6 +18,7 @@ mod bc;
 mod cells;
 mod fabric;
 mod glb;
+mod gpu_draw;
 mod gpu_time;
 mod lights;
 mod livery;
@@ -409,7 +410,19 @@ fn wgpu_options(no_vsync: bool, gpu: Option<String>) -> eframe::egui_wgpu::WgpuC
         c.device_descriptor = std::sync::Arc::new(move |adapter| {
             let mut d = base(adapter);
             d.required_features |= adapter.features()
-                & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::DEPTH32FLOAT_STENCIL8 | crate::gpu_time::features());
+                & (wgpu::Features::TEXTURE_COMPRESSION_BC
+                    | wgpu::Features::DEPTH32FLOAT_STENCIL8
+                    // ped glass's blend (render3d's glass pipeline)
+                    | wgpu::Features::DUAL_SOURCE_BLENDING
+                    | crate::gpu_time::features());
+            // the 3D map's material table (gpu_draw.rs): all of its features or none
+            if adapter.features().contains(crate::gpu_draw::features()) {
+                d.required_features |= crate::gpu_draw::features();
+                d.required_limits.max_binding_array_elements_per_shader_stage = d
+                    .required_limits
+                    .max_binding_array_elements_per_shader_stage
+                    .max(adapter.limits().max_binding_array_elements_per_shader_stage.min(crate::gpu_draw::ARRAYS));
+            }
             // the mesh shaders read more than wgpu's default 16 textures per stage (sky, shadow cascades, hair
             // lighting tables, materials); ask for what the adapter has, up to 32
             d.required_limits.max_sampled_textures_per_shader_stage =
@@ -1057,6 +1070,35 @@ impl App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     #[cfg(all(target_os = "macos", feature = "metal4-poc"))]
                     if let Some(renderer) = metal4_renderer.as_deref_mut() {
+                        let mut msaa = renderer.msaa_level();
+                        egui::ComboBox::from_id_salt("metal4-msaa")
+                            .selected_text(format!(
+                                "MSAA {} ({})",
+                                msaa,
+                                if msaa > 0 && renderer.msaa_sample_count() == 1 {
+                                    "1x fallback".to_string()
+                                } else if renderer.msaa_sample_count() == 1 {
+                                    "Off".to_string()
+                                } else {
+                                    format!("{}x", renderer.msaa_sample_count())
+                                }
+                            ))
+                            .show_ui(ui, |ui| {
+                                for (level, label) in [
+                                    (0, "Off"),
+                                    (1, "2x"),
+                                    (2, "4x"),
+                                    (3, "8x"),
+                                    (4, "16x"),
+                                ] {
+                                    ui.selectable_value(&mut msaa, level, label);
+                                }
+                            });
+                        if msaa != renderer.msaa_level() {
+                            if let Err(error) = renderer.set_msaa_level(msaa) {
+                                eprintln!("[metal4-msaa] failed to apply level {msaa}: {error:#}");
+                            }
+                        }
                         let mut mode = renderer.temporal_upscale_mode();
                         egui::ComboBox::from_id_salt("metalfx-temporal-mode")
                             .selected_text(match mode {
@@ -2048,6 +2090,8 @@ impl App {
         m.livery.ed.auto_select = c.get("livery-select").and_then(|s| s.parse().ok());
         m.livery.ed.auto_add = c.get("livery-add").map(|s| s.split(',').map(str::to_string).collect()).unwrap_or_default();
         m.livery.ed.auto_click = c.get("livery-click").map(pairs).unwrap_or_default();
+        m.livery.ed.auto_flat = c.has("livery-flat");
+        m.livery.ed.auto_from = c.get("livery-from").and_then(crate::livery::Side::parse);
         m.livery.ed.auto_drag = c.get("livery-drag").map(pairs).and_then(|v| v.first().copied());
         m.livery.ed.auto_save = c.has("livery-save");
         m.livery.ed.auto_undo = c.get("livery-undo").and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -2093,6 +2137,10 @@ impl App {
             m.cam.pitch = v;
         }
         m.zoom_after_load = c.f("zoom");
+        // --skin-detail off: ped skin without the engine detail (also SIXNG_SKIN_DETAIL=0)
+        if let Some(v) = c.get("skin-detail") {
+            m.look.skin_detail = !matches!(v.to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no");
+        }
         // --body <weight>,<muscle>[,<breasts>,<butt>] (-1..1, 0..1, -1..1,
         // 0..1; missing values are 0) or a --body-shape spec
         // (gcweightbelly=0.5,gcbutt=1,...): body shape of characters, kept

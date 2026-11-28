@@ -398,6 +398,75 @@ impl Library {
     }
 }
 
+/// A sub-material's transmission record: what the see-through clothing
+/// shader (`ped_standard_muv_alpha`, lenses) reads per sub-material from the
+/// game's per-material table, as the game's parser fills it from a profile
+/// record ([`PROFILE`]): the parameter defaults first ([`Defaults`]; a
+/// parameter without one is 0), then each of the profile's parameters
+/// whose index is 255 or the field's own. A sub-material whose preset and
+/// base name no profile keeps the all-defaults record. Traced from the
+/// executable and the shader (shared notes 42es and its follow-ups); the
+/// copy of the record into the GPU table is taken as verbatim (the field
+/// offsets line up with the shader's reads).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Transmission {
+    /// `Absorption[0..2]` (σA) and `f1088873` (how far the shaded base
+    /// colour lowers it, wA).
+    pub absorption: [f32; 3],
+    pub absorption_albedo: f32,
+    /// `scattering[0..2]` (σB) and `000482aa` (wB).
+    pub scattering: [f32; 3],
+    pub scattering_albedo: f32,
+    /// `5ba33632`: the thickness (d_base); `95f8d114`: its mask scale
+    /// (d_mask); `a14dce4e`: the cap on the view path (d_max).
+    pub thickness: f32,
+    pub thickness_mask: f32,
+    pub path_cap: f32,
+    /// `thicknessanisotropy` (p): how much of the slanted view path counts;
+    /// its sign picks 1 / |N.V| (positive) or |N.V|.
+    pub anisotropy: f32,
+    /// `0604e865` (h0): back / front thickness anchor; negative = none.
+    pub back_front: f32,
+    /// `alphathreshold` (k: opacity = saturate(a0 / k)) and `f920ffb1`
+    /// (t: the part of a0 above it is drawn opaque).
+    pub alpha_divisor: f32,
+    pub opaque_from: f32,
+    /// The profile's name (0 = none, the all-defaults record).
+    pub profile: u32,
+}
+
+impl Library {
+    /// The transmission record of sub-material `sub` of a preset (see
+    /// [`Transmission`]): the preset's profile override for the
+    /// sub-material, else its base material's profile, else none.
+    pub fn transmission(&self, preset: u32, sub: usize) -> Option<Transmission> {
+        let p = self.presets.get(&preset)?;
+        let base = p.bases.get(sub).and_then(|b| self.base.get(b));
+        let id = Some(p.profiles.get(sub).copied().unwrap_or(0)).filter(|&x| x != 0).or_else(|| base.map(|b| b.profiles[0]).filter(|&x| x != 0)).unwrap_or(0);
+        let prof = self.profiles.get(&id);
+        let j = crate::meta7a::joaat;
+        // field `name` at slot `index`: the profile's value (index 255 or the slot's), else the default, else 0
+        let f = |name: u32, index: u8| {
+            prof.and_then(|r| r.floats.iter().find(|x| x.0 == name && (x.1 == 255 || x.1 == index)).map(|x| x.3)).or_else(|| self.defaults.float(name)).unwrap_or(0.0)
+        };
+        let rgb = |name: u32| [0u8, 1, 2].map(|i| f(name, i));
+        Some(Transmission {
+            absorption: rgb(j("absorption")),
+            absorption_albedo: f(0xf108_8873, 255),
+            scattering: rgb(j("scattering")),
+            scattering_albedo: f(0x0004_82aa, 255),
+            thickness: f(0x5ba3_3632, 255),
+            thickness_mask: f(0x95f8_d114, 255),
+            path_cap: f(0xa14d_ce4e, 255),
+            anisotropy: f(j("thicknessanisotropy"), 255),
+            back_front: f(0x0604_e865, 255),
+            alpha_divisor: f(0xc391_fd51, 255),
+            opaque_from: f(0xf920_ffb1, 255),
+            profile: if prof.is_some() { id } else { 0 },
+        })
+    }
+}
+
 /// 0xAABBGGRR -> [r, g, b, a]. The byte order was settled with the items'
 /// colour tags: presets of items tagged blue hold values such as
 /// 0xff684a26, those tagged brown 0xff142e49.
@@ -677,6 +746,44 @@ mod tests {
 
     fn param(name: u32, index: u8, sub: u8, value: Value) -> Value {
         json!({"Name": name, "Index": index, field_name(0xaade_b53e): sub, "Value": value})
+    }
+
+    #[test]
+    fn a_lens_profile_fills_the_transmission_record_over_the_defaults() {
+        let j = crate::meta7a::joaat;
+        // the names the traced parser matches
+        assert_eq!((j("alphathreshold"), j("absorptionalbedoblend"), j("scatteringalbedoblend")), (0xc391_fd51, 0xf108_8873, 0x0004_82aa));
+        let mut lib = Library::default();
+        for (k, v) in [(j("absorption"), 500.0), (j("scattering"), 100.0), (0x5ba3_3632, 0.02), (0x0604_e865, -0.1), (0xc391_fd51, 0.1), (0xf920_ffb1, 0.9)] {
+            lib.defaults.floats.insert(format!("{k:08x}"), v);
+        }
+        // a glasses preset: sub-material 0 a frame base without a profile, 3 the glass base with profile 0x55
+        lib.base.insert(0x11, Record::default());
+        let mut glass = Record::default();
+        glass.profiles[0] = 0x55;
+        lib.base.insert(0x12, glass);
+        let mut preset = Record::default();
+        preset.bases = [0x11, 0x11, 0x11, 0x12, 0, 0, 0, 0];
+        lib.presets.insert(0x22, preset);
+        let mut prof = Record::default();
+        prof.floats = vec![(j("absorption"), 0, 255, 5.0), (j("absorption"), 1, 255, 5.0), (j("absorption"), 2, 255, 4.0), (j("scattering"), 255, 255, 0.01), (j("thicknessanisotropy"), 255, 255, 10.79), (0xa14d_ce4e, 255, 255, 11.67)];
+        lib.profiles.insert(0x55, prof);
+        let t = lib.transmission(0x22, 3).unwrap();
+        assert_eq!(t.profile, 0x55);
+        assert_eq!((t.absorption, t.scattering), ([5.0, 5.0, 4.0], [0.01; 3]));
+        assert_eq!((t.anisotropy, t.path_cap), (10.79, 11.67));
+        // left to the defaults, or 0 without one
+        assert_eq!((t.thickness, t.thickness_mask, t.back_front, t.alpha_divisor, t.opaque_from, t.absorption_albedo), (0.02, 0.0, -0.1, 0.1, 0.9, 0.0));
+        // no profile: the all-defaults record
+        let d = lib.transmission(0x22, 0).unwrap();
+        assert_eq!((d.profile, d.absorption, d.scattering, d.path_cap), (0, [500.0; 3], [100.0; 3], 0.0));
+        // a preset's own profile wins over its base's
+        lib.presets.get_mut(&0x22).unwrap().profiles[3] = 0x66;
+        let mut other = Record::default();
+        other.floats = vec![(j("absorption"), 255, 255, 1.0)];
+        lib.profiles.insert(0x66, other);
+        assert_eq!(lib.transmission(0x22, 3).unwrap().absorption, [1.0; 3]);
+        assert_eq!(lib.transmission(0x99, 3), None);
     }
 
     #[test]

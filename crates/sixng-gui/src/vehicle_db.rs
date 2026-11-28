@@ -21,6 +21,8 @@ struct Veh {
     #[serde(default)]
     steering_lock: Option<f32>,
     #[serde(default)]
+    records_from: Option<String>,
+    #[serde(default)]
     display_name: Option<String>,
     #[serde(default)]
     make: Option<String>,
@@ -250,6 +252,9 @@ pub struct Vehicle {
     pub lights: Option<std::sync::Arc<Lights>>,
     /// The game's own name for the model, with its make ("Bravado '19 Buffalo").
     pub display: Option<String>,
+    /// The handlingId (joaat) whose records were merged into this model's:
+    /// the game's liveries filed under it are this model's.
+    pub records_from: Option<u32>,
     pub configs: Vec<Config>,
     /// Paint palettes as (colour, share 0..1), most frequent first. The
     /// stored lists repeat colours (e.g. 400 entries, 10 distinct), so they
@@ -484,6 +489,7 @@ fn load(game: &str, work: &str, path: &Path) -> anyhow::Result<HashMap<String, V
                     })
                 }),
                 display,
+                records_from: v.records_from.as_deref().and_then(|h| u32::from_str_radix(h, 16).ok()),
                 configs,
                 palettes,
                 mods: v

@@ -2225,9 +2225,10 @@ impl ModelView {
         egui::CollapsingHeader::new("Shape details").id_salt("body_details").show(ui, |ui| {
             egui::Grid::new("body_detail_grid").num_columns(2).show(ui, |ui| {
                 for k in BODY_DETAILS..shape.len() {
-                    let (name, _, neg) = sixng_core::bodyshape::CONTROLS[k];
-                    let lo = if neg.is_some() { -1.0 } else { 0.0 };
-                    ui.label(detail_label(name)).on_hover_text(format!("The game's {name} control ({lo}..1)."));
+                    let name = sixng_core::bodyshape::CONTROLS[k].0;
+                    let lo = sixng_core::bodyshape::control_min(name);
+                    let more = if name == "gcheadscale" { " The rig scales the head by 1 + v (x 2 at 1); below -0.5 the head shrinks out of sight (1 % at -1), so the slider stops at half size." } else { "" };
+                    ui.label(detail_label(name)).on_hover_text(format!("The game's {name} control ({lo}..1).{more}"));
                     released |= ui.add(egui::Slider::new(&mut shape[k], lo..=1.0)).drag_stopped();
                     ui.end_row();
                 }
@@ -2248,6 +2249,7 @@ impl ModelView {
             let how = if look.body_preset.is_some() { "the sliders open in its values" } else { "its values could not be read (anim.rpf and common.rpf need to be indexed); the sliders open neutral" };
             ui.label(egui::RichText::new(format!("Body-shape preset of this outfit: {p} ({how}).")).weak().small());
         }
+        ui.checkbox(&mut self.look.skin_detail, "skin detail").on_hover_text("The engine's skin detail maps (pores, fine wrinkles) on the bare skin, as the game draws them up close. Turn it off to see whether a pattern on the skin comes from them. Also --skin-detail off or SIXNG_SKIN_DETAIL=0.");
         if shape != before {
             *BODY_SHAPE.lock().unwrap() = shape;
         }
@@ -3676,7 +3678,10 @@ impl ModelView {
             return false;
         }
         let cache = self.cache_dir();
-        self.livery.ed.ready = !self.loading && self.idle_for_model() && self.frames_since_load >= 3;
+        // (and once the wheels shown are in: a tyre takes stickers too)
+        let want_wheels = self.wheels_on && !self.veh_no_wheels && !self.mounts().is_empty();
+        let wheels_in = !want_wheels || (!self.wheel_loading && !self.wheel_src.is_empty() && self.wheels.len() == self.wheel_src.len() && self.wheel_key == format!("{}|{}", self.wheel_rim, self.wheel_tyre));
+        self.livery.ed.ready = !self.loading && wheels_in && self.idle_for_model() && self.frames_since_load >= 3;
         // clicks land on the vehicle as it is drawn: doors open, a roof down
         let skin = if self.livery.ed.open { self.joint_mats().1 } else { Vec::new() };
         let Some(l) = &self.loaded else { return false };
@@ -3694,7 +3699,15 @@ impl ModelView {
         let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
         let parts: Vec<String> = l.info["assembled_from"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
         let key = crate::livery::vehicle_key(&crate::vehicle_db::model_key(&l.source));
-        self.livery.sync(rs, ren, g, &l.model, &key, &parts, Path::new(&self.game), Path::new(&self.work), &cache);
+        // the fitted rim and tyre, drawn apart from the vehicle: a tyre's
+        // sidewall takes stickers too (the names in the order they load)
+        let names: Vec<String> = self.wheel_key.split('|').filter(|n| !n.is_empty()).map(str::to_string).collect();
+        let mut wheels: Vec<(&glb::Model, String, &mut GpuModel)> = if self.wheels.len() == self.wheel_src.len() && names.len() == self.wheel_src.len() && self.wheels_on && !self.veh_no_wheels {
+            self.wheel_src.iter().zip(names).zip(self.wheels.iter_mut()).map(|((s, n), g)| (&s.model, n, g)).collect()
+        } else {
+            Vec::new()
+        };
+        self.livery.sync(rs, ren, g, &l.model, &key, &parts, &mut wheels, Path::new(&self.game), Path::new(&self.work), &cache);
     }
 
     fn update_wheels(&mut self, rs: &egui_wgpu::RenderState, ctx: &egui::Context) {
@@ -5576,25 +5589,8 @@ fn split_parts(q: &str) -> (&str, Option<Vec<u64>>) {
 /// are the game's bone frames turned to Y-up (C M C^T), so the game frame
 /// is C^T W C.
 fn body_tapers(a: &sixng_core::game::ArchiveInfo, entries: &[sixng_core::scan::Entry], name: &str, joints: &[glb::Joint]) -> (Vec<sixng_core::groom::Taper>, Vec<sixng_core::groom::Cuboid>) {
-    let Some(e) = entries.iter().find(|e| e.rtype.as_deref() == Some("ft") && e.name.as_deref() == Some(name)) else { return Default::default() };
-    let Ok(r) = sixng_core::resource::Resource::load(&a.path, e) else { return Default::default() };
-    let c = Mat4::from_cols_array(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
-    let bone: HashMap<u32, Mat4> = joints.iter().map(|j| (sixng_core::meta7a::joaat(&j.name), c.transpose() * Mat4::from_cols_array(&j.ibm).inverse() * c)).collect();
-    let (mut tapers, mut boxes) = (Vec::new(), Vec::new());
-    for p in sixng_core::fragphys::body_pieces(&r) {
-        let Some(b) = bone.get(&p.bone_hash) else { continue };
-        let m = *b * Mat4::from_cols_array(&p.local);
-        if p.kind == 3 {
-            let [lo, hi] = p.bbox.map(Vec3::from);
-            let axes = [m.x_axis, m.y_axis, m.z_axis].map(|v| v.truncate());
-            let half: [f32; 3] = std::array::from_fn(|i| (hi[i] - lo[i]) / 2.0 * axes[i].length());
-            boxes.push(sixng_core::groom::Cuboid { centre: m.transform_point3((lo + hi) / 2.0).into(), axes: axes.map(|v| v.normalize_or_zero().into()), half });
-        } else {
-            let h = p.length / 2.0;
-            tapers.push(sixng_core::groom::Taper { a: m.transform_point3(Vec3::new(0.0, h, 0.0)).into(), b: m.transform_point3(Vec3::new(0.0, -h, 0.0)).into(), ra: p.r_pos, rb: p.r_neg });
-        }
-    }
-    (tapers, boxes)
+    let joints: Vec<(String, [f32; 16])> = joints.iter().map(|j| (j.name.clone(), j.ibm)).collect();
+    sixng_core::hairexport::body_bound(a, entries, name, &joints)
 }
 
 fn load_parts(
@@ -6481,7 +6477,30 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
                 // pixel on opaque garments (alpha carries its texels); the
                 // Metal 4 renderer has no such path and keeps the baked weave.
                 let detail = !crate::METAL4_BUILD && std::env::var_os("SIXNG_NO_FABRIC_DETAIL").is_none() && mats.iter().all(|&k| m.materials[k].alpha_mode == "OPAQUE");
-                if let Some(main) = crate::fabric::bake(m, &mats, i, &fab, &|w, h| sub_material_map(&mat, &[cache, shaped.as_path()], w, h), detail) {
+                // materials sharing the texture that mark their sub-material per
+                // vertex (a lens on a frame that has a `materialid` texture)
+                let by_vertex: Vec<usize> = mats.iter().copied().filter(|&k| sub_material_map(&m.materials[k], &[cache, shaped.as_path()], 1, 1).is_none()).collect();
+                // ped glass (`ped_standard_muv_alpha` drawn blended, its
+                // sub-material per vertex): the transmission record of the
+                // sub-material most of its vertices name, for the viewer's
+                // tinted-glass blend; its texels' alpha becomes the glass
+                // opacity in the bake
+                let mut glass = Vec::new();
+                let lenses: Vec<usize> = by_vertex.iter().copied().filter(|&k| m.materials[k].shader_hash == "1c43a65b" && m.materials[k].alpha_mode == "BLEND").collect();
+                for k in lenses {
+                    let mut count = [0usize; 8];
+                    for me in m.meshes.iter().filter(|me| me.material == Some(k)) {
+                        for v in &me.verts {
+                            count[((v.col[1] >> 2) & 7) as usize] += 1;
+                        }
+                    }
+                    let Some(s) = (0..8).filter(|&s| count[s] > 0).max_by_key(|&s| (count[s], 8 - s)) else { continue };
+                    if let Some(rec) = f.preset.and_then(|p| crate::fabric::transmission(game, p, s)) {
+                        m.materials[k].glass = Some(rec);
+                        glass.push(k);
+                    }
+                }
+                if let Some(main) = crate::fabric::bake(m, &mats, &by_vertex, &glass, i, &fab, &|w, h| sub_material_map(&mat, &[cache, shaped.as_path()], w, h), detail) {
                     m.images[i].key = format!("{}#fabric{:08x}{}", m.images[i].key, f.preset.unwrap_or(0), if main.is_some() { "d" } else { "" });
                     if let Some((tile, scale, rot)) = main.and_then(|s| fab.detail(s)) {
                         let (w, h, px) = tile.rgba();
@@ -6564,8 +6583,12 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
     if bare_tint(m, |_| lut[125]) {
         done.insert(usize::MAX);
     }
-    for mat in m.materials.iter().filter(|x| x.ped_shade) {
-        let Some(i) = mat.base else { continue };
+    // and materials whose colour slot binds a tint data map rather than a
+    // colour (`packed_tint_map`: the shared jewellery map of about 300
+    // materials), as on items with a tint and no preset (Raul's hoop)
+    let packed: Vec<usize> = m.materials.iter().filter(|x| !x.ped_shade).filter_map(|x| x.base).filter(|&i| m.images.get(i).is_some_and(|im| im.bc.is_none() && im.mips.first().is_some_and(|l| packed_tint_map(&l.2)))).collect();
+    let bases: Vec<usize> = m.materials.iter().filter(|x| x.ped_shade).filter_map(|x| x.base).chain(packed).collect();
+    for i in bases {
         if !done.insert(i) {
             continue;
         }
@@ -6581,6 +6604,26 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
         im.key = format!("{}#{:?}{:?}", im.key, f.colour, f.tint);
     }
     !done.is_empty()
+}
+
+/// Whether RGBA8 texels are a tint data map in the layout of the clothing
+/// shade map (`sixng_core::pedtint`): R and B are each off or full (they
+/// pick the region), G is the shade. The jewellery map (texture
+/// d01c36ca7ea7eef4, bound as `diffusetex`) is one: orange (255, 110, 0),
+/// blue (0, 110, 255) and green (0, 110, 0) regions. Needs most texels to
+/// have R or B full, so a black colour map does not count. Which of the
+/// three tint rows each region takes is not decoded (as for the clothing
+/// shade map): the map is coloured with tint 0.
+fn packed_tint_map(px: &[u8]) -> bool {
+    let edge = |v: u8| v <= 12 || v >= 243;
+    let (mut n, mut ok, mut lit) = (0usize, 0usize, 0usize);
+    for t in px.chunks_exact(4).filter(|t| t[3] > 0) {
+        n += 1;
+        ok += usize::from(edge(t[0]) && edge(t[2]));
+        lit += usize::from(t[0] >= 243 || t[2] >= 243);
+    }
+    // (98 % on the jewellery map: block compression blends region edges)
+    n > 0 && ok * 100 >= n * 95 && lit * 2 >= n
 }
 
 /// sRGB colour of clothing that has no texture in the install and no colour
@@ -9959,6 +10002,17 @@ fn srgb32(c: [f32; 3]) -> egui::Color32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_tint_data_map_is_told_from_a_colour_map() {
+        use super::packed_tint_map;
+        let map = |texels: &[[u8; 4]]| texels.iter().flatten().copied().collect::<Vec<u8>>();
+        // the jewellery map's orange, blue and green regions
+        assert!(packed_tint_map(&map(&[[255, 110, 1, 255], [1, 110, 255, 255], [0, 110, 0, 254], [255, 107, 1, 255]])));
+        // a black or a plain colour map is not one
+        assert!(!packed_tint_map(&map(&[[0, 0, 0, 255]; 4])));
+        assert!(!packed_tint_map(&map(&[[200, 150, 90, 255], [255, 110, 1, 255], [180, 120, 60, 255], [190, 140, 80, 255]])));
+    }
+
     #[test]
     fn coat_records_in_the_ramp_image() {
         use super::coat_row;

@@ -2131,7 +2131,7 @@ dependencies = [
 [[package]]
 name = "metal-rust"
 version = "1.0.0"
-source = "git+https://github.com/maple-quartz18/Metal-Rust.git?rev=e67e0fe6007f773a99debca0cfdb111cf49b792c#e67e0fe6007f773a99debca0cfdb111cf49b792c"
+source = "git+https://github.com/maple-quartz18/Metal-Rust.git?rev=0aa2a1f694adf1a7e3ba877cc799e114d639df16#0aa2a1f694adf1a7e3ba877cc799e114d639df16"
 dependencies = [
  "metal-rust-ffi",
  "raw-window-handle",
@@ -2140,7 +2140,7 @@ dependencies = [
 [[package]]
 name = "metal-rust-ffi"
 version = "1.0.0"
-source = "git+https://github.com/maple-quartz18/Metal-Rust.git?rev=e67e0fe6007f773a99debca0cfdb111cf49b792c#e67e0fe6007f773a99debca0cfdb111cf49b792c"
+source = "git+https://github.com/maple-quartz18/Metal-Rust.git?rev=0aa2a1f694adf1a7e3ba877cc799e114d639df16#0aa2a1f694adf1a7e3ba877cc799e114d639df16"
 dependencies = [
  "block2 0.6.2",
  "cc",
@@ -3440,7 +3440,7 @@ checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 
 [[package]]
 name = "sixng-cli"
-version = "0.12.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3454,11 +3454,12 @@ dependencies = [
 
 [[package]]
 name = "sixng-core"
-version = "0.12.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "bcpack-rs",
  "flate2",
+ "glam",
  "image",
  "opus",
  "rayon",
@@ -3470,7 +3471,7 @@ dependencies = [
 
 [[package]]
 name = "sixng-gui"
-version = "0.12.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "bytemuck",
