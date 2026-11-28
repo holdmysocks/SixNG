@@ -1052,8 +1052,8 @@ pub fn shader(common: &str, src: &str) -> Option<String> {
         // the material index: the instance's first material (extra.w) plus
         // the vertex's own (joints.w); the vertex program sets its own w
         && rep(
-            "    @location(11) uv23: vec4<f32>,\n};",
-            "    @location(11) uv23: vec4<f32>,\n    @location(12) @interpolate(flat) mid: u32,\n};",
+            "    @location(13) rest_n: vec3<f32>,\n};",
+            "    @location(13) rest_n: vec3<f32>,\n    @location(14) @interpolate(flat) mid: u32,\n};",
         )
         && rep(
             "fn vs_mesh(v: VIn) -> VOut {\n    return mesh_vertex(v);",
