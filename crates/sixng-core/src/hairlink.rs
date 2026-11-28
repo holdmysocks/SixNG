@@ -76,7 +76,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::OnceLock;
 
-const CACHE_VERSION: u32 = 5;
+const CACHE_VERSION: u32 = 6;
 const ITEM: u32 = 0xf795_e8ba;
 const TAG_PLACEHOLDER: u32 = 0x023e_5a2f;
 const STATE_BASE: u32 = 0x44e2_1c90;
@@ -94,8 +94,10 @@ const STRAND: [&str; 13] = ["hair", "beard", "brows", "lashes", "bodyhair", "che
 /// Part words, longest first.
 const CATS: [&str; 12] = ["armpithair", "bodyhair", "chesthair", "leghair", "genitalhair", "hair", "beard", "brows", "lashes", "chin", "chops", "wigs"];
 /// Walk penalties (log): one piece more or fewer than listed, none at all,
-/// one piece of no known asset.
-const OFF_BY_ONE: f64 = -3.5;
+/// one piece of no known asset. Fewer is the likelier: a listed piece whose
+/// data another piece already has is stored once, under the other.
+const ONE_MORE: f64 = -4.5;
+const ONE_FEWER: f64 = -2.0;
 const ABSENT: f64 = -4.0;
 const GAP: f64 = -3.0;
 /// Longest strand (metres) by length word and its spread (log): measured on
@@ -450,14 +452,6 @@ pub fn walk(slots: &[Slot], shapes: &[Shape]) -> Vec<Vec<Placed>> {
             v
         });
     }
-    let (mut w0, mut wx, mut wy) = (vec![0.0f64; b + 1], vec![0.0f64; b + 1], vec![0.0f64; b + 1]);
-    for q in 0..b {
-        let w = shapes[q].strands as f64 * shapes[q].len_med as f64 + 1e-9;
-        w0[q + 1] = w0[q] + w;
-        wx[q + 1] = wx[q] + w * shapes[q].lean[0] as f64;
-        wy[q + 1] = wy[q] + w * shapes[q].lean[1] as f64;
-    }
-    let bell = |x: f64, mu: f64, sd: f64| (-0.5 * ((x - mu) / sd).powi(2)).max(-3.0);
     // options of a slot: (candidate, pieces, penalty)
     let options = |s: &Slot| -> Vec<(usize, usize, f64)> {
         let mut o = Vec::new();
@@ -467,9 +461,9 @@ pub fn walk(slots: &[Slot], shapes: &[Shape]) -> Vec<Vec<Placed>> {
                 o.push((ci, 0, 0.0));
                 continue;
             }
-            o.extend([(ci, k, 0.0), (ci, k + 1, OFF_BY_ONE), (ci, 0, ABSENT)]);
+            o.extend([(ci, k, 0.0), (ci, k + 1, ONE_MORE), (ci, 0, ABSENT)]);
             if k >= 2 {
-                o.push((ci, k - 1, OFF_BY_ONE));
+                o.push((ci, k - 1, ONE_FEWER));
             }
         }
         if s.cands.is_empty() {
@@ -484,33 +478,7 @@ pub fn walk(slots: &[Slot], shapes: &[Shape]) -> Vec<Vec<Placed>> {
         }
         let pr = &pre[&(s.part, s.fit.as_str())];
         let c = s.cands.get(ci);
-        let len = c.and_then(|c| c.length).and_then(|l| match s.part {
-            "hair" => HAIR_LEN.get(l as usize - 1),
-            "beard" => BEARD_LEN.get(l as usize - 1),
-            _ => None,
-        });
-        let side = c.and_then(|c| c.side).filter(|_| s.part == "hair");
-        (0..=b - k)
-            .map(|p| {
-                let mut e = pen + pr[p + k] - pr[p];
-                if k > 0 {
-                    if let Some(&(mu, sd)) = len {
-                        let m = shapes[p..p + k].iter().map(|f| f.len_max).fold(1e-3f32, f32::max) as f64;
-                        e += bell(m.ln(), mu.ln(), sd);
-                    }
-                    if let Some(sw) = side {
-                        let den = w0[p + k] - w0[p];
-                        if let Some(&(_, mu, sd)) = LEAN_X.iter().find(|x| x.0 == sw) {
-                            e += bell((wx[p + k] - wx[p]) / den, mu, sd);
-                        }
-                        if let Some(&(_, mu, sd)) = LEAN_Y.iter().find(|x| x.0 == sw) {
-                            e += bell((wy[p + k] - wy[p]) / den, mu, sd);
-                        }
-                    }
-                }
-                e
-            })
-            .collect()
+        (0..=b - k).map(|p| pen + pr[p + k] - pr[p] + run_terms(s, c, &shapes[p..p + k])).collect()
     };
     let em: Vec<Vec<(usize, usize, Vec<f64>)>> = slots.par_iter().map(|s| options(s).into_iter().map(|(ci, k, pen)| (ci, k, emit(s, ci, k, pen))).filter(|x| x.1 <= b).collect()).collect();
     // forward: fw[i][p] = slots[..i] placed, the last ending at p; fg = after gap pieces
@@ -569,6 +537,39 @@ pub fn walk(slots: &[Slot], shapes: &[Shape]) -> Vec<Vec<Placed>> {
             best
         })
         .collect()
+}
+
+/// Length and side terms of a run of pieces for a slot's candidate: the
+/// longest strand against the length word, the strand-weighted lean
+/// against the side word (hair only).
+fn run_terms(s: &Slot, c: Option<&Candidate>, run: &[Shape]) -> f64 {
+    if run.is_empty() {
+        return 0.0;
+    }
+    let bell = |x: f64, mu: f64, sd: f64| (-0.5 * ((x - mu) / sd).powi(2)).max(-3.0);
+    let mut e = 0.0;
+    let len = c.and_then(|c| c.length).and_then(|l| match s.part {
+        "hair" => HAIR_LEN.get(l as usize - 1),
+        "beard" => BEARD_LEN.get(l as usize - 1),
+        _ => None,
+    });
+    if let Some(&(mu, sd)) = len {
+        let m = run.iter().map(|f| f.len_max).fold(1e-3f32, f32::max) as f64;
+        e += bell(m.ln(), mu.ln(), sd);
+    }
+    if let Some(sw) = c.and_then(|c| c.side).filter(|_| s.part == "hair") {
+        let w: Vec<f64> = run.iter().map(|f| f.strands as f64 * f.len_med as f64 + 1e-9).collect();
+        let den: f64 = w.iter().sum();
+        let lx = run.iter().zip(&w).map(|(f, w)| w * f.lean[0] as f64).sum::<f64>() / den;
+        let ly = run.iter().zip(&w).map(|(f, w)| w * f.lean[1] as f64).sum::<f64>() / den;
+        if let Some(&(_, mu, sd)) = LEAN_X.iter().find(|x| x.0 == sw) {
+            e += bell(lx, mu, sd);
+        }
+        if let Some(&(_, mu, sd)) = LEAN_Y.iter().find(|x| x.0 == sw) {
+            e += bell(ly, mu, sd);
+        }
+    }
+    e
 }
 
 /// A field of a decoded meta object: under its name when the name
@@ -752,6 +753,95 @@ const PIECE_WORDS: &[&str] = &[
 ];
 const WORD_NUMBERS: [&str; 7] = ["", "1", "2", "3", "4", "_2", "_02"];
 
+/// Pieces `furlink::pieces` folded into the piece before them. A piece
+/// has one, three or four files (densest and LODs); a chain of two or of
+/// five and more files nearly always holds the start of the next piece. It
+/// is cut where the root boxes of two neighbouring files differ most, and
+/// the parts again while they are of such a length.
+fn split_odd_chains(pcs: Vec<crate::furlink::Piece>, cat: &[GroomInfo]) -> Vec<crate::furlink::Piece> {
+    let info: HashMap<u64, &GroomInfo> = cat.iter().map(|g| (g.off, g)).collect();
+    let gap = |a: &[[f32; 3]; 2], b: &[[f32; 3]; 2]| (0..3).map(|k| (a[0][k] - b[0][k]).abs().max((a[1][k] - b[1][k]).abs())).fold(0f32, f32::max);
+    let mut out = Vec::with_capacity(pcs.len());
+    let mut todo: Vec<crate::furlink::Piece> = pcs.into_iter().rev().collect();
+    while let Some(p) = todo.pop() {
+        let n = p.lods.len();
+        let files: Option<Vec<&GroomInfo>> = p.lods.iter().map(|o| info.get(o).copied()).collect();
+        let cut = match files {
+            // LODs thin out: a file with no fewer strands than the one before starts a piece
+            Some(g) if (1..n).any(|j| g[j].strands >= g[j - 1].strands) => (1..n).find(|&j| g[j].strands >= g[j - 1].strands),
+            Some(g) if n == 2 || n >= 5 => (1..n).max_by(|&x, &y| gap(&g[x - 1].root_box, &g[x].root_box).total_cmp(&gap(&g[y - 1].root_box, &g[y].root_box))),
+            _ => None,
+        };
+        match cut {
+            Some(j) => {
+                let second = info[&p.lods[j]];
+                let b = crate::furlink::Piece { lods: p.lods[j..].to_vec(), strands: second.strands, root_box: second.root_box };
+                let a = crate::furlink::Piece { lods: p.lods[..j].to_vec(), ..p };
+                todo.push(b);
+                todo.push(a);
+            }
+            None => out.push(p),
+        }
+    }
+    out
+}
+
+/// LODs that `furlink::pieces` left as pieces of their own: a piece with
+/// the root box of one of the three pieces before it (to half a
+/// millimetre), the same bones and fewer strands joins it.
+fn join_split_lods(pcs: Vec<crate::furlink::Piece>, cat: &[GroomInfo]) -> Vec<crate::furlink::Piece> {
+    let bones: HashMap<u64, &Vec<String>> = cat.iter().map(|g| (g.off, &g.bones)).collect();
+    let same = |a: &[[f32; 3]; 2], b: &[[f32; 3]; 2]| (0..3).all(|k| (a[0][k] - b[0][k]).abs() < 5e-4 && (a[1][k] - b[1][k]).abs() < 5e-4);
+    let mut out: Vec<crate::furlink::Piece> = Vec::with_capacity(pcs.len());
+    for p in pcs {
+        let n = out.len();
+        let hit = (1..=3.min(n)).map(|k| n - k).find(|&i| {
+            let q = &out[i];
+            same(&q.root_box, &p.root_box) && p.strands < q.strands && bones.get(&q.lods[0]) == bones.get(&p.lods[0])
+        });
+        match hit {
+            Some(i) => out[i].lods.extend(p.lods),
+            None => out.push(p),
+        }
+    }
+    out
+}
+
+/// Every piece id a placeholder's pieces may have (`<base>_<word><number>`,
+/// base = the name without `_full`) -> the placeholders (indices) it names.
+fn piece_owners(phs: &[Placeholder]) -> HashMap<u64, Vec<usize>> {
+    let ids: Vec<Vec<u64>> = phs
+        .par_iter()
+        .map(|p| {
+            let b = p.name.trim_end_matches("_full");
+            PIECE_WORDS.iter().flat_map(|w| WORD_NUMBERS.iter().map(move |n| crate::meta7a::asset_id(&format!("{b}_{w}{n}")))).collect()
+        })
+        .collect();
+    let mut out: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, v) in ids.into_iter().enumerate() {
+        for id in v {
+            let e = out.entry(id).or_default();
+            if !e.contains(&i) {
+                e.push(i);
+            }
+        }
+    }
+    out
+}
+
+/// The placeholders that name the most of an asset's piece ids (none when
+/// no id is named).
+fn named_placeholders(ids: &[u64], owners: &HashMap<u64, Vec<usize>>) -> Vec<usize> {
+    let mut n: BTreeMap<usize, usize> = BTreeMap::new();
+    for id in ids.iter().collect::<BTreeSet<_>>() {
+        for &i in owners.get(id).into_iter().flatten() {
+            *n.entry(i).or_default() += 1;
+        }
+    }
+    let top = n.values().copied().max().unwrap_or(0);
+    n.into_iter().filter(|x| x.1 == top && top > 0).map(|x| x.0).collect()
+}
+
 /// Name the listed piece ids (`ids`) that are `<base>_<word>` for one of
 /// the placeholder bases (names without `_full`): id -> piece name.
 pub fn piece_names<'a>(bases: impl IntoIterator<Item = &'a str>, ids: &HashSet<u64>) -> HashMap<u64, String> {
@@ -916,7 +1006,7 @@ pub fn build_exact(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::scan
 /// shapes, then the walk.
 pub fn build_inferred(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry]) -> Result<HairLinks> {
     let cat: Vec<GroomInfo> = crate::groom::catalog_cached(work, a, all)?;
-    let pcs = crate::furlink::pieces(&cat);
+    let pcs = join_split_lods(split_odd_chains(crate::furlink::pieces(&cat), &cat), &cat);
     if pcs.is_empty() {
         return Err(anyhow!("no grooms in {}", a.id));
     }
@@ -952,10 +1042,13 @@ pub fn build_inferred(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::s
     }
     let ward = wardrobe_tags(&a.path, all);
     let index: HashMap<&str, usize> = phs.iter().enumerate().map(|(i, p)| (p.name.as_str(), i)).collect();
+    let named = piece_owners(&phs);
     let mut at: BTreeMap<u64, (Vec<usize>, BTreeSet<String>)> = BTreeMap::new();
     for (guid, tags) in &reg {
-        let Some((own, w)) = asset_words(tags, &stems, &words) else { continue };
-        let mut c: Vec<usize> = candidates(&own, &w, &phs).iter().map(|p| index[p.name.as_str()]).collect();
+        // piece ids named under a placeholder settle it
+        let by_name = named_placeholders(table.get(guid).map(|v| v.as_slice()).unwrap_or(&[]), &named);
+        let Some((own, w)) = asset_words(tags, &stems, &words).or_else(|| (!by_name.is_empty()).then(|| (String::new(), BTreeSet::new()))) else { continue };
+        let mut c: Vec<usize> = if by_name.is_empty() { candidates(&own, &w, &phs).iter().map(|p| index[p.name.as_str()]).collect() } else { by_name };
         // a wardrobe item naming exactly one of them settles it
         if let Some(t) = ward.get(guid) {
             let named: Vec<usize> = c.iter().copied().filter(|&i| t.iter().any(|h| *h == joaat(&phs[i].name) || *h == joaat(phs[i].name.trim_end_matches("_full")))).collect();
@@ -1041,7 +1134,7 @@ pub fn build_inferred(work: &Path, a: &crate::game::ArchiveInfo, all: &[crate::s
             let v: Vec<usize> = r.split(',').filter_map(|x| x.parse().ok()).collect();
             for q in v[0]..v[1].min(pcs.len()) {
                 let sh = &shapes[q];
-                eprintln!("[hair] piece {q} off {:x} strands {} len {:.3}/{:.3} top {:.3} y {:.3} lean {:.2?}", pcs[q].lods[0], sh.strands, sh.len_med, sh.len_max, sh.root_box[1][2], sh.root_y, sh.lean);
+                eprintln!("[hair] piece {q} off {:x} strands {} len {:.3}/{:.3} top {:.3} y {:.3} lean {:.2?} lods {:x?}", pcs[q].lods[0], sh.strands, sh.len_med, sh.len_max, sh.root_box[1][2], sh.root_y, sh.lean, pcs[q].lods);
             }
         }
     }
@@ -1153,6 +1246,42 @@ mod tests {
         let files: HashMap<u64, u64> = HashMap::from([(id(&name), 100), (id(&format!("{name}_lod1")), 101), (id(&format!("{name}_lod2")), 102), (id(&format!("{name}_lod3")), 200)]);
         let file = |i: &u64| files.get(i).copied();
         assert_eq!(lod_files(&name, 100, file, &HashSet::from([100, 200])), [100, 101, 102]);
+    }
+
+    fn groom(off: u64, strands: u32, top: f32) -> GroomInfo {
+        GroomInfo { off, id: String::new(), strands, root_triangles: 0, bones: vec!["h".into()], root_box: [[0.0; 3], [0.1, 0.1, top]], category: String::new(), chain: 0, lod: 0 }
+    }
+
+    fn piece(cat: &[GroomInfo], offs: &[u64]) -> crate::furlink::Piece {
+        let g = cat.iter().find(|g| g.off == offs[0]).unwrap();
+        crate::furlink::Piece { lods: offs.to_vec(), strands: g.strands, root_box: g.root_box }
+    }
+
+    /// Chains of two or of five files are cut where the root box jumps; a
+    /// file with no fewer strands than the one before starts a piece.
+    #[test]
+    fn odd_chains_split() {
+        // a one-file piece (1) folded before a four-file piece (2..5)
+        let cat = [groom(1, 300, 0.7), groom(2, 160, 0.6), groom(3, 100, 0.6), groom(4, 60, 0.6), groom(5, 35, 0.6)];
+        let out = split_odd_chains(vec![piece(&cat, &[1, 2, 3, 4, 5])], &cat);
+        assert_eq!(out.iter().map(|p| p.lods.clone()).collect::<Vec<_>>(), [vec![1], vec![2, 3, 4, 5]]);
+        assert_eq!((out[1].strands, out[1].root_box[1][2]), (160, 0.6));
+        // four files that thin out stay one piece
+        assert_eq!(split_odd_chains(vec![piece(&cat, &[2, 3, 4, 5])], &cat).len(), 1);
+        // lashes: one file each, strands up again; the two-file parts are cut too
+        let cat = [groom(1, 360, 0.6), groom(2, 250, 0.6), groom(3, 340, 0.6), groom(4, 280, 0.6)];
+        let out = split_odd_chains(vec![piece(&cat, &[1, 2, 3, 4])], &cat);
+        assert_eq!(out.iter().map(|p| p.lods.clone()).collect::<Vec<_>>(), [vec![1], vec![2], vec![3], vec![4]]);
+    }
+
+    /// A piece with the root box of one of the three before it and fewer
+    /// strands is a LOD of it; another box stays a piece.
+    #[test]
+    fn split_lods_join() {
+        let cat = [groom(1, 120, 0.7), groom(2, 70, 0.6), groom(3, 75, 0.7), groom(4, 60, 0.5)];
+        let pcs = cat.iter().map(|g| piece(&cat, &[g.off])).collect();
+        let out = join_split_lods(pcs, &cat);
+        assert_eq!(out.iter().map(|p| p.lods.clone()).collect::<Vec<_>>(), [vec![1, 3], vec![2], vec![4]]);
     }
 
     #[test]
