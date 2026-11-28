@@ -31,7 +31,7 @@
 //! `head_mesh` and `head_uv_set`: the head mesh and which of its UV sets
 //! (`TEXCOORD_n`) the root UVs are coordinates in (`root_uv_set`).
 use crate::gltf::StrandPrim;
-use crate::groom::{Coat, Colliders, Cuboid, Groom, Shell, Taper};
+use crate::groom::{Coat, Colliders, Cuboid, Groom, Shell, Surface, Taper};
 use serde_json::{json, Value};
 
 /// How much of the hair to write.
@@ -253,6 +253,7 @@ pub fn piece_with(g: &Groom, name: &str, o: &Options, colour: Option<&HairColour
     let k = g.points_per_strand;
     let mut out = Vec::new();
     let mut pressed = 0;
+    let mut lifted = 0;
     let mut settled = false;
     let under;
     let g = if o.settle || hat.is_some() {
@@ -264,6 +265,9 @@ pub fn piece_with(g: &Groom, name: &str, o: &Options, colour: Option<&HairColour
         if let Some(h) = hat {
             pressed += h.press_strands(&mut c.points, k, 0.003);
         }
+        if let Some(s) = colliders.and_then(|c| c.surface.as_ref()).filter(|_| o.settle) {
+            lifted += s.clear(&mut c.points, k);
+        }
         under = c;
         &under
     } else {
@@ -273,6 +277,9 @@ pub fn piece_with(g: &Groom, name: &str, o: &Options, colour: Option<&HairColour
     let mut coat = g.coat_with(sh, colliders);
     if let Some(h) = hat {
         pressed += h.press_strands(&mut coat.points, k, 0.003);
+    }
+    if let Some(s) = colliders.and_then(|c| c.surface.as_ref()).filter(|_| o.settle) {
+        lifted += s.clear(&mut coat.points, k);
     }
     let grown = !coat.guides.is_empty();
     let mut ex = extras.clone();
@@ -290,7 +297,7 @@ pub fn piece_with(g: &Groom, name: &str, o: &Options, colour: Option<&HairColour
         out.push(prim(g, format!("{name}_guides"), k, &g.points, &g.root_uv, &[], &[], None, params, o, ex));
     }
     let summary = json!({"name": name, "written": if grown { coat.guides.len() } else { g.strands }, "stored": g.stored_strands(), "guides": g.strands,
-        "points_per_strand": if o.points >= 2 { o.points } else { k }, "grown": grown, "settled": settled, "colliders": colliders.is_some(), "hat_pressed": hat.map(|_| pressed)});
+        "points_per_strand": if o.points >= 2 { o.points } else { k }, "grown": grown, "settled": settled, "colliders": colliders.is_some(), "hat_pressed": hat.map(|_| pressed), "lifted_out_of_body": lifted});
     (out, summary)
 }
 
@@ -570,8 +577,13 @@ pub fn character_colliders(a: &crate::game::ArchiveInfo, entries: &[crate::scan:
         }
     }
     if !shapes.is_empty() {
-        let note = format!("{} round pieces and {} boxes of the body bound {} and of {worn} garment bounds", shapes.len(), boxes.len(), bound.map(|b| b.0).unwrap_or_default());
-        return Some((Colliders::shapes(shapes).with_boxes(boxes), note));
+        let mut note = format!("{} round pieces and {} boxes of the body bound {} and of {worn} garment bounds", shapes.len(), boxes.len(), bound.map(|b| b.0).unwrap_or_default());
+        let mut c = Colliders::shapes(shapes).with_boxes(boxes);
+        if let Some((sf, n)) = character_surface(&doc, bin, hats) {
+            c = c.with_surface(sf);
+            note += &format!("; hair kept outside the {n} body and garment meshes");
+        }
+        return Some((c, note));
     }
     let hairy = ["hair", "brows", "beard", "lashes", "body hair", "eyes", "eyecaps", "teeth", "teeth accessory"];
     let mut pts: Vec<[f32; 3]> = Vec::new();
@@ -586,6 +598,30 @@ pub fn character_colliders(a: &crate::game::ArchiveInfo, entries: &[crate::scan:
         pts.extend(p.chunks_exact(3).map(|c| [c[0], -c[2], c[1]]));
     }
     (!pts.is_empty()).then(|| (Colliders::new(&pts), format!("the vertices of the model's {} meshes other than hair, eyes, teeth and hats (no body bound)", drawables.len())))
+}
+
+/// The body and garment surfaces of a model GLB (`Surface`): the vertices
+/// and normals of its meshes other than the head, hair, eyes, teeth and the
+/// hats `hats`, in RAGE model space. Also the number of meshes.
+fn character_surface(doc: &Value, bin: &[u8], hats: &[String]) -> Option<(Surface, usize)> {
+    let skip = ["head", "hair", "brows", "beard", "lashes", "body hair", "eyes", "eyecaps", "teeth", "teeth accessory"];
+    let mut meshes: Vec<(Vec<[f32; 3]>, Vec<[f32; 3]>)> = Vec::new();
+    for node in doc["nodes"].as_array()? {
+        let (Some(name), Some(mi)) = (node["name"].as_str(), node["mesh"].as_u64()) else { continue };
+        let d = name.split('/').next().unwrap_or(name).to_ascii_lowercase();
+        if hats.contains(&d) || skip.contains(&crate::pedlook::slot_of(&d).as_str()) {
+            continue;
+        }
+        let Some(pr) = doc["meshes"][mi as usize]["primitives"].get(0) else { continue };
+        let (Some(p), Some(n)) = (glb_floats(doc, bin, &pr["attributes"]["POSITION"]), glb_floats(doc, bin, &pr["attributes"]["NORMAL"])) else { continue };
+        if p.len() != n.len() {
+            continue;
+        }
+        // glTF Y-up back to RAGE Z-up: (x, y, z) -> (x, -z, y)
+        let turn = |v: &[f32]| v.chunks_exact(3).map(|c| [c[0], -c[2], c[1]]).collect::<Vec<_>>();
+        meshes.push((turn(&p), turn(&n)));
+    }
+    (!meshes.is_empty()).then(|| (Surface::new(&meshes), meshes.len()))
 }
 
 /// Which of the head's UV sets a groom's root UVs belong to: at every guide
