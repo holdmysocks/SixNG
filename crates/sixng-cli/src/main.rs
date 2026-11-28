@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod bench;
+mod dialogue_links;
 mod scene_dialogue;
 
 #[derive(Parser)]
@@ -1163,6 +1164,21 @@ enum Cmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Link subtitles to their speaker and audio stream: <work>/dialogue_links.json, read by `text --label`/`--find`, the Audio page and Scenes. With --conversations, from the game's conversation files (PSO: per line its subtitle label, audio cue and take and speaker slot, and the conversation's characters; subtitle key = joaat(label), wave = <cue>_<take>, looked up in the archive's audio index and then in the other indexed archives; a wave in several banks plays from the speaker's voice bank, from the bank containers `audio-meta` records); a table row for a subtitle these already link is compared with them and only fills a stream they give none. Reads a local address table (TSV with a header: subtitle_key as `<table>/<hex key>`, character_id, speaker_hash_hex, speaker_status, archive, bank_offset, stream_index, stream_id_hex, clip_name, data_offset, data_size, channel_id_hex, pcm_start_frame, pcm_end_frame_exclusive, confirmed). Each audio address is rebuilt from the archive's audio index (`sixng audio <archive>` first): a stream id or byte range that does not match the index is rejected, and a wave name is kept only when its joaat gives the stream id. Reports linked and rejected rows, confirmed and unconfirmed apart
+    DialogueLinks {
+        /// The local address table (TSV).
+        #[arg(long)]
+        addresses: Option<PathBuf>,
+        /// Archives whose conversation files to derive links from (e.g. pack/shared_minigame000/shared_minigame000); needs its audio index; waves it lacks are looked up in the other archives with an audio index (story lines also play from audio.rpf). Repeat for several.
+        #[arg(long)]
+        conversations: Vec<String>,
+        /// A JSON table from `sixng text --out`, for the subtitle text. Repeat for tables in one locale.
+        #[arg(long)]
+        text_table: Vec<PathBuf>,
+        /// Output file (default <work>/dialogue_links.json).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Inspect a ttpf texture store: list its textures, or decode some to PNG.
     Ttpf {
         /// Store id or substring (e.g. vehicles/ttdb_vehicles.ttpf).
@@ -2176,6 +2192,10 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let default = ws.work.join("scene_dialogue.json");
             out.print(&scene_dialogue::generate(&ws, input, text_table, path.as_deref().unwrap_or(&default))?);
         }
+        Cmd::DialogueLinks { addresses, conversations, text_table, out: path } => {
+            let default = sixng_core::dialogue::links_path(&ws.work);
+            out.print(&dialogue_links::generate(&ws, addresses.as_deref(), conversations, text_table, path.as_deref().unwrap_or(&default))?);
+        }
         Cmd::Ttpf { store, hash, first, mip, all_slices, float, all, out: tout } => {
             let a = ws.resolve(store)?;
             let st = sixng_core::ttpf::Ttpf::open(&a.path)?;
@@ -2383,7 +2403,15 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     }
                 }
                 let total = hits.len();
-                let rows: Vec<serde_json::Value> = hits.into_iter().take(*limit).map(|((h, s), (n, first))| json!({"label": format!("{h:08x}"), "text": s, "tables": n, "first_table": first})).collect();
+                let links = sixng_core::dialogue::load(&ws.work)?.unwrap_or_default();
+                let links = links.by_subtitle();
+                let rows: Vec<serde_json::Value> = hits.into_iter().take(*limit).map(|((h, s), (n, first))| {
+                    let mut row = json!({"label": format!("{h:08x}"), "text": s, "tables": n, "first_table": first});
+                    if let Some(l) = links.get(&h) {
+                        row["dialogue"] = l.iter().map(|l| sixng_core::dialogue::summary(l)).collect();
+                    }
+                    row
+                }).collect();
                 out.print(&json!({"ok": true, "archive": a.id, "tables": tables.len(), "errors": errors, "matches": total, "shown": rows.len(), "seconds": t.elapsed().as_secs_f64(), "hits": rows}));
             } else if !label.is_empty() {
                 let keys: Vec<(String, u32)> = label
@@ -2393,6 +2421,8 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                         (l.clone(), h)
                     })
                     .collect();
+                let links = sixng_core::dialogue::load(&ws.work)?.unwrap_or_default();
+                let links = links.by_subtitle();
                 let found: Vec<serde_json::Value> = keys
                     .iter()
                     .map(|(l, h)| {
@@ -2400,7 +2430,11 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                             .iter()
                             .filter_map(|t| t.strings.get(h).map(|s| json!({"table": t.id, "text": if *plain { sixng_core::text::plain(s) } else { s.clone() }})))
                             .collect();
-                        json!({"label": l, "hash": format!("{h:08x}"), "found": hits})
+                        let mut row = json!({"label": l, "hash": format!("{h:08x}"), "found": hits});
+                        if let Some(l) = links.get(h) {
+                            row["dialogue"] = l.iter().map(|l| sixng_core::dialogue::summary(l)).collect();
+                        }
+                        row
                     })
                     .collect();
                 out.print(&json!({"ok": true, "archive": a.id, "tables": tables.len(), "labels": found}));

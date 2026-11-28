@@ -1085,7 +1085,12 @@ fn shader_with(common: &str, src: &str, full: bool) -> Option<String> {
             } else {
                 "fn fs_shadow(i: VOut) {\n    M.base = MATS[i.mid].m.base;\n    M.flags = MATS[i.mid].m.flags;\n    TI0.x = MATS[i.mid].t0.x;"
             },
-        );
+        )
+        // no stickers on the map: the pixel program without their part.
+        // With it the main pass took about a tenth longer although the
+        // list is empty there and the part never runs (measured: the
+        // sticker laid on flat alone added 0.5 ms to 4.4 ms).
+        && rep("let st_n = min(ST[0].flags.x, arrayLength(&ST) - 1u);", "let st_n = 0u;");
     if !ok {
         return None;
     }

@@ -163,6 +163,9 @@ struct DialogueRow {
     subtitle_key: u32,
     text: String,
     audio: Option<SceneAudio>,
+    /// Speaker or audio filled from `dialogue_links.json`.
+    #[serde(skip)]
+    linked: bool,
 }
 
 type DialogueRows = BTreeMap<String, Vec<DialogueRow>>;
@@ -180,10 +183,48 @@ fn parse_dialogue(bytes: &[u8]) -> anyhow::Result<DialogueRows> {
 }
 
 fn load_dialogue(work: &Path) -> anyhow::Result<DialogueRows> {
-    match std::fs::read(work.join("scene_dialogue.json")) {
-        Ok(bytes) => parse_dialogue(&bytes),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
-        Err(e) => Err(e.into()),
+    let mut rows = match std::fs::read(work.join("scene_dialogue.json")) {
+        Ok(bytes) => parse_dialogue(&bytes)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+        Err(e) => return Err(e.into()),
+    };
+    if let Some(links) = sixng_core::dialogue::load(work)? {
+        merge_links(&mut rows, &links);
+    }
+    Ok(rows)
+}
+
+fn scene_audio(a: &sixng_core::dialogue::LinkedAudio) -> SceneAudio {
+    SceneAudio { address: a.address.clone(), stem: a.stem }
+}
+
+/// Add the subtitle links to the scene rows: a row without audio gets the
+/// stream its subtitle is linked to when that is one stream; a link that
+/// names a scene and is not listed there yet becomes a row of that scene.
+fn merge_links(rows: &mut DialogueRows, links: &sixng_core::dialogue::DialogueLinks) {
+    let by_key = links.by_subtitle();
+    for row in rows.values_mut().flatten().filter(|r| r.audio.is_none()) {
+        let Some(found) = by_key.get(&row.subtitle_key) else { continue };
+        let mut audio = found.iter().filter_map(|l| l.audio.as_ref());
+        if let (Some(a), None) = (audio.next(), audio.next()) {
+            row.audio = Some(scene_audio(a));
+            row.linked = true;
+        }
+    }
+    for l in &links.links {
+        let Some(scene) = &l.scene else { continue };
+        let list = rows.entry(scene.clone()).or_default();
+        if list.iter().any(|r| r.subtitle_key == l.subtitle_key) {
+            continue;
+        }
+        list.push(DialogueRow {
+            speaker: l.speaker.as_ref().map(|s| s.label.clone()).unwrap_or_default(),
+            speaker_hash: l.speaker.as_ref().and_then(|s| s.hash).unwrap_or(0),
+            subtitle_key: l.subtitle_key,
+            text: l.text.as_deref().map(sixng_core::text::plain).unwrap_or_default(),
+            audio: l.audio.as_ref().map(scene_audio),
+            linked: true,
+        });
     }
 }
 
@@ -500,10 +541,15 @@ fn scene_ui(ui: &mut egui::Ui, s: &Scene, names: Option<&Names>, dialogue: Resul
                         ui.strong("Audio");
                         ui.end_row();
                         for row in rows {
-                            ui.label(&row.speaker)
-                                .on_hover_text(format!("Native speaker hash {:08x}", row.speaker_hash));
+                            let hover = if row.speaker_hash == 0 { "Speaker hash not known".to_string() } else { format!("Native speaker hash {:08x}", row.speaker_hash) };
+                            let hover = if row.linked { format!("{hover}. Linked from dialogue_links.json") } else { hover };
+                            ui.label(&row.speaker).on_hover_text(hover);
                             ui.monospace(format!("{:08x}", row.subtitle_key));
-                            ui.add(egui::Label::new(&row.text).wrap());
+                            if row.text.is_empty() {
+                                ui.weak("(text not in the selected tables)");
+                            } else {
+                                ui.add(egui::Label::new(&row.text).wrap());
+                            }
                             if let Some(address) = &row.audio {
                                 let label = if address.stem.is_some() { "Open voice excerpt" } else { "Open in Audio" };
                                 if ui.button(label).clicked() {
@@ -584,6 +630,34 @@ mod tests {
         assert_ne!(rows[0].speaker_hash, rows[1].speaker_hash);
         assert_eq!(rows[0].subtitle_key, rows[1].subtitle_key);
         assert!(parse_dialogue(br#"{"schema_version":2,"scenes":{}}"#).is_err());
+    }
+
+    #[test]
+    fn subtitle_links_fill_scene_rows_and_add_linked_scene_lines() {
+        let mut rows = parse_dialogue(br#"{"schema_version": 1, "scenes": {"fixture_scene": [
+            {"speaker": "Guide", "speaker_hash": 1, "subtitle_key": 3, "text": "Come in."},
+            {"speaker": "Guide", "speaker_hash": 1, "subtitle_key": 4, "text": "Twice linked."}
+        ]}}"#).unwrap();
+        let audio = |index: usize| serde_json::json!({"archive": "local/fixture.rpf", "bank_offset": 4096, "stream_index": index,
+            "stream_id": 66, "data_offset": 4352, "data_size": 512});
+        let links = sixng_core::dialogue::parse(serde_json::json!({"schema_version": 1, "links": [
+            {"subtitle_key": 3, "audio": audio(1)},
+            {"subtitle_key": 4, "audio": audio(0)},
+            {"subtitle_key": 4, "audio": audio(1)},
+            {"subtitle_key": 9, "scene": "fixture_scene", "speaker": {"label": "visitor", "hash": 5}, "text": "~b~Hi.~b~", "audio": audio(0)},
+            {"subtitle_key": 3, "scene": "fixture_scene", "speaker": {"label": "guide"}},
+            {"subtitle_key": 10, "scene": "other_scene", "speaker": {"label": "visitor"}}
+        ]}).to_string().as_bytes()).unwrap();
+        merge_links(&mut rows, &links);
+        let scene = &rows["fixture_scene"];
+        assert_eq!(scene.len(), 3);
+        assert_eq!(scene[0].audio.as_ref().unwrap().address.stream_index, 1);
+        assert!(scene[0].linked);
+        assert!(scene[1].audio.is_none() && !scene[1].linked, "two candidate streams: left unresolved");
+        assert_eq!((scene[2].speaker.as_str(), scene[2].speaker_hash, scene[2].text.as_str()), ("visitor", 5, "Hi."));
+        assert_eq!(scene[2].audio.as_ref().unwrap().address.stream_index, 0);
+        assert_eq!(rows["other_scene"][0].speaker_hash, 0);
+        assert!(rows["other_scene"][0].text.is_empty());
     }
     use sixng_core::cutscene::SceneObject;
 
