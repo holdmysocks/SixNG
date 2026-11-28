@@ -186,6 +186,11 @@ fn link_lines(
                     *by_voice.entry("speaker_lines").or_default() += 1;
                     Ok((source, one))
                 }
+                // speech voices are known but none is this speaker's: a generic role
+                // (clerk, cop, enemy) whose voice is the spawned ped's
+                (None, None) if voices.get(source).is_some_and(|v| !v.is_empty() && l.speaker.is_some_and(|s| !v.contains_key(&s))) => {
+                    Err(anyhow::anyhow!("wave id in several banks, speaker has no speech voice (voice chosen at run time)"))
+                }
                 (None, None) => Err(anyhow::anyhow!("wave id in several banks")),
             },
             None => Err(anyhow::anyhow!("wave in no audio index")),
@@ -666,6 +671,8 @@ mod tests {
             assert_eq!((a3.address.archive.as_str(), a3.address.bank_offset, a3.address.stream_index), ("other.rpf", 1024, 1));
             assert_eq!(rejected.len(), 3);
             assert!(rejected[0].1.contains("several banks") && rejected[1].1.contains("no audio index") && rejected[2].1.contains("several banks"));
+            // a line without a speaker keeps the plain reason; speaker 8 has no speech voice while others do
+            assert!(!rejected[0].1.contains("run time") && rejected[2].1.contains("voice chosen at run time"));
             assert!(rejected[1].0.contains("FXAU_AAAD_01"));
             Ok(())
         })();
