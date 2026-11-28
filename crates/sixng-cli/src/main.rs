@@ -1137,7 +1137,12 @@ enum Cmd {
     /// / `_tNN` / `_xN` suffixes, an audio name in its scene files, or the
     /// bank of the master timelines placing it. Scenes
     /// placed in a master timeline list the master, the start time, the
-    /// section and the master's own audio bank.
+    /// section and the master's own audio bank. Each scene lists its
+    /// subtitle lines (label, speaker, start and end in their section, and
+    /// the time on a master's bank clock for each slot that plays the
+    /// line's section), with text
+    /// and speaker names from the dialogue links (`dialogue-links`) when
+    /// they exist.
     Cutscenes {
         /// One scene in full (name, `cin@` optional).
         scene: Option<String>,
@@ -1159,6 +1164,12 @@ enum Cmd {
         /// At most this many scenes (0 = all).
         #[arg(long, default_value_t = 0)]
         limit: usize,
+        /// List the master timelines instead of the scenes: each master's
+        /// slots (start, end, scene, section), its state machine (each
+        /// state's start times and transitions, with the target's start
+        /// and the kinds of condition) and its audio bank.
+        #[arg(long)]
+        masters: bool,
     },
     /// Build the Scenes dialogue index from verified local occurrences and GXT tables.
     SceneDialogue {
@@ -2149,7 +2160,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             out.print(&v);
         }
-        Cmd::Cutscenes { scene, name, cast, archive, rescan, summary, limit } => {
+        Cmd::Cutscenes { scene, name, cast, archive, rescan, summary, limit, masters: list_masters } => {
             use sixng_core::cutscene;
             let t = Instant::now();
             let c = cutscene::catalog(&ws, archive, *rescan, pr.clone())?;
@@ -2159,6 +2170,11 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let aix = sixng_core::audio::index_path(&ws.work, &c.archive).is_file().then(|| sixng_core::audio::load_index(&ws.work, &c.archive)).transpose()?;
             if let Some(ix) = &aix {
                 cutscene::attach_audio(&mut all, &c, &cutscene::AudioBanks::new(ix));
+            }
+            // subtitle text and speaker names from the dialogue links, when they exist
+            let links = sixng_core::dialogue::load(&ws.work)?;
+            if let Some(l) = &links {
+                cutscene::attach_dialogue(&mut all, l);
             }
             let re = name.as_deref().map(|n| regex::RegexBuilder::new(n).case_insensitive(true).build()).transpose()?;
             let cre = cast.as_deref().map(|n| regex::RegexBuilder::new(n).case_insensitive(true).build()).transpose()?;
@@ -2171,6 +2187,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     .collect(),
             };
             let objs = || sel.iter().flat_map(|s| s.cast.iter().chain(&s.props).chain(&s.other));
+            let subs = || sel.iter().flat_map(|s| &s.subtitles);
             let count = |k: &str| objs().filter(|o| o.kind == k).count();
             let clips: usize = sel.iter().map(|s| s.cast.iter().chain(&s.props).chain(&s.other).map(|o| o.clips.len() + o.face_clips.len()).sum::<usize>()).sum();
             let totals = json!({
@@ -2198,6 +2215,17 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 "audio_bank_by": {"scene_name": sel.iter().filter(|s| s.audio.as_ref().is_some_and(|a| a.source == "scene name")).count(), "audio_name": sel.iter().filter(|s| s.audio.as_ref().is_some_and(|a| a.source == "audio name")).count(), "master_timeline": sel.iter().filter(|s| s.audio.as_ref().is_some_and(|a| a.source == "master timeline")).count()},
                 "placed_in_master": sel.iter().filter(|s| !s.placements.is_empty()).count(),
                 "placements": sel.iter().map(|s| s.placements.len()).sum::<usize>(),
+                "subtitles": {
+                    "lines": subs().count(),
+                    "scenes": sel.iter().filter(|s| !s.subtitles.is_empty()).count(),
+                    "dialogue_links": links.is_some(),
+                    "with_text": subs().filter(|x| x.text.is_some()).count(),
+                    "speaker_named": subs().filter(|x| u32::from_str_radix(&x.speaker, 16).is_err() || x.speaker.len() != 8).count(),
+                    "speaker_agrees": subs().filter(|x| x.speaker_agrees == Some(true)).count(),
+                    "speaker_differs": subs().filter(|x| x.speaker_agrees == Some(false)).count(),
+                    "on_bank_clock": subs().filter(|x| !x.bank_times.is_empty()).count(),
+                    "bank_times": subs().map(|x| x.bank_times.len()).sum::<usize>(),
+                },
             });
             // master timelines of the archive: slots, those on a catalogued scene, and masters with an audio bank
             let hashes: std::collections::HashSet<u32> = all.iter().map(|s| sixng_core::meta7a::joaat(&s.name)).collect();
@@ -2209,9 +2237,14 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 "slots_on_catalogued_scenes": masters.iter().flat_map(|f| &f.timeline).filter(|sl| hashes.contains(&sl.scene)).count(),
                 "with_audio_name": masters.iter().filter(|f| !f.audio.is_empty()).count(),
                 "with_audio_bank": banks.as_ref().map(|b| masters.iter().filter(|f| f.audio.iter().any(|n| b.find_audio_name(n).is_some())).count()),
+                "state_machines": cutscene::fsm_totals(&c),
             });
             let mut o = json!({"ok": true, "archive": c.archive, "dictionaries": c.dicts.len(), "scene_files": c.files.len(), "totals": totals, "master_timelines": masters_json, "seconds": t.elapsed().as_secs_f64()});
-            if !*summary {
+            if *list_masters {
+                let ms = cutscene::masters(&c, &all, banks.as_ref());
+                let take = if *limit == 0 { ms.len() } else { *limit };
+                o["masters"] = json!(ms.iter().take(take).collect::<Vec<_>>());
+            } else if !*summary {
                 let take = if *limit == 0 { sel.len() } else { *limit };
                 o["scenes"] = json!(sel.iter().take(take).collect::<Vec<_>>());
             }

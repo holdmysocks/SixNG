@@ -172,6 +172,10 @@ pub const DERIVED: &[&str] = &[
     // uvset, side by side), and the two-layer prop blend mask: its texture (controltexturetex), UV pick (controluvset)
     // and channel weights (controlfilter), adjacent in the same 60 effects
     "uv0scalebias", "uv1scalebias", "uvset", "controltexturetex", "controluvset", "controlfilter",
+    // names carried over from the previous engine generation's shaders (2026-11-28), hashed directly against the
+    // unnamed constants (a list of about 370, ~0 random hits expected), and fur + two words (~0.2 expected)
+    "umglobalparams", "usetessellation", "specularintensitymult", "specularfalloffmult", "diffuse2specmod", "reflectivepower",
+    "bumpselfshadowamount", "furattencoef", "furselfshadowmin", "furminlayers", "furmaxlayers", "furwetstiffness",
     // water_micro_geom (the inland water tiles): meet-in-the-middle joaat search over water and shader words (2026-11-27),
     // about 16 random hits expected over 45 hashes; kept only names that fit the value or a sibling. The three use* flags
     // are integer 1 on every tile and 0 on the 6 tiles whose flow, height and surface map textures are 4 x 4 placeholders;

@@ -2242,7 +2242,7 @@ mod tests {
         use crate::meta7a::asset_id;
         let d = SceneDict { name: "cin@x_p1_t01".into(), id: "a.rpf@10".into(), clips: ["boss_face", "guard2", "lucia"].map(String::from).to_vec(), sections: 0, section_ids: vec![], adopted_sections: 0, streamed: vec![], unjoined: vec![], windows_streamed: 0, windows_missing: 0 };
         // the scene file records the boss's model; the guard's is not recorded
-        let f = SceneFile { id: "a.rpf@20".into(), states: vec![], objects: vec![FileObject { key: joaat("boss"), kind: "ped".into(), model: Some(asset_id("cs_boss")) }], audio: vec![], timeline: vec![] };
+        let f = SceneFile { id: "a.rpf@20".into(), states: vec![], objects: vec![FileObject { key: joaat("boss"), kind: "ped".into(), model: Some(asset_id("cs_boss")) }], audio: vec![], timeline: vec![], fsm: vec![], subtitles: vec![] };
         let c = Catalog { version: CATALOG_VERSION, archive: "a.rpf".into(), dicts: vec![d], files: vec![f] };
         let listed: HashSet<u32> = ["cs_boss", "cs_guard", "player_story000_00"].iter().map(|n| joaat(n)).collect();
         let (mut names, mut uncertain) = (BTreeMap::new(), std::collections::BTreeSet::new());

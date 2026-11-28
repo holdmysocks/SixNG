@@ -685,6 +685,7 @@ mod tests {
             audio: None,
             placements: vec![],
             master_audio: Default::default(),
+            subtitles: vec![],
         }
     }
 
