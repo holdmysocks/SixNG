@@ -1092,8 +1092,25 @@ again**).
   `pack/story000_restofworld/story000_restofworld.rpf`, which this
   command does not read by default. Which slot applies when one child
   state fills two slots, and where a movie starts, are not established.
+  **State machines** (`--masters` lists the masters instead of the
+  scenes): a master's states are keys of its id map, and each state's
+  item lists the start-map keys it plays. A transition leads to
+  another state (`toState`); its conditions either name its own source
+  state ("when this state ends") or test an entity's value (a branch).
+  `--masters` gives each master's slots (start, end, scene, section),
+  its states with their start times and transitions (the target's
+  start, `on_end`, the number of value tests) and its bank;
+  `master_timelines.state_machines` counts them.
+  Measured on the story pack's 139 masters: 929 states (256 end
+  states) and 797 transitions; 760 have a "when this state ends"
+  condition and 211 an entity-value branch. Placing each state at its
+  earliest start, 755 transitions lead forward in time (534 to the next
+  later start, the others skip ahead over alternatives) and 37 back.
+  Where one scene fills several slots of a master, its slots mostly
+  belong to states on one path (each slot a different section, played
+  in turn); only a few are alternatives on separate branches.
   Not decoded: the scene files' events (subtitle and movie events) and
-  state transitions.
+  what the entity conditions test.
 - **Story names** (`sixng story-names [--tags]`): arc and mission names
   for the scenes. The story pack's protected ambient-rule files (read
   through the table of contents, so Windows x64 with the game executable)
