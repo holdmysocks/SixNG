@@ -132,7 +132,11 @@ pub mod watch {
 /// the shadow cascades), `nomulti` (one indirect call per sub-draw),
 /// `noarray` (textures stay in their own images, so nothing joins the
 /// pools) and `nopool` (textures go to the arrays, geometry stays in its
-/// own buffers and is drawn the old way).
+/// own buffers and is drawn the old way), `shadowold` (the table's models
+/// cast their shadows the old way), `vsfull` (each program loads the
+/// whole material row, as before), `shadowfull` (shadow casters with the
+/// full mesh vertex program, not the short one) and `nolate` (the table's
+/// models' decals and see-through surfaces drawn the old way).
 pub fn opt(name: &str) -> bool {
     static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     V.get_or_init(|| std::env::var("SIXNG_MAP_GPU_TABLE").unwrap_or_default()).split(',').any(|s| s.trim() == name)
@@ -1012,11 +1016,24 @@ fn rewrite_tex_calls(s: &str, names: &[(&str, &str)]) -> String {
     out
 }
 
+/// No stickers on the map: this piece of the mesh shader and what the map's
+/// renderer puts in its place, which leaves the stickers' part out of the
+/// pixel program. With it the main pass took about a tenth longer although
+/// the list is empty there and the part never runs (measured: the sticker
+/// laid on flat alone added 0.5 ms to 4.4 ms).
+pub const NO_STICKERS: (&str, &str) = ("let st_n = min(ST[0].flags.x, arrayLength(&ST) - 1u);", "let st_n = 0u;");
+
 /// The map shader for GPU-driven draws: the material group becomes the
 /// shared table and the texture arrays, read through the material index
 /// (the instance's first material plus the vertex's own). None (and the
 /// path off) if the source has changed shape and a piece is not found.
 pub fn shader(common: &str, src: &str) -> Option<String> {
+    shader_with(common, src, opt("vsfull"))
+}
+
+/// `full`: every program loads the material's whole row (the earlier form,
+/// kept for A/B runs).
+fn shader_with(common: &str, src: &str, full: bool) -> Option<String> {
     let mut s = src.replace("\r\n", "\n");
     let fail = |what: &str| {
         eprintln!("[map3d] GPU-driven draws: off (shader piece not found: {what})");
@@ -1055,20 +1072,34 @@ pub fn shader(common: &str, src: &str) -> Option<String> {
             "    @location(13) rest_n: vec3<f32>,\n};",
             "    @location(13) rest_n: vec3<f32>,\n    @location(14) @interpolate(flat) mid: u32,\n};",
         )
+        // The vertex program reads only the strand width factor (the
+        // shadow passes are vertex bound, and a whole row is 176 bytes per
+        // vertex); a shadow cut-out only its alpha inputs and base texture.
         && rep(
             "fn vs_mesh(v: VIn) -> VOut {\n    return mesh_vertex(v);",
-            "fn vs_mesh(v: VIn) -> VOut {\n    let mid = u32(v.extra.w + 0.5) + v.joints.w;\n    bl_set(mid);\n    var o = mesh_vertex(v);\n    o.mid = mid;\n    return o;",
+            if full {
+                "fn vs_mesh(v: VIn) -> VOut {\n    let mid = u32(v.extra.w + 0.5) + v.joints.w;\n    bl_set(mid);\n    var o = mesh_vertex(v);\n    o.mid = mid;\n    return o;"
+            } else {
+                "fn vs_mesh(v: VIn) -> VOut {\n    let mid = u32(v.extra.w + 0.5) + v.joints.w;\n    M.strand = MATS[mid].m.strand;\n    var o = mesh_vertex(v);\n    o.mid = mid;\n    return o;"
+            },
         )
         && rep(
             "fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {",
             "fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {\n    bl_set(i.mid);",
         )
-        && rep("fn fs_shadow(i: VOut) {", "fn fs_shadow(i: VOut) {\n    bl_set(i.mid);")
-        // no stickers on the map: the pixel program without their part.
-        // With it the main pass took about a tenth longer although the
-        // list is empty there and the part never runs (measured: the
-        // sticker laid on flat alone added 0.5 ms to 4.4 ms).
-        && rep("let st_n = min(ST[0].flags.x, arrayLength(&ST) - 1u);", "let st_n = 0u;");
+        && rep(
+            "fn fs_mesh_blend(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {",
+            "fn fs_mesh_blend(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {\n    bl_set(i.mid);",
+        )
+        && rep(
+            "fn fs_shadow(i: VOut) {",
+            if full {
+                "fn fs_shadow(i: VOut) {\n    bl_set(i.mid);"
+            } else {
+                "fn fs_shadow(i: VOut) {\n    M.base = MATS[i.mid].m.base;\n    M.flags = MATS[i.mid].m.flags;\n    TI0.x = MATS[i.mid].t0.x;"
+            },
+        )
+        && rep(NO_STICKERS.0, NO_STICKERS.1);
     if !ok {
         return None;
     }
@@ -1089,6 +1120,12 @@ pub fn shader(common: &str, src: &str) -> Option<String> {
     for (name, to) in slots {
         s = replace_ident(&s, name, to);
     }
+    // The shadow casters' vertex program: a table model has no joints and
+    // no strands, so its place is the instance's matrix times the vertex;
+    // the cut-out test needs only the base UV and the material index.
+    s.push_str(
+        "\n@vertex\nfn vs_shadow_t(v: VIn) -> VOut {\n    var o: VOut;\n    let w = mat4x4<f32>(v.m0, v.m1, v.m2, v.m3) * vec4(v.pos, 1.0);\n    o.clip = F.view_proj * w;\n    o.uv0 = v.uv0;\n    o.mid = u32(v.extra.w + 0.5) + v.joints.w;\n    return o;\n}\n",
+    );
     // the material now comes from a table indexed per pixel, so naga's
     // uniformity check would reject the texture reads under its branches;
     // the index is the same over a draw, which is what the check guards
@@ -1174,13 +1211,21 @@ mod tests {
 
     #[test]
     fn map_shader_parses_and_validates() {
-        let src = shader(include_str!("atmo_common.wgsl"), include_str!("shader.wgsl")).expect("transform");
-        let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&src)));
-        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
-            .validate(&module)
-            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&src)));
-        for t in ["t_base", "t_nrm", "t_pk", "t_em", "t_tile", "t_wear", "t_primer", "t_dust"] {
-            assert!(!src.contains(&format!("{t},")) && !src.contains(&format!("{t})")), "{t} left");
+        // the map's own renderer takes the same piece out of the shared shader, without a check of its own
+        assert_eq!(include_str!("shader.wgsl").matches(NO_STICKERS.0).count(), 1);
+        for full in [false, true] {
+            let src = shader_with(include_str!("atmo_common.wgsl"), include_str!("shader.wgsl"), full).expect("transform");
+            let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&src)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&src)));
+            for t in ["t_base", "t_nrm", "t_pk", "t_em", "t_tile", "t_wear", "t_primer", "t_dust"] {
+                assert!(!src.contains(&format!("{t},")) && !src.contains(&format!("{t})")), "{t} left");
+            }
+            // the vertex program loads one field, not the row
+            let vs = &src[src.find("fn vs_mesh(").unwrap()..];
+            let vs = &vs[..vs.find("\n}").unwrap()];
+            assert_eq!(vs.contains("bl_set("), full);
         }
     }
 }

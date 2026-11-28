@@ -129,6 +129,9 @@ pub struct Sticker {
     /// centre is the place on the model the UV centre stands for.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub flat: bool,
+    /// The side a flat sticker is projected from.
+    #[serde(default, skip_serializing_if = "Side::is_panels")]
+    pub from: Side,
     /// Zones of other models a flat sticker lies on as well.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub also: Vec<Also>,
@@ -151,7 +154,7 @@ pub struct Also {
 
 impl Sticker {
     pub fn new(picture: Picture) -> Sticker {
-        Sticker { name: String::new(), picture, model: String::new(), zones: Vec::new(), uv_set: 1, centre: [0.5, 0.5], size: [1.0, 1.0], rotation: 0.0, mirror: false, mask: false, colours: white3(), opacity: 1.0, visible: true, shader_uv: None, game_uv: None, flat: false, also: Vec::new(), projection: None, fresh: true }
+        Sticker { name: String::new(), picture, model: String::new(), zones: Vec::new(), uv_set: 1, centre: [0.5, 0.5], size: [1.0, 1.0], rotation: 0.0, mirror: false, mask: false, colours: white3(), opacity: 1.0, visible: true, shader_uv: None, game_uv: None, flat: false, from: Side::Panels, also: Vec::new(), projection: None, fresh: true }
     }
 }
 
@@ -433,30 +436,39 @@ impl Zones {
 
     /// Survey a loaded model. `parts`: the fitted part names in slot order
     /// (slot 1 first).
+    #[cfg(test)]
     pub fn of(m: &glb::Model, parts: &[String]) -> Zones {
+        Zones::of_with(m, &[], parts)
+    }
+
+    /// Survey a loaded model and models drawn apart from it (the wheels),
+    /// each of those under the slot given with it. `parts` names every
+    /// slot from 1 on, theirs too.
+    pub fn of_with(m: &glb::Model, extra: &[(&glb::Model, u8)], parts: &[String]) -> Zones {
+        let meshes: Vec<(&glb::Mesh, Option<u8>)> = m.meshes.iter().map(|me| (me, None)).chain(extra.iter().flat_map(|(x, slot)| x.meshes.iter().map(move |me| (me, Some(*slot))))).collect();
         let mut zones: BTreeMap<(u8, u8), Zone> = BTreeMap::new();
         // first the UV islands, over every face that can take a sticker
         // (also the faces on a border between two zones: they tie the
         // islands of neighbouring zones together)
         let mut isl = Islands::default();
-        for me in &m.meshes {
+        for (me, over) in &meshes {
             for t in me.indices.chunks_exact(3) {
                 let v = [&me.verts[t[0] as usize], &me.verts[t[1] as usize], &me.verts[t[2] as usize]];
                 if v[0].zone[2] == 0 {
                     continue;
                 }
                 for set in 0..2 {
-                    let slot = v[0].zone[1];
+                    let slot = over.unwrap_or(v[0].zone[1]);
                     let n = v.map(|q| isl.node(slot, set, Vec2::from(if set == 0 { q.uv0 } else { q.uv1 })));
                     isl.join(n[0], n[1]);
                     isl.join(n[0], n[2]);
                 }
             }
         }
-        for me in &m.meshes {
+        for (me, over) in &meshes {
             for t in me.indices.chunks_exact(3) {
                 let v = [&me.verts[t[0] as usize], &me.verts[t[1] as usize], &me.verts[t[2] as usize]];
-                let key = (v[0].zone[1], v[0].zone[0]);
+                let key = (over.unwrap_or(v[0].zone[1]), v[0].zone[0]);
                 if v[0].zone[2] == 0 || v[1].zone[0] != key.1 || v[2].zone[0] != key.1 {
                     continue;
                 }
@@ -602,16 +614,72 @@ pub struct ZoneSet {
     pub anchor_uv: Vec2,
 }
 
+/// The side of the vehicle a flat sticker is projected from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Side {
+    /// Along the normal of the sticker's own panels.
+    #[default]
+    Panels,
+    Left,
+    Right,
+    Top,
+    Front,
+    Back,
+}
+
+impl Side {
+    pub const ALL: [Side; 6] = [Side::Panels, Side::Left, Side::Right, Side::Top, Side::Front, Side::Back];
+
+    pub fn is_panels(&self) -> bool {
+        *self == Side::Panels
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Side::Panels => "its panels",
+            Side::Left => "the left",
+            Side::Right => "the right",
+            Side::Top => "the top",
+            Side::Front => "the front",
+            Side::Back => "the back",
+        }
+    }
+
+    /// From its name in the livery file (also what `--livery-from` takes).
+    pub fn parse(s: &str) -> Option<Side> {
+        Side::ALL.into_iter().find(|x| format!("{x:?}").eq_ignore_ascii_case(s.trim()))
+    }
+
+    /// The way the side looks, in the vehicle's space as the viewer shows
+    /// it (Y up, the front towards -Z, the left towards -X).
+    pub fn normal(self) -> Option<Vec3> {
+        match self {
+            Side::Panels => None,
+            Side::Left => Some(Vec3::NEG_X),
+            Side::Right => Some(Vec3::X),
+            Side::Top => Some(Vec3::Y),
+            Side::Front => Some(Vec3::NEG_Z),
+            Side::Back => Some(Vec3::Z),
+        }
+    }
+}
+
+/// "To the right" and "down" on a surface that looks along `n`, as seen
+/// from outside: a picture laid along them reads upright.
+fn axes_of(n: Vec3) -> (Vec3, Vec3) {
+    // on a roof or bonnet "up" is towards the front of the vehicle
+    let up = if n.y.abs() > 0.9 { Vec3::new(0.0, 0.0, -1.0) } else { Vec3::Y };
+    let right = up.cross(n).normalize_or_zero();
+    let down = right.cross(n).normalize_or_zero();
+    (right, down)
+}
+
 impl ZoneSet {
     /// The panel's "to the right" and "down" as seen from outside (unit
     /// vectors in the surface): a picture laid along them reads upright.
     pub fn axes(&self) -> (Vec3, Vec3) {
-        let n = if self.normal.length_squared() > 0.0 { self.normal } else { self.du.cross(self.dv).normalize_or_zero() };
-        // on a roof or bonnet "up" is towards the front of the vehicle
-        let up = if n.y.abs() > 0.9 { Vec3::new(0.0, 0.0, -1.0) } else { Vec3::Y };
-        let right = up.cross(n).normalize_or_zero();
-        let down = right.cross(n).normalize_or_zero();
-        (right, down)
+        axes_of(if self.normal.length_squared() > 0.0 { self.normal } else { self.du.cross(self.dv).normalize_or_zero() })
     }
 
     /// Metres per UV unit along U and V.
@@ -645,9 +713,14 @@ impl ZoneSet {
     }
 
     /// The reverse of `point` for a place on or off the panel: the UV point
-    /// it stands over, seen along the panel's normal.
-    pub fn uv_at(&self, p: Vec3) -> Vec2 {
-        let (right, down) = self.axes();
+    /// it stands over, seen along the panel's normal, or from `from` when
+    /// that is a side of the vehicle (the way a flat sticker projected
+    /// from that side sees it, so its middle comes to lie over `p`).
+    pub fn uv_at(&self, p: Vec3, from: Side) -> Vec2 {
+        let det_of = |(right, down): (Vec3, Vec3)| right.dot(self.du) * down.dot(self.dv) - right.dot(self.dv) * down.dot(self.du);
+        // a side the panel is seen edge-on from: along the panel's normal
+        let own = self.axes();
+        let (right, down) = from.normal().map(axes_of).filter(|ax| det_of(*ax).abs() > 0.05 * det_of(own).abs()).unwrap_or(own);
         let (a, b, c, d) = (right.dot(self.du), right.dot(self.dv), down.dot(self.du), down.dot(self.dv));
         let det = a * d - b * c;
         if det.abs() < 1e-9 {
@@ -660,9 +733,15 @@ impl ZoneSet {
     /// A flat sticker's numbers: with P a place on the model (the vehicle's
     /// space as stored, doors shut), `u = A·P + ou`, `v = B·P + ov`, and N
     /// the direction the faces under it look in. `[A, ou, B, ov, N]`. On a
-    /// flat panel this draws what `shader_uv` draws.
+    /// flat panel this draws what `shader_uv` draws. With a side chosen
+    /// (`Sticker::from`) N is that side's and the picture stands upright
+    /// as seen from it; its middle is still the place the centre stands
+    /// for on the panels.
     pub fn projection(&self, s: &Sticker) -> [f32; 11] {
-        let (right, down) = self.axes();
+        let (right, down) = match s.from.normal() {
+            Some(n) => axes_of(n),
+            None => self.axes(),
+        };
         let (sin, cos) = s.rotation.to_radians().sin_cos();
         let mut r = right * cos - down * sin;
         let d = down * cos + right * sin;
@@ -674,7 +753,7 @@ impl ZoneSet {
         let c = self.point(Vec2::from(s.centre));
         // the way the panel looks, square to the picture
         let n = right.cross(down).normalize_or_zero();
-        let n = if n.dot(self.normal) >= 0.0 { n } else { -n };
+        let n = if n.dot(s.from.normal().unwrap_or(self.normal)) >= 0.0 { n } else { -n };
         [a.x, a.y, a.z, 0.5 - a.dot(c), b.x, b.y, b.z, 0.5 - b.dot(c), n.x, n.y, n.z]
     }
 
@@ -856,6 +935,17 @@ pub fn records(l: &mut Livery, zones: &Zones, layer_of: &dyn Fn(&Picture) -> Opt
     out
 }
 
+/// The records for a model drawn apart from the vehicle (a wheel), whose
+/// vertices are all in slot 0: the ones for `slot` are moved to 0, all
+/// others to a slot no vertex has.
+pub fn records_for_slot(recs: &[Record], slot: u8) -> Vec<Record> {
+    let mut out = recs.to_vec();
+    for r in out.iter_mut().skip(1) {
+        r.flags[1] = if r.flags[1] == slot as u32 { 0 } else { u32::MAX };
+    }
+    out
+}
+
 /// A picture as a layer: `LAYER` x `LAYER` RGBA with its mip chain, and
 /// the picture's own size.
 pub struct Layer {
@@ -927,11 +1017,12 @@ pub struct State {
     /// `--livery FILE`: open this file for the next vehicle instead of its
     /// saved one.
     pub open_once: Option<PathBuf>,
-    /// `--livery-info FILE`: write the zones of the next vehicle there.
+    /// `--livery-info FILE`: write the zones of the vehicle there (the last
+    /// table, wheels included).
     pub info_once: Option<PathBuf>,
     /// The vehicle the livery belongs to (`vehicle_key`).
     pub vehicle: String,
-    zones_key: (PathBuf, usize, usize),
+    zones_key: (PathBuf, usize, usize, Vec<String>),
     pub zones: Zones,
     /// Pictures read so far, by `Picture::key`; an error text for the ones
     /// that could not be read.
@@ -1044,7 +1135,11 @@ impl State {
     /// the loaded vehicle; does nothing while nothing changed. `parts`: the
     /// fitted part names in slot order.
     #[allow(clippy::too_many_arguments)]
-    pub fn sync(&mut self, rs: &egui_wgpu::RenderState, ren: &crate::render3d::Renderer3D, gpu: &mut crate::render3d::GpuModel, model: &glb::Model, vehicle: &str, parts: &[String], game: &Path, work: &Path, cache: &Path) {
+    /// `wheels`: the wheel models drawn apart from the vehicle (rim and
+    /// tyre), each with its name and its model on the GPU. Their zones
+    /// come after the fitted parts' (a tyre's sidewall lettering, zones
+    /// 226 and 227).
+    pub fn sync(&mut self, rs: &egui_wgpu::RenderState, ren: &crate::render3d::Renderer3D, gpu: &mut crate::render3d::GpuModel, model: &glb::Model, vehicle: &str, parts: &[String], wheels: &mut [(&glb::Model, String, &mut crate::render3d::GpuModel)], game: &Path, work: &Path, cache: &Path) {
         if vehicle != self.vehicle {
             self.vehicle = vehicle.to_string();
             let file = self.open_once.take().unwrap_or_else(|| file_for(work, vehicle));
@@ -1067,12 +1162,16 @@ impl State {
             self.highlight = Highlight::default();
             self.dirty = true;
         }
-        let key = (model.path.clone(), model.triangles, model.vertices);
+        let wheel_names: Vec<String> = wheels.iter().map(|w| w.1.clone()).collect();
+        let key = (model.path.clone(), model.triangles, model.vertices, wheel_names.clone());
         if key != self.zones_key {
-            self.zones = Zones::of(model, parts);
+            let extra: Vec<(&glb::Model, u8)> = wheels.iter().enumerate().map(|(i, w)| (w.0, (parts.len() + 1 + i).min(255) as u8)).collect();
+            let all: Vec<String> = parts.iter().cloned().chain(wheel_names).collect();
+            self.zones = Zones::of_with(model, &extra, &all);
             self.zones_key = key;
             self.dirty = true;
-            if let Some(f) = self.info_once.take() {
+            // (written again as the table changes: the wheels come in later)
+            if let Some(f) = &self.info_once {
                 let _ = sixng_core::atomic::write(f, serde_json::to_vec_pretty(&self.zones.describe()).unwrap_or_default());
             }
         }
@@ -1082,7 +1181,9 @@ impl State {
         }
         self.ed.reading = self.reading.len();
         let nothing = self.livery.stickers.is_empty() && self.highlight == Highlight::default();
-        if !self.dirty && (gpu.sticker_buf.is_some() || nothing) {
+        // a wheel uploaded again (another rim) has no stickers yet
+        let fresh_wheel = wheels.iter().any(|w| w.2.sticker_buf.is_none());
+        if !self.dirty && (nothing || (gpu.sticker_buf.is_some() && !fresh_wheel)) {
             return;
         }
         // the pictures of the stickers shown, as layers
@@ -1109,6 +1210,10 @@ impl State {
         let on_gpu = &self.on_gpu;
         let recs = records(&mut self.livery, &self.zones, &|p| on_gpu.iter().position(|k| *k == p.key()).map(|i| i as u32), &self.highlight);
         ren.set_stickers(rs, gpu, &recs, self.view.as_ref());
+        for (i, w) in wheels.iter_mut().enumerate() {
+            let slot = (parts.len() + 1 + i).min(255) as u8;
+            ren.set_stickers(rs, w.2, &records_for_slot(&recs, slot), self.view.as_ref());
+        }
         self.dirty = false;
     }
 }
@@ -1268,6 +1373,16 @@ pub fn pick(m: &glb::Model, origin: Vec3, dir: Vec3, posed: Option<&Posed>) -> O
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_wheel_takes_only_its_own_records() {
+        let rec = |slot: u32| Record { flags: [1, slot, 0, 0], ..Default::default() };
+        let recs = vec![Record { flags: [3, 0, 0, 0], ..Default::default() }, rec(0), rec(4), rec(5)];
+        let w = records_for_slot(&recs, 4);
+        // the header stays; the wheel's own record moves to slot 0
+        assert_eq!(w.iter().map(|r| r.flags[1]).collect::<Vec<_>>(), [0, u32::MAX, 0, u32::MAX]);
+        assert_eq!(w[0].flags[0], 3);
+    }
+
     fn quad(zone: u8, flip_u: bool) -> glb::Model {
         // a 4 m x 2 m wall in the XY plane facing +Z; UV 0..1 across it,
         // V down
@@ -1329,8 +1444,37 @@ mod tests {
                 let flat = Vec2::new(p[0] * at.x + p[1] * at.y + p[2] * at.z + p[3], p[4] * at.x + p[5] * at.y + p[6] * at.z + p[7]);
                 assert!((by_uv - flat).length() < 1e-4, "{by_uv} {flat}");
                 // and a place on the model gives its UV point back
-                assert!((set.uv_at(at) - Vec2::new(u, v)).length() < 1e-4);
+                assert!((set.uv_at(at, Side::Panels) - Vec2::new(u, v)).length() < 1e-4);
             }
+            // from a side: it looks that way whatever the wall does, the
+            // picture upright (up the vehicle is up the picture) and its
+            // middle where the centre is on the wall
+            for side in [Side::Left, Side::Right, Side::Top, Side::Front, Side::Back] {
+                s.from = side;
+                let q = set.projection(&s);
+                let (a, b, n) = (Vec3::new(q[0], q[1], q[2]), Vec3::new(q[4], q[5], q[6]), Vec3::new(q[8], q[9], q[10]));
+                assert!((n - side.normal().unwrap()).length() < 1e-5);
+                assert!(a.dot(n).abs() < 1e-5 && b.dot(n).abs() < 1e-5 && a.dot(b).abs() < 1e-5);
+                let c = set.point(Vec2::from(s.centre));
+                assert!((a.dot(c) + q[3] - 0.5).abs() < 1e-4 && (b.dot(c) + q[7] - 0.5).abs() < 1e-4);
+                if side != Side::Top {
+                    assert!((b.y + s.rotation.to_radians().cos() / s.size[1]).abs() < 1e-4, "{side:?} {b}");
+                }
+                assert_eq!(Side::parse(&format!("{side:?}").to_lowercase()), Some(side));
+                // a place on the model taken as the centre: the picture's
+                // middle lies over it (not from a side the wall is edge-on to)
+                let at = Vec3::new(0.7, 0.4, 0.3);
+                let mut t = s.clone();
+                t.centre = set.uv_at(at, side).to_array();
+                let q = set.projection(&t);
+                let mid = Vec2::new(q[0] * at.x + q[1] * at.y + q[2] * at.z + q[3], q[4] * at.x + q[5] * at.y + q[6] * at.z + q[7]);
+                if side == Side::Back || side == Side::Front {
+                    assert!((mid - Vec2::splat(0.5)).length() < 1e-4, "{side:?} {mid}");
+                } else {
+                    assert_eq!(t.centre, set.uv_at(at, Side::Panels).to_array());
+                }
+            }
+            s.from = Side::Panels;
             // one record on the wall, one more per other model it lies on
             s.flat = true;
             s.also = vec![Also { model: "box".into(), zones: vec![2, 40] }, Also { model: "not fitted".into(), zones: vec![1] }];

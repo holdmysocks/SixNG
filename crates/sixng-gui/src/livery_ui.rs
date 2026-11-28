@@ -163,6 +163,8 @@ pub struct Editor {
     /// `--livery-flat`: lay the chosen sticker on flat once it has zones
     /// (before the next scripted click, which may then add another model's).
     pub auto_flat: bool,
+    /// `--livery-from SIDE`: with `--livery-flat`, the side it is projected from.
+    pub auto_from: Option<livery::Side>,
     pub auto_drag: Option<[f32; 2]>,
     /// `--livery-undo N`, `--livery-redo N`: after the other scripted steps,
     /// undo N steps, then redo N (before a scripted save).
@@ -218,6 +220,7 @@ impl Default for Editor {
             ready: false,
             auto_click: Vec::new(),
             auto_flat: false,
+            auto_from: None,
             auto_drag: None,
             auto_save: false,
             auto_undo: 0,
@@ -523,6 +526,7 @@ impl State {
             s.zones = from.zones.clone();
             s.uv_set = from.uv_set;
             s.flat = from.flat;
+            s.from = from.from;
             s.also = from.also.clone();
         }
         let has_zones = !s.zones.is_empty();
@@ -1042,6 +1046,13 @@ impl State {
             if ui.checkbox(&mut s.flat, "lay it on flat (across panels and models)").on_hover_text("Off: the sticker follows the panels' texture layout, as the game's own stickers do; it stays on one model and on one unwrapped piece of it.\nOn: the picture is projected straight onto the vehicle from the side its panels face. It then runs across panel pieces, and onto panels of other models: with this on, click panels of another model (the box behind the cab) to add them. On a curved panel the picture is stretched where the surface turns away. The game has no such sticker; it is the viewer's own.").changed() && !s.flat {
                 s.also.clear();
             }
+            if s.flat {
+                egui::ComboBox::from_label("projected from").selected_text(s.from.label()).show_ui(ui, |ui| {
+                    for side in livery::Side::ALL {
+                        ui.selectable_value(&mut s.from, side, side.label());
+                    }
+                }).response.on_hover_text("The direction the picture is projected onto the vehicle from.\nIts panels: square to the panels the sticker lies on (their mean direction).\nA side of the vehicle: straight from that side, with the picture upright as seen from there, whatever way the panels lean. For a sticker along the whole side of a body whose panels curve or lean.\nOnly faces that look towards that side take the picture.");
+            }
             for a in &s.also {
                 let fitted = self.zones.slot_of(&a.model).is_some();
                 ui.label(egui::RichText::new(format!("also on {}: zones {}{}", model_label(&a.model), a.zones.iter().map(|z| z.to_string()).collect::<Vec<_>>().join(", "), if fitted { "" } else { " (not fitted now)" })).small());
@@ -1373,6 +1384,9 @@ impl State {
         let sel = self.ed.selected.filter(|i| *i < self.livery.stickers.len());
         if let Some(s) = sel.filter(|_| self.ed.auto_flat).map(|i| &mut self.livery.stickers[i]).filter(|s| !s.zones.is_empty()) {
             s.flat = true;
+            if let Some(side) = self.ed.auto_from.take() {
+                s.from = side;
+            }
             self.ed.auto_flat = false;
             self.changed();
             return false;
@@ -1390,6 +1404,9 @@ impl State {
             self.ed.auto_drag = None;
             let pos = rect.min + egui::vec2(rect.width() * c[0], rect.height() * c[1]);
             let hit = self.hit(pos, rect, cam, model, env.skin);
+            if let Some(h) = &hit {
+                eprintln!("[livery] scripted drag to {c:?}: zone {} at {:.3?} on the model", h.zone, h.pos.to_array());
+            }
             match hit.and_then(|h| self.place_of(i, &h)) {
                 Some(uv) => {
                     self.livery.stickers[i].fresh = false;
@@ -1529,7 +1546,7 @@ impl State {
         if !own && !other {
             return None;
         }
-        Some(self.zones.set(slot, &s.zones, set)?.uv_at(h.pos))
+        Some(self.zones.set(slot, &s.zones, set)?.uv_at(h.pos, s.from))
     }
 
     /// What the view shows at a place of the viewport.

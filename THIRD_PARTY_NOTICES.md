@@ -183,5 +183,19 @@ under the MIT License; no dictionary data is included in this repository.
 Copyright (c) 2026 the gta6-namehash contributors
 ```
 
+## vihook
+
+The struct and member names of the cutscene master timeline in
+`crates/sixng-core/src/cutscene.rs` (`fwAnimSceneReferenceSectionData`,
+`fwAnimSceneCompositeSectionData`, `sceneId`, `sectionId` and `sectionIds`)
+come from vihook's `scripts/data/par_names.txt`, as cited in
+issue #516. That list is distributed under the MIT License. Only these
+few names are used, in comments and docs; no part of the file is included
+in this repository.
+
+```
+Copyright (c) the vihook contributors
+```
+
 Rust crate dependencies keep their own licences; see `Cargo.lock` and each
 crate's metadata (`cargo license` lists them).

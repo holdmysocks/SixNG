@@ -3678,7 +3678,10 @@ impl ModelView {
             return false;
         }
         let cache = self.cache_dir();
-        self.livery.ed.ready = !self.loading && self.idle_for_model() && self.frames_since_load >= 3;
+        // (and once the wheels shown are in: a tyre takes stickers too)
+        let want_wheels = self.wheels_on && !self.veh_no_wheels && !self.mounts().is_empty();
+        let wheels_in = !want_wheels || (!self.wheel_loading && !self.wheel_src.is_empty() && self.wheels.len() == self.wheel_src.len() && self.wheel_key == format!("{}|{}", self.wheel_rim, self.wheel_tyre));
+        self.livery.ed.ready = !self.loading && wheels_in && self.idle_for_model() && self.frames_since_load >= 3;
         // clicks land on the vehicle as it is drawn: doors open, a roof down
         let skin = if self.livery.ed.open { self.joint_mats().1 } else { Vec::new() };
         let Some(l) = &self.loaded else { return false };
@@ -3696,7 +3699,15 @@ impl ModelView {
         let ren = self.renderer.get_or_insert_with(|| Renderer3D::new_viewer(rs));
         let parts: Vec<String> = l.info["assembled_from"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
         let key = crate::livery::vehicle_key(&crate::vehicle_db::model_key(&l.source));
-        self.livery.sync(rs, ren, g, &l.model, &key, &parts, Path::new(&self.game), Path::new(&self.work), &cache);
+        // the fitted rim and tyre, drawn apart from the vehicle: a tyre's
+        // sidewall takes stickers too (the names in the order they load)
+        let names: Vec<String> = self.wheel_key.split('|').filter(|n| !n.is_empty()).map(str::to_string).collect();
+        let mut wheels: Vec<(&glb::Model, String, &mut GpuModel)> = if self.wheels.len() == self.wheel_src.len() && names.len() == self.wheel_src.len() && self.wheels_on && !self.veh_no_wheels {
+            self.wheel_src.iter().zip(names).zip(self.wheels.iter_mut()).map(|((s, n), g)| (&s.model, n, g)).collect()
+        } else {
+            Vec::new()
+        };
+        self.livery.sync(rs, ren, g, &l.model, &key, &parts, &mut wheels, Path::new(&self.game), Path::new(&self.work), &cache);
     }
 
     fn update_wheels(&mut self, rs: &egui_wgpu::RenderState, ctx: &egui::Context) {
@@ -6572,8 +6583,12 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
     if bare_tint(m, |_| lut[125]) {
         done.insert(usize::MAX);
     }
-    for mat in m.materials.iter().filter(|x| x.ped_shade) {
-        let Some(i) = mat.base else { continue };
+    // and materials whose colour slot binds a tint data map rather than a
+    // colour (`packed_tint_map`: the shared jewellery map of about 300
+    // materials), as on items with a tint and no preset (Raul's hoop)
+    let packed: Vec<usize> = m.materials.iter().filter(|x| !x.ped_shade).filter_map(|x| x.base).filter(|&i| m.images.get(i).is_some_and(|im| im.bc.is_none() && im.mips.first().is_some_and(|l| packed_tint_map(&l.2)))).collect();
+    let bases: Vec<usize> = m.materials.iter().filter(|x| x.ped_shade).filter_map(|x| x.base).chain(packed).collect();
+    for i in bases {
         if !done.insert(i) {
             continue;
         }
@@ -6589,6 +6604,26 @@ fn colour_part(m: &mut glb::Model, f: &PartFx, game: &Path, cache: &Path) -> boo
         im.key = format!("{}#{:?}{:?}", im.key, f.colour, f.tint);
     }
     !done.is_empty()
+}
+
+/// Whether RGBA8 texels are a tint data map in the layout of the clothing
+/// shade map (`sixng_core::pedtint`): R and B are each off or full (they
+/// pick the region), G is the shade. The jewellery map (texture
+/// d01c36ca7ea7eef4, bound as `diffusetex`) is one: orange (255, 110, 0),
+/// blue (0, 110, 255) and green (0, 110, 0) regions. Needs most texels to
+/// have R or B full, so a black colour map does not count. Which of the
+/// three tint rows each region takes is not decoded (as for the clothing
+/// shade map): the map is coloured with tint 0.
+fn packed_tint_map(px: &[u8]) -> bool {
+    let edge = |v: u8| v <= 12 || v >= 243;
+    let (mut n, mut ok, mut lit) = (0usize, 0usize, 0usize);
+    for t in px.chunks_exact(4).filter(|t| t[3] > 0) {
+        n += 1;
+        ok += usize::from(edge(t[0]) && edge(t[2]));
+        lit += usize::from(t[0] >= 243 || t[2] >= 243);
+    }
+    // (98 % on the jewellery map: block compression blends region edges)
+    n > 0 && ok * 100 >= n * 95 && lit * 2 >= n
 }
 
 /// sRGB colour of clothing that has no texture in the install and no colour
@@ -9967,6 +10002,17 @@ fn srgb32(c: [f32; 3]) -> egui::Color32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_tint_data_map_is_told_from_a_colour_map() {
+        use super::packed_tint_map;
+        let map = |texels: &[[u8; 4]]| texels.iter().flatten().copied().collect::<Vec<u8>>();
+        // the jewellery map's orange, blue and green regions
+        assert!(packed_tint_map(&map(&[[255, 110, 1, 255], [1, 110, 255, 255], [0, 110, 0, 254], [255, 107, 1, 255]])));
+        // a black or a plain colour map is not one
+        assert!(!packed_tint_map(&map(&[[0, 0, 0, 255]; 4])));
+        assert!(!packed_tint_map(&map(&[[200, 150, 90, 255], [255, 110, 1, 255], [180, 120, 60, 255], [190, 140, 80, 255]])));
+    }
+
     #[test]
     fn coat_records_in_the_ramp_image() {
         use super::coat_row;
