@@ -5,6 +5,7 @@ pub mod fragphys;
 pub mod cutscene;
 pub mod audio;
 pub mod audiometa;
+pub mod dialogue;
 pub mod scriptdoc;
 pub mod wardrobe;
 pub mod bounds;
