@@ -847,6 +847,8 @@ pub struct Renderer3D {
     gd_args: Option<wgpu::Buffer>,
     /// Last frame: sub-draws, indirect calls, models drawn the old way, models on the table.
     pub gd_stats: [u32; 4],
+    /// Last frame: the table's runs in the late lists by kind (decal, blended decal, see-through).
+    gd_late: [u32; 3],
 }
 
 /// Indirect calls of one pass: the sub-draws of one set of pool chunks
@@ -2045,6 +2047,7 @@ impl Renderer3D {
             gd_pipes,
             gd_args: None,
             gd_stats: [0; 4],
+            gd_late: [0; 3],
             shadow,
             shadow_bgs,
             pipe_shadow,
@@ -3522,7 +3525,8 @@ impl Renderer3D {
             return String::new();
         };
         let [sub, calls, old, on] = self.gd_stats;
-        format!(" | table: {on} models in {sub} sub-draws, {calls} calls, {old} models the old way; {}", g.summary())
+        let [d, db, b] = self.gd_late;
+        format!(" | table: {on} models in {sub} sub-draws, {calls} calls (late runs {d}/{db}/{b}), {old} models the old way; {}", g.summary())
     }
 
     /// The frame's shadow cascades and which of them are drawn this frame
@@ -3745,10 +3749,19 @@ impl Renderer3D {
                 }
             }
             // by layer order (terrain blend layers 0, other decals 1), then
-            // opaque before blended, then far to near
+            // opaque before blended, then far to near. Opaque ones of the
+            // table's models go first, by geometry chunk, so they form long
+            // runs of its sub-draws: their order matters only within a model
+            // (`lateexact`: the plain order, for A/B runs)
+            let exact = crate::gpu_draw::opt("lateexact");
+            let chunk = |e: &(u8, bool, f32, usize, usize, &GpuModel, &GpuMesh, bool)| match (&e.5.gd, e.1 || exact) {
+                (Some(h), false) => h.gc,
+                _ => usize::MAX,
+            };
             dl.sort_by(|a, b| {
                 a.0.cmp(&b.0)
                     .then(a.1.cmp(&b.1))
+                    .then(chunk(a).cmp(&chunk(b)))
                     .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
                     .then(a.3.cmp(&b.3))
                     .then(a.4.cmp(&b.4))
@@ -3851,8 +3864,12 @@ impl Renderer3D {
     }
 
     /// Record a late list's runs. `scene`: the see-through pass's scene depth group (2).
+    /// A table run binds only what differs from the run before it, unless
+    /// old-path draws came in between.
     fn record_late(&self, pass: &mut wgpu::RenderPass<'_>, f: Option<&GdFrame>, segs: &[LateSeg], scene: Option<&wgpu::BindGroup>) -> u32 {
         let mut n = 0;
+        // the table's state bound now: (kind, geometry chunk, instance chunk); None after old-path draws
+        let mut cur: Option<(u8, usize, usize)> = None;
         for s in segs {
             match s {
                 LateSeg::Old(items) => {
@@ -3860,11 +3877,35 @@ impl Renderer3D {
                         pass.set_bind_group(2, sb, &[]);
                     }
                     n += Self::record_joined(pass, items.iter().map(|&(k, mi, gm, me, sh)| (self.late_pipe(k), mi, gm, me, sh)));
+                    cur = None;
                 }
                 LateSeg::Gd(k, l) => {
-                    if let (Some(f), Some(p), Some(a)) = (f, &self.gd_pipes, &self.gd_args) {
-                        n += Self::record_gd(pass, &p[4 + *k as usize], &self.default_frame_bg, f, std::slice::from_ref(l), a, false, None, scene);
+                    let (Some(f), Some(p), Some(a)) = (f, &self.gd_pipes, &self.gd_args) else {
+                        continue;
+                    };
+                    let (Some(bg), Some(Some(gb)), Some(Some(inb))) = (f.snap.bg.as_ref(), f.snap.g.get(l.g), f.snap.n.get(l.n)) else {
+                        continue;
+                    };
+                    if cur.is_none_or(|c| c.0 != *k) {
+                        pass.set_pipeline(&p[4 + *k as usize]);
                     }
+                    if cur.is_none() {
+                        pass.set_bind_group(0, Some(&self.default_frame_bg), &[]);
+                        pass.set_bind_group(1, Some(bg), &[]);
+                        if let Some(sb) = scene {
+                            pass.set_bind_group(2, Some(sb), &[]);
+                        }
+                    }
+                    if cur.is_none_or(|c| c.1 != l.g) {
+                        pass.set_vertex_buffer(0, Some(gb.slice(..)));
+                        pass.set_index_buffer(gb.slice(..), wgpu::IndexFormat::Uint32);
+                    }
+                    if cur.is_none_or(|c| c.2 != l.n) {
+                        pass.set_vertex_buffer(1, Some(inb.slice(..)));
+                    }
+                    cur = Some((*k, l.g, l.n));
+                    pass.multi_draw_indexed_indirect(a, l.args.start as u64 * crate::gpu_draw::ARGS, l.args.end - l.args.start);
+                    n += 1;
                 }
             }
         }
@@ -4285,7 +4326,13 @@ impl Renderer3D {
         let blend_segs = Self::late_segs(gdf.as_mut().filter(|_| !nolate), blended);
         if let Some(f) = &gdf {
             self.gd_write(device, queue, f);
-            self.gd_stats[1] += decal_segs.iter().chain(&blend_segs).filter(|s| matches!(s, LateSeg::Gd(..))).count() as u32;
+            self.gd_late = [0; 3];
+            for s in decal_segs.iter().chain(&blend_segs) {
+                if let LateSeg::Gd(k, _) = s {
+                    self.gd_late[(*k as usize).min(2)] += 1;
+                }
+            }
+            self.gd_stats[1] += self.gd_late.iter().sum::<u32>();
         }
         crate::gpu_draw::watch::at(0, 4);
         self.render_shadows(queue, &mut enc, cam, look, &fu, aspect, models, gdf.as_ref());
