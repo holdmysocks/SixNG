@@ -515,7 +515,7 @@ pub fn detail_json(shader_hash: &str, consts: &[crate::drawable::ShaderConst], g
         "uv_scale": [scale[2], scale[3]],
         "forced_slice": force,
         "atlases": {"normal": format!("{DETAIL_NORMAL_ATLAS:016x}"), "control": format!("{DETAIL_CONTROL_ATLAS:016x}"), "store": "data/ttdb/graphics/ttdb_graphics.ttpf"},
-        "layout": "4 x 4 sheets of 256 x 256 tiles, region r (speculartex2 G: u32(16 G + 0.5)) at column r % 4, row r / 4; the game reads them as a texture array, so keep filtering inside the tile (one mip level, the position held half a texel of it from the edge) or the tile edges pick up the neighbouring tile",
+        "layout": "4 x 4 sheets of 256 x 256 tiles, region r (speculartex2 G: the high nibble of the byte, u32(255 G + 0.5) >> 4) at column r % 4, row r / 4; the game reads them as a texture array, so keep filtering inside the tile (one mip level, the position held half a texel of it from the edge) or the tile edges pick up the neighbouring tile",
         "rule": "uv = UV0 * uv_scale; c = control sheet R, d = normal sheet RG * 2 - 1, mask = speculartex2 R; colour *= saturate(1 + strength.x * mask * (2c - 1)); tangent-space normal xy += strength.y * mask * d (before z is rebuilt). Where speculartex2 G straddles two regions the game samples both and averages.",
         "per_ped": per_ped_detail_json()
     });

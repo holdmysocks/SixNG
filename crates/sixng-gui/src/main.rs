@@ -18,6 +18,7 @@ mod bc;
 mod cells;
 mod fabric;
 mod glb;
+mod gpu_draw;
 mod gpu_time;
 mod lights;
 mod livery;
@@ -414,6 +415,14 @@ fn wgpu_options(no_vsync: bool, gpu: Option<String>) -> eframe::egui_wgpu::WgpuC
                     // ped glass's blend (render3d's glass pipeline)
                     | wgpu::Features::DUAL_SOURCE_BLENDING
                     | crate::gpu_time::features());
+            // the 3D map's material table (gpu_draw.rs): all of its features or none
+            if adapter.features().contains(crate::gpu_draw::features()) {
+                d.required_features |= crate::gpu_draw::features();
+                d.required_limits.max_binding_array_elements_per_shader_stage = d
+                    .required_limits
+                    .max_binding_array_elements_per_shader_stage
+                    .max(adapter.limits().max_binding_array_elements_per_shader_stage.min(crate::gpu_draw::ARRAYS));
+            }
             // the mesh shaders read more than wgpu's default 16 textures per stage (sky, shadow cascades, hair
             // lighting tables, materials); ask for what the adapter has, up to 32
             d.required_limits.max_sampled_textures_per_shader_stage =

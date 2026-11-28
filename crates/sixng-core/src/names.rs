@@ -161,6 +161,10 @@ pub const DERIVED: &[&str] = &[
     "layer2tiling", "layer2offset", "layer2intensity", "layer2opacitythreshold", "layer2opacitycontrast",
     "dirttintchannel", "furlengthjitter", "normalmaptiling2", "specularfresnelselector", "waterfadestartrandom",
     "stickermetalness", "stickerroughness", "stickerbackopacity",
+    // neighbour-stem search (2026-11-27): each constant tried as a prefix of a named neighbour + word (+ suffix),
+    // about 0.14 random hits expected over all of them
+    "vertexdisplacementnoisetiling", "tintroughnessmod", "grassdecallayer", "grassdecaluvoffset", "verttintblendamount",
+    "tangentuvset", "clearcoatuvset", "heightfilter",
     // water_micro_geom (the inland water tiles): meet-in-the-middle joaat search over water and shader words (2026-11-27),
     // about 16 random hits expected over 45 hashes; kept only names that fit the value or a sibling. The three use* flags
     // are integer 1 on every tile and 0 on the 6 tiles whose flow, height and surface map textures are 4 x 4 placeholders;
