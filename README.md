@@ -1092,8 +1092,60 @@ again**).
   `pack/story000_restofworld/story000_restofworld.rpf`, which this
   command does not read by default. Which slot applies when one child
   state fills two slots, and where a movie starts, are not established.
-  Not decoded: the scene files' events (subtitle and movie events) and
-  state transitions.
+  **State machines** (`--masters` lists the masters instead of the
+  scenes): a master's states are keys of its id map, and each state's
+  item lists the start-map keys it plays. A transition leads to
+  another state (`toState`); its conditions either name its own source
+  state ("when this state ends") or test a string variable (a branch:
+  `fwAnimSceneConditionString`, the variable named by `entityName`, a
+  string entity of the scene whose value the script sets, must equal
+  the string whose joaat is `value`, or differ from it with `invert`).
+  The machine also has start transitions, which have no source state:
+  the first whose tests hold picks the state the master starts in.
+  `--masters` gives each master's slots (start, end, scene, section),
+  its states with their start times and transitions (the target's
+  start, `on_end`, the number of value tests and the tests: variable
+  and value by name where the dictionary has one, else the hash), its
+  start transitions (`start`) and its bank;
+  `master_timelines.state_machines` counts them.
+  Measured on the story pack's 139 masters: 929 states (256 end
+  states) and 797 transitions; 760 have a "when this state ends"
+  condition and 211 an entity-value branch. Placing each state at its
+  earliest start, 755 transitions lead forward in time (534 to the next
+  later start, the others skip ahead over alternatives) and 37 back.
+  Where one scene fills several slots of a master, its slots mostly
+  belong to states on one path (each slot a different section, played
+  in turn); only a few are alternatives on separate branches. Every
+  master has start transitions: 293 in all, 78 without conditions (the
+  default) and 214 with string tests. Every state that no transition
+  leads to (256) is the target of a start transition. The masters hold
+  695 string tests (277 on transitions, 418 on start transitions) over
+  21 variables. The commonest check which player character plays
+  (`jason` / `lucia`, 153), a relationship level (`s_relationship`:
+  `low`, `medium`, `high`, 121) and a yes/no choice (36); one variable
+  has 89 values (vehicle models and places such as `Office`). 122
+  tests have both the variable and the value named.
+  **Subtitles**: a scene file's subtitle events
+  (`fwAnimSceneSubtitleEventData`) give the text label, the speaker (joaat
+  of the character name) and the start and end in their section. Each scene
+  lists its lines; with the dialogue links (`sixng dialogue-links`) they
+  get their text and speaker name, and `speaker_agrees` says whether the
+  links give the same speaker hash. A composite section lists sections
+  that play together from its start (character, camera and other
+  layers), so a line's times count from the start of the composite it
+  plays under. A master slot's `sectionId` names one composite of the
+  child scene, so each line gets a time on the master's bank clock for
+  every slot that plays its composite (`bank_times`: the slot's
+  `bank_time` plus the line's start). Placed this way, the lines line up
+  with the `.c` stream within 0.2 s on 81 of 95 masters (7 of 95 when
+  each master's lines are tried on another master's audio).
+  Measured on the story pack: 11,903 lines in 1,488 scenes; 11,804 get
+  their text and 9,395 a speaker name, and the links agree on the
+  speaker for 11,860 (43 differ). 3,176 lines are on a bank clock (the
+  others are in scenes no master places).
+  Not decoded: which movie file a movie event plays. Its name
+  (`binkName`) is empty in this copy, and its 64-bit id (71 distinct)
+  matches no name or file of `movies.rpf`.
 - **Story names** (`sixng story-names [--tags]`): arc and mission names
   for the scenes. The story pack's protected ambient-rule files (read
   through the table of contents, so Windows x64 with the game executable)
@@ -1956,11 +2008,29 @@ the cue it plays (`Variation`). SixNG derives:
   audio index or, when that has none, in the first other archive with an
   audio index that has it (story lines also play from `audio.rpf`). Generic
   speech (a wave each character voice records) sits in several banks, one
-  per voice. Such a line plays from its speaker's voice bank: the candidate
-  bank whose container (from `sixng audio-meta <archive>`) holds at least
+  per voice. Such a line plays from its speaker's voice bank. First choice
+  is the speaker's speech voice. The pack's speech file (schema 18) has one
+  object per voice, named like the character (`jason`, `lucia`). It lists
+  each speech context (the wave without its `_NN` take, hashed as joaat
+  without the final mix) with the container of the bank that holds its
+  takes. `sixng audio-meta <archive>` writes these to
+  `<work>/index/audio_voices_<archive>.json`. Without a voice, the candidate
+  bank is the one whose container (also from `audio-meta`) holds at least
   two of the speaker's lines that are in one bank only, while no other
-  candidate holds any. A line whose ID is in no index, or in several banks
-  with no voice bank to pick, gets no audio;
+  candidate holds any. In `story000`, 635 generic lines sit in several
+  banks. The speech voices place 410 of them, including all 242 that the
+  older rule placed, and they agree on every one. 224 stay unplaced: their
+  speaker has no voice object (206), the voice lacks the context (17), or
+  it names a container no candidate has (1). The 206 lines come from 92
+  generic roles (store clerks, cops, enemies): none of them is a ped model
+  or has other lines, and their waves are in up to 359 voices' banks. The
+  voice is that of whichever ped plays the role, chosen at run time. The
+  report gives that reason ("voice chosen at run time") when the line's
+  archive has speech voices but none for its speaker: 159 lines. The other
+  47 have candidate banks in `audio.rpf`, which has no speech voices, so they
+  keep the plain reason. A line
+  whose ID is in no index, or in several banks with no voice bank to pick,
+  gets no audio;
 - the speaker: the conversation's character hash. In a conversation with
   several characters, each character has a slot number and each line names
   the slot of the character who says it. A line without a slot falls back
@@ -1976,8 +2046,9 @@ the cue it plays (`Variation`). SixNG derives:
 
 The archive's audio index must exist (`sixng audio <archive>`). The report
 counts, per archive, the conversation files, lines, speakers and linked
-streams (by the archive that holds them; `audio_from_voice_banks` of them
-picked by voice bank), and the lines without a speaker by reason
+streams (by the archive that holds them; `audio_from_voice_banks` counts
+those picked by speech voice and by the speaker's lines), and the lines
+without a speaker by reason
 (`no_speaker`).
 
 **Address table.**

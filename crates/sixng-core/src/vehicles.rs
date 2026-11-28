@@ -34,7 +34,7 @@ const OWNER: u32 = 0xfb1f_80ff;
 /// `handlingId` (case-sensitive joaat).
 const HANDLING_ID: u32 = 0xec41_bd9c;
 /// Layout version of vehicles.json; the model viewer rebuilds older files.
-pub const FORMAT: u32 = 18;
+pub const FORMAT: u32 = 20;
 /// The names of the mod slots, as far as they are known: the slot of a part
 /// is the joaat of one of these. Found by hashing likely names against the
 /// 166 slots the vehicles use; 147 of them answer, the rest stay a number.
@@ -335,6 +335,89 @@ pub fn build(ws: &crate::export::Workspace, out: &std::path::Path) -> Result<Val
     export(&a, &metas, &model_names(ws), out)
 }
 
+/// Merge the record of a handlingId with no model of its own into the
+/// model whose only model info names it (see `export`). Returns the merged
+/// hashes (8 hex digits) with the model each went into.
+fn merge_by_handling(models: &mut BTreeMap<u32, Value>, handling_users: &HashMap<u32, std::collections::BTreeSet<u32>>, game_count: &HashMap<u32, std::collections::BTreeSet<String>>) -> BTreeMap<String, String> {
+    let mut merged: BTreeMap<String, String> = BTreeMap::new();
+    for (hid, users) in handling_users {
+        let mut users = users.iter();
+        let (Some(&g), None) = (users.next(), users.next()) else { continue };
+        if g == *hid || game_count.get(&g).map_or(0, |c| c.len()) != 1 {
+            continue;
+        }
+        let empty = |m: &Value, k: &str| m[k].as_array().is_none_or(|a| a.is_empty());
+        let fits = match (models.get(hid), models.get(&g)) {
+            (Some(src), Some(dst)) => src["model"].is_null() && !dst["model"].is_null() && !empty(src, "configurations") && empty(dst, "configurations"),
+            _ => false,
+        };
+        if !fits {
+            continue;
+        }
+        let Some(src) = models.remove(hid) else { continue };
+        let Some(dst) = models.get_mut(&g) else { continue };
+        for (k, v) in src.as_object().into_iter().flatten() {
+            if matches!(k.as_str(), "model" | "model_hash" | "model_info" | "model_info_via") {
+                continue;
+            }
+            let unset = dst.get(k).is_none_or(|x| x.is_null() || x.as_array().is_some_and(|a| a.is_empty()) || x.as_object().is_some_and(|o| o.is_empty()));
+            if unset {
+                dst[k] = v.clone();
+            } else if let (Some(have), Some(more)) = (dst[k].as_array_mut(), v.as_array()) {
+                // lists (palettes, part groups): both records' entries
+                for x in more {
+                    if !have.contains(x) {
+                        have.push(x.clone());
+                    }
+                }
+            }
+        }
+        dst["records_from"] = json!(format!("{hid:08x}"));
+        merged.insert(format!("{hid:08x}"), dst["model"].as_str().unwrap_or_default().to_string());
+    }
+    merged
+}
+
+/// Name a record that has configurations but no model name after the model
+/// its chassis part fits: the semi-trailer `trailers` files its 39
+/// configurations, parts and liveries under the gameName `trailer`, a name
+/// with no model, and its chassis part's first element is `trailers`. Only
+/// where every chassis part of the record names the same known model and
+/// that model has no record of its own. The record moves to that model's
+/// hash; `records_from` keeps the old one (its liveries are filed there).
+/// Returns the renamed hashes (8 hex digits) with the model each now names.
+fn name_by_chassis(models: &mut BTreeMap<u32, Value>, names: &HashMap<u32, String>) -> BTreeMap<String, String> {
+    let by_asset: HashMap<u64, &String> = names.values().map(|n| (meta7a::asset_id(n), n)).collect();
+    let mut named: BTreeMap<String, String> = BTreeMap::new();
+    let unnamed: Vec<u32> = models.iter().filter(|(_, m)| m["model"].is_null() && m["configurations"].as_array().is_some_and(|a| !a.is_empty())).map(|(h, _)| *h).collect();
+    for h in unnamed {
+        let chassis = format!("{SLOT_CHASSIS:08x}");
+        let firsts: Vec<Option<&String>> = models[&h]["mods"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|m| m["slot"] == chassis.as_str())
+            .map(|m| m["elements"][0]["asset"].as_str().and_then(|a| u64::from_str_radix(a, 16).ok()).and_then(|a| by_asset.get(&a).copied()))
+            .collect();
+        let Some(Some(name)) = firsts.first() else { continue };
+        let name = name.trim_end_matches("_hi").to_string();
+        if firsts.iter().any(|f| f.map(|f| f.trim_end_matches("_hi")) != Some(name.as_str())) {
+            continue;
+        }
+        let to = meta7a::joaat(&name);
+        if models.contains_key(&to) {
+            continue;
+        }
+        let Some(mut rec) = models.remove(&h) else { continue };
+        rec["model"] = json!(name);
+        rec["model_hash"] = json!(format!("{to:08x}"));
+        rec["records_from"] = json!(format!("{h:08x}"));
+        named.insert(format!("{h:08x}"), name);
+        models.insert(to, rec);
+    }
+    named
+}
+
 /// Write `<out>/vehicles/vehicles.json`. `names`: joaat -> model name.
 pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, out: &std::path::Path) -> Result<Value> {
     // The resource(s) with model-info records.
@@ -372,6 +455,10 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
     // distinct row once per model.
     let mut seen: std::collections::HashSet<(u32, String)> = std::collections::HashSet::new();
     let mut by_handling: Vec<(u32, Value)> = Vec::new();
+    // per gameName its model-info records, per handlingId the gameNames
+    // that name it (for the merge below)
+    let mut game_count: HashMap<u32, std::collections::BTreeSet<String>> = HashMap::new();
+    let mut handling_users: HashMap<u32, std::collections::BTreeSet<u32>> = HashMap::new();
     let mut mods_of: Vec<(u32, Vec<Value>)> = Vec::new();
     let mut switches_of: Vec<(u32, Switches)> = Vec::new();
     let mut fits_of: Vec<(u32, FitSource)> = Vec::new();
@@ -394,8 +481,10 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
             // an unresolved hash) while `handlingId` is the name the
             // configurations and the drawable use. Kept for the second pass.
             let hid = get(&mi, HANDLING_ID).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            game_count.entry(h).or_default().insert(mi.to_string());
             if hid != 0 && hid != h {
                 by_handling.push((hid, mi.clone()));
+                handling_users.entry(hid).or_default().insert(h);
             }
             if models.get(&h).is_some_and(|m| !m["model_info"].is_null()) {
                 continue;
@@ -700,6 +789,20 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
             m["steering_lock"] = json!(l);
         }
     }
+    // A model whose configurations, palettes, parts and liveries are filed
+    // under its handlingId, a name with no model of its own: guardiantx2's
+    // under guardian, blazer4's, dump's and voyager's under unnamed hashes.
+    // The model's own record then has its model info and nothing else, and
+    // the handlingId's record everything else. Merged into the model's
+    // record where it is certain: exactly one model info names that
+    // handlingId, it is its gameName's only one, the gameName is a named
+    // model with no configurations of its own and the handlingId's record
+    // has no name. Lists both records have (blazer4's palettes) are
+    // joined; anything else the model's record has stays. Several freight cars share one gameName: left as they are.
+    let merged = merge_by_handling(&mut models, &handling_users, &game_count);
+    // A record with configurations and no name, whose chassis part fits a
+    // known model with no record (the semi-trailer `trailers`): named after it.
+    let named_by_chassis = name_by_chassis(&mut models, names);
     let list: Vec<&Value> = models.values().collect();
     let with_info = list.iter().filter(|m| !m["model_info"].is_null()).count();
     let named = list.iter().filter(|m| !m["model"].is_null()).count();
@@ -707,10 +810,86 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("vehicles.json");
     crate::atomic::write(&path, serde_json::to_vec_pretty(&json!({
-        "note": "Per vehicle model: model_info (vehicles.meta-like; wheelScale / wheelScaleRear are not understood: they are not the rim radius (0.219 on comet7, whose rim is 0.82 x a 0.35 m tyre). A wheel's size, width and position are in the model's export (model.json wheel_mounts, from the collision discs), and the rim's share of it in the configuration's rim_ratio), configurations (body colour ARGB + the part models incl. rim and tyre; parts_key = a key of the part list that a vehicle export's model.json part_colours.configs uses to name the part colours of this configuration; rim_ratio = rim radius / tyre radius from the configuration's wheel fitment record, slot 39d5e253, where it has one), palettes (ARGB paint-colour lists; colours repeat, so repetition reads as the draw weight), part_groups (weighted part choices). mods are the parts with models: the vehicle pack's own and, marked shared, the library parts its configurations name (truck beds and boxes, light bars ...); an element's asset names its model in a vehicle pack (16 hex digits: the first half of MurmurHash3 x64 128, seed 0, of the model's lower-case name without LOD suffix; null in the library), and model is the joaat of the model's name for library parts (in a pack it is only the low half of asset), bone the bone it is modelled around and hides the stock bones it replaces. switches are the stock alternatives of a part (bonnet variants, aerial, light bar and plate mounts, engine pieces): a fitted part sets keys (part_keys: part name -> keys, for the pack's own parts and the library parts its configurations name), and a switch, in force while its part is fitted (part; null = the chassis part, always fitted), shows the element of the option whose key is set (and whose also key, where it has one, is set too: such an option goes first; a null element shows nothing), else its default element (null = nothing). wheel_fits is what a fitted part changes on the wheels (part name -> wheel fitment records, struct 9a172293: a widebody kit, spacers): offset and spacing in metres (both taken as moving the wheel out from the centre line), width in metres added to the tyre, axles 0, 2 or 3 (taken as front, rear and both; not confirmed), relative as stored. lights are the vehicle's light patterns (sirens, strobes, indicators): patterns by name with slot, speed, clock and per lamp the bone name hash (joaat of siren12, indicator_lf ...) and steps of [phase offset, flash type number]; pack names the patterns of the vehicle's own light pack, a configuration's light_patterns the ones its parts link; archetypes gives a lamp bone's light set name (red, amber, led ..., a hash where the name is not known) and lamp_lights its light as [RRGGBB, intensity], from that light set of its light archetype in levels.rpf. What a flash type number looks like over time is not decoded. steering_lock is fSteeringLock of the model's handling record (radians, the largest angle of the steered wheels; from the PSO files in data.rpf, joined by handlingId). display_name and make are the game's own text for the model's name hash and its vehicleMakeName (from the first text table in data.rpf that has them: English). Names resolve where known; others are joaat hex.",
+        "note": "Per vehicle model: model_info (vehicles.meta-like; wheelScale / wheelScaleRear are not understood: they are not the rim radius (0.219 on comet7, whose rim is 0.82 x a 0.35 m tyre). A wheel's size, width and position are in the model's export (model.json wheel_mounts, from the collision discs), and the rim's share of it in the configuration's rim_ratio), configurations (body colour ARGB + the part models incl. rim and tyre; parts_key = a key of the part list that a vehicle export's model.json part_colours.configs uses to name the part colours of this configuration; rim_ratio = rim radius / tyre radius from the configuration's wheel fitment record, slot 39d5e253, where it has one), palettes (ARGB paint-colour lists; colours repeat, so repetition reads as the draw weight), part_groups (weighted part choices). mods are the parts with models: the vehicle pack's own and, marked shared, the library parts its configurations name (truck beds and boxes, light bars ...); an element's asset names its model in a vehicle pack (16 hex digits: the first half of MurmurHash3 x64 128, seed 0, of the model's lower-case name without LOD suffix; null in the library), and model is the joaat of the model's name for library parts (in a pack it is only the low half of asset), bone the bone it is modelled around and hides the stock bones it replaces. switches are the stock alternatives of a part (bonnet variants, aerial, light bar and plate mounts, engine pieces): a fitted part sets keys (part_keys: part name -> keys, for the pack's own parts and the library parts its configurations name), and a switch, in force while its part is fitted (part; null = the chassis part, always fitted), shows the element of the option whose key is set (and whose also key, where it has one, is set too: such an option goes first; a null element shows nothing), else its default element (null = nothing). wheel_fits is what a fitted part changes on the wheels (part name -> wheel fitment records, struct 9a172293: a widebody kit, spacers): offset and spacing in metres (both taken as moving the wheel out from the centre line), width in metres added to the tyre, axles 0, 2 or 3 (taken as front, rear and both; not confirmed), relative as stored. lights are the vehicle's light patterns (sirens, strobes, indicators): patterns by name with slot, speed, clock and per lamp the bone name hash (joaat of siren12, indicator_lf ...) and steps of [phase offset, flash type number]; pack names the patterns of the vehicle's own light pack, a configuration's light_patterns the ones its parts link; archetypes gives a lamp bone's light set name (red, amber, led ..., a hash where the name is not known) and lamp_lights its light as [RRGGBB, intensity], from that light set of its light archetype in levels.rpf. What a flash type number looks like over time is not decoded. records_from: the hash whose record held this model's configurations, palettes, parts and liveries (a handlingId merged in, or a name with no model, such as the gameName trailer of the semi-trailer trailers, named after the model its chassis part fits; the liveries of that hash belong to this model). steering_lock is fSteeringLock of the model's handling record (radians, the largest angle of the steered wheels; from the PSO files in data.rpf, joined by handlingId). display_name and make are the game's own text for the model's name hash and its vehicleMakeName (from the first text table in data.rpf that has them: English). Names resolve where known; others are joaat hex.",
         "format": FORMAT,
         "sources": sources,
         "vehicles": list,
     }))?)?;
-    Ok(json!({"models": list.len(), "named": named, "with_model_info": with_info, "configurations": n_cfg, "configurations_with_rim": n_rim, "palettes": n_pal, "display_names": n_named, "shared_parts": n_shared, "wheel_fits": n_fits, "switches": n_switches, "light_patterns": n_lights, "steering_locks": n_lock, "file": path}))
+    Ok(json!({"models": list.len(), "named": named, "with_model_info": with_info, "configurations": n_cfg, "configurations_with_rim": n_rim, "palettes": n_pal, "display_names": n_named, "shared_parts": n_shared, "wheel_fits": n_fits, "switches": n_switches, "light_patterns": n_lights, "steering_locks": n_lock, "merged_by_handling": merged, "named_by_chassis": named_by_chassis, "file": path}))
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    fn rec(model: Option<&str>, h: u32, cfgs: usize) -> Value {
+        json!({"model": model, "model_hash": format!("{h:08x}"), "model_info": {"x": h}, "configurations": vec![json!({"colour": "c"}); cfgs], "palettes": [], "part_groups": []})
+    }
+
+    #[test]
+    fn a_handling_record_goes_into_its_model() {
+        // guardiantx2 (model info only) and guardian (its configurations)
+        let (model, handling) = (0x70cb_15b3, 0x825a_9f4c);
+        let mut models = BTreeMap::from([(model, rec(Some("guardiantx2"), model, 0)), (handling, rec(None, handling, 10))]);
+        models.get_mut(&handling).unwrap()["mods"] = json!([{"name": "p"}]);
+        let users = HashMap::from([(handling, [model].into())]);
+        let count = HashMap::from([(model, ["mi".to_string()].into())]);
+        let m = merge_by_handling(&mut models, &users, &count);
+        assert_eq!(m.get("825a9f4c").map(String::as_str), Some("guardiantx2"));
+        assert!(!models.contains_key(&handling));
+        let g = &models[&model];
+        assert_eq!(g["configurations"].as_array().unwrap().len(), 10);
+        assert_eq!(g["mods"][0]["name"], "p");
+        assert_eq!(g["records_from"], "825a9f4c");
+        assert_eq!(g["model_info"]["x"], model);
+        // lists both have are joined
+        let mut models = BTreeMap::from([(model, rec(Some("blazer4"), model, 0)), (handling, rec(None, handling, 3))]);
+        models.get_mut(&model).unwrap()["palettes"] = json!([["a"]]);
+        models.get_mut(&handling).unwrap()["palettes"] = json!([["a"], ["b"]]);
+        merge_by_handling(&mut models, &users, &count);
+        assert_eq!(models[&model]["palettes"], json!([["a"], ["b"]]));
+    }
+
+    #[test]
+    fn a_record_with_no_name_takes_its_chassis_model() {
+        let (h, other) = (0x5c27_aa11, 7);
+        let chassis = |asset: &str| json!({"slot": format!("{SLOT_CHASSIS:08x}"), "elements": [{"asset": asset}]});
+        let names = HashMap::from([(meta7a::joaat("trailers"), "trailers".to_string()), (meta7a::joaat("mule"), "mule".to_string())]);
+        let a = format!("{:016x}", meta7a::asset_id("trailers"));
+        let mut models = BTreeMap::from([(h, rec(None, h, 39)), (other, rec(None, other, 2))]);
+        models.get_mut(&h).unwrap()["mods"] = json!([chassis(&a)]);
+        // two chassis parts naming different models: not certain
+        models.get_mut(&other).unwrap()["mods"] = json!([chassis(&a), chassis(&format!("{:016x}", meta7a::asset_id("mule")))]);
+        let n = name_by_chassis(&mut models, &names);
+        assert_eq!(n.len(), 1);
+        let t = &models[&meta7a::joaat("trailers")];
+        assert_eq!((t["model"].as_str(), t["records_from"].as_str()), (Some("trailers"), Some("5c27aa11")));
+        assert!(models[&other]["model"].is_null());
+        // a model with a record of its own keeps it
+        let mut models = BTreeMap::from([(h, rec(None, h, 3)), (meta7a::joaat("trailers"), rec(Some("trailers"), meta7a::joaat("trailers"), 0))]);
+        models.get_mut(&h).unwrap()["mods"] = json!([chassis(&a)]);
+        assert!(name_by_chassis(&mut models, &names).is_empty());
+    }
+
+    #[test]
+    fn shared_or_unsure_records_stay_apart() {
+        let (model, other, handling) = (1, 2, 3);
+        let base = BTreeMap::from([(model, rec(Some("freight"), model, 0)), (other, rec(Some("tankercar"), other, 0)), (handling, rec(None, handling, 2))]);
+        // two models name the handlingId
+        let mut models = base.clone();
+        let users = HashMap::from([(handling, [model, other].into())]);
+        let count = HashMap::from([(model, ["a".to_string()].into()), (other, ["b".to_string()].into())]);
+        assert!(merge_by_handling(&mut models, &users, &count).is_empty());
+        // the gameName has two model infos (freight cars)
+        let mut models = base.clone();
+        let users = HashMap::from([(handling, [model].into())]);
+        let count = HashMap::from([(model, ["a".to_string(), "b".to_string()].into())]);
+        assert!(merge_by_handling(&mut models, &users, &count).is_empty());
+        // the model has configurations of its own
+        let mut models = base;
+        models.insert(model, rec(Some("freight"), model, 1));
+        let count = HashMap::from([(model, ["a".to_string()].into())]);
+        assert!(merge_by_handling(&mut models, &users, &count).is_empty());
+        assert!(models.contains_key(&handling));
+    }
 }

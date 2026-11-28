@@ -618,6 +618,23 @@ impl Library {
                         mv.picker.toggle_favourite(id);
                     }
                 });
+                // A character exports as one rigged GLB of the outfit and body shape the viewer shows
+                // (`sixng outfit`), not as its own default parts, one file each: those leave out the
+                // clothes the outfit takes from shared items, the tints and the body shape.
+                if id.contains("#outfit:") {
+                    ui.horizontal(|ui| {
+                        let hover = if mv.shows_look_of(id) {
+                            format!("Queues a job: the outfit and body shape shown in the 3D viewer as one rigged GLB (glTF + textures) in {out_root}/characters")
+                        } else {
+                            format!("Queues a job: the character's first outfit in its own body-shape preset as one rigged GLB (glTF + textures) in {out_root}/characters. Open it in the 3D viewer to pick another outfit or body shape first.")
+                        };
+                        if ui.button("⬇ Export (glTF + textures)").on_hover_text(hover).clicked() {
+                            if let Some((file, args)) = mv.outfit_export(id, out_root) {
+                                *act = Some(Action::Job(format!("export {file}"), args));
+                            }
+                        }
+                    });
+                } else {
                 ui.horizontal(|ui| {
                     let (ids, hover) = match &parts {
                         Some(p) => (p.join(","), format!("Queues a job: extract the {} parts to {out_root} (one glTF each, in the same bind pose, so they line up when imported together)", p.len())),
@@ -628,6 +645,7 @@ impl Library {
                         *act = Some(Action::Job(format!("export {name}"), vec!["extract".into(), archive_of(&first).into(), "--id".into(), ids, "-o".into(), out_root.into(), "--tex".into(), "both".into()]));
                     }
                 });
+                }
             });
         });
         ui.separator();
