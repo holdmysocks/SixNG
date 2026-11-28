@@ -1981,13 +1981,14 @@ fn look_row(t: &Models, a: &ArchiveInfo, ix: &ArchiveIndex, model: &str, row: &M
     let decorations = crate::peddeco::get(&crate::export::game_root(a));
     let assign_decorations = |parts: &mut Vec<LookPart>, cats: &HashMap<String, u32>, vs: &[&Variation]| {
         let Some(cat) = decorations else { return };
+        // a name is a record or a set of records ([`crate::peddeco::SET`])
         let mut seen = HashSet::new();
-        for n in vs.iter().flat_map(|v| &v.parts).flat_map(|p| &p.decorations) {
-            let Some(d) = u32::from_str_radix(n, 16).ok().filter(|h| seen.insert(*h)).and_then(|h| cat.get(h)) else { continue };
+        let names = vs.iter().flat_map(|v| &v.parts).flat_map(|p| &p.decorations).filter_map(|n| u32::from_str_radix(n, 16).ok());
+        for d in names.flat_map(|h| cat.records(h)).filter(|d| seen.insert(d.name)) {
             let Some(slot) = crate::peddeco::skin_slot(d.category) else { continue };
             let at = parts.iter().position(|p| cats.get(&p.drawable) == Some(&d.category)).or_else(|| parts.iter().position(|p| p.slot == slot));
             if let Some(i) = at {
-                parts[i].decorations.push(n.clone());
+                parts[i].decorations.push(format!("{:08x}", d.name));
             }
         }
         // the skin tone: the first item (a skin-tone item) or variation (the

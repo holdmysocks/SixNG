@@ -82,13 +82,19 @@ use std::sync::OnceLock;
 pub const RECORD: u32 = 0x40e7_9f52;
 /// The layer struct.
 pub const LAYER: u32 = 0x77f0_121d;
+/// The decoration set struct: a name and the records it stands for
+/// (`Name`, `Values`). A wardrobe item's decoration name is a record or a
+/// set; a set's records each go on the part of their own category (a design
+/// split over the upper body and the head, or the upper and the lower body).
+/// A set's head records are left out ([`Catalogue::records`]).
+pub const SET: u32 = 0x9150_1997;
 /// Wardrobe tag key whose items are decoration names (`decorationpresets`).
 pub const TAG: u32 = 0xd9f1_087b;
 /// Decoration categories that go on skin, with the outfit slot that takes
 /// them when no part has that item category.
 pub const SKIN_CATEGORIES: [(u32, &str); 3] = [(0x3817_131d, "body upper"), (0x4492_5bfd, "body lower"), (0x378a_d10c, "head")];
 
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 /// Changes when the bake rule changes, so baked textures are made again.
 pub const BAKE_RULE: u32 = 12;
 /// The skin tone record struct (`data.rpf`): a name, a linear colour.
@@ -147,8 +153,13 @@ pub struct Catalogue {
     /// Skin tones: name, linear RGB (the colour head makeup starts from).
     #[serde(default)]
     pub skin_tones: Vec<(u32, [f32; 3])>,
+    /// Decoration sets ([`SET`]): name, record names.
+    #[serde(default)]
+    pub sets: Vec<(u32, Vec<u32>)>,
     #[serde(skip)]
     by_name: HashMap<u32, usize>,
+    #[serde(skip)]
+    by_set: HashMap<u32, usize>,
 }
 
 fn le32(d: &[u8], o: usize) -> u32 {
@@ -221,12 +232,38 @@ impl Catalogue {
                 Decoration { name: le32(d, o + name), category: le32(d, o + cat), layers: ls }
             })
             .collect();
-        (!decorations.is_empty()).then(|| Catalogue { version: VERSION, source: source.into(), decorations, skin_tones: Vec::new(), by_name: HashMap::new() }.indexed())
+        let sets = match (member(p, SET, 0xacec_22be), member(p, SET, 0x24b9_ad8a)) {
+            (Some(name), Some(values)) => p
+                .meta()
+                .objects(SET)
+                .into_iter()
+                .map(|o| (le32(d, o + name), array(p, o + values).map(|(n, b)| (0..n).map(|i| le32(d, b + 4 * i)).collect()).unwrap_or_default()))
+                .collect(),
+            _ => Vec::new(),
+        };
+        (!decorations.is_empty()).then(|| Catalogue { version: VERSION, source: source.into(), decorations, skin_tones: Vec::new(), sets, by_name: HashMap::new(), by_set: HashMap::new() }.indexed())
     }
 
     fn indexed(mut self) -> Self {
         self.by_name = self.decorations.iter().enumerate().map(|(i, d)| (d.name, i)).collect();
+        self.by_set = self.sets.iter().enumerate().map(|(i, s)| (s.0, i)).collect();
         self
+    }
+
+    /// The records a wardrobe decoration name stands for: the record of that
+    /// name, else the body records of the set of that name ([`SET`]).
+    ///
+    /// A set's head records are left out: most of their layers (55 of 69)
+    /// repeat a layer of the set's body record with the same texture and
+    /// matrix, so they continue a design placed in body space (a neck
+    /// piece) onto the head mesh. Where that space falls on the head is not
+    /// known: placed in the head's own UV they cover the face.
+    pub fn records(&self, name: u32) -> Vec<&Decoration> {
+        if let Some(d) = self.get(name) {
+            return vec![d];
+        }
+        let body = |d: &&Decoration| skin_slot(d.category) != Some("head");
+        self.by_set.get(&name).map(|&i| self.sets[i].1.iter().filter_map(|&n| self.get(n)).filter(body).collect()).unwrap_or_default()
     }
 
     pub fn get(&self, name: u32) -> Option<&Decoration> {
@@ -1060,6 +1097,18 @@ mod tests {
 
     fn corner(u: f32, v: f32, colours: [u8; 8]) -> Corner {
         Corner { at: [u, v], colours }
+    }
+
+    #[test]
+    fn a_set_name_stands_for_its_records() {
+        let rec = |name, category| Decoration { name, category, layers: vec![] };
+        let c = Catalogue { version: VERSION, source: String::new(), decorations: vec![rec(1, 0x3817_131d), rec(2, 0x378a_d10c), rec(3, 0x4492_5bfd)], skin_tones: vec![], sets: vec![(10, vec![1, 2, 99])], by_name: HashMap::new(), by_set: HashMap::new() }.indexed();
+        assert_eq!(c.records(3).iter().map(|d| d.name).collect::<Vec<_>>(), vec![3]);
+        // a set gives its body members that are in the catalogue (not its head one)
+        assert_eq!(c.records(10).iter().map(|d| d.name).collect::<Vec<_>>(), vec![1]);
+        // a head record named directly still counts
+        assert_eq!(c.records(2).iter().map(|d| d.name).collect::<Vec<_>>(), vec![2]);
+        assert!(c.records(42).is_empty());
     }
 
     #[test]
