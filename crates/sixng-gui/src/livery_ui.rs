@@ -1390,6 +1390,9 @@ impl State {
             self.ed.auto_drag = None;
             let pos = rect.min + egui::vec2(rect.width() * c[0], rect.height() * c[1]);
             let hit = self.hit(pos, rect, cam, model, env.skin);
+            if let Some(h) = &hit {
+                eprintln!("[livery] scripted drag to {c:?}: zone {} at {:.3?} on the model", h.zone, h.pos.to_array());
+            }
             match hit.and_then(|h| self.place_of(i, &h)) {
                 Some(uv) => {
                     self.livery.stickers[i].fresh = false;
@@ -1529,7 +1532,7 @@ impl State {
         if !own && !other {
             return None;
         }
-        Some(self.zones.set(slot, &s.zones, set)?.uv_at(h.pos))
+        Some(self.zones.set(slot, &s.zones, set)?.uv_at(h.pos, s.from))
     }
 
     /// What the view shows at a place of the viewport.
