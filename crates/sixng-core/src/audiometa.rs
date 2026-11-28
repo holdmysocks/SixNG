@@ -520,6 +520,100 @@ pub fn bank_list(file: &[u8], m: &AudioMeta) -> Option<Vec<BankListEntry>> {
     })
 }
 
+/// Schema id of the speech files.
+pub const SCHEMA_SPEECH: u32 = 18;
+
+/// A speech context's hash: joaat of the lower-case context name without
+/// the final mix (the context of wave `GENERIC_HI_01` is `GENERIC_HI`).
+pub fn context_hash(name: &str) -> u32 {
+    let mut h: u32 = 0;
+    for c in name.bytes() {
+        h = h.wrapping_add(c.to_ascii_lowercase() as u32);
+        h = h.wrapping_add(h << 10);
+        h ^= h >> 6;
+    }
+    h
+}
+
+/// Per voice (name hash), per context ([`context_hash`]): the container of
+/// the bank that holds the context's takes, and the number of takes.
+pub type Voices = std::collections::BTreeMap<u32, std::collections::BTreeMap<u32, (u32, u16)>>;
+
+/// The voices of a speech file (schema 18). A voice object is named after
+/// the voice (`jason`, `lucia`: the game's character names) and holds a u32
+/// count, then count x `{u32 context hash, u16 bank ref, u16 takes}` sorted
+/// by hash. A bank ref `r` names the 5-byte class-2 object whose name hash
+/// is `r` (these objects are named by number), which holds the container
+/// hash after its class byte. In
+/// `story000.rpf`: 2,186 voices, 176,212 contexts, every bank ref resolves;
+/// for the 241 lines `dialogue-links` placed by a speaker's single-bank
+/// lines, the speaker's voice gives the same bank in 241. Other objects
+/// that read this way by chance are not voices: every entry's ref must
+/// resolve and the hashes must rise.
+pub fn speech_voices(file: &[u8], m: &AudioMeta) -> Voices {
+    let mut out = Voices::new();
+    if m.schema != SCHEMA_SPEECH {
+        return out;
+    }
+    let data = |o: &Object| file.get(8 + o.offset as usize..8 + o.offset as usize + o.size as usize);
+    let u = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    let banks: std::collections::HashMap<u32, u32> = m
+        .objects
+        .iter()
+        .filter(|o| o.class == 2 && o.size >= 5)
+        .filter_map(|o| Some((u32::from_str_radix(&o.hash, 16).ok()?, u(data(o)?, 1))))
+        .collect();
+    for o in &m.objects {
+        let (Some(d), Ok(voice)) = (data(o), u32::from_str_radix(&o.hash, 16)) else { continue };
+        if d.len() < 12 {
+            continue;
+        }
+        let n = u(d, 0) as usize;
+        if n == 0 || d.len() < 4 + 8 * n || d.len() >= 12 + 8 * n {
+            continue;
+        }
+        let mut ctx = std::collections::BTreeMap::new();
+        let mut last = None;
+        for k in 0..n {
+            let e = 4 + 8 * k;
+            let h = u(d, e);
+            let r = u16::from_le_bytes([d[e + 4], d[e + 5]]);
+            let takes = u16::from_le_bytes([d[e + 6], d[e + 7]]);
+            let Some(&container) = banks.get(&(r as u32)) else { break };
+            if last.is_some_and(|l| l >= h) {
+                break;
+            }
+            last = Some(h);
+            ctx.insert(h, (container, takes));
+        }
+        if ctx.len() == n {
+            out.insert(voice, ctx);
+        }
+    }
+    out
+}
+
+/// `<work>/index/audio_voices_<archive>.json`: voice hash (hex) -> context
+/// hash (hex) -> [container hash (hex), takes], written by `audio-meta`.
+pub fn voices_path(work: &std::path::Path, archive: &str) -> std::path::PathBuf {
+    work.join("index").join(format!("audio_voices_{}.json", archive.trim_end_matches(".rpf").replace(['/', '\\'], "_")))
+}
+
+pub fn save_voices(work: &std::path::Path, archive: &str, v: &Voices) -> Result<()> {
+    let j: std::collections::BTreeMap<String, std::collections::BTreeMap<String, (String, u16)>> =
+        v.iter().map(|(h, c)| (format!("{h:08x}"), c.iter().map(|(k, (b, t))| (format!("{k:08x}"), (format!("{b:08x}"), *t))).collect())).collect();
+    let p = voices_path(work, archive);
+    std::fs::create_dir_all(p.parent().unwrap())?;
+    crate::atomic::write(p, serde_json::to_vec(&j)?)?;
+    Ok(())
+}
+
+pub fn load_voices(work: &std::path::Path, archive: &str) -> Option<Voices> {
+    let j: std::collections::BTreeMap<String, std::collections::BTreeMap<String, (String, u16)>> = serde_json::from_slice(&std::fs::read(voices_path(work, archive)).ok()?).ok()?;
+    let x = |s: &str| u32::from_str_radix(s, 16).ok();
+    Some(j.into_iter().filter_map(|(h, c)| Some((x(&h)?, c.into_iter().filter_map(|(k, (b, t))| Some((x(&k)?, (x(&b)?, t)))).collect()))).collect())
+}
+
 /// How far past the last placed bank [`align_bank_list`] looks for an
 /// entry's bank.
 pub const LOOKAHEAD: usize = 128;
@@ -661,13 +755,14 @@ pub fn load_containers(work: &std::path::Path, archive: &str) -> Option<BankCont
 /// Decode every audio metadata file of an archive to
 /// `<out>/audio_meta/<archive>/<offset>.json` plus `index.jsonl`.
 /// Returns (decoded, failed, container hashes per bank, bank-list entries,
-/// the name hashes of every decoded object).
+/// the name hashes of every decoded object, the speech files' voices).
 /// `banks`: (bank offset, stream ids) of the archive's audio index, to link
 /// sound files to streams (empty: not linked, no containers); `sizes`: (bank
 /// offset, size), to place the bank list. Banks the sound files do not
 /// reach get their container from the bank list, with 0 waves.
-pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], banks: &[(u64, std::collections::HashSet<u32>)], sizes: &[(u64, u64)], out: &std::path::Path) -> Result<(usize, usize, BankContainers, Vec<BankListEntry>, std::collections::BTreeSet<u32>)> {
+pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], banks: &[(u64, std::collections::HashSet<u32>)], sizes: &[(u64, u64)], out: &std::path::Path) -> Result<(usize, usize, BankContainers, Vec<BankListEntry>, std::collections::BTreeSet<u32>, Voices)> {
     let mut containers = BankContainers::new();
+    let mut voices = Voices::new();
     let mut objects = std::collections::BTreeSet::new();
     let mut list: Vec<BankListEntry> = Vec::new();
     let known: std::collections::HashSet<u32> = banks.iter().flat_map(|(_, s)| s.iter().copied()).collect();
@@ -701,6 +796,11 @@ pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], ban
                 if let Some(l) = bank_list(&b, &m) {
                     list.extend(l);
                 }
+                // a speech file split over two entries: its voices from the joined bytes
+                if m.schema == SCHEMA_SPEECH {
+                    let full = if stitched.is_some() { stitch(&a.path, e, &b, &by_off).map(|x| x.0) } else { None };
+                    voices.extend(speech_voices(full.as_deref().unwrap_or(&b), &m));
+                }
                 objects.extend(m.objects.iter().filter_map(|o| u32::from_str_radix(&o.hash, 16).ok()));
                 ok += 1;
                 let file = format!("{:x}.json", e.off);
@@ -721,7 +821,7 @@ pub fn export(a: &crate::game::ArchiveInfo, entries: &[&crate::scan::Entry], ban
             containers.entry(off).or_insert_with(|| [(e.container, 0)].into_iter().collect());
         }
     }
-    Ok((ok, bad, containers, list, objects))
+    Ok((ok, bad, containers, list, objects, voices))
 }
 
 /// A large file can be indexed as two entries with stored (not zlib) 64 KiB
@@ -773,6 +873,39 @@ fn stitch(path: &std::path::Path, e: &crate::scan::Entry, b: &[u8], by_off: &[&c
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn speech_voices_name_each_contexts_bank() {
+        use super::*;
+        assert_eq!(context_hash("GENERIC_HI"), context_hash("generic_hi"));
+        // data: bank refs 1 and 2 (class 2, container), a voice of two contexts, an object that is no voice
+        let mut d = Vec::new();
+        let at = |d: &Vec<u8>| d.len() as u32;
+        let (b1, b2) = (at(&d), 5);
+        d.push(2);
+        d.extend(0xc1u32.to_le_bytes());
+        d.push(2);
+        d.extend(0xc2u32.to_le_bytes());
+        let v = at(&d);
+        d.extend(2u32.to_le_bytes());
+        for (h, r, t) in [(10u32, 2u16, 3u16), (20, 1, 1)] {
+            d.extend(h.to_le_bytes());
+            d.extend(r.to_le_bytes());
+            d.extend(t.to_le_bytes());
+        }
+        d.extend([0; 4]);
+        let junk = at(&d);
+        d.extend(1u32.to_le_bytes());
+        d.extend([9, 0, 0, 0, 7, 0, 1, 0]);
+        let obj = |h: u32, o: u32, size: u32, class: u8| Object { hash: format!("{h:08x}"), offset: o, size, class, ..Default::default() };
+        let mut file = vec![0; 8];
+        file.extend(&d);
+        let m = AudioMeta { schema: SCHEMA_SPEECH, data_len: d.len() as u32, table_counts: [0, 0], objects: vec![obj(1, b1, 5, 2), obj(2, b2 + b1, 5, 2), obj(0x7e, v, junk - v, 2), obj(0x7f, junk, d.len() as u32 - junk, 1)], classes: Default::default() };
+        let voices = speech_voices(&file, &m);
+        // the junk object's ref 7 names no bank: not a voice
+        assert_eq!(voices, Voices::from([(0x7e, [(10, (0xc2, 3)), (20, (0xc1, 1))].into())]));
+        assert!(speech_voices(&file, &AudioMeta { schema: 166, ..m }).is_empty());
+    }
+
     #[test]
     fn bank_list_align() {
         use super::*;

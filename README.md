@@ -1991,11 +1991,22 @@ the cue it plays (`Variation`). SixNG derives:
   audio index or, when that has none, in the first other archive with an
   audio index that has it (story lines also play from `audio.rpf`). Generic
   speech (a wave each character voice records) sits in several banks, one
-  per voice. Such a line plays from its speaker's voice bank: the candidate
-  bank whose container (from `sixng audio-meta <archive>`) holds at least
+  per voice. Such a line plays from its speaker's voice bank. First choice
+  is the speaker's speech voice. The pack's speech file (schema 18) has one
+  object per voice, named like the character (`jason`, `lucia`). It lists
+  each speech context (the wave without its `_NN` take, hashed as joaat
+  without the final mix) with the container of the bank that holds its
+  takes. `sixng audio-meta <archive>` writes these to
+  `<work>/index/audio_voices_<archive>.json`. Without a voice, the candidate
+  bank is the one whose container (also from `audio-meta`) holds at least
   two of the speaker's lines that are in one bank only, while no other
-  candidate holds any. A line whose ID is in no index, or in several banks
-  with no voice bank to pick, gets no audio;
+  candidate holds any. In `story000`, 635 generic lines sit in several
+  banks. The speech voices place 410 of them, including all 242 that the
+  older rule placed, and they agree on every one. 224 stay unplaced: their
+  speaker has no voice object (206), the voice lacks the context (17), or
+  it names a container no candidate has (1). A line
+  whose ID is in no index, or in several banks with no voice bank to pick,
+  gets no audio;
 - the speaker: the conversation's character hash. In a conversation with
   several characters, each character has a slot number and each line names
   the slot of the character who says it. A line without a slot falls back
@@ -2011,8 +2022,9 @@ the cue it plays (`Variation`). SixNG derives:
 
 The archive's audio index must exist (`sixng audio <archive>`). The report
 counts, per archive, the conversation files, lines, speakers and linked
-streams (by the archive that holds them; `audio_from_voice_banks` of them
-picked by voice bank), and the lines without a speaker by reason
+streams (by the archive that holds them; `audio_from_voice_banks` counts
+those picked by speech voice and by the speaker's lines), and the lines
+without a speaker by reason
 (`no_speaker`).
 
 **Address table.**

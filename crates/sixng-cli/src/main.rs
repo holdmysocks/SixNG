@@ -847,7 +847,7 @@ enum Cmd {
         #[arg(short, long)]
         out: PathBuf,
     },
-    /// Audio metadata files (the sound, game-object, curve, speech, music and mixer definitions beside a pack's banks: plain files with 0x045a88ea at +8): per file its schema id, every object's name hash, offset, size and class id (first byte), as <out>/audio_meta/<archive>/<offset>.json + index.jsonl. Sound files (schema 166) also get each simple sound's wave (container hash, stream id and, when the archive's audio index exists, its bank), the child sounds of randomized, sequential, wrapper and twenty other sound classes, and every sound's reachable (bank, stream) pairs. Names are hashes; other class fields are not decoded.
+    /// Audio metadata files (the sound, game-object, curve, speech, music and mixer definitions beside a pack's banks: plain files with 0x045a88ea at +8): per file its schema id, every object's name hash, offset, size and class id (first byte), as <out>/audio_meta/<archive>/<offset>.json + index.jsonl. Sound files (schema 166) also get each simple sound's wave (container hash, stream id and, when the archive's audio index exists, its bank), the child sounds of randomized, sequential, wrapper and twenty other sound classes, and every sound's reachable (bank, stream) pairs. Speech files (schema 18) give each voice's contexts and the container of the bank holding their takes (<work>/index/audio_voices_<archive>.json, read by `dialogue-links`). Names are hashes; other class fields are not decoded.
     AudioMeta {
         archive: String,
         #[arg(short, long)]
@@ -1183,7 +1183,7 @@ enum Cmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    /// Link subtitles to their speaker and audio stream: <work>/dialogue_links.json, read by `text --label`/`--find`, the Audio page and Scenes. With --conversations, from the game's conversation files (PSO: per line its subtitle label, audio cue and take and speaker slot, and the conversation's characters; subtitle key = joaat(label), wave = <cue>_<take>, looked up in the archive's audio index and then in the other indexed archives; a wave in several banks plays from the speaker's voice bank, from the bank containers `audio-meta` records); a table row for a subtitle these already link is compared with them and only fills a stream they give none. Reads a local address table (TSV with a header: subtitle_key as `<table>/<hex key>`, character_id, speaker_hash_hex, speaker_status, archive, bank_offset, stream_index, stream_id_hex, clip_name, data_offset, data_size, channel_id_hex, pcm_start_frame, pcm_end_frame_exclusive, confirmed). Each audio address is rebuilt from the archive's audio index (`sixng audio <archive>` first): a stream id or byte range that does not match the index is rejected, and a wave name is kept only when its joaat gives the stream id. Reports linked and rejected rows, confirmed and unconfirmed apart
+    /// Link subtitles to their speaker and audio stream: <work>/dialogue_links.json, read by `text --label`/`--find`, the Audio page and Scenes. With --conversations, from the game's conversation files (PSO: per line its subtitle label, audio cue and take and speaker slot, and the conversation's characters; subtitle key = joaat(label), wave = <cue>_<take>, looked up in the archive's audio index and then in the other indexed archives; a wave in several banks plays from the speaker's voice bank: the bank the speaker's speech voice names for the wave's context, else the one the speaker's single-bank lines point to, from the voices and bank containers `audio-meta` records); a table row for a subtitle these already link is compared with them and only fills a stream they give none. Reads a local address table (TSV with a header: subtitle_key as `<table>/<hex key>`, character_id, speaker_hash_hex, speaker_status, archive, bank_offset, stream_index, stream_id_hex, clip_name, data_offset, data_size, channel_id_hex, pcm_start_frame, pcm_end_frame_exclusive, confirmed). Each audio address is rebuilt from the archive's audio index (`sixng audio <archive>` first): a stream id or byte range that does not match the index is rejected, and a wave name is kept only when its joaat gives the stream id. Reports linked and rejected rows, confirmed and unconfirmed apart
     DialogueLinks {
         /// The local address table (TSV).
         #[arg(long)]
@@ -3357,7 +3357,14 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let aix = sixng_core::audio::load_index(&ws.work, &a.id).ok();
             let banks: Vec<(u64, std::collections::HashSet<u32>)> = aix.as_ref().map(|ix| ix.banks.iter().map(|b| (b.off, b.streams.iter().map(|s| s.id).collect())).collect()).unwrap_or_default();
             let sizes: Vec<(u64, u64)> = aix.as_ref().map(|ix| ix.banks.iter().map(|b| (b.off, b.size)).collect()).unwrap_or_default();
-            let (ok, bad, containers, list, objects) = sixng_core::audiometa::export(&a, &sel, &banks, &sizes, po)?;
+            let (ok, bad, containers, list, objects, voices) = sixng_core::audiometa::export(&a, &sel, &banks, &sizes, po)?;
+            // speech voices: which bank holds each voice's takes of a context, for `dialogue-links`
+            let speech = if voices.is_empty() {
+                None
+            } else {
+                sixng_core::audiometa::save_voices(&ws.work, &a.id, &voices)?;
+                Some(json!({"voices": voices.len(), "contexts": voices.values().map(|c| c.len()).sum::<usize>(), "file": sixng_core::audiometa::voices_path(&ws.work, &a.id)}))
+            };
             // which container (bank name hash) each bank holds, for `sixng audio`
             let named = if containers.is_empty() {
                 None
@@ -3374,7 +3381,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 };
                 Some(json!({"banks": c.len(), "from_sounds": containers.values().filter(|m| m.values().any(|n| *n > 0)).count(), "bank_list_entries": list.len(), "names": names, "file": sixng_core::audiometa::containers_path(&ws.work, &a.id)}))
             };
-            out.print(&json!({"ok": true, "archive": a.id, "scanned": sel.len(), "decoded": ok, "failed": bad, "linked_to_banks": !banks.is_empty(), "bank_containers": named, "seconds": t.elapsed().as_secs_f64(), "out": po.join("audio_meta")}));
+            out.print(&json!({"ok": true, "archive": a.id, "scanned": sel.len(), "decoded": ok, "failed": bad, "linked_to_banks": !banks.is_empty(), "bank_containers": named, "speech_voices": speech, "seconds": t.elapsed().as_secs_f64(), "out": po.join("audio_meta")}));
         }
         Cmd::Audio { archive, rescan, min_seconds, limit } => {
             use sixng_core::audio;
