@@ -239,6 +239,92 @@ pub struct Colliders {
     boxes: Vec<Cuboid>,
     /// Changes with the points or shapes (cache key).
     pub id: u64,
+    /// The character's own body and garment surfaces, which hair is kept
+    /// just outside of after the settle (`Surface::clear`).
+    pub surface: Option<Surface>,
+}
+
+/// A character's body and garment surfaces as vertices with their normals,
+/// binned for lookups. The game's colliders lie a few millimetres inside
+/// the cloth and skin (Mandy's tank top: 3 to 6 mm, up to 2 cm), so hair
+/// settled onto them ends under the garment it rests on. A display rule,
+/// not the game's: points at most `DEPTH` under the surface of the nearest
+/// vertex (within `REACH` of it) are moved out to `GAP` above it.
+pub struct Surface {
+    /// Per bin: vertex, unit normal and mesh.
+    grid: std::collections::HashMap<(i32, i32, i32), Vec<([f32; 3], [f32; 3], u32)>>,
+}
+
+impl Surface {
+    /// Bin size and the farthest a vertex is looked for (metres).
+    pub const REACH: f32 = 0.03;
+    /// The deepest a point may lie under the surface and be moved out.
+    pub const DEPTH: f32 = 0.025;
+    /// How far outside the surface a moved point is put.
+    pub const GAP: f32 = 0.002;
+
+    /// From meshes of vertices and their normals (same order, model space).
+    pub fn new(meshes: &[(Vec<[f32; 3]>, Vec<[f32; 3]>)]) -> Surface {
+        let mut grid: std::collections::HashMap<(i32, i32, i32), Vec<([f32; 3], [f32; 3], u32)>> = Default::default();
+        for (m, (points, normals)) in meshes.iter().enumerate() {
+            for (p, n) in points.iter().zip(normals) {
+                let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                if l > 1e-6 {
+                    grid.entry(Colliders::key(Self::REACH, *p)).or_default().push((*p, [n[0] / l, n[1] / l, n[2] / l], m as u32));
+                }
+            }
+        }
+        Surface { grid }
+    }
+
+    /// The point moved out of the surfaces, or None when it is outside
+    /// them. Each mesh is tested on its own nearest vertex (a garment over
+    /// skin: the skin's vertex may be nearer); the point goes out along the
+    /// normal of the mesh it lies deepest in, a few rounds.
+    pub fn lift(&self, mut p: [f32; 3]) -> Option<[f32; 3]> {
+        let mut moved = false;
+        for _ in 0..3 {
+            let (x, y, z) = Colliders::key(Self::REACH, p);
+            let mut near: std::collections::HashMap<u32, (f32, [f32; 3], [f32; 3])> = Default::default();
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        for (v, n, m) in self.grid.get(&(x + dx, y + dy, z + dz)).into_iter().flatten() {
+                            let d = (v[0] - p[0]).powi(2) + (v[1] - p[1]).powi(2) + (v[2] - p[2]).powi(2);
+                            if d < Self::REACH * Self::REACH && near.get(m).is_none_or(|b| d < b.0) {
+                                near.insert(*m, (d, *v, *n));
+                            }
+                        }
+                    }
+                }
+            }
+            let worst = near
+                .values()
+                .map(|(_, v, n)| ((p[0] - v[0]) * n[0] + (p[1] - v[1]) * n[1] + (p[2] - v[2]) * n[2], *n))
+                .filter(|(s, _)| *s < Self::GAP && *s > -Self::DEPTH)
+                .min_by(|a, b| a.0.total_cmp(&b.0));
+            let Some((s, n)) = worst else { break };
+            p = [0, 1, 2].map(|i| p[i] + (Self::GAP - s) * n[i]);
+            moved = true;
+        }
+        moved.then_some(p)
+    }
+
+    /// Moves the points of strands of `k` points (roots left as they are)
+    /// out of the surface; returns how many moved.
+    pub fn clear(&self, pts: &mut [[f32; 3]], k: usize) -> usize {
+        let mut moved = 0;
+        for (i, p) in pts.iter_mut().enumerate() {
+            if k > 0 && i % k == 0 {
+                continue;
+            }
+            if let Some(q) = self.lift(*p) {
+                *p = q;
+                moved += 1;
+            }
+        }
+        moved
+    }
 }
 
 /// A tapered capsule (a sphere when `a == b`): radius `ra` at `a`, `rb`
@@ -294,7 +380,7 @@ impl Colliders {
             grid.entry(Self::key(cell, *p)).or_default().push(*p);
             id = (id ^ (p[0].to_bits() as u64) << 1 ^ p[2].to_bits() as u64).wrapping_mul(0x100_0000_01b3);
         }
-        Colliders { cell, grid, shapes: Vec::new(), boxes: Vec::new(), id }
+        Colliders { cell, grid, shapes: Vec::new(), boxes: Vec::new(), id, surface: None }
     }
 
     /// Colliders from the body bound's round pieces.
@@ -305,7 +391,13 @@ impl Colliders {
                 id = (id ^ v.to_bits() as u64).wrapping_mul(0x100_0000_01b3);
             }
         }
-        Colliders { cell: Self::FALLOFF, grid: Default::default(), shapes, boxes: Vec::new(), id }
+        Colliders { cell: Self::FALLOFF, grid: Default::default(), shapes, boxes: Vec::new(), id, surface: None }
+    }
+
+    /// Adds the character's body and garment surfaces (`Surface`).
+    pub fn with_surface(mut self, surface: Surface) -> Colliders {
+        self.surface = Some(surface);
+        self
     }
 
     /// Adds the bound's boxes to the shapes.
@@ -2057,6 +2149,25 @@ mod tests {
         let mut g = hanging(4, 100.0, 1.0, false);
         g.sim = None;
         assert!(!g.settle(None));
+    }
+
+    /// Points shallowly under a garment go out to just above it, along the
+    /// normal of the mesh they lie in, even with skin nearer underneath;
+    /// points outside, too deep or far from every vertex stay; roots stay.
+    #[test]
+    fn surface_lifts_hair_out_of_a_garment() {
+        let grid = |z: f32| (0..21).flat_map(|i| (0..21).map(move |j| [i as f32 * 0.01 - 0.1, j as f32 * 0.01 - 0.1, z])).collect::<Vec<_>>();
+        let up = |n: usize| vec![[0.0, 0.0, 1.0]; n];
+        let (cloth, skin) = (grid(0.004), grid(0.0));
+        let sf = Surface::new(&[(skin.clone(), up(skin.len())), (cloth.clone(), up(cloth.len()))]);
+        let q = sf.lift([0.003, 0.002, 0.001]).unwrap();
+        assert!((q[2] - (0.004 + Surface::GAP)).abs() < 1e-5 && (q[0] - 0.003).abs() < 1e-6);
+        assert_eq!(sf.lift([0.0, 0.0, 0.01]), None);
+        assert_eq!(sf.lift([0.0, 0.0, -0.04]), None);
+        assert_eq!(sf.lift([0.5, 0.0, 0.0]), None);
+        let mut strand = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
+        assert_eq!(sf.clear(&mut strand, 2), 1);
+        assert_eq!(strand[0], [0.0, 0.0, 0.0]);
     }
 
     #[test]
