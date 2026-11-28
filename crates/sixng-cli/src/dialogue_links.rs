@@ -8,7 +8,7 @@ use sixng_core::audio::{StemWindow, StreamAddress};
 use sixng_core::audiometa::BankContainers;
 use sixng_core::dialogue::{self, DialogueLink, DialogueLinks, LinkedAudio, Speaker};
 use sixng_core::export::Workspace;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Speaker states that do not name one speaker.
@@ -238,6 +238,7 @@ pub fn generate(ws: &Workspace, addresses: Option<&Path>, conversations: &[Strin
     let rows: Vec<Vec<&str>> = table_lines.filter(|l| !l.trim().is_empty()).map(|l| l.trim_end_matches('\r').split('\t').collect()).collect();
 
     let (mut no_key, mut wave_mismatch) = (0, 0);
+    let mut table_names: Vec<String> = Vec::new();
     let mut tally: BTreeMap<&str, Tally> = BTreeMap::new();
     let mut check: BTreeMap<&'static str, usize> = BTreeMap::new();
     if let Some(cols) = &cols {
@@ -249,6 +250,9 @@ pub fn generate(ws: &Workspace, addresses: Option<&Path>, conversations: &[Strin
             };
             let status = cols.get(r, "speaker_status");
             let label = cols.get(r, "character_id");
+            if !label.is_empty() {
+                table_names.push(label.to_string());
+            }
             let speaker = (!label.is_empty() && !NO_SPEAKER.contains(&status)).then(|| Speaker { label: label.to_string(), hash: hex32(cols.get(r, "speaker_hash_hex")) });
 
             let mut audio = None;
@@ -283,12 +287,32 @@ pub fn generate(ws: &Workspace, addresses: Option<&Path>, conversations: &[Strin
     }
     ensure!(!links.is_empty(), "nothing to link");
 
+    let mut namer = Namer::new(&links);
+    for h in namer.wanted.clone() {
+        if let Some(n) = sixng_core::names::lookup(h, sixng_core::names::Ctx::Audio) {
+            namer.offer("names", &n);
+        }
+    }
+    if let Ok(models) = sixng_core::pedlook::model_names(&ws.game) {
+        for (h, n) in &models.names {
+            if !models.uncertain.contains(h) {
+                namer.offer_parts("ped_models", n);
+            }
+        }
+        for n in models.display.values() {
+            namer.offer_words("ped_models", n);
+        }
+    }
+    for n in &table_names {
+        namer.offer("address_table", n);
+    }
     if !tables.is_empty() {
         let wanted: HashSet<u32> = links.iter().map(|l| l.subtitle_key).collect();
         let mut texts: HashMap<u32, HashSet<String>> = HashMap::new();
         for path in tables {
             let table: TextTable = read_json(path)?;
             for (hash, text) in table.strings {
+                namer.offer_words("subtitles", &text);
                 let key = hex32(&hash).with_context(|| format!("invalid text key in {}", path.display()))?;
                 if wanted.contains(&key) && !text.trim().is_empty() {
                     texts.entry(key).or_default().insert(text);
@@ -299,6 +323,7 @@ pub fn generate(ws: &Workspace, addresses: Option<&Path>, conversations: &[Strin
             l.text = texts.get(&l.subtitle_key).filter(|v| v.len() == 1).and_then(|v| v.iter().next().cloned());
         }
     }
+    let speaker_names = namer.apply(&mut links);
     let audio_links = links.iter().filter(|l| l.audio.is_some()).count();
     let speakers = links.iter().filter(|l| l.speaker.is_some()).count();
     let with_text = links.iter().filter(|l| l.text.is_some()).count();
@@ -306,9 +331,90 @@ pub fn generate(ws: &Workspace, addresses: Option<&Path>, conversations: &[Strin
     dialogue::save(output, &DialogueLinks { schema_version: dialogue::SCHEMA_VERSION, links })?;
     let tally: BTreeMap<_, _> = tally.into_iter().map(|(k, t)| (k, json!({"linked": t.linked, "rejected": t.rejected}))).collect();
     let rejected: Vec<Value> = reasons.into_iter().map(|(why, (n, at))| json!({"reason": why, "count": n, "first": at})).collect();
-    Ok(json!({"ok": true, "file": output, "conversations": derived, "rows": rows.len(), "links": count, "speakers": speakers,
+    Ok(json!({"ok": true, "file": output, "conversations": derived, "rows": rows.len(), "links": count, "speakers": speakers, "speaker_names": speaker_names,
         "audio_links": audio_links, "with_text": with_text, "rows_without_subtitle_key": no_key,
         "wave_names_dropped": wave_mismatch, "audio": tally, "table_check": check, "rejected": rejected}))
+}
+
+/// Names for speakers known only by hash: a candidate names a speaker when
+/// the joaat of its lower-case spelling is the speaker's hash, and a speaker
+/// gets a name only when one distinct name matches it.
+struct Namer {
+    wanted: HashSet<u32>,
+    /// hash -> (names, first source that named it)
+    found: HashMap<u32, (BTreeSet<String>, &'static str)>,
+}
+
+impl Namer {
+    fn new(links: &[DialogueLink]) -> Self {
+        let wanted = links.iter().filter_map(|l| l.speaker.as_ref()).filter_map(|s| s.hash.filter(|h| s.label == format!("{h:08x}"))).collect();
+        Self { wanted, found: HashMap::new() }
+    }
+
+    fn offer(&mut self, source: &'static str, name: &str) {
+        let name = name.trim().to_ascii_lowercase();
+        if name.is_empty() || name.contains(':') {
+            return;
+        }
+        let h = sixng_core::meta7a::joaat(&name);
+        if self.wanted.contains(&h) {
+            self.found.entry(h).or_insert_with(|| (BTreeSet::new(), source)).0.insert(name);
+        }
+    }
+
+    /// A model name and its parts (`cs_bret_vogel`: `bret_vogel`, `vogel`,
+    /// `cs_bret`, ...), without a trailing number.
+    fn offer_parts(&mut self, source: &'static str, model: &str) {
+        let model = model.to_ascii_lowercase();
+        let base = model.trim_end_matches(|c: char| c.is_ascii_digit()).trim_end_matches('_');
+        for m in [model.as_str(), base] {
+            let parts: Vec<&str> = m.split('_').collect();
+            for i in 0..parts.len() {
+                self.offer(source, &parts[i..].join("_"));
+                self.offer(source, &parts[..=i].join("_"));
+            }
+        }
+    }
+
+    /// Words of a text and runs of two or three of them joined by `_`
+    /// ("Raul Bautista" -> `raul`, `bautista`, `raul_bautista`), with and
+    /// without apostrophes and dots.
+    fn offer_words(&mut self, source: &'static str, text: &str) {
+        let plain = sixng_core::text::plain(text);
+        const MARKS: [char; 3] = ['\'', '.', '-'];
+        let words: Vec<&str> = plain.split(|c: char| !(c.is_ascii_alphabetic() || MARKS.contains(&c))).map(|w| w.trim_matches(&MARKS[..])).filter(|w| !w.is_empty()).collect();
+        for i in 0..words.len() {
+            for k in 1..=3.min(words.len() - i) {
+                let joined = words[i..i + k].join("_");
+                self.offer(source, &joined);
+                if joined.contains(['\'', '.']) {
+                    self.offer(source, &joined.replace(['\'', '.'], ""));
+                }
+            }
+        }
+    }
+
+    /// Name the speakers; report named speakers and lines per source and
+    /// the speakers several names match.
+    fn apply(&self, links: &mut [DialogueLink]) -> Value {
+        let mut speakers: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut lines: BTreeMap<&str, usize> = BTreeMap::new();
+        for (names, source) in self.found.values() {
+            if names.len() == 1 {
+                *speakers.entry(source).or_default() += 1;
+            }
+        }
+        for l in links.iter_mut() {
+            let Some(s) = l.speaker.as_mut() else { continue };
+            let Some(h) = s.hash.filter(|h| s.label == format!("{h:08x}")) else { continue };
+            if let Some((names, source)) = self.found.get(&h).filter(|(n, _)| n.len() == 1) {
+                s.label = names.iter().next().unwrap().clone();
+                *lines.entry(source).or_default() += 1;
+            }
+        }
+        let several = self.found.values().filter(|(n, _)| n.len() > 1).count();
+        json!({"speakers": self.wanted.len(), "named": speakers, "lines_named": lines, "several_names": several})
+    }
 }
 
 /// Compare a table row with the links derived for its subtitle (`found`,
@@ -558,5 +664,30 @@ mod tests {
         check_row(&mut links, &[1], &characters, Some(address(8192)), None, &mut check);
         assert_eq!(links[1].audio.as_ref().unwrap().address.bank_offset, 8192);
         assert_eq!(check, BTreeMap::from([("audio_agrees", 1), ("audio_differs", 1), ("audio_filled", 1), ("speaker_agrees", 1), ("speaker_differs", 1), ("speaker_id_not_in_files", 1)]));
+    }
+
+    #[test]
+    fn speakers_are_named_by_hash_from_one_distinct_name() {
+        let j = sixng_core::meta7a::joaat;
+        let link = |h: u32| DialogueLink { subtitle_key: h, speaker: Some(Speaker { label: format!("{h:08x}"), hash: Some(h) }), audio: None, text: None, mission: None, scene: None };
+        let (guide, bret, twin) = (j("guide_fx"), j("bret_vogel"), j("fx"));
+        let mut links = vec![link(guide), link(bret), link(twin), link(j("nobody_fx")),
+            // a table speaker keeps its own label
+            DialogueLink { subtitle_key: 9, speaker: Some(Speaker { label: "visitor".into(), hash: Some(j("visitor")) }), audio: None, text: None, mission: None, scene: None }];
+        let mut namer = Namer::new(&links);
+        namer.offer_words("subtitles", "~sl:0:1~Hey, Guide FX! I'm here.");
+        namer.offer_parts("ped_models", "cs_bret_vogel_01");
+        // two distinct names for one hash: no name
+        namer.offer("names", "fx");
+        namer.found.get_mut(&twin).unwrap().0.insert("other".into());
+        namer.offer("address_table", "credit:someone");
+        let report = namer.apply(&mut links);
+        let labels: Vec<&str> = links.iter().map(|l| l.speaker.as_ref().unwrap().label.as_str()).collect();
+        assert_eq!(labels[..2], ["guide_fx", "bret_vogel"]);
+        assert_eq!(labels[2], format!("{twin:08x}"));
+        assert_eq!(labels[4], "visitor");
+        assert_eq!(report["named"], json!({"ped_models": 1, "subtitles": 1}));
+        assert_eq!(report["several_names"], 1);
+        assert_eq!(report["speakers"], 4);
     }
 }
