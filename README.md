@@ -1938,6 +1938,13 @@ the cue it plays (`Variation`). SixNG derives:
   the slot of the character who says it. A line without a slot falls back
   to the character whose single-speaker conversations use the same voice,
   when that is one of the conversation's characters.
+  A character hash is the joaat of the character's lower-case name. A
+  speaker is named when exactly one name from the name dictionary, the ped
+  model names (and their parts, `cs_bret_vogel` -> `bret_vogel`), the
+  address table or the words of the subtitle text tables (single words and
+  runs of two or three joined by `_`) has that hash; otherwise it keeps
+  its hash as its label. The report's `speaker_names` counts named speakers
+  and lines per source.
 
 The archive's audio index must exist (`sixng audio <archive>`). The report
 counts, per archive, the conversation files, lines, speakers and linked
