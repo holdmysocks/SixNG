@@ -1137,7 +1137,11 @@ enum Cmd {
     /// / `_tNN` / `_xN` suffixes, an audio name in its scene files, or the
     /// bank of the master timelines placing it. Scenes
     /// placed in a master timeline list the master, the start time, the
-    /// section and the master's own audio bank.
+    /// section and the master's own audio bank. Each scene lists its
+    /// subtitle lines (label, speaker, start and end in the scene, and the
+    /// time on the master's bank clock for a scene placed once), with text
+    /// and speaker names from the dialogue links (`dialogue-links`) when
+    /// they exist.
     Cutscenes {
         /// One scene in full (name, `cin@` optional).
         scene: Option<String>,
@@ -2166,6 +2170,11 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             if let Some(ix) = &aix {
                 cutscene::attach_audio(&mut all, &c, &cutscene::AudioBanks::new(ix));
             }
+            // subtitle text and speaker names from the dialogue links, when they exist
+            let links = sixng_core::dialogue::load(&ws.work)?;
+            if let Some(l) = &links {
+                cutscene::attach_dialogue(&mut all, l);
+            }
             let re = name.as_deref().map(|n| regex::RegexBuilder::new(n).case_insensitive(true).build()).transpose()?;
             let cre = cast.as_deref().map(|n| regex::RegexBuilder::new(n).case_insensitive(true).build()).transpose()?;
             let sel: Vec<&cutscene::Scene> = match scene {
@@ -2177,6 +2186,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     .collect(),
             };
             let objs = || sel.iter().flat_map(|s| s.cast.iter().chain(&s.props).chain(&s.other));
+            let subs = || sel.iter().flat_map(|s| &s.subtitles);
             let count = |k: &str| objs().filter(|o| o.kind == k).count();
             let clips: usize = sel.iter().map(|s| s.cast.iter().chain(&s.props).chain(&s.other).map(|o| o.clips.len() + o.face_clips.len()).sum::<usize>()).sum();
             let totals = json!({
@@ -2204,6 +2214,16 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 "audio_bank_by": {"scene_name": sel.iter().filter(|s| s.audio.as_ref().is_some_and(|a| a.source == "scene name")).count(), "audio_name": sel.iter().filter(|s| s.audio.as_ref().is_some_and(|a| a.source == "audio name")).count(), "master_timeline": sel.iter().filter(|s| s.audio.as_ref().is_some_and(|a| a.source == "master timeline")).count()},
                 "placed_in_master": sel.iter().filter(|s| !s.placements.is_empty()).count(),
                 "placements": sel.iter().map(|s| s.placements.len()).sum::<usize>(),
+                "subtitles": {
+                    "lines": subs().count(),
+                    "scenes": sel.iter().filter(|s| !s.subtitles.is_empty()).count(),
+                    "dialogue_links": links.is_some(),
+                    "with_text": subs().filter(|x| x.text.is_some()).count(),
+                    "speaker_named": subs().filter(|x| u32::from_str_radix(&x.speaker, 16).is_err() || x.speaker.len() != 8).count(),
+                    "speaker_agrees": subs().filter(|x| x.speaker_agrees == Some(true)).count(),
+                    "speaker_differs": subs().filter(|x| x.speaker_agrees == Some(false)).count(),
+                    "on_bank_clock": subs().filter(|x| x.bank_time.is_some()).count(),
+                },
             });
             // master timelines of the archive: slots, those on a catalogued scene, and masters with an audio bank
             let hashes: std::collections::HashSet<u32> = all.iter().map(|s| sixng_core::meta7a::joaat(&s.name)).collect();

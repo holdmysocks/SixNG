@@ -87,7 +87,7 @@ pub fn mission_ids<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> 
     v
 }
 /// Bumped when the cached catalog's layout or contents change.
-pub const CATALOG_VERSION: u32 = 6;
+pub const CATALOG_VERSION: u32 = 7;
 
 /// Struct and member hashes of the scene files.
 pub mod hashes {
@@ -145,6 +145,43 @@ pub mod hashes {
     pub const CONDITION_STATE_ID: u32 = 0xf82a_367d;
     /// A condition on an entity's value (`entityName`, `value`): a branch.
     pub const CONDITION_ENTITY: u32 = 0xd5f7_c394;
+    /// `fwAnimSceneSubtitleEventData`: a subtitle line of a scene, with
+    /// `TextLabelName` (the text label), `Speaker` (joaat of the speaker's
+    /// character name), `startTime` and `endTime` (seconds into the scene).
+    pub const SUBTITLE: u32 = 0x2e33_8a28;
+    pub const SUBTITLE_LABEL: u32 = 0x14ff_380c;
+    pub const SUBTITLE_SPEAKER: u32 = 0x97bf_dfda;
+    pub const EVENT_START: u32 = 0x929d_b78d;
+    pub const EVENT_END: u32 = 0x2b30_c60b;
+}
+
+/// A subtitle event of a scene file.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SubtitleEvent {
+    /// Text label (`TextLabelName`); its joaat is the text-table key.
+    pub label: String,
+    /// `Speaker`: joaat of the speaker's character name (0 for none).
+    pub speaker: u32,
+    pub start: f32,
+    pub end: f32,
+}
+
+/// The subtitle events of a scene file, by start time. Events without a
+/// label are left out.
+pub fn subtitle_events(m: &Meta) -> Vec<SubtitleEvent> {
+    use hashes::*;
+    let (Some(sp), Some(st), Some(en)) = (member_off(m, SUBTITLE, SUBTITLE_SPEAKER), member_off(m, SUBTITLE, EVENT_START), member_off(m, SUBTITLE, EVENT_END)) else { return Vec::new() };
+    let mut out: Vec<SubtitleEvent> = m
+        .objects(SUBTITLE)
+        .into_iter()
+        .filter_map(|o| {
+            let label = m.member_value(SUBTITLE, o, SUBTITLE_LABEL)?.as_str().filter(|x| !x.is_empty())?.to_string();
+            Some(SubtitleEvent { label, speaker: m.r.u32(o + sp.0), start: m.r.f32(o + st.0), end: m.r.f32(o + en.0) })
+        })
+        .collect();
+    out.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.label.cmp(&b.label)));
+    out.dedup();
+    out
 }
 
 /// One slot of a master timeline: a scene section that starts `start`
@@ -409,6 +446,9 @@ pub struct SceneFile {
     /// The master's state machine ([`master_states`]); masters only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fsm: Vec<FsmState>,
+    /// Subtitle events ([`subtitle_events`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subtitles: Vec<SubtitleEvent>,
 }
 
 /// A transition of a master's state machine.
@@ -552,7 +592,7 @@ pub fn scene_file(id: &str, m: &Meta) -> Option<SceneFile> {
     audio.sort();
     audio.dedup();
     let fsm = if timeline.is_empty() { Vec::new() } else { master_states(m) };
-    Some(SceneFile { id: id.to_string(), states, objects, audio, timeline, fsm })
+    Some(SceneFile { id: id.to_string(), states, objects, audio, timeline, fsm, subtitles: subtitle_events(m) })
 }
 
 /// A timeline item: a section reference or a composite.
@@ -1001,6 +1041,33 @@ pub struct Scene {
     /// bank), when an audio index was given.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub master_audio: BTreeMap<String, SceneAudio>,
+    /// Subtitle lines of the scene's own scene files, by start time
+    /// ([`attach_dialogue`] adds text and speaker names).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub subtitles: Vec<SceneSubtitle>,
+}
+
+/// A subtitle line of a scene.
+#[derive(Clone, Debug, Serialize)]
+pub struct SceneSubtitle {
+    pub label: String,
+    /// Speaker: the dialogue links' name for the hash, else the hash (hex).
+    pub speaker: String,
+    /// Seconds into the scene.
+    pub start: f32,
+    pub end: f32,
+    /// The start on the audio bank clock of the one master that places the
+    /// scene (its placement's `bank_time` plus `start`); none for scenes
+    /// placed in no master or in several slots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bank_time: Option<f32>,
+    /// Text from the dialogue links.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Whether the dialogue links give this label the same speaker (by
+    /// hash); none when they give no speaker hash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_agrees: Option<bool>,
 }
 
 /// Build the scene list of a catalog.
@@ -1148,6 +1215,19 @@ pub fn scenes(c: &Catalog, models: &Models) -> Vec<Scene> {
             set_models,
             set_models_unresolved: set_unres,
             audio: None,
+            subtitles: {
+                let pl = placed.get(&joaat(scene));
+                let base = pl.filter(|v| v.len() == 1).map(|v| v[0].bank_time);
+                let mut v: Vec<SceneSubtitle> = files
+                    .iter()
+                    .filter(|f| f.timeline.is_empty())
+                    .flat_map(|f| &f.subtitles)
+                    .map(|e| SceneSubtitle { label: e.label.clone(), speaker: format!("{:08x}", e.speaker), start: e.start, end: e.end, bank_time: base.map(|b| b + e.start), text: None, speaker_agrees: None })
+                    .collect();
+                v.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.label.cmp(&b.label)));
+                v.dedup_by(|a, b| a.label == b.label && a.start == b.start);
+                v
+            },
             placements: placed.get(&joaat(scene)).cloned().unwrap_or_default(),
             master_audio: BTreeMap::new(),
         });
@@ -1184,6 +1264,33 @@ pub fn attach_audio(all: &mut [Scene], c: &Catalog, banks: &AudioBanks) {
                 if v.all(|a| a.bank == first.bank) {
                     s.audio = Some(SceneAudio { source: "master timeline", ..first.clone() });
                 }
+            }
+        }
+    }
+}
+
+/// Give the scenes' subtitle lines their text and speaker names from the
+/// dialogue links (looked up by the joaat of the label), and say whether
+/// the links' speaker hash is the event's own. Speaker names come from
+/// the links' speaker labels that are not the bare hash.
+pub fn attach_dialogue(all: &mut [Scene], links: &crate::dialogue::DialogueLinks) {
+    let by = links.by_subtitle();
+    let mut names: HashMap<u32, &str> = HashMap::new();
+    for l in &links.links {
+        if let Some(sp) = &l.speaker {
+            if let Some(h) = sp.hash.filter(|h| sp.label != format!("{h:08x}")) {
+                names.entry(h).or_insert(sp.label.as_str());
+            }
+        }
+    }
+    for s in all.iter_mut() {
+        for sub in &mut s.subtitles {
+            let hash = u32::from_str_radix(&sub.speaker, 16).ok();
+            let l = by.get(&joaat(&sub.label)).and_then(|v| v.first());
+            sub.text = l.and_then(|l| l.text.clone());
+            sub.speaker_agrees = l.and_then(|l| l.speaker.as_ref()?.hash).zip(hash).map(|(a, b)| a == b);
+            if let Some(n) = hash.and_then(|h| names.get(&h)) {
+                sub.speaker = n.to_string();
             }
         }
     }
@@ -1467,12 +1574,15 @@ mod tests {
             audio: vec!["test_scene_audio".into()],
             timeline: vec![],
             fsm: vec![],
+            subtitles: vec![SubtitleEvent { label: "TEST_SCENE_2".into(), speaker: joaat("lucia"), start: 3.0, end: 4.0 }, SubtitleEvent { label: "TEST_SCENE_1".into(), speaker: joaat("boss"), start: 1.0, end: 2.0 }],
         };
+        // the second scene's own file: one line (placed in the master at 12.5 s, bank time 10 s)
+        let f2 = SceneFile { id: "a.rpf@50".into(), states: vec![joaat("other_scene_p1_t01")], objects: vec![], audio: vec![], timeline: vec![], fsm: vec![], subtitles: vec![SubtitleEvent { label: "OTHER_1".into(), speaker: 0x1234, start: 0.5, end: 1.5 }] };
         // a master timeline that places the second scene's section 2 at 12.5 s
-        let master = SceneFile { id: "a.rpf@40".into(), states: vec![joaat("test_master")], objects: vec![], audio: vec!["tst_test_master".into()], timeline: vec![Slot { key: 11, also: vec![], start: 2.5, scene: 5, section: 1 }, Slot { key: 12, also: vec![], start: 12.5, scene: joaat("other_scene_p1_t01"), section: 2 }, Slot { key: 13, also: vec![14], start: 20.0, scene: 6, section: 3 }], fsm: test_fsm() };
+        let master = SceneFile { id: "a.rpf@40".into(), states: vec![joaat("test_master")], objects: vec![], audio: vec!["tst_test_master".into()], timeline: vec![Slot { key: 11, also: vec![], start: 2.5, scene: 5, section: 1 }, Slot { key: 12, also: vec![], start: 12.5, scene: joaat("other_scene_p1_t01"), section: 2 }, Slot { key: 13, also: vec![14], start: 20.0, scene: 6, section: 3 }], fsm: test_fsm(), subtitles: vec![] };
         // a second scene without a scene file of its own
         let d2 = SceneDict { name: "cin@other_scene_p1_t01".into(), id: "a.rpf@30".into(), clips: ["boss", "boss_face", "ib_phone"].map(String::from).to_vec(), sections: 0, section_ids: vec![], adopted_sections: 0, streamed: vec![], unjoined: vec![], windows_streamed: 0, windows_missing: 0 };
-        Catalog { version: CATALOG_VERSION, archive: "a.rpf".into(), dicts: vec![d, d2], files: vec![f, master] }
+        Catalog { version: CATALOG_VERSION, archive: "a.rpf".into(), dicts: vec![d, d2], files: vec![f, master, f2] }
     }
 
     #[test]
@@ -1504,6 +1614,32 @@ mod tests {
             // a state listing only the repeat key of the last slot
             FsmState { name: 500, starts: vec![14], transitions: vec![] },
         ]
+    }
+
+    #[test]
+    fn scene_subtitles_get_text_speakers_and_bank_times() {
+        use crate::dialogue::{DialogueLink, DialogueLinks, Speaker};
+        let c = catalog();
+        let mut all = scenes(&c, &Models::default());
+        let s = &all[0];
+        assert_eq!(s.subtitles.iter().map(|x| (x.label.as_str(), x.start, x.bank_time)).collect::<Vec<_>>(), vec![("TEST_SCENE_1", 1.0, None), ("TEST_SCENE_2", 3.0, None)]);
+        // placed once in the master: on its bank clock
+        assert_eq!(all[1].subtitles.iter().map(|x| (x.label.as_str(), x.bank_time)).collect::<Vec<_>>(), vec![("OTHER_1", Some(10.5))]);
+        let link = |label: &str, sp: Option<(&str, u32)>, text: &str| DialogueLink { subtitle_key: joaat(label), speaker: sp.map(|(l, h)| Speaker { label: l.into(), hash: Some(h) }), audio: None, text: Some(text.into()), mission: None, scene: None };
+        let links = DialogueLinks {
+            schema_version: 0,
+            links: vec![
+                link("TEST_SCENE_1", Some(("boss", joaat("boss"))), "Hello."),
+                // the links name lucia's hash through another line, and give this one another speaker
+                link("TEST_SCENE_2", Some(("00000007", 7)), "Bye."),
+                link("SOMEWHERE_ELSE", Some(("lucia", joaat("lucia"))), "Hi."),
+            ],
+        };
+        attach_dialogue(&mut all, &links);
+        let v: Vec<_> = all[0].subtitles.iter().map(|x| (x.speaker.as_str(), x.text.as_deref(), x.speaker_agrees)).collect();
+        assert_eq!(v, vec![("boss", Some("Hello."), Some(true)), ("lucia", Some("Bye."), Some(false))]);
+        // a label the links lack keeps its hash and has no text
+        assert_eq!((all[1].subtitles[0].speaker.as_str(), all[1].subtitles[0].text.as_deref()), ("00001234", None));
     }
 
     #[test]
@@ -1623,9 +1759,9 @@ mod tests {
         m.add(["cs_boss", "prop_cup_01a", "prop_table_01a"]);
         let all = scenes(&catalog(), &m);
         assert_eq!(all.len(), 2);
-        // the second scene: the ped's model from the other scene, the in-hand item a prop
+        // the second scene: no ped record in its own file, so the model from the other scene; the in-hand item a prop
         let o = &all[1];
-        assert!(o.scene_files.is_empty());
+        assert_eq!(o.scene_files, vec!["a.rpf@50".to_string()]);
         assert_eq!((o.cast[0].model.as_deref(), o.cast[0].model_source), (Some("cs_boss"), Some("other scenes")));
         assert_eq!((o.props[0].handle.as_str(), o.props[0].model.as_deref()), ("ib_phone", None));
         let s = &all[0];
