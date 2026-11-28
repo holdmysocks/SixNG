@@ -2004,7 +2004,14 @@ the cue it plays (`Variation`). SixNG derives:
   banks. The speech voices place 410 of them, including all 242 that the
   older rule placed, and they agree on every one. 224 stay unplaced: their
   speaker has no voice object (206), the voice lacks the context (17), or
-  it names a container no candidate has (1). A line
+  it names a container no candidate has (1). The 206 lines come from 92
+  generic roles (store clerks, cops, enemies): none of them is a ped model
+  or has other lines, and their waves are in up to 359 voices' banks. The
+  voice is that of whichever ped plays the role, chosen at run time. The
+  report gives that reason ("voice chosen at run time") when the line's
+  archive has speech voices but none for its speaker: 159 lines. The other
+  47 have candidate banks in `audio.rpf`, which has no speech voices, so they
+  keep the plain reason. A line
   whose ID is in no index, or in several banks with no voice bank to pick,
   gets no audio;
 - the speaker: the conversation's character hash. In a conversation with
