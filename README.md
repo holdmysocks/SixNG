@@ -1902,6 +1902,89 @@ pre-skip, with an exclusive end.
 plays only that channel and frame range. The full bank is still available
 in Audio.
 
+### Dialogue links
+
+`sixng dialogue-links` links subtitles to their speaker and audio stream
+and writes `<work>/dialogue_links.json`. It takes the links from the
+game's own conversation files, from a local address table, or both:
+
+```sh
+sixng audio 'pack/shared_minigame000/shared_minigame000'
+sixng dialogue-links --conversations 'pack/shared_minigame000/shared_minigame000'
+sixng audio 'pack/story000/story000'
+sixng audio audio
+sixng dialogue-links --conversations 'pack/shared_minigame000/shared_minigame000' --conversations 'pack/story000/story000' --addresses addresses.tsv --text-table 'text-export/text/data/1000.json'
+```
+
+**Conversation files.** A pack can hold one conversation file per mission
+(a PSO file; the minigame pack has five, the story pack about 730). A conversation lists its
+characters and its lines in the order they are spoken. Each line stores its
+subtitle label in plain text, its audio cue (`Context`) and which take of
+the cue it plays (`Variation`). SixNG derives:
+
+- the subtitle key: `joaat(label)`, the key in `sixng text` tables;
+- the wave: `<cue>_<take as two digits>`, whose joaat's low 29 bits are the
+  stream ID. The stream is the one stream with that ID in the archive's
+  audio index or, when that has none, in the first other archive with an
+  audio index that has it (story lines also play from `audio.rpf`). Generic
+  speech (a wave each character voice records) sits in several banks, one
+  per voice. Such a line plays from its speaker's voice bank: the candidate
+  bank whose container (from `sixng audio-meta <archive>`) holds at least
+  two of the speaker's lines that are in one bank only, while no other
+  candidate holds any. A line whose ID is in no index, or in several banks
+  with no voice bank to pick, gets no audio;
+- the speaker: the conversation's character hash. In a conversation with
+  several characters, each character has a slot number and each line names
+  the slot of the character who says it. A line without a slot falls back
+  to the character whose single-speaker conversations use the same voice,
+  when that is one of the conversation's characters.
+
+The archive's audio index must exist (`sixng audio <archive>`). The report
+counts, per archive, the conversation files, lines, speakers and linked
+streams (by the archive that holds them; `audio_from_voice_banks` of them
+picked by voice bank), and the lines without a speaker by reason
+(`no_speaker`).
+
+**Address table.**
+The table is a TSV file with a header row. The command reads these
+columns and ignores the rest: `subtitle_key` (`<table>/<hex key>`, the
+last part being the text label hash), `character_id`, `speaker_hash_hex`,
+`speaker_status`, `mission_id`, `scene`, `archive`, `bank_offset`,
+`stream_index`, `stream_id_hex`, `clip_name`, `data_offset`, `data_size`,
+`channel_id_hex`, `pcm_start_frame`, `pcm_end_frame_exclusive` and
+`confirmed`. A row needs only the key plus a speaker or an audio address.
+A row for a subtitle that the conversation files already link is not
+added. It is compared with the derived link instead, and only gives it a
+stream when the conversation files have none. The report's `table_check`
+counts agreeing and differing streams, streams filled from the table, and
+agreeing and differing speakers. A table speaker hash that no conversation
+file uses for any character is the table's own ID, not a game character;
+it is counted as `speaker_id_not_in_files`.
+
+The table only names the stream. The command rebuilds every address from
+the archive's SixNG audio index: the stream at `bank_offset` and
+`stream_index` must have the given ID, and the encoded byte range comes
+from the index. A table range that disagrees with the index rejects the
+row. A wave name (`clip_name`) is kept only when the low 29 bits of its
+joaat are the stream ID. Rows with a speaker state of `conflict`,
+`unattributed` or `no_verified_dialogue` get no speaker. The report
+counts linked and rejected addresses for confirmed and unconfirmed rows
+and groups the rejections by reason.
+
+With the file in place:
+
+- `sixng text --label` and `--find` add a `dialogue` list to each label
+  that has links: speaker, speaker hash, archive, bank, stream position,
+  stream ID, wave name and stem window.
+- **Audio** adds a **Subtitle** column to banks with linked streams. It
+  shows the speaker and the line; hover for every subtitle key.
+- **Scenes** fills the audio of a dialogue row from its subtitle's link
+  when the link names exactly one stream. Links that name a scene are
+  added to that scene's dialogue.
+
+Keep the address table and `dialogue_links.json` local: they hold game
+data.
+
 ## Output layout
 
 ```
