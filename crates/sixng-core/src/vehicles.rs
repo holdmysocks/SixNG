@@ -356,26 +356,32 @@ fn merge_by_handling(models: &mut BTreeMap<u32, Value>, handling_users: &HashMap
         }
         let Some(src) = models.remove(hid) else { continue };
         let Some(dst) = models.get_mut(&g) else { continue };
-        for (k, v) in src.as_object().into_iter().flatten() {
-            if matches!(k.as_str(), "model" | "model_hash" | "model_info" | "model_info_via") {
-                continue;
-            }
-            let unset = dst.get(k).is_none_or(|x| x.is_null() || x.as_array().is_some_and(|a| a.is_empty()) || x.as_object().is_some_and(|o| o.is_empty()));
-            if unset {
-                dst[k] = v.clone();
-            } else if let (Some(have), Some(more)) = (dst[k].as_array_mut(), v.as_array()) {
-                // lists (palettes, part groups): both records' entries
-                for x in more {
-                    if !have.contains(x) {
-                        have.push(x.clone());
-                    }
-                }
-            }
-        }
-        dst["records_from"] = json!(format!("{hid:08x}"));
+        merge_into(dst, &src, *hid);
         merged.insert(format!("{hid:08x}"), dst["model"].as_str().unwrap_or_default().to_string());
     }
     merged
+}
+
+/// Copy record `src` (filed under `from`) into the model's record `dst`:
+/// what `dst` leaves unset, and the entries of lists both have (palettes,
+/// part groups). `dst` keeps its name and model info and gets `records_from`.
+fn merge_into(dst: &mut Value, src: &Value, from: u32) {
+    for (k, v) in src.as_object().into_iter().flatten() {
+        if matches!(k.as_str(), "model" | "model_hash" | "model_info" | "model_info_via") {
+            continue;
+        }
+        let unset = dst.get(k).is_none_or(|x| x.is_null() || x.as_array().is_some_and(|a| a.is_empty()) || x.as_object().is_some_and(|o| o.is_empty()));
+        if unset {
+            dst[k] = v.clone();
+        } else if let (Some(have), Some(more)) = (dst[k].as_array_mut(), v.as_array()) {
+            for x in more {
+                if !have.contains(x) {
+                    have.push(x.clone());
+                }
+            }
+        }
+    }
+    dst["records_from"] = json!(format!("{from:08x}"));
 }
 
 /// Name a record that has configurations but no model name after the model
@@ -383,8 +389,10 @@ fn merge_by_handling(models: &mut BTreeMap<u32, Value>, handling_users: &HashMap
 /// configurations, parts and liveries under the gameName `trailer`, a name
 /// with no model, and its chassis part's first element is `trailers`. Only
 /// where every chassis part of the record names the same known model and
-/// that model has no record of its own. The record moves to that model's
-/// hash; `records_from` keeps the old one (its liveries are filed there).
+/// that model has no record with configurations or parts of its own. The
+/// record moves to that model's hash (or is merged into the model's record
+/// when it has one); `records_from` keeps the old hash (its liveries are
+/// filed there).
 /// Returns the renamed hashes (8 hex digits) with the model each now names.
 fn name_by_chassis(models: &mut BTreeMap<u32, Value>, names: &HashMap<u32, String>) -> BTreeMap<String, String> {
     let by_asset: HashMap<u64, &String> = names.values().map(|n| (meta7a::asset_id(n), n)).collect();
@@ -405,7 +413,20 @@ fn name_by_chassis(models: &mut BTreeMap<u32, Value>, names: &HashMap<u32, Strin
             continue;
         }
         let to = meta7a::joaat(&name);
-        if models.contains_key(&to) {
+        // The model has a record: merged into it when that record has no
+        // configurations and no parts of its own (the freight cars
+        // tankercar and freight: their model infos share names, so the
+        // handlingId merge leaves them), else left as it is.
+        if let Some(dst) = models.get(&to) {
+            let empty = |k: &str| dst[k].as_array().is_none_or(|a| a.is_empty());
+            if !(empty("configurations") && empty("mods")) || dst["records_from"].is_string() {
+                continue;
+            }
+            let Some(src) = models.remove(&h) else { continue };
+            if let Some(dst) = models.get_mut(&to) {
+                merge_into(dst, &src, h);
+            }
+            named.insert(format!("{h:08x}"), name);
             continue;
         }
         let Some(mut rec) = models.remove(&h) else { continue };
@@ -865,8 +886,16 @@ mod merge_tests {
         let t = &models[&meta7a::joaat("trailers")];
         assert_eq!((t["model"].as_str(), t["records_from"].as_str()), (Some("trailers"), Some("5c27aa11")));
         assert!(models[&other]["model"].is_null());
-        // a model with a record of its own keeps it
-        let mut models = BTreeMap::from([(h, rec(None, h, 3)), (meta7a::joaat("trailers"), rec(Some("trailers"), meta7a::joaat("trailers"), 0))]);
+        // a model with a record of its own but no configurations takes it in
+        // (tankercar); one with configurations keeps its own
+        let t = meta7a::joaat("trailers");
+        let mut models = BTreeMap::from([(h, rec(None, h, 3)), (t, rec(Some("trailers"), t, 0))]);
+        models.get_mut(&h).unwrap()["mods"] = json!([chassis(&a)]);
+        assert_eq!(name_by_chassis(&mut models, &names).len(), 1);
+        assert_eq!(models[&t]["configurations"].as_array().unwrap().len(), 3);
+        assert_eq!(models[&t]["records_from"], "5c27aa11");
+        assert_eq!(models[&t]["model_info"]["x"], t);
+        let mut models = BTreeMap::from([(h, rec(None, h, 3)), (t, rec(Some("trailers"), t, 2))]);
         models.get_mut(&h).unwrap()["mods"] = json!([chassis(&a)]);
         assert!(name_by_chassis(&mut models, &names).is_empty());
     }
