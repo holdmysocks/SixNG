@@ -2898,9 +2898,9 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let t = Instant::now();
             let v = sixng_core::vehicles::export(&a, &metas, &names, po)?;
             // liveries: the stickers each brand places (<out>/vehicles/liveries.json),
-            // a merged handlingId's under its model's name
+            // a merged handlingId's (or a record named by its chassis) under its model's name
             let mut names = names;
-            for (h, m) in v["merged_by_handling"].as_object().into_iter().flatten() {
+            for (h, m) in v["merged_by_handling"].as_object().into_iter().flatten().chain(v["named_by_chassis"].as_object().into_iter().flatten()) {
                 if let (Ok(h), Some(m)) = (u32::from_str_radix(h, 16), m.as_str()) {
                     names.insert(h, m.to_string());
                 }
