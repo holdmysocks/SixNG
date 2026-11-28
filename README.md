@@ -1111,16 +1111,22 @@ again**).
   in turn); only a few are alternatives on separate branches.
   **Subtitles**: a scene file's subtitle events
   (`fwAnimSceneSubtitleEventData`) give the text label, the speaker (joaat
-  of the character name) and the start and end in the scene. Each scene
+  of the character name) and the start and end in their section. Each scene
   lists its lines; with the dialogue links (`sixng dialogue-links`) they
   get their text and speaker name, and `speaker_agrees` says whether the
-  links give the same speaker hash. A scene that one master places once
-  also gets each line's time on that master's bank clock (`bank_time`).
+  links give the same speaker hash. A composite section lists sections
+  that play together from its start (character, camera and other
+  layers), so a line's times count from the start of the composite it
+  plays under. A master slot's `sectionId` names one composite of the
+  child scene, so each line gets a time on the master's bank clock for
+  every slot that plays its composite (`bank_times`: the slot's
+  `bank_time` plus the line's start). Placed this way, the lines line up
+  with the `.c` stream within 0.2 s on 81 of 95 masters (7 of 95 when
+  each master's lines are tried on another master's audio).
   Measured on the story pack: 11,903 lines in 1,488 scenes; 11,804 get
   their text and 9,395 a speaker name, and the links agree on the
-  speaker for 11,860 (43 differ). 1,444 lines are on a bank clock.
-  Times are as the events store them: in scenes with several sections
-  they restart per section, which is not decoded yet.
+  speaker for 11,860 (43 differ). 3,176 lines are on a bank clock (the
+  others are in scenes no master places).
   Not decoded: movie events (their movie names are empty in this copy)
   and what the entity conditions test.
 - **Story names** (`sixng story-names [--tags]`): arc and mission names

@@ -1138,8 +1138,9 @@ enum Cmd {
     /// bank of the master timelines placing it. Scenes
     /// placed in a master timeline list the master, the start time, the
     /// section and the master's own audio bank. Each scene lists its
-    /// subtitle lines (label, speaker, start and end in the scene, and the
-    /// time on the master's bank clock for a scene placed once), with text
+    /// subtitle lines (label, speaker, start and end in their section, and
+    /// the time on a master's bank clock for each slot that plays the
+    /// line's section), with text
     /// and speaker names from the dialogue links (`dialogue-links`) when
     /// they exist.
     Cutscenes {
@@ -2222,7 +2223,8 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     "speaker_named": subs().filter(|x| u32::from_str_radix(&x.speaker, 16).is_err() || x.speaker.len() != 8).count(),
                     "speaker_agrees": subs().filter(|x| x.speaker_agrees == Some(true)).count(),
                     "speaker_differs": subs().filter(|x| x.speaker_agrees == Some(false)).count(),
-                    "on_bank_clock": subs().filter(|x| x.bank_time.is_some()).count(),
+                    "on_bank_clock": subs().filter(|x| !x.bank_times.is_empty()).count(),
+                    "bank_times": subs().map(|x| x.bank_times.len()).sum::<usize>(),
                 },
             });
             // master timelines of the archive: slots, those on a catalogued scene, and masters with an audio bank
