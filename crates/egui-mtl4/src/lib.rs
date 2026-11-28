@@ -1,3 +1,6 @@
+// Metal 4 is Apple-only; on other platforms this crate is empty.
+#![cfg(target_os = "macos")]
+
 use anyhow::{bail, Context};
 use egui::{self, epaint};
 use metal_rust::metal::{

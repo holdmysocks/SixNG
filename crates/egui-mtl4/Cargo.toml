@@ -4,11 +4,14 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "Experimental egui painter for Apple's Metal 4 API"
-repository = "https://github.com/maple-quartz18/SixNG"
+repository = "https://github.com/holdmysocks/SixNG"
 readme = "README.md"
 
 [dependencies]
 anyhow = "1"
 bytemuck = { version = "1", features = ["derive"] }
 egui = "0.36.2"
+
+# Metal 4 is Apple-only; on other platforms the crate builds empty.
+[target.'cfg(target_os = "macos")'.dependencies]
 metal-rust = { version = "=1.0.0", git = "https://github.com/maple-quartz18/Metal-Rust.git", rev = "0aa2a1f694adf1a7e3ba877cc799e114d639df16" }
