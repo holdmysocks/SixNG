@@ -1109,8 +1109,20 @@ again**).
   Where one scene fills several slots of a master, its slots mostly
   belong to states on one path (each slot a different section, played
   in turn); only a few are alternatives on separate branches.
-  Not decoded: the scene files' events (subtitle and movie events) and
-  what the entity conditions test.
+  **Subtitles**: a scene file's subtitle events
+  (`fwAnimSceneSubtitleEventData`) give the text label, the speaker (joaat
+  of the character name) and the start and end in the scene. Each scene
+  lists its lines; with the dialogue links (`sixng dialogue-links`) they
+  get their text and speaker name, and `speaker_agrees` says whether the
+  links give the same speaker hash. A scene that one master places once
+  also gets each line's time on that master's bank clock (`bank_time`).
+  Measured on the story pack: 11,903 lines in 1,488 scenes; 11,804 get
+  their text and 9,395 a speaker name, and the links agree on the
+  speaker for 11,860 (43 differ). 1,444 lines are on a bank clock.
+  Times are as the events store them: in scenes with several sections
+  they restart per section, which is not decoded yet.
+  Not decoded: movie events (their movie names are empty in this copy)
+  and what the entity conditions test.
 - **Story names** (`sixng story-names [--tags]`): arc and mission names
   for the scenes. The story pack's protected ambient-rule files (read
   through the table of contents, so Windows x64 with the game executable)
