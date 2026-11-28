@@ -1063,7 +1063,12 @@ pub fn shader(common: &str, src: &str) -> Option<String> {
             "fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {",
             "fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> MeshOut {\n    bl_set(i.mid);",
         )
-        && rep("fn fs_shadow(i: VOut) {", "fn fs_shadow(i: VOut) {\n    bl_set(i.mid);");
+        && rep("fn fs_shadow(i: VOut) {", "fn fs_shadow(i: VOut) {\n    bl_set(i.mid);")
+        // no stickers on the map: the pixel program without their part.
+        // With it the main pass took about a tenth longer although the
+        // list is empty there and the part never runs (measured: the
+        // sticker laid on flat alone added 0.5 ms to 4.4 ms).
+        && rep("let st_n = min(ST[0].flags.x, arrayLength(&ST) - 1u);", "let st_n = 0u;");
     if !ok {
         return None;
     }
